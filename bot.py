@@ -2,7 +2,7 @@
 # BingX Auto Trader (Render Background Worker)
 # - EMA20/EMA50 크로스 + RSI 필터로 방향 결정
 # - 진입 즉시 TP/SL 예약 (reduceOnly)
-# - 청산 후 쿨다운 -> 다시 신호 체크
+# - 청산 후 쿨다운 → 다시 신호 체크
 # - 텔레그램 알림
 import os, time, hmac, hashlib, math, signal
 from typing import Any, Dict, List, Tuple
@@ -15,7 +15,7 @@ API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 
 SYMBOL   = os.getenv("SYMBOL", "BTC-USDT")     # 계정에 따라 BTCUSDT로 바꿔야 할 수도 있음
-INTERVAL = os.getenv("INTERVAL", "3m")         # 3분봉
+INTERVAL = os.getenv("INTERVAL", "3m")         # 기본 3분봉
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 ISOLATED = os.getenv("ISOLATED", "1") == "1"
 
@@ -23,8 +23,8 @@ TP_PCT   = float(os.getenv("TP_PCT", "0.012"))  # 기본 1.2% 익절
 SL_PCT   = float(os.getenv("SL_PCT", "0.006"))  # 기본 0.6% 손절
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "15"))
 
-POSITION_VALUE_USDT = float(os.getenv("POSITION_VALUE_USDT", "50"))
-QTY_FIX = os.getenv("QTY_FIX")  # 있으면 이 수량으로 진입
+POSITION_VALUE_USDT = float(os.getenv("POSITION_VALUE_USDT", "50"))  # 1회 진입 명목가
+QTY_FIX = os.getenv("QTY_FIX")  # 있으면 이 수량 그대로 사용
 
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "3"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 BASE = "https://open-api.bingx.com"
 
 # ─────────────────────────────
-# 공통
+# 공통 유틸
 # ─────────────────────────────
 def ts_ms() -> int:
     return int(time.time() * 1000)
@@ -58,13 +58,16 @@ def req(method: str, path: str, params: Dict[str, Any] | None=None, body: Dict[s
     return r.json()
 
 def send_tg(text: str):
+    """텔레그램으로 전송하고, Render 로그에도 찍는다."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("[TG SKIP]", text)
         return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=8)
-    except Exception:
-        pass
+        print("[TG OK]", text)
+    except Exception as e:
+        print("[TG ERROR]", e, text)
 
 # ─────────────────────────────
 # 마켓 데이터
@@ -123,6 +126,7 @@ RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "70"))
 RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD", "30"))
 
 def decide_signal(candles: List[Tuple[int,float,float,float,float]]) -> str | None:
+    """EMA20/EMA50 크로스 + RSI 조건으로 LONG/SHORT 결정"""
     closes = [c[4] for c in candles]
     if len(closes) < 60:
         return None
@@ -132,10 +136,14 @@ def decide_signal(candles: List[Tuple[int,float,float,float,float]]) -> str | No
     e20p, e20n = e20[-2], e20[-1]
     e50p, e50n = e50[-2], e50[-1]
     r_now = r[-1]
+
     long_sig  = (e20p < e50p) and (e20n > e50n) and (r_now < RSI_OVERBOUGHT)
     short_sig = (e20p > e50p) and (e20n < e50n) and (r_now > RSI_OVERSOLD)
-    if long_sig:  return "LONG"
-    if short_sig: return "SHORT"
+
+    if long_sig:
+        return "LONG"
+    if short_sig:
+        return "SHORT"
     return None
 
 # ─────────────────────────────
@@ -164,6 +172,7 @@ def place_tp_sl(symbol: str, side_open: str, qty: float, entry: float, tp_pct: f
     tp_price = round(entry * (1 + tp_pct) if side_open == "BUY" else entry * (1 - tp_pct), 2)
     sl_price = round(entry * (1 - sl_pct) if side_open == "BUY" else entry * (1 + sl_pct), 2)
 
+    # 익절
     req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": close_side,
@@ -172,6 +181,7 @@ def place_tp_sl(symbol: str, side_open: str, qty: float, entry: float, tp_pct: f
         "reduceOnly": True,
         "triggerPrice": tp_price,
     })
+    # 손절
     req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": close_side,
@@ -187,6 +197,7 @@ def place_tp_sl(symbol: str, side_open: str, qty: float, entry: float, tp_pct: f
 # ─────────────────────────────
 RUNNING = True
 def _sigterm(*_):
+    """Render가 SIGTERM 보낼 때 안전하게 종료"""
     global RUNNING
     RUNNING = False
 signal.signal(signal.SIGTERM, _sigterm)
@@ -203,7 +214,7 @@ def main():
 
     while RUNNING:
         try:
-            # 날짜 바뀌면 보고
+            # 날짜 바뀌면 리포트
             today = time.strftime("%Y-%m-%d")
             if today != last_reset_day:
                 send_tg(f"📊 [DAILY] PnL {daily_pnl:.2f} USDT, 연속손실 {consec_losses}")
@@ -211,6 +222,7 @@ def main():
                 consec_losses = 0
                 last_reset_day = today
 
+            # 신호 계산
             candles = get_klines(SYMBOL, INTERVAL, 120)
             sig = decide_signal(candles)
             if not sig:
@@ -226,6 +238,7 @@ def main():
             side = "BUY" if sig == "LONG" else "SELL"
             send_tg(f"🟢 [ENTRY] {SYMBOL} {sig} {LEVERAGE}x qty={qty} @≈{last_price}")
 
+            # 시장가 진입
             res = place_market(SYMBOL, side, qty)
             entry = last_price
             try:
@@ -236,9 +249,11 @@ def main():
             tp_sl = place_tp_sl(SYMBOL, side, qty, entry, TP_PCT, SL_PCT)
             send_tg(f"📌 [ORDERS] TP@{tp_sl['tp']} / SL@{tp_sl['sl']} (reduceOnly)")
 
+            # 단순 쿨다운
             time.sleep(COOLDOWN_SEC)
 
         except Exception as e:
+            print("ERROR:", e)
             send_tg(f"❌ [ERROR] {e}")
             time.sleep(2)
 
