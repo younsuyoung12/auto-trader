@@ -4,9 +4,17 @@
 # - 진입 즉시 TP/SL 예약 (reduceOnly)
 # - 청산 후 쿨다운 → 다시 신호 체크
 # - 텔레그램 알림
+
 import os, time, hmac, hashlib, math, signal
 from typing import Any, Dict, List, Tuple
 import requests
+
+# ─────────────────────────────
+# 시작 시각 / STOP 필터
+# ─────────────────────────────
+START_TS = time.time()
+# 배포 테스트로 몇 초 안에 죽는 경우는 STOP 안 보냄
+MIN_UPTIME_FOR_STOP = int(os.getenv("MIN_UPTIME_FOR_STOP", "5"))
 
 # ─────────────────────────────
 # 환경변수
@@ -14,13 +22,13 @@ import requests
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 
-SYMBOL   = os.getenv("SYMBOL", "BTC-USDT")     # 계정에 따라 BTCUSDT로 바꿔야 할 수도 있음
-INTERVAL = os.getenv("INTERVAL", "3m")         # 기본 3분봉
+SYMBOL   = os.getenv("SYMBOL", "BTC-USDT")     # 일부 계정은 BTCUSDT 써야 할 수 있음
+INTERVAL = os.getenv("INTERVAL", "3m")         # 3분봉
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 ISOLATED = os.getenv("ISOLATED", "1") == "1"
 
-TP_PCT   = float(os.getenv("TP_PCT", "0.012"))  # 기본 1.2% 익절
-SL_PCT   = float(os.getenv("SL_PCT", "0.006"))  # 기본 0.6% 손절
+TP_PCT   = float(os.getenv("TP_PCT", "0.012"))   # +1.2%
+SL_PCT   = float(os.getenv("SL_PCT", "0.006"))   # -0.6%
 COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "15"))
 
 POSITION_VALUE_USDT = float(os.getenv("POSITION_VALUE_USDT", "50"))  # 1회 진입 명목가
@@ -58,7 +66,7 @@ def req(method: str, path: str, params: Dict[str, Any] | None=None, body: Dict[s
     return r.json()
 
 def send_tg(text: str):
-    """텔레그램으로 전송하고, Render 로그에도 찍는다."""
+    """텔레그램으로 전송하고 Render 로그에도 남긴다."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         print("[TG SKIP]", text)
         return
@@ -70,33 +78,51 @@ def send_tg(text: str):
         print("[TG ERROR]", e, text)
 
 # ─────────────────────────────
-# 마켓 데이터 (여기 수정)
+# 마켓 데이터 (안전 파싱 + 원본 로그)
 # ─────────────────────────────
 def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, float, float, float, float]]:
-    r = requests.get(
+    resp = requests.get(
         f"{BASE}/openApi/swap/v2/quote/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
         timeout=12,
     )
-    raw = r.json()
+
+    # 원본 응답 로그에 남기기 (형태 확인용)
+    try:
+        raw_text = resp.text
+        print("[KLINES RAW]", raw_text[:500])
+    except Exception:
+        print("[KLINES RAW] <cannot print>")
+
+    raw = resp.json()
     data = raw.get("data", []) if isinstance(raw, dict) else raw
 
     out: List[Tuple[int, float, float, float, float]] = []
 
     for it in data:
         if isinstance(it, dict):
-            # 빙엑스가 딕셔너리로 줄 때
-            ts = int(it.get("time") or it.get("openTime") or it.get("t"))
-            o = float(it.get("open"))
-            h = float(it.get("high"))
-            l = float(it.get("low"))
-            c = float(it.get("close"))
+            ts_val = it.get("time") or it.get("openTime") or it.get("t")
+            if not ts_val:
+                print("[KLINES WARN] no time field:", it)
+                continue
+            try:
+                ts = int(ts_val)
+                o = float(it.get("open"))
+                h = float(it.get("high"))
+                l = float(it.get("low"))
+                c = float(it.get("close"))
+            except Exception as e:
+                print("[KLINES WARN] bad price fields:", it, e)
+                continue
             out.append((ts, o, h, l, c))
         else:
-            # 옛날/다른 포맷: 리스트
-            ts = int(it[0])
-            o, h, l, c = map(float, it[1:5])
-            out.append((ts, o, h, l, c))
+            try:
+                ts = int(it[0])
+                o, h, l, c = map(float, it[1:5])
+                out.append((ts, o, h, l, c))
+            except Exception as e:
+                print("[KLINES WARN] list parse failed:", it, e)
+                continue
 
     out.sort(key=lambda x: x[0])
     return out
@@ -140,7 +166,7 @@ RSI_OVERBOUGHT = int(os.getenv("RSI_OVERBOUGHT", "70"))
 RSI_OVERSOLD   = int(os.getenv("RSI_OVERSOLD", "30"))
 
 def decide_signal(candles: List[Tuple[int,float,float,float,float]]) -> str | None:
-    """EMA20/EMA50 크로스 + RSI 조건으로 LONG/SHORT 결정"""
+    """EMA20/50 크로스 + RSI로 방향 결정"""
     closes = [c[4] for c in candles]
     if len(closes) < 60:
         return None
@@ -227,6 +253,7 @@ def main():
 
     while RUNNING:
         try:
+            # 날짜 바뀌면 데일리 리포트
             today = time.strftime("%Y-%m-%d")
             if today != last_reset_day:
                 send_tg(f"📊 [DAILY] PnL {daily_pnl:.2f} USDT, 연속손실 {consec_losses}")
@@ -266,7 +293,12 @@ def main():
             send_tg(f"❌ [ERROR] {e}")
             time.sleep(2)
 
-    send_tg("🛑 [BOT STOPPED]")
+    # 종료 시점: 너무 빨리 죽은 건 배포 테스트로 간주하고 알림 생략
+    uptime = time.time() - START_TS
+    if uptime >= MIN_UPTIME_FOR_STOP:
+        send_tg("🛑 [BOT STOPPED]")
+    else:
+        print(f"[SKIP STOP] uptime={uptime:.2f}s < {MIN_UPTIME_FOR_STOP}s")
 
 if __name__ == "__main__":
     main()
