@@ -10,17 +10,22 @@
 # - 포지션 1개만 운용, 청산 전에는 재진입 안 함
 # - 3회 연속 손실이면 일정 시간 휴식
 # - 시작 시 거래소 포지션/열린 주문 동기화
-#   ↳ 근데 네 계정처럼 /trade/positions 가 100400 주면 자동으로 건너뜀
+#   ↳ 일부 계정에서 /trade/positions 가 100400 주면 자동으로 건너뜀
 # - TP/SL 중 한쪽이 사라지면 다시 걸어줌
 # - 진입 주문이 타임아웃 나면 강제 취소
 # - /healthz, /metrics 붙일 수 있는 HTTP 서버(옵션)
 # - 일정 주기마다 잔고 로그 남김
 # - BingX 잔고 응답이 중첩(dict 안에 dict)일 때도 파싱되게 함
+# - 환경변수에 한글/공백 들어 있어도 죽지 않도록 완화
 
 import os, time, hmac, hashlib, math, signal, random, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Tuple, Optional
 import requests
+
+# <= 이 줄들 바로 아래에 추가
+from dotenv import load_dotenv
+load_dotenv()  # 같은 폴더의 .env 읽어옴
 
 # ─────────────────────────────
 # 기본 런타임 상태
@@ -63,10 +68,10 @@ MIN_TP_PCT  = float(os.getenv("MIN_TP_PCT", "0.005"))   # 0.5%
 MIN_SL_PCT  = float(os.getenv("MIN_SL_PCT", "0.005"))   # 0.5%
 
 # 각종 쿨다운
-COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", "15"))          # 진입 후 기본 대기
-COOLDOWN_AFTER_CLOSE = int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"))  # 청산 후 대기
-COOLDOWN_AFTER_3LOSS = int(os.getenv("COOLDOWN_AFTER_3LOSS", "3600"))  # 3연속 손실 후 대기(초)
-POLL_FILLS_SEC       = int(os.getenv("POLL_FILLS_SEC", "2"))         # TP/SL 체결 체크 주기
+COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", "15"))             # 진입 후 기본 대기
+COOLDOWN_AFTER_CLOSE = int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"))     # 청산 후 대기
+COOLDOWN_AFTER_3LOSS = int(os.getenv("COOLDOWN_AFTER_3LOSS", "3600"))   # 3연속 손실 후 대기(초)
+POLL_FILLS_SEC       = int(os.getenv("POLL_FILLS_SEC", "2"))            # TP/SL 체결 체크 주기
 
 # 주문 금액 최소/최대
 MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "5"))
@@ -125,7 +130,7 @@ def log(msg: str):
     print(line, flush=True)
     if LOG_TO_FILE:
         try:
-            with open(LOG_FILE, "a") as f:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
             pass
@@ -163,6 +168,26 @@ def send_tg(text: str):
         log("[TG OK] " + text)
     except Exception as e:
         log(f"[TG ERROR] {e} {text}")
+
+# ─────────────────────────────
+# 환경변수 정리: 한글/공백 들어가도 죽지 않게
+# ─────────────────────────────
+def _ensure_ascii_env(val: str, name: str) -> str:
+    """
+    키에 한글/공백 들어있어서 requests 헤더에서 터지는 걸 방지.
+    - 가능하면 ASCII만 남기고
+    - 뭐가 지워졌는지 로그만 남기고
+    - 여기서 예외는 안 던진다.
+    """
+    if not val:
+        return val
+    try:
+        val.encode("ascii")
+        return val
+    except UnicodeEncodeError:
+        cleaned = val.encode("ascii", "ignore").decode("ascii").strip()
+        log(f"[WARN] {name}에 ASCII 아닌 문자가 있어 제거했습니다. 원래='{val}' -> '{cleaned}'")
+        return cleaned
 
 # ─────────────────────────────
 # 거래소 응답 파서
@@ -248,6 +273,8 @@ SESSIONS = _parse_sessions(TRADING_SESSIONS_UTC)
 
 def in_trading_session_utc() -> bool:
     """현재 UTC 시간이 우리가 지정한 시간대 안에 있는지"""
+    # Deprecation 피하려면 datetime.datetime.now(datetime.UTC)로 가도 되는데
+    # 여기서는 간단하게 유지
     now_utc = datetime.datetime.utcnow()
     h = now_utc.hour
     for s, e in SESSIONS:
@@ -880,7 +907,7 @@ def check_closes() -> List[Dict[str, Any]]:
 RUNNING = True
 
 def _sigterm(*_):
-    """Render에서 SIGTERM 들어오면 플래그만 바꿔서 자연 종료"""
+    """운영 환경에서 SIGTERM 들어오면 플래그만 바꿔서 자연 종료"""
     global RUNNING, TERMINATED_BY_SIGNAL
     TERMINATED_BY_SIGNAL = True
     RUNNING = False
@@ -888,23 +915,37 @@ def _sigterm(*_):
 signal.signal(signal.SIGTERM, _sigterm)
 
 def main():
-    global LAST_CLOSE_TS, CONSEC_LOSSES, CONSEC_KLINE_FAILS, OPEN_TRADES
+    global LAST_CLOSE_TS, CONSEC_LOSSES, CONSEC_KLINE_FAILS, OPEN_TRADES, API_KEY, API_SECRET
 
-    # 환경변수 필수 검사
+    # 여기서 한글/공백 제거해서 안전하게 바꿔 둔다.
+    API_KEY = _ensure_ascii_env(API_KEY, "BINGX_API_KEY")
+    API_SECRET = _ensure_ascii_env(API_SECRET, "BINGX_API_SECRET")
+
+    # 환경변수 필수 검사 (없으면 종료만 하고 프로세스는 살려둠)
     if not API_KEY or not API_SECRET:
-        raise RuntimeError("BINGX_API_KEY / BINGX_API_SECRET 가 필요합니다.")
+        msg = "❗ BINGX_API_KEY 또는 BINGX_API_SECRET 이 비어있습니다. .env 또는 PowerShell 환경변수를 다시 설정하세요."
+        log(msg)
+        send_tg(msg)
+        return
+
     if not (0 < RISK_PCT <= 1):
-        raise ValueError("RISK_PCT 는 0 < RISK_PCT <= 1 이어야 합니다.")
+        log("RISK_PCT 는 0 < RISK_PCT <= 1 이어야 합니다. 현재 설정이 잘못되었습니다.")
+        return
     if LEVERAGE <= 0:
-        raise ValueError("LEVERAGE 는 0보다 커야 합니다.")
+        log("LEVERAGE 는 0보다 커야 합니다.")
+        return
     if TP_PCT <= 0 or SL_PCT <= 0:
-        raise ValueError("TP_PCT, SL_PCT 는 0보다 커야 합니다.")
+        log("TP_PCT, SL_PCT 는 0보다 커야 합니다.")
+        return
 
     # 시작 알림
     send_tg("✅ [봇 시작] BingX 자동매매 시작합니다.")
 
     # 레버리지/마진 세팅
-    set_leverage_and_mode(SYMBOL, LEVERAGE, ISOLATED)
+    try:
+        set_leverage_and_mode(SYMBOL, LEVERAGE, ISOLATED)
+    except Exception as e:
+        log(f"[WARN] 레버리지/마진 설정 실패: {e} (계속 진행은 함)")
 
     # health 서버 시작
     start_health_server()
