@@ -1,10 +1,9 @@
 # bot.py
 # BingX Auto Trader (Render Background Worker)
-# - EMA20/EMA50 크로스 + RSI 필터로 방향 결정
+# - EMA20/EMA50 크로스 + RSI 필터
 # - 진입 즉시 TP/SL 예약 (reduceOnly)
-# - TP/SL 체결 시 실제 fill 내역 조회해서 텔레그램으로 PnL 보고
-# - 청산 후 쿨다운 → 다시 신호 체크
-# - 텔레그램 알림
+# - TP/SL 체결 시 fill 조회해서 텔레그램으로 PnL 보고
+# - Render가 SIGTERM 보낸 종료는 텔레그램에 STOP 안 보냄
 
 import os, time, hmac, hashlib, math, signal
 from typing import Any, Dict, List, Tuple
@@ -15,6 +14,7 @@ import requests
 # ─────────────────────────────
 START_TS = time.time()
 MIN_UPTIME_FOR_STOP = int(os.getenv("MIN_UPTIME_FOR_STOP", "5"))
+TERMINATED_BY_SIGNAL = False  # ← SIGTERM 종료 여부
 
 # ─────────────────────────────
 # 환경변수
@@ -22,15 +22,15 @@ MIN_UPTIME_FOR_STOP = int(os.getenv("MIN_UPTIME_FOR_STOP", "5"))
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 
-SYMBOL   = os.getenv("SYMBOL", "BTC-USDT")       # 일부 계정은 BTCUSDT
+SYMBOL   = os.getenv("SYMBOL", "BTC-USDT")   # 필요하면 BTCUSDT 로 변경
 INTERVAL = os.getenv("INTERVAL", "3m")
 LEVERAGE = int(os.getenv("LEVERAGE", "30"))
 ISOLATED = os.getenv("ISOLATED", "1") == "1"
 
 TP_PCT   = float(os.getenv("TP_PCT", "0.012"))   # +1.2%
 SL_PCT   = float(os.getenv("SL_PCT", "0.006"))   # -0.6%
-COOLDOWN_SEC = int(os.getenv("COOLDOWN_SEC", "15"))
-POLL_FILLS_SEC = int(os.getenv("POLL_FILLS_SEC", "2"))  # TP/SL 체결 확인 주기
+COOLDOWN_SEC   = int(os.getenv("COOLDOWN_SEC", "15"))
+POLL_FILLS_SEC = int(os.getenv("POLL_FILLS_SEC", "2"))
 
 POSITION_VALUE_USDT = float(os.getenv("POSITION_VALUE_USDT", "50"))
 QTY_FIX = os.getenv("QTY_FIX")
@@ -40,7 +40,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 BASE = "https://open-api.bingx.com"
 
-# TP/SL이 걸려 있는 포지션을 추적하기 위한 메모리
+# TP/SL 추적용
 OPEN_TRADES: List[Dict[str, Any]] = []
 
 # ─────────────────────────────
@@ -87,8 +87,7 @@ def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, 
         timeout=12,
     )
     try:
-        raw_text = resp.text
-        print("[KLINES RAW]", raw_text[:500])
+        print("[KLINES RAW]", resp.text[:500])
     except Exception:
         print("[KLINES RAW] <cannot print>")
 
@@ -192,13 +191,12 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True):
     })
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
-    res = req("POST", "/openApi/swap/v2/trade/order", {
+    return req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
         "quantity": qty,
     })
-    return res
 
 def place_tp_sl(symbol: str, side_open: str, qty: float, entry: float, tp_pct: float, sl_pct: float):
     close_side = "SELL" if side_open == "BUY" else "BUY"
@@ -221,20 +219,20 @@ def place_tp_sl(symbol: str, side_open: str, qty: float, entry: float, tp_pct: f
         "reduceOnly": True,
         "triggerPrice": sl_price,
     })
-    tp_id = (tp_res.get("data") or {}).get("orderId")
-    sl_id = (sl_res.get("data") or {}).get("orderId")
-    return {"tp": tp_price, "sl": sl_price, "tp_order_id": tp_id, "sl_order_id": sl_id}
+    return {
+        "tp": tp_price,
+        "sl": sl_price,
+        "tp_order_id": (tp_res.get("data") or {}).get("orderId"),
+        "sl_order_id": (sl_res.get("data") or {}).get("orderId"),
+    }
 
 def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
-    # BingX 문서: /openApi/swap/v2/trade/order 로 단일 주문 조회 :contentReference[oaicite:1]{index=1}
-    res = req("GET", "/openApi/swap/v2/trade/order", {
+    return req("GET", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "orderId": order_id,
     })
-    return res
 
 def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
-    # BingX 문서: /openApi/swap/v2/trade/allFillOrders 가 스왑 트레이드 히스토리 조회 :contentReference[oaicite:2]{index=2}
     res = req("GET", "/openApi/swap/v2/trade/allFillOrders", {
         "symbol": symbol,
         "orderId": order_id,
@@ -251,7 +249,6 @@ def summarize_fills(symbol: str, order_id: str) -> Dict[str, Any] | None:
     notional = 0.0
     last_time = None
     for f in fills:
-        # 여러 이름으로 올 수 있으니 다 받아본다
         q = float(f.get("quantity") or f.get("qty") or f.get("volume") or f.get("vol") or 0.0)
         px = float(f.get("price") or f.get("avgPrice") or 0.0)
         pnl = float(f.get("realizedPnl") or 0.0)
@@ -268,7 +265,6 @@ def summarize_fills(symbol: str, order_id: str) -> Dict[str, Any] | None:
     }
 
 def check_closes() -> List[Dict[str, Any]]:
-    """OPEN_TRADES 안의 TP/SL 주문이 체결됐는지 확인하고, 체결된 건에 대해 fill 요약을 반환"""
     global OPEN_TRADES
     if not OPEN_TRADES:
         return []
@@ -278,7 +274,6 @@ def check_closes() -> List[Dict[str, Any]]:
     for t in OPEN_TRADES:
         symbol = t["symbol"]
         closed = False
-        # TP 먼저
         tp_id = t.get("tp_order_id")
         sl_id = t.get("sl_order_id")
 
@@ -315,8 +310,10 @@ def check_closes() -> List[Dict[str, Any]]:
 # ─────────────────────────────
 RUNNING = True
 def _sigterm(*_):
-    global RUNNING
+    global RUNNING, TERMINATED_BY_SIGNAL
+    TERMINATED_BY_SIGNAL = True
     RUNNING = False
+
 signal.signal(signal.SIGTERM, _sigterm)
 
 def main():
@@ -340,7 +337,7 @@ def main():
                 consec_losses = 0
                 last_reset_day = today
 
-            # TP/SL 체결 확인 (너무 자주 안 치도록 인터벌 둠)
+            # TP/SL 체결 확인
             now = time.time()
             if now - last_fill_check >= POLL_FILLS_SEC:
                 closed_list = check_closes()
@@ -352,7 +349,6 @@ def main():
                     closed_price = summary.get("avg_price") or 0.0
                     pnl = summary.get("pnl")
                     if pnl is None or pnl == 0.0:
-                        # 실현PnL을 안 줬으면 우리가 계산
                         if reason == "TP":
                             if t["side"] == "BUY":
                                 pnl = (t["tp_price"] - t["entry"]) * closed_qty
@@ -369,11 +365,13 @@ def main():
                     else:
                         consec_losses = 0
                     send_tg(
-                        f"💰 [CLOSE-{reason}] {t['symbol']} {t['side']} qty={closed_qty} "
-                        f"@{closed_price:.2f} PnL={pnl:.2f} USDT (오늘누계 {daily_pnl:.2f})"
+                        f"💰 [CLOSE-{reason}] {t['symbol']} {t['side']} "
+                        f"qty={closed_qty} @{closed_price:.2f} "
+                        f"PnL={pnl:.2f} USDT (오늘누계 {daily_pnl:.2f})"
                     )
                 last_fill_check = now
 
+            # 진입 신호 체크
             candles = get_klines(SYMBOL, INTERVAL, 120)
             sig = decide_signal(candles)
             if not sig:
@@ -400,7 +398,6 @@ def main():
             tp_sl = place_tp_sl(SYMBOL, side, qty, entry, TP_PCT, SL_PCT)
             send_tg(f"📌 [ORDERS] TP@{tp_sl['tp']} / SL@{tp_sl['sl']} (reduceOnly)")
 
-            # 추적용 정보 저장
             OPEN_TRADES.append({
                 "symbol": SYMBOL,
                 "side": side,
@@ -421,10 +418,10 @@ def main():
             time.sleep(2)
 
     uptime = time.time() - START_TS
-    if uptime >= MIN_UPTIME_FOR_STOP:
+    if (not TERMINATED_BY_SIGNAL) and (uptime >= MIN_UPTIME_FOR_STOP):
         send_tg("🛑 [BOT STOPPED]")
     else:
-        print(f"[SKIP STOP] uptime={uptime:.2f}s < {MIN_UPTIME_FOR_STOP}s")
+        print(f"[SKIP STOP] sig={TERMINATED_BY_SIGNAL} uptime={uptime:.2f}s")
 
 if __name__ == "__main__":
     main()
