@@ -1,0 +1,3 @@
+requests==2.*
+websocket-client==1.*
+python-dotenv==1.*
