@@ -10,10 +10,12 @@
 # - 포지션 1개만 운용, 청산 전에는 재진입 안 함
 # - 3회 연속 손실이면 일정 시간 휴식
 # - 시작 시 거래소 포지션/열린 주문 동기화
+#   ↳ 근데 네 계정처럼 /trade/positions 가 100400 주면 자동으로 건너뜀
 # - TP/SL 중 한쪽이 사라지면 다시 걸어줌
 # - 진입 주문이 타임아웃 나면 강제 취소
 # - /healthz, /metrics 붙일 수 있는 HTTP 서버(옵션)
 # - 일정 주기마다 잔고 로그 남김
+# - BingX 잔고 응답이 중첩(dict 안에 dict)일 때도 파싱되게 함
 
 import os, time, hmac, hashlib, math, signal, random, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -32,13 +34,13 @@ TERMINATED_BY_SIGNAL = False
 # ─────────────────────────────
 API_KEY    = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
-SYMBOL   = os.getenv("SYMBOL", "BTC-USDT")
-INTERVAL = os.getenv("INTERVAL", "3m")  # 메인 타임프레임
+SYMBOL     = os.getenv("SYMBOL", "BTC-USDT")
+INTERVAL   = os.getenv("INTERVAL", "3m")  # 메인 타임프레임
 
 # 전략 ON/OFF
-ENABLE_TREND = os.getenv("ENABLE_TREND", "1") == "1"   # 3m → 15m 추세 전략
-ENABLE_RANGE = os.getenv("ENABLE_RANGE", "0") == "1"   # 박스장 전략
-ENABLE_1M_CONFIRM = os.getenv("ENABLE_1M_CONFIRM", "1") == "1"  # 1분봉 마지막 캔들 확인
+ENABLE_TREND       = os.getenv("ENABLE_TREND", "1") == "1"   # 3m → 15m 추세 전략
+ENABLE_RANGE       = os.getenv("ENABLE_RANGE", "0") == "1"   # 박스장 전략
+ENABLE_1M_CONFIRM  = os.getenv("ENABLE_1M_CONFIRM", "1") == "1"  # 1분봉 마지막 캔들 확인
 
 # 레버리지/마진
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
@@ -52,19 +54,19 @@ TP_PCT = float(os.getenv("TP_PCT", "0.02"))   # +2%
 SL_PCT = float(os.getenv("SL_PCT", "0.02"))   # -2%
 
 # ATR 기반 TP/SL 옵션
-USE_ATR       = os.getenv("USE_ATR", "1") == "1"
-ATR_LEN       = int(os.getenv("ATR_LEN", "20"))
-ATR_TP_MULT   = float(os.getenv("ATR_TP_MULT", "2.0"))
-ATR_SL_MULT   = float(os.getenv("ATR_SL_MULT", "1.2"))
+USE_ATR     = os.getenv("USE_ATR", "1") == "1"
+ATR_LEN     = int(os.getenv("ATR_LEN", "20"))
+ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.0"))
+ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.2"))
 # ATR이 너무 작거나 클 때 최소/최대 퍼센트
-MIN_TP_PCT    = float(os.getenv("MIN_TP_PCT", "0.005"))   # 0.5%
-MIN_SL_PCT    = float(os.getenv("MIN_SL_PCT", "0.005"))   # 0.5%
+MIN_TP_PCT  = float(os.getenv("MIN_TP_PCT", "0.005"))   # 0.5%
+MIN_SL_PCT  = float(os.getenv("MIN_SL_PCT", "0.005"))   # 0.5%
 
 # 각종 쿨다운
-COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", "15"))      # 진입 후 기본 대기
+COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", "15"))          # 진입 후 기본 대기
 COOLDOWN_AFTER_CLOSE = int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"))  # 청산 후 대기
 COOLDOWN_AFTER_3LOSS = int(os.getenv("COOLDOWN_AFTER_3LOSS", "3600"))  # 3연속 손실 후 대기(초)
-POLL_FILLS_SEC       = int(os.getenv("POLL_FILLS_SEC", "2"))     # TP/SL 체결 체크 주기
+POLL_FILLS_SEC       = int(os.getenv("POLL_FILLS_SEC", "2"))         # TP/SL 체결 체크 주기
 
 # 주문 금액 최소/최대
 MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "5"))
@@ -80,10 +82,10 @@ BASE = "https://open-api.bingx.com"
 
 # 로그 옵션
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "0") == "1"
-LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+LOG_FILE    = os.getenv("LOG_FILE", "bot.log")
 
 # 시세 호출 실패 관련
-MAX_KLINE_FAILS = int(os.getenv("MAX_KLINE_FAILS", "5"))
+MAX_KLINE_FAILS  = int(os.getenv("MAX_KLINE_FAILS", "5"))
 KLINE_FAIL_SLEEP = int(os.getenv("KLINE_FAIL_SLEEP", "600"))
 
 # UTC 시간대 필터 (예: "0-3,8-12")
@@ -140,7 +142,7 @@ def sign_query(params: Dict[str, Any]) -> str:
 def headers() -> Dict[str, str]:
     return {"X-BX-APIKEY": API_KEY, "Content-Type": "application/json"}
 
-def req(method: str, path: str, params: Dict[str, Any] | None=None, body: Dict[str, Any] | None=None) -> Dict[str, Any]:
+def req(method: str, path: str, params: Optional[Dict[str, Any]]=None, body: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
     """BingX REST 호출 공통 함수 (단일 시도 버전)"""
     params = params or {}
     params["timestamp"] = ts_ms()
@@ -163,7 +165,7 @@ def send_tg(text: str):
         log(f"[TG ERROR] {e} {text}")
 
 # ─────────────────────────────
-# 거래소 응답을 한 군데서만 파싱
+# 거래소 응답 파서
 # ─────────────────────────────
 def normalize_order(resp: Dict[str, Any]) -> Dict[str, Any]:
     """order 응답을 공통 포맷으로 바꿈"""
@@ -211,8 +213,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, *_):
-        # HTTP 서버 자체 로그는 안 남김 (시끄러워서)
-        return
+        return  # HTTP 요청 로그는 생략
 
 def start_health_server():
     """0이 아닌 포트가 설정돼 있으면 /healthz, /metrics 띄움"""
@@ -258,33 +259,86 @@ def in_trading_session_utc() -> bool:
 # 잔고 / 포지션 / 주문
 # ─────────────────────────────
 def get_available_usdt() -> float:
-    """가용 선물 잔고 조회 + 로그"""
+    """
+    가용 선물 잔고 조회 + 로그
+    BingX가 종종 {"data": {"balance": {...}}} 이렇게 중첩으로 주기 때문에 그 경우도 처리한다.
+    """
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
+
         data = res.get("data") or res.get("balances") or res
+
+        # case 1: {"data": {"balance": {...}}}
+        if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
+            bal = data["balance"]
+            cand = (
+                bal.get("availableMargin")
+                or bal.get("availableBalance")
+                or bal.get("balance")
+                or bal.get("equity")
+                or 0.0
+            )
+            try:
+                avail = float(cand)
+            except (TypeError, ValueError):
+                avail = 0.0
+            log(f"[BALANCE] available={avail} USDT (nested balance)")
+            return avail
+
+        # case 2: 리스트로 오는 경우
         if isinstance(data, list) and data:
             item = data[0]
         else:
             item = data
-        avail = (
+
+        # case 3: item 안에 다시 balance dict 있는 경우
+        if isinstance(item, dict) and "balance" in item and isinstance(item["balance"], dict):
+            bal = item["balance"]
+            cand = (
+                bal.get("availableMargin")
+                or bal.get("availableBalance")
+                or bal.get("balance")
+                or bal.get("equity")
+                or 0.0
+            )
+            try:
+                avail = float(cand)
+            except (TypeError, ValueError):
+                avail = 0.0
+            log(f"[BALANCE] available={avail} USDT (item.balance)")
+            return avail
+
+        # 일반 케이스
+        cand = (
             item.get("availableBalance")
             or item.get("availableMargin")
             or item.get("balance")
             or 0.0
         )
-        avail = float(avail)
+        try:
+            avail = float(cand)
+        except (TypeError, ValueError):
+            avail = 0.0
+
         log(f"[BALANCE] available={avail} USDT")
         return avail
+
     except Exception as e:
         log(f"[BALANCE ERROR] {e}")
         send_tg(f"⚠️ 잔고 조회 실패: {e}")
         return 0.0
 
 def fetch_open_positions() -> List[Dict[str, Any]]:
-    """거래소에 실제 열려 있는 포지션 가져오기"""
+    """
+    거래소에 실제 열려 있는 포지션 가져오기
+    일부 환경에서는 code=100400(this api is not exist) 을 주므로 그땐 그냥 빈 리스트 리턴
+    """
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": SYMBOL})
+        if res.get("code") == 100400:
+            log("[POSITIONS] this api is not exist -> skip syncing positions")
+            return []
         log(f"[POSITIONS RAW] {res}")
         data = res.get("data") or res.get("positions") or []
         if not isinstance(data, list):
@@ -311,6 +365,7 @@ def sync_open_trades_from_exchange():
     """
     봇이 재시작됐을 때,
     거래소에 열려 있는 포지션/주문을 보고 내부 OPEN_TRADES 상태를 맞춤.
+    positions API가 미지원이면 그냥 안 맞추고 넘어감.
     """
     global OPEN_TRADES
     positions = fetch_open_positions()
@@ -318,6 +373,7 @@ def sync_open_trades_from_exchange():
     if not positions:
         log("[SYNC] 열려 있는 포지션이 없습니다.")
         return
+
     for pos in positions:
         qty = float(pos.get("positionAmt") or pos.get("quantity") or pos.get("size") or 0.0)
         if qty == 0.0:
@@ -356,7 +412,6 @@ def sync_open_trades_from_exchange():
 def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, float, float, float, float]]:
     """
     캔들 가져와서 (ts, open, high, low, close) 리스트로 변환
-    여기서도 간단하게 ok 로그 남겨서 3분봉 정상 수신 여부 확인 가능
     """
     resp = requests.get(
         f"{BASE}/openApi/swap/v2/quote/klines",
@@ -386,7 +441,6 @@ def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, 
             except Exception:
                 continue
     out.sort(key=lambda x: x[0])
-    # 여기서 3m/15m 둘 다 찍히게 됨
     if out:
         log(f"[KLINES {interval}] ok count={len(out)} last_close={out[-1][4]}")
     else:
@@ -492,7 +546,7 @@ def has_bullish_rsi_divergence(candles, rsi_vals) -> bool:
 # ─────────────────────────────
 # 전략 1: 3분봉 추세 + 15분봉 필터
 # ─────────────────────────────
-def decide_signal_3m_trend(candles: List[Tuple[int,float,float,float,float]]) -> str | None:
+def decide_signal_3m_trend(candles: List[Tuple[int,float,float,float,float]]) -> Optional[str]:
     """3분봉에서 골든/데드크로스 + RSI + 횡보필터"""
     closes = [c[4] for c in candles]
     if len(closes) < 60:
@@ -532,7 +586,7 @@ def decide_signal_3m_trend(candles: List[Tuple[int,float,float,float,float]]) ->
         return "SHORT"
     return None
 
-def decide_trend_15m(candles_15m) -> str | None:
+def decide_trend_15m(candles_15m) -> Optional[str]:
     """15분봉 큰 방향"""
     closes = [c[4] for c in candles_15m]
     if len(closes) < 50:
@@ -550,7 +604,7 @@ def decide_trend_15m(candles_15m) -> str | None:
 # ─────────────────────────────
 # 전략 2: 박스장 모드
 # ─────────────────────────────
-def decide_signal_range(candles) -> str | None:
+def decide_signal_range(candles) -> Optional[str]:
     """
     최근 N개 캔들 안에서 박스가 보이면 상단부에선 숏, 하단부에선 롱
     RSI도 같이 봐서 너무 약하면 진입 안함
@@ -668,7 +722,7 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
     })
     return res.get("data", []) or []
 
-def summarize_fills(symbol: str, order_id: str) -> Dict[str, Any] | None:
+def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
     """체결내역으로부터 실제 체결가/수량/실현손익 추려내기"""
     fills = get_fills(symbol, order_id)
     if not fills:
@@ -726,6 +780,7 @@ def ensure_tp_sl_for_trade(t: Dict[str, Any]) -> bool:
     close_side = "SELL" if side_open == "BUY" else "BUY"
     need_tp = False
     need_sl = False
+
     # TP 상태 체크
     if t.get("tp_order_id"):
         try:
@@ -738,6 +793,7 @@ def ensure_tp_sl_for_trade(t: Dict[str, Any]) -> bool:
             need_tp = True
     else:
         need_tp = True
+
     # SL 상태 체크
     if t.get("sl_order_id"):
         try:
@@ -750,6 +806,7 @@ def ensure_tp_sl_for_trade(t: Dict[str, Any]) -> bool:
             need_sl = True
     else:
         need_sl = True
+
     ok = True
     if need_tp:
         try:
@@ -821,11 +878,13 @@ def check_closes() -> List[Dict[str, Any]]:
 # 메인 루프
 # ─────────────────────────────
 RUNNING = True
+
 def _sigterm(*_):
     """Render에서 SIGTERM 들어오면 플래그만 바꿔서 자연 종료"""
     global RUNNING, TERMINATED_BY_SIGNAL
     TERMINATED_BY_SIGNAL = True
     RUNNING = False
+
 signal.signal(signal.SIGTERM, _sigterm)
 
 def main():
@@ -850,7 +909,7 @@ def main():
     # health 서버 시작
     start_health_server()
 
-    # 거래소 상태 동기화
+    # 거래소 상태 동기화 (positions 미지원이면 그냥 패스됨)
     sync_open_trades_from_exchange()
 
     last_reset_day = time.strftime("%Y-%m-%d")
@@ -969,8 +1028,10 @@ def main():
                         candles_1m = get_klines(SYMBOL, "1m", 20)
                         if len(candles_1m) >= 2:
                             last_1m = candles_1m[-1]
+                            # 롱인데 1분봉이 음봉이면 패스
                             if chosen_signal == "LONG" and last_1m[4] < last_1m[1]:
                                 chosen_signal = None
+                            # 숏인데 1분봉이 양봉이면 패스
                             elif chosen_signal == "SHORT" and last_1m[4] > last_1m[1]:
                                 chosen_signal = None
 
