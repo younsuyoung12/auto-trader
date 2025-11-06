@@ -70,20 +70,34 @@ def send_tg(text: str):
         print("[TG ERROR]", e, text)
 
 # ─────────────────────────────
-# 마켓 데이터
+# 마켓 데이터 (여기 수정)
 # ─────────────────────────────
-def get_klines(symbol: str, interval: str, limit: int=120) -> List[Tuple[int,float,float,float,float]]:
+def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, float, float, float, float]]:
     r = requests.get(
         f"{BASE}/openApi/swap/v2/quote/klines",
         params={"symbol": symbol, "interval": interval, "limit": limit},
         timeout=12,
     )
-    j = r.json()["data"]
-    out = []
-    for it in j:
-        ts = int(it[0])
-        o, h, l, c = map(float, it[1:5])
-        out.append((ts, o, h, l, c))
+    raw = r.json()
+    data = raw.get("data", []) if isinstance(raw, dict) else raw
+
+    out: List[Tuple[int, float, float, float, float]] = []
+
+    for it in data:
+        if isinstance(it, dict):
+            # 빙엑스가 딕셔너리로 줄 때
+            ts = int(it.get("time") or it.get("openTime") or it.get("t"))
+            o = float(it.get("open"))
+            h = float(it.get("high"))
+            l = float(it.get("low"))
+            c = float(it.get("close"))
+            out.append((ts, o, h, l, c))
+        else:
+            # 옛날/다른 포맷: 리스트
+            ts = int(it[0])
+            o, h, l, c = map(float, it[1:5])
+            out.append((ts, o, h, l, c))
+
     out.sort(key=lambda x: x[0])
     return out
 
@@ -197,7 +211,6 @@ def place_tp_sl(symbol: str, side_open: str, qty: float, entry: float, tp_pct: f
 # ─────────────────────────────
 RUNNING = True
 def _sigterm(*_):
-    """Render가 SIGTERM 보낼 때 안전하게 종료"""
     global RUNNING
     RUNNING = False
 signal.signal(signal.SIGTERM, _sigterm)
@@ -214,7 +227,6 @@ def main():
 
     while RUNNING:
         try:
-            # 날짜 바뀌면 리포트
             today = time.strftime("%Y-%m-%d")
             if today != last_reset_day:
                 send_tg(f"📊 [DAILY] PnL {daily_pnl:.2f} USDT, 연속손실 {consec_losses}")
@@ -222,7 +234,6 @@ def main():
                 consec_losses = 0
                 last_reset_day = today
 
-            # 신호 계산
             candles = get_klines(SYMBOL, INTERVAL, 120)
             sig = decide_signal(candles)
             if not sig:
@@ -238,7 +249,6 @@ def main():
             side = "BUY" if sig == "LONG" else "SELL"
             send_tg(f"🟢 [ENTRY] {SYMBOL} {sig} {LEVERAGE}x qty={qty} @≈{last_price}")
 
-            # 시장가 진입
             res = place_market(SYMBOL, side, qty)
             entry = last_price
             try:
@@ -249,7 +259,6 @@ def main():
             tp_sl = place_tp_sl(SYMBOL, side, qty, entry, TP_PCT, SL_PCT)
             send_tg(f"📌 [ORDERS] TP@{tp_sl['tp']} / SL@{tp_sl['sl']} (reduceOnly)")
 
-            # 단순 쿨다운
             time.sleep(COOLDOWN_SEC)
 
         except Exception as e:
