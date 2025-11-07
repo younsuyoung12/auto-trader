@@ -19,6 +19,7 @@
 # - 환경변수에 한글/공백 들어 있어도 죽지 않도록 완화
 # - 📌 (추가) 박스장일 때는 별도 TP/SL 퍼센트 사용
 # - 📌 (추가) 텔레그램에 "추세장/박스장" + "롱/숏" 한글로 전송
+# - 📌 (추가) KST 자정에 하루 수익 텔레 메시지 전송
 
 import os, time, hmac, hashlib, math, signal, random, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -31,6 +32,9 @@ import requests
 START_TS = time.time()
 MIN_UPTIME_FOR_STOP = int(os.getenv("MIN_UPTIME_FOR_STOP", "5"))
 TERMINATED_BY_SIGNAL = False
+
+# KST 타임존 (한국 시간)
+KST = datetime.timezone(datetime.timedelta(hours=9))
 
 # ─────────────────────────────
 # 환경변수 설정
@@ -951,7 +955,10 @@ def main():
     # 거래소 상태 동기화 (positions 미지원이면 그냥 패스됨)
     sync_open_trades_from_exchange()
 
-    last_reset_day = time.strftime("%Y-%m-%d")
+    # KST 기준으로 이날 처음 시작한 날짜
+    now_kst = datetime.datetime.now(KST)
+    last_report_date_kst = now_kst.strftime("%Y-%m-%d")
+
     daily_pnl = 0.0
     last_fill_check = 0.0
     last_balance_log = 0.0
@@ -971,13 +978,15 @@ def main():
                 get_available_usdt()
                 last_balance_log = now
 
-            # 날짜 바뀌면 일일 정산
-            today = time.strftime("%Y-%m-%d")
-            if today != last_reset_day:
-                send_tg(f"📊 일일 정산: PnL {daily_pnl:.2f} USDT, 연속 손실 {CONSEC_LOSSES}")
-                daily_pnl = 0.0
-                CONSEC_LOSSES = 0
-                last_reset_day = today
+            # KST 자정이면 하루 정산 보냄 (00:00 ~ 00:00:59 사이 한 번만)
+            now_kst = datetime.datetime.now(KST)
+            today_kst = now_kst.strftime("%Y-%m-%d")
+            if now_kst.hour == 0 and now_kst.minute < 1:
+                if last_report_date_kst != today_kst:
+                    send_tg(f"📊 일일 정산(KST): PnL {daily_pnl:.2f} USDT, 연속 손실 {CONSEC_LOSSES}")
+                    daily_pnl = 0.0
+                    CONSEC_LOSSES = 0
+                    last_report_date_kst = today_kst
 
             # TP/SL 체결 체크
             if now - last_fill_check >= POLL_FILLS_SEC:
