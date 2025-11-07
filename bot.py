@@ -362,7 +362,8 @@ SESSIONS = _parse_sessions(TRADING_SESSIONS_UTC)
 
 def in_trading_session_utc() -> bool:
     """현재 UTC 시간이 우리가 지정한 시간대 안에 있는지"""
-    now_utc = datetime.datetime.utcnow()
+    # utcnow() 제거: DeprecationWarning 피하기
+    now_utc = datetime.datetime.now(datetime.UTC)
     h = now_utc.hour
     for s, e in SESSIONS:
         if s <= h <= e:
@@ -1241,6 +1242,14 @@ def main():
                 time.sleep(1)
                 continue
 
+            # 📌 잔고가 0이면 이 지점에서 가장 먼저 1시간짜리 스킵을 날리고 끝낸다.
+            # 이렇게 해야 밑에 있는 range_blocked_today 로직까지 내려가서 그게 먼저 찍히는 일이 없음.
+            avail = get_available_usdt()
+            if avail <= 0:
+                send_skip_tg("[BALANCE_SKIP] ⚠️ 가용 선물 잔고가 0입니다. 진입을 건너뜁니다.")
+                time.sleep(3)
+                continue
+
             # 진입 방향 결정
             chosen_signal = None
             signal_source = None
@@ -1324,14 +1333,6 @@ def main():
                                 continue
                     except Exception as e:
                         log(f"[SPREAD PARSE ERROR] {e}")
-
-            # 잔고 확인
-            avail = get_available_usdt()
-            if avail <= 0:
-                # 📌 여기만 1시간짜리 스킵 알림으로 보냄 (env 건드리지 않고 하드코딩)
-                send_skip_tg("[BALANCE_SKIP] ⚠️ 가용 선물 잔고가 0입니다. 진입을 건너뜁니다.")
-                time.sleep(3)
-                continue
 
             # 📌 ATR이 갑자기 커진 장에서는 RISK_PCT 자동 축소
             effective_risk_pct = RISK_PCT
