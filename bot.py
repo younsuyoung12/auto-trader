@@ -17,15 +17,13 @@
 # - 일정 주기마다 잔고 로그 남김
 # - BingX 잔고 응답이 중첩(dict 안에 dict)일 때도 파싱되게 함
 # - 환경변수에 한글/공백 들어 있어도 죽지 않도록 완화
+# - 📌 (추가) 박스장일 때는 별도 TP/SL 퍼센트 사용
+# - 📌 (추가) 텔레그램에 "추세장/박스장" + "롱/숏" 한글로 전송
 
 import os, time, hmac, hashlib, math, signal, random, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Tuple, Optional
 import requests
-
-# <= 이 줄들 바로 아래에 추가
-from dotenv import load_dotenv
-load_dotenv()  # 같은 폴더의 .env 읽어옴
 
 # ─────────────────────────────
 # 기본 런타임 상태
@@ -54,11 +52,15 @@ ISOLATED = os.getenv("ISOLATED", "1") == "1"
 # 한 번에 계좌의 몇 %를 쓸지 (가용 선물잔고 기준)
 RISK_PCT = float(os.getenv("RISK_PCT", "0.3"))
 
-# 고정 TP/SL 비율
+# 고정 TP/SL 비율 (추세장 기본값)
 TP_PCT = float(os.getenv("TP_PCT", "0.02"))   # +2%
 SL_PCT = float(os.getenv("SL_PCT", "0.02"))   # -2%
 
-# ATR 기반 TP/SL 옵션
+# 📌 박스장 전용 TP/SL 비율 (좀 더 짧게)
+RANGE_TP_PCT = float(os.getenv("RANGE_TP_PCT", "0.006"))  # 0.6% 먹기
+RANGE_SL_PCT = float(os.getenv("RANGE_SL_PCT", "0.004"))  # 0.4% 손절
+
+# ATR 기반 TP/SL 옵션 (추세장에서만 쓰도록 아래에서 분기)
 USE_ATR     = os.getenv("USE_ATR", "1") == "1"
 ATR_LEN     = int(os.getenv("ATR_LEN", "20"))
 ATR_TP_MULT = float(os.getenv("ATR_TP_MULT", "2.0"))
@@ -273,8 +275,6 @@ SESSIONS = _parse_sessions(TRADING_SESSIONS_UTC)
 
 def in_trading_session_utc() -> bool:
     """현재 UTC 시간이 우리가 지정한 시간대 안에 있는지"""
-    # Deprecation 피하려면 datetime.datetime.now(datetime.UTC)로 가도 되는데
-    # 여기서는 간단하게 유지
     now_utc = datetime.datetime.utcnow()
     h = now_utc.hour
     for s, e in SESSIONS:
@@ -408,7 +408,6 @@ def sync_open_trades_from_exchange():
         side = "BUY" if (pos.get("positionSide") or pos.get("side") or "").upper() in ("LONG", "BUY") else "SELL"
         entry_price = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
         tp_id = None; sl_id = None; tp_price = None; sl_price = None
-        # 열려 있는 주문 중에서 이 포지션에 붙어 있는 TP/SL 찾아서 같이 넣어줌
         for o in orders:
             o_type = o.get("type") or o.get("orderType")
             oid = o.get("orderId") or o.get("id")
@@ -894,7 +893,6 @@ def check_closes() -> List[Dict[str, Any]]:
         if not closed:
             ok = ensure_tp_sl_for_trade(t)
             if not ok:
-                # TP/SL 재설정 실패 → 그냥 포지션 닫아버림
                 close_position_market(symbol, t["side"], t["qty"])
             else:
                 still_open.append(t)
@@ -921,9 +919,9 @@ def main():
     API_KEY = _ensure_ascii_env(API_KEY, "BINGX_API_KEY")
     API_SECRET = _ensure_ascii_env(API_SECRET, "BINGX_API_SECRET")
 
-    # 환경변수 필수 검사 (없으면 종료만 하고 프로세스는 살려둠)
+    # 환경변수 필수 검사
     if not API_KEY or not API_SECRET:
-        msg = "❗ BINGX_API_KEY 또는 BINGX_API_SECRET 이 비어있습니다. .env 또는 PowerShell 환경변수를 다시 설정하세요."
+        msg = "❗ BINGX_API_KEY 또는 BINGX_API_SECRET 이 비어있습니다. .env 또는 Render 환경변수를 다시 설정하세요."
         log(msg)
         send_tg(msg)
         return
@@ -956,7 +954,7 @@ def main():
     last_reset_day = time.strftime("%Y-%m-%d")
     daily_pnl = 0.0
     last_fill_check = 0.0
-    last_balance_log = 0.0  # 잔고 로그를 1분에 한 번만 찍기 위한 타임스탬프
+    last_balance_log = 0.0
 
     while RUNNING:
         try:
@@ -989,7 +987,6 @@ def main():
                     closed_qty = summary.get("qty") or t["qty"]
                     closed_price = summary.get("avg_price") or 0.0
                     pnl = summary.get("pnl")
-                    # PnL이 체결내역에 없으면 우리가 계산
                     if pnl is None or pnl == 0.0:
                         if reason == "TP":
                             if t["side"] == "BUY":
@@ -1064,15 +1061,12 @@ def main():
                 if sig_3m and trend_15m and sig_3m == trend_15m:
                     chosen_signal = sig_3m
                     signal_source = "TREND"
-                    # 1분봉 마지막 캔들 확인
                     if ENABLE_1M_CONFIRM:
                         candles_1m = get_klines(SYMBOL, "1m", 20)
                         if len(candles_1m) >= 2:
                             last_1m = candles_1m[-1]
-                            # 롱인데 1분봉이 음봉이면 패스
                             if chosen_signal == "LONG" and last_1m[4] < last_1m[1]:
                                 chosen_signal = None
-                            # 숏인데 1분봉이 양봉이면 패스
                             elif chosen_signal == "SHORT" and last_1m[4] > last_1m[1]:
                                 chosen_signal = None
 
@@ -1115,19 +1109,29 @@ def main():
             qty = round(notional / last_price, 6)
             side = "BUY" if chosen_signal == "LONG" else "SELL"
 
-            # TP/SL 퍼센트 계산 (ATR 모드면 여기서 덮어씀)
-            local_tp_pct = TP_PCT
-            local_sl_pct = SL_PCT
-            if USE_ATR:
-                atr = calc_atr(candles_3m, ATR_LEN)
-                if atr and last_price > 0:
-                    sl_pct_atr = (atr * ATR_SL_MULT) / last_price
-                    tp_pct_atr = (atr * ATR_TP_MULT) / last_price
-                    local_sl_pct = max(sl_pct_atr, MIN_SL_PCT)
-                    local_tp_pct = max(tp_pct_atr, MIN_TP_PCT)
+            # TP/SL 퍼센트 계산
+            # 박스장일 때는 RANGE_TP_PCT/RANGE_SL_PCT를 그대로 사용
+            # 추세장일 때만 ATR 모드/고정모드 사용
+            if signal_source == "RANGE":
+                local_tp_pct = RANGE_TP_PCT
+                local_sl_pct = RANGE_SL_PCT
+            else:
+                local_tp_pct = TP_PCT
+                local_sl_pct = SL_PCT
+                if USE_ATR:
+                    atr = calc_atr(candles_3m, ATR_LEN)
+                    if atr and last_price > 0:
+                        sl_pct_atr = (atr * ATR_SL_MULT) / last_price
+                        tp_pct_atr = (atr * ATR_TP_MULT) / last_price
+                        local_sl_pct = max(sl_pct_atr, MIN_SL_PCT)
+                        local_tp_pct = max(tp_pct_atr, MIN_TP_PCT)
+
+            # 한글로 전략/방향 변환
+            strategy_kr = "추세장" if signal_source == "TREND" else "박스장"
+            direction_kr = "롱" if chosen_signal == "LONG" else "숏"
 
             send_tg(
-                f"🟢 진입 시도: {SYMBOL} 전략={signal_source} 방향={chosen_signal}"
+                f"🟢 진입 시도: {SYMBOL} 전략={strategy_kr} 방향={direction_kr}"
                 f" 레버리지={LEVERAGE}x 사용비율={RISK_PCT*100:.0f}% 명목가≈{notional:.2f}USDT 수량={qty}"
             )
 
@@ -1174,7 +1178,7 @@ def main():
 
             send_tg(
                 f"📌 예약완료: TP={tp_sl['tp']} / SL={tp_sl['sl']} "
-                f"(reduceOnly, mode={'ATR' if USE_ATR else 'FIXED'})"
+                f"(reduceOnly, mode={'ATR' if signal_source != 'RANGE' and USE_ATR else 'FIXED'})"
             )
 
             # 우리 내부 상태에 포지션 추가
@@ -1194,7 +1198,6 @@ def main():
             time.sleep(COOLDOWN_SEC)
 
         except Exception as e:
-            # 어떤 에러든 여기로 떨어지면 텔레그램으로 알려주고 루프 계속
             log(f"ERROR: {e}")
             send_tg(f"❌ 오류 발생: {e}")
             time.sleep(2)
