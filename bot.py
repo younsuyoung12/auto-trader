@@ -1085,6 +1085,9 @@ def main():
     if TP_PCT <= 0 or SL_PCT <= 0:
         log("TP_PCT, SL_PCT 는 0보다 커야 합니다.")
         return
+    # 👉 여기서 현재 켜진 전략들 찍어주기
+
+    log(f"CONFIG: ENABLE_TREND={ENABLE_TREND}, ENABLE_RANGE={ENABLE_RANGE}, ENABLE_1M_CONFIRM={ENABLE_1M_CONFIRM}")
 
     # 시작 알림
     send_tg("✅ [봇 시작] BingX 자동매매 시작합니다.")
