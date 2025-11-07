@@ -84,7 +84,7 @@ ATR_SL_MULT = float(os.getenv("ATR_SL_MULT", "1.2"))
 MIN_TP_PCT  = float(os.getenv("MIN_TP_PCT", "0.005"))   # 0.5%
 MIN_SL_PCT  = float(os.getenv("MIN_SL_PCT", "0.005"))   # 0.5%
 
-# 각종 쿨डाउन (공통)
+# 각종 쿨다운 (공통)
 COOLDOWN_SEC         = int(os.getenv("COOLDOWN_SEC", "15"))             # 진입 후 기본 대기
 COOLDOWN_AFTER_CLOSE = int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"))     # 청산 후 대기
 COOLDOWN_AFTER_3LOSS = int(os.getenv("COOLDOWN_AFTER_3LOSS", "3600"))   # 3연속 손실 후 대기(초)
@@ -236,12 +236,18 @@ def send_skip_tg(reason: str):
     📌 스킵 사유 텔레그램은 너무 자주 날 수 있으니까
     같은 reason 문자열에 대해 쿨다운 안에서는 한 번만 보낸다.
     📌 여기서만 '잔고 없음' 같은 특수 케이스를 1시간으로 길게 잡는다.
+    📌 그리고 '박스장 진입 스킵'도 1시간에 한 번만 보내도록 한다.
     """
     now = time.time()
-    # 잔고 관련 스킵은 reason을 "[BALANCE_SKIP]" 으로 시작하게 해서 1시간에 한 번만 보내도록 함
+
+    # 1) 잔고 관련 스킵 → 1시간
     if reason.startswith("[BALANCE_SKIP]"):
         cooldown = BALANCE_SKIP_COOLDOWN
+    # 2) 박스장 막힘 관련 스킵 → 1시간
+    elif "range_blocked_today" in reason:
+        cooldown = 3600
     else:
+        # 3) 그 외는 기본값 (기본 30초)
         cooldown = SKIP_TG_COOLDOWN
 
     last = LAST_SKIP_TG.get(reason, 0)
@@ -771,7 +777,7 @@ def should_block_range_today(candles_3m, candles_15m) -> bool:
         if atr_fast < atr_slow * 0.5:
             return True
 
-    # 2) 15m 추세 강도 체크 (이격이 크면 추세장에 가깝다고 본다)
+    # 2) 15m 추세 강도 체크 (이격이 크면 박스장 비추천)
     if candles_15m:
         closes_15 = [c[4] for c in candles_15m]
         if len(closes_15) >= 50:
