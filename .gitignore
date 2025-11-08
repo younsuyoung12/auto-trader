@@ -1,1 +1,46 @@
+# ───── 파이썬 기본 ─────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# ───── 가상환경 ─────
+.venv/
+venv/
+env/
+
+# ───── IDE / OS ─────
+.vscode/
+.idea/
+.DS_Store
+
+# ───── 환경변수/민감정보 ─────
+.env
+*.env
+
+# 구글 서비스 계정 키 (절대 올리지 말 것)
+bingx-bot-*.json
+*.serviceaccount.json
+*.gserviceaccount.json
+*.key.json
+credentials.json
+
+# ───── 로그 / 임시파일 ─────
+logs/
+*.log
+*.tmp
+*.bak
+
+# ───── Jupyter ─────
+.ipynb_checkpoints/
+
+# ───── 프로젝트 개별 ─────
+/*.sqlite3
+/.python-version
+
+# 개발용 테스트 스크립트
 bot_test.py

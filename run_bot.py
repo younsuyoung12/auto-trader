@@ -1,18 +1,17 @@
 """run_bot.py
 메인 루프 파일.
 
-원래 하나로 뭉쳐 있던 bot.py 내용을 역할별로 나눈 뒤,
-여기서 전부 import 해서 실제로 봇을 돌린다.
-
-주요 역할:
+역할:
 - 환경설정 로드
 - health/metrics HTTP 서버 (옵션)
 - 거래소 포지션/열린 주문 → 내부 상태로 동기화
 - 무한 루프에서 진입 조건 판단, 주문, TP/SL 확인
 - 텔레그램 알림 전송
+- signals_logger 로 모든 이벤트(SKIP/ENTRY/CLOSE) CSV 기록
+- (옵션) 청산 시 오늘자 signals CSV 를 구글 드라이브에 업로드
 
-이 파일을 Render의 실행 엔트리로 두면 된다.
-예: python -u run_bot.py
+Render 실행 엔트리:
+    python -u run_bot.py
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
-# 우리가 앞에서 나눈 모듈들
+# 프로젝트 모듈들
 from settings import load_settings, KST
 from telelog import log, send_tg, send_skip_tg
 from exchange_api import (
@@ -50,6 +49,10 @@ from trader import (
     open_position_with_tp_sl,
     check_closes,
 )
+# 구글 드라이브 업로더
+from drive_uploader import upload_to_drive
+# 시그널 CSV 로거
+from signals_logger import log_signal
 
 # ─────────────────────────────
 # 1. 설정 및 전역 상태
@@ -111,10 +114,9 @@ LAST_SIGNAL_TS_3M: int = 0
 class _HealthHandler(BaseHTTPRequestHandler):
     """Render 같은 곳에서 상태 확인할 때 쓰는 단순 HTTP 핸들러."""
 
-    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler 규약)
+    def do_GET(self) -> None:  # noqa: N802
         """GET /healthz, /metrics 에 응답"""
         if self.path == "/healthz":
-            # 단순 생존 확인
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -122,7 +124,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/metrics":
-            # 프로메테우스 스타일 간단 메트릭
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -136,12 +137,11 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write("\n".join(out).encode())
             return
 
-        # 그 외 경로는 404
         self.send_response(404)
         self.end_headers()
 
     def log_message(self, *_: Any) -> None:
-        """기본 HTTP 요청 로그는 지워서 콘솔이 지저분해지는 걸 막는다."""
+        """기본 HTTP 요청 로그는 숨긴다."""
         return
 
 
@@ -210,7 +210,10 @@ signal.signal(signal.SIGTERM, _sigterm)
 # 5. 거래소 → 내부 포지션 동기화
 # ─────────────────────────────
 def sync_open_trades_from_exchange(symbol: str) -> None:
-    """거래소에 이미 열려 있는 포지션/주문을 OPEN_TRADES 에 반영해서 중복 진입을 막는다."""
+    """
+    봇이 재시작됐을 때 거래소에 이미 열려 있는 포지션/주문을
+    현재 봇의 OPEN_TRADES 에 맞춰 넣어 중복 진입을 막는다.
+    """
     global OPEN_TRADES
 
     positions = fetch_open_positions(symbol)
@@ -289,7 +292,7 @@ def main() -> None:
         send_tg(msg)
         return
 
-    # 설정 출력
+    # 시작 메시지
     log(
         f"CONFIG: ENABLE_TREND={SET.enable_trend}, "
         f"ENABLE_RANGE={SET.enable_range}, "
@@ -335,7 +338,9 @@ def main() -> None:
 
             # 1) 1분에 한 번 잔고 찍기
             if now - last_balance_log >= 60:
-                get_available_usdt()
+                # 이 안에서 잔고 0이면 우리가 만든 SKIP 로그가 찍히도록
+                avail_tmp = get_available_usdt()
+                # 잔고 조회만 하는 거라 signals_logger 는 여기선 안 찍음
                 last_balance_log = now
 
             # 2) KST 자정이면 일일 결산 메시지 보내고 각종 카운트 리셋
@@ -364,6 +369,7 @@ def main() -> None:
                     closed_price = summary.get("avg_price") if summary else 0.0
                     pnl = summary.get("pnl") if summary else None
 
+                    # PnL 직접 계산
                     if pnl is None or pnl == 0.0:
                         if reason == "TP":
                             if t.side == "BUY":
@@ -379,16 +385,19 @@ def main() -> None:
                     daily_pnl += pnl
                     LAST_CLOSE_TS = now
 
+                    # 연속 손실 카운트 관리
                     if pnl < 0:
                         CONSEC_LOSSES += 1
                     else:
                         CONSEC_LOSSES = 0
 
+                    # 전략별 최근 청산 시각 기록
                     if t.source == "TREND":
                         LAST_CLOSE_TS_TREND = now
                     elif t.source == "RANGE":
                         LAST_CLOSE_TS_RANGE = now
 
+                    # 박스장 손절 횟수 관리
                     if t.source == "RANGE" and reason == "SL" and pnl < 0:
                         RANGE_DAILY_SL += 1
                         if RANGE_DAILY_SL >= SET.range_max_daily_sl:
@@ -397,13 +406,42 @@ def main() -> None:
                                 f"🛑 [RANGE_OFF] 박스장 손절 {RANGE_DAILY_SL}회 → 오늘은 박스장 전략 비활성화"
                             )
 
+                    # 텔레그램 청산 알림
                     send_tg(
                         f"💰 청산({reason}) {t.symbol} {t.side} 수량={closed_qty} "
                         f"가격={closed_price:.2f} PnL={pnl:.2f} USDT (금일 누적 {daily_pnl:.2f})"
                     )
 
+                    # CSV 로그에도 남기기
+                    log_signal(
+                        event="CLOSE",
+                        symbol=t.symbol,
+                        strategy_type=t.source,
+                        direction=t.side,
+                        price=closed_price,
+                        qty=closed_qty,
+                        tp_price=t.tp_price,
+                        sl_price=t.sl_price,
+                        reason=reason,
+                        pnl=pnl,
+                        exchange_order_id=t.entry_order_id,
+                    )
+
+                    # 오늘자 signals CSV 를 구글 드라이브에 업로드 시도
+                    try:
+                        day_str = datetime.datetime.now(KST).strftime("%Y-%m-%d")
+                        local_csv = f"logs/signals/signals-{day_str}.csv"
+                        upload_to_drive(local_csv, f"signals-{day_str}.csv")
+                        log("[DRIVE] signals uploaded to Google Drive.")
+                    except FileNotFoundError:
+                        log("[DRIVE] signals CSV 가 없어서 업로드를 건너뜁니다.")
+                    except Exception as e:
+                        log(f"[DRIVE] 업로드 실패: {e}")
+
+                # 다음 체크 시간 기록
                 last_fill_check = now
 
+                # TP/SL 재설정 실패가 여러 번 누적된 경우
                 if TRADER_STATE.should_stop_bot():
                     send_tg("🛑 TP/SL 재설정이 연속으로 실패해서 봇을 중단합니다.")
                     RUNNING = False
@@ -435,7 +473,6 @@ def main() -> None:
             try:
                 candles_3m = get_klines(SET.symbol, SET.interval, 120)
                 CONSEC_KLINE_FAILS = 0
-                # 여기서 바로 로그 남겨서 Render 콘솔에서 확인 가능하게 함
                 if candles_3m:
                     log(
                         f"[DATA] 3m klines ok: symbol={SET.symbol} count={len(candles_3m)} last_close={candles_3m[-1][4]}"
@@ -453,19 +490,37 @@ def main() -> None:
                     time.sleep(2)
                 continue
 
+            # 캔들이 너무 적으면 전략 계산 불가
             if len(candles_3m) < 50:
                 time.sleep(1)
                 continue
 
+            # 최신 3m 캔들이 너무 오래된 경우
             latest_3m_ts = candles_3m[-1][0]
             now_ms = int(time.time() * 1000)
             if now_ms - latest_3m_ts > SET.max_kline_delay_sec * 1000:
                 send_skip_tg("[SKIP] 3m_kline_delayed: 최근 3m 캔들이 지연되었습니다.")
+                # 로그에도 기록
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type="UNKNOWN",
+                    reason="3m_kline_delayed",
+                    candle_ts=latest_3m_ts,
+                )
                 time.sleep(1)
                 continue
 
+            # 같은 3m 캔들에서 이미 진입했다면 다시 진입 안 함
             if latest_3m_ts == LAST_SIGNAL_TS_3M:
                 send_skip_tg("[SKIP] same_3m_candle: 이미 이 캔들에서 진입했습니다.")
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type="UNKNOWN",
+                    reason="same_3m_candle",
+                    candle_ts=latest_3m_ts,
+                )
                 time.sleep(1)
                 continue
 
@@ -473,13 +528,23 @@ def main() -> None:
             avail = get_available_usdt()
             if avail <= 0:
                 send_skip_tg("[BALANCE_SKIP] ⚠️ 가용 선물 잔고가 0입니다. 진입을 건너뜁니다.")
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type="UNKNOWN",
+                    reason="balance_zero",
+                    candle_ts=latest_3m_ts,
+                    available_usdt=0.0,
+                )
                 time.sleep(3)
                 continue
 
-            # ───────── 시그널 판단 ─────────
-            chosen_signal: Optional[str] = None
-            signal_source: Optional[str] = None
+            # ───────── 시그널 판단 시작 ─────────
+            chosen_signal: Optional[str] = None  # "LONG" / "SHORT"
+            signal_source: Optional[str] = None  # "TREND" / "RANGE"
+            trend_15m_val: Optional[str] = None  # 로그용
 
+            # 1) 추세 전략 먼저 본다.
             candles_15m: Optional[List[Any]] = None
             if SET.enable_trend:
                 candles_15m = get_klines(SET.symbol, "15m", 120)
@@ -492,13 +557,14 @@ def main() -> None:
                     SET.rsi_overbought,
                     SET.rsi_oversold,
                 )
-                trend_15m = decide_trend_15m(candles_15m) if candles_15m else None
+                trend_15m_val = decide_trend_15m(candles_15m) if candles_15m else None
 
-                if sig_3m and trend_15m and sig_3m == trend_15m:
+                # 3m 신호 있고 15m 방향과 같을 때만
+                if sig_3m and trend_15m_val and sig_3m == trend_15m_val:
                     if (time.time() - LAST_CLOSE_TS_TREND) >= SET.cooldown_after_close_trend:
                         chosen_signal = sig_3m
                         signal_source = "TREND"
-
+                        # 1분봉 확인 옵션
                         if SET.enable_1m_confirm:
                             candles_1m = get_klines(SET.symbol, "1m", 20)
                             if candles_1m:
@@ -507,11 +573,30 @@ def main() -> None:
                                 )
                             if not confirm_1m_direction(candles_1m, chosen_signal):
                                 send_skip_tg("[SKIP] 1m_confirm_mismatch: 1분봉이 방향 불일치")
+                                log_signal(
+                                    event="SKIP",
+                                    symbol=SET.symbol,
+                                    strategy_type="TREND",
+                                    direction=chosen_signal,
+                                    reason="1m_confirm_mismatch",
+                                    candle_ts=latest_3m_ts,
+                                    trend_15m=trend_15m_val,
+                                )
                                 chosen_signal = None
                                 signal_source = None
                     else:
                         send_skip_tg("[SKIP] trend_cooldown: 직전 TREND 포지션 대기중")
+                        log_signal(
+                            event="SKIP",
+                            symbol=SET.symbol,
+                            strategy_type="TREND",
+                            direction=sig_3m,
+                            reason="trend_cooldown",
+                            candle_ts=latest_3m_ts,
+                            trend_15m=trend_15m_val,
+                        )
 
+            # 2) 추세 신호가 없을 때만 박스장 전략
             if (not chosen_signal) and SET.enable_range and (not RANGE_DISABLED_TODAY):
                 if not candles_15m:
                     candles_15m = get_klines(SET.symbol, "15m", 120)
@@ -527,14 +612,29 @@ def main() -> None:
                             signal_source = "RANGE"
                     else:
                         send_skip_tg("[SKIP] range_blocked_today: 박스장 조건 불리")
+                        log_signal(
+                            event="SKIP",
+                            symbol=SET.symbol,
+                            strategy_type="RANGE",
+                            reason="range_blocked_today",
+                            candle_ts=latest_3m_ts,
+                        )
                 else:
                     send_skip_tg("[SKIP] range_cooldown: 직전 RANGE 포지션 대기중")
+                    log_signal(
+                        event="SKIP",
+                        symbol=SET.symbol,
+                        strategy_type="RANGE",
+                        reason="range_cooldown",
+                        candle_ts=latest_3m_ts,
+                    )
 
+            # 두 전략 모두 진입 조건이 안 나왔으면 다음 루프
             if not chosen_signal:
                 time.sleep(1)
                 continue
 
-            # ───────── 진입 전 가드 ─────────
+            # ───────── 진입 전에 여러 가드 확인 ─────────
             last_price = candles_3m[-1][4]
             prev_price = candles_3m[-2][4]
             move_pct = abs(last_price - prev_price) / prev_price
@@ -542,9 +642,20 @@ def main() -> None:
                 send_skip_tg(
                     f"[SKIP] price_jump_guard: {move_pct:.4f} > {SET.max_price_jump_pct:.4f}"
                 )
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type=signal_source or "UNKNOWN",
+                    direction=chosen_signal,
+                    reason="price_jump_guard",
+                    candle_ts=latest_3m_ts,
+                    extra=f"move_pct={move_pct:.6f}",
+                )
                 time.sleep(1)
                 continue
 
+            # 호가 스프레드 확인
+            spread_pct_logged: Optional[float] = None
             orderbook = get_orderbook(SET.symbol, 5)
             if orderbook:
                 bids = orderbook.get("bids") or []
@@ -555,36 +666,63 @@ def main() -> None:
                         best_ask = float(asks[0][0] if isinstance(asks[0], list) else asks[0].get("price"))
                         if best_bid > 0:
                             spread_pct = (best_ask - best_bid) / best_bid
+                            spread_pct_logged = spread_pct
                             if spread_pct > SET.max_spread_pct:
                                 send_skip_tg(
                                     f"[SKIP] spread_guard: {spread_pct:.5f} > {SET.max_spread_pct:.5f}"
+                                )
+                                log_signal(
+                                    event="SKIP",
+                                    symbol=SET.symbol,
+                                    strategy_type=signal_source or "UNKNOWN",
+                                    direction=chosen_signal,
+                                    reason="spread_guard",
+                                    candle_ts=latest_3m_ts,
+                                    spread_pct=spread_pct,
                                 )
                                 time.sleep(1)
                                 continue
                     except Exception as e:
                         log(f"[SPREAD PARSE ERROR] {e}")
 
+            # ATR 급등 시 리스크 자동 축소
             effective_risk_pct = SET.risk_pct
+            atr_fast_val: Optional[float] = None
+            atr_slow_val: Optional[float] = None
             if SET.use_atr:
-                atr_fast = calc_atr(candles_3m, SET.atr_len)
-                atr_slow = calc_atr(candles_3m, max(SET.atr_len * 2, SET.atr_len + 10))
-                if atr_fast and atr_slow and atr_slow > 0:
-                    if atr_fast > atr_slow * SET.atr_risk_high_mult:
+                atr_fast_val = calc_atr(candles_3m, SET.atr_len)
+                atr_slow_val = calc_atr(candles_3m, max(SET.atr_len * 2, SET.atr_len + 10))
+                if atr_fast_val and atr_slow_val and atr_slow_val > 0:
+                    if atr_fast_val > atr_slow_val * SET.atr_risk_high_mult:
                         effective_risk_pct = SET.risk_pct * SET.atr_risk_reduction
                         log(
                             f"[ATR RISK] fast ATR high → risk {SET.risk_pct} -> {effective_risk_pct}"
                         )
 
+            # 주문 명목가 계산
             notional = avail * effective_risk_pct * SET.leverage
             if notional < SET.min_notional_usdt:
                 send_tg(f"⚠️ 계산된 주문 금액이 너무 작습니다: {notional:.2f} USDT")
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type=signal_source or "UNKNOWN",
+                    direction=chosen_signal,
+                    reason="notional_too_small",
+                    candle_ts=latest_3m_ts,
+                    available_usdt=avail,
+                    notional=notional,
+                )
                 time.sleep(3)
                 continue
+            # 최대 주문 금액 제한
             notional = min(notional, SET.max_notional_usdt)
 
+            # 수량 계산
             qty = round(notional / last_price, 6)
             side_open = "BUY" if chosen_signal == "LONG" else "SELL"
 
+            # TP/SL 비율 결정
             if signal_source == "RANGE":
                 local_tp_pct = SET.range_tp_pct
                 local_sl_pct = SET.range_sl_pct
@@ -599,15 +737,35 @@ def main() -> None:
                         local_sl_pct = max(sl_pct_atr, SET.min_sl_pct)
                         local_tp_pct = max(tp_pct_atr, SET.min_tp_pct)
 
+            # 한글로 전략/방향 표시
             strategy_kr = "추세장" if signal_source == "TREND" else "박스장"
             direction_kr = "롱" if chosen_signal == "LONG" else "숏"
 
+            # 진입 시도 텔레그램
             send_tg(
                 f"[ENTRY][{signal_source}] 🟢 진입 시도: {SET.symbol} 전략={strategy_kr} 방향={direction_kr} "
                 f"레버리지={SET.leverage}x 사용비율={effective_risk_pct*100:.0f}% "
                 f"명목가≈{notional:.2f}USDT 수량={qty}"
             )
 
+            # 시그널이 실제 진입까지 왔다는 기록 (주문 직전)
+            log_signal(
+                event="ENTRY_SIGNAL",
+                symbol=SET.symbol,
+                strategy_type=signal_source or "UNKNOWN",
+                direction=chosen_signal,
+                price=last_price,
+                qty=qty,
+                candle_ts=latest_3m_ts,
+                trend_15m=trend_15m_val,
+                atr_fast=atr_fast_val,
+                atr_slow=atr_slow_val,
+                spread_pct=spread_pct_logged,
+                available_usdt=avail,
+                notional=notional,
+            )
+
+            # 실제 진입 + TP/SL 예약
             trade = open_position_with_tp_sl(
                 settings=SET,
                 symbol=SET.symbol,
@@ -619,22 +777,62 @@ def main() -> None:
                 source=signal_source or "UNKNOWN",
             )
             if trade is None:
+                # 진입 실패 -> 로그 남기기
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type=signal_source or "UNKNOWN",
+                    direction=chosen_signal,
+                    reason="entry_failed",
+                    candle_ts=latest_3m_ts,
+                )
                 time.sleep(2)
                 continue
 
+            # 예약 성공 알림
             send_tg(
                 f"[ENTRY][{signal_source}] 📌 예약완료: TP={trade.tp_price} / SL={trade.sl_price}"
             )
 
+            # 진입 성공 기록
+            log_signal(
+                event="ENTRY_OPENED",
+                symbol=trade.symbol,
+                strategy_type=trade.source,
+                direction=trade.side,
+                price=trade.entry,
+                qty=trade.qty,
+                tp_price=trade.tp_price,
+                sl_price=trade.sl_price,
+                candle_ts=latest_3m_ts,
+                exchange_order_id=trade.entry_order_id,
+                available_usdt=avail,
+                notional=notional,
+            )
+
+            # 내부 상태에 추가
             OPEN_TRADES.append(trade)
+
+            # 같은 3m 캔들에서 다시는 안 들어가도록 기록
             LAST_SIGNAL_TS_3M = latest_3m_ts
+
+            # 진입 후 공통 쿨다운
             time.sleep(SET.cooldown_sec)
 
         except Exception as e:
+            # 최상위에서 예외를 모두 잡아 텔레그램으로 알려주고 루프는 계속 돈다.
             log(f"ERROR: {e}")
             send_tg(f"❌ 오류 발생: {e}")
+            # 예외 상황도 한 줄 남겨두면 분석할 때 좋다.
+            log_signal(
+                event="ERROR",
+                symbol=SET.symbol,
+                strategy_type="UNKNOWN",
+                reason=str(e),
+            )
             time.sleep(2)
 
+    # 루프가 끝났다면 여기로 온다.
     uptime = time.time() - START_TS
     if (not TERMINATED_BY_SIGNAL) and (uptime >= SET.min_uptime_for_stop):
         send_tg("🛑 봇이 종료되었습니다.")
@@ -642,5 +840,6 @@ def main() -> None:
         log(f"[SKIP STOP] sig={TERMINATED_BY_SIGNAL} uptime={uptime:.2f}s")
 
 
+# 이 파일을 직접 실행했을 때만 main() 실행
 if __name__ == "__main__":
     main()
