@@ -1,5 +1,13 @@
-"""trader.py
+"""
+trader.py
 포지션 진입/TP·SL 설정/유지/체결 확인을 담당하는 모듈.
+
+2025-11-09 수정 사항
+- settings 에서 추가된 max_entry_slippage_pct 값을 사용해서
+  "실제 체결가(entry_price)가 run_bot 이 넘겨준 진입 힌트(entry_price_hint)보다
+  너무 나쁘면(=슬리피지 초과) 바로 시장가로 닫고 포지션을 포기"하는 가드를 추가했다.
+- 진입 자체는 성공했어도 슬리피지가 과하면 TP/SL 을 안 깔고 None 을 리턴하도록 했다.
+  (짧은 TP 전략 보호용)
 
 이 모듈은 저수준 거래소 요청은 exchange_api.py 에 맡기고,
 여기서는 그 API 들을 조합해서 우리가 쓰는 형태의 포지션(Trade)을 만들고 관리한다.
@@ -105,7 +113,7 @@ def compute_tp_sl_prices(
 # ─────────────────────────────
 def open_position_with_tp_sl(
     *,
-    settings: Any,              # run_bot.py 에서 load_settings() 한 객체를 그대로 받는다 (여기선 tp/sl 퍼센트만 실제로 사용)
+    settings: Any,              # run_bot.py 에서 load_settings() 한 객체를 그대로 받는다
     symbol: str,
     side_open: str,
     qty: float,
@@ -121,6 +129,7 @@ def open_position_with_tp_sl(
     - 시장가 주문 자체가 실패한 경우
     - 시장가가 시간 내에 FILLED 되지 않은 경우
     - TP/SL 중 하나라도 주문이 실패한 경우 (이때는 시장가로 강제 청산한다)
+    - (추가) 실제 체결가가 힌트보다 설정값 이상으로 나쁘게 체결된 경우
     """
     # 1) 시장가로 진입
     try:
@@ -162,6 +171,27 @@ def open_position_with_tp_sl(
         or entry_price_hint
     )
 
+    # ───────── 슬리피지 가드 (2025-11-09 추가) ─────────
+    # settings.max_entry_slippage_pct: 허용 슬리피지가 0보다 크고,
+    # 우리가 넘겨준 힌트(entry_price_hint)가 유효할 때만 체크한다.
+    max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0)
+    if max_slip_pct and entry_price_hint and entry_price_hint > 0:
+        slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
+        if slip_pct > max_slip_pct:
+            # 진입은 됐지만 가격이 너무 나쁘다 → 즉시 시장가로 닫고 포기
+            close_side = "SELL" if side_open == "BUY" else "BUY"
+            try:
+                close_position_market(symbol, close_side, filled_qty)
+            except Exception as e:
+                send_tg(
+                    f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
+                )
+            else:
+                send_tg(
+                    f"[ENTRY][{source}] ❌ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} → 포지션 취소"
+                )
+            return None
+
     # 3) TP/SL 실제 가격 계산
     tp_price, sl_price = compute_tp_sl_prices(
         side_open=side_open,
@@ -191,7 +221,7 @@ def open_position_with_tp_sl(
     except Exception as e:
         # 한쪽이라도 실패하면 포지션을 바로 닫는다.
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
-        close_position_market(symbol, side_open, filled_qty)
+        close_position_market(symbol, close_side, filled_qty)
         return None
 
     # 주문 ID 정규화

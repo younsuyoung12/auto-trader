@@ -41,6 +41,3 @@ logs/
 # ───── 프로젝트 개별 ─────
 /*.sqlite3
 /.python-version
-
-# 개발용 테스트 스크립트
-bot_test.py

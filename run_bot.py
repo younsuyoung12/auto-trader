@@ -11,6 +11,19 @@ run_bot.py
 - signals_logger 로 모든 이벤트(SKIP/ENTRY/CLOSE/ERROR) CSV 기록
 - (추가) 백그라운드에서 일정 주기로 오늘자 CSV를 구글 드라이브에 올리고,
          너무 오래된 CSV는 Render 디스크에서 지워서 용량이 안 불어나게 함
+
+2025-11-09 1차 수정:
+- settings.py에 추가된 use_orderbook_entry_hint 값을 반영해서,
+  주문 직전에 받아둔 호가(best bid / best ask)로 진입가 힌트를 만든 뒤
+  open_position_with_tp_sl(...)에 넘기도록 변경
+- 스프레드 체크 시 가져온 best_bid / best_ask를 이후에도 재사용하도록 변수 유지
+
+2025-11-09 2차 수정 (안전 종료 기능):
+- 텔레그램에서 한글로 "종료", "봇종료", "끝나면 종료", "안전종료" 를 보내면
+  SAFE_STOP_REQUESTED 플래그를 세팅하는 스레드를 추가
+- 메인 루프에서 이 플래그를 보고,
+  ① 열려 있는 포지션이 없으면 즉시 종료하고
+  ② 열려 있는 포지션이 있으면 새 포지션은 만들지 않고 기다렸다가 비는 순간 종료
 """
 
 from __future__ import annotations
@@ -20,6 +33,8 @@ import datetime
 import signal
 import threading
 import time
+import json  # ← [추가] 텔레그램 getUpdates 응답 파싱용
+import urllib.request  # ← [추가] 텔레그램 폴링용 HTTP 요청
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -103,6 +118,12 @@ LAST_CLOSE_TS_RANGE: float = 0.0
 
 # 같은 3m 캔들 재진입 막는 타임스탬프
 LAST_SIGNAL_TS_3M: int = 0
+
+# ← [추가] 텔레그램으로 "종료" 명령이 들어왔는지 체크하는 플래그
+SAFE_STOP_REQUESTED: bool = False
+
+# ← [추가] 텔레그램 getUpdates 오프셋
+TG_UPDATE_OFFSET: int = 0
 
 
 # ─────────────────────────────
@@ -200,6 +221,47 @@ def start_drive_sync_thread() -> None:
                 log(f"[DRIVE_SYNC] error: {e}")
 
             time.sleep(SYNC_INTERVAL_SEC)
+
+    th = threading.Thread(target=_worker, daemon=True)
+    th.start()
+
+
+# ─────────────────────────────
+# 3-1. 텔레그램 명령 수신 스레드 (2025-11-09 추가)
+# ─────────────────────────────
+def start_telegram_command_thread() -> None:
+    """텔레그램에서 '종료' 같은 한글 명령을 받아와 SAFE_STOP_REQUESTED 를 켜는 스레드"""
+    if not SET.telegram_bot_token or not SET.telegram_chat_id:
+        return  # 텔레그램 설정이 없으면 안 돌린다
+
+    def _worker():
+        global SAFE_STOP_REQUESTED, TG_UPDATE_OFFSET
+        base_url = f"https://api.telegram.org/bot{SET.telegram_bot_token}/getUpdates"
+        chat_id_str = str(SET.telegram_chat_id)
+        while True:
+            try:
+                url = f"{base_url}?timeout=30"
+                if TG_UPDATE_OFFSET:
+                    url += f"&offset={TG_UPDATE_OFFSET}"
+                with urllib.request.urlopen(url, timeout=35) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                for upd in data.get("result", []):
+                    # 다음 요청부터는 이 이후로만
+                    TG_UPDATE_OFFSET = upd["update_id"] + 1
+                    msg = upd.get("message") or upd.get("channel_post")
+                    if not msg:
+                        continue
+                    if str(msg["chat"]["id"]) != chat_id_str:
+                        continue
+                    text = (msg.get("text") or "").strip()
+                    # 한글 종료 명령어 집합
+                    if text in ("종료", "봇종료", "끝나면 종료", "안전종료"):
+                        SAFE_STOP_REQUESTED = True
+                        send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
+            except Exception as e:
+                log(f"[TG CMD] error: {e}")
+                time.sleep(5)
 
     th = threading.Thread(target=_worker, daemon=True)
     th.start()
@@ -328,6 +390,7 @@ def main() -> None:
     global RANGE_DAILY_SL, RANGE_DISABLED_TODAY
     global LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
     global LAST_SIGNAL_TS_3M
+    global SAFE_STOP_REQUESTED  # ← [추가] 종료명령 플래그 사용
 
     # 필수 키 체크
     if not SET.api_key or not SET.api_secret:
@@ -350,9 +413,10 @@ def main() -> None:
     except Exception as e:
         log(f"[WARN] 레버리지/마진 설정 실패: {e}")
 
-    # health 서버, 드라이브 동기화 스레드 시작
+    # health 서버, 드라이브 동기화 스레드, 텔레그램 명령 스레드 시작
     start_health_server()
     start_drive_sync_thread()
+    start_telegram_command_thread()  # ← [추가] 텔레그램에서 종료 명령 수신
 
     # 거래소 포지션을 우리 내부에 반영
     sync_open_trades_from_exchange(SET.symbol)
@@ -478,10 +542,22 @@ def main() -> None:
                     RUNNING = False
                     break
 
+                # ← [추가] 종료 명령이 있고, 포지션이 이제 0개면 바로 종료
+                if SAFE_STOP_REQUESTED and not OPEN_TRADES:
+                    send_tg("🛑 종료 명령에 따라 포지션이 없어 즉시 종료합니다.")
+                    RUNNING = False
+                    break
+
             # 4) 포지션 열려 있으면 새로 진입하지 않음
             if OPEN_TRADES:
                 time.sleep(1)
                 continue
+
+            # ← [추가] 포지션이 없고 종료 요청이 켜져 있으면 새 진입 없이 종료
+            if SAFE_STOP_REQUESTED:
+                send_tg("🛑 종료 명령에 따라 새 진입 없이 종료합니다.")
+                RUNNING = False
+                break
 
             # 5) 연속 손실 3회면 잠깐 쉬기
             if CONSEC_LOSSES >= 3:
@@ -683,8 +759,10 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 호가 스프레드 체크
+            # 호가 스프레드 체크 (아래에서 진입가 힌트로도 쓰기 위해 best_bid/best_ask 보관)
             spread_pct_logged: Optional[float] = None
+            best_bid: Optional[float] = None
+            best_ask: Optional[float] = None
             orderbook = get_orderbook(SET.symbol, 5)
             if orderbook:
                 bids = orderbook.get("bids") or []
@@ -792,13 +870,22 @@ def main() -> None:
                 notional=notional,
             )
 
+            # ===== 진입가 힌트 결정 (기존 2025-11-09 수정) =====
+            entry_price_hint = last_price
+            if SET.use_orderbook_entry_hint and best_bid and best_ask:
+                # 살 때는 매도호가, 팔 때는 매수호가 기준으로 TP/SL 계산하도록 힌트를 준다
+                if side_open == "BUY":
+                    entry_price_hint = best_ask
+                else:
+                    entry_price_hint = best_bid
+
             # 진짜 주문 + TP/SL 예약
             trade = open_position_with_tp_sl(
                 settings=SET,
                 symbol=SET.symbol,
                 side_open=side_open,
                 qty=qty,
-                entry_price_hint=last_price,
+                entry_price_hint=entry_price_hint,
                 tp_pct=local_tp_pct,
                 sl_pct=local_sl_pct,
                 source=signal_source or "UNKNOWN",

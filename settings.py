@@ -108,6 +108,11 @@ class BotSettings:
     # 슬리피지/호가 가드
     max_price_jump_pct: float = 0.003
     max_spread_pct: float = 0.0008
+    # ↓↓↓ 추가: 실제 체결가가 진입 힌트가격에서 얼마나 멀어지면 포기할지 설정
+    # 예) 0.0005 = 0.05% 이상 미끄러지면 바로 닫게끔 상위 로직에서 사용할 값
+    max_entry_slippage_pct: float = 0.0005
+    # ↓↓↓ 추가: 호가(bid/ask) 기반 진입가 힌트를 사용할지 여부
+    use_orderbook_entry_hint: bool = True
 
     # 텔레그램
     telegram_bot_token: str = ""
@@ -189,10 +194,20 @@ def load_settings() -> BotSettings:
         cooldown_after_close=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"), 30),
         cooldown_after_3loss=_as_int(os.getenv("COOLDOWN_AFTER_3LOSS", "3600"), 3600),
         poll_fills_sec=_as_int(os.getenv("POLL_FILLS_SEC", "2"), 2),
-        cooldown_after_close_trend=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE_TREND", os.getenv("COOLDOWN_AFTER_CLOSE", "30")), 30),
-        cooldown_after_close_range=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE_RANGE", os.getenv("COOLDOWN_AFTER_CLOSE", "30")), 30),
+        cooldown_after_close_trend=_as_int(
+            os.getenv("COOLDOWN_AFTER_CLOSE_TREND", os.getenv("COOLDOWN_AFTER_CLOSE", "30")),
+            30,
+        ),
+        cooldown_after_close_range=_as_int(
+            os.getenv("COOLDOWN_AFTER_CLOSE_RANGE", os.getenv("COOLDOWN_AFTER_CLOSE", "30")),
+            30,
+        ),
         max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.003"), 0.003),
         max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
+        # ↓↓↓ 추가: 진입 시 허용할 슬리피지 비율 환경변수로도 제어
+        max_entry_slippage_pct=_as_float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"), 0.0005),
+        # ↓↓↓ 추가: 호가 기반 진입 힌트 사용 여부도 환경변수로 제어
+        use_orderbook_entry_hint=_as_bool(os.getenv("USE_ORDERBOOK_ENTRY_HINT", "1"), True),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         log_to_file=_as_bool(os.getenv("LOG_TO_FILE", "0"), False),
