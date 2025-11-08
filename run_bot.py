@@ -18,12 +18,17 @@ run_bot.py
   open_position_with_tp_sl(...)에 넘기도록 변경
 - 스프레드 체크 시 가져온 best_bid / best_ask를 이후에도 재사용하도록 변수 유지
 
-2025-11-09 2차 수정 (안전 종료 기능):
+2025-11-09 2차 수정 (안전 종료 기능 ①):
 - 텔레그램에서 한글로 "종료", "봇종료", "끝나면 종료", "안전종료" 를 보내면
   SAFE_STOP_REQUESTED 플래그를 세팅하는 스레드를 추가
 - 메인 루프에서 이 플래그를 보고,
   ① 열려 있는 포지션이 없으면 즉시 종료하고
   ② 열려 있는 포지션이 있으면 새 포지션은 만들지 않고 기다렸다가 비는 순간 종료
+
+2025-11-09 3차 수정 (안전 종료 기능 ②, 재시작 차단):
+- 위와 같이 종료할 때 STOP_FLAG 파일을 생성해서, 컨테이너/호스트가
+  run_bot.py를 다시 실행하더라도 이 파일이 있으면 즉시 종료하도록 추가
+- 다시 시작하려면 컨테이너 안에서 STOP_FLAG 파일을 삭제한 뒤 run_bot.py를 실행
 """
 
 from __future__ import annotations
@@ -33,8 +38,8 @@ import datetime
 import signal
 import threading
 import time
-import json  # ← [추가] 텔레그램 getUpdates 응답 파싱용
-import urllib.request  # ← [추가] 텔레그램 폴링용 HTTP 요청
+import json  # 텔레그램 getUpdates 응답 파싱용
+import urllib.request  # 텔레그램 폴링용 HTTP 요청
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -119,11 +124,21 @@ LAST_CLOSE_TS_RANGE: float = 0.0
 # 같은 3m 캔들 재진입 막는 타임스탬프
 LAST_SIGNAL_TS_3M: int = 0
 
-# ← [추가] 텔레그램으로 "종료" 명령이 들어왔는지 체크하는 플래그
+# 텔레그램으로 "종료" 명령이 들어왔는지 체크하는 플래그
 SAFE_STOP_REQUESTED: bool = False
 
-# ← [추가] 텔레그램 getUpdates 오프셋
+# 텔레그램 getUpdates 오프셋
 TG_UPDATE_OFFSET: int = 0
+
+
+def _write_stop_flag() -> None:
+    """재시작 시 바로 종료하도록 STOP_FLAG 파일을 만든다."""
+    try:
+        with open("STOP_FLAG", "w") as f:
+            f.write("stop")
+    except OSError:
+        # 파일을 못 써도 봇 종료 자체는 진행
+        pass
 
 
 # ─────────────────────────────
@@ -247,7 +262,6 @@ def start_telegram_command_thread() -> None:
                     data = json.loads(resp.read().decode("utf-8"))
 
                 for upd in data.get("result", []):
-                    # 다음 요청부터는 이 이후로만
                     TG_UPDATE_OFFSET = upd["update_id"] + 1
                     msg = upd.get("message") or upd.get("channel_post")
                     if not msg:
@@ -255,7 +269,6 @@ def start_telegram_command_thread() -> None:
                     if str(msg["chat"]["id"]) != chat_id_str:
                         continue
                     text = (msg.get("text") or "").strip()
-                    # 한글 종료 명령어 집합
                     if text in ("종료", "봇종료", "끝나면 종료", "안전종료"):
                         SAFE_STOP_REQUESTED = True
                         send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
@@ -348,7 +361,6 @@ def sync_open_trades_from_exchange(symbol: str) -> None:
         tp_price: Optional[float] = None
         sl_price: Optional[float] = None
 
-        # 열려 있는 주문들 중에서 TP/SL 찾아서 붙여줌
         for o in orders:
             o_type = (o.get("type") or o.get("orderType") or "").upper()
             oid = o.get("orderId") or o.get("id")
@@ -390,7 +402,13 @@ def main() -> None:
     global RANGE_DAILY_SL, RANGE_DISABLED_TODAY
     global LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
     global LAST_SIGNAL_TS_3M
-    global SAFE_STOP_REQUESTED  # ← [추가] 종료명령 플래그 사용
+    global SAFE_STOP_REQUESTED
+
+    # 시작 시 STOP_FLAG 가 있으면 바로 종료해서 재시작을 막는다.
+    if os.path.exists("STOP_FLAG"):
+        log("STOP_FLAG detected on startup. exiting without start.")
+        send_tg("⛔ 이전에 종료 명령이 있어 재시작하지 않습니다.")
+        return
 
     # 필수 키 체크
     if not SET.api_key or not SET.api_secret:
@@ -416,28 +434,20 @@ def main() -> None:
     # health 서버, 드라이브 동기화 스레드, 텔레그램 명령 스레드 시작
     start_health_server()
     start_drive_sync_thread()
-    start_telegram_command_thread()  # ← [추가] 텔레그램에서 종료 명령 수신
+    start_telegram_command_thread()
 
     # 거래소 포지션을 우리 내부에 반영
     sync_open_trades_from_exchange(SET.symbol)
 
-    # KST 기준 마지막 일일 보고 날짜
     now_kst = datetime.datetime.now(KST)
     last_report_date_kst = now_kst.strftime("%Y-%m-%d")
 
-    # 일일 PnL
     daily_pnl: float = 0.0
-
-    # 마지막 TP/SL 체결체크 시각
     last_fill_check: float = 0.0
-
-    # 잔고 로그용
     last_balance_log: float = 0.0
 
-    # ───────── 메인 무한 루프 ─────────
     while RUNNING:
         try:
-            # 메트릭 최신화
             METRICS["last_loop_ts"] = time.time()
             METRICS["open_trades"] = len(OPEN_TRADES)
             METRICS["consec_losses"] = CONSEC_LOSSES
@@ -445,12 +455,12 @@ def main() -> None:
 
             now = time.time()
 
-            # 1) 1분마다 잔고 찍기 (Render 로그에서 보려고)
+            # 잔고 로깅
             if now - last_balance_log >= 60:
                 get_available_usdt()
                 last_balance_log = now
 
-            # 2) KST 자정이면 하루 정산
+            # KST 자정 리셋
             now_kst = datetime.datetime.now(KST)
             today_kst = now_kst.strftime("%Y-%m-%d")
             if now_kst.hour == 0 and now_kst.minute < 1:
@@ -464,7 +474,7 @@ def main() -> None:
                     RANGE_DISABLED_TODAY = False
                     last_report_date_kst = today_kst
 
-            # 3) 열려 있는 포지션들 TP/SL 체결됐는지 주기적으로 확인
+            # TP/SL 체결 확인
             if now - last_fill_check >= SET.poll_fills_sec:
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
                 for closed in closed_list:
@@ -476,14 +486,13 @@ def main() -> None:
                     closed_price = summary.get("avg_price") if summary else 0.0
                     pnl = summary.get("pnl") if summary else None
 
-                    # pnl 이 없으면 우리가 계산
                     if pnl is None or pnl == 0.0:
                         if reason == "TP":
                             if t.side == "BUY":
                                 pnl = (t.tp_price - t.entry) * closed_qty
                             else:
                                 pnl = (t.entry - t.tp_price) * closed_qty
-                        else:  # SL or FORCE_CLOSE
+                        else:
                             if t.side == "BUY":
                                 pnl = (t.sl_price - t.entry) * closed_qty
                             else:
@@ -492,19 +501,16 @@ def main() -> None:
                     daily_pnl += pnl
                     LAST_CLOSE_TS = now
 
-                    # 연속 손실 up/down
                     if pnl < 0:
                         CONSEC_LOSSES += 1
                     else:
                         CONSEC_LOSSES = 0
 
-                    # 전략별 최근 청산 시각
                     if t.source == "TREND":
                         LAST_CLOSE_TS_TREND = now
                     elif t.source == "RANGE":
                         LAST_CLOSE_TS_RANGE = now
 
-                    # 박스장 SL 누적되면 오늘은 박스 전략 off
                     if t.source == "RANGE" and reason == "SL" and pnl < 0:
                         RANGE_DAILY_SL += 1
                         if RANGE_DAILY_SL >= SET.range_max_daily_sl:
@@ -513,13 +519,11 @@ def main() -> None:
                                 f"🛑 [RANGE_OFF] 박스장 손절 {RANGE_DAILY_SL}회 → 오늘은 박스장 전략 비활성화"
                             )
 
-                    # 텔레그램 청산 알림
                     send_tg(
                         f"💰 청산({reason}) {t.symbol} {t.side} 수량={closed_qty} "
                         f"가격={closed_price:.2f} PnL={pnl:.2f} USDT (금일 누적 {daily_pnl:.2f})"
                     )
 
-                    # CSV에도 청산 기록
                     log_signal(
                         event="CLOSE",
                         symbol=t.symbol,
@@ -536,47 +540,49 @@ def main() -> None:
 
                 last_fill_check = now
 
-                # TP/SL 재설정이 계속 실패하면 봇 멈춤
+                # TP/SL 재설정 실패로 인한 중단
                 if TRADER_STATE.should_stop_bot():
                     send_tg("🛑 TP/SL 재설정이 연속으로 실패해서 봇을 중단합니다.")
                     RUNNING = False
                     break
 
-                # ← [추가] 종료 명령이 있고, 포지션이 이제 0개면 바로 종료
+                # 종료 명령이 있고, 포지션이 0개가 된 시점이면 종료 + STOP_FLAG
                 if SAFE_STOP_REQUESTED and not OPEN_TRADES:
                     send_tg("🛑 종료 명령에 따라 포지션이 없어 즉시 종료합니다.")
+                    _write_stop_flag()
                     RUNNING = False
                     break
 
-            # 4) 포지션 열려 있으면 새로 진입하지 않음
+            # 포지션 살아 있으면 신규 진입 안 함
             if OPEN_TRADES:
                 time.sleep(1)
                 continue
 
-            # ← [추가] 포지션이 없고 종료 요청이 켜져 있으면 새 진입 없이 종료
+            # 포지션이 없는데 종료 요청 플래그만 켜져 있으면 여기서 종료 + STOP_FLAG
             if SAFE_STOP_REQUESTED:
                 send_tg("🛑 종료 명령에 따라 새 진입 없이 종료합니다.")
+                _write_stop_flag()
                 RUNNING = False
                 break
 
-            # 5) 연속 손실 3회면 잠깐 쉬기
+            # 연속 손실 3회면 휴식
             if CONSEC_LOSSES >= 3:
                 send_tg("⛔ 연속 3회 손실 → 1시간 휴식")
                 time.sleep(SET.cooldown_after_3loss)
                 CONSEC_LOSSES = 0
                 continue
 
-            # 6) 청산 직후 공통 쿨다운
+            # 청산 직후 쿨다운
             if LAST_CLOSE_TS > 0 and (time.time() - LAST_CLOSE_TS) < SET.cooldown_after_close:
                 time.sleep(1)
                 continue
 
-            # 7) 트레이딩 세션(UTC) 밖이면 대기
+            # 거래 가능 시간대 체크
             if not in_trading_session_utc():
                 time.sleep(2)
                 continue
 
-            # 8) 3분봉 데이터 가져오기
+            # 3분봉 데이터
             try:
                 candles_3m = get_klines(SET.symbol, SET.interval, 120)
                 CONSEC_KLINE_FAILS = 0
@@ -597,12 +603,10 @@ def main() -> None:
                     time.sleep(2)
                 continue
 
-            # 캔들이 너무 적으면 패스
             if len(candles_3m) < 50:
                 time.sleep(1)
                 continue
 
-            # 최신 캔들이 너무 오래됐으면 패스
             latest_3m_ts = candles_3m[-1][0]
             now_ms = int(time.time() * 1000)
             if now_ms - latest_3m_ts > SET.max_kline_delay_sec * 1000:
@@ -617,7 +621,6 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 같은 3m 캔들에서 이미 진입했으면 패스
             if latest_3m_ts == LAST_SIGNAL_TS_3M:
                 send_skip_tg("[SKIP] same_3m_candle: 이미 이 캔들에서 진입했습니다.")
                 log_signal(
@@ -630,7 +633,7 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 9) 잔고 확인
+            # 잔고 확인
             avail = get_available_usdt()
             if avail <= 0:
                 send_skip_tg("[BALANCE_SKIP] ⚠️ 가용 선물 잔고가 0입니다. 진입을 건너뜁니다.")
@@ -645,12 +648,11 @@ def main() -> None:
                 time.sleep(3)
                 continue
 
-            # ───────── 시그널 판단 ─────────
-            chosen_signal: Optional[str] = None  # LONG / SHORT
-            signal_source: Optional[str] = None  # TREND / RANGE
-            trend_15m_val: Optional[str] = None  # 로깅용
+            # 시그널 판단
+            chosen_signal: Optional[str] = None
+            signal_source: Optional[str] = None
+            trend_15m_val: Optional[str] = None
 
-            # 1) 추세 전략
             candles_15m: Optional[List[Any]] = None
             if SET.enable_trend:
                 candles_15m = get_klines(SET.symbol, "15m", 120)
@@ -669,7 +671,6 @@ def main() -> None:
                     if (time.time() - LAST_CLOSE_TS_TREND) >= SET.cooldown_after_close_trend:
                         chosen_signal = sig_3m
                         signal_source = "TREND"
-                        # 1분봉 확인 옵션
                         if SET.enable_1m_confirm:
                             candles_1m = get_klines(SET.symbol, "1m", 20)
                             if candles_1m:
@@ -701,7 +702,6 @@ def main() -> None:
                             trend_15m=trend_15m_val,
                         )
 
-            # 2) 박스 전략
             if (not chosen_signal) and SET.enable_range and (not RANGE_DISABLED_TODAY):
                 if not candles_15m:
                     candles_15m = get_klines(SET.symbol, "15m", 120)
@@ -734,12 +734,11 @@ def main() -> None:
                         candle_ts=latest_3m_ts,
                     )
 
-            # 두 전략 다 없으면 다음 루프
             if not chosen_signal:
                 time.sleep(1)
                 continue
 
-            # ───────── 진입 전 가드 ─────────
+            # 진입 전 가드
             last_price = candles_3m[-1][4]
             prev_price = candles_3m[-2][4]
             move_pct = abs(last_price - prev_price) / prev_price
@@ -759,7 +758,7 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 호가 스프레드 체크 (아래에서 진입가 힌트로도 쓰기 위해 best_bid/best_ask 보관)
+            # 호가 스프레드 체크
             spread_pct_logged: Optional[float] = None
             best_bid: Optional[float] = None
             best_ask: Optional[float] = None
@@ -769,8 +768,12 @@ def main() -> None:
                 asks = orderbook.get("asks") or []
                 if bids and asks:
                     try:
-                        best_bid = float(bids[0][0] if isinstance(bids[0], list) else bids[0].get("price"))
-                        best_ask = float(asks[0][0] if isinstance(asks[0], list) else asks[0].get("price"))
+                        best_bid = float(
+                            bids[0][0] if isinstance(bids[0], list) else bids[0].get("price")
+                        )
+                        best_ask = float(
+                            asks[0][0] if isinstance(asks[0], list) else asks[0].get("price")
+                        )
                         if best_bid > 0:
                             spread_pct = (best_ask - best_bid) / best_bid
                             spread_pct_logged = spread_pct
@@ -824,7 +827,6 @@ def main() -> None:
                 continue
             notional = min(notional, SET.max_notional_usdt)
 
-            # 수량
             qty = round(notional / last_price, 6)
             side_open = "BUY" if chosen_signal == "LONG" else "SELL"
 
@@ -846,14 +848,12 @@ def main() -> None:
             strategy_kr = "추세장" if signal_source == "TREND" else "박스장"
             direction_kr = "롱" if chosen_signal == "LONG" else "숏"
 
-            # 텔레그램 진입 시도 메시지
             send_tg(
                 f"[ENTRY][{signal_source}] 🟢 진입 시도: {SET.symbol} 전략={strategy_kr} 방향={direction_kr} "
                 f"레버리지={SET.leverage}x 사용비율={effective_risk_pct*100:.0f}% "
                 f"명목가≈{notional:.2f}USDT 수량={qty}"
             )
 
-            # 실제 주문 넣기 전에 ENTRY_SIGNAL 기록
             log_signal(
                 event="ENTRY_SIGNAL",
                 symbol=SET.symbol,
@@ -870,16 +870,14 @@ def main() -> None:
                 notional=notional,
             )
 
-            # ===== 진입가 힌트 결정 (기존 2025-11-09 수정) =====
+            # 진입가 힌트
             entry_price_hint = last_price
             if SET.use_orderbook_entry_hint and best_bid and best_ask:
-                # 살 때는 매도호가, 팔 때는 매수호가 기준으로 TP/SL 계산하도록 힌트를 준다
                 if side_open == "BUY":
                     entry_price_hint = best_ask
                 else:
                     entry_price_hint = best_bid
 
-            # 진짜 주문 + TP/SL 예약
             trade = open_position_with_tp_sl(
                 settings=SET,
                 symbol=SET.symbol,
@@ -891,7 +889,6 @@ def main() -> None:
                 source=signal_source or "UNKNOWN",
             )
             if trade is None:
-                # 주문 자체가 실패했다면 SKIP 으로 기록
                 log_signal(
                     event="SKIP",
                     symbol=SET.symbol,
@@ -903,12 +900,10 @@ def main() -> None:
                 time.sleep(2)
                 continue
 
-            # 예약 성공 텔레그램
             send_tg(
                 f"[ENTRY][{signal_source}] 📌 예약완료: TP={trade.tp_price} / SL={trade.sl_price}"
             )
 
-            # 실제로 포지션 열린 것 기록
             log_signal(
                 event="ENTRY_OPENED",
                 symbol=trade.symbol,
@@ -924,17 +919,13 @@ def main() -> None:
                 extra=f"entry_order_id={trade.entry_order_id}",
             )
 
-            # 내부 상태에 포지션 추가
             OPEN_TRADES.append(trade)
 
-            # 같은 3m 캔들 재진입 방지
             LAST_SIGNAL_TS_3M = latest_3m_ts
 
-            # 진입 후 쿨다운
             time.sleep(SET.cooldown_sec)
 
         except Exception as e:
-            # 최상단 예외 처리
             log(f"ERROR: {e}")
             send_tg(f"❌ 오류 발생: {e}")
             log_signal(
@@ -945,7 +936,6 @@ def main() -> None:
             )
             time.sleep(2)
 
-    # 메인 루프 빠져나온 뒤
     uptime = time.time() - START_TS
     if (not TERMINATED_BY_SIGNAL) and (uptime >= SET.min_uptime_for_stop):
         send_tg("🛑 봇이 종료되었습니다.")
@@ -953,6 +943,5 @@ def main() -> None:
         log(f"[SKIP STOP] sig={TERMINATED_BY_SIGNAL} uptime={uptime:.2f}s")
 
 
-# 직접 실행일 때만 main() 호출
 if __name__ == "__main__":
     main()
