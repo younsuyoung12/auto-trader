@@ -434,8 +434,7 @@ def main() -> None:
     # health 서버, 드라이브 동기화 스레드, 텔레그램 명령 스레드 시작
     start_health_server()
     start_drive_sync_thread()
-    start_telegram_command_thread()
-
+ 
     # 거래소 포지션을 우리 내부에 반영
     sync_open_trades_from_exchange(SET.symbol)
 
