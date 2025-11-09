@@ -65,7 +65,7 @@ run_bot.py
 - 이런 계정에서는 주기 동기화를 해도 항상 "열려 있는 포지션이 없습니다." 로 찍히는데,
   balance 안의 data.balance.usedMargin 은 계속 증가/유지된다.
 - 루프에서 포지션이 없다고 판단한 뒤에도 잔고를 한 번 더 읽어서
-  usedMargin > 0 이면 "사람이 수동으로 들고 있는 포지션"으로 보고 신규 진입을 건너뛰도록 했다.
+  usedMargin > 0 이면 "사람이 수동으로 들고 있는 포지션"으로 보고 신규 진입을 건너뜁니다.
 - 이렇게 하면 봇이 만든 포지션만 익절/손절하고, 사람이 만든 포지션 위에 얹어서 진입하지 않는다.
 
 2025-11-10 추가 (드라이브 업로드 시 오늘 CSV 강제 생성):
@@ -73,6 +73,11 @@ run_bot.py
   자정 이후 아무 로그가 없으면 드라이브에 안 올라갔다.
 - drive_sync 스레드에서 업로드하기 전에 signals_logger._ensure_today_csv() 를 호출해
   오늘자 CSV를 먼저 만들고 그걸 올리도록 변경.
+
+2025-11-10 9차 수정 (시그널 순서/레인지 1m 확인/일일 레인지 잠금 완화):
+- 시그널 판단 순서를 "엄격 TREND → (없으면) RANGE → (RANGE가 이 캔들에서 불리하면) 느슨 TREND → SKIP" 으로 변경
+- RANGE 시그널도 SET.enable_1m_confirm 가 켜져 있으면 1분봉으로 방향을 다시 확인
+- RANGE 손절 일일 한도 초과 시 하루 전체 비활성화하던 줄을 주석 처리해 연구·관찰 상황에서도 다음 캔들에서 다시 기회를 보도록 변경
 """
 
 from __future__ import annotations
@@ -160,7 +165,7 @@ CONSEC_KLINE_FAILS: int = 0
 
 # 박스장 손절 횟수 / 비활성화 여부
 RANGE_DAILY_SL: int = 0
-RANGE_DISABLED_TODAY: bool = False
+RANGE_DISABLED_TODAY: bool = False  # 연구 모드에서는 아래에서 하루잠금 안 걸도록 조정
 
 # 전략별 최근 청산 시각
 LAST_CLOSE_TS_TREND: float = 0.0
@@ -259,7 +264,6 @@ def start_drive_sync_thread() -> None:
         while True:
             try:
                 # 1) 오늘자 CSV가 없으면 여기서 먼저 만든다
-                #    signals_logger 쪽에서 헤더까지 적힌 파일을 돌려준다.
                 local_path = _ensure_today_csv()
                 day_str = os.path.basename(local_path).replace("signals-", "").replace(".csv", "")
 
@@ -598,12 +602,15 @@ def main() -> None:
                     elif t.source == "RANGE":
                         LAST_CLOSE_TS_RANGE = now
 
+                    # 박스장 손절 누적 → 원래는 여기서 오늘 하루 끄던 줄이 있었음
                     if t.source == "RANGE" and reason == "SL" and pnl < 0:
                         RANGE_DAILY_SL += 1
                         if RANGE_DAILY_SL >= SET.range_max_daily_sl:
-                            RANGE_DISABLED_TODAY = True
+                            # 아래 한 줄이 "오늘은 박스장 전략 비활성화"였는데
+                            # 연구/관찰 모드에서는 주석 처리해서 다음 캔들에서도 다시 보게 한다.
+                            # RANGE_DISABLED_TODAY = True
                             send_tg(
-                                f"🛑 [RANGE_OFF] 박스장 손절 {RANGE_DAILY_SL}회 → 오늘은 박스장 전략 비활성화"
+                                f"🛑 [RANGE_WARN] 박스장 손절 {RANGE_DAILY_SL}회 → 다음 캔들부터도 다시 판단(하루잠금 해제 상태)"
                             )
 
                     send_tg(
@@ -751,12 +758,16 @@ def main() -> None:
                 time.sleep(3)
                 continue
 
+            # ─────────────────────────────
             # 시그널 판단
+            # ─────────────────────────────
             chosen_signal: Optional[str] = None
             signal_source: Optional[str] = None
             trend_15m_val: Optional[str] = None
 
             candles_15m: Optional[List[Any]] = None
+
+            # 1) 엄격 추세 먼저
             if SET.enable_trend:
                 candles_15m = get_klines(SET.symbol, "15m", 120)
                 if candles_15m:
@@ -774,6 +785,7 @@ def main() -> None:
                     if (time.time() - LAST_CLOSE_TS_TREND) >= SET.cooldown_after_close_trend:
                         chosen_signal = sig_3m
                         signal_source = "TREND"
+                        # 1분봉 확인이 켜져 있으면 여기서 확인
                         if SET.enable_1m_confirm:
                             candles_1m = get_klines(SET.symbol, "1m", 20)
                             if candles_1m:
@@ -805,6 +817,7 @@ def main() -> None:
                             trend_15m=trend_15m_val,
                         )
 
+            # 2) 엄격 추세가 안 나왔을 때만 박스장 시도
             if (not chosen_signal) and SET.enable_range and (not RANGE_DISABLED_TODAY):
                 if not candles_15m:
                     candles_15m = get_klines(SET.symbol, "15m", 120)
@@ -812,21 +825,61 @@ def main() -> None:
                         log(
                             f"[DATA] 15m klines ok: symbol={SET.symbol} count={len(candles_15m)} last_close={candles_15m[-1][4]}"
                         )
+
+                # 직전 RANGE 청산 쿨다운
                 if (time.time() - LAST_CLOSE_TS_RANGE) >= SET.cooldown_after_close_range:
-                    if not should_block_range_today(candles_3m, candles_15m):
+                    # 이 캔들에서만 박스가 불리한지 확인
+                    blocked_now = should_block_range_today(candles_3m, candles_15m)
+                    if not blocked_now:
                         r_sig = decide_signal_range(candles_3m)
                         if r_sig:
-                            chosen_signal = r_sig
-                            signal_source = "RANGE"
+                            # 박스장도 1분봉 확인을 옵션으로 추가
+                            ok_range = True
+                            if SET.enable_1m_confirm:
+                                candles_1m = get_klines(SET.symbol, "1m", 20)
+                                if candles_1m:
+                                    log(
+                                        f"[DATA] 1m klines ok: symbol={SET.symbol} count={len(candles_1m)} last_close={candles_1m[-1][4]}"
+                                    )
+                                # RANGE에서는 r_sig 가 "LONG"/"SHORT" 이므로 그대로 넘긴다
+                                if not confirm_1m_direction(candles_1m, r_sig):
+                                    ok_range = False
+                            if ok_range:
+                                chosen_signal = r_sig
+                                signal_source = "RANGE"
+                            else:
+                                send_skip_tg("[SKIP] 1m_confirm_mismatch_range")
+                                log_signal(
+                                    event="SKIP",
+                                    symbol=SET.symbol,
+                                    strategy_type="RANGE",
+                                    direction=r_sig,
+                                    reason="1m_confirm_mismatch_range",
+                                    candle_ts=latest_3m_ts,
+                                )
                     else:
-                        send_skip_tg("[SKIP] range_blocked_today: 박스장 조건 불리")
-                        log_signal(
-                            event="SKIP",
-                            symbol=SET.symbol,
-                            strategy_type="RANGE",
-                            reason="range_blocked_today",
-                            candle_ts=latest_3m_ts,
+                        # 3) 박스가 이 캔들에서는 불리하면 → 느슨한 추세로 한 번 더 본다
+                        loose_sig = decide_signal_3m_trend(
+                            candles_3m,
+                            SET.rsi_overbought + 5,  # 기준 조금 완화
+                            SET.rsi_oversold - 5,
                         )
+                        loose_trend_15m = decide_trend_15m(candles_15m) if candles_15m else None
+
+                        if loose_sig and loose_trend_15m and loose_sig == loose_trend_15m:
+                            chosen_signal = loose_sig
+                            signal_source = "TREND"  # fallback 이지만 TREND로 표기
+                            send_skip_tg("[INFO] range blocked → loose TREND fallback used")
+                        else:
+                            # 그래도 없으면 이 캔들만 SKIP
+                            send_skip_tg("[SKIP] range_blocked_today: 박스장 조건 불리")
+                            log_signal(
+                                event="SKIP",
+                                symbol=SET.symbol,
+                                strategy_type="RANGE",
+                                reason="range_blocked_today",
+                                candle_ts=latest_3m_ts,
+                            )
                 else:
                     send_skip_tg("[SKIP] range_cooldown: 직전 RANGE 포지션 대기중")
                     log_signal(
@@ -837,6 +890,7 @@ def main() -> None:
                         candle_ts=latest_3m_ts,
                     )
 
+            # 위에서 세 단계 다 해봤는데도 신호가 없으면 패스
             if not chosen_signal:
                 time.sleep(1)
                 continue
