@@ -47,6 +47,11 @@ run_bot.py
      "마진기준퍼센트 ÷ 100 ÷ 레버리지" 로 다시 덮어쓴다.
      예) 10배 레버리지, 마진기준 tp=0.5% → 실제 가격변동률 tp = 0.5/100/10 = 0.0005 (=0.05%)
   3) 너무 작아져서 거래소가 안 받을 수 있으니 min_tp_pct / min_sl_pct 로 바닥은 깔아준다.
+
+2025-11-09 6차 조정 (텔레그램 409 Conflict 무시):
+- 텔레그램 getUpdates 에서 HTTP 409 가 계속 찍히던 걸
+  urllib.error.HTTPError 로 구분해서 로그만 남기고 다시 시도하도록 수정
+- 다른 곳(메인 루프)에는 영향 없음
 """
 
 from __future__ import annotations
@@ -265,11 +270,16 @@ def start_drive_sync_thread() -> None:
 # 3-1. 텔레그램 명령 수신 스레드
 # ─────────────────────────────
 def start_telegram_command_thread() -> None:
-    """텔레그램에서 '종료' 같은 한글 명령을 받아와 SAFE_STOP_REQUESTED 를 켜는 스레드"""
+    """텔레그램에서 '종료' 같은 한글 명령을 받아와 SAFE_STOP_REQUESTED 를 켜는 스레드
+    409 Conflict (다른 곳에서 이미 getUpdates 중) 이 떠도 메인 봇은 계속 돌아야 하므로
+    그 경우는 그냥 로그만 찍고 재시도한다.
+    """
     if not SET.telegram_bot_token or not SET.telegram_chat_id:
         return  # 텔레그램 설정이 없으면 안 돌린다
 
     def _worker():
+        import urllib.error  # 409 구분하려고 내부에서 import
+
         global SAFE_STOP_REQUESTED, TG_UPDATE_OFFSET
         base_url = f"https://api.telegram.org/bot{SET.telegram_bot_token}/getUpdates"
         chat_id_str = str(SET.telegram_chat_id)
@@ -294,8 +304,14 @@ def start_telegram_command_thread() -> None:
                     if text in ("종료", "봇종료", "끝나면 종료", "안전종료"):
                         SAFE_STOP_REQUESTED = True
                         send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
-            except Exception as e:
+            except urllib.error.HTTPError as e:
                 # 여기서 409 Conflict 가 나도 메인 봇은 계속 돌아야 한다
+                if e.code == 409:
+                    log("[TG CMD] 409 Conflict (다른 폴링/웹훅이 있는 것 같음) → 무시 후 재시도")
+                else:
+                    log(f"[TG CMD] http error: {e}")
+                time.sleep(5)
+            except Exception as e:
                 log(f"[TG CMD] error: {e}")
                 time.sleep(5)
 

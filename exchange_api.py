@@ -14,19 +14,17 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 2025-11-09 수정/추가 내용
 1) 응답 검증 강화
    - BingX가 HTTP 200을 줘도 JSON 안에 code가 0/None/100400 이 아니면 실패로 보도록 req()를 보강했다.
-   - 단, 일부 엔드포인트가 주는 100400은 기존처럼 예외를 던지지 않고 그대로 돌려줘서
-     상위(run_bot.py 등)에서 “이 API는 계정에서 미지원”으로 처리할 수 있게 했다.
+   - 일부 엔드포인트가 주는 100400은 여전히 예외 안 던지고 넘겨서 상위에서 처리할 수 있게 했다.
 
 2) 주문 응답 로그 추가
-   - 시장가 주문(place_market)과 조건부 주문(place_conditional)을 넣을 때
-     BingX가 돌려준 원본 응답을 log()로 남기도록 했다.
-     → 텔레그램에 "시장가 진입 응답에 orderId가 없어 포지션을 건너뜁니다." 가 찍히는 원인을
-       서버 로그에서 바로 확인할 수 있게 하기 위함.
+   - place_market(), place_conditional() 이 BingX 원본 응답을 log()로 남기게 했다.
+   - 진입 직후 orderId가 없다고 나올 때 서버 로그로 원인 파악할 수 있게 하기 위함.
 
-3) 레버리지 설정 파라미터 보완 (중요)
-   - 일부 계정에서 /openApi/swap/v2/trade/leverage 가 symbol + leverage 만으로 109400(Invalid parameters)를 내서
-     side 를 명시적으로 LONG, SHORT 두 번 호출하도록 변경했다.
-   - 이렇게 하면 롱/숏 양쪽 레버리지가 동시에 설정되므로 run_bot.py 에서 한 번만 호출해도 된다.
+3) 레버리지/마진 설정 예외 완화
+   - 어떤 계정은 API로 레버리지/마진을 못 바꿔서 109400(Invalid parameters)이 뜬다.
+   - set_leverage_and_mode()에서 LONG/SHORT/marginType 을 각각 시도하되,
+     109400인 경우에는 “지원 안 하는 듯” 하고 경고만 남기고 봇은 계속 돌도록 완화했다.
+   - 이렇게 하면 run_bot.py 시작할 때마다 에러로 죽지 않는다.
 """
 
 from __future__ import annotations
@@ -90,7 +88,7 @@ def req(
 
     if isinstance(data, dict):
         code = data.get("code")
-        # code 가 0, "0", None, 100400 이면 통과
+        # 0 / "0" / None / 100400 은 통과
         if code not in (None, 0, "0", 100400):
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
@@ -110,7 +108,7 @@ def get_available_usdt() -> float:
 
         data = res.get("data") or res.get("balances") or res
 
-        # case 1: {"data": {"balance": {...}}}
+        # {"data": {"balance": {...}}} 케이스
         if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
             bal = data["balance"]
             cand = (
@@ -122,13 +120,13 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
-        # case 2: 리스트로 오는 경우 → 첫 원소 사용
+        # 리스트로 오면 첫 원소 사용
         if isinstance(data, list) and data:
             item = data[0]
         else:
             item = data
 
-        # case 3: item 안에 다시 balance dict 가 있는 경우
+        # item 안에 balance 가 또 있는 경우
         if isinstance(item, dict) and "balance" in item and isinstance(item["balance"], dict):
             bal = item["balance"]
             cand = (
@@ -160,6 +158,7 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
+            # 이 계정에서는 이 API 가 없을 때
             log("[POSITIONS] this api is not exist -> skip syncing positions")
             return []
         log(f"[POSITIONS RAW] {res}")
@@ -192,43 +191,43 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """레버리지와 마진 모드를 설정한다.
 
-    여기서는 BingX 문서대로 side 를 LONG, SHORT 두 번 호출한다.
-    하나라도 성공하면 그냥 넘어가고, 둘 다 실패하면 경고만 찍는다.
+    어떤 계정에서는 이게 109400 을 내고 실패할 수 있으니,
+    그 경우엔 경고만 찍고 봇은 계속 돌게 한다.
     """
-    errors: List[str] = []
+    errs: List[str] = []
 
-    # 1) LONG 레버리지
-    try:
-        req("POST", "/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol,
-            "leverage": leverage,
-            "side": "LONG",
-        })
-    except Exception as e:
-        errors.append(f"LONG: {e}")
+    # 1) 레버리지 LONG / SHORT 각각 시도
+    for side in ("LONG", "SHORT"):
+        try:
+            req("POST", "/openApi/swap/v2/trade/leverage", {
+                "symbol": symbol,
+                "leverage": leverage,
+                "side": side,
+            })
+        except Exception as e:
+            msg = str(e)
+            # 109400 이면 “API로는 못 바꾸네” 하고 넘어가기
+            if "109400" in msg:
+                log(f"[WARN] 레버리지({side})는 API로 설정 불가해 보여서 건너뜁니다: {msg}")
+            else:
+                errs.append(f"{side}: {msg}")
 
-    # 2) SHORT 레버리지
-    try:
-        req("POST", "/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol,
-            "leverage": leverage,
-            "side": "SHORT",
-        })
-    except Exception as e:
-        errors.append(f"SHORT: {e}")
-
-    # 3) 마진 모드
+    # 2) 마진 모드
     try:
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
             "marginType": "ISOLATED" if isolated else "CROSSED",
         })
     except Exception as e:
-        errors.append(f"MARGIN: {e}")
+        msg = str(e)
+        if "109400" in msg:
+            log(f"[WARN] 마진모드는 API로 설정 불가해 보여서 건너뜁니다: {msg}")
+        else:
+            errs.append(f"MARGIN: {msg}")
 
-    if errors:
-        # run_bot.py 에서 멈추지 않도록 여기서만 경고
-        log(f"[WARN] 레버리지/마진 설정 일부 실패: {', '.join(errors)}")
+    # 3) 진짜 에러만 묶어서 한 번에 보여주기
+    if errs:
+        log(f"[WARN] 레버리지/마진 설정 일부 실패: {', '.join(errs)}")
 
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
@@ -294,7 +293,7 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
-    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다."""
+    """체결내역 여러 건을 요약해서 평균가/총수량/실현손익을 계산한다."""
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
@@ -340,6 +339,7 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
         except Exception as e:
             log(f"[wait_filled] error: {e}")
         time.sleep(0.5)
+    # 타임아웃 → 취소
     log(f"[wait_filled] timeout, last_status={last_status}, cancel order")
     cancel_order(symbol, order_id)
     return None
