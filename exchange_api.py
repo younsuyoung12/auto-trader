@@ -24,16 +24,9 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
        서버 로그에서 바로 확인할 수 있게 하기 위함.
 
 3) 레버리지 설정 파라미터 보완 (중요)
-   - BingX 선물 v2 레버리지 설정이 symbol + leverage 만으로는 109400(Invalid parameters)를 내는 케이스가 있어서
-     side="BOTH" 를 같이 보내도록 수정했다.
+   - 일부 계정에서 /openApi/swap/v2/trade/leverage 가 symbol + leverage 만으로 109400(Invalid parameters)를 내서
+     side 를 명시적으로 LONG, SHORT 두 번 호출하도록 변경했다.
    - 이렇게 하면 롱/숏 양쪽 레버리지가 동시에 설정되므로 run_bot.py 에서 한 번만 호출해도 된다.
-
-주의:
-- 여기서는 "OPEN_TRADES" 같은 봇 내부 상태는 다루지 않는다.
-  그 부분은 run_bot.py 쪽에서 이 모듈의 함수들을 호출해서 상태를 구성해야 한다.
-- 일부 BingX 엔드포인트는 계정 설정에 따라 없는 경우가 있어(code=100400),
-  그런 경우는 req()가 예외를 던지지 않고 그대로 JSON을 돌려주고,
-  호출한 쪽에서 100400을 해석해서 빈 리스트로 처리하도록 한다.
 """
 
 from __future__ import annotations
@@ -61,12 +54,7 @@ def _ts_ms() -> int:
 
 
 def sign_query(params: Dict[str, Any], api_secret: str) -> str:
-    """BingX 가 요구하는 방식으로 쿼리스트링에 서명한다.
-
-    - 파라미터 키를 알파벳 순으로 정렬한 후 "k=v&..." 형태로 만든다.
-    - 그 문자열에 대해 HMAC-SHA256(api_secret) 을 수행해서 signature 를 붙인다.
-    - 반환값은 "k=v&...&signature=xxxx" 문자열이다.
-    """
+    """BingX 가 요구하는 방식으로 쿼리스트링에 서명한다."""
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return qs + "&signature=" + sig
@@ -89,13 +77,7 @@ def req(
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """BingX REST 요청을 1회 수행하는 기본 함수.
-
-    - 모든 요청에 timestamp 를 추가한다.
-    - HTTP status 가 200 이 아니면 예외.
-    - JSON 안에 code 필드가 있고, 그 값이 0/None/100400 이 아니면 예외.
-      (100400 은 일부 계정에서 "이 API 없음" 으로 자주 오므로 그대로 리턴하게 한다.)
-    """
+    """BingX REST 요청을 1회 수행하는 기본 함수."""
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
@@ -110,7 +92,6 @@ def req(
         code = data.get("code")
         # code 가 0, "0", None, 100400 이면 통과
         if code not in (None, 0, "0", 100400):
-            # 여기서 바로 이유를 보이게 예외로 올린다.
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
@@ -122,10 +103,7 @@ def req(
 # 계좌/포지션/주문 조회
 # ─────────────────────────────
 def get_available_usdt() -> float:
-    """가용 선물 잔고(availableBalance/availableMargin 계열)를 조회한다.
-
-    실패하면 0.0 을 리턴하고 텔레그램으로 알린다.
-    """
+    """가용 선물 잔고(availableBalance/availableMargin 계열)를 조회한다."""
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
@@ -182,12 +160,11 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
-            # 이 계정에서는 이 API 가 없을 때
             log("[POSITIONS] this api is not exist -> skip syncing positions")
             return []
         log(f"[POSITIONS RAW] {res}")
         data = res.get("data") or res.get("positions") or []
-        if not isinstance(data, list):  # 단일 오브젝트로 오는 경우
+        if not isinstance(data, list):
             data = [data]
         return data
     except Exception as e:
@@ -215,24 +192,43 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """레버리지와 마진 모드를 설정한다.
 
-    2025-11-09: BingX 선물 v2 레버리지 설정 시 side 가 없으면 109400 을 주는 케이스가 있어서
-    side="BOTH" 를 같이 보내도록 수정했다.
-    실패하더라도 봇 전체가 멈출 필요는 없으므로 예외를 상위로 올리지 않는다.
+    여기서는 BingX 문서대로 side 를 LONG, SHORT 두 번 호출한다.
+    하나라도 성공하면 그냥 넘어가고, 둘 다 실패하면 경고만 찍는다.
     """
+    errors: List[str] = []
+
+    # 1) LONG 레버리지
     try:
-        # 레버리지: 롱/숏 둘 다 동일하게 맞추기 위해 side=BOTH
         req("POST", "/openApi/swap/v2/trade/leverage", {
             "symbol": symbol,
             "leverage": leverage,
-            "side": "BOTH",
+            "side": "LONG",
         })
-        # 마진 모드
+    except Exception as e:
+        errors.append(f"LONG: {e}")
+
+    # 2) SHORT 레버리지
+    try:
+        req("POST", "/openApi/swap/v2/trade/leverage", {
+            "symbol": symbol,
+            "leverage": leverage,
+            "side": "SHORT",
+        })
+    except Exception as e:
+        errors.append(f"SHORT: {e}")
+
+    # 3) 마진 모드
+    try:
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
             "marginType": "ISOLATED" if isolated else "CROSSED",
         })
     except Exception as e:
-        log(f"[WARN] 레버리지/마진 설정 실패: {e}")
+        errors.append(f"MARGIN: {e}")
+
+    if errors:
+        # run_bot.py 에서 멈추지 않도록 여기서만 경고
+        log(f"[WARN] 레버리지/마진 설정 일부 실패: {', '.join(errors)}")
 
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
@@ -243,7 +239,6 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
         "type": "MARKET",
         "quantity": qty,
     })
-    # 주문 응답은 꼭 로그로 남겨 두자 (orderId 없을 때 원인 확인용)
     log(f"[PLACE MARKET] {resp}")
     return resp
 
@@ -269,8 +264,7 @@ def place_conditional(
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
-    """주문 ID 기준으로 주문을 취소한다.
-    시장가 대기 중 타임아웃이 났을 때 사용."""
+    """주문 ID 기준으로 주문을 취소한다."""
     try:
         res = req("POST", "/openApi/swap/v2/trade/cancel", {
             "symbol": symbol,
@@ -300,11 +294,7 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
-    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다.
-
-    - TP/SL 이 체결된 뒤 run_bot 에서 텔레그램용 메시지를 만들 때 사용한다.
-    - 체결이 하나도 없으면 None 리턴.
-    """
+    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다."""
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
@@ -336,10 +326,7 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 
 
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
-    """시장가 주문이 실제로 FILLED 될 때까지 짧게 폴링한다.
-
-    응답에 FILLED 가 안 찍혀 있으면 주문을 취소하고 None 을 리턴한다.
-    """
+    """시장가 주문이 실제로 FILLED 될 때까지 짧게 폴링한다."""
     end = time.time() + timeout
     last_status = None
     while time.time() < end:
@@ -353,7 +340,6 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
         except Exception as e:
             log(f"[wait_filled] error: {e}")
         time.sleep(0.5)
-    # 타임아웃 → 취소 시도
     log(f"[wait_filled] timeout, last_status={last_status}, cancel order")
     cancel_order(symbol, order_id)
     return None
