@@ -61,7 +61,7 @@ run_bot.py
 - 이렇게 하면 "지금 내가 이미 사둔 포지션"도 봇이 인식해서 중복 진입을 방지한다.
 
 2025-11-09 8차 수정 (포지션 API 미지원 계정용 usedMargin 진입 가드):
-- 일부 계정은 /openApi/swap/v2/trade/positions 가 100400 을 내면서 아예 안 된다.
+- 일부 계정은 /openApi/swap/v2/trade/positions 가 100400 を 내면서 아예 안 된다.
 - 이런 계정에서는 주기 동기화를 해도 항상 "열려 있는 포지션이 없습니다." 로 찍히는데,
   balance 안의 data.balance.usedMargin 은 계속 증가/유지된다.
 - 루프에서 포지션이 없다고 판단한 뒤에도 잔고를 한 번 더 읽어서
@@ -78,6 +78,11 @@ run_bot.py
 - 시그널 판단 순서를 "엄격 TREND → (없으면) RANGE → (RANGE가 이 캔들에서 불리하면) 느슨 TREND → SKIP" 으로 변경
 - RANGE 시그널도 SET.enable_1m_confirm 가 켜져 있으면 1분봉으로 방향을 다시 확인
 - RANGE 손절 일일 한도 초과 시 하루 전체 비활성화하던 줄을 주석 처리해 연구·관찰 상황에서도 다음 캔들에서 다시 기회를 보도록 변경
+
+2025-11-10 10차 수정 (3m 거래량 가드 + 레인지/대체추세 로그 보강):
+- 신호가 선택된 뒤, 실제 진입 직전에 3m 캔들의 거래량이 최근 20개 평균의 min_entry_volume_ratio (기본 0.3) 미만이면 그 캔들만 진입을 스킵
+- range_blocked_today 분기에서 "대체 느슨 추세를 시도했는지"까지 로그로 남기도록 보강
+- 이렇게 하면 하루잠금 없이도 렌더 로그/CSV만 보고 왜 스킵됐는지 역추적 가능
 """
 
 from __future__ import annotations
@@ -165,7 +170,7 @@ CONSEC_KLINE_FAILS: int = 0
 
 # 박스장 손절 횟수 / 비활성화 여부
 RANGE_DAILY_SL: int = 0
-RANGE_DISABLED_TODAY: bool = False  # 연구 모드에서는 아래에서 하루잠금 안 걸도록 조정
+RANGE_DISABLED_TODAY: bool = False  # 연구 모드에서는 하루잠금 안 걸도록 유지
 
 # 전략별 최근 청산 시각
 LAST_CLOSE_TS_TREND: float = 0.0
@@ -606,8 +611,6 @@ def main() -> None:
                     if t.source == "RANGE" and reason == "SL" and pnl < 0:
                         RANGE_DAILY_SL += 1
                         if RANGE_DAILY_SL >= SET.range_max_daily_sl:
-                            # 아래 한 줄이 "오늘은 박스장 전략 비활성화"였는데
-                            # 연구/관찰 모드에서는 주석 처리해서 다음 캔들에서도 다시 보게 한다.
                             # RANGE_DISABLED_TODAY = True
                             send_tg(
                                 f"🛑 [RANGE_WARN] 박스장 손절 {RANGE_DAILY_SL}회 → 다음 캔들부터도 다시 판단(하루잠금 해제 상태)"
@@ -841,7 +844,6 @@ def main() -> None:
                                     log(
                                         f"[DATA] 1m klines ok: symbol={SET.symbol} count={len(candles_1m)} last_close={candles_1m[-1][4]}"
                                     )
-                                # RANGE에서는 r_sig 가 "LONG"/"SHORT" 이므로 그대로 넘긴다
                                 if not confirm_1m_direction(candles_1m, r_sig):
                                     ok_range = False
                             if ok_range:
@@ -859,6 +861,7 @@ def main() -> None:
                                 )
                     else:
                         # 3) 박스가 이 캔들에서는 불리하면 → 느슨한 추세로 한 번 더 본다
+                        log("[INFO] range blocked for this candle, trying loose trend fallback")
                         loose_sig = decide_signal_3m_trend(
                             candles_3m,
                             SET.rsi_overbought + 5,  # 기준 조금 완화
@@ -895,7 +898,42 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 진입 전 가드
+            # ─────────────────────────────
+            # 3m 거래량 가드 (신호는 나왔으나 체결은 이 캔들만 스킵)
+            # ─────────────────────────────
+            min_vol_ratio = getattr(SET, "min_entry_volume_ratio", 0.3)  # 없으면 30%로
+            last_vol = None
+            avg_vol_20 = None
+            try:
+                # get_klines 가 [ts, o, h, l, c, vol, ...] 구조라는 전제
+                last_vol = float(candles_3m[-1][5])
+                vols_20 = [float(c[5]) for c in candles_3m[-20:]]
+                avg_vol_20 = sum(vols_20) / len(vols_20)
+            except Exception:
+                # 캔들에 볼륨 없으면 그냥 통과
+                last_vol = None
+                avg_vol_20 = None
+
+            if (
+                last_vol is not None
+                and avg_vol_20 is not None
+                and avg_vol_20 > 0
+                and last_vol < avg_vol_20 * min_vol_ratio
+            ):
+                send_skip_tg("[SKIP] volume_too_low_for_entry")
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type=signal_source or "UNKNOWN",
+                    direction=chosen_signal,
+                    reason="volume_too_low_for_entry",
+                    candle_ts=latest_3m_ts,
+                    extra=f"last_vol={last_vol}, avg_vol_20={avg_vol_20}, ratio={min_vol_ratio}",
+                )
+                time.sleep(1)
+                continue
+
+            # 진입 전 가드 (가격 점프)
             last_price = candles_3m[-1][4]
             prev_price = candles_3m[-2][4]
             move_pct = abs(last_price - prev_price) / prev_price
