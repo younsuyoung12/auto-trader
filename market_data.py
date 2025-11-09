@@ -6,8 +6,10 @@
 - 최신 캔들이 지연됐는지 판단할 수 있도록 정렬까지 마친 상태로 리턴
 - 진입 직전에 호가 스프레드가 얼마나 벌어져 있는지 확인하기 위해 orderbook(depth) 조회
 
-원래 bot.py 안에 있던 로직을 그대로 분리해서 옮겨왔다.
-이 모듈에서는 '신호 판단' 은 하지 않고, 순수히 "시장 데이터를 가져오는 것" 에만 집중한다.
+중요 (2025-11-09 메모):
+- 여기서는 BingX **선물(swap)** 엔드포인트(`/openApi/swap/...`)만 사용한다.
+- 그래서 run_bot.py 에서 1분/3분/15분 캔들을 호출하면 전부 "선물 차트" 기준으로 신호를 보게 된다.
+- 현물로 바꾸고 싶으면 아래 URL 을 spot 용으로만 바꿔주면 된다.
 """
 
 from __future__ import annotations
@@ -20,14 +22,18 @@ from telelog import log
 
 # 설정을 전역으로 보관 (BASE URL 등)
 SET = load_settings()
-BASE = SET.bingx_base  # https://open-api.bingx.com
+BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 
 
 # ─────────────────────────────
-# 캔들 데이터 가져오기
+# 캔들 데이터 가져오기 (선물 기준)
 # ─────────────────────────────
-def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, float, float, float, float]]:
-    """BingX 의 klines 엔드포인트에서 캔들을 받아와서 정규화한다.
+def get_klines(
+    symbol: str,
+    interval: str,
+    limit: int = 120,
+) -> List[Tuple[int, float, float, float, float]]:
+    """BingX 선물(swap) klines 엔드포인트에서 캔들을 받아와서 정규화한다.
 
     반환 형식:
         [ (timestamp(ms), open, high, low, close), ... ]
@@ -37,7 +43,7 @@ def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, 
     """
     try:
         resp = requests.get(
-            f"{BASE}/openApi/swap/v2/quote/klines",
+            f"{BASE}/openApi/swap/v2/quote/klines",  # ← 선물용
             params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=12,
         )
@@ -87,10 +93,10 @@ def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, 
 
 
 # ─────────────────────────────
-# 호가(오더북) 데이터 가져오기
+# 호가(오더북) 데이터 가져오기 (선물 기준)
 # ─────────────────────────────
 def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
-    """진입 직전에 스프레드를 확인하기 위해 depth 를 조회한다.
+    """진입 직전에 스프레드를 확인하기 위해 선물 depth 를 조회한다.
 
     반환 형식은 BingX 원본 그대로(dict) 를 리턴하고,
     상위 코드에서 `data.get("bids")`, `data.get("asks")` 식으로 접근해서
@@ -100,7 +106,7 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
     """
     try:
         resp = requests.get(
-            f"{BASE}/openApi/swap/v2/quote/depth",
+            f"{BASE}/openApi/swap/v2/quote/depth",  # ← 선물용
             params={"symbol": symbol, "limit": limit},
             timeout=8,
         )

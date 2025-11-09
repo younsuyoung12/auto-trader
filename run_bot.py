@@ -29,6 +29,24 @@ run_bot.py
 - 위와 같이 종료할 때 STOP_FLAG 파일을 생성해서, 컨테이너/호스트가
   run_bot.py를 다시 실행하더라도 이 파일이 있으면 즉시 종료하도록 추가
 - 다시 시작하려면 컨테이너 안에서 STOP_FLAG 파일을 삭제한 뒤 run_bot.py를 실행
+
+2025-11-09 4차 조정 (선물 기준 PnL 명시 + 텔레그램 스레드 누락 보완):
+- PnL 계산 부분에 "선물(레버리지) 체결가 기준으로 qty * (체결가 차이)"라는 걸 주석으로 명확히 했다.
+  spot/현물 퍼센트가 아니라 실제 우리가 청산한 선물 체결 가격을 기준으로 수익을 본다.
+- main() 안에서 start_telegram_command_thread() 호출을 빠뜨리지 않도록 다시 넣었다.
+
+2025-11-09 5차 조정 (현물 퍼센트가 아니라 '선물 수익률'로 익절/손절):
+- settings.py 에 추가한
+    use_margin_based_tp_sl
+    fut_tp_margin_pct
+    fut_sl_margin_pct
+  값을 실제 진입 시점에 반영하도록 변경.
+- 로직:
+  1) 원래대로 전략별 TP/SL 퍼센트 계산 (박스장이면 range값, 아니면 기본값/ATR)
+  2) 그 다음에 use_margin_based_tp_sl 이 켜져 있으면
+     "마진기준퍼센트 ÷ 100 ÷ 레버리지" 로 다시 덮어쓴다.
+     예) 10배 레버리지, 마진기준 tp=0.5% → 실제 가격변동률 tp = 0.5/100/10 = 0.0005 (=0.05%)
+  3) 너무 작아져서 거래소가 안 받을 수 있으니 min_tp_pct / min_sl_pct 로 바닥은 깔아준다.
 """
 
 from __future__ import annotations
@@ -131,14 +149,16 @@ SAFE_STOP_REQUESTED: bool = False
 TG_UPDATE_OFFSET: int = 0
 
 
+# ─────────────────────────────
+# STOP_FLAG 헬퍼
+# ─────────────────────────────
 def _write_stop_flag() -> None:
     """재시작 시 바로 종료하도록 STOP_FLAG 파일을 만든다."""
     try:
-        with open("STOP_FLAG", "w") as f:
-            f.write("stop")
-    except OSError:
-        # 파일을 못 써도 봇 종료 자체는 진행
-        pass
+        with open("STOP_FLAG", "w", encoding="utf-8") as f:
+            f.write("stop\n")
+    except OSError as e:
+        log(f"[STOP_FLAG] write failed: {e}")
 
 
 # ─────────────────────────────
@@ -242,7 +262,7 @@ def start_drive_sync_thread() -> None:
 
 
 # ─────────────────────────────
-# 3-1. 텔레그램 명령 수신 스레드 (2025-11-09 추가)
+# 3-1. 텔레그램 명령 수신 스레드
 # ─────────────────────────────
 def start_telegram_command_thread() -> None:
     """텔레그램에서 '종료' 같은 한글 명령을 받아와 SAFE_STOP_REQUESTED 를 켜는 스레드"""
@@ -262,6 +282,7 @@ def start_telegram_command_thread() -> None:
                     data = json.loads(resp.read().decode("utf-8"))
 
                 for upd in data.get("result", []):
+                    # 다음 요청부터는 이 이후로만
                     TG_UPDATE_OFFSET = upd["update_id"] + 1
                     msg = upd.get("message") or upd.get("channel_post")
                     if not msg:
@@ -269,10 +290,12 @@ def start_telegram_command_thread() -> None:
                     if str(msg["chat"]["id"]) != chat_id_str:
                         continue
                     text = (msg.get("text") or "").strip()
+                    # 종료 명령어 집합
                     if text in ("종료", "봇종료", "끝나면 종료", "안전종료"):
                         SAFE_STOP_REQUESTED = True
                         send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
             except Exception as e:
+                # 여기서 409 Conflict 가 나도 메인 봇은 계속 돌아야 한다
                 log(f"[TG CMD] error: {e}")
                 time.sleep(5)
 
@@ -361,6 +384,7 @@ def sync_open_trades_from_exchange(symbol: str) -> None:
         tp_price: Optional[float] = None
         sl_price: Optional[float] = None
 
+        # 열려 있는 주문들 중에서 TP/SL 찾아서 붙여줌
         for o in orders:
             o_type = (o.get("type") or o.get("orderType") or "").upper()
             oid = o.get("orderId") or o.get("id")
@@ -407,7 +431,7 @@ def main() -> None:
     # 시작 시 STOP_FLAG 가 있으면 바로 종료해서 재시작을 막는다.
     if os.path.exists("STOP_FLAG"):
         log("STOP_FLAG detected on startup. exiting without start.")
-        send_tg("⛔ 이전에 종료 명령이 있어 재시작하지 않습니다.")
+        send_tg("⛔ 이전에 종료 명령이 있어 재시작하지 않습니다. (STOP_FLAG 지우고 다시 실행)")
         return
 
     # 필수 키 체크
@@ -423,7 +447,7 @@ def main() -> None:
         f"ENABLE_RANGE={SET.enable_range}, "
         f"ENABLE_1M_CONFIRM={SET.enable_1m_confirm}"
     )
-    send_tg("✅ [봇 시작] BingX 자동매매 시작합니다.")
+    send_tg("✅ [봇 시작] BingX 선물 자동매매 시작합니다.")
 
     # 레버리지/마진 설정 (실패해도 멈추지 않음)
     try:
@@ -434,7 +458,8 @@ def main() -> None:
     # health 서버, 드라이브 동기화 스레드, 텔레그램 명령 스레드 시작
     start_health_server()
     start_drive_sync_thread()
- 
+    start_telegram_command_thread()
+
     # 거래소 포지션을 우리 내부에 반영
     sync_open_trades_from_exchange(SET.symbol)
 
@@ -485,13 +510,16 @@ def main() -> None:
                     closed_price = summary.get("avg_price") if summary else 0.0
                     pnl = summary.get("pnl") if summary else None
 
+                    # ───────── 여기서의 PnL 계산은 "선물 체결가 기준"이다 ─────────
+                    # 우리가 진입했던 entry, 예약해 둔 TP/SL 가격의 차이에 qty(=포지션 수량)를 곱하는 구조
+                    # 현물 %가 아니라 실제로 그 가격 차이만큼 USDT 가 벌고/잃는다.
                     if pnl is None or pnl == 0.0:
                         if reason == "TP":
                             if t.side == "BUY":
                                 pnl = (t.tp_price - t.entry) * closed_qty
                             else:
                                 pnl = (t.entry - t.tp_price) * closed_qty
-                        else:
+                        else:  # SL or FORCE_CLOSE
                             if t.side == "BUY":
                                 pnl = (t.sl_price - t.entry) * closed_qty
                             else:
@@ -542,6 +570,7 @@ def main() -> None:
                 # TP/SL 재설정 실패로 인한 중단
                 if TRADER_STATE.should_stop_bot():
                     send_tg("🛑 TP/SL 재설정이 연속으로 실패해서 봇을 중단합니다.")
+                    _write_stop_flag()
                     RUNNING = False
                     break
 
@@ -808,7 +837,7 @@ def main() -> None:
                             f"[ATR RISK] fast ATR high → risk {SET.risk_pct} -> {effective_risk_pct}"
                         )
 
-            # 주문 명목가 계산
+            # 주문 명목가 계산 (선물: 가용선물잔고 × 내 리스크 × 레버리지)
             notional = avail * effective_risk_pct * SET.leverage
             if notional < SET.min_notional_usdt:
                 send_tg(f"⚠️ 계산된 주문 금액이 너무 작습니다: {notional:.2f} USDT")
@@ -829,13 +858,18 @@ def main() -> None:
             qty = round(notional / last_price, 6)
             side_open = "BUY" if chosen_signal == "LONG" else "SELL"
 
+            # ─────────────────────────────
             # TP/SL 퍼센트 선택
+            # ─────────────────────────────
             if signal_source == "RANGE":
+                # 박스장은 원래 짧은 값
                 local_tp_pct = SET.range_tp_pct
                 local_sl_pct = SET.range_sl_pct
             else:
+                # 추세장 기본값
                 local_tp_pct = SET.tp_pct
                 local_sl_pct = SET.sl_pct
+                # ATR 사용 시 시장 변동성에 맞춰 자동 보정
                 if SET.use_atr:
                     atr_val = calc_atr(candles_3m, SET.atr_len)
                     if atr_val and last_price > 0:
@@ -843,6 +877,24 @@ def main() -> None:
                         tp_pct_atr = (atr_val * SET.atr_tp_mult) / last_price
                         local_sl_pct = max(sl_pct_atr, SET.min_sl_pct)
                         local_tp_pct = max(tp_pct_atr, SET.min_tp_pct)
+
+            # ─────────────────────────────
+            # ★ 선물(마진) 기준 TP/SL 강제 변환
+            # settings.use_margin_based_tp_sl 이 켜져 있으면
+            #   "내가 마진 기준으로 0.5% 먹고 싶다" → 실제 가격으로는 (0.5/100)/레버리지 만 움직이면 된다.
+            # 예) 10배 레버리지, 0.5% 마진익절 → 실제 가격변동률 0.05% (=0.0005)
+            # ─────────────────────────────
+            if SET.use_margin_based_tp_sl:
+                # 사용자가 환경변수로 0.5 라고 넣었다면 0.5% 라고 본다.
+                margin_tp_pct = SET.fut_tp_margin_pct / 100.0
+                margin_sl_pct = SET.fut_sl_margin_pct / 100.0
+                lev = SET.leverage if SET.leverage > 0 else 1
+                # 가격 기준 퍼센트로 환산
+                local_tp_pct = margin_tp_pct / lev
+                local_sl_pct = margin_sl_pct / lev
+                # 거래소 최소 허용보다 너무 작아지지 않게 바닥 깔기
+                local_tp_pct = max(local_tp_pct, SET.min_tp_pct)
+                local_sl_pct = max(local_sl_pct, SET.min_sl_pct)
 
             strategy_kr = "추세장" if signal_source == "TREND" else "박스장"
             direction_kr = "롱" if chosen_signal == "LONG" else "숏"

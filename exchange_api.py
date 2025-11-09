@@ -10,14 +10,21 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 주문 상태 폴링(wait_filled)
 - 체결내역 요약(summarize_fills)
 
-원래 bot.py 안에 있던 코드를 최대한 그대로 옮겨 왔고,
-settings.py, telelog.py 에 있는 유틸을 재사용하도록 했다.
+2025-11-09 수정/추가 내용
+- BingX가 HTTP 200을 줘도 JSON 안에 code가 0이 아니면 실패로 보도록 req()를 보강했다.
+  (단, 일부 엔드포인트가 주는 100400은 기존 코드처럼 상위에서 처리할 수 있게 예외로 올리지 않는다.)
+- 시장가 주문(place_market)과 조건부 주문(place_conditional)을 넣을 때
+  BingX가 돌려준 원본 응답을 log()로 남기도록 했다.
+  → 텔레그램에 "시장가 진입 응답에 orderId가 없어 포지션을 건너뜁니다." 가 찍히는 원인을
+     서버 로그에서 바로 확인할 수 있게 하기 위함.
+- 나머지 공개/조회용 함수는 기존 동작을 유지한다.
 
 주의:
 - 여기서는 "OPEN_TRADES" 같은 봇 내부 상태는 다루지 않는다.
   그 부분은 run_bot.py 쪽에서 이 모듈의 함수들을 호출해서 상태를 구성해야 한다.
 - 일부 BingX 엔드포인트는 계정 설정에 따라 없는 경우가 있어(code=100400),
-  그런 경우는 상위에서 빈 리스트로 처리하도록 한다.
+  그런 경우는 req()가 예외를 던지지 않고 그대로 JSON을 돌려주고,
+  호출한 쪽에서 100400을 해석해서 빈 리스트로 처리하도록 한다.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ from __future__ import annotations
 import time
 import hmac
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import requests
 
 from settings import load_settings
@@ -67,20 +74,39 @@ def _headers() -> Dict[str, str]:
 # ─────────────────────────────
 # 공통 요청 함수
 # ─────────────────────────────
-def req(method: str, path: str, params: Optional[Dict[str, Any]] = None, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def req(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """BingX REST 요청을 1회 수행하는 기본 함수.
 
     - 모든 요청에 timestamp 를 추가한다.
-    - 실패하면 RuntimeError 를 던지게 해서 상위에서 처리하도록 한다.
-    - status_code 가 200 이 아니면 그대로 예외로 올린다.
+    - HTTP status 가 200 이 아니면 예외.
+    - JSON 안에 code 필드가 있고, 그 값이 0/None/100400 이 아니면 예외.
+      (100400 은 일부 계정에서 "이 API 없음" 으로 자주 오므로 그대로 리턴하게 한다.)
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
     r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
+
     if r.status_code != 200:
         raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
-    return r.json()
+
+    data = r.json()
+
+    if isinstance(data, dict):
+        code = data.get("code")
+        # code 가 0, "0", None, 100400 이면 통과
+        if code not in (None, 0, "0", 100400):
+            # 여기서 바로 이유를 보이게 예외로 올린다.
+            raise RuntimeError(
+                f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
+            )
+
+    return data
 
 
 # ─────────────────────────────
@@ -89,13 +115,6 @@ def req(method: str, path: str, params: Optional[Dict[str, Any]] = None, body: O
 def get_available_usdt() -> float:
     """가용 선물 잔고(availableBalance/availableMargin 계열)를 조회한다.
 
-    BingX 가 종종
-    {
-        "data": {
-            "balance": { ... }
-        }
-    }
-    이런 식으로 중첩해서 보내므로 그 케이스를 전부 커버한다.
     실패하면 0.0 을 리턴하고 텔레그램으로 알린다.
     """
     try:
@@ -150,14 +169,11 @@ def get_available_usdt() -> float:
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
-    """실제 거래소에 열려 있는 포지션 목록을 가져온다.
-
-    - 일부 계정/서버에서는 이 API 가 100400 코드를 주면서 "this api is not exist" 라고 한다.
-      이 경우에는 빈 리스트를 리턴해서 상위에서 '동기화 불가' 로 처리하도록 한다.
-    """
+    """실제 거래소에 열려 있는 포지션 목록을 가져온다."""
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
+            # 이 계정에서는 이 API 가 없을 때
             log("[POSITIONS] this api is not exist -> skip syncing positions")
             return []
         log(f"[POSITIONS RAW] {res}")
@@ -190,7 +206,7 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """레버리지와 마진 모드를 설정한다.
 
-    - 실패하더라도 봇 전체가 멈출 필요는 없으므로 예외를 상위로 올리지 않는다.
+    실패하더라도 봇 전체가 멈출 필요는 없으므로 예외를 상위로 올리지 않는다.
     """
     try:
         req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -207,17 +223,26 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """시장가 주문을 발행한다."""
-    return req("POST", "/openApi/swap/v2/trade/order", {
+    resp = req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
         "quantity": qty,
     })
+    # 주문 응답은 꼭 로그로 남겨 두자 (orderId 없을 때 원인 확인용)
+    log(f"[PLACE MARKET] {resp}")
+    return resp
 
 
-def place_conditional(symbol: str, side: str, qty: float, trigger_price: float, order_type: str) -> Dict[str, Any]:
+def place_conditional(
+    symbol: str,
+    side: str,
+    qty: float,
+    trigger_price: float,
+    order_type: str,
+) -> Dict[str, Any]:
     """TP/SL 과 같은 조건부 주문을 발행한다."""
-    return req("POST", "/openApi/swap/v2/trade/order", {
+    resp = req("POST", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "side": side,
         "type": order_type,
@@ -225,6 +250,8 @@ def place_conditional(symbol: str, side: str, qty: float, trigger_price: float, 
         "reduceOnly": True,
         "triggerPrice": trigger_price,
     })
+    log(f"[PLACE CONDITIONAL] {resp}")
+    return resp
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
@@ -259,11 +286,7 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
-    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다.
-
-    - TP/SL 이 체결된 뒤 run_bot 에서 텔레그램용 메시지를 만들 때 사용한다.
-    - 체결이 하나도 없으면 None 리턴.
-    """
+    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다."""
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
@@ -272,7 +295,13 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
     notional = 0.0
     last_time = None
     for f in fills:
-        q = float(f.get("quantity") or f.get("qty") or f.get("volume") or f.get("vol") or 0.0)
+        q = float(
+            f.get("quantity")
+            or f.get("qty")
+            or f.get("volume")
+            or f.get("vol")
+            or 0.0
+        )
         px = float(f.get("price") or f.get("avgPrice") or 0.0)
         pnl = float(f.get("realizedPnl") or 0.0)
         total_qty += q
@@ -291,15 +320,13 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
     """시장가 주문이 실제로 FILLED 될 때까지 짧게 폴링한다.
 
-    - 응답에 FILLED 가 안 찍혀 있으면 주문을 취소하고 None 을 리턴한다.
-    - Render 같은 환경에서 너무 길게 잡으면 안 되므로 기본 5초.
+    응답에 FILLED 가 안 찍혀 있으면 주문을 취소하고 None 을 리턴한다.
     """
     end = time.time() + timeout
     last_status = None
     while time.time() < end:
         try:
             o = get_order(symbol, order_id)
-            # 주문 응답 구조가 제각각이라 normalize 대신 필수값만 본다.
             d = o.get("data") or o
             status = d.get("status") or d.get("orderStatus")
             last_status = status

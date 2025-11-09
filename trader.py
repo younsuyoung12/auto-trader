@@ -2,21 +2,22 @@
 trader.py
 포지션 진입/TP·SL 설정/유지/체결 확인을 담당하는 모듈.
 
-2025-11-09 수정 사항
+2025-11-09 1차 수정
 - settings 에서 추가된 max_entry_slippage_pct 값을 사용해서
   "실제 체결가(entry_price)가 run_bot 이 넘겨준 진입 힌트(entry_price_hint)보다
   너무 나쁘면(=슬리피지 초과) 바로 시장가로 닫고 포지션을 포기"하는 가드를 추가했다.
+  → 선물에서 TP/SL 이 아주 짧을 때(예: 0.05% ~ 0.2%) 슬리피지로 바로 손실 나는 걸 막기 위함.
 - 진입 자체는 성공했어도 슬리피지가 과하면 TP/SL 을 안 깔고 None 을 리턴하도록 했다.
-  (짧은 TP 전략 보호용)
+  (짧은 TP 전략 보호용. 상위 run_bot.py 는 None 을 받으면 "이번 진입은 실패"로만 기록하면 된다.)
 
-이 모듈은 저수준 거래소 요청은 exchange_api.py 에 맡기고,
-여기서는 그 API 들을 조합해서 우리가 쓰는 형태의 포지션(Trade)을 만들고 관리한다.
-
-run_bot.py 에서는 이 모듈에서 제공하는 아래 네 가지만 가져다 쓰면 된다.
-- Trade (dataclass)
-- TraderState (TP/SL 재설정 실패 횟수 관리)
-- open_position_with_tp_sl(...)  → 진입 + TP/SL 두 개 예약
-- check_closes(...)              → 열린 포지션들의 TP/SL 체결 여부 확인
+2025-11-09 2차 설명 보강
+- 지금 구조에서는 "레버리지 몇 배냐", "선물 마진 기준으로 몇 % 먹겠다"를
+  run_bot.py 에서 이미 계산해서 tp_pct / sl_pct 로 넘겨준다.
+  이 모듈(trader.py)은 그 퍼센트를 "그대로 가격에 적용"만 한다.
+  즉, 여기서는 선물이냐 현물이냐를 다시 판단하지 않는다.
+  → 우리는 선물 기준 TP/SL 을 run_bot.py 에서 만들어서 넘긴다. (이미 그렇게 바꿔놨음)
+- 그래서 아래 compute_tp_sl_prices(...) / open_position_with_tp_sl(...) 는
+  "넘어온 퍼센트를 원시 가격(entry)에 곱해서 TP/SL 가격을 만든다"는 역할만 남겨두었다.
 """
 
 from __future__ import annotations
@@ -42,20 +43,19 @@ from exchange_api import (
 class Trade:
     """열려 있는 우리 봇 포지션 1건을 표현하는 구조체.
 
-    원래는 dict 로 다뤘지만 가독성을 위해 dataclass 로 고정했다.
     run_bot.py 에서는 Trade 인스턴스를 리스트로만 관리하면 된다.
     """
 
     symbol: str               # 예: "BTC-USDT"
     side: str                 # "BUY" 또는 "SELL" (진입 방향)
     qty: float                # 진입 수량
-    entry: float              # 실제 진입가
+    entry: float              # 실제 진입가 (거래소 체결가)
     entry_order_id: Optional[str] = None  # 진입 주문 ID (시장가)
     tp_order_id: Optional[str] = None     # 예약된 TP 주문 ID
     sl_order_id: Optional[str] = None     # 예약된 SL 주문 ID
     tp_price: Optional[float] = None      # TP 가격
     sl_price: Optional[float] = None      # SL 가격
-    source: str = "UNKNOWN"              # 이 포지션이 어떤 전략에서 열렸는지 ("TREND" / "RANGE" / "SYNC" ...)
+    source: str = "UNKNOWN"               # 이 포지션이 어떤 전략에서 열렸는지 ("TREND" / "RANGE" / "SYNC" ...)
 
 
 @dataclass
@@ -64,7 +64,6 @@ class TraderState:
 
     - TP/SL 을 다시 걸어야 할 때마다 실패할 수 있는데, 이게 연속으로 여러 번 실패하면
       전체 봇을 멈추도록 run_bot.py 쪽에 시그널을 주어야 한다.
-    - 그 카운트를 여기서 관리한다.
     """
 
     tp_sl_retry_fails: int = 0           # 현재까지 연속 실패 횟수
@@ -95,10 +94,17 @@ def compute_tp_sl_prices(
 ) -> Tuple[float, float]:
     """진입 방향과 퍼센트로 실제 TP/SL 가격을 계산한다.
 
+    ⚠️ 여기서 tp_pct, sl_pct 는 이미 run_bot.py 에서
+       "선물 마진 기준 → 실제 가격변동률"로 변환되어 들어온 값이라고 가정한다.
+
     - 롱이면 TP = entry * (1 + tp_pct), SL = entry * (1 - sl_pct)
     - 숏이면 TP = entry * (1 - tp_pct), SL = entry * (1 + sl_pct)
     - 거래소가 소숫점 2자리까지 지원하는 경우가 많아서 기본을 2자리로 맞춰 둔다.
     """
+    if entry <= 0:
+        # 혹시 모를 방어: 잘못된 진입가가 넘어오면 그냥 그대로 둔다.
+        entry = 0.0
+
     if side_open == "BUY":
         tp_price = round(entry * (1 + tp_pct), precision)
         sl_price = round(entry * (1 - sl_pct), precision)
@@ -125,11 +131,12 @@ def open_position_with_tp_sl(
     """시장가로 진입하고 곧바로 TP/SL 조건부 주문을 두 개 다 거는 고수준 함수.
 
     성공하면 Trade 를 리턴하고, 실패하면 None 을 리턴한다.
+
     실패 케이스는 다음과 같다.
     - 시장가 주문 자체가 실패한 경우
     - 시장가가 시간 내에 FILLED 되지 않은 경우
     - TP/SL 중 하나라도 주문이 실패한 경우 (이때는 시장가로 강제 청산한다)
-    - (추가) 실제 체결가가 힌트보다 설정값 이상으로 나쁘게 체결된 경우
+    - (2025-11-09 추가) 실제 체결가가 힌트보다 설정값 이상으로 나쁘게 체결된 경우
     """
     # 1) 시장가로 진입
     try:
@@ -181,8 +188,9 @@ def open_position_with_tp_sl(
             # 진입은 됐지만 가격이 너무 나쁘다 → 즉시 시장가로 닫고 포기
             close_side = "SELL" if side_open == "BUY" else "BUY"
             try:
-                close_position_market(symbol, close_side, filled_qty)
+                close_position_market(symbol, side_open, filled_qty)
             except Exception as e:
+                # 포지션 닫기까지 실패하면 이유만 남긴다
                 send_tg(
                     f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
                 )
