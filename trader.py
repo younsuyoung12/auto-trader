@@ -18,6 +18,12 @@ trader.py
   → 우리는 선물 기준 TP/SL 을 run_bot.py 에서 만들어서 넘긴다. (이미 그렇게 바꿔놨음)
 - 그래서 아래 compute_tp_sl_prices(...) / open_position_with_tp_sl(...) 는
   "넘어온 퍼센트를 원시 가격(entry)에 곱해서 TP/SL 가격을 만든다"는 역할만 남겨두었다.
+
+2025-11-09 3차 수정 (수동/동기화 포지션 보호)
+- run_bot.py 가 거래소에서 그대로 가져와서 source="SYNC" 로 넣어준 포지션은
+  봇이 TP/SL 을 다시 깔거나, 강제 청산하거나, 체결 확인 대상으로 삼지 않도록 했다.
+- 즉, 사람이 수동으로 연 포지션(=거래소에 이미 있던 것)은 봇이 익절/손절을 건드리지 않고
+  그대로 둔다. 봇이 직접 연 것(source가 TREND/RANGE/UNKNOWN 등)만 관리한다.
 """
 
 from __future__ import annotations
@@ -102,7 +108,7 @@ def compute_tp_sl_prices(
     - 거래소가 소숫점 2자리까지 지원하는 경우가 많아서 기본을 2자리로 맞춰 둔다.
     """
     if entry <= 0:
-        # 혹시 모를 방어: 잘못된 진입가가 넘어오면 그냥 그대로 둔다.
+        # 방어
         entry = 0.0
 
     if side_open == "BUY":
@@ -152,18 +158,16 @@ def open_position_with_tp_sl(
         or data.get("orderID")
     )
     if not entry_order_id:
-        # 주문 ID 가 없으면 TP/SL 을 걸 수가 없다.
         send_tg("[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다.")
         return None
 
-    # 2) 진입 체결 대기 (기본 5초)
+    # 2) 진입 체결 대기
     filled = wait_filled(symbol, entry_order_id, timeout=5)
     if not filled:
-        # 시간 내에 체결이 안 되면 여기서 포기
         send_tg("[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다.")
         return None
 
-    # 체결 수량/가격 추출 (없으면 힌트를 사용)
+    # 체결 수량/가격 추출
     filled_qty = float(
         filled.get("quantity")
         or filled.get("executedQty")
@@ -178,19 +182,15 @@ def open_position_with_tp_sl(
         or entry_price_hint
     )
 
-    # ───────── 슬리피지 가드 (2025-11-09 추가) ─────────
-    # settings.max_entry_slippage_pct: 허용 슬리피지가 0보다 크고,
-    # 우리가 넘겨준 힌트(entry_price_hint)가 유효할 때만 체크한다.
+    # ───────── 슬리피지 가드 ─────────
     max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0)
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
-            # 진입은 됐지만 가격이 너무 나쁘다 → 즉시 시장가로 닫고 포기
-            close_side = "SELL" if side_open == "BUY" else "BUY"
+            # 진입은 됐지만 가격이 너무 나쁘니 바로 닫는다
             try:
                 close_position_market(symbol, side_open, filled_qty)
             except Exception as e:
-                # 포지션 닫기까지 실패하면 이유만 남긴다
                 send_tg(
                     f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
                 )
@@ -227,7 +227,6 @@ def open_position_with_tp_sl(
             "STOP_MARKET",
         )
     except Exception as e:
-        # 한쪽이라도 실패하면 포지션을 바로 닫는다.
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
         close_position_market(symbol, close_side, filled_qty)
         return None
@@ -258,10 +257,12 @@ def open_position_with_tp_sl(
 def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     """포지션은 살아 있는데 TP/SL 주문이 없는 경우 다시 건다.
 
-    - TP 또는 SL 중 하나만 없어졌으면 그쪽만 다시 건다.
-    - 다시 거는 것까지 실패하면 False 를 리턴하고, state 에 실패 횟수를 올린다.
-    - run_bot.py 에서는 이 False 를 보면 시장가로 포지션을 정리해버릴 수 있다.
+    ⚠️ 단, source == "SYNC" 인 포지션은 사람이/외부에서 연 걸로 보고 손대지 않는다.
     """
+    # 사람이 수동으로 열어서 run_bot 이 SYNC 한 포지션이라면 그대로 둔다.
+    if trade.source == "SYNC":
+        return True
+
     symbol = trade.symbol
     side_open = trade.side
     qty = trade.qty
@@ -334,7 +335,6 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
             send_tg(f"❗ SL 재설정 실패: {e}")
             ok = False
 
-    # 결과에 따라 상태 업데이트
     if ok:
         state.reset_tp_sl_fails()
     else:
@@ -354,6 +354,7 @@ def check_closes(
     """열린 포지션 목록을 받아서 TP/SL 체결 여부를 확인하고 결과를 돌려준다.
 
     반환값은 (still_open, closed_list) 이다.
+
     - still_open: 아직 열려 있는 포지션들
     - closed_list: 이번에 닫힌 포지션 정보 목록. 각 원소는
         {
@@ -362,7 +363,10 @@ def check_closes(
             "summary": summarize_fills(...) 결과 또는 None,
         }
       형태이다.
-    run_bot.py 는 이 closed_list 를 받아서 텔레그램으로 알리고, PnL 을 계산한다.
+
+    ⚠️ 여기서도 source == "SYNC" 인 포지션은
+       "사람이 거래소에서 직접 열어둔 것"으로 보고 건드리지 않는다.
+       → TP/SL 확인 안 하고, 다시 깔지도 않고, 강제청산도 하지 않는다.
     """
     if not open_trades:
         return [], []
@@ -371,6 +375,11 @@ def check_closes(
     closed_results: List[Dict[str, Any]] = []
 
     for t in open_trades:
+        # 사람이/외부에서 열어서 run_bot 이 동기화만 한 포지션
+        if t.source == "SYNC":
+            still_open.append(t)
+            continue
+
         symbol = t.symbol
         tp_id = t.tp_order_id
         sl_id = t.sl_order_id
@@ -389,7 +398,7 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes TP error: {e}")
 
-        # 2) SL 체크 (TP 안 된 경우에만)
+        # 2) SL 체크
         if (not closed) and sl_id:
             try:
                 o = get_order(symbol, sl_id)
@@ -402,11 +411,11 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes SL error: {e}")
 
-        # 3) 아직 안 닫혔으면 TP/SL 이 둘 다 살아 있는지 다시 확인해서 필요시 재설정한다.
+        # 3) TP/SL 재설정 혹은 강제청산
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:
-                # 재설정조차 실패 → 포지션을 강제 시장가 청산하고 닫힌 것으로 처리
+                # 여기까지 왔다는 건 봇이 연 포지션이므로 강제 정리 가능
                 close_position_market(symbol, t.side, t.qty)
                 closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
             else:

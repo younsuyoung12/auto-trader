@@ -52,6 +52,13 @@ run_bot.py
 - 텔레그램 getUpdates 에서 HTTP 409 가 계속 찍히던 걸
   urllib.error.HTTPError 로 구분해서 로그만 남기고 다시 시도하도록 수정
 - 다른 곳(메인 루프)에는 영향 없음
+
+2025-11-09 7차 수정 (거래소 포지션 주기적 재동기화):
+- 봇이 시작할 때 한 번만 거래소 포지션을 동기화하면,
+  사람이 거래소 앱에서 수동으로 포지션을 연 경우 봇이 그걸 모른 채로 새로 진입할 수 있다.
+- 이를 막기 위해 루프 안에서 일정 주기(기본 20초, settings.position_resync_sec 가 있으면 그 값)로
+  fetch_open_positions() / fetch_open_orders() 를 다시 호출해 OPEN_TRADES 를 교체하도록 했다.
+- 이렇게 하면 "지금 내가 이미 사둔 포지션"도 봇이 인식해서 중복 진입을 방지한다.
 """
 
 from __future__ import annotations
@@ -152,6 +159,9 @@ SAFE_STOP_REQUESTED: bool = False
 
 # 텔레그램 getUpdates 오프셋
 TG_UPDATE_OFFSET: int = 0
+
+# 거래소 포지션 재동기화 시각
+LAST_EXCHANGE_SYNC_TS: float = 0.0
 
 
 # ─────────────────────────────
@@ -367,15 +377,22 @@ signal.signal(signal.SIGTERM, _sigterm)
 # ─────────────────────────────
 # 6. 거래소 → 내부 포지션 동기화
 # ─────────────────────────────
-def sync_open_trades_from_exchange(symbol: str) -> None:
+def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
     """
-    봇이 재시작됐을 때 실제 거래소에 열려 있는 포지션을
-    우리 OPEN_TRADES 에 그대로 반영해서 중복 진입을 막는다.
+    실제 거래소에 열려 있는 포지션을 우리 OPEN_TRADES 에 반영해서 중복 진입을 막는다.
+
+    - replace=True 이면 기존 리스트를 비우고 거래소 상태로 덮어쓴다.
+      (주기적 재동기화에서 이 모드로 호출)
+    - replace=False 이면 현재 리스트 뒤에 붙인다.
+      (초기 로딩에서만 쓰고 싶으면 False 로 쓴다)
     """
     global OPEN_TRADES
 
     positions = fetch_open_positions(symbol)
     orders = fetch_open_orders(symbol)
+
+    if replace:
+        OPEN_TRADES = []
 
     if not positions:
         log("[SYNC] 열려 있는 포지션이 없습니다.")
@@ -428,7 +445,7 @@ def sync_open_trades_from_exchange(symbol: str) -> None:
         )
 
     if OPEN_TRADES:
-        send_tg(f"🔁 재시작 시 기존 포지션 {len(OPEN_TRADES)}건을 동기화했습니다. (중복 진입 방지)")
+        send_tg(f"🔁 거래소 포지션 {len(OPEN_TRADES)}건을 동기화했습니다. (중복 진입 방지)")
     else:
         log("[SYNC] 포지션을 못 가져와서 동기화할 게 없습니다.")
 
@@ -443,6 +460,7 @@ def main() -> None:
     global LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
     global LAST_SIGNAL_TS_3M
     global SAFE_STOP_REQUESTED
+    global LAST_EXCHANGE_SYNC_TS
 
     # 시작 시 STOP_FLAG 가 있으면 바로 종료해서 재시작을 막는다.
     if os.path.exists("STOP_FLAG"):
@@ -476,8 +494,9 @@ def main() -> None:
     start_drive_sync_thread()
     start_telegram_command_thread()
 
-    # 거래소 포지션을 우리 내부에 반영
-    sync_open_trades_from_exchange(SET.symbol)
+    # 거래소 포지션을 우리 내부에 반영 (시작 시 1회)
+    sync_open_trades_from_exchange(SET.symbol, replace=True)
+    LAST_EXCHANGE_SYNC_TS = time.time()
 
     now_kst = datetime.datetime.now(KST)
     last_report_date_kst = now_kst.strftime("%Y-%m-%d")
@@ -485,6 +504,9 @@ def main() -> None:
     daily_pnl: float = 0.0
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
+
+    # 재동기화 주기 (settings 에 없으면 20초로)
+    position_resync_sec = getattr(SET, "position_resync_sec", 20)
 
     while RUNNING:
         try:
@@ -494,6 +516,14 @@ def main() -> None:
             METRICS["kline_failures"] = CONSEC_KLINE_FAILS
 
             now = time.time()
+
+            # ─────────────────────────────
+            # 0) 거래소 포지션 주기적 재동기화
+            #    ↳ 사람이 거래소에서 수동으로 포지션 열어도 여기서 봇이 다시 인식
+            # ─────────────────────────────
+            if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
+                sync_open_trades_from_exchange(SET.symbol, replace=True)
+                LAST_EXCHANGE_SYNC_TS = now
 
             # 잔고 로깅
             if now - last_balance_log >= 60:
@@ -527,8 +557,6 @@ def main() -> None:
                     pnl = summary.get("pnl") if summary else None
 
                     # ───────── 여기서의 PnL 계산은 "선물 체결가 기준"이다 ─────────
-                    # 우리가 진입했던 entry, 예약해 둔 TP/SL 가격의 차이에 qty(=포지션 수량)를 곱하는 구조
-                    # 현물 %가 아니라 실제로 그 가격 차이만큼 USDT 가 벌고/잃는다.
                     if pnl is None or pnl == 0.0:
                         if reason == "TP":
                             if t.side == "BUY":
@@ -896,19 +924,13 @@ def main() -> None:
 
             # ─────────────────────────────
             # ★ 선물(마진) 기준 TP/SL 강제 변환
-            # settings.use_margin_based_tp_sl 이 켜져 있으면
-            #   "내가 마진 기준으로 0.5% 먹고 싶다" → 실제 가격으로는 (0.5/100)/레버리지 만 움직이면 된다.
-            # 예) 10배 레버리지, 0.5% 마진익절 → 실제 가격변동률 0.05% (=0.0005)
             # ─────────────────────────────
             if SET.use_margin_based_tp_sl:
-                # 사용자가 환경변수로 0.5 라고 넣었다면 0.5% 라고 본다.
                 margin_tp_pct = SET.fut_tp_margin_pct / 100.0
                 margin_sl_pct = SET.fut_sl_margin_pct / 100.0
                 lev = SET.leverage if SET.leverage > 0 else 1
-                # 가격 기준 퍼센트로 환산
                 local_tp_pct = margin_tp_pct / lev
                 local_sl_pct = margin_sl_pct / lev
-                # 거래소 최소 허용보다 너무 작아지지 않게 바닥 깔기
                 local_tp_pct = max(local_tp_pct, SET.min_tp_pct)
                 local_sl_pct = max(local_sl_pct, SET.min_sl_pct)
 

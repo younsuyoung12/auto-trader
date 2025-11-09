@@ -25,6 +25,14 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
    - set_leverage_and_mode()에서 LONG/SHORT/marginType 을 각각 시도하되,
      109400인 경우에는 “지원 안 하는 듯” 하고 경고만 남기고 봇은 계속 돌도록 완화했다.
    - 이렇게 하면 run_bot.py 시작할 때마다 에러로 죽지 않는다.
+
+4) 선물 수량 정규화 추가 (중요)
+   - BingX 선물 BTC-USDT 등은 보통 quantity step 이 0.001 이라서
+     run_bot.py 에서 계산된 0.005904 같은 값을 그대로 보내면 109400 이 발생할 수 있다.
+   - place_market(), place_conditional(), close_position_market() 에서 모두
+     0.001 단위로 내림(floor) 후 소수 셋째 자리까지로 잘라서 전송하도록 변경했다.
+   - 이 변경으로 전략단(run_bot.py / trader.py)에서 약간 지저분한 수량을 내려보내도
+     실제 API 호출 시에는 거래소가 받는 단위로 정리된다.
 """
 
 from __future__ import annotations
@@ -41,6 +49,15 @@ from telelog import log, send_tg
 # 설정 읽기 (전역으로 보관)
 SET = load_settings()
 BASE = SET.bingx_base  # 기본: https://open-api.bingx.com
+
+# ─────────────────────────────
+# 심볼별 수량 step (선물 전용)
+# 필요 시 여기다 심볼을 더 넣어라.
+# ─────────────────────────────
+_QTY_STEP: Dict[str, float] = {
+    "BTC-USDT": 0.001,
+    "BTCUSDT": 0.001,  # 혹시 심볼 포맷이 다르게 들어오는 경우 대비
+}
 
 
 # ─────────────────────────────
@@ -64,6 +81,28 @@ def _headers() -> Dict[str, str]:
         "X-BX-APIKEY": SET.api_key,
         "Content-Type": "application/json",
     }
+
+
+# ─────────────────────────────
+# 수량 정규화 (선물)
+# ─────────────────────────────
+def _normalize_qty(symbol: str, raw_qty: float) -> float:
+    """
+    선물 주문 수량을 거래소가 받는 단위로 내린다.
+    예) 0.005904 → 0.005
+    - 기본 step 은 0.001 로 둔다.
+    - 0 이하로 내려가면 최소 step 을 보낸다.
+    - API가 문자열로 보내도 허용하므로 마지막에 소수 3째 자리까지만 유지한다.
+    """
+    step = _QTY_STEP.get(symbol, 0.001)
+    if step <= 0:
+        step = 0.001
+    units = int(raw_qty / step)
+    qty = units * step
+    if qty <= 0:
+        qty = step
+    # 소수 셋째 자리까지만
+    return float(f"{qty:.3f}")
 
 
 # ─────────────────────────────
@@ -231,14 +270,23 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
-    """시장가 주문을 발행한다."""
-    resp = req("POST", "/openApi/swap/v2/trade/order", {
+    """
+    시장가 주문을 발행한다.
+    - run_bot.py / trader.py 에서 넘어온 수량을 그대로 쓰지 않고
+      여기서 선물 규격(0.001)로 내린 뒤 전송한다.
+    - 이렇게 해야 109400 Invalid parameters 를 피할 수 있다.
+    """
+    norm_qty = _normalize_qty(symbol, qty)
+    payload = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": qty,
-    })
-    log(f"[PLACE MARKET] {resp}")
+        "quantity": norm_qty,
+        "recvWindow": 5000,
+    }
+    log(f"[PLACE MARKET REQ] {payload}")
+    resp = req("POST", "/openApi/swap/v2/trade/order", payload)
+    log(f"[PLACE MARKET RESP] {resp}")
     return resp
 
 
@@ -249,16 +297,24 @@ def place_conditional(
     trigger_price: float,
     order_type: str,
 ) -> Dict[str, Any]:
-    """TP/SL 과 같은 조건부 주문을 발행한다."""
-    resp = req("POST", "/openApi/swap/v2/trade/order", {
+    """
+    TP/SL 과 같은 조건부 주문을 발행한다.
+    - 진입 수량과 동일한 규칙으로 0.001 단위로 내린다.
+    - reduceOnly=True 로 보내서 포지션을 늘리지 않게 한다.
+    """
+    norm_qty = _normalize_qty(symbol, qty)
+    payload = {
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "quantity": qty,
+        "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
-    })
-    log(f"[PLACE CONDITIONAL] {resp}")
+        "recvWindow": 5000,
+    }
+    log(f"[PLACE CONDITIONAL REQ] {payload}")
+    resp = req("POST", "/openApi/swap/v2/trade/order", payload)
+    log(f"[PLACE CONDITIONAL RESP] {resp}")
     return resp
 
 
@@ -346,17 +402,24 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
-    """TP/SL 세팅이 실패했을 때 포지션을 즉시 시장가로 닫을 때 사용."""
+    """
+    TP/SL 세팅이 실패했을 때 포지션을 즉시 시장가로 닫을 때 사용.
+    이때도 선물 수량 규격을 맞춰서 보낸다.
+    """
     close_side = "SELL" if side_open == "BUY" else "BUY"
+    norm_qty = _normalize_qty(symbol, qty)
+    payload = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "MARKET",
+        "quantity": norm_qty,
+        "reduceOnly": True,
+        "recvWindow": 5000,
+    }
+    log(f"[FORCE CLOSE REQ] {payload}")
     try:
-        req("POST", "/openApi/swap/v2/trade/order", {
-            "symbol": symbol,
-            "side": close_side,
-            "type": "MARKET",
-            "quantity": qty,
-            "reduceOnly": True,
-        })
-        send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={qty}")
+        req("POST", "/openApi/swap/v2/trade/order", payload)
+        send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
     except Exception as e:
         send_tg(f"❗ 포지션 강제 정리 실패: {e}")
 
