@@ -84,6 +84,12 @@ run_bot.py
 - range_blocked_today 분기에서 "대체 느슨 추세를 시도했는지"까지 로그로 남기도록 보강
 - 엄격 추세가 실패했을 때 (3m 자체 없음 / 15m 방향 없음 / 3m-15m 불일치) 각각을 CSV에 남겨서 왜 RANGE로 내려갔는지 보이게 함
 - balance detail 호출 실패 시에도 CSV에 남겨서 원인을 추적 가능하게 함
+
+2025-11-10 11차 수정 (3m 캔들은 거래량까지 주는 버전으로 받아서 언패킹 오류 방지):
+- market_data 에 추가된 get_klines_with_volume(...)을 3m 전용으로 사용
+- 전략(decide_signal_3m_trend 등)은 여전히 5개짜리 캔들을 기대하므로 3m 데이터는
+  (ts, o, h, l, c, v) → (ts, o, h, l, c) 로 한 번 더 가공해서 넘김
+- 거래량 가드는 6번째 값만 따로 보고, 캔들에 거래량이 없으면 그대로 통과
 """
 
 from __future__ import annotations
@@ -108,7 +114,8 @@ from exchange_api import (
     set_leverage_and_mode,
     get_balance_detail,  # 8차: 수동 포지션 감지용
 )
-from market_data import get_klines, get_orderbook
+# 여기서 3m 은 거래량까지, 나머지는 원래대로
+from market_data import get_klines, get_klines_with_volume, get_orderbook
 from indicators import calc_atr
 from strategies_trend import (
     decide_signal_3m_trend,
@@ -609,7 +616,7 @@ def main() -> None:
                     elif t.source == "RANGE":
                         LAST_CLOSE_TS_RANGE = now
 
-                    # 박스장 손절 누적 → 원래는 여기서 오늘 하루 끄던 줄이 있었음
+                    # 박스장 손절 누적
                     if t.source == "RANGE" and reason == "SL" and pnl < 0:
                         RANGE_DAILY_SL += 1
                         if RANGE_DAILY_SL >= SET.range_max_daily_sl:
@@ -705,14 +712,20 @@ def main() -> None:
                 time.sleep(2)
                 continue
 
-            # 3분봉 데이터
+            # ─────────────────────────────
+            # 3분봉 데이터 (이제는 거래량까지 같이 받는 전용 함수)
+            # ─────────────────────────────
             try:
-                candles_3m = get_klines(SET.symbol, SET.interval, 120)
+                candles_3m_raw = get_klines_with_volume(SET.symbol, SET.interval, 120)
                 CONSEC_KLINE_FAILS = 0
-                if candles_3m:
+                if candles_3m_raw:
+                    # 전략에 쓸 5개짜리 버전
+                    candles_3m = [c[:5] for c in candles_3m_raw]
                     log(
                         f"[DATA] 3m klines ok: symbol={SET.symbol} count={len(candles_3m)} last_close={candles_3m[-1][4]}"
                     )
+                else:
+                    candles_3m = []
             except Exception as e:
                 CONSEC_KLINE_FAILS += 1
                 log(f"[KLINE ERROR] {e} (fail={CONSEC_KLINE_FAILS})")
@@ -950,12 +963,11 @@ def main() -> None:
             last_vol = None
             avg_vol_20 = None
             try:
-                # get_klines 가 [ts, o, h, l, c, vol, ...] 구조라는 전제
-                last_vol = float(candles_3m[-1][5])
-                vols_20 = [float(c[5]) for c in candles_3m[-20:]]
+                # candles_3m_raw 는 (ts,o,h,l,c,vol) 이다
+                last_vol = float(candles_3m_raw[-1][5])
+                vols_20 = [float(c[5]) for c in candles_3m_raw[-20:]]
                 avg_vol_20 = sum(vols_20) / len(vols_20)
             except Exception:
-                # 캔들에 볼륨 없으면 그냥 통과
                 last_vol = None
                 avg_vol_20 = None
 

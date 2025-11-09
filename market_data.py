@@ -2,7 +2,7 @@
 시세/호가(depth) 관련 함수만 모아 둔 모듈.
 
 이 모듈이 하는 일:
-- BingX 에서 캔들(klines)을 가져와서 `(ts, open, high, low, close, volume)` 형태의 리스트로 정규화  ← (2025-11-10 거래량 필드 추가)
+- BingX 에서 캔들(klines)을 가져와서 `(ts, open, high, low, close)` 형태의 리스트로 정규화
 - 최신 캔들이 지연됐는지 판단할 수 있도록 정렬까지 마친 상태로 리턴
 - 진입 직전에 호가 스프레드가 얼마나 벌어져 있는지 확인하기 위해 orderbook(depth) 조회
 
@@ -12,10 +12,10 @@
 - 현물로 바꾸고 싶으면 아래 URL 을 spot 용으로만 바꿔주면 된다.
 
 2025-11-10 추가:
-- run_bot.py 에서 3m 거래량으로 진입을 거르도록 수정했기 때문에,
-  여기서도 캔들을 5튜플이 아니라 6튜플 `(ts, o, h, l, c, vol)` 로 넘기도록 변경.
-- BingX 응답이 dict 형식일 때는 `volume` / `vol` / `baseVol` 순서로 탐색해서 넣고,
-  list 형식일 때는 6번째가 있으면 그걸 volume 으로 쓰고, 없으면 0.0 으로 채운다.
+- 캔들을 거래량까지 포함해서 받고 싶은 경우를 위해
+  `get_klines_with_volume(...)` 를 추가했다.
+- 이 함수는 `(ts, open, high, low, close, volume)` 형태로 리턴한다.
+- 기존 전략 코드가 다 5개짜리 튜플을 가정하고 있어서, 기존 `get_klines(...)`는 건드리지 않았다.
 """
 
 from __future__ import annotations
@@ -32,17 +32,17 @@ BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 
 
 # ─────────────────────────────
-# 캔들 데이터 가져오기 (선물 기준)
+# 캔들 데이터 가져오기 (선물 기준, 5개짜리 기본 버전)
 # ─────────────────────────────
 def get_klines(
     symbol: str,
     interval: str,
     limit: int = 120,
-) -> List[Tuple[int, float, float, float, float, float]]:
+) -> List[Tuple[int, float, float, float, float]]:
     """BingX 선물(swap) klines 엔드포인트에서 캔들을 받아와서 정규화한다.
 
     반환 형식:
-        [ (timestamp(ms), open, high, low, close, volume), ... ]
+        [ (timestamp(ms), open, high, low, close), ... ]
     - timestamp 는 int(ms) 로 맞춰서 정렬해서 리턴한다.
     - 일부 응답은 dict 형식이고, 일부는 list 형식이라 둘 다 처리한다.
     - 실패하면 빈 리스트를 리턴한다 (상위에서 재시도/대기하도록).
@@ -60,8 +60,7 @@ def get_klines(
 
     # BingX 는 보통 {"data": [...]} 형태로 준다.
     data = raw.get("data", []) if isinstance(raw, dict) else raw
-    # 우리가 리턴할 건 이제 6개짜리 튜플
-    out: List[Tuple[int, float, float, float, float, float]] = []
+    out: List[Tuple[int, float, float, float, float]] = []
 
     for it in data:
         # dict 형식일 때
@@ -75,32 +74,16 @@ def get_klines(
                 h = float(it.get("high"))
                 l = float(it.get("low"))
                 c = float(it.get("close"))
-                # 거래량 필드는 거래소마다 이름이 달라서 몇 개를 순서대로 확인
-                v_raw = (
-                    it.get("volume")
-                    or it.get("vol")
-                    or it.get("baseVol")
-                    or it.get("quoteVol")
-                    or 0.0
-                )
-                v = float(v_raw)
             except Exception:
                 # 숫자 변환 실패하면 해당 캔들은 건너뛴다.
                 continue
-            out.append((ts, o, h, l, c, v))
+            out.append((ts, o, h, l, c))
         else:
-            # list 형식일 때: 통상 [ts, open, high, low, close, volume, ...]
+            # list 형식일 때: [ts, open, high, low, close, ...]
             try:
                 ts = int(it[0])
-                o = float(it[1])
-                h = float(it[2])
-                l = float(it[3])
-                c = float(it[4])
-                if len(it) > 5:
-                    v = float(it[5])
-                else:
-                    v = 0.0
-                out.append((ts, o, h, l, c, v))
+                o, h, l, c = map(float, it[1:5])
+                out.append((ts, o, h, l, c))
             except Exception:
                 continue
 
@@ -108,12 +91,79 @@ def get_klines(
     out.sort(key=lambda x: x[0])
 
     if out:
-        # 볼륨도 찍어주면 디버깅에 좋다
-        log(
-            f"[KLINES {interval}] ok count={len(out)} last_close={out[-1][4]} last_vol={out[-1][5]}"
-        )
+        log(f"[KLINES {interval}] ok count={len(out)} last_close={out[-1][4]}")
     else:
         log(f"[KLINES {interval}] empty for {symbol}")
+
+    return out
+
+
+# ─────────────────────────────
+# 캔들 데이터 + 거래량까지 가져오기 (선물 기준, 6개짜리 보강 버전)
+# ─────────────────────────────
+def get_klines_with_volume(
+    symbol: str,
+    interval: str,
+    limit: int = 120,
+) -> List[Tuple[int, float, float, float, float, float]]:
+    """BingX 선물(swap) klines 엔드포인트에서 캔들을 받아와서
+    (ts, open, high, low, close, volume) 형태로 정규화한다.
+
+    - run_bot.py 처럼 '진입 직전에 이 캔들 볼륨이 너무 말랐는지' 확인할 때만 이걸 쓰고,
+      나머지 전략/인디케이터 코드는 기존 get_klines(...) 를 계속 쓰면 된다.
+    """
+    try:
+        resp = requests.get(
+            f"{BASE}/openApi/swap/v2/quote/klines",
+            params={"symbol": symbol, "interval": interval, "limit": limit},
+            timeout=12,
+        )
+        raw = resp.json()
+    except Exception as e:
+        log(f"[KLINES VOL ERROR] symbol={symbol} interval={interval} err={e}")
+        return []
+
+    data = raw.get("data", []) if isinstance(raw, dict) else raw
+    out: List[Tuple[int, float, float, float, float, float]] = []
+
+    for it in data:
+        if isinstance(it, dict):
+            ts_val = it.get("time") or it.get("openTime") or it.get("t")
+            if not ts_val:
+                continue
+            try:
+                ts = int(ts_val)
+                o = float(it.get("open"))
+                h = float(it.get("high"))
+                l = float(it.get("low"))
+                c = float(it.get("close"))
+                # BingX 가 volume, vol 둘 중 하나로 줄 수 있으니 둘 다 시도
+                v = float(it.get("volume") or it.get("vol") or 0.0)
+            except Exception:
+                continue
+            out.append((ts, o, h, l, c, v))
+        else:
+            # list 형식일 때는 보통 [ts, o, h, l, c, v, ...] 이런 식
+            try:
+                ts = int(it[0])
+                o = float(it[1])
+                h = float(it[2])
+                l = float(it[3])
+                c = float(it[4])
+                v = float(it[5]) if len(it) > 5 else 0.0
+            except Exception:
+                continue
+            out.append((ts, o, h, l, c, v))
+
+    out.sort(key=lambda x: x[0])
+
+    if out:
+        log(
+            f"[KLINES {interval} VOL] ok count={len(out)} "
+            f"last_close={out[-1][4]} vol={out[-1][5]}"
+        )
+    else:
+        log(f"[KLINES {interval} VOL] empty for {symbol}")
 
     return out
 
@@ -144,4 +194,4 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
         return None
 
 
-__all__ = ["get_klines", "get_orderbook"]
+__all__ = ["get_klines", "get_klines_with_volume", "get_orderbook"]
