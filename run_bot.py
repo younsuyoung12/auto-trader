@@ -61,7 +61,7 @@ run_bot.py
 - 이렇게 하면 "지금 내가 이미 사둔 포지션"도 봇이 인식해서 중복 진입을 방지한다.
 
 2025-11-09 8차 수정 (포지션 API 미지원 계정용 usedMargin 진입 가드):
-- 일부 계정은 /openApi/swap/v2/trade/positions 가 100400 を 내면서 아예 안 된다.
+- 일부 계정은 /openApi/swap/v2/trade/positions 가 100400 을 내면서 아예 안 된다.
 - 이런 계정에서는 주기 동기화를 해도 항상 "열려 있는 포지션이 없습니다." 로 찍히는데,
   balance 안의 data.balance.usedMargin 은 계속 증가/유지된다.
 - 루프에서 포지션이 없다고 판단한 뒤에도 잔고를 한 번 더 읽어서
@@ -79,10 +79,11 @@ run_bot.py
 - RANGE 시그널도 SET.enable_1m_confirm 가 켜져 있으면 1분봉으로 방향을 다시 확인
 - RANGE 손절 일일 한도 초과 시 하루 전체 비활성화하던 줄을 주석 처리해 연구·관찰 상황에서도 다음 캔들에서 다시 기회를 보도록 변경
 
-2025-11-10 10차 수정 (3m 거래량 가드 + 레인지/대체추세 로그 보강):
+2025-11-10 10차 수정 (3m 거래량 가드 + 레인지/대체추세 로그 보강 + 추세 실패 이유 CSV 기록 + balance detail 에러 CSV 기록):
 - 신호가 선택된 뒤, 실제 진입 직전에 3m 캔들의 거래량이 최근 20개 평균의 min_entry_volume_ratio (기본 0.3) 미만이면 그 캔들만 진입을 스킵
 - range_blocked_today 분기에서 "대체 느슨 추세를 시도했는지"까지 로그로 남기도록 보강
-- 이렇게 하면 하루잠금 없이도 렌더 로그/CSV만 보고 왜 스킵됐는지 역추적 가능
+- 엄격 추세가 실패했을 때 (3m 자체 없음 / 15m 방향 없음 / 3m-15m 불일치) 각각을 CSV에 남겨서 왜 RANGE로 내려갔는지 보이게 함
+- balance detail 호출 실패 시에도 CSV에 남겨서 원인을 추적 가능하게 함
 """
 
 from __future__ import annotations
@@ -306,7 +307,8 @@ def start_drive_sync_thread() -> None:
 # 3-1. 텔레그램 명령 수신 스레드
 # ─────────────────────────────
 def start_telegram_command_thread() -> None:
-    """텔레그램에서 '종료' 같은 한글 명령을 받아와 SAFE_STOP_REQUESTED 를 켜는 스레드
+    """
+    텔레그램에서 '종료' 같은 한글 명령을 받아와 SAFE_STOP_REQUESTED 를 켜는 스레드
     409 Conflict (다른 곳에서 이미 getUpdates 중) 이 떠도 메인 봇은 계속 돌아야 하므로
     그 경우는 그냥 로그만 찍고 재시도한다.
     """
@@ -664,6 +666,14 @@ def main() -> None:
                 used_margin = float(bal_detail.get("usedMargin") or 0.0)
             except Exception as e:
                 log(f"[MANUAL_GUARD] balance detail error: {e}")
+                # CSV 에도 남겨서 왜 수동포지션 체크를 못 했는지 보이게 한다
+                log_signal(
+                    event="SKIP",
+                    symbol=SET.symbol,
+                    strategy_type="UNKNOWN",
+                    reason="manual_guard_balance_error",
+                    extra=str(e),
+                )
                 used_margin = 0.0
 
             if used_margin > 0:
@@ -784,6 +794,32 @@ def main() -> None:
                 )
                 trend_15m_val = decide_trend_15m(candles_15m) if candles_15m else None
 
+                # 엄격 추세가 왜 안 됐는지 CSV 로 남긴다 (연구용)
+                if not sig_3m:
+                    log_signal(
+                        event="SKIP",
+                        symbol=SET.symbol,
+                        strategy_type="TREND",
+                        reason="trend_3m_no_signal",
+                        candle_ts=latest_3m_ts,
+                    )
+                elif not trend_15m_val:
+                    log_signal(
+                        event="SKIP",
+                        symbol=SET.symbol,
+                        strategy_type="TREND",
+                        reason="trend_15m_unknown",
+                        candle_ts=latest_3m_ts,
+                    )
+                elif sig_3m != trend_15m_val:
+                    log_signal(
+                        event="SKIP",
+                        symbol=SET.symbol,
+                        strategy_type="TREND",
+                        reason="trend_3m_15m_mismatch",
+                        candle_ts=latest_3m_ts,
+                    )
+
                 if sig_3m and trend_15m_val and sig_3m == trend_15m_val:
                     if (time.time() - LAST_CLOSE_TS_TREND) >= SET.cooldown_after_close_trend:
                         chosen_signal = sig_3m
@@ -872,6 +908,15 @@ def main() -> None:
                         if loose_sig and loose_trend_15m and loose_sig == loose_trend_15m:
                             chosen_signal = loose_sig
                             signal_source = "TREND"  # fallback 이지만 TREND로 표기
+                            # CSV에도 남겨둔다
+                            log_signal(
+                                event="ENTRY_SIGNAL",
+                                symbol=SET.symbol,
+                                strategy_type="TREND",
+                                direction=loose_sig,
+                                reason="range_blocked_fallback_to_loose_trend",
+                                candle_ts=latest_3m_ts,
+                            )
                             send_skip_tg("[INFO] range blocked → loose TREND fallback used")
                         else:
                             # 그래도 없으면 이 캔들만 SKIP
