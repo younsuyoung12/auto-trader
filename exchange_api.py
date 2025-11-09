@@ -1,4 +1,5 @@
-"""exchange_api.py
+"""
+exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
 이 모듈이 담당하는 것:
@@ -11,13 +12,21 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 체결내역 요약(summarize_fills)
 
 2025-11-09 수정/추가 내용
-- BingX가 HTTP 200을 줘도 JSON 안에 code가 0이 아니면 실패로 보도록 req()를 보강했다.
-  (단, 일부 엔드포인트가 주는 100400은 기존 코드처럼 상위에서 처리할 수 있게 예외로 올리지 않는다.)
-- 시장가 주문(place_market)과 조건부 주문(place_conditional)을 넣을 때
-  BingX가 돌려준 원본 응답을 log()로 남기도록 했다.
-  → 텔레그램에 "시장가 진입 응답에 orderId가 없어 포지션을 건너뜁니다." 가 찍히는 원인을
-     서버 로그에서 바로 확인할 수 있게 하기 위함.
-- 나머지 공개/조회용 함수는 기존 동작을 유지한다.
+1) 응답 검증 강화
+   - BingX가 HTTP 200을 줘도 JSON 안에 code가 0/None/100400 이 아니면 실패로 보도록 req()를 보강했다.
+   - 단, 일부 엔드포인트가 주는 100400은 기존처럼 예외를 던지지 않고 그대로 돌려줘서
+     상위(run_bot.py 등)에서 “이 API는 계정에서 미지원”으로 처리할 수 있게 했다.
+
+2) 주문 응답 로그 추가
+   - 시장가 주문(place_market)과 조건부 주문(place_conditional)을 넣을 때
+     BingX가 돌려준 원본 응답을 log()로 남기도록 했다.
+     → 텔레그램에 "시장가 진입 응답에 orderId가 없어 포지션을 건너뜁니다." 가 찍히는 원인을
+       서버 로그에서 바로 확인할 수 있게 하기 위함.
+
+3) 레버리지 설정 파라미터 보완 (중요)
+   - BingX 선물 v2 레버리지 설정이 symbol + leverage 만으로는 109400(Invalid parameters)를 내는 케이스가 있어서
+     side="BOTH" 를 같이 보내도록 수정했다.
+   - 이렇게 하면 롱/숏 양쪽 레버리지가 동시에 설정되므로 run_bot.py 에서 한 번만 호출해도 된다.
 
 주의:
 - 여기서는 "OPEN_TRADES" 같은 봇 내부 상태는 다루지 않는다.
@@ -206,13 +215,18 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """레버리지와 마진 모드를 설정한다.
 
+    2025-11-09: BingX 선물 v2 레버리지 설정 시 side 가 없으면 109400 을 주는 케이스가 있어서
+    side="BOTH" 를 같이 보내도록 수정했다.
     실패하더라도 봇 전체가 멈출 필요는 없으므로 예외를 상위로 올리지 않는다.
     """
     try:
+        # 레버리지: 롱/숏 둘 다 동일하게 맞추기 위해 side=BOTH
         req("POST", "/openApi/swap/v2/trade/leverage", {
             "symbol": symbol,
             "leverage": leverage,
+            "side": "BOTH",
         })
+        # 마진 모드
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
             "marginType": "ISOLATED" if isolated else "CROSSED",
@@ -286,7 +300,11 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
-    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다."""
+    """체결 내역 여러 건을 한 번에 요약해서 평균가/총수량/실현손익을 계산한다.
+
+    - TP/SL 이 체결된 뒤 run_bot 에서 텔레그램용 메시지를 만들 때 사용한다.
+    - 체결이 하나도 없으면 None 리턴.
+    """
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
