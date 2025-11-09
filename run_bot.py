@@ -59,6 +59,14 @@ run_bot.py
 - 이를 막기 위해 루프 안에서 일정 주기(기본 20초, settings.position_resync_sec 가 있으면 그 값)로
   fetch_open_positions() / fetch_open_orders() 를 다시 호출해 OPEN_TRADES 를 교체하도록 했다.
 - 이렇게 하면 "지금 내가 이미 사둔 포지션"도 봇이 인식해서 중복 진입을 방지한다.
+
+2025-11-09 8차 수정 (포지션 API 미지원 계정용 usedMargin 진입 가드):
+- 일부 계정은 /openApi/swap/v2/trade/positions 가 100400 을 내면서 아예 안 된다.
+- 이런 계정에서는 주기 동기화를 해도 항상 "열려 있는 포지션이 없습니다." 로 찍히는데,
+  balance 안의 data.balance.usedMargin 은 계속 증가/유지된다.
+- 루프에서 포지션이 없다고 판단한 뒤에도 잔고를 한 번 더 읽어서
+  usedMargin > 0 이면 "사람이 수동으로 들고 있는 포지션"으로 보고 신규 진입을 건너뛰도록 했다.
+- 이렇게 하면 봇이 만든 포지션만 익절/손절하고, 사람이 만든 포지션 위에 얹어서 진입하지 않는다.
 """
 
 from __future__ import annotations
@@ -81,6 +89,7 @@ from exchange_api import (
     fetch_open_positions,
     fetch_open_orders,
     set_leverage_and_mode,
+    get_balance_detail,  # 8차: 수동 포지션 감지용
 )
 from market_data import get_klines, get_orderbook
 from indicators import calc_atr
@@ -519,7 +528,6 @@ def main() -> None:
 
             # ─────────────────────────────
             # 0) 거래소 포지션 주기적 재동기화
-            #    ↳ 사람이 거래소에서 수동으로 포지션 열어도 여기서 봇이 다시 인식
             # ─────────────────────────────
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 sync_open_trades_from_exchange(SET.symbol, replace=True)
@@ -628,6 +636,26 @@ def main() -> None:
             # 포지션 살아 있으면 신규 진입 안 함
             if OPEN_TRADES:
                 time.sleep(1)
+                continue
+
+            # ─────────────────────────────
+            # 8차: 포지션 API가 안 되는 계정용 수동 포지션 가드
+            #  - 여기까지 왔다는 건 우리 쪽에서는 포지션이 없다고 봤다는 뜻인데
+            #  - 잔고에서 usedMargin 이 0보다 크면 실제로는 뭔가 들고 있는 것이다.
+            #  - 이런 경우는 사람이 거래소 앱에서 손으로 잡아둔 포지션일 가능성이 높으니
+            #    봇은 새로 진입하지 말고 스킵만 한다.
+            # ─────────────────────────────
+            try:
+                bal_detail = get_balance_detail()
+                used_margin = float(bal_detail.get("usedMargin") or 0.0)
+            except Exception as e:
+                # 잔고가 안 불러와져도 봇이 아예 죽으면 안 되니까 로그만
+                log(f"[MANUAL_GUARD] balance detail error: {e}")
+                used_margin = 0.0
+
+            if used_margin > 0:
+                send_skip_tg("[SKIP] manual_position_detected: usedMargin>0 → 신규 진입 건너뜀")
+                time.sleep(2)
                 continue
 
             # 포지션이 없는데 종료 요청 플래그만 켜져 있으면 여기서 종료 + STOP_FLAG

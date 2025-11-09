@@ -33,6 +33,12 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
      0.001 단위로 내림(floor) 후 소수 셋째 자리까지로 잘라서 전송하도록 변경했다.
    - 이 변경으로 전략단(run_bot.py / trader.py)에서 약간 지저분한 수량을 내려보내도
      실제 API 호출 시에는 거래소가 받는 단위로 정리된다.
+
+5) 잔고 상세(raw) 조회 헬퍼 추가
+   - 일부 계정은 포지션 API가 없어서 run_bot.py 쪽에서 “사람이 들고 있는 포지션이 있는지”를
+     잔고의 usedMargin 으로 추정해야 한다.
+   - 이를 위해 /openApi/swap/v2/user/balance 의 안쪽 balance dict 를 그대로 꺼내는
+     get_balance_detail() 을 추가했다.
 """
 
 from __future__ import annotations
@@ -190,6 +196,36 @@ def get_available_usdt() -> float:
         log(f"[BALANCE ERROR] {e}")
         send_tg(f"⚠️ 잔고 조회 실패: {e}")
         return 0.0
+
+
+def get_balance_detail() -> Dict[str, Any]:
+    """
+    잔고 전체 구조를 그대로(혹은 최대한 평평하게) 돌려준다.
+    run_bot.py 쪽에서 usedMargin 이나 freezedMargin 으로
+    “사람이 이미 포지션 들고 있는지” 추정할 때 쓴다.
+    """
+    res = req("GET", "/openApi/swap/v2/user/balance", {})
+    log(f"[BALANCE RAW for detail] {res}")
+
+    data = res.get("data") or res.get("balances") or res
+
+    # 가장 자주 보는 구조: {"data": {"balance": {...}}}
+    if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
+        return data["balance"]
+
+    # 리스트로 올 수도 있음
+    if isinstance(data, list) and data:
+        # 첫 원소 안에 balance 가 있으면 그걸, 아니면 첫 원소를
+        first = data[0]
+        if isinstance(first, dict) and "balance" in first and isinstance(first["balance"], dict):
+            return first["balance"]
+        return first
+
+    # 그래도 아니면 그냥 data 전체
+    if isinstance(data, dict):
+        return data
+
+    return {"raw": res}
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
@@ -427,6 +463,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
 __all__ = [
     "req",
     "get_available_usdt",
+    "get_balance_detail",
     "fetch_open_positions",
     "fetch_open_orders",
     "set_leverage_and_mode",
