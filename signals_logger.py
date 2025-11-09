@@ -13,6 +13,12 @@ event 예시:
 - "ENTRY_OPENED"   : 실제로 주문 나가고 포지션 열린 시점
 - "CLOSE"          : TP/SL/강제청산 등으로 닫혔을 때
 - "SKIP"           : 조건 안 맞아서/가드에 걸려서 안 들어갔을 때
+
+2025-11-10 추가/변경
+1) 모듈이 import 되는 시점에 그날(KST) 날짜 파일이 없으면 헤더만 있는 빈 CSV를 미리 만들어 둔다.
+   → 진입·스킵이 전혀 없어도 드라이브 업로더가 올릴 수 있게 됨.
+2) log_signal()이 호출될 때마다도 해당 날짜 파일 존재여부를 다시 확인해서
+   자정(KST) 이후에도 자동으로 새 파일이 생기도록 했다.
 """
 
 from __future__ import annotations
@@ -21,7 +27,6 @@ import csv
 import os
 import datetime
 from typing import Optional
-
 
 # 로그가 쌓일 기본 폴더
 BASE_DIR = os.path.join("logs", "signals")
@@ -48,11 +53,64 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def _get_csv_path() -> str:
-    """오늘 날짜 기준 CSV 파일 경로를 돌려준다."""
+def _csv_path_for(day_str: str) -> str:
+    """주어진 날짜(KST)용 CSV 파일 전체 경로를 돌려준다."""
     _ensure_dir(BASE_DIR)
-    fname = f"signals-{_today_kst_str()}.csv"
+    fname = f"signals-{day_str}.csv"
     return os.path.join(BASE_DIR, fname)
+
+
+def _ensure_today_csv() -> str:
+    """
+    오늘(KST) 날짜의 CSV가 없으면 헤더만 있는 빈 파일을 만들어둔다.
+    - run_bot 이 켜지는 순간 바로 오늘자 파일이 생기게 하기 위함.
+    """
+    day = _today_kst_str()
+    path = _csv_path_for(day)
+    fieldnames = [
+        "ts_kst",
+        "event",
+        "symbol",
+        "strategy_type",
+        "direction",
+        "price",
+        "qty",
+        "tp_price",
+        "sl_price",
+        "reason",
+        "pnl",
+        "trade_id",
+        "exchange_order_id",
+        "step",
+        "candle_ts",
+        "signal_price",
+        "rsi_3m",
+        "trend_15m",
+        "atr_fast",
+        "atr_slow",
+        "spread_pct",
+        "available_usdt",
+        "notional",
+        "strategy_version",
+        "extra",
+    ]
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+    return path
+
+
+# 모듈이 로드될 때 오늘자 파일을 한 번 만들어 둔다.
+_ensure_today_csv()
+
+
+def _get_csv_path() -> str:
+    """
+    오늘 날짜 기준 CSV 파일 경로를 돌려준다.
+    이때 파일이 없으면 헤더만 있는 새 파일을 만든다.
+    """
+    return _ensure_today_csv()
 
 
 def log_signal(
@@ -87,6 +145,7 @@ def log_signal(
 ) -> None:
     """
     한 줄을 CSV에 쓴다. 파일이 없으면 헤더를 먼저 쓴다.
+    (자정 이후에도 신규 파일이 자동으로 생기게 _get_csv_path()가 알아서 처리)
     """
     path = _get_csv_path()
     file_exists = os.path.exists(path)
@@ -151,6 +210,8 @@ def log_signal(
 
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
+        # _ensure_today_csv()에서 이미 헤더를 써놨으면 file_exists는 True지만,
+        # 자정 지나 새 파일이 생긴 경우에는 여기서도 헤더를 한 번 더 써준다.
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)

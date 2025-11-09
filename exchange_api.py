@@ -39,6 +39,12 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
      잔고의 usedMargin 으로 추정해야 한다.
    - 이를 위해 /openApi/swap/v2/user/balance 의 안쪽 balance dict 를 그대로 꺼내는
      get_balance_detail() 을 추가했다.
+
+6) positionSide 강제 추가 (헤지/원웨이 공통 호환)
+   - 일부 계정/환경에서 MARKET, 조건부 주문에 positionSide 가 없으면 109400 이 난다.
+   - place_market(), place_conditional(), close_position_market() 에서 side 값을 보고
+     positionSide=LONG/SHORT 를 함께 전송하도록 수정했다.
+   - 이렇게 해도 원웨이 모드에서는 문제 없이 처리된다.
 """
 
 from __future__ import annotations
@@ -310,12 +316,14 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     시장가 주문을 발행한다.
     - run_bot.py / trader.py 에서 넘어온 수량을 그대로 쓰지 않고
       여기서 선물 규격(0.001)로 내린 뒤 전송한다.
-    - 이렇게 해야 109400 Invalid parameters 를 피할 수 있다.
+    - 헤지/원웨이 계정 모두에서 동작하도록 positionSide 도 함께 보낸다.
     """
     norm_qty = _normalize_qty(symbol, qty)
+    position_side = "LONG" if side.upper() == "BUY" else "SHORT"  # ← 추가
     payload = {
         "symbol": symbol,
         "side": side,
+        "positionSide": position_side,  # ← 추가
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
@@ -337,11 +345,14 @@ def place_conditional(
     TP/SL 과 같은 조건부 주문을 발행한다.
     - 진입 수량과 동일한 규칙으로 0.001 단위로 내린다.
     - reduceOnly=True 로 보내서 포지션을 늘리지 않게 한다.
+    - 헤지/원웨이 계정 모두에서 동작하도록 positionSide 도 함께 보낸다.
     """
     norm_qty = _normalize_qty(symbol, qty)
+    position_side = "LONG" if side.upper() == "BUY" else "SHORT"  # ← 추가
     payload = {
         "symbol": symbol,
         "side": side,
+        "positionSide": position_side,  # ← 추가
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
@@ -441,12 +452,16 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     TP/SL 세팅이 실패했을 때 포지션을 즉시 시장가로 닫을 때 사용.
     이때도 선물 수량 규격을 맞춰서 보낸다.
+    헤지/원웨이 공통으로 positionSide 를 함께 보낸다.
     """
     close_side = "SELL" if side_open == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
+    # 진입이 BUY(롱)이었으면 닫을 때는 숏 포지션을 줄이는 것이므로 positionSide=SHORT
+    position_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
     payload = {
         "symbol": symbol,
         "side": close_side,
+        "positionSide": position_side,  # ← 추가
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
