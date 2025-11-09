@@ -67,6 +67,12 @@ run_bot.py
 - 루프에서 포지션이 없다고 판단한 뒤에도 잔고를 한 번 더 읽어서
   usedMargin > 0 이면 "사람이 수동으로 들고 있는 포지션"으로 보고 신규 진입을 건너뛰도록 했다.
 - 이렇게 하면 봇이 만든 포지션만 익절/손절하고, 사람이 만든 포지션 위에 얹어서 진입하지 않는다.
+
+2025-11-10 추가 (드라이브 업로드 시 오늘 CSV 강제 생성):
+- 기존에는 "로컬에 오늘자 파일이 있으면"만 드라이브에 올렸기 때문에
+  자정 이후 아무 로그가 없으면 드라이브에 안 올라갔다.
+- drive_sync 스레드에서 업로드하기 전에 signals_logger._ensure_today_csv() 를 호출해
+  오늘자 CSV를 먼저 만들고 그걸 올리도록 변경.
 """
 
 from __future__ import annotations
@@ -109,7 +115,7 @@ from trader import (
     check_closes,
 )
 from drive_uploader import upload_to_drive
-from signals_logger import log_signal
+from signals_logger import log_signal, _ensure_today_csv  # ← 오늘 파일 강제 생성용 추가
 
 
 # ─────────────────────────────
@@ -240,9 +246,11 @@ def start_health_server() -> None:
 # ─────────────────────────────
 def start_drive_sync_thread() -> None:
     """
-    logs/signals 안에 오늘자 CSV가 있으면 5분마다 구글 드라이브에 올리고,
-    3일 지난 CSV는 로컬(Render 디스크)에서 지우는 스레드.
-    → 매매 루프 성능에 영향 거의 없음.
+    (수정됨)
+    - 5분마다 '오늘자' CSV를 먼저 로컬에 생성하고
+    - 생성된 그 파일을 구글 드라이브에 올린다.
+    - 3일 지난 CSV는 로컬(Render 디스크)에서 지워서 용량을 유지한다.
+    이렇게 하면 자정 이후에 신호가 한 번도 안 와도 드라이브에 날짜별 파일이 생긴다.
     """
     SYNC_INTERVAL_SEC = 300  # 5분
     KEEP_DAYS = 3  # 3일 지난 건 삭제
@@ -250,17 +258,17 @@ def start_drive_sync_thread() -> None:
     def _worker():
         while True:
             try:
-                # 오늘 날짜 기준 파일 경로
-                day_str = datetime.datetime.now(KST).strftime("%Y-%m-%d")
-                local_dir = os.path.join("logs", "signals")
-                local_path = os.path.join(local_dir, f"signals-{day_str}.csv")
+                # 1) 오늘자 CSV가 없으면 여기서 먼저 만든다
+                #    signals_logger 쪽에서 헤더까지 적힌 파일을 돌려준다.
+                local_path = _ensure_today_csv()
+                day_str = os.path.basename(local_path).replace("signals-", "").replace(".csv", "")
 
-                # 있으면 드라이브로 업로드
-                if os.path.exists(local_path):
-                    upload_to_drive(local_path, f"signals-{day_str}.csv")
-                    log("[DRIVE_SYNC] uploaded today's signals csv")
+                # 2) 드라이브로 업로드 (없으면 create, 있으면 update)
+                upload_to_drive(local_path, f"signals-{day_str}.csv")
+                log("[DRIVE_SYNC] uploaded today's signals csv")
 
-                # 오래된 CSV 정리
+                # 3) 오래된 CSV 정리
+                local_dir = os.path.dirname(local_path)
                 if os.path.exists(local_dir):
                     now_ts = time.time()
                     for fname in os.listdir(local_dir):
@@ -640,16 +648,11 @@ def main() -> None:
 
             # ─────────────────────────────
             # 8차: 포지션 API가 안 되는 계정용 수동 포지션 가드
-            #  - 여기까지 왔다는 건 우리 쪽에서는 포지션이 없다고 봤다는 뜻인데
-            #  - 잔고에서 usedMargin 이 0보다 크면 실제로는 뭔가 들고 있는 것이다.
-            #  - 이런 경우는 사람이 거래소 앱에서 손으로 잡아둔 포지션일 가능성이 높으니
-            #    봇은 새로 진입하지 말고 스킵만 한다.
             # ─────────────────────────────
             try:
                 bal_detail = get_balance_detail()
                 used_margin = float(bal_detail.get("usedMargin") or 0.0)
             except Exception as e:
-                # 잔고가 안 불러와져도 봇이 아예 죽으면 안 되니까 로그만
                 log(f"[MANUAL_GUARD] balance detail error: {e}")
                 used_margin = 0.0
 
