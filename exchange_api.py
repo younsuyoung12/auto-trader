@@ -2,36 +2,23 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
-이 모듈이 담당하는 것:
-- 쿼리 스트링 서명 (HMAC SHA256)
-- 공통 요청(req)
-- 레버리지/마진 설정
-- 잔고 조회, 포지션 조회, 주문 조회
-- 시장가/조건부 주문 생성
-- 주문 상태 폴링(wait_filled)
-- 체결내역 요약(summarize_fills)
-
-2025-11-12 수정 (7차)  ← 이 버전
+2025-11-11 수정 (6차)  ← 이번 수정
 ----------------------------------------------------
-(현상)
-- 계정에서 주문을 보냈더니
-    1) "positionSide: This field is required."
-    2) 이어서 "In the One-way mode, the 'PositionSide' field can only be set to BOTH."
-  이 두 가지가 보였다.
-- 즉 이 계정은
-    - positionSide 를 반드시 보내야 하고
-    - 보내더라도 LONG/SHORT 는 안 되고
-    - 오직 BOTH 만 허용한다.
+(왜 바꿨나)
+- 실제 계정에서 시장가 주문이 109400으로 떨어지면서
+  "In the One-way mode, the 'PositionSide' field can only be set to BOTH."
+  라는 메시지를 줬다.
+- 이 말은 이 계정이 **단방향이면서도 positionSide=BOTH 를 강제로 요구**한다는 뜻이다.
+- 그래서 주문을 보낼 때
+    1) positionSide 없이 한 번 보내고
+    2) 109400/Invalid parameters 면 같은 payload 에 positionSide="BOTH" 를 붙여서 다시 보내는
+  2단계 폴백을 넣었다.
+- 조건부 주문(place_conditional)하고 강제청산(close_position_market)도 똑같이 한다.
+- 로그에도 1차 실패 → 2차 재시도 라고 찍히게 했다.
 
-(대응)
-1) 모든 주문(place_market, place_conditional, close_position_market)은
-   첫 번째로는 positionSide 없이 보낸다. (혹시나 계정이 관대한 경우)
-2) 만약 109400 이고 메시지에 'positionSide' 관련 오류가 있으면
-   같은 payload 에
-       positionSide="BOTH"
-   를 붙여서 한 번 더 보낸다.
-3) 이전에 넣었던 LONG/SHORT 폴백은 이 계정에서는 의미가 없으므로 제거했다.
-4) 나머지 조회/서명 로직은 그대로 유지한다.
+(주의)
+- 나머지 조회 로직, 서명 로직은 그대로다.
+----------------------------------------------------
 """
 
 from __future__ import annotations
@@ -57,23 +44,17 @@ _QTY_STEP: Dict[str, float] = {
 }
 
 
-# ─────────────────────────────
-# 공통 유틸
-# ─────────────────────────────
 def _ts_ms() -> int:
-    """현재 ms 타임스탬프"""
     return int(time.time() * 1000)
 
 
 def sign_query(params: Dict[str, Any], api_secret: str) -> str:
-    """파라미터를 정렬해서 HMAC-SHA256 서명 붙이기"""
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return qs + "&signature=" + sig
 
 
 def _headers() -> Dict[str, str]:
-    """BingX 필수 헤더"""
     return {
         "X-BX-APIKEY": SET.api_key,
         "Content-Type": "application/json",
@@ -81,10 +62,6 @@ def _headers() -> Dict[str, str]:
 
 
 def _normalize_qty(symbol: str, raw_qty: float) -> float:
-    """
-    선물 수량을 거래소가 받는 최소 단위로 내린다.
-    예: step=0.001, raw=0.005904 → 0.005
-    """
     step = _QTY_STEP.get(symbol, 0.001)
     if step <= 0:
         step = 0.001
@@ -101,10 +78,6 @@ def req(
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    BingX REST 요청 공통부.
-    - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
-    """
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
@@ -114,50 +87,36 @@ def req(
         raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
 
     data = r.json()
-
     if isinstance(data, dict):
         code = data.get("code")
         if code not in (None, 0, "0", 100400):
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
-
     return data
 
 
-# ─────────────────────────────
-# 에러 판별 유틸
-# ─────────────────────────────
 def _is_param_error(exc: Exception) -> bool:
-    """109400, Invalid parameters 같은 파라미터 오류인지 판별"""
     msg = str(exc)
-    return "109400" in msg or "Invalid parameters" in msg
-
-
-def _needs_position_side(exc: Exception) -> bool:
-    """'positionSide' 필드를 요구하는지"""
-    msg = str(exc)
-    return _is_param_error(exc) and "positionSide" in msg
-
-
-def _needs_position_side_both(exc: Exception) -> bool:
-    """'can only be set to BOTH' 인지"""
-    msg = str(exc)
-    return _is_param_error(exc) and "can only be set to BOTH" in msg
+    # 계정이 주는 형태:
+    # "In the One-way mode, the 'PositionSide' field can only be set to BOTH."
+    return (
+        "109400" in msg
+        or "Invalid parameters" in msg
+        or "PositionSide" in msg
+    )
 
 
 # ─────────────────────────────
 # 계좌/포지션/주문 조회
 # ─────────────────────────────
 def get_available_usdt() -> float:
-    """가용 마진(availableMargin/Balance)을 최대한 평탄화해서 가져온다."""
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
 
         data = res.get("data") or res.get("balances") or res
 
-        # {"data": {"balance": {...}}} 구조
         if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
             bal = data["balance"]
             cand = (
@@ -169,7 +128,6 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
-        # 리스트 구조
         if isinstance(data, list) and data:
             item = data[0]
         else:
@@ -201,7 +159,6 @@ def get_available_usdt() -> float:
 
 
 def get_balance_detail() -> Dict[str, Any]:
-    """잔고 전체 구조를 그대로 반환."""
     res = req("GET", "/openApi/swap/v2/user/balance", {})
     log(f"[BALANCE RAW for detail] {res}")
 
@@ -223,12 +180,6 @@ def get_balance_detail() -> Dict[str, Any]:
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
-    """
-    열려 있는 포지션 목록 조회.
-    1) /user/positions 먼저
-    2) 안 되면 /trade/positions 로 폴백
-    """
-    # 1차
     try:
         res = req("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
         log(f"[POSITIONS RAW user] {res}")
@@ -239,7 +190,6 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     except Exception as e1:
         log(f"[POSITIONS user ERROR] {e1}")
 
-    # 2차
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
@@ -256,7 +206,6 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
 
 
 def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
-    """걸려 있는 주문 목록 조회"""
     try:
         res = req("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
         log(f"[OPEN ORDERS RAW] {res}")
@@ -273,20 +222,14 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # 레버리지/마진
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
-    """
-    레버리지/마진 설정.
-    일부 계정에서는 여전히 이게 안 될 수 있으므로, 실패해도 에러만 남기고 진행한다.
-    """
-    # 레버리지
     try:
         req("POST", "/openApi/swap/v2/trade/leverage", {
             "symbol": symbol,
             "leverage": leverage,
         })
     except Exception as e:
-        log(f"[WARN] 레버리지 설정 실패: {e}")
+        log(f"[WARN] 레버리지 설정 실패(단방향): {e}")
 
-    # 마진 모드
     try:
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
@@ -297,14 +240,9 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (one-way 에서 BOTH 강제 대응)
+# 주문 전송 (단방향 + BOTH 폴백)
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
-    """
-    시장가 주문
-    1) positionSide 없이 한 번 보낸다.
-    2) 109400 이면서 positionSide 관련 에러면 positionSide="BOTH" 로 다시 보낸다.
-    """
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
@@ -319,12 +257,13 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
         log(f"[PLACE MARKET RESP] {resp}")
         return resp
     except Exception as e:
-        if _needs_position_side(e) or _needs_position_side_both(e):
-            payload2 = dict(payload)
-            payload2["positionSide"] = "BOTH"
-            log(f"[PLACE MARKET RETRY WITH positionSide=BOTH] {payload2}")
-            resp = req("POST", "/openApi/swap/v2/trade/order", payload2)
-            log(f"[PLACE MARKET RESP2] {resp}")
+        # 109400 / positionSide 필요 → BOTH로 다시
+        if _is_param_error(e):
+            payload_fb = dict(payload)
+            payload_fb["positionSide"] = "BOTH"
+            log(f"[PLACE MARKET RETRY with BOTH] {payload_fb}")
+            resp = req("POST", "/openApi/swap/v2/trade/order", payload_fb)
+            log(f"[PLACE MARKET RESP RETRY] {resp}")
             return resp
         raise
 
@@ -336,11 +275,6 @@ def place_conditional(
     trigger_price: float,
     order_type: str,
 ) -> Dict[str, Any]:
-    """
-    TP/SL 조건부 주문
-    1) 일단 positionSide 없이 보내보고
-    2) positionSide 관련 109400 이면 positionSide="BOTH" 로 다시 보낸다.
-    """
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
@@ -357,18 +291,17 @@ def place_conditional(
         log(f"[PLACE CONDITIONAL RESP] {resp}")
         return resp
     except Exception as e:
-        if _needs_position_side(e) or _needs_position_side_both(e):
-            payload2 = dict(payload)
-            payload2["positionSide"] = "BOTH"
-            log(f"[PLACE CONDITIONAL RETRY WITH positionSide=BOTH] {payload2}")
-            resp = req("POST", "/openApi/swap/v2/trade/order", payload2)
-            log(f"[PLACE CONDITIONAL RESP2] {resp}")
+        if _is_param_error(e):
+            payload_fb = dict(payload)
+            payload_fb["positionSide"] = "BOTH"
+            log(f"[PLACE CONDITIONAL RETRY with BOTH] {payload_fb}")
+            resp = req("POST", "/openApi/swap/v2/trade/order", payload_fb)
+            log(f"[PLACE CONDITIONAL RESP RETRY] {resp}")
             return resp
         raise
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
-    """주문 취소"""
     try:
         res = req("POST", "/openApi/swap/v2/trade/cancel", {
             "symbol": symbol,
@@ -380,7 +313,6 @@ def cancel_order(symbol: str, order_id: str) -> None:
 
 
 def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
-    """주문 상태 조회"""
     return req("GET", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "orderId": order_id,
@@ -388,7 +320,6 @@ def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
 
 
 def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
-    """체결 내역 조회"""
     res = req("GET", "/openApi/swap/v2/trade/allFillOrders", {
         "symbol": symbol,
         "orderId": order_id,
@@ -398,7 +329,6 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
-    """여러 체결 건을 평균가 등으로 요약"""
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
@@ -430,9 +360,6 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 
 
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
-    """
-    시장가 주문이 실제 FILLED 될 때까지 잠깐 폴링.
-    """
     end = time.time() + timeout
     last_status = None
     while time.time() < end:
@@ -452,11 +379,6 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
-    """
-    강제 시장가 청산
-    - 기본적으로 reduceOnly MARKET
-    - positionSide 필요하면 BOTH 붙여서 다시 보낸다.
-    """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
@@ -472,16 +394,12 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         req("POST", "/openApi/swap/v2/trade/order", payload)
         send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
     except Exception as e:
-        if _needs_position_side(e) or _needs_position_side_both(e):
-            payload2 = dict(payload)
-            payload2["positionSide"] = "BOTH"
-            log(f"[FORCE CLOSE RETRY WITH positionSide=BOTH] {payload2}")
-            try:
-                req("POST", "/openApi/swap/v2/trade/order", payload2)
-                send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
-                return
-            except Exception as e2:
-                send_tg(f"❗ 포지션 강제 정리 실패(재시도): {e2}")
+        if _is_param_error(e):
+            payload_fb = dict(payload)
+            payload_fb["positionSide"] = "BOTH"
+            log(f"[FORCE CLOSE RETRY with BOTH] {payload_fb}")
+            req("POST", "/openApi/swap/v2/trade/order", payload_fb)
+            send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다.(BOTH) 수량={norm_qty}")
         else:
             send_tg(f"❗ 포지션 강제 정리 실패: {e}")
 
