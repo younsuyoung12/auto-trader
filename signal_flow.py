@@ -4,21 +4,29 @@ signal_flow.py
 시그널 결정 전담 모듈.
 run_bot.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
 
+2025-11-10 추가:
+- 기존에는 추세(TREND)가 안 나왔을 때 CSV(signals_logger) 에만 남았고 콘솔에는 안 보였다.
+- 운영 중에 “왜 맨날 RANGE만 나오냐”를 바로 보이게 하려고,
+  추세가 막힌 3가지 케이스에도 log(...) 를 추가해서 콘솔에 찍히도록 변경했다.
+  (1) 3m 추세 신호 없음
+  (2) 15m 방향 판단 불가
+  (3) 3m/15m 방향 불일치
+
 역할:
 1) 3분봉(거래량 포함), 15분봉, (필요 시) 1분봉 캔들 가져오기
 2) 엄격 TRND → RANGE → 느슨 TRND 순서로 진입 방향 결정
-3) 왜 안 됐는지 signals_logger 에 남기기 (연구/관찰용)
+3) 왜 안 됐는지 signals_logger 에 남기기 (연구/관찰용) + 주요 스킵은 콘솔에도 노출
 4) 진입에 필요한 부가정보(tp/sl 퍼센트, atr 값, 리스크 비율)도 같이 넘기기
 
 반환값 형식:
     tuple(
         chosen_signal: str,        # "LONG" | "SHORT"
         signal_source: str,        # "TREND" | "RANGE"
-        latest_ts: int,           # 마지막 3m 캔들 타임스탬프(ms)
-        candles_3m: list,         # (ts,o,h,l,c) 형태로 자른 3분봉 리스트
-        candles_3m_raw: list,     # (ts,o,h,l,c,vol) 형태 원본 3분봉 리스트
-        last_price: float,        # 진입 기준 가격 (3m 마지막 종가)
-        extra: dict,              # tp_pct, sl_pct, effective_risk_pct 등 부가정보
+        latest_ts: int,            # 마지막 3m 캔들 타임스탬프(ms)
+        candles_3m: list,          # (ts,o,h,l,c) 형태로 자른 3분봉 리스트
+        candles_3m_raw: list,      # (ts,o,h,l,c,vol) 형태 원본 3분봉 리스트
+        last_price: float,         # 진입 기준 가격 (3m 마지막 종가)
+        extra: dict,               # tp_pct, sl_pct, effective_risk_pct 등 부가정보
     )
 시그널이 없으면 None 반환.
 """
@@ -94,6 +102,7 @@ def get_trading_signal(
             log(
                 f"[DATA] 15m klines ok: symbol={symbol} count={len(candles_15m)} last_close={candles_15m[-1][4]}"
             )
+
         # 3m 추세 판단
         sig_3m = decide_signal_3m_trend(
             candles_3m,
@@ -102,7 +111,9 @@ def get_trading_signal(
         )
         trend_15m_val = decide_trend_15m(candles_15m) if candles_15m else None
 
-        # 왜 안됐는지 남김
+        # ─────────────────────────────
+        # 추세 실패 사유: CSV + 콘솔 둘 다 남김
+        # ─────────────────────────────
         if not sig_3m:
             log_signal(
                 event="SKIP",
@@ -111,6 +122,7 @@ def get_trading_signal(
                 reason="trend_3m_no_signal",
                 candle_ts=latest_3m_ts,
             )
+            log("[TREND_SKIP] 3m 추세 신호 없음")
         elif not trend_15m_val:
             log_signal(
                 event="SKIP",
@@ -119,6 +131,7 @@ def get_trading_signal(
                 reason="trend_15m_unknown",
                 candle_ts=latest_3m_ts,
             )
+            log("[TREND_SKIP] 15m 방향 판단 불가")
         elif sig_3m != trend_15m_val:
             log_signal(
                 event="SKIP",
@@ -127,6 +140,7 @@ def get_trading_signal(
                 reason="trend_3m_15m_mismatch",
                 candle_ts=latest_3m_ts,
             )
+            log("[TREND_SKIP] 3m/15m 방향 불일치")
 
         # 엄격 추세가 조건을 만족하면 여기서 끝
         if sig_3m and trend_15m_val and sig_3m == trend_15m_val:
@@ -193,7 +207,7 @@ def get_trading_signal(
                             candle_ts=latest_3m_ts,
                         )
             else:
-                # 박스가 이 캔들에서만 불리하면 느슨한 추세로 한 번 더 본다
+                # 박스가 이 캔들에서는 불리하면 느슨한 추세로 한 번 더 본다
                 log("[INFO] range blocked for this candle, trying loose trend fallback")
                 loose_sig = decide_signal_3m_trend(
                     candles_3m,
@@ -241,7 +255,12 @@ def get_trading_signal(
         atr_slow = calc_atr(candles_3m, max(settings.atr_len * 2, settings.atr_len + 10))
         extra["atr_fast"] = atr_fast
         extra["atr_slow"] = atr_slow
-        if atr_fast and atr_slow and atr_slow > 0 and atr_fast > atr_slow * settings.atr_risk_high_mult:
+        if (
+            atr_fast
+            and atr_slow
+            and atr_slow > 0
+            and atr_fast > atr_slow * settings.atr_risk_high_mult
+        ):
             # 변동성이 높으면 리스크 비율을 줄이도록 힌트 제공
             extra["effective_risk_pct"] = settings.risk_pct * settings.atr_risk_reduction
 
