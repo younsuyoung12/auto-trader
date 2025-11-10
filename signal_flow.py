@@ -4,17 +4,23 @@ signal_flow.py
 시그널 결정 전담 모듈.
 run_bot.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
 
-2025-11-10 추가:
-- 기존에는 추세(TREND)가 안 나왔을 때 CSV(signals_logger) 에만 남았고 콘솔에는 안 보였다.
+2025-11-10 추가 ①:
+- 기존에는 추세(TREND)가 안 나왔을 때 CSV(signals_logger)에만 남았고 콘솔에는 안 보였다.
 - 운영 중에 “왜 맨날 RANGE만 나오냐”를 바로 보이게 하려고,
   추세가 막힌 3가지 케이스에도 log(...) 를 추가해서 콘솔에 찍히도록 변경했다.
   (1) 3m 추세 신호 없음
   (2) 15m 방향 판단 불가
   (3) 3m/15m 방향 불일치
 
+2025-11-10 추가 ② (RANGE 완화):
+- should_block_range_today(...)가 True를 주더라도,
+  그 캔들에 대해서는 한 번은 decide_signal_range(...)를 시도해본다.
+- 이때 나온 RANGE 신호는 signals_logger에 reason="range_relaxed_entry"로 남긴다.
+- 이렇게 해서 “추세 없음 → RANGE 차단”으로 신호가 0건이 되는 상황을 줄인다.
+
 역할:
 1) 3분봉(거래량 포함), 15분봉, (필요 시) 1분봉 캔들 가져오기
-2) 엄격 TRND → RANGE → 느슨 TRND 순서로 진입 방향 결정
+2) 엄격 TREND → RANGE → (RANGE가 막히면) 완화 RANGE → 느슨 TREND 순서로 진입 방향 결정
 3) 왜 안 됐는지 signals_logger 에 남기기 (연구/관찰용) + 주요 스킵은 콘솔에도 노출
 4) 진입에 필요한 부가정보(tp/sl 퍼센트, atr 값, 리스크 비율)도 같이 넘기기
 
@@ -88,11 +94,12 @@ def get_trading_signal(
         )
         return None
 
+    # ─────────────────────────────
     # 3) 엄격 추세 먼저
+    # ─────────────────────────────
     chosen_signal: Optional[str] = None
     signal_source: Optional[str] = None
     extra: Dict[str, Any] = {}
-
     candles_15m: Optional[List[Any]] = None
 
     if settings.enable_trend:
@@ -111,9 +118,7 @@ def get_trading_signal(
         )
         trend_15m_val = decide_trend_15m(candles_15m) if candles_15m else None
 
-        # ─────────────────────────────
-        # 추세 실패 사유: CSV + 콘솔 둘 다 남김
-        # ─────────────────────────────
+        # 추세 실패 사유: CSV + 콘솔
         if not sig_3m:
             log_signal(
                 event="SKIP",
@@ -142,9 +147,8 @@ def get_trading_signal(
             )
             log("[TREND_SKIP] 3m/15m 방향 불일치")
 
-        # 엄격 추세가 조건을 만족하면 여기서 끝
+        # 추세 진입
         if sig_3m and trend_15m_val and sig_3m == trend_15m_val:
-            # 전략별 쿨다운
             if (time.time() - last_trend_close_ts) >= settings.cooldown_after_close_trend:
                 chosen_signal = sig_3m
                 signal_source = "TREND"
@@ -164,7 +168,6 @@ def get_trading_signal(
                         )
                         chosen_signal = None
                         signal_source = None
-                # 추세 기본 TP/SL 은 여기서 굳이 넣지 않고 run_bot 에서 없으면 settings 값 사용
             else:
                 send_skip_tg("[SKIP] trend_cooldown: 직전 TREND 포지션 대기중")
                 log_signal(
@@ -177,14 +180,18 @@ def get_trading_signal(
                     trend_15m=trend_15m_val,
                 )
 
-    # 4) 추세가 안 됐을 때만 RANGE 시도
+    # ─────────────────────────────
+    # 4) 추세가 안 됐을 때 RANGE 시도
+    # ─────────────────────────────
     if (not chosen_signal) and settings.enable_range:
         if not candles_15m:
             candles_15m = get_klines(symbol, "15m", 120)
-        # RANGE 쿨다운
+
         if (time.time() - last_range_close_ts) >= settings.cooldown_after_close_range:
             blocked_now = should_block_range_today(candles_3m, candles_15m)
+
             if not blocked_now:
+                # 원래대로 RANGE
                 r_sig = decide_signal_range(candles_3m)
                 if r_sig:
                     ok_range = True
@@ -195,7 +202,6 @@ def get_trading_signal(
                     if ok_range:
                         chosen_signal = r_sig
                         signal_source = "RANGE"
-                        # 박스장은 기본적으로 settings.range_tp_pct / range_sl_pct 를 사용할 거라 extra 는 비워둠
                     else:
                         send_skip_tg("[SKIP] 1m_confirm_mismatch_range")
                         log_signal(
@@ -207,26 +213,37 @@ def get_trading_signal(
                             candle_ts=latest_3m_ts,
                         )
             else:
-                # 박스가 이 캔들에서는 불리하면 느슨한 추세로 한 번 더 본다
-                log("[INFO] range blocked for this candle, trying loose trend fallback")
-                loose_sig = decide_signal_3m_trend(
-                    candles_3m,
-                    settings.rsi_overbought + 5,
-                    settings.rsi_oversold - 5,
-                )
-                loose_trend_15m = decide_trend_15m(candles_15m) if candles_15m else None
-                if loose_sig and loose_trend_15m and loose_sig == loose_trend_15m:
-                    chosen_signal = loose_sig
-                    signal_source = "TREND"
-                    log_signal(
-                        event="ENTRY_SIGNAL",
-                        symbol=symbol,
-                        strategy_type="TREND",
-                        direction=loose_sig,
-                        reason="range_blocked_fallback_to_loose_trend",
-                        candle_ts=latest_3m_ts,
-                    )
+                # 완화: 막혀도 한 번은 RANGE 형태로 본다
+                log("[INFO] range blocked for this candle, trying relaxed RANGE")
+                r_sig = decide_signal_range(candles_3m)
+                if r_sig:
+                    ok_range = True
+                    if settings.enable_1m_confirm:
+                        candles_1m = get_klines(symbol, "1m", 20)
+                        if not confirm_1m_direction(candles_1m, r_sig):
+                            ok_range = False
+                    if ok_range:
+                        chosen_signal = r_sig
+                        signal_source = "RANGE"
+                        log_signal(
+                            event="ENTRY_SIGNAL",
+                            symbol=symbol,
+                            strategy_type="RANGE",
+                            direction=r_sig,
+                            reason="range_relaxed_entry",
+                            candle_ts=latest_3m_ts,
+                        )
+                    else:
+                        send_skip_tg("[SKIP] range_blocked_today: 박스장 조건 불리")
+                        log_signal(
+                            event="SKIP",
+                            symbol=symbol,
+                            strategy_type="RANGE",
+                            reason="range_blocked_today",
+                            candle_ts=latest_3m_ts,
+                        )
                 else:
+                    # 진짜로 박스 신호가 없으면 예전처럼 SKIP
                     send_skip_tg("[SKIP] range_blocked_today: 박스장 조건 불리")
                     log_signal(
                         event="SKIP",
@@ -245,11 +262,15 @@ def get_trading_signal(
                 candle_ts=latest_3m_ts,
             )
 
+    # ─────────────────────────────
     # 5) 여기까지 해도 시그널이 없으면 종료
+    # ─────────────────────────────
     if not chosen_signal or not signal_source:
         return None
 
-    # 6) ATR 기반 리스크가 필요한 경우 extra 에 넣어준다 (run_bot 이 사용해도 되고 무시해도 됨)
+    # ─────────────────────────────
+    # 6) ATR 기반 리스크 정보
+    # ─────────────────────────────
     if settings.use_atr:
         atr_fast = calc_atr(candles_3m, settings.atr_len)
         atr_slow = calc_atr(candles_3m, max(settings.atr_len * 2, settings.atr_len + 10))
@@ -261,7 +282,6 @@ def get_trading_signal(
             and atr_slow > 0
             and atr_fast > atr_slow * settings.atr_risk_high_mult
         ):
-            # 변동성이 높으면 리스크 비율을 줄이도록 힌트 제공
             extra["effective_risk_pct"] = settings.risk_pct * settings.atr_risk_reduction
 
     return (
