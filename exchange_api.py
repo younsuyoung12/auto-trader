@@ -40,11 +40,12 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
    - 이를 위해 /openApi/swap/v2/user/balance 의 안쪽 balance dict 를 그대로 꺼내는
      get_balance_detail() 을 추가했다.
 
-6) positionSide 강제 추가 (헤지/원웨이 공통 호환)
-   - 일부 계정/환경에서 MARKET, 조건부 주문에 positionSide 가 없으면 109400 이 난다.
-   - place_market(), place_conditional(), close_position_market() 에서 side 값을 보고
-     positionSide=LONG/SHORT 를 함께 전송하도록 수정했다.
-   - 이렇게 해도 원웨이 모드에서는 문제 없이 처리된다.
+6) positionSide 강제 추가 (헤지/원웨이 공통 호환) + 109400 폴백
+   - 어떤 계정/환경에서는 MARKET, 조건부 주문에 positionSide 가 없으면 109400 이 난다.
+   - 반대로 어떤 계정에서는 positionSide 를 주면 109400 이 난다.
+   - 그래서 기본은 positionSide 를 붙여서 보내고,
+     만약 RuntimeError 안에 109400 이 보이면 같은 주문을 positionSide 없이 한 번 더 보내도록
+     place_market(), place_conditional(), close_position_market() 을 보강했다.
 """
 
 from __future__ import annotations
@@ -104,7 +105,7 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     예) 0.005904 → 0.005
     - 기본 step 은 0.001 로 둔다.
     - 0 이하로 내려가면 최소 step 을 보낸다.
-    - API가 문자열로 보내도 허용하므로 마지막에 소수 3째 자리까지만 유지한다.
+    - 마지막엔 소수 3째 자리까지만 유지한다.
     """
     step = _QTY_STEP.get(symbol, 0.001)
     if step <= 0:
@@ -113,7 +114,6 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
-    # 소수 셋째 자리까지만
     return float(f"{qty:.3f}")
 
 
@@ -221,13 +221,11 @@ def get_balance_detail() -> Dict[str, Any]:
 
     # 리스트로 올 수도 있음
     if isinstance(data, list) and data:
-        # 첫 원소 안에 balance 가 있으면 그걸, 아니면 첫 원소를
         first = data[0]
         if isinstance(first, dict) and "balance" in first and isinstance(first["balance"], dict):
             return first["balance"]
         return first
 
-    # 그래도 아니면 그냥 data 전체
     if isinstance(data, dict):
         return data
 
@@ -239,7 +237,6 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
-            # 이 계정에서는 이 API 가 없을 때
             log("[POSITIONS] this api is not exist -> skip syncing positions")
             return []
         log(f"[POSITIONS RAW] {res}")
@@ -270,11 +267,7 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # 주문/포지션 관련 액션
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
-    """레버리지와 마진 모드를 설정한다.
-
-    어떤 계정에서는 이게 109400 을 내고 실패할 수 있으니,
-    그 경우엔 경고만 찍고 봇은 계속 돌게 한다.
-    """
+    """레버리지와 마진 모드를 설정한다."""
     errs: List[str] = []
 
     # 1) 레버리지 LONG / SHORT 각각 시도
@@ -287,7 +280,6 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
             })
         except Exception as e:
             msg = str(e)
-            # 109400 이면 “API로는 못 바꾸네” 하고 넘어가기
             if "109400" in msg:
                 log(f"[WARN] 레버리지({side})는 API로 설정 불가해 보여서 건너뜁니다: {msg}")
             else:
@@ -306,7 +298,6 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         else:
             errs.append(f"MARGIN: {msg}")
 
-    # 3) 진짜 에러만 묶어서 한 번에 보여주기
     if errs:
         log(f"[WARN] 레버리지/마진 설정 일부 실패: {', '.join(errs)}")
 
@@ -314,24 +305,36 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문을 발행한다.
-    - run_bot.py / trader.py 에서 넘어온 수량을 그대로 쓰지 않고
-      여기서 선물 규격(0.001)로 내린 뒤 전송한다.
-    - 헤지/원웨이 계정 모두에서 동작하도록 positionSide 도 함께 보낸다.
+    1) 기본적으로 positionSide 를 붙여서 보낸다.
+    2) 만약 이 계정이 positionSide 를 싫어해서 109400 이 나면
+       positionSide 를 뺀 페이로드로 한 번 더 시도한다.
     """
     norm_qty = _normalize_qty(symbol, qty)
-    position_side = "LONG" if side.upper() == "BUY" else "SHORT"  # ← 추가
-    payload = {
+    position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+    base_payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": position_side,  # ← 추가
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
     }
-    log(f"[PLACE MARKET REQ] {payload}")
-    resp = req("POST", "/openApi/swap/v2/trade/order", payload)
-    log(f"[PLACE MARKET RESP] {resp}")
-    return resp
+    payload_with_pos = dict(base_payload, positionSide=position_side)
+
+    log(f"[PLACE MARKET REQ] {payload_with_pos}")
+    try:
+        resp = req("POST", "/openApi/swap/v2/trade/order", payload_with_pos)
+        log(f"[PLACE MARKET RESP] {resp}")
+        return resp
+    except RuntimeError as e:
+        msg = str(e)
+        if "109400" in msg:
+            # positionSide 빼고 다시 시도
+            log("[PLACE MARKET] 109400 → positionSide 제거 후 재시도")
+            log(f"[PLACE MARKET REQ2] {base_payload}")
+            resp = req("POST", "/openApi/swap/v2/trade/order", base_payload)
+            log(f"[PLACE MARKET RESP2] {resp}")
+            return resp
+        raise
 
 
 def place_conditional(
@@ -343,26 +346,36 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 과 같은 조건부 주문을 발행한다.
-    - 진입 수량과 동일한 규칙으로 0.001 단위로 내린다.
-    - reduceOnly=True 로 보내서 포지션을 늘리지 않게 한다.
-    - 헤지/원웨이 계정 모두에서 동작하도록 positionSide 도 함께 보낸다.
+    기본은 positionSide 를 보낸다.
+    109400 이면 positionSide 를 빼고 다시 보낸다.
     """
     norm_qty = _normalize_qty(symbol, qty)
-    position_side = "LONG" if side.upper() == "BUY" else "SHORT"  # ← 추가
-    payload = {
+    position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+    base_payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": position_side,  # ← 추가
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
         "recvWindow": 5000,
     }
-    log(f"[PLACE CONDITIONAL REQ] {payload}")
-    resp = req("POST", "/openApi/swap/v2/trade/order", payload)
-    log(f"[PLACE CONDITIONAL RESP] {resp}")
-    return resp
+    payload_with_pos = dict(base_payload, positionSide=position_side)
+
+    log(f"[PLACE CONDITIONAL REQ] {payload_with_pos}")
+    try:
+        resp = req("POST", "/openApi/swap/v2/trade/order", payload_with_pos)
+        log(f"[PLACE CONDITIONAL RESP] {resp}")
+        return resp
+    except RuntimeError as e:
+        msg = str(e)
+        if "109400" in msg:
+            log("[PLACE CONDITIONAL] 109400 → positionSide 제거 후 재시도")
+            log(f"[PLACE CONDITIONAL REQ2] {base_payload}")
+            resp = req("POST", "/openApi/swap/v2/trade/order", base_payload)
+            log(f"[PLACE CONDITIONAL RESP2] {resp}")
+            return resp
+        raise
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
@@ -442,7 +455,6 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
         except Exception as e:
             log(f"[wait_filled] error: {e}")
         time.sleep(0.5)
-    # 타임아웃 → 취소
     log(f"[wait_filled] timeout, last_status={last_status}, cancel order")
     cancel_order(symbol, order_id)
     return None
@@ -451,28 +463,34 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     TP/SL 세팅이 실패했을 때 포지션을 즉시 시장가로 닫을 때 사용.
-    이때도 선물 수량 규격을 맞춰서 보낸다.
-    헤지/원웨이 공통으로 positionSide 를 함께 보낸다.
+    기본은 positionSide 를 붙여서 보내고,
+    109400 이면 positionSide 를 빼고 다시 보낸다.
     """
     close_side = "SELL" if side_open == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
-    # 진입이 BUY(롱)이었으면 닫을 때는 숏 포지션을 줄이는 것이므로 positionSide=SHORT
     position_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
-    payload = {
+    base_payload = {
         "symbol": symbol,
         "side": close_side,
-        "positionSide": position_side,  # ← 추가
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
         "recvWindow": 5000,
     }
-    log(f"[FORCE CLOSE REQ] {payload}")
+    payload_with_pos = dict(base_payload, positionSide=position_side)
+
+    log(f"[FORCE CLOSE REQ] {payload_with_pos}")
     try:
-        req("POST", "/openApi/swap/v2/trade/order", payload)
+        req("POST", "/openApi/swap/v2/trade/order", payload_with_pos)
         send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
-    except Exception as e:
-        send_tg(f"❗ 포지션 강제 정리 실패: {e}")
+    except RuntimeError as e:
+        msg = str(e)
+        if "109400" in msg:
+            log("[FORCE CLOSE] 109400 → positionSide 제거 후 재시도")
+            req("POST", "/openApi/swap/v2/trade/order", base_payload)
+            send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다(재시도). 수량={norm_qty}")
+        else:
+            send_tg(f"❗ 포지션 강제 정리 실패: {e}")
 
 
 __all__ = [
