@@ -52,7 +52,7 @@ class Trade:
     run_bot.py 에서는 Trade 인스턴스를 리스트로만 관리하면 된다.
     """
 
-    symbol: str               # 예: "BTC-USDT"
+    symbol: str               # 예: "BTCUSD"
     side: str                 # "BUY" 또는 "SELL" (진입 방향)
     qty: float                # 진입 수량
     entry: float              # 실제 진입가 (거래소 체결가)

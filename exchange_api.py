@@ -60,8 +60,8 @@ BASE = SET.bingx_base  # 기본: https://open-api.bingx.com
 # 심볼별 수량 step (선물 전용)
 # ─────────────────────────────
 _QTY_STEP: Dict[str, float] = {
-    "BTC-USDT": 0.001,
-    "BTCUSDT": 0.001,
+    "BTCUSDT": 0.001,   # 우리가 지금 실제로 쓰려는 심볼
+    "BTC-USDT": 0.001,  # 혹시 위쪽(settings)에서 하이픈으로 내려오면 이것도 받게
 }
 
 

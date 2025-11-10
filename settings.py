@@ -206,7 +206,7 @@ def load_settings() -> BotSettings:
         api_key=api_key,
         api_secret=api_secret,
         # 기본 심볼/주기
-        symbol=os.getenv("SYMBOL", "BTC-USDT"),
+        symbol=os.getenv("SYMBOL", "BTCUSDT"),
         interval=os.getenv("INTERVAL", "3m"),
         # 전략 on/off
         enable_trend=_as_bool(os.getenv("ENABLE_TREND", "1"), True),
