@@ -109,7 +109,7 @@ def should_block_range_today(candles_3m: Candles, candles_15m: Candles) -> bool:
                 dist = abs(e20_15[-1] - e50_15[-1]) / e50_15[-1]
                 # 기존: dist > 0.002 (0.2%)
                 # 완화: dist > 0.003 (0.3%) 일 때만 막음
-                if dist > 0.003:
+                if dist > 0.001:
                     log(
                         f"[RANGE_BLOCK] 15m EMA distance too wide: dist={dist:.6f} > 0.003"
                     )
