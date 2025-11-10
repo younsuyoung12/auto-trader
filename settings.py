@@ -90,7 +90,7 @@ class BotSettings:
     api_secret: str
 
     # 기본 심볼/주기
-    symbol: str = "BTC-USDT"
+    symbol: str = "BTCUSDT"
     interval: str = "3m"  # 메인은 3분봉
 
     # 전략 on/off
