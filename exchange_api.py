@@ -2,28 +2,45 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
+이 모듈이 담당하는 것:
+- 쿼리 스트링 서명 (HMAC SHA256)
+- 공통 요청(req)
+- 레버리지/마진 설정
+- 잔고 조회, 포지션 조회, 주문 조회
+- 시장가/조건부 주문 생성
+- 주문 상태 폴링(wait_filled)
+- 체결내역 요약(summarize_fills)
+
 2025-11-11 수정 (6차)  ← 지금 버전
 ----------------------------------------------------
 (배경)
-- 단방향(one-way) 계정으로 바꾼 뒤에도 시장가 주문이 109400 이 계속 났다.
-- 로그를 보니 우리가 보내는 quantity 가 0.005 처럼 '소수'였고,
-  BingX 공식 예제는 quantity=5 처럼 '정수'를 쓴다.
-- 이 계정/상품은 quantity 를 "계약 수"처럼 정수로 받는 쪽이라고 판단했다.
+- 잔고/포지션 같은 GET 은 잘 되는데, 주문/레버리지/마진 같은 POST 가 전부
+  109400 Invalid parameters 로 떨어졌다.
+- 우리가 보내는 POST 에는 실제 body 가 없는데도 Content-Type: application/json
+  을 항상 붙이고 있었고, BingX 예제는 이걸 붙이지 않는다.
+- 이게 이 계정/엔드포인트에서 파라미터 전체를 Invalid 로 보는 원인으로
+  판단된다.
 
 (변경)
-- 수량 정규화 함수를 "최소 1, 정수"로 바꿨다.
-  _normalize_qty(...) → _normalize_contract_qty(...)
-- place_market(...), place_conditional(...), close_position_market(...)
-  세 군데 모두 이 정수 변환을 쓰게 했다.
-- 단방향(one-way)라서 positionSide 는 계속 안 보낸다.
-- 레버리지/마진 설정은 계정에서 막혀 있으면 그냥 WARN 만 찍고 계속 간다.
-----------------------------------------------------
+- _headers(...) 를 "바디가 있을 때만" Content-Type 을 붙이는 형태로 바꿨다.
+- req(...) 에서 body 가 None 이면 Content-Type 을 안 넣는다.
+- 나머지 로직(단방향 주문, positionSide 제거 등)은 2025-11-11 버전 그대로 유지.
 
 2025-11-11 수정 (5차)
 ----------------------------------------------------
-- 단방향(one-way) 기준으로 주문에서 positionSide 관련 필드를 전부 제거.
-- 폴백(1차 실패 → 2차 최소필드 → 3차 BOTH)도 전부 제거.
-- 포지션 조회는 /user/positions → /trade/positions 순서 유지.
+- 앱에서 포지션 모드를 Hedge → One-way 로 바꾼 환경에 맞춰
+  주문 전송 시 positionSide 를 전부 제거했다.
+- 주문을 한 번만 심플하게 보내도록 했다.
+
+2025-11-10 수정 (3~4차)
+----------------------------------------------------
+- 포지션 조회를 /user/positions → /trade/positions 순으로 폴백하도록 유지.
+- 계정에 따라 positionSide 를 넣어야 하는 케이스가 있어서 한 번 넣었으나,
+  지금은 단방향 기준이라 제거됨.
+
+2025-11-10 이전
+----------------------------------------------------
+- 공통 요청, 시그니처, 주문, 체결조회 기본 뼈대.
 ----------------------------------------------------
 """
 
@@ -42,6 +59,13 @@ from telelog import log, send_tg
 SET = load_settings()
 BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 
+# ─────────────────────────────
+# 심볼별 수량 step (선물 전용)
+# ─────────────────────────────
+_QTY_STEP: Dict[str, float] = {
+    "BTC-USDT": 0.001,  # 기본으로 이걸 쓴다
+}
+
 
 # ─────────────────────────────
 # 공통 유틸
@@ -58,30 +82,34 @@ def sign_query(params: Dict[str, Any], api_secret: str) -> str:
     return qs + "&signature=" + sig
 
 
-def _headers() -> Dict[str, str]:
-    """BingX 필수 헤더"""
-    return {
+def _headers(has_body: bool = False) -> Dict[str, str]:
+    """
+    BingX 필수 헤더.
+    - 기본으로는 X-BX-APIKEY 만 넣는다.
+    - 실제 JSON 바디를 보낼 때만 Content-Type 을 붙인다.
+      (이걸 항상 넣어두면 파라미터 전체를 Invalid 로 보는 계정이 있었다.)
+    """
+    h = {
         "X-BX-APIKEY": SET.api_key,
-        "Content-Type": "application/json",
     }
+    if has_body:
+        h["Content-Type"] = "application/json"
+    return h
 
 
-def _normalize_contract_qty(raw_qty: float) -> int:
+def _normalize_qty(symbol: str, raw_qty: float) -> float:
     """
-    이 계정에서는 quantity 를 소수로 보내면 109400 이 난다.
-    → 계약 개수처럼 최소 1, 정수로 보낸다.
-    예)
-      0.005 → 1
-      0.8   → 1
-      3.2   → 3
+    선물 수량을 거래소가 받는 최소 단위로 내린다.
+    예: step=0.001, raw=0.005904 → 0.005
     """
-    try:
-        q = int(raw_qty)
-    except (TypeError, ValueError):
-        q = 1
-    if q < 1:
-        q = 1
-    return q
+    step = _QTY_STEP.get(symbol, 0.001)
+    if step <= 0:
+        step = 0.001
+    units = int(raw_qty / step)
+    qty = units * step
+    if qty <= 0:
+        qty = step
+    return float(f"{qty:.3f}")
 
 
 def req(
@@ -93,11 +121,20 @@ def req(
     """
     BingX REST 요청 공통부.
     - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
+    - 2025-11-11: body 가 있을 때만 Content-Type 을 넣는다.
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
-    r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
+
+    has_body = body is not None
+    r = requests.request(
+        method,
+        url,
+        json=body if has_body else None,
+        headers=_headers(has_body),
+        timeout=12,
+    )
 
     if r.status_code != 200:
         raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
@@ -249,8 +286,9 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
     단방향 기준 레버리지/마진 설정.
-    이 계정에서는 이게 109400 으로 막힐 수 있으니 실패해도 진행.
+    일부 계정에서는 여전히 이게 안 될 수 있으므로, 실패해도 에러만 남기고 진행한다.
     """
+    # 레버리지
     try:
         req("POST", "/openApi/swap/v2/trade/leverage", {
             "symbol": symbol,
@@ -259,6 +297,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
     except Exception as e:
         log(f"[WARN] 레버리지 설정 실패(단방향): {e}")
 
+    # 마진 모드
     try:
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
@@ -269,13 +308,15 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (단방향 + 계약식 수량)
+# 주문 전송 (단방향 전용)
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
-    시장가 주문 (단방향 + 계약 정수 수량)
+    시장가 주문 (단방향)
+    - positionSide 전혀 안 보냄
+    - 한 번만 시도
     """
-    norm_qty = _normalize_contract_qty(qty)
+    norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": side,
@@ -297,9 +338,11 @@ def place_conditional(
     order_type: str,
 ) -> Dict[str, Any]:
     """
-    TP/SL 조건부 주문 (단방향 + 계약 정수 수량)
+    TP/SL 조건부 주문 (단방향)
+    - positionSide 전혀 안 보냄
+    - reduceOnly 만 붙임
     """
-    norm_qty = _normalize_contract_qty(qty)
+    norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": side,
@@ -402,10 +445,11 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
-    강제 시장가 청산 (단방향 + 계약 정수 수량)
+    강제 시장가 청산 (단방향)
+    - 그냥 반대 side 로 MARKET 한 번만 보낸다.
     """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
-    norm_qty = _normalize_contract_qty(qty)
+    norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": close_side,
