@@ -7,7 +7,12 @@
 3. 너무 좁은 박스는 무시한다.
 4. ATR 수축/15분 이격 과다일 때는 '오늘은 박스 안 쓰자' 라고 신호를 낼 수 있게 한다.
 
-원래 bot.py 안에 있던 박스장 판정 로직을 그대로 옮겨왔다.
+2025-11-10 완화:
+- 박스가 “너무 쉽게” 막혀서 실제 진입이 0이 되는 상황이 나와서,
+  should_block_range_today() 안의 차단 임계값을 조금 올렸다.
+  1) ATR 빠른 값이 느린 값의 50% 미만 → 60% 미만일 때만 막도록 완화
+  2) 15m EMA 이격 0.2% 초과 → 0.3% 초과일 때만 막도록 완화
+이렇게 하면 강한 추세가 있어도 박스가 전부 닫히지는 않는다.
 """
 
 from __future__ import annotations
@@ -29,15 +34,6 @@ def decide_signal_range(candles_3m: Candles, lookback: int = 40) -> Optional[str
 
     반환값:
         "LONG" / "SHORT" / None
-
-    로직:
-    - 최소 캔들 수가 안 되면(None) → 상위에서 스킵
-    - 최근 lookback 개 캔들의 최고가/최저가로 박스 폭을 계산
-    - 박스 폭이 너무 좁으면(None)
-    - 현재가가 박스 상단 75% 이상 + RSI 60 이상이면 SHORT
-    - 현재가가 박스 하단 25% 이하 + RSI 40 이하이면 LONG
-      (RSI 는 여기서 다시 계산해도 되지만, 단순화를 위해 가격 조건만으로도 사용 가능)
-    이 모듈에서는 RSI 를 강제하지 않고, 단순 가격 구간으로만 판단해도 되도록 남겨둔다.
     """
     if len(candles_3m) < lookback:
         return None
@@ -82,14 +78,15 @@ def should_block_range_today(candles_3m: Candles, candles_15m: Candles) -> bool:
     2) 15m EMA 이격이 너무 크면 → 추세가 강한 날이라 박스가 안 먹힌다 → True
     둘 다 아니면 False.
     """
-    # 1) ATR 수축 체크 (최근이 예전의 50% 미만이면 비추천)
+    # 1) ATR 수축 체크
     atr_fast = calc_atr(candles_3m, 14)
     atr_slow = calc_atr(candles_3m, 40)
     if atr_fast and atr_slow and atr_slow > 0:
-        if atr_fast < atr_slow * 0.5:
+        # 기존: 0.5 → 완화: 0.6
+        if atr_fast < atr_slow * 0.6:
             return True
 
-    # 2) 15m 추세 강도 체크 (이격이 크면 박스장 비추천)
+    # 2) 15m 추세 강도 체크
     if candles_15m:
         closes_15 = [c[4] for c in candles_15m]
         if len(closes_15) >= 50:
@@ -97,8 +94,9 @@ def should_block_range_today(candles_3m: Candles, candles_15m: Candles) -> bool:
             e50_15 = ema(closes_15, 50)
             if not math.isnan(e20_15[-1]) and not math.isnan(e50_15[-1]):
                 dist = abs(e20_15[-1] - e50_15[-1]) / e50_15[-1]
-                # 0.2% 이상 벌어져 있으면 추세가 강하다고 보고 박스 스킵
-                if dist > 0.002:
+                # 기존: dist > 0.002 (0.2%)
+                # 완화: dist > 0.003 (0.3%) 일 때만 막음
+                if dist > 0.003:
                     return True
 
     return False
