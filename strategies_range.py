@@ -7,17 +7,11 @@
 3. 너무 좁은 박스는 무시한다.
 4. ATR 수축/15분 이격 과다일 때는 '오늘은 박스 안 쓰자' 라고 신호를 낼 수 있게 한다.
 
-2025-11-10 완화 (기존 설명):
-- 박스가 “너무 쉽게” 막혀서 실제 진입이 0이 되는 상황이 나와서,
-  should_block_range_today() 안의 차단 임계값을 조금 올렸다.
-  1) ATR 빠른 값이 느린 값의 50% 미만 → 60% 미만일 때만 막도록 완화
-  2) 15m EMA 이격 0.2% 초과 → 0.3% 초과일 때만 막도록 완화
-  이렇게 하면 강한 추세가 있어도 박스가 전부 닫히지는 않는다.
-
-2025-11-10 추가 기록 기능:
-- 실제로 박스장이 막혔을 때 왜 막혔는지를 로그에 남기도록 했다.
-- ATR 수축으로 막혔는지, 15m 이격으로 막혔는지 각각 다른 메시지를 찍는다.
-- run_bot.py / signal_flow.py 쪽 시그니처는 그대로(bool)라서 기존 코드와 호환된다.
+2025-11-10 완화 (최종):
+- 15m EMA 이격 기준을 0.3%가 아니라 1%로 올렸다. (0.01)
+  → 지금처럼 dist=0.0068 (=0.68%) 나와도 막지 말자는 뜻.
+- ATR 수축 조건은 0.6 그대로 둔다.
+- 왜 막혔는지는 log(...)로 콘솔에 남긴다.
 """
 
 from __future__ import annotations
@@ -80,19 +74,15 @@ def decide_signal_range(candles_3m: Candles, lookback: int = 40) -> Optional[str
 def should_block_range_today(candles_3m: Candles, candles_15m: Candles) -> bool:
     """박스장 진입 전에 시장 상태를 한 번 더 필터링한다.
 
-    원래 코드의 의도:
-    1) 최근 3m ATR 이 예전(느린 ATR)보다 확 줄어 있으면 → 변동성이 너무 죽은 날이라 박스가 안 먹힌다 → True
-    2) 15m EMA 이격이 너무 크면 → 추세가 강한 날이라 박스가 안 먹힌다 → True
-    둘 다 아니면 False.
-
-    여기에서는 막힌 이유까지 log(...)로 찍어준다.
+    1) ATR 이 너무 죽어 있으면 → True
+    2) 15m EMA 이격이 너무 크면 → True
+    아니면 False.
     """
     # 1) ATR 수축 체크
     atr_fast = calc_atr(candles_3m, 14)
     atr_slow = calc_atr(candles_3m, 40)
     if atr_fast and atr_slow and atr_slow > 0:
-        # 기존: atr_fast < atr_slow * 0.5
-        # 완화: atr_fast < atr_slow * 0.6 일 때만 막음
+        # 완화 버전: fast < slow * 0.6 일 때만 막는다
         if atr_fast < atr_slow * 0.6:
             log(
                 f"[RANGE_BLOCK] ATR compressed: fast={atr_fast:.6f} slow={atr_slow:.6f} → fast < slow*0.6"
@@ -107,15 +97,14 @@ def should_block_range_today(candles_3m: Candles, candles_15m: Candles) -> bool:
             e50_15 = ema(closes_15, 50)
             if not math.isnan(e20_15[-1]) and not math.isnan(e50_15[-1]):
                 dist = abs(e20_15[-1] - e50_15[-1]) / e50_15[-1]
-                # 기존: dist > 0.002 (0.2%)
-                # 완화: dist > 0.003 (0.3%) 일 때만 막음
-                if dist > 0.001:
+                # 최종 완화: dist > 0.01 (1%) 일 때만 막는다
+                if dist > 0.01:
                     log(
-                        f"[RANGE_BLOCK] 15m EMA distance too wide: dist={dist:.6f} > 0.003"
+                        f"[RANGE_BLOCK] 15m EMA distance too wide: dist={dist:.6f} > 0.01"
                     )
                     return True
 
-    # 여기까지 안 걸리면 오늘은 박스 허용
+    # 여기까지 안 걸리면 박스 허용
     return False
 
 
