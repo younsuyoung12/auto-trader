@@ -11,19 +11,27 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 주문 상태 폴링(wait_filled)
 - 체결내역 요약(summarize_fills)
 
-2025-11-10 수정 (1차)
+2025-11-10 수정 (3차)
 ----------------------------------------------------
 (배경)
-- 어떤 계정은 헤지(양방향) 모드처럼 주문을 보내면 잘 되는데,
-  어떤 계정은 원웨이(단방향) 모드라서 주문에 positionSide(LONG/SHORT)가 들어가면
-  bingx code=109400 "Invalid parameters" 가 발생했다.
-- 우리는 봇 코드(run_bot.py / trader.py) 쪽은 그대로 두고,
-  실제로 BingX에 주문을 던지는 이 레이어에서만 "안 되면 한 번 더" 시도하게 만들면
-  위쪽 코드를 건드리지 않아도 된다.
-→ place_market(), place_conditional(), close_position_market() 에
-   positionSide 넣었다가 109400이면 빼고 다시 보내는 폴백을 넣었다.
+- 실제 계정에서 MARKET 주문을 세 가지 패턴
+  (positionSide 포함 / 미포함 / BOTH)으로 모두 보내도
+  code=109400 이 반환되는 케이스가 있었다.
+- 원인은 "필드가 많은 주문"을 보냈을 때 BingX가
+  일부 계정 모드에서 이를 거부하는 것으로 추정된다.
+- 따라서 가장 보수적인 순서로 바꾼다.
+  1) 최소 필드만 넣어서 보낸다.
+     {symbol, side, type="MARKET", quantity, recvWindow}
+  2) 그래도 109400이면 그때만 positionSide 를 붙여서 다시 보낸다.
+  3) 그래도 안 되면 BOTH 로 한 번 더 보낸다.
+- 조건부 주문(place_conditional)과 강제청산(close_position_market)
+  도 같은 패턴으로 단순화해서, 계정 모드 차이로 인한
+  109400 을 최대한 우회한다.
+- 포지션 조회도 /trade/positions 만 쓰면 "this api is not exist"
+  로그가 계속 찍히므로, 우선적으로 /user/positions 를 시도하고
+  안 되면 기존 엔드포인트로 폴백한다.
 
-2025-11-10 수정 (2차) ← 지금 추가된 부분
+2025-11-10 수정 (2차)
 ----------------------------------------------------
 (문제)
 - positionSide 를 넣어도, 빼도, BOTH 로 넣어도 전부 109400 이 나왔다.
@@ -38,6 +46,18 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
   이렇게 두 개를 같이 보낸다.
 - 조건부(TP/SL) 주문도 동일하게 orderType 을 같이 보낸다.
 - 나머지 구조, 수량 내림, 109400 폴백은 그대로 유지한다.
+
+2025-11-10 수정 (1차)
+----------------------------------------------------
+(배경)
+- 어떤 계정은 헤지(양방향) 모드처럼 주문을 보내면 잘 되는데,
+  어떤 계정은 원웨이(단방향) 모드라서 주문에 positionSide(LONG/SHORT)가 들어가면
+  bingx code=109400 "Invalid parameters" 가 발생했다.
+- 우리는 봇 코드(run_bot.py / trader.py) 쪽은 그대로 두고,
+  실제로 BingX에 주문을 던지는 이 레이어에서만 "안 되면 한 번 더" 시도하게 만들면
+  위쪽 코드를 건드리지 않아도 된다.
+→ place_market(), place_conditional(), close_position_market() 에
+   positionSide 넣었다가 109400이면 빼고 다시 보내는 폴백을 넣었다.
 ----------------------------------------------------
 """
 
@@ -61,8 +81,7 @@ BASE = SET.bingx_base  # 기본: https://open-api.bingx.com
 # ─────────────────────────────
 _QTY_STEP: Dict[str, float] = {
     "BTC-USDT": 0.001,   # 우리가 지금 실제로 쓰려는 심볼
- 
- }
+}
 
 
 # ─────────────────────────────
@@ -120,7 +139,6 @@ def req(
     r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
 
     if r.status_code != 200:
-        # 이 부분에도 찍어두면 나중에 왜 죽었는지 바로 본다
         raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
 
     data = r.json()
@@ -129,7 +147,6 @@ def req(
         code = data.get("code")
         # 0 / "0" / None / 100400 은 통과
         if code not in (None, 0, "0", 100400):
-            # 여기에 payload 가 뭔지까지 찍고 싶으면 위에서 이미 찍어놨으니 이 정도만
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
@@ -138,7 +155,7 @@ def req(
 
 
 def _is_param_error(exc: Exception) -> bool:
-    """109400, Invalid parameters 같은 파라미터 오류인지 대충 판별"""
+    """109400, Invalid parameters 같은 파라미터 오류인지 판별"""
     msg = str(exc)
     return "109400" in msg or "Invalid parameters" in msg
 
@@ -224,19 +241,35 @@ def get_balance_detail() -> Dict[str, Any]:
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
-    """열려 있는 포지션 목록 조회 (계정에 따라 안 될 수도 있음)"""
+    """
+    열려 있는 포지션 목록 조회.
+    일부 계정/엔드포인트에서 100400, "this api is not exist" 가 나와서
+    user → trade 순으로 시도한다.
+    """
+    # 1차: user/positions
+    try:
+        res = req("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+        log(f"[POSITIONS RAW user] {res}")
+        data = res.get("data") or res.get("positions") or []
+        if not isinstance(data, list):
+            data = [data]
+        return data
+    except Exception as e1:
+        log(f"[POSITIONS user ERROR] {e1}")
+
+    # 2차: trade/positions (기존 방식)
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
             log("[POSITIONS] this api is not exist -> skip syncing positions")
             return []
-        log(f"[POSITIONS RAW] {res}")
+        log(f"[POSITIONS RAW trade] {res}")
         data = res.get("data") or res.get("positions") or []
         if not isinstance(data, list):
             data = [data]
         return data
-    except Exception as e:
-        log(f"[POSITIONS ERROR] {e}")
+    except Exception as e2:
+        log(f"[POSITIONS trade ERROR] {e2}")
         return []
 
 
@@ -297,28 +330,25 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (109400 폴백 포함) + orderType 동시 전송
+# 주문 전송 (109400 폴백 포함, 최소 필드 우선)
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문 발행.
     순서:
-      1) positionSide=LONG/SHORT + type=MARKET + orderType=MARKET
-      2) 109400 이면 positionSide 빼고 다시
-      3) 그래도 109400 이면 positionSide=BOTH 로 한 번 더
+      1) 최소 필드로 전송
+      2) 109400 이면 positionSide=LONG/SHORT 으로 재시도
+      3) 그래도 109400 이면 positionSide=BOTH 로 최종 재시도
     """
     norm_qty = _normalize_qty(symbol, qty)
 
-    # 1차: LONG/SHORT
-    pos_side = "LONG" if side.upper() == "BUY" else "SHORT"
+    # 1차: 최소 필드
     payload1 = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "orderType": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
-        "positionSide": pos_side,
     }
     log(f"[PLACE MARKET REQ 1] {payload1}")
     try:
@@ -328,15 +358,17 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     except Exception as e1:
         if not _is_param_error(e1):
             raise
+        log(f"[PLACE MARKET] 1차가 파라미터 오류여서 positionSide 붙이고 재시도: {e1}")
 
-    # 2차: positionSide 없이
+    # 2차: 계정이 헷지/양방향일 때
+    pos_side = "LONG" if side.upper() == "BUY" else "SHORT"
     payload2 = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "orderType": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
+        "positionSide": pos_side,
     }
     log(f"[PLACE MARKET REQ 2] {payload2}")
     try:
@@ -346,13 +378,13 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     except Exception as e2:
         if not _is_param_error(e2):
             raise
+        log(f"[PLACE MARKET] 2차도 파라미터 오류여서 BOTH 로 재시도: {e2}")
 
-    # 3차: positionSide=BOTH
+    # 3차: BOTH
     payload3 = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "orderType": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
         "positionSide": "BOTH",
@@ -372,22 +404,19 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문.
-    MARKET 과 마찬가지로 orderType 을 같이 보낸다.
+    순서도 시장가와 동일하게 최소 필드 → positionSide → BOTH 로 간다.
     """
     norm_qty = _normalize_qty(symbol, qty)
 
-    # 1차: positionSide 포함
-    pos_side = "LONG" if side.upper() == "BUY" else "SHORT"
+    # 1차: 최소 필드
     payload1 = {
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "orderType": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
         "recvWindow": 5000,
-        "positionSide": pos_side,
     }
     log(f"[PLACE CONDITIONAL REQ 1] {payload1}")
     try:
@@ -397,17 +426,19 @@ def place_conditional(
     except Exception as e1:
         if not _is_param_error(e1):
             raise
+        log(f"[PLACE CONDITIONAL] 1차가 파라미터 오류여서 positionSide 붙이고 재시도: {e1}")
 
-    # 2차: positionSide 빼고
+    # 2차: positionSide 포함
+    pos_side = "LONG" if side.upper() == "BUY" else "SHORT"
     payload2 = {
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "orderType": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
         "recvWindow": 5000,
+        "positionSide": pos_side,
     }
     log(f"[PLACE CONDITIONAL REQ 2] {payload2}")
     try:
@@ -417,13 +448,13 @@ def place_conditional(
     except Exception as e2:
         if not _is_param_error(e2):
             raise
+        log(f"[PLACE CONDITIONAL] 2차도 파라미터 오류여서 BOTH 로 재시도: {e2}")
 
     # 3차: BOTH
     payload3 = {
         "symbol": symbol,
         "side": side,
         "type": order_type,
-        "orderType": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
@@ -521,42 +552,66 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산.
-    여기도 계정 모드 따라 positionSide 가 문제될 수 있으니
-    109400 이면 빼고 재시도.
+    최소 필드로 먼저 보내고, 109400 이면 positionSide 를 붙여서 다시 보낸다.
     """
     close_side = "SELL" if side_open == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
-    position_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
+
+    # 1차: 최소 필드
     payload1 = {
         "symbol": symbol,
         "side": close_side,
         "type": "MARKET",
-        "orderType": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
         "recvWindow": 5000,
-        "positionSide": position_side,
     }
     log(f"[FORCE CLOSE REQ 1] {payload1}")
     try:
         req("POST", "/openApi/swap/v2/trade/order", payload1)
         send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
+        return
     except Exception as e1:
-        if _is_param_error(e1):
-            payload2 = {
-                "symbol": symbol,
-                "side": close_side,
-                "type": "MARKET",
-                "orderType": "MARKET",
-                "quantity": norm_qty,
-                "reduceOnly": True,
-                "recvWindow": 5000,
-            }
-            log(f"[FORCE CLOSE REQ 2] {payload2}")
-            req("POST", "/openApi/swap/v2/trade/order", payload2)
-            send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty} (fallback)")
-        else:
+        if not _is_param_error(e1):
             send_tg(f"❗ 포지션 강제 정리 실패: {e1}")
+            return
+        log(f"[FORCE CLOSE] 1차가 파라미터 오류여서 positionSide 붙이고 재시도: {e1}")
+
+    # 2차: positionSide 포함
+    position_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
+    payload2 = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "MARKET",
+        "quantity": norm_qty,
+        "reduceOnly": True,
+        "recvWindow": 5000,
+        "positionSide": position_side,
+    }
+    log(f"[FORCE CLOSE REQ 2] {payload2}")
+    try:
+        req("POST", "/openApi/swap/v2/trade/order", payload2)
+        send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty} (fallback)")
+        return
+    except Exception as e2:
+        if not _is_param_error(e2):
+            send_tg(f"❗ 포지션 강제 정리 실패: {e2}")
+            return
+        log(f"[FORCE CLOSE] 2차도 파라미터 오류여서 BOTH 로 재시도: {e2}")
+
+    # 3차: BOTH
+    payload3 = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "MARKET",
+        "quantity": norm_qty,
+        "reduceOnly": True,
+        "recvWindow": 5000,
+        "positionSide": "BOTH",
+    }
+    log(f"[FORCE CLOSE REQ 3] {payload3}")
+    req("POST", "/openApi/swap/v2/trade/order", payload3)
+    send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty} (fallback BOTH)")
 
 
 __all__ = [
