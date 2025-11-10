@@ -9,8 +9,6 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
   주문 관련 함수에서 positionSide 를 아예 항상 넣도록 고정했다.
 - 시장가/조건부/강제청산 모두 동일하게 positionSide="BOTH" 붙인다.
 - 나머지 구조(서명, 조회, 폴링)는 네가 쓰던 형태 그대로 유지.
-
-이렇게 하면 주문이 한 번에 맞는 포맷으로 나가서 109400 을 피할 수 있다.
 """
 
 from __future__ import annotations
@@ -232,26 +230,11 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    단방향 기준 레버리지/마진 설정.
-    일부 계정에서는 여전히 이게 안 될 수 있으므로, 실패해도 에러만 남기고 진행한다.
+    앱에서 미리 설정한 레버리지/마진을 그대로 쓰는 계정용.
+    BingX가 API 변경을 109400으로 거부하므로 여기서는 로그만 남기고 실요청은 하지 않는다.
     """
-    # 레버리지
-    try:
-        req("POST", "/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol,
-            "leverage": leverage,
-        })
-    except Exception as e:
-        log(f"[WARN] 레버리지 설정 실패(단방향): {e}")
-
-    # 마진 모드
-    try:
-        req("POST", "/openApi/swap/v2/trade/marginType", {
-            "symbol": symbol,
-            "marginType": "ISOLATED" if isolated else "CROSSED",
-        })
-    except Exception as e:
-        log(f"[WARN] 마진모드 설정 실패: {e}")
+    log("[INFO] 레버리지/마진 설정은 앱 설정을 사용합니다. API 변경은 생략합니다.")
+    return
 
 
 # ─────────────────────────────
@@ -266,7 +249,7 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": "BOTH",  # ← 여기 추가
+        "positionSide": "BOTH",
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
@@ -293,7 +276,7 @@ def place_conditional(
     payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": "BOTH",  # ← 여기 추가
+        "positionSide": "BOTH",
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
@@ -401,7 +384,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     payload = {
         "symbol": symbol,
         "side": close_side,
-        "positionSide": "BOTH",  # ← 여기 추가
+        "positionSide": "BOTH",
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
