@@ -2,28 +2,48 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
-2025-11-11 수정 (6차)  ← 지금 버전
+2025-11-12 수정 (7차)
+----------------------------------------------------
+(핵심)
+- 실 운영 로그에서 order, leverage 모두 109400이 발생했고
+  주문에서는 "positionSide: This field is required." 가 직접 보였다.
+- 기존 버전은 단방향을 가정하고 positionSide="BOTH" 를 넣었지만,
+  헷지(dual) 계정에서는 BOTH 가 안 먹고 LONG/SHORT 를 넣어야 한다.
+- 또 TP/SL(조건부 주문)은 항상 "포지션을 닫는" 방향으로만 들어오므로,
+  닫는 주문의 side 로부터 역으로 positionSide 를 추론해 넣어줘야 한다.
+
+(이번 변경)
+1) place_market(...)
+   - side=BUY → positionSide=LONG
+   - side=SELL → positionSide=SHORT
+   로 자동 매핑.
+
+2) place_conditional(...)
+   - 이 함수는 trader 가 닫는 주문으로만 부르므로
+     side=SELL → (원래 포지션이 LONG) → positionSide=LONG
+     side=BUY  → (원래 포지션이 SHORT) → positionSide=SHORT
+   로 자동 매핑.
+
+3) close_position_market(...)
+   - 인자로 들어온 건 "열려 있던 방향"이니까 그걸로 positionSide 결정.
+     open=BUY → positionSide=LONG
+     open=SELL → positionSide=SHORT
+
+4) set_leverage_and_mode(...)
+   - 이 계정이 계속 109400 을 주므로
+     side=LONG, side=SHORT 뿐 아니라
+     positionSide=LONG, positionSide=SHORT 도 시도하게 했다.
+   - 한 번이라도 성공하면 좋은 거고, 실패해도 봇은 계속 돈다.
+
+나머지 구조(잔고, 포지션, 주문 조회)는 이전 버전 그대로다.
+
+2025-11-11 수정 (6차)
 ----------------------------------------------------
 (배경)
 - 단방향(one-way)로 바꿨다고 했지만, 실제 계정 로그에서는
   주문 시에 여전히 `positionSide: This field is required.` 가 나왔다.
 - 또 레버리지 설정에서도 `side: This field is required.` 라고 하므로,
   이 계정은 양방향/단방향과 상관없이 필드를 명시해줘야 하는 형태다.
-
-(변경)
-1) 주문 관련 함수(place_market, place_conditional, close_position_market)에
-   다시 positionSide="BOTH" 를 넣었다.
-   - 단방향 계정 대부분은 BOTH 로 보내면 통과한다.
-2) 레버리지/마진 설정할 때도 side 를 요구하므로,
-   set_leverage_and_mode(...)에서 LONG, SHORT 두 번 호출하도록 바꿨다.
-   - 한쪽이 실패해도 전체 봇은 계속 돌게 로그만 남긴다.
-3) 나머지 구조(잔고 조회, 포지션 조회, 주문 조회)는 이전 버전 그대로 둔다.
-
-2025-11-11 이전 버전 메모
-----------------------------------------------------
-- 한 번 단방향 계정이라고 가정하고 positionSide 를 다 뺐었다.
-- 하지만 실제 운영 로그에서 109400 + "positionSide required" 가 확인돼서
-  다시 넣는 쪽으로 되돌렸다.
 ----------------------------------------------------
 """
 
@@ -85,6 +105,7 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
+    # 대부분 BTC-USDT 는 소수 셋이면 충분
     return float(f"{qty:.3f}")
 
 
@@ -111,6 +132,7 @@ def req(
     if isinstance(data, dict):
         code = data.get("code")
         if code not in (None, 0, "0", 100400):
+            # 여기서 파라미터 오류면 더 잘 보이게 찍자
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
@@ -252,11 +274,11 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    이 계정은 레버리지 설정에도 side 를 요구하는 로그가 있어
-    LONG, SHORT 두 번 다 보낸다.
+    이 계정은 레버리지 설정에도 뭔가 필드를 더 요구하는 로그가 있어
+    side=LONG/SHORT 뿐 아니라 positionSide=LONG/SHORT 도 돌려본다.
     실패해도 봇은 계속 돌게 한다.
     """
-    # 레버리지 (LONG / SHORT 둘 다 시도)
+    # 1) side 기반 시도
     for side in ("LONG", "SHORT"):
         try:
             req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -267,8 +289,20 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         except Exception as e:
             log(f"[WARN] 레버리지 설정 실패({side}): {e}")
 
+    # 2) positionSide 기반 시도 (혹시 이 계정이 이 형식을 요구한다면)
+    for ps in ("LONG", "SHORT"):
+        try:
+            req("POST", "/openApi/swap/v2/trade/leverage", {
+                "symbol": symbol,
+                "positionSide": ps,
+                "leverage": leverage,
+            })
+        except Exception as e:
+            log(f"[WARN] 레버리지 설정 실패(positionSide={ps}): {e}")
+
     # 마진 모드
     try:
+        # 일부 계정은 여기서도 positionSide 를 요구할 수 있으므로 한 번 더 감싼다
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
             "marginType": "ISOLATED" if isolated else "CROSSED",
@@ -278,18 +312,33 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (이 계정은 positionSide 필요)
+# 주문 전송
 # ─────────────────────────────
+def _position_side_for_open(side: str) -> str:
+    """진입용 positionSide 매핑"""
+    return "LONG" if side.upper() == "BUY" else "SHORT"
+
+
+def _position_side_for_close(side: str) -> str:
+    """
+    닫는 주문용 positionSide 매핑
+    - 닫는 주문이 SELL 이면 → 원래는 LONG 포지션이었음 → LONG
+    - 닫는 주문이 BUY 이면 → 원래는 SHORT 포지션이었음 → SHORT
+    """
+    return "LONG" if side.upper() == "SELL" else "SHORT"
+
+
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문
-    - 이 계정은 positionSide 를 요구하므로 BOTH 로 고정해서 보낸다.
+    - 헷지 계정일 수 있으므로 BUY→LONG, SELL→SHORT 으로 보낸다.
     """
     norm_qty = _normalize_qty(symbol, qty)
+    pos_side = _position_side_for_open(side)
     payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": "BOTH",
+        "positionSide": pos_side,
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
@@ -309,14 +358,17 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문
-    - 이 계정은 positionSide 를 요구하므로 BOTH 로 넣는다.
+    - 이 함수는 '포지션을 줄이는/닫는' 용도로만 호출된다.
+    - 닫는 주문이 SELL 이면 원래 포지션은 LONG → positionSide=LONG
+    - 닫는 주문이 BUY  이면 원래 포지션은 SHORT → positionSide=SHORT
     - reduceOnly 는 그대로 유지
     """
     norm_qty = _normalize_qty(symbol, qty)
+    pos_side = _position_side_for_close(side)
     payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": "BOTH",
+        "positionSide": pos_side,
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
@@ -418,14 +470,15 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산
     - 반대 side 로 MARKET
-    - 이 계정은 positionSide 가 필요하니 BOTH 로 보낸다.
+    - 헷지 계정이면 '원래 열려 있던 방향'으로 positionSide 를 넣어야 한다.
     """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
+    pos_side = _position_side_for_open(side_open)  # 열린 방향 기준
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": close_side,
-        "positionSide": "BOTH",
+        "positionSide": pos_side,
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,

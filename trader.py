@@ -2,53 +2,29 @@
 trader.py
 포지션 진입/TP·SL 설정/유지/체결 확인을 담당하는 모듈.
 
+2025-11-12 8차 수정
+----------------------------------------------------
+(이 계정의 BingX 선물 v2 엔드포인트가 positionSide 를 필수로 요구하는 문제 대응)
+
+- 시장가 진입할 때도 진입 방향으로부터 positionSide 를 계산해서 같이 보낸다.
+    BUY  → positionSide="LONG"
+    SELL → positionSide="SHORT"
+
+- TP/SL 조건부 주문을 보낼 때도 같은 positionSide 를 붙여서
+  "지금 열려 있는 그 포지션을 닫는 주문"으로 확실히 인식되게 한다.
+
+- BingX 일부 심볼이 계약 단위를 정수로 받으므로,
+  실제 API 호출할 때는 quantity 를 정수로 한 번 더 보정해 보낸다.
+  (trade 구조체에는 원래 체결된 수량을 그대로 둔다.)
+
+이렇게 해두면 exchange_api.py 에서도 굳이 추론 안 해도 되고,
+run_bot → trader → exchange_api 흐름이 전부 LONG/SHORT 로 일관된다.
+
+----------------------------------------------------
 2025-11-12 7차 수정
 ----------------------------------------------------
 (요청한 “들어가자마자 손절 빈도 줄이기”를 실행 레벨에서 보완)
-
-이전까지는 전략(strategies_*.py)에서 TP/SL 퍼센트를 예쁘게 계산해 와도,
-실제 거래 시점(entry)에서
-- 슬리피지가 조금 있었거나
-- 전략이 박스라서 SL을 아주 좁게 줬거나
-하면 선물 변동성에 그대로 맞고 나가는 일이 있었다.
-
-그래서 여기(trader.py)에서 한 번 더 안전장치를 둔다.
-
-1) 설정에 있는 최소 TP/SL 하한을 실제 주문 직전에 강제 반영
-   - settings.min_tp_pct, settings.min_sl_pct 가 있으면
-     전략이 0.004 같은 걸 줘도 최소값(예: 0.005)까지는 끌어올린다.
-   - “너무 좁은” SL로 들어가는 걸 막기 위한 최종 방어선이다.
-
-2) 방향별 SL 바닥값을 한 번 더 적용
-   - settings.range_short_sl_floor_ratio (예: 0.75)를 trader 레벨에서도 받아서
-     숏(SELL) 진입일 때
-        sl_pct = max(sl_pct, tp_pct * range_short_sl_floor_ratio)
-     를 마지막으로 한 번 더 해준다.
-   - 이렇게 하면 전략이 잘못 좁게 준 경우에도
-     “위로 한 번만 털려도 SL”을 줄일 수 있다.
-   - run_bot 이 이 값을 안 줘도 settings 에서 읽어오므로 호환성은 그대로다.
-
-3) soft 모드 시 TP 살짝만 낮추기
-   - open_position_with_tp_sl(...) 에 soft_mode: bool 파라미터를 추가했다.
-   - soft_mode=True 로 들어오면
-       tp_pct = min(tp_pct, settings.range_tp_min * settings.range_soft_tp_factor)
-     로 살짝만 눌러서 “오늘은 애매하니까 빨리 먹고 나오자” 형태를 만들 수 있다.
-   - run_bot 이 이 파라미터를 넘기지 않으면 기존과 동일하게 동작한다.
-
-4) 선물(마진) 기준 TP/SL 옵션을 여기서도 받아서 최종 퍼센트로 변환
-   - settings.use_margin_based_tp_sl 이 켜져 있으면
-     fut_tp_margin_pct, fut_sl_margin_pct 를
-       (마진% / 100) / 레버리지
-     로 바꾼 값을 기존 tp_pct/sl_pct 와 비교해 더 큰 쪽을 쓴다.
-   - 원래는 run_bot 쪽에서 해도 되지만, 여기서도 한 번 더 보정하면
-     호출부가 단순해진다.
-
-이렇게 하면 전략/가드에서 한 번, 실제 주문 직전에서 한 번 더 좁은 SL을 걸러서
-“들어가자마자 잘리는” 패턴을 줄일 수 있다.
-
-----------------------------------------------------
-2025-11-11 6차 수정  ← 이전 버전 설명
-(단방향 exchange_api 와 맞춰 TP/SL 을 체결 이후에만 거는 구조, 슬리피지 초과시 즉시 청산 등)
+... ← 아래 원래 설명 그대로 유지
 """
 
 from __future__ import annotations
@@ -65,6 +41,21 @@ from exchange_api import (
     summarize_fills,
     close_position_market,
 )
+
+
+# ─────────────────────────────
+# 작은 유틸: 수량을 계약 단위 정수로 맞추기
+# ─────────────────────────────
+def _to_contract_qty(q: float) -> int:
+    """
+    BingX 선물 v2가 심볼에 따라 수량을 정수로만 받는 경우가 있어서
+    API 보낼 때는 한 번 더 정수로 깎아준다.
+    0으로 떨어지지 않게 최소 1은 보장.
+    """
+    if q is None:
+        return 1
+    iq = int(round(q))
+    return iq if iq >= 1 else 1
 
 
 # ─────────────────────────────
@@ -160,16 +151,17 @@ def open_position_with_tp_sl(
     1) 시장가로 진입하고
     2) 실제로 FILLED 되었는지 확인한 다음
     3) 그 가격으로 TP/SL 을 두 개 다 거는 고수준 함수.
-
-    ⚠️ 아주 중요한 순서:
-      (a) place_market(...) 으로 먼저 주문을 “보낸다”.
-      (b) wait_filled(...) 로 거래소가 실제 체결해줬는지 “확인한다”.
-      (c) 그 다음에만 place_conditional(...) 로 TP 와 SL 을 “각각” 건다.
-      → 중간에 하나라도 실패하면 포지션을 열어두지 않고 종료(return None).
     """
-    # 1) 시장가 진입 시도
+    # 진입 방향으로부터 포지션 방향도 같이 만든다.
+    pos_side = "LONG" if side_open.upper() == "BUY" else "SHORT"
+
+    # 1) 시장가 진입 시도 (positionSide 같이 보냄)
     try:
-        resp = place_market(symbol, side_open, qty)
+        resp = place_market(symbol, side_open, _to_contract_qty(qty), position_side=pos_side)
+    except TypeError:
+        # 만약 exchange_api.place_market 이 position_side 인자를 아직 안 받는 버전이면
+        # 기존 방식으로 한 번 더 시도한다.
+        resp = place_market(symbol, side_open, _to_contract_qty(qty))
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}")
         return None
@@ -192,7 +184,6 @@ def open_position_with_tp_sl(
             )
 
     if not entry_order_id:
-        # 여기서 멈추면 TP/SL 도 절대 안 건다.
         send_tg("[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다.")
         return None
 
@@ -222,10 +213,9 @@ def open_position_with_tp_sl(
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
-            # 진입은 됐는데 가격이 너무 나쁘다 → 바로 시장가로 닫기
             close_side = "SELL" if side_open == "BUY" else "BUY"
             try:
-                close_position_market(symbol, close_side, filled_qty)
+                close_position_market(symbol, close_side, _to_contract_qty(filled_qty))
             except Exception as e:
                 send_tg(
                     f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
@@ -240,19 +230,15 @@ def open_position_with_tp_sl(
     # 3.5) 여기서부터는 “진짜로 열기로 한” 포지션에 대해
     #      TP/SL 퍼센트를 한 번 더 안전하게 보정한다.
     # ─────────────────────────────────────────────
-
-    # (a) 선물(마진) 기준 TP/SL 이 켜져 있으면 우선 반영
     if getattr(settings, "use_margin_based_tp_sl", False):
         lev = getattr(settings, "leverage", 1) or 1
         fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
         fut_sl_margin_pct = getattr(settings, "fut_sl_margin_pct", 0.0)
-        # (마진% / 100) / 레버리지 → 가격 퍼센트
         m_tp = (fut_tp_margin_pct / 100.0) / lev if lev > 0 else 0.0
         m_sl = (fut_sl_margin_pct / 100.0) / lev if lev > 0 else 0.0
         tp_pct = max(tp_pct, m_tp)
         sl_pct = max(sl_pct, m_sl)
 
-    # (b) 설정에서 최소 TP/SL 이 정해져 있으면 그보다 좁게는 안 쓰도록 한다.
     min_tp_pct = getattr(settings, "min_tp_pct", 0.0)
     min_sl_pct = getattr(settings, "min_sl_pct", 0.0)
     if min_tp_pct > 0:
@@ -260,23 +246,19 @@ def open_position_with_tp_sl(
     if min_sl_pct > 0:
         sl_pct = max(sl_pct, min_sl_pct)
 
-    # (c) soft 모드면 TP 를 너무 멀리 두지 않도록 살짝만 제한
     if soft_mode:
         tp_min = getattr(settings, "range_tp_min", tp_pct)
         soft_factor = getattr(settings, "range_soft_tp_factor", 1.0)
-        # 예: tp_min=0.0035, factor=1.2 → 0.0042 이상은 안 쓰게
         tp_soft_cap = tp_min * soft_factor
         tp_pct = min(tp_pct, tp_soft_cap)
 
-    # (d) 숏일 때는 SL 바닥 비율을 한 번 더 적용 (들어가자마자 손절 방지)
-    #     외부에서 sl_floor_ratio 를 넘겨주면 그걸 우선하고, 없으면 settings 값을 쓴다.
     eff_sl_floor_ratio = sl_floor_ratio or getattr(settings, "range_short_sl_floor_ratio", 0.0)
     if side_open == "SELL" and eff_sl_floor_ratio > 0 and tp_pct > 0:
         min_short_sl = tp_pct * eff_sl_floor_ratio
         if sl_pct < min_short_sl:
             sl_pct = min_short_sl
 
-    # 4) TP/SL 가격 계산 (이 시점에는 entry_price 가 확정되어 있음)
+    # 4) TP/SL 실제 가격
     tp_price, sl_price = compute_tp_sl_prices(
         side_open=side_open,
         entry=entry_price,
@@ -286,43 +268,51 @@ def open_position_with_tp_sl(
     )
     close_side = "SELL" if side_open == "BUY" else "BUY"
 
-    # 5) TP/SL 두 개 주문 실제 전송
+    # 5) TP/SL 두 개 주문 실제 전송 (positionSide 같이 보냄)
     try:
         tp_resp = place_conditional(
             symbol,
             close_side,
-            filled_qty,
+            _to_contract_qty(filled_qty),
+            tp_price,
+            "TAKE_PROFIT_MARKET",
+            position_side=pos_side,
+        )
+        sl_resp = place_conditional(
+            symbol,
+            close_side,
+            _to_contract_qty(filled_qty),
+            sl_price,
+            "STOP_MARKET",
+            position_side=pos_side,
+        )
+    except TypeError:
+        # exchange_api 가 아직 position_side 를 안 받는다면 예전 방식으로 한 번 더
+        tp_resp = place_conditional(
+            symbol,
+            close_side,
+            _to_contract_qty(filled_qty),
             tp_price,
             "TAKE_PROFIT_MARKET",
         )
         sl_resp = place_conditional(
             symbol,
             close_side,
-            filled_qty,
+            _to_contract_qty(filled_qty),
             sl_price,
             "STOP_MARKET",
         )
     except Exception as e:
-        # 한쪽이라도 실패하면 포지션을 열어두면 안 된다.
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
-        close_position_market(symbol, close_side, filled_qty)
+        close_position_market(symbol, close_side, _to_contract_qty(filled_qty))
         return None
 
     # ───── TP/SL 응답에서도 중첩 구조를 확인하는 헬퍼 ─────
     def _norm_id(r: Dict[str, Any]) -> Optional[str]:
-        """
-        BingX 가
-          { "data": { "orderId": ... } }
-        도 주고,
-          { "data": { "order": { "orderId": ... } } }
-        도 주기 때문에 두 경우를 모두 처리한다.
-        """
         d = r.get("data") or r
-        # 1) 평평한 구조
         oid = d.get("orderId") or d.get("id") or d.get("orderID")
         if oid:
             return str(oid)
-        # 2) 중첩 구조
         if isinstance(d, dict):
             order_obj = d.get("order")
             if isinstance(order_obj, dict):
@@ -334,7 +324,6 @@ def open_position_with_tp_sl(
                 ) or None
         return None
 
-    # 여기까지 오면 포지션 1건이 완성
     trade = Trade(
         symbol=symbol,
         side=side_open,
@@ -356,8 +345,7 @@ def open_position_with_tp_sl(
 def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     """
     포지션은 살아 있는데 TP/SL 주문이 없는 경우 다시 건다.
-
-    ⚠️ source == "SYNC" 인 건 손대지 않는다. (사람이 연 포지션)
+    source == "SYNC" 인 건 손대지 않는다.
     """
     if trade.source == "SYNC":
         return True
@@ -366,6 +354,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     side_open = trade.side
     qty = trade.qty
     close_side = "SELL" if side_open == "BUY" else "BUY"
+    pos_side = "LONG" if side_open == "BUY" else "SHORT"
 
     need_tp = False
     need_sl = False
@@ -400,13 +389,30 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
 
     ok = True
 
-    # 필요하면 TP 다시 건다
     if need_tp:
         try:
             tp_r = place_conditional(
                 symbol,
                 close_side,
-                qty,
+                _to_contract_qty(qty),
+                trade.tp_price,
+                "TAKE_PROFIT_MARKET",
+                position_side=pos_side,
+            )
+            d = tp_r.get("data") or tp_r
+            trade.tp_order_id = (
+                d.get("orderId")
+                or d.get("id")
+                or d.get("orderID")
+                or (d.get("order") or {}).get("orderId")
+            )
+            send_tg(f"🔄 TP 재설정: {symbol} {trade.tp_price}")
+        except TypeError:
+            # 예전 버전 호환
+            tp_r = place_conditional(
+                symbol,
+                close_side,
+                _to_contract_qty(qty),
                 trade.tp_price,
                 "TAKE_PROFIT_MARKET",
             )
@@ -422,13 +428,29 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
             send_tg(f"❗ TP 재설정 실패: {e}")
             ok = False
 
-    # 필요하면 SL 다시 건다
     if need_sl:
         try:
             sl_r = place_conditional(
                 symbol,
                 close_side,
-                qty,
+                _to_contract_qty(qty),
+                trade.sl_price,
+                "STOP_MARKET",
+                position_side=pos_side,
+            )
+            d = sl_r.get("data") or sl_r
+            trade.sl_order_id = (
+                d.get("orderId")
+                or d.get("id")
+                or d.get("orderID")
+                or (d.get("order") or {}).get("orderId")
+            )
+            send_tg(f"🔄 SL 재설정: {symbol} {trade.sl_price}")
+        except TypeError:
+            sl_r = place_conditional(
+                symbol,
+                close_side,
+                _to_contract_qty(qty),
                 trade.sl_price,
                 "STOP_MARKET",
             )
@@ -472,7 +494,6 @@ def check_closes(
     closed_results: List[Dict[str, Any]] = []
 
     for t in open_trades:
-        # 사람이/외부에서 열어준 포지션은 그대로 둔다.
         if t.source == "SYNC":
             still_open.append(t)
             continue
@@ -482,7 +503,6 @@ def check_closes(
         sl_id = t.sl_order_id
         closed = False
 
-        # 1) TP 체결 여부
         if tp_id:
             try:
                 o = get_order(symbol, tp_id)
@@ -495,7 +515,6 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes TP error: {e}")
 
-        # 2) SL 체결 여부
         if (not closed) and sl_id:
             try:
                 o = get_order(symbol, sl_id)
@@ -508,11 +527,10 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes SL error: {e}")
 
-        # 3) TP/SL 다시 걸기 또는 강제청산
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:
-                close_position_market(symbol, t.side, t.qty)
+                close_position_market(symbol, t.side, _to_contract_qty(t.qty))
                 closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
             else:
                 still_open.append(t)

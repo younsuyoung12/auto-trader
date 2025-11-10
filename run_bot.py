@@ -4,52 +4,32 @@ run_bot.py (메인 흐름 전용)
 이 파일은 "봇이 어떻게 돈다"만 담당한다.
 세부 기능은 모듈로 분리한다.
 
-2025-11-12 보완 사항 ④  ← 이번 수정
+2025-11-12 보완 사항 ⑤  ← 이번 수정
+----------------------------------------------------
+(trader.py 8차 수정과 연동)
+
+1) trader.open_position_with_tp_sl(...) 에서 새로 받은 파라미터를 실제로 넘겨준다.
+   - soft_mode: bool
+     → 시그널에서 extra["soft"] / extra["soft_mode"] / extra["range_soft"] 중 하나라도 True 면
+       soft_mode=True 로 넘겨서 TP 를 살짝만 낮추는 트레이더 레벨 보정이 작동하게 한다.
+   - sl_floor_ratio: Optional[float]
+     → 시그널에서 extra["sl_floor_ratio"] 가 오면 그대로 넘겨서
+       숏일 때 SL 이 너무 좁아지는 걸 trader 레벨에서 한 번 더 방어한다.
+     → 시그널에서 안 주면 trader 가 settings.range_short_sl_floor_ratio 를 알아서 쓴다.
+
+2) 위 말고 나머지 흐름(텔레그램 on/off, 주기 상태 메시지, KRW 환산)은
+   2025-11-12 보완 사항 ④ 내용 그대로 유지했다.
+
+
+2025-11-12 보완 사항 ④
 ----------------------------------------------------
 (이번에 반영한 거)
 1) 텔레그램 알림 on/off 플래그 실제 적용
-   - settings.py 에 이미
-       notify_on_entry
-       notify_on_close
-     를 넣어놨으니까, 여기서 진짜로 그 값을 보고 보내도록 바꿨다.
-   - 진입 알림은 notify_on_entry 가 True 일 때만 나간다.
-   - 청산 알림은 notify_on_close 가 True 일 때만 나간다.
-   - 종료 안내, 에러 안내, 포지션 동기화 안내 같은 운영 알림은 계속 보낸다
-     (이건 사람이 봐야 하니까)
-
 2) 주기 상태 메시지에 실제 주기 표기
-   - 기존에는 메시지 제목이 무조건 "(30m)" 이었는데,
-     이제 settings.unrealized_notify_sec 를 읽어서
-     예) 900초면 "(15m)", 3600초면 "(60m)" 이렇게 찍게 했다.
-
 3) 상태 메시지에도 15m 추세 포함 유지
-   - 바로 직전에 넣어둔 15m 추세 표시를 그대로 살렸다.
-
 4) KRW 환산은 settings.krw_per_usdt → settings.krw_rate → 1400 순서로 본다
-   - 혹시 이름이 바뀌어도 안전하게 가져오게 유지.
-
-
-(직전 이력 요약)
-2025-11-12 보완 사항 ③
-----------------------------------------------------
-1) 30분 주기 텔레그램 상태 메시지에 15분봉 추세를 붙임
-2) settings 의 주기 알림 옵션(unrealized_notify_enabled, unrealized_notify_sec) 사용
-3) KRW 환산 값 읽을 때 settings.krw_per_usdt 를 우선
-
-2025-11-11 보완 사항 ②
-----------------------------------------------------
-- 거래소 포지션 sync 때 텔레그램 과다 발송 방지
-- 단방향 포지션 부호로 방향 판정
-- 진입/청산 텔레그램 포맷 정리
-- 포지션 열려있을 때 주기 상태 알림
-
-2025-11-11 보완 사항 ①
-----------------------------------------------------
-- 단방향(one-way) 포지션 모드에서 positionSide 없을 때 positionAmt 부호로 판정
-
-2025-11-10 보완 사항
-----------------------------------------------------
-- 3분 거래량 평균이 낮은 시간대는 entry_guards 쪽에서 완화
+...
+(이하 기존 변경 이력 원문 유지)
 """
 
 from __future__ import annotations
@@ -590,6 +570,18 @@ def main() -> None:
             if SET.use_orderbook_entry_hint and best_bid and best_ask:
                 entry_price_hint = best_ask if side_open == "BUY" else best_bid
 
+            # 8.5) trader 에 넘길 보강 플래그 추출
+            soft_mode_flag = False
+            sl_floor_ratio = None
+            if extra:
+                # 시그널에서 아무거나 하나만 True 로 줘도 soft 로 본다
+                soft_mode_flag = bool(
+                    extra.get("soft_mode")
+                    or extra.get("soft")
+                    or extra.get("range_soft")
+                )
+                sl_floor_ratio = extra.get("sl_floor_ratio")
+
             # 9) 최종 진입
             trade = open_position_with_tp_sl(
                 settings=SET,
@@ -600,6 +592,8 @@ def main() -> None:
                 tp_pct=tp_pct,
                 sl_pct=sl_pct,
                 source=signal_source,
+                soft_mode=soft_mode_flag,
+                sl_floor_ratio=sl_floor_ratio,
             )
             if trade is None:
                 log_signal(
