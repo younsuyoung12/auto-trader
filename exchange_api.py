@@ -2,45 +2,28 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
-이 모듈이 담당하는 것:
-- 쿼리 스트링 서명 (HMAC SHA256)
-- 공통 요청(req)
-- 레버리지/마진 설정
-- 잔고 조회, 포지션 조회, 주문 조회
-- 시장가/조건부 주문 생성
-- 주문 상태 폴링(wait_filled)
-- 체결내역 요약(summarize_fills)
-
 2025-11-11 수정 (6차)  ← 지금 버전
 ----------------------------------------------------
 (배경)
-- 잔고/포지션 같은 GET 은 잘 되는데, 주문/레버리지/마진 같은 POST 가 전부
-  109400 Invalid parameters 로 떨어졌다.
-- 우리가 보내는 POST 에는 실제 body 가 없는데도 Content-Type: application/json
-  을 항상 붙이고 있었고, BingX 예제는 이걸 붙이지 않는다.
-- 이게 이 계정/엔드포인트에서 파라미터 전체를 Invalid 로 보는 원인으로
-  판단된다.
+- 단방향(one-way)로 바꿨다고 했지만, 실제 계정 로그에서는
+  주문 시에 여전히 `positionSide: This field is required.` 가 나왔다.
+- 또 레버리지 설정에서도 `side: This field is required.` 라고 하므로,
+  이 계정은 양방향/단방향과 상관없이 필드를 명시해줘야 하는 형태다.
 
 (변경)
-- _headers(...) 를 "바디가 있을 때만" Content-Type 을 붙이는 형태로 바꿨다.
-- req(...) 에서 body 가 None 이면 Content-Type 을 안 넣는다.
-- 나머지 로직(단방향 주문, positionSide 제거 등)은 2025-11-11 버전 그대로 유지.
+1) 주문 관련 함수(place_market, place_conditional, close_position_market)에
+   다시 positionSide="BOTH" 를 넣었다.
+   - 단방향 계정 대부분은 BOTH 로 보내면 통과한다.
+2) 레버리지/마진 설정할 때도 side 를 요구하므로,
+   set_leverage_and_mode(...)에서 LONG, SHORT 두 번 호출하도록 바꿨다.
+   - 한쪽이 실패해도 전체 봇은 계속 돌게 로그만 남긴다.
+3) 나머지 구조(잔고 조회, 포지션 조회, 주문 조회)는 이전 버전 그대로 둔다.
 
-2025-11-11 수정 (5차)
+2025-11-11 이전 버전 메모
 ----------------------------------------------------
-- 앱에서 포지션 모드를 Hedge → One-way 로 바꾼 환경에 맞춰
-  주문 전송 시 positionSide 를 전부 제거했다.
-- 주문을 한 번만 심플하게 보내도록 했다.
-
-2025-11-10 수정 (3~4차)
-----------------------------------------------------
-- 포지션 조회를 /user/positions → /trade/positions 순으로 폴백하도록 유지.
-- 계정에 따라 positionSide 를 넣어야 하는 케이스가 있어서 한 번 넣었으나,
-  지금은 단방향 기준이라 제거됨.
-
-2025-11-10 이전
-----------------------------------------------------
-- 공통 요청, 시그니처, 주문, 체결조회 기본 뼈대.
+- 한 번 단방향 계정이라고 가정하고 positionSide 를 다 뺐었다.
+- 하지만 실제 운영 로그에서 109400 + "positionSide required" 가 확인돼서
+  다시 넣는 쪽으로 되돌렸다.
 ----------------------------------------------------
 """
 
@@ -82,19 +65,12 @@ def sign_query(params: Dict[str, Any], api_secret: str) -> str:
     return qs + "&signature=" + sig
 
 
-def _headers(has_body: bool = False) -> Dict[str, str]:
-    """
-    BingX 필수 헤더.
-    - 기본으로는 X-BX-APIKEY 만 넣는다.
-    - 실제 JSON 바디를 보낼 때만 Content-Type 을 붙인다.
-      (이걸 항상 넣어두면 파라미터 전체를 Invalid 로 보는 계정이 있었다.)
-    """
-    h = {
+def _headers() -> Dict[str, str]:
+    """BingX 필수 헤더"""
+    return {
         "X-BX-APIKEY": SET.api_key,
+        "Content-Type": "application/json",
     }
-    if has_body:
-        h["Content-Type"] = "application/json"
-    return h
 
 
 def _normalize_qty(symbol: str, raw_qty: float) -> float:
@@ -121,20 +97,11 @@ def req(
     """
     BingX REST 요청 공통부.
     - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
-    - 2025-11-11: body 가 있을 때만 Content-Type 을 넣는다.
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
-
-    has_body = body is not None
-    r = requests.request(
-        method,
-        url,
-        json=body if has_body else None,
-        headers=_headers(has_body),
-        timeout=12,
-    )
+    r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
 
     if r.status_code != 200:
         raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
@@ -285,17 +252,20 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    단방향 기준 레버리지/마진 설정.
-    일부 계정에서는 여전히 이게 안 될 수 있으므로, 실패해도 에러만 남기고 진행한다.
+    이 계정은 레버리지 설정에도 side 를 요구하는 로그가 있어
+    LONG, SHORT 두 번 다 보낸다.
+    실패해도 봇은 계속 돌게 한다.
     """
-    # 레버리지
-    try:
-        req("POST", "/openApi/swap/v2/trade/leverage", {
-            "symbol": symbol,
-            "leverage": leverage,
-        })
-    except Exception as e:
-        log(f"[WARN] 레버리지 설정 실패(단방향): {e}")
+    # 레버리지 (LONG / SHORT 둘 다 시도)
+    for side in ("LONG", "SHORT"):
+        try:
+            req("POST", "/openApi/swap/v2/trade/leverage", {
+                "symbol": symbol,
+                "side": side,
+                "leverage": leverage,
+            })
+        except Exception as e:
+            log(f"[WARN] 레버리지 설정 실패({side}): {e}")
 
     # 마진 모드
     try:
@@ -308,18 +278,18 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (단방향 전용)
+# 주문 전송 (이 계정은 positionSide 필요)
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
-    시장가 주문 (단방향)
-    - positionSide 전혀 안 보냄
-    - 한 번만 시도
+    시장가 주문
+    - 이 계정은 positionSide 를 요구하므로 BOTH 로 고정해서 보낸다.
     """
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": side,
+        "positionSide": "BOTH",
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
@@ -338,14 +308,15 @@ def place_conditional(
     order_type: str,
 ) -> Dict[str, Any]:
     """
-    TP/SL 조건부 주문 (단방향)
-    - positionSide 전혀 안 보냄
-    - reduceOnly 만 붙임
+    TP/SL 조건부 주문
+    - 이 계정은 positionSide 를 요구하므로 BOTH 로 넣는다.
+    - reduceOnly 는 그대로 유지
     """
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": side,
+        "positionSide": "BOTH",
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
@@ -423,7 +394,7 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
     """
     시장가 주문이 실제 FILLED 될 때까지 잠깐 폴링.
-    단방향이므로 따로 positionSide 를 보낼 필요는 없다.
+    positionSide 는 조회할 때 필요 없으므로 빼고 조회.
     """
     end = time.time() + timeout
     last_status = None
@@ -445,14 +416,16 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
-    강제 시장가 청산 (단방향)
-    - 그냥 반대 side 로 MARKET 한 번만 보낸다.
+    강제 시장가 청산
+    - 반대 side 로 MARKET
+    - 이 계정은 positionSide 가 필요하니 BOTH 로 보낸다.
     """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": close_side,
+        "positionSide": "BOTH",
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
