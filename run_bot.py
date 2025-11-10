@@ -4,7 +4,12 @@ run_bot.py (메인 흐름 전용)
 이 파일은 "봇이 어떻게 돈다"만 담당한다.
 세부 기능은 모듈로 분리한다.
 
-의존 모듈 (다음 순서로 제공 예정):
+2025-11-10 보완 사항
+- entry_guards.py 쪽에서 3분 거래량 평균이 아주 낮은 시간대는 통과시키도록 완화했다.
+  이 파일은 그 가드를 그대로 호출만 하므로 흐름 설명에 그 점을 명시했다.
+- 나머지 구조는 동일하며, 시그널 → 가드 → 주문 순서는 그대로 유지된다.
+
+의존 모듈 (다음 순서로 제공):
 1) bot_workers.py
    - start_health_server()
    - start_drive_sync_thread()
@@ -28,7 +33,7 @@ run_bot.py (메인 흐름 전용)
    4-1) TP/SL 체결 확인
    4-2) 종료 플래그 확인
    4-3) 포지션 있으면 다음 루프
-   4-4) 시그널 요청 → 가드 → 진입 → 로그
+   4-4) 시그널 요청 → (완화된) 가드 → 진입 → 로그
 5. 안전 종료면 STOP_FLAG 남기고 끝낸다.
 """
 
@@ -52,7 +57,7 @@ from exchange_api import (
 from trader import Trade, TraderState, open_position_with_tp_sl, check_closes
 from signals_logger import log_signal
 
-# 분리된 모듈 (이후 캔버스에서 정의)
+# 분리된 모듈
 from bot_workers import (
     start_health_server,
     start_drive_sync_thread,
@@ -74,7 +79,7 @@ START_TS: float = time.time()
 RUNNING: bool = True
 TERMINATED_BY_SIGNAL: bool = False
 
-# 메트릭
+# 간단 메트릭
 METRICS: Dict[str, Any] = {
     "start_ts": START_TS,
     "last_loop_ts": START_TS,
@@ -116,6 +121,7 @@ def _write_stop_flag() -> None:
 # SIGTERM 핸들러
 # ─────────────────────────────
 def _sigterm(*_: Any) -> None:
+    """컨테이너에서 SIGTERM 오면 자연스럽게 빠져나오게 한다."""
     global RUNNING, TERMINATED_BY_SIGNAL
     TERMINATED_BY_SIGNAL = True
     RUNNING = False
@@ -128,7 +134,10 @@ signal.signal(signal.SIGTERM, _sigterm)
 # 거래소 → 내부 포지션 동기화 (간단 버전)
 # ─────────────────────────────
 def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
-    """거래소 포지션/열린 주문을 내부 리스트로 옮겨 중복 진입을 막는다."""
+    """
+    거래소 포지션/열린 주문을 내부 리스트로 옮겨 중복 진입을 막는다.
+    시작할 때 1번, 이후에는 주기적으로 호출한다.
+    """
     global OPEN_TRADES
 
     positions = fetch_open_positions(symbol)
@@ -150,6 +159,7 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
         )
         if qty == 0.0:
             continue
+
         side_raw = (pos.get("positionSide") or pos.get("side") or "").upper()
         side_open = "BUY" if side_raw in ("LONG", "BUY") else "SELL"
         entry_price = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
@@ -193,7 +203,10 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
 # 텔레그램 종료 콜백
 # ─────────────────────────────
 def _on_safe_stop() -> None:
-    """텔레그램 스레드에서 호출한다."""
+    """
+    텔레그램 명령 스레드에서 호출하는 콜백.
+    여기서는 플래그만 세우고 실제 종료는 메인 루프가 판단한다.
+    """
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
     send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
@@ -230,6 +243,7 @@ def main() -> None:
     try:
         set_leverage_and_mode(SET.symbol, SET.leverage, SET.isolated)
     except Exception as e:
+        # 여기서 멈추지 않는 게 중요하다.
         log(f"[WARN] 레버리지/마진 설정 실패: {e}")
 
     # 5) 보조 스레드 시작
@@ -251,6 +265,9 @@ def main() -> None:
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
 
+    # ─────────────────────────────
+    # 메인 무한 루프
+    # ─────────────────────────────
     while RUNNING:
         try:
             METRICS["last_loop_ts"] = time.time()
@@ -360,14 +377,14 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 4) 시그널 + 캔들 가져오기 (핵심 분리 부분)
+            # 4) 시그널 + 캔들 가져오기 (여기서 TREND/RANGE/완화 RANGE가 결정된다)
             signal_ctx = get_trading_signal(
                 settings=SET,
                 last_trend_close_ts=LAST_CLOSE_TS_TREND,
                 last_range_close_ts=LAST_CLOSE_TS_RANGE,
             )
             if signal_ctx is None:
-                # 시그널 없음 → 다음 캔들
+                # 시그널 없음 → 다음 루프
                 time.sleep(1)
                 continue
 
@@ -393,6 +410,7 @@ def main() -> None:
                 continue
 
             # 5-2) 거래량 가드
+            #     entry_guards 에서 평균 거래량이 아주 낮은 시간대는 통과시키도록 이미 완화되어 있음.
             vol_ok = check_volume_guard(
                 settings=SET,
                 candles_3m_raw=candles_3m_raw,
@@ -443,6 +461,7 @@ def main() -> None:
                 time.sleep(3)
                 continue
 
+            # ATR 에서 리스크를 줄여오면 그걸 우선 사용
             effective_risk_pct = extra.get("effective_risk_pct", SET.risk_pct) if extra else SET.risk_pct
             notional = avail * effective_risk_pct * SET.leverage
             if notional < SET.min_notional_usdt:
