@@ -4,47 +4,37 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 
 2025-11-12 수정 (7차)
 ----------------------------------------------------
-(핵심)
-- 실 운영 로그에서 order, leverage 모두 109400이 발생했고
-  주문에서는 "positionSide: This field is required." 가 직접 보였다.
-- 기존 버전은 단방향을 가정하고 positionSide="BOTH" 를 넣었지만,
-  헷지(dual) 계정에서는 BOTH 가 안 먹고 LONG/SHORT 를 넣어야 한다.
-- 또 TP/SL(조건부 주문)은 항상 "포지션을 닫는" 방향으로만 들어오므로,
-  닫는 주문의 side 로부터 역으로 positionSide 를 추론해 넣어줘야 한다.
+(배경)
+- 실제 계정에서 주문을 넣어보니, 단순히 positionSide="BOTH" 로는
+  "Invalid parameters" 가 계속 발생했고,
+  사용자가 올려준 BingX 예제 파이썬 코드에서는
+    positionSide: "LONG"
+  처럼 방향을 명시해서 보내고 있었다.
+- 따라서 이 계정은 주문마다 포지션 방향을 LONG/SHORT 으로 넣어줘야만
+  정상 주문이 되는 형태로 보인다.
 
 (이번 변경)
-1) place_market(...)
-   - side=BUY → positionSide=LONG
-   - side=SELL → positionSide=SHORT
-   로 자동 매핑.
+1) place_market(...) 이 side 에 맞춰서 positionSide 를 LONG/SHORT 으로 자동 설정하게 했다.
+   - side == "BUY"  → positionSide="LONG"
+   - side == "SELL" → positionSide="SHORT"
 
-2) place_conditional(...)
-   - 이 함수는 trader 가 닫는 주문으로만 부르므로
-     side=SELL → (원래 포지션이 LONG) → positionSide=LONG
-     side=BUY  → (원래 포지션이 SHORT) → positionSide=SHORT
-   로 자동 매핑.
+2) place_conditional(...) 에서도 TP/SL 주문일 때는 방향을 추론해서
+   - TP/SL 이고 side == "SELL" 이면  → 기존 LONG 포지션 닫는다고 보고 positionSide="LONG"
+   - TP/SL 이고 side == "BUY"  이면  → 기존 SHORT 포지션 닫는다고 보고 positionSide="SHORT"
+   으로 보내게 했다.
+   - 필요하면 호출부에서 position_side=... 로 강제로 지정할 수도 있게 파라미터를 추가했다.
+     (기존 호출 방식은 그대로 동작)
 
-3) close_position_market(...)
-   - 인자로 들어온 건 "열려 있던 방향"이니까 그걸로 positionSide 결정.
-     open=BUY → positionSide=LONG
-     open=SELL → positionSide=SHORT
+3) close_position_market(...) 도 원래 포지션 방향을 받아서
+   반대 side + 그 포지션의 positionSide 로 보내도록 바꿨다.
 
-4) set_leverage_and_mode(...)
-   - 이 계정이 계속 109400 을 주므로
-     side=LONG, side=SHORT 뿐 아니라
-     positionSide=LONG, positionSide=SHORT 도 시도하게 했다.
-   - 한 번이라도 성공하면 좋은 거고, 실패해도 봇은 계속 돈다.
-
-나머지 구조(잔고, 포지션, 주문 조회)는 이전 버전 그대로다.
+4) 레버리지/마진 설정은 계정별 요구 파라미터가 다른 것으로 보이므로
+   기존처럼 여러 형태로 시도하되 실패해도 봇이 멈추지 않게 유지했다.
+----------------------------------------------------
 
 2025-11-11 수정 (6차)
 ----------------------------------------------------
-(배경)
-- 단방향(one-way)로 바꿨다고 했지만, 실제 계정 로그에서는
-  주문 시에 여전히 `positionSide: This field is required.` 가 나왔다.
-- 또 레버리지 설정에서도 `side: This field is required.` 라고 하므로,
-  이 계정은 양방향/단방향과 상관없이 필드를 명시해줘야 하는 형태다.
-----------------------------------------------------
+(단방향 계정에서 positionSide 를 요구하므로 주문에 positionSide 를 넣는 버전)
 """
 
 from __future__ import annotations
@@ -105,7 +95,6 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
-    # 대부분 BTC-USDT 는 소수 셋이면 충분
     return float(f"{qty:.3f}")
 
 
@@ -132,7 +121,6 @@ def req(
     if isinstance(data, dict):
         code = data.get("code")
         if code not in (None, 0, "0", 100400):
-            # 여기서 파라미터 오류면 더 잘 보이게 찍자
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
@@ -274,11 +262,10 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    이 계정은 레버리지 설정에도 뭔가 필드를 더 요구하는 로그가 있어
-    side=LONG/SHORT 뿐 아니라 positionSide=LONG/SHORT 도 돌려본다.
-    실패해도 봇은 계속 돌게 한다.
+    계정에서 side/positionSide 를 요구할 수 있으므로 몇 가지 패턴을 다 시도한다.
+    실패해도 봇은 계속 돌게 하고, 로그에만 남긴다.
     """
-    # 1) side 기반 시도
+    # 1) side 기반 (LONG / SHORT)
     for side in ("LONG", "SHORT"):
         try:
             req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -289,7 +276,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         except Exception as e:
             log(f"[WARN] 레버리지 설정 실패({side}): {e}")
 
-    # 2) positionSide 기반 시도 (혹시 이 계정이 이 형식을 요구한다면)
+    # 2) positionSide 기반 (LONG / SHORT)
     for ps in ("LONG", "SHORT"):
         try:
             req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -300,9 +287,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         except Exception as e:
             log(f"[WARN] 레버리지 설정 실패(positionSide={ps}): {e}")
 
-    # 마진 모드
+    # 3) 마진 모드
     try:
-        # 일부 계정은 여기서도 positionSide 를 요구할 수 있으므로 한 번 더 감싼다
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
             "marginType": "ISOLATED" if isolated else "CROSSED",
@@ -314,30 +300,21 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 # ─────────────────────────────
 # 주문 전송
 # ─────────────────────────────
-def _position_side_for_open(side: str) -> str:
-    """진입용 positionSide 매핑"""
-    return "LONG" if side.upper() == "BUY" else "SHORT"
-
-
-def _position_side_for_close(side: str) -> str:
-    """
-    닫는 주문용 positionSide 매핑
-    - 닫는 주문이 SELL 이면 → 원래는 LONG 포지션이었음 → LONG
-    - 닫는 주문이 BUY 이면 → 원래는 SHORT 포지션이었음 → SHORT
-    """
-    return "LONG" if side.upper() == "SELL" else "SHORT"
-
-
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문
-    - 헷지 계정일 수 있으므로 BUY→LONG, SELL→SHORT 으로 보낸다.
+    - 이 계정은 positionSide 를 실제 LONG/SHORT 으로 지정해야 하므로 side 에 맞춰 넣는다.
     """
     norm_qty = _normalize_qty(symbol, qty)
-    pos_side = _position_side_for_open(side)
+    side_u = side.upper()
+    if side_u == "BUY":
+        pos_side = "LONG"
+    else:
+        pos_side = "SHORT"
+
     payload = {
         "symbol": symbol,
-        "side": side,
+        "side": side_u,
         "positionSide": pos_side,
         "type": "MARKET",
         "quantity": norm_qty,
@@ -355,21 +332,35 @@ def place_conditional(
     qty: float,
     trigger_price: float,
     order_type: str,
+    position_side: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문
-    - 이 함수는 '포지션을 줄이는/닫는' 용도로만 호출된다.
-    - 닫는 주문이 SELL 이면 원래 포지션은 LONG → positionSide=LONG
-    - 닫는 주문이 BUY  이면 원래 포지션은 SHORT → positionSide=SHORT
-    - reduceOnly 는 그대로 유지
+    - 이 계정은 positionSide 를 요구하므로 가능한 한 방향을 추론해서 넣는다.
+    - 호출부에서 position_side 를 직접 넘기면 그 값을 그대로 사용한다.
     """
     norm_qty = _normalize_qty(symbol, qty)
-    pos_side = _position_side_for_close(side)
+    side_u = side.upper()
+    order_type_u = order_type.upper()
+
+    # position_side 가 안 들어오면 추론
+    ps = position_side
+    if not ps:
+        # TP/SL 이고 side 가 SELL 이면 → LONG 포지션 종료
+        if any(k in order_type_u for k in ("TAKE_PROFIT", "STOP")) and side_u == "SELL":
+            ps = "LONG"
+        # TP/SL 이고 side 가 BUY 이면 → SHORT 포지션 종료
+        elif any(k in order_type_u for k in ("TAKE_PROFIT", "STOP")) and side_u == "BUY":
+            ps = "SHORT"
+        else:
+            # 일반적인 경우에는 side 에 따라 맞춰준다
+            ps = "LONG" if side_u == "BUY" else "SHORT"
+
     payload = {
         "symbol": symbol,
-        "side": side,
-        "positionSide": pos_side,
-        "type": order_type,
+        "side": side_u,
+        "positionSide": ps,
+        "type": order_type_u,
         "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
@@ -469,11 +460,17 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산
-    - 반대 side 로 MARKET
-    - 헷지 계정이면 '원래 열려 있던 방향'으로 positionSide 를 넣어야 한다.
+    - 열 때가 BUY(=LONG) 였으면 닫을 때는 SELL + positionSide=LONG
+    - 열 때가 SELL(=SHORT) 였으면 닫을 때는 BUY + positionSide=SHORT
     """
-    close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
-    pos_side = _position_side_for_open(side_open)  # 열린 방향 기준
+    side_open_u = side_open.upper()
+    if side_open_u == "BUY":
+        close_side = "SELL"
+        pos_side = "LONG"
+    else:
+        close_side = "BUY"
+        pos_side = "SHORT"
+
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
