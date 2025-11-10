@@ -2,21 +2,32 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
-2025-11-11 단방향(One-way) 정리본
-----------------------------------------------------
-배경
-- 앱에서 포지션 모드를 단방향으로 바꿨다.
-- 단방향 계정은 주문에 positionSide 를 보내면 오히려 109400 이 날 수 있다.
-- 실제 로그에서도 positionSide="BOTH" 가 나가서 109400 이 났다.
+이 모듈이 담당하는 것:
+- 쿼리 스트링 서명 (HMAC SHA256)
+- 공통 요청(req)
+- 레버리지/마진 설정
+- 잔고 조회, 포지션 조회, 주문 조회
+- 시장가/조건부 주문 생성
+- 주문 상태 폴링(wait_filled)
+- 체결내역 요약(summarize_fills)
 
-변경 요약
-1) 주문 관련 함수(place_market, place_conditional, close_position_market)에서
-   positionSide 필드를 아예 제거했다.
-2) 예전처럼 "1차 실패 → positionSide 바꿔서 다시" 하는 폴백도 제거했다.
-   단방향에서 그거 하면 오히려 연속 실패하기 때문.
-3) 포지션/주문 조회, 잔고 조회, 시그니처 만드는 부분은 그대로다.
-4) 레버리지/마진 설정은 안 되는 계정도 있어서 실패해도 로그만 남기고 진행한다.
+2025-11-11 수정 (6차, 단방향 강제)
 ----------------------------------------------------
+(배경)
+- 실제 로그에 아직도 아래처럼 찍혔다.
+  [PLACE MARKET REQ] {..., 'positionSide': 'BOTH', ...}
+  이건 예전(헷지 계정 대응) 버전이 그대로 돌고 있다는 뜻이다.
+- 지금 계정은 앱에서 one-way(단방향)으로 바꾼 상태라
+  주문에 positionSide 를 넣으면 109400 이 난다.
+
+(변경)
+- 주문 관련 함수(place_market, place_conditional, close_position_market)에서
+  positionSide 관련 키를 완전히 제거했다.
+- 폴백(1차 실패 → 최소필드 → BOTH)도 다 뺐다. 단방향은 한 번만 심플하게 보낸다.
+- 로그에도 positionSide 가 찍히지 않도록 했다.
+----------------------------------------------------
+
+2025-11-10~11 이전 버전 내용은 아래 주석 참고.
 """
 
 from __future__ import annotations
@@ -237,7 +248,7 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
     단방향 기준 레버리지/마진 설정.
-    안 되는 계정도 있어서 실패해도 진행한다.
+    일부 계정에서는 여전히 이게 안 될 수 있으므로, 실패해도 에러만 남기고 진행한다.
     """
     # 레버리지
     try:
@@ -290,7 +301,7 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문 (단방향)
-    - positionSide 안 보냄
+    - positionSide 전혀 안 보냄
     - reduceOnly 만 붙임
     """
     norm_qty = _normalize_qty(symbol, qty)
