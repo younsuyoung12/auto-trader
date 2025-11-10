@@ -2,13 +2,21 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
-2025-11-11 수정 (6차)  ← One-way 계정 강제 BOTH 버전
+2025-11-11 단방향(One-way) 정리본
 ----------------------------------------------------
-(이번 변경 포인트)
-- 실제 계정이 "One-way 모드에서는 positionSide 를 반드시 BOTH로 내라" 라고 응답했으므로
-  주문 관련 함수에서 positionSide 를 아예 항상 넣도록 고정했다.
-- 시장가/조건부/강제청산 모두 동일하게 positionSide="BOTH" 붙인다.
-- 나머지 구조(서명, 조회, 폴링)는 네가 쓰던 형태 그대로 유지.
+배경
+- 앱에서 포지션 모드를 단방향으로 바꿨다.
+- 단방향 계정은 주문에 positionSide 를 보내면 오히려 109400 이 날 수 있다.
+- 실제 로그에서도 positionSide="BOTH" 가 나가서 109400 이 났다.
+
+변경 요약
+1) 주문 관련 함수(place_market, place_conditional, close_position_market)에서
+   positionSide 필드를 아예 제거했다.
+2) 예전처럼 "1차 실패 → positionSide 바꿔서 다시" 하는 폴백도 제거했다.
+   단방향에서 그거 하면 오히려 연속 실패하기 때문.
+3) 포지션/주문 조회, 잔고 조회, 시그니처 만드는 부분은 그대로다.
+4) 레버리지/마진 설정은 안 되는 계정도 있어서 실패해도 로그만 남기고 진행한다.
+----------------------------------------------------
 """
 
 from __future__ import annotations
@@ -30,7 +38,7 @@ BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 # 심볼별 수량 step (선물 전용)
 # ─────────────────────────────
 _QTY_STEP: Dict[str, float] = {
-    "BTC-USDT": 0.001,  # 기본으로 이걸 쓴다
+    "BTC-USDT": 0.001,
 }
 
 
@@ -184,7 +192,6 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     1) /user/positions 먼저
     2) 안 되면 /trade/positions 로 폴백
     """
-    # 1차
     try:
         res = req("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
         log(f"[POSITIONS RAW user] {res}")
@@ -195,7 +202,6 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     except Exception as e1:
         log(f"[POSITIONS user ERROR] {e1}")
 
-    # 2차
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
@@ -230,26 +236,41 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    앱에서 미리 설정한 레버리지/마진을 그대로 쓰는 계정용.
-    BingX가 API 변경을 109400으로 거부하므로 여기서는 로그만 남기고 실요청은 하지 않는다.
+    단방향 기준 레버리지/마진 설정.
+    안 되는 계정도 있어서 실패해도 진행한다.
     """
-    log("[INFO] 레버리지/마진 설정은 앱 설정을 사용합니다. API 변경은 생략합니다.")
-    return
+    # 레버리지
+    try:
+        req("POST", "/openApi/swap/v2/trade/leverage", {
+            "symbol": symbol,
+            "leverage": leverage,
+        })
+    except Exception as e:
+        log(f"[WARN] 레버리지 설정 실패(단방향): {e}")
+
+    # 마진 모드
+    try:
+        req("POST", "/openApi/swap/v2/trade/marginType", {
+            "symbol": symbol,
+            "marginType": "ISOLATED" if isolated else "CROSSED",
+        })
+    except Exception as e:
+        log(f"[WARN] 마진모드 설정 실패: {e}")
 
 
 # ─────────────────────────────
-# 주문 전송 (One-way → 항상 BOTH)
+# 주문 전송 (단방향 전용)
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
-    시장가 주문 (One-way)
-    - positionSide 를 항상 BOTH 로 보낸다.
+    시장가 주문 (단방향)
+    - positionSide 전혀 안 보냄
+    - 한 번만 시도
     """
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": "BOTH",
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
@@ -268,15 +289,14 @@ def place_conditional(
     order_type: str,
 ) -> Dict[str, Any]:
     """
-    TP/SL 조건부 주문 (One-way)
-    - positionSide 를 항상 BOTH 로 보낸다.
-    - reduceOnly 는 그대로 유지.
+    TP/SL 조건부 주문 (단방향)
+    - positionSide 안 보냄
+    - reduceOnly 만 붙임
     """
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": "BOTH",
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
@@ -354,7 +374,7 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
     """
     시장가 주문이 실제 FILLED 될 때까지 잠깐 폴링.
-    단방향이므로 따로 다른 필드는 필요 없다.
+    단방향이므로 따로 positionSide 를 보낼 필요는 없다.
     """
     end = time.time() + timeout
     last_status = None
@@ -377,14 +397,13 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산 (단방향)
-    - 반대 side + positionSide=BOTH 로 MARKET 보낸다.
+    - 그냥 반대 side 로 MARKET 한 번만 보낸다.
     """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": close_side,
-        "positionSide": "BOTH",
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
