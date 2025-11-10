@@ -7,14 +7,27 @@
 3. (옵션) 1분봉 마지막 캔들이 실제 진입 방향과 맞는지 확인한다.
 4. RSI 다이버전스가 신호와 반대면 신호를 버린다.
 
-실제 "주문" 은 여기서 하지 않는다. run_bot.py(또는 trader.py) 에서 이 함수를 불러서
-"이번 캔들에서 LONG/SHORT 진입할지" 만 결정한다.
+2025-11-10 변경
+----------------------------------------------------
+(배경)
+- 실시간 로그에서 3m, 15m 는 정상적으로 방향을 내고 있었으나
+  마지막 1m 확인 단계에서
+    [SKIP] 1m_confirm_mismatch: 1분봉이 방향 불일치
+  가 반복되어 실제 주문 단계까지 가지 못했다.
+- 기존 confirm_1m_direction 은 변동폭이 0.05% 미만일 때도 막고 있었는데,
+  횡보 구간에서는 이 조건이 지나치게 보수적으로 작동했다.
+
+(변경)
+- 1분봉을 “역방향으로 강하게 가지 않았는지” 확인하는 용도로만 사용한다.
+- 즉, 변동폭이 작아도 방향(시가 대비 종가)만 맞으면 통과시키도록 완화했다.
+- 데이터가 없을 때도 굳이 막지 않고 True 로 통과시켜 주문 단계로 진행되게 했다.
+----------------------------------------------------
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from indicators import (
     ema,
@@ -70,7 +83,7 @@ def decide_signal_3m_trend(
     if spread_ratio < 0.0005:
         return None
 
-    # 마지막 3m 캔들의 변동폭이 너무 작으면 스킵 (0.1% 미만)
+    # 마지막 3m 캔들의 변동폭이 너무 작으면 스킵 (0.05% 미만)
     last = candles_3m[-1]
     last_range_pct = (last[2] - last[3]) / last[3] if last[3] else 0.0
     if last_range_pct < 0.0005:
@@ -130,35 +143,29 @@ def decide_trend_15m(candles_15m: FifteenMCandles) -> Optional[str]:
 
 
 # ─────────────────────────────
-# 1분봉 확인
+# 1분봉 확인 (완화 버전)
 # ─────────────────────────────
 def confirm_1m_direction(candles_1m: OneMCandles, direction: str) -> bool:
-    """1분봉 마지막 캔들이 우리가 진입하려는 방향과 맞는지 확인한다.
-
-    기준(원래 bot.py 에 있던 것 그대로):
-    - 1분봉 캔들의 변동폭이 너무 작으면 False
-    - LONG 진입인데 1분봉 종가가 시가보다 낮으면 False
-    - SHORT 진입인데 1분봉 종가가 시가보다 높으면 False
+    """
+    1분봉을 ‘역주행 캔들 차단’ 용도로만 사용한다.
+    변동폭이 작아도 시가 대비 종가 방향만 맞으면 통과시킨다.
+    데이터가 없으면 막지 않는다.
     """
     if len(candles_1m) < 1:
-        return False
+        # 1분 데이터가 없다고 진입까지 막지는 않는다.
+        return True
 
-    last = candles_1m[-1]
-    _ts, o, h, l, c = last
-
-    # 변동폭 체크 (0.05% 미만이면 너무 작은 캔들로 보고 진입 안 함)
-    if l == 0:
-        return False
-    last_range_pct = (h - l) / l
-    if last_range_pct < 0.0005:
-        return False
+    _ts, o, _h, _l, c = candles_1m[-1]
 
     if direction == "LONG":
-        return c >= o  # 위로 마감해야 롱 진입 허용
+        # 양봉이면 그대로 통과
+        return c >= o
     if direction == "SHORT":
-        return c <= o  # 아래로 마감해야 숏 진입 허용
+        # 음봉이면 그대로 통과
+        return c <= o
 
-    return False
+    # 방향 정보가 이상하면 막지 않는다.
+    return True
 
 
 __all__ = [
