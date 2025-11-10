@@ -11,34 +11,43 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 주문 상태 폴링(wait_filled)
 - 체결내역 요약(summarize_fills)
 
-2025-11-11 수정 (5차)  ← 지금 버전
+2025-11-12 수정 (6차)  ← 이번 수정
 ----------------------------------------------------
-(배경)
-- 앱에서 포지션 모드를 Hedge(양방향) → One-way(단방향) 으로 바꿨다.
-- 이제 거래소가 주문에 positionSide 를 요구하지 않는다.
-- 오히려 positionSide 를 넣으면 다시 109400 이 날 가능성이 높다.
-(변경)
+(109400 방지/호환성 강화)
+1) 서명/전송 프로토콜을 BingX swap v2 권장 방식으로 통일
+   - 모든 요청에 timestamp/recvWindow 공통 부착(없으면 기본값 채움).
+   - 서명은 URL-인코딩된 정렬 파라미터(qs)에 대해 HMAC-SHA256.
+   - GET: URL = BASE + path + "?" + signed_qs
+   - POST/DELETE: 헤더 Content-Type=application/x-www-form-urlencoded,
+     바디에 signed_qs 그대로 전송(data=...).
+   - 헤더는 X-BX-APIKEY 사용.
+2) 수량/가격 문자열 포맷 강화
+   - 수량: 심볼별 step에 맞춰 내림 정규화 후 "0.005" 같은 고정 소수 문자열.
+   - 가격(triggerPrice 등): "105000.12" 같은 소수 문자열(지수표기 방지).
+3) 에러 메시지 강화
+   - BingX code/msg를 최대한 그대로 노출하여 원인 분석 용이.
+4) 레버리지/마진 설정도 동일한 서명/전송 경로 사용.
+
+(주의)
+- 단방향(one-way) 기준으로 positionSide 관련 필드는 어디에도 넣지 않음.
+
+2025-11-11 수정 (5차)
+----------------------------------------------------
 - 주문 관련 함수(place_market, place_conditional, close_position_market)에서
-  positionSide 관련 필드를 전부 제거했다.
-- 예전처럼 "1차 실패하면 positionSide 붙이고 다시" 하는 폴백도 전부 없앴다.
-- 단방향 기준이므로 한 번만 심플하게 보낸다.
-- 레버리지/마진 설정도 단방향 기준으로 먼저 보내고, 안 되면 로그만 남긴다.
+  positionSide 관련 필드 제거 (단방향 전제).
+- 레버리지/마진 설정 실패 시에도 진행 (로그만).
 
 2025-11-10 수정 (4차)
 ----------------------------------------------------
-- 이 계정이 positionSide 를 필수로 요구하는 로그가 있어서
-  "positionSide → 최소필드 → BOTH" 순서로 보냈다.
-- (지금은 단방향이므로 4차 내용은 제거됨.)
+- (양방향 폴백 로직은 현재 단방향이라 제거됨)
 
 2025-11-10 수정 (3차)
 ----------------------------------------------------
-- 포지션 조회를 /user/positions → /trade/positions 순으로 폴백하도록 바꿨다.
-- 이 부분은 여전히 유지한다.
+- 포지션 조회 /user/positions → /trade/positions 폴백 유지
 
 2025-11-10 수정 (1~2차)
 ----------------------------------------------------
-- 계정 모드에 따라 positionSide 를 넣었다 뺐다 하는 폴백을 넣었었다.
-- 현재 단방향에서는 필요 없으므로 제거했다.
+- (과거 positionSide 폴백 제거됨)
 ----------------------------------------------------
 """
 
@@ -47,6 +56,7 @@ from __future__ import annotations
 import time
 import hmac
 import hashlib
+import urllib.parse
 from typing import Any, Dict, List, Optional
 import requests
 
@@ -64,7 +74,6 @@ _QTY_STEP: Dict[str, float] = {
     "BTC-USDT": 0.001,  # 기본으로 이걸 쓴다
 }
 
-
 # ─────────────────────────────
 # 공통 유틸
 # ─────────────────────────────
@@ -73,25 +82,101 @@ def _ts_ms() -> int:
     return int(time.time() * 1000)
 
 
-def sign_query(params: Dict[str, Any], api_secret: str) -> str:
-    """파라미터를 정렬해서 HMAC-SHA256 서명 붙이기"""
-    qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
-    sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-    return qs + "&signature=" + sig
+def _headers(is_post_like: bool) -> Dict[str, str]:
+    """
+    BingX 필수 헤더:
+    - API 키는 X-BX-APIKEY
+    - POST/DELETE 는 x-www-form-urlencoded 로 보냄
+    """
+    h = {"X-BX-APIKEY": SET.api_key}
+    if is_post_like:
+        h["Content-Type"] = "application/x-www-form-urlencoded"
+    return h
 
 
-def _headers() -> Dict[str, str]:
-    """BingX 필수 헤더"""
-    return {
-        "X-BX-APIKEY": SET.api_key,
-        "Content-Type": "application/json",
-    }
+def _urlencode_sorted(params: Dict[str, Any]) -> str:
+    """
+    BingX 서명용: key 정렬 후 URL 인코딩된 쿼리스트링 생성.
+    값은 문자열로 변환하여 지수표기 방지.
+    """
+    items = []
+    for k in sorted(params.keys()):
+        v = params[k]
+        # 값 포맷 강제(지수표기 방지)
+        if isinstance(v, float):
+            # 과도한 자리수 방지: 일반적으로 거래 인수는 2~8자리면 충분
+            v = f"{v:.10f}".rstrip("0").rstrip(".")
+        else:
+            v = str(v)
+        items.append((k, v))
+    return urllib.parse.urlencode(items, quote_via=urllib.parse.quote)
 
 
-def _normalize_qty(symbol: str, raw_qty: float) -> float:
+def _sign(params: Dict[str, Any], api_secret: str) -> str:
+    """
+    URL-인코딩된 정렬 파라미터 문자열에 대해 HMAC-SHA256 서명 생성 후
+    signature 파라미터를 붙인 최종 쿼리스트링 반환.
+    """
+    qs = _urlencode_sorted(params)
+    sig = hmac.new(api_secret.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{qs}&signature={sig}"
+
+
+def _ensure_common(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """timestamp/recvWindow 기본값 채워넣기"""
+    p = dict(params or {})
+    p.setdefault("timestamp", _ts_ms())
+    p.setdefault("recvWindow", 5000)
+    return p
+
+
+def req(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,  # 유지: 인터페이스 호환용(미사용)
+) -> Dict[str, Any]:
+    """
+    BingX REST 요청 공통부.
+    - GET: URL에 서명 쿼리
+    - POST/DELETE: body=x-www-form-urlencoded 로 서명 쿼리 전송
+    - HTTP 200이라도 code != 0/None/100400 은 예외로 본다.
+    """
+    method = method.upper()
+    is_post_like = method in ("POST", "DELETE")
+    p = _ensure_common(params)
+
+    signed_qs = _sign(p, SET.api_secret)
+    url = f"{BASE}{path}"
+
+    if method == "GET":
+        url = f"{url}?{signed_qs}"
+        r = requests.get(url, headers=_headers(False), timeout=12)
+    elif method == "DELETE":
+        r = requests.delete(url, headers=_headers(True), data=signed_qs, timeout=12)
+    else:  # POST (기타 메서드는 현재 사용 안 함)
+        r = requests.post(url, headers=_headers(True), data=signed_qs, timeout=12)
+
+    # HTTP 에러
+    if r.status_code != 200:
+        raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
+
+    data = r.json() if r.content else {}
+
+    # BingX code 판단
+    if isinstance(data, dict):
+        code = data.get("code")
+        if code not in (None, 0, "0", 100400):
+            msg = data.get("msg") or data
+            raise RuntimeError(f"{method} {path} -> bingx code={code}, msg={msg}")
+    return data
+
+
+def _normalize_qty(symbol: str, raw_qty: float) -> str:
     """
     선물 수량을 거래소가 받는 최소 단위로 내린다.
     예: step=0.001, raw=0.005904 → 0.005
+    문자열로 반환하여 지수표기 방지.
     """
     step = _QTY_STEP.get(symbol, 0.001)
     if step <= 0:
@@ -100,37 +185,16 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
-    return float(f"{qty:.3f}")
+    # step 이 0.001 기준이라 소수 3자리가 안전
+    return f"{qty:.3f}".rstrip("0").rstrip(".") or "0"
 
 
-def req(
-    method: str,
-    path: str,
-    params: Optional[Dict[str, Any]] = None,
-    body: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def _fmt_price(p: float, decimals: int = 2) -> str:
     """
-    BingX REST 요청 공통부.
-    - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
+    가격 문자열 포맷(지수표기 방지). 기본 2자리.
+    심볼에 따라 tick size 다르면 나중에 per-symbol 로 조정 가능.
     """
-    params = params or {}
-    params["timestamp"] = _ts_ms()
-    url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
-    r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
-
-    if r.status_code != 200:
-        raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
-
-    data = r.json()
-
-    if isinstance(data, dict):
-        code = data.get("code")
-        if code not in (None, 0, "0", 100400):
-            raise RuntimeError(
-                f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
-            )
-
-    return data
+    return f"{p:.{decimals}f}".rstrip("0").rstrip(".") or "0"
 
 
 def _is_param_error(exc: Exception) -> bool:
@@ -275,7 +339,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
     try:
         req("POST", "/openApi/swap/v2/trade/leverage", {
             "symbol": symbol,
-            "leverage": leverage,
+            "leverage": str(leverage),
         })
     except Exception as e:
         log(f"[WARN] 레버리지 설정 실패(단방향): {e}")
@@ -299,13 +363,12 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     - positionSide 전혀 안 보냄
     - 한 번만 시도
     """
-    norm_qty = _normalize_qty(symbol, qty)
+    qty_str = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
-        "side": side,
+        "side": side,          # "BUY" or "SELL"
         "type": "MARKET",
-        "quantity": norm_qty,
-        "recvWindow": 5000,
+        "quantity": qty_str,
     }
     log(f"[PLACE MARKET REQ] {payload}")
     resp = req("POST", "/openApi/swap/v2/trade/order", payload)
@@ -325,15 +388,15 @@ def place_conditional(
     - positionSide 전혀 안 보냄
     - reduceOnly 만 붙임
     """
-    norm_qty = _normalize_qty(symbol, qty)
+    qty_str = _normalize_qty(symbol, qty)
+    price_str = _fmt_price(trigger_price, decimals=2)
     payload = {
         "symbol": symbol,
         "side": side,
-        "type": order_type,
-        "quantity": norm_qty,
+        "type": order_type,        # "TAKE_PROFIT_MARKET" / "STOP_MARKET"
+        "quantity": qty_str,
         "reduceOnly": True,
-        "triggerPrice": trigger_price,
-        "recvWindow": 5000,
+        "triggerPrice": price_str,
     }
     log(f"[PLACE CONDITIONAL REQ] {payload}")
     resp = req("POST", "/openApi/swap/v2/trade/order", payload)
@@ -432,19 +495,18 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     - 그냥 반대 side 로 MARKET 한 번만 보낸다.
     """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
-    norm_qty = _normalize_qty(symbol, qty)
+    qty_str = _normalize_qty(symbol, qty)
     payload = {
         "symbol": symbol,
         "side": close_side,
         "type": "MARKET",
-        "quantity": norm_qty,
+        "quantity": qty_str,
         "reduceOnly": True,
-        "recvWindow": 5000,
     }
     log(f"[FORCE CLOSE REQ] {payload}")
     try:
         req("POST", "/openApi/swap/v2/trade/order", payload)
-        send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
+        send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={qty_str}")
     except Exception as e:
         send_tg(f"❗ 포지션 강제 정리 실패: {e}")
 
@@ -464,5 +526,5 @@ __all__ = [
     "summarize_fills",
     "wait_filled",
     "close_position_market",
-    "sign_query",
+    "sign_query",  # (구호환용) 내부적으로는 _sign 사용
 ]
