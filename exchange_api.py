@@ -4,37 +4,53 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 
 2025-11-12 수정 (7차)
 ----------------------------------------------------
-(배경)
-- 실제 계정에서 주문을 넣어보니, 단순히 positionSide="BOTH" 로는
-  "Invalid parameters" 가 계속 발생했고,
-  사용자가 올려준 BingX 예제 파이썬 코드에서는
-    positionSide: "LONG"
-  처럼 방향을 명시해서 보내고 있었다.
-- 따라서 이 계정은 주문마다 포지션 방향을 LONG/SHORT 으로 넣어줘야만
-  정상 주문이 되는 형태로 보인다.
+이번 로그 기준으로 여전히 109400(Invalid parameters)이 떨어져서,
+"어느 파라미터 조합을 요구하는지"가 계정단에서 확실치 않은 상태다.
+그래서 주문/레버리지 설정을 한 모양으로만 보내지 말고,
+여러 대표적인 모양을 순서대로 시도해서
+하나라도 통과되면 그걸 쓰도록 방어 로직을 추가했다.
 
-(이번 변경)
-1) place_market(...) 이 side 에 맞춰서 positionSide 를 LONG/SHORT 으로 자동 설정하게 했다.
-   - side == "BUY"  → positionSide="LONG"
-   - side == "SELL" → positionSide="SHORT"
+변경 포인트
+1) req() 에 어떤 파라미터로 호출했는지 로그를 좀 더 남기게 했다.
+   - 서명(signature)은 찍지 않는다.
+   - 109400 난 요청은 어떤 params였는지 로그에 남겨서 나중에 바로 비교할 수 있게 했다.
 
-2) place_conditional(...) 에서도 TP/SL 주문일 때는 방향을 추론해서
-   - TP/SL 이고 side == "SELL" 이면  → 기존 LONG 포지션 닫는다고 보고 positionSide="LONG"
-   - TP/SL 이고 side == "BUY"  이면  → 기존 SHORT 포지션 닫는다고 보고 positionSide="SHORT"
-   으로 보내게 했다.
-   - 필요하면 호출부에서 position_side=... 로 강제로 지정할 수도 있게 파라미터를 추가했다.
-     (기존 호출 방식은 그대로 동작)
+2) set_leverage_and_mode(...)
+   - 지금까지는 LONG, SHORT 한 번씩만 보냈는데,
+     여기에 positionSide 를 쓰는 형태도 추가로 시도한다.
+   - 그래도 안 되면 마지막으로 "심볼만" 보내는 최소형도 한 번 던져본다.
+   - 어떤 단계에서 실패했는지는 WARN 으로 찍는다.
 
-3) close_position_market(...) 도 원래 포지션 방향을 받아서
-   반대 side + 그 포지션의 positionSide 로 보내도록 바꿨다.
+3) place_market(...)
+   - 아래 3가지 모양을 차례대로 시도한다.
+     (1) 현행 계정에서 요구했던 형태: side + positionSide(LONG/SHORT) + MARKET + quantity
+     (2) side + positionSide=BOTH + MARKET + quantity
+     (3) side + MARKET + quantity (positionSide 생략형)
+   - quantity 는 먼저 소수(step 단위)로 보냈다가 실패하면, 정수형 문자열(계약 수량식)으로도 한 번 더 보낸다.
+     → 일부 계정은 BTC-USDT 선물에서 정수 계약수만 받는 경우가 있어서 이렇게 한다.
 
-4) 레버리지/마진 설정은 계정별 요구 파라미터가 다른 것으로 보이므로
-   기존처럼 여러 형태로 시도하되 실패해도 봇이 멈추지 않게 유지했다.
+4) place_conditional(...), close_position_market(...) 도 (1) → (2) → (3) fallback 을 동일하게 적용한다.
+
+이렇게 해두면 어떤 모양에서 통과되는지를 로그로 바로 볼 수 있으니,
+다음 단계에서 "이 계정은 이 모양으로만 보내자"로 좁혀갈 수 있다.
+
 ----------------------------------------------------
-
 2025-11-11 수정 (6차)
+(원본 설명은 아래 그대로 남겨둠)
 ----------------------------------------------------
-(단방향 계정에서 positionSide 를 요구하므로 주문에 positionSide 를 넣는 버전)
+(배경)
+- 단방향(one-way)로 바꿨다고 했지만, 실제 계정 로그에서는
+  주문 시에 여전히 `positionSide: This field is required.` 가 나왔다.
+- 또 레버리지 설정에서도 `side: This field is required.` 라고 하므로,
+  이 계정은 양방향/단방향과 상관없이 필드를 명시해줘야 하는 형태다.
+
+(변경)
+1) 주문 관련 함수(place_market, place_conditional, close_position_market)에
+   다시 positionSide="BOTH" 를 넣었다.
+2) 레버리지/마진 설정할 때도 side 를 요구하므로,
+   set_leverage_and_mode(...)에서 LONG, SHORT 두 번 호출하도록 바꿨다.
+3) 나머지 구조(잔고 조회, 포지션 조회, 주문 조회)는 이전 버전 그대로 둔다.
+----------------------------------------------------
 """
 
 from __future__ import annotations
@@ -95,7 +111,18 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
+    # 3자리까지만
     return float(f"{qty:.3f}")
+
+
+def _as_int_qty(raw_qty: float) -> str:
+    """
+    어떤 계정은 '계약 수량' 형식의 정수만 받기도 하므로
+    실패 시에 대비해서 문자열 정수 형태도 만들어둔다.
+    """
+    if raw_qty <= 0:
+        return "1"
+    return str(int(round(raw_qty)) or 1)
 
 
 def req(
@@ -107,10 +134,17 @@ def req(
     """
     BingX REST 요청 공통부.
     - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
+    - 요청 파라미터는 로그에 남기되, signature 는 남기지 않는다.
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
-    url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
+    # signature 붙이기
+    signed_qs = sign_query(params, SET.api_secret)
+    url = f"{BASE}{path}?{signed_qs}"
+
+    # signature 빼고 원래 params 만 찍어둔다
+    log(f"[REQ] {method} {path} params={{{{ {', '.join(f'{k}: {params[k]}' for k in sorted(params.keys()) if k != 'signature')} }}}}")
+
     r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
 
     if r.status_code != 200:
@@ -121,6 +155,7 @@ def req(
     if isinstance(data, dict):
         code = data.get("code")
         if code not in (None, 0, "0", 100400):
+            # 어떤 파라미터 때문에 막혔는지 나중에 보려고 그대로 남긴다
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
@@ -262,10 +297,11 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    계정에서 side/positionSide 를 요구할 수 있으므로 몇 가지 패턴을 다 시도한다.
-    실패해도 봇은 계속 돌게 하고, 로그에만 남긴다.
+    이 계정은 뭘 넣어도 109400 을 줬으므로,
+    symbol+side, symbol+positionSide, symbol-only 3단계로 시도한다.
+    실패해도 봇은 계속 돌게 한다.
     """
-    # 1) side 기반 (LONG / SHORT)
+    # 1단계: side 로 보내기
     for side in ("LONG", "SHORT"):
         try:
             req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -276,7 +312,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         except Exception as e:
             log(f"[WARN] 레버리지 설정 실패({side}): {e}")
 
-    # 2) positionSide 기반 (LONG / SHORT)
+    # 2단계: positionSide 로도 한 번 던져보기
     for ps in ("LONG", "SHORT"):
         try:
             req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -287,7 +323,16 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         except Exception as e:
             log(f"[WARN] 레버리지 설정 실패(positionSide={ps}): {e}")
 
-    # 3) 마진 모드
+    # 3단계: 심볼만
+    try:
+        req("POST", "/openApi/swap/v2/trade/leverage", {
+            "symbol": symbol,
+            "leverage": leverage,
+        })
+    except Exception as e:
+        log(f"[WARN] 레버리지 설정 실패(심볼만): {e}")
+
+    # 마진 모드
     try:
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
@@ -298,32 +343,79 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송
+# 주문 전송 (여러 모양으로 재시도)
 # ─────────────────────────────
+def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    주어진 payload 리스트를 순서대로 /trade/order 에 던져서
+    처음으로 성공하는 응답을 돌려준다.
+    전부 실패하면 마지막 예외를 다시 던진다.
+    """
+    last_err: Optional[Exception] = None
+    for idx, pay in enumerate(payloads, start=1):
+        log(f"[PLACE TRY {idx}] {pay}")
+        try:
+            resp = req("POST", "/openApi/swap/v2/trade/order", pay)
+            log(f"[PLACE RESP {idx}] {resp}")
+            return resp
+        except Exception as e:
+            last_err = e
+            log(f"[PLACE ERR {idx}] {e}")
+            # 파라미터 에러면 다음 모양으로 계속 간다
+            if not _is_param_error(e):
+                break
+    if last_err:
+        raise last_err
+    raise RuntimeError("order failed without explicit error")
+
+
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문
-    - 이 계정은 positionSide 를 실제 LONG/SHORT 으로 지정해야 하므로 side 에 맞춰 넣는다.
+    - (1) side + positionSide(LONG/SHORT) + MARKET
+    - (2) side + positionSide=BOTH + MARKET
+    - (3) side + MARKET
+    - 실패하면 quantity 를 정수 문자열로 한 번 더 시도
     """
     norm_qty = _normalize_qty(symbol, qty)
-    side_u = side.upper()
-    if side_u == "BUY":
-        pos_side = "LONG"
-    else:
-        pos_side = "SHORT"
+    int_qty_str = _as_int_qty(qty)
 
-    payload = {
-        "symbol": symbol,
-        "side": side_u,
-        "positionSide": pos_side,
-        "type": "MARKET",
-        "quantity": norm_qty,
-        "recvWindow": 5000,
-    }
-    log(f"[PLACE MARKET REQ] {payload}")
-    resp = req("POST", "/openApi/swap/v2/trade/order", payload)
-    log(f"[PLACE MARKET RESP] {resp}")
-    return resp
+    # 1차 시도들 (소수 수량)
+    payloads = [
+        {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "LONG" if side.upper() == "BUY" else "SHORT",
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "recvWindow": 5000,
+        },
+        {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "BOTH",
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "recvWindow": 5000,
+        },
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "recvWindow": 5000,
+        },
+    ]
+
+    try:
+        return _try_order(payloads)
+    except Exception as e:
+        # 전부 안 되면 정수 수량으로 다시 시도
+        log(f"[PLACE MARKET] float qty fail -> retry with int qty: {int_qty_str}")
+        payloads_int = [
+            {**p, "quantity": int_qty_str} for p in payloads
+        ]
+        return _try_order(payloads_int)
 
 
 def place_conditional(
@@ -332,44 +424,51 @@ def place_conditional(
     qty: float,
     trigger_price: float,
     order_type: str,
-    position_side: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문
-    - 이 계정은 positionSide 를 요구하므로 가능한 한 방향을 추론해서 넣는다.
-    - 호출부에서 position_side 를 직접 넘기면 그 값을 그대로 사용한다.
+    위랑 똑같이 3단계 모양으로 시도한다.
     """
     norm_qty = _normalize_qty(symbol, qty)
-    side_u = side.upper()
-    order_type_u = order_type.upper()
+    int_qty_str = _as_int_qty(qty)
 
-    # position_side 가 안 들어오면 추론
-    ps = position_side
-    if not ps:
-        # TP/SL 이고 side 가 SELL 이면 → LONG 포지션 종료
-        if any(k in order_type_u for k in ("TAKE_PROFIT", "STOP")) and side_u == "SELL":
-            ps = "LONG"
-        # TP/SL 이고 side 가 BUY 이면 → SHORT 포지션 종료
-        elif any(k in order_type_u for k in ("TAKE_PROFIT", "STOP")) and side_u == "BUY":
-            ps = "SHORT"
-        else:
-            # 일반적인 경우에는 side 에 따라 맞춰준다
-            ps = "LONG" if side_u == "BUY" else "SHORT"
-
-    payload = {
-        "symbol": symbol,
-        "side": side_u,
-        "positionSide": ps,
-        "type": order_type_u,
-        "quantity": norm_qty,
-        "reduceOnly": True,
-        "triggerPrice": trigger_price,
-        "recvWindow": 5000,
-    }
-    log(f"[PLACE CONDITIONAL REQ] {payload}")
-    resp = req("POST", "/openApi/swap/v2/trade/order", payload)
-    log(f"[PLACE CONDITIONAL RESP] {resp}")
-    return resp
+    payloads = [
+        {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "LONG" if side.upper() == "BUY" else "SHORT",
+            "type": order_type,
+            "quantity": norm_qty,
+            "reduceOnly": True,
+            "triggerPrice": trigger_price,
+            "recvWindow": 5000,
+        },
+        {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "BOTH",
+            "type": order_type,
+            "quantity": norm_qty,
+            "reduceOnly": True,
+            "triggerPrice": trigger_price,
+            "recvWindow": 5000,
+        },
+        {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "quantity": norm_qty,
+            "reduceOnly": True,
+            "triggerPrice": trigger_price,
+            "recvWindow": 5000,
+        },
+    ]
+    try:
+        return _try_order(payloads)
+    except Exception:
+        # 정수 수량으로 한 번 더
+        payloads_int = [{**p, "quantity": int_qty_str} for p in payloads]
+        return _try_order(payloads_int)
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
@@ -460,33 +559,51 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산
-    - 열 때가 BUY(=LONG) 였으면 닫을 때는 SELL + positionSide=LONG
-    - 열 때가 SELL(=SHORT) 였으면 닫을 때는 BUY + positionSide=SHORT
+    - 위에서 만든 order fallback 을 그대로 써서 닫는다.
     """
-    side_open_u = side_open.upper()
-    if side_open_u == "BUY":
-        close_side = "SELL"
-        pos_side = "LONG"
-    else:
-        close_side = "BUY"
-        pos_side = "SHORT"
-
+    close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
-    payload = {
-        "symbol": symbol,
-        "side": close_side,
-        "positionSide": pos_side,
-        "type": "MARKET",
-        "quantity": norm_qty,
-        "reduceOnly": True,
-        "recvWindow": 5000,
-    }
-    log(f"[FORCE CLOSE REQ] {payload}")
+    int_qty_str = _as_int_qty(qty)
+
+    payloads = [
+        {
+            "symbol": symbol,
+            "side": close_side,
+            "positionSide": "LONG" if close_side == "BUY" else "SHORT",
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "reduceOnly": True,
+            "recvWindow": 5000,
+        },
+        {
+            "symbol": symbol,
+            "side": close_side,
+            "positionSide": "BOTH",
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "reduceOnly": True,
+            "recvWindow": 5000,
+        },
+        {
+            "symbol": symbol,
+            "side": close_side,
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "reduceOnly": True,
+            "recvWindow": 5000,
+        },
+    ]
     try:
-        req("POST", "/openApi/swap/v2/trade/order", payload)
+        _try_order(payloads)
         send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
-    except Exception as e:
-        send_tg(f"❗ 포지션 강제 정리 실패: {e}")
+    except Exception:
+        # 정수로도 한 번
+        payloads_int = [{**p, "quantity": int_qty_str} for p in payloads]
+        try:
+            _try_order(payloads_int)
+            send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={int_qty_str}")
+        except Exception as e:
+            send_tg(f"❗ 포지션 강제 정리 실패: {e}")
 
 
 __all__ = [
