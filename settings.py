@@ -5,6 +5,15 @@ BingX 자동매매 봇 공통 설정 모듈
 - 기본 타임존, 상수 정의
 - 다른 모듈에서 import 해서 사용
 
+2025-11-10 추가
+3) 진입 거래량 가드 완화용 옵션 추가
+- min_entry_volume_ratio: float = 0.15
+  → 3분봉 진입 직전에 "이 캔들 거래량 / 최근 20개 평균 거래량"을 비교할 때 쓰는 하한선
+  → 원래 코드에서는 기본값 0.3(=30%)로 꽤 보수적으로 돼 있어서,
+     시장이 얇은 구간에서는 신호가 나와도 전부 SKIP 되어버렸다.
+  → 여기서 기본을 0.15로 내려서 평균의 15%만 돼도 진입을 허용하도록 했다.
+  → 환경변수(MIN_ENTRY_VOLUME_RATIO)로도 덮어쓸 수 있다.
+
 2025-11-09 수정/추가 내용
 1) 진입 안전성 관련
 - 선물 중심 운영을 위해 진입 슬리피지 한도 옵션을 추가함:
@@ -118,6 +127,11 @@ class BotSettings:
     min_sl_pct: float = 0.005
     atr_risk_high_mult: float = 1.5
     atr_risk_reduction: float = 0.5
+
+    # ↓↓↓ 2025-11-10: 진입 거래량 가드 하한
+    # 최근 20개 3m 거래량 평균의 몇 % 이상일 때만 진입을 허용할지
+    # run_bot.py / entry_guards.py 에서 이 값을 참조해서 volume_too_low_for_entry 를 결정한다.
+    min_entry_volume_ratio: float = 0.15
 
     # 쿨다운/폴링
     cooldown_sec: int = 15
@@ -273,6 +287,8 @@ def load_settings() -> BotSettings:
         # RSI 기준
         rsi_overbought=_as_int(os.getenv("RSI_OVERBOUGHT", "70"), 70),
         rsi_oversold=_as_int(os.getenv("RSI_OVERSOLD", "30"), 30),
+        # ↓↓↓ 2025-11-10: 진입 거래량 가드도 환경변수로 읽기
+        min_entry_volume_ratio=_as_float(os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.15"), 0.15),
         # 종료 관련
         min_uptime_for_stop=_as_int(os.getenv("MIN_UPTIME_FOR_STOP", "5"), 5),
         # BingX base url
