@@ -11,53 +11,43 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 주문 상태 폴링(wait_filled)
 - 체결내역 요약(summarize_fills)
 
+2025-11-10 수정 (4차)
+----------------------------------------------------
+(핵심 원인)
+- BingX 공식 예제는 파라미터를 전부 쿼리스트링에 넣고,
+  POST 바디는 비워서 보낸다.
+- 우리는 바디가 없어도 Content-Type: application/json 헤더를
+  강제로 달아서 보내고 있었기 때문에, 서버가 이를 파라미터 오류
+  (code=109400)로 처리했을 가능성이 크다.
+
+(해결)
+- req() 에서 POST를 보낼 때 body가 없으면 Content-Type 을 붙이지 않는다.
+- body가 있을 때만 json 으로 보낸다.
+- 나머지 주문 로직(최소 필드 → positionSide → BOTH)과
+  포지션 2단계 조회(user → trade)는 3차 수정 사항을 그대로 유지한다.
+
 2025-11-10 수정 (3차)
 ----------------------------------------------------
 (배경)
-- 실제 계정에서 MARKET 주문을 세 가지 패턴
-  (positionSide 포함 / 미포함 / BOTH)으로 모두 보내도
-  code=109400 이 반환되는 케이스가 있었다.
-- 원인은 "필드가 많은 주문"을 보냈을 때 BingX가
-  일부 계정 모드에서 이를 거부하는 것으로 추정된다.
-- 따라서 가장 보수적인 순서로 바꾼다.
-  1) 최소 필드만 넣어서 보낸다.
-     {symbol, side, type="MARKET", quantity, recvWindow}
-  2) 그래도 109400이면 그때만 positionSide 를 붙여서 다시 보낸다.
-  3) 그래도 안 되면 BOTH 로 한 번 더 보낸다.
-- 조건부 주문(place_conditional)과 강제청산(close_position_market)
-  도 같은 패턴으로 단순화해서, 계정 모드 차이로 인한
-  109400 을 최대한 우회한다.
-- 포지션 조회도 /trade/positions 만 쓰면 "this api is not exist"
-  로그가 계속 찍히므로, 우선적으로 /user/positions 를 시도하고
-  안 되면 기존 엔드포인트로 폴백한다.
+- MARKET 주문을 positionSide 포함/미포함/BOTH로 모두 던져도
+  code=109400 이 나온 계정이 있었다.
+- 계정 모드/필드 수에 민감한 것으로 보고,
+  가장 보수적으로 ① 최소 필드만 → ② 그래도 안 되면 positionSide →
+  ③ 그래도 안 되면 BOTH 순서로 바꾼다.
+- 조건부 주문(place_conditional)과 강제청산(close_position_market)도
+  같은 패턴으로 단순화한다.
+- 포지션 조회도 /user/positions 를 먼저 쓰고, 안 되면 /trade/positions 로
+  폴백하도록 했다.
 
 2025-11-10 수정 (2차)
 ----------------------------------------------------
-(문제)
-- positionSide 를 넣어도, 빼도, BOTH 로 넣어도 전부 109400 이 나왔다.
-- 이걸 보면 파라미터 이름 자체가 빙엑스가 원하는 것과 살짝 달 가능성이 크다.
-- 우리가 지금까지 응답 파싱할 때는 get("type") 또는 get("orderType") 둘 다를 받도록 해둔 상태였다.
-  이 말은 "빙엑스가 응답에서는 orderType 라는 키를 쓸 수 있다"는 뜻이다.
-(해결)
-- 주문 보낼 때도 type=... 만 보내지 말고 orderType=... 을 같이 보낸다.
-- 즉, MARKET 주문이면
-    "type": "MARKET",
-    "orderType": "MARKET"
-  이렇게 두 개를 같이 보낸다.
-- 조건부(TP/SL) 주문도 동일하게 orderType 을 같이 보낸다.
-- 나머지 구조, 수량 내림, 109400 폴백은 그대로 유지한다.
+- 응답에서 orderType 이 오는 것을 보고, 요청에도 orderType 을 같이 보내도록
+  했던 버전. (현재는 최소 필드 우선이므로 필요시만 추가)
 
 2025-11-10 수정 (1차)
 ----------------------------------------------------
-(배경)
-- 어떤 계정은 헤지(양방향) 모드처럼 주문을 보내면 잘 되는데,
-  어떤 계정은 원웨이(단방향) 모드라서 주문에 positionSide(LONG/SHORT)가 들어가면
-  bingx code=109400 "Invalid parameters" 가 발생했다.
-- 우리는 봇 코드(run_bot.py / trader.py) 쪽은 그대로 두고,
-  실제로 BingX에 주문을 던지는 이 레이어에서만 "안 되면 한 번 더" 시도하게 만들면
-  위쪽 코드를 건드리지 않아도 된다.
-→ place_market(), place_conditional(), close_position_market() 에
-   positionSide 넣었다가 109400이면 빼고 다시 보내는 폴백을 넣었다.
+- place_market(), place_conditional(), close_position_market() 에서
+  positionSide 넣었다가 109400이면 빼고 다시 보내는 폴백을 넣었다.
 ----------------------------------------------------
 """
 
@@ -74,13 +64,13 @@ from telelog import log, send_tg
 
 # 설정 읽기 (전역으로 보관)
 SET = load_settings()
-BASE = SET.bingx_base  # 기본: https://open-api.bingx.com
+BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 
 # ─────────────────────────────
 # 심볼별 수량 step (선물 전용)
 # ─────────────────────────────
 _QTY_STEP: Dict[str, float] = {
-    "BTC-USDT": 0.001,   # 우리가 지금 실제로 쓰려는 심볼
+    "BTC-USDT": 0.001,  # 현재 봇에서 사용할 심볼
 }
 
 
@@ -88,29 +78,24 @@ _QTY_STEP: Dict[str, float] = {
 # 공통 유틸
 # ─────────────────────────────
 def _ts_ms() -> int:
-    """현재 ms 타임스탬프"""
+    """현재 ms 타임스탬프 반환"""
     return int(time.time() * 1000)
 
 
 def sign_query(params: Dict[str, Any], api_secret: str) -> str:
-    """파라미터를 정렬해서 HMAC-SHA256 서명 붙이기"""
+    """
+    파라미터를 key 기준으로 정렬해 쿼리스트링을 만든 뒤
+    HMAC-SHA256 으로 서명해서 signature=... 를 붙여준다.
+    """
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return qs + "&signature=" + sig
 
 
-def _headers() -> Dict[str, str]:
-    """BingX 필수 헤더"""
-    return {
-        "X-BX-APIKEY": SET.api_key,
-        "Content-Type": "application/json",
-    }
-
-
 def _normalize_qty(symbol: str, raw_qty: float) -> float:
     """
-    선물 수량을 거래소가 받는 최소 단위로 내린다.
-    예: step=0.001, raw=0.005904 → 0.005
+    선물 수량을 거래소 최소단위로 내림.
+    예) step=0.001, raw=0.005904 → 0.005 → 0.005 으로 고정
     """
     step = _QTY_STEP.get(symbol, 0.001)
     if step <= 0:
@@ -129,20 +114,37 @@ def req(
     body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    BingX REST 요청 공통부.
-    - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
-    - 상위에서 109400만 따로 잡아서 폴백할 수 있게 한다.
+    BingX REST 공통 요청.
+    - 파라미터는 전부 쿼리스트링에 올리고 서명한다.
+    - POST 인데 body 가 없으면 Content-Type 을 붙이지 않는다
+      (공식 예제와 동일한 형태).
+    - 응답 code 가 0/None/100400 이 아니면 예외로 올린다.
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
-    r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
 
-    if r.status_code != 200:
-        raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
+    # 필수 헤더: 키만 먼저
+    headers = {
+        "X-BX-APIKEY": SET.api_key,
+    }
 
-    data = r.json()
+    # 메서드에 따라 전송
+    if method.upper() == "POST":
+        if body is None:
+            # 바디 없이 보내는 공식 예제 패턴
+            resp = requests.post(url, headers=headers, data="", timeout=12)
+        else:
+            # 바디가 있을 때만 JSON 으로
+            headers["Content-Type"] = "application/json"
+            resp = requests.post(url, headers=headers, json=body, timeout=12)
+    else:
+        resp = requests.request(method, url, headers=headers, timeout=12)
 
+    if resp.status_code != 200:
+        raise RuntimeError(f"{method} {path} -> {resp.status_code}: {resp.text}")
+
+    data = resp.json()
     if isinstance(data, dict):
         code = data.get("code")
         # 0 / "0" / None / 100400 은 통과
@@ -150,12 +152,11 @@ def req(
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
-
     return data
 
 
 def _is_param_error(exc: Exception) -> bool:
-    """109400, Invalid parameters 같은 파라미터 오류인지 판별"""
+    """109400 / Invalid parameters 문자열이 포함된 예외인지 판별"""
     msg = str(exc)
     return "109400" in msg or "Invalid parameters" in msg
 
@@ -164,14 +165,17 @@ def _is_param_error(exc: Exception) -> bool:
 # 계좌/포지션/주문 조회
 # ─────────────────────────────
 def get_available_usdt() -> float:
-    """가용 마진(availableMargin/Balance)을 최대한 평탄화해서 가져온다."""
+    """
+    사용 가능한 USDT(availableMargin 등)를 최대한 회수해서 float 으로 리턴.
+    구조가 계정마다 조금 달라서 케이스별로 풀어줌.
+    """
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
 
         data = res.get("data") or res.get("balances") or res
 
-        # {"data": {"balance": {...}}} 구조
+        # case 1: {"data": {"balance": {...}}}
         if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
             bal = data["balance"]
             cand = (
@@ -183,7 +187,7 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
-        # 리스트로 오는 구조
+        # case 2: list 로 온 경우
         if isinstance(data, list) and data:
             item = data[0]
         else:
@@ -200,7 +204,7 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
-        # 마지막 일반 케이스
+        # fallback
         cand = (
             item.get("availableBalance")
             or item.get("availableMargin")
@@ -217,8 +221,8 @@ def get_available_usdt() -> float:
 
 def get_balance_detail() -> Dict[str, Any]:
     """
-    잔고 전체 구조를 그대로 반환.
-    run_bot.py 에서 usedMargin 등 읽어볼 때 사용.
+    잔고 구조 전체를 그대로 돌려준다.
+    run_bot.py / trader.py 쪽에서 usedMargin 같은 필드를 직접 읽을 때 사용.
     """
     res = req("GET", "/openApi/swap/v2/user/balance", {})
     log(f"[BALANCE RAW for detail] {res}")
@@ -243,8 +247,7 @@ def get_balance_detail() -> Dict[str, Any]:
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     """
     열려 있는 포지션 목록 조회.
-    일부 계정/엔드포인트에서 100400, "this api is not exist" 가 나와서
-    user → trade 순으로 시도한다.
+    일부 계정은 trade/positions 가 막혀 있으므로 user/positions 먼저 시도.
     """
     # 1차: user/positions
     try:
@@ -257,7 +260,7 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     except Exception as e1:
         log(f"[POSITIONS user ERROR] {e1}")
 
-    # 2차: trade/positions (기존 방식)
+    # 2차: trade/positions
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
@@ -274,7 +277,7 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
 
 
 def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
-    """걸려 있는 주문 목록 조회"""
+    """열려 있는 주문 목록 조회"""
     try:
         res = req("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
         log(f"[OPEN ORDERS RAW] {res}")
@@ -288,12 +291,12 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 
 
 # ─────────────────────────────
-# 레버리지/마진
+# 레버리지/마진 설정
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    레버리지/마진 모드 설정.
-    일부 계정에서는 안 되므로 109400이면 경고만 남기고 넘어간다.
+    레버리지/마진모드 설정.
+    일부 계정은 이 API 자체가 막혀 있어 109400 을 내므로 그때는 경고만.
     """
     errs: List[str] = []
 
@@ -308,7 +311,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         except Exception as e:
             msg = str(e)
             if "109400" in msg:
-                log(f"[WARN] 레버리지({side})는 API로 설정 불가해 보여서 건너뜁니다: {msg}")
+                log(f"[WARN] 레버리지({side})는 API로 설정 불가해서 건너뜀: {msg}")
             else:
                 errs.append(f"{side}: {msg}")
 
@@ -321,7 +324,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
     except Exception as e:
         msg = str(e)
         if "109400" in msg:
-            log(f"[WARN] 마진모드는 API로 설정 불가해 보여서 건너뜁니다: {msg}")
+            log(f"[WARN] 마진모드는 API로 설정 불가해서 건너뜀: {msg}")
         else:
             errs.append(f"MARGIN: {msg}")
 
@@ -330,15 +333,14 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (109400 폴백 포함, 최소 필드 우선)
+# 주문 전송 (시장가/조건부) - 109400 폴백 포함
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
-    시장가 주문 발행.
-    순서:
-      1) 최소 필드로 전송
-      2) 109400 이면 positionSide=LONG/SHORT 으로 재시도
-      3) 그래도 109400 이면 positionSide=BOTH 로 최종 재시도
+    시장가 주문.
+    1) 최소 필드로 먼저 던진다.
+    2) 109400 이면 positionSide=LONG/SHORT 으로 한 번 더.
+    3) 그래도 109400 이면 positionSide=BOTH 로 마지막으로.
     """
     norm_qty = _normalize_qty(symbol, qty)
 
@@ -358,9 +360,9 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     except Exception as e1:
         if not _is_param_error(e1):
             raise
-        log(f"[PLACE MARKET] 1차가 파라미터 오류여서 positionSide 붙이고 재시도: {e1}")
+        log(f"[PLACE MARKET] 1차 파라미터 오류 → positionSide 재시도: {e1}")
 
-    # 2차: 계정이 헷지/양방향일 때
+    # 2차: 헷지/양방향 모드 고려
     pos_side = "LONG" if side.upper() == "BUY" else "SHORT"
     payload2 = {
         "symbol": symbol,
@@ -378,7 +380,7 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     except Exception as e2:
         if not _is_param_error(e2):
             raise
-        log(f"[PLACE MARKET] 2차도 파라미터 오류여서 BOTH 로 재시도: {e2}")
+        log(f"[PLACE MARKET] 2차 파라미터 오류 → BOTH 재시도: {e2}")
 
     # 3차: BOTH
     payload3 = {
@@ -404,7 +406,7 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문.
-    순서도 시장가와 동일하게 최소 필드 → positionSide → BOTH 로 간다.
+    시장가와 동일한 패턴으로 1→2→3 단계로 보낸다.
     """
     norm_qty = _normalize_qty(symbol, qty)
 
@@ -426,7 +428,7 @@ def place_conditional(
     except Exception as e1:
         if not _is_param_error(e1):
             raise
-        log(f"[PLACE CONDITIONAL] 1차가 파라미터 오류여서 positionSide 붙이고 재시도: {e1}")
+        log(f"[PLACE CONDITIONAL] 1차 파라미터 오류 → positionSide 재시도: {e1}")
 
     # 2차: positionSide 포함
     pos_side = "LONG" if side.upper() == "BUY" else "SHORT"
@@ -448,7 +450,7 @@ def place_conditional(
     except Exception as e2:
         if not _is_param_error(e2):
             raise
-        log(f"[PLACE CONDITIONAL] 2차도 파라미터 오류여서 BOTH 로 재시도: {e2}")
+        log(f"[PLACE CONDITIONAL] 2차 파라미터 오류 → BOTH 재시도: {e2}")
 
     # 3차: BOTH
     payload3 = {
@@ -552,12 +554,14 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산.
-    최소 필드로 먼저 보내고, 109400 이면 positionSide 를 붙여서 다시 보낸다.
+    - 1차: 최소 필드
+    - 2차: positionSide 붙여서
+    - 3차: BOTH
     """
     close_side = "SELL" if side_open == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
 
-    # 1차: 최소 필드
+    # 1차
     payload1 = {
         "symbol": symbol,
         "side": close_side,
@@ -575,9 +579,9 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         if not _is_param_error(e1):
             send_tg(f"❗ 포지션 강제 정리 실패: {e1}")
             return
-        log(f"[FORCE CLOSE] 1차가 파라미터 오류여서 positionSide 붙이고 재시도: {e1}")
+        log(f"[FORCE CLOSE] 1차 파라미터 오류 → positionSide 재시도: {e1}")
 
-    # 2차: positionSide 포함
+    # 2차
     position_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
     payload2 = {
         "symbol": symbol,
@@ -597,9 +601,9 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         if not _is_param_error(e2):
             send_tg(f"❗ 포지션 강제 정리 실패: {e2}")
             return
-        log(f"[FORCE CLOSE] 2차도 파라미터 오류여서 BOTH 로 재시도: {e2}")
+        log(f"[FORCE CLOSE] 2차도 파라미터 오류 → BOTH 재시도: {e2}")
 
-    # 3차: BOTH
+    # 3차
     payload3 = {
         "symbol": symbol,
         "side": close_side,
