@@ -73,7 +73,7 @@ def decide_signal_3m_trend(
     # 마지막 3m 캔들의 변동폭이 너무 작으면 스킵 (0.1% 미만)
     last = candles_3m[-1]
     last_range_pct = (last[2] - last[3]) / last[3] if last[3] else 0.0
-    if last_range_pct < 0.001:
+    if last_range_pct < 0.0005:
         return None
 
     # 골든/데드크로스 판정
