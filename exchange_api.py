@@ -11,30 +11,28 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 주문 상태 폴링(wait_filled)
 - 체결내역 요약(summarize_fills)
 
-2025-11-10 수정
+2025-11-10 수정 (2차)
 ----------------------------------------------------
 (배경)
-- 어떤 계정은 헤지(양방향) 모드처럼 주문을 보내면 잘 되는데,
-  어떤 계정은 원웨이(단방향) 모드라서 주문에 positionSide(LONG/SHORT)가 들어가면
-  bingx code=109400 "Invalid parameters" 가 발생했다.
-- 우리는 봇 코드(run_bot.py / trader.py) 쪽은 그대로 두고,
-  실제로 BingX에 주문을 던지는 이 레이어에서만 "안 되면 한 번 더" 시도하게 만들면
-  위쪽 코드를 건드리지 않아도 된다.
+- 어떤 계정은 헤지(양방향) 모드처럼 order 에 positionSide=LONG/SHORT 가 있으면 성공한다.
+- 어떤 계정은 원웨이(단방향) 모드라서 positionSide 자체가 있으면 109400 이 난다.
+- 또 어떤 계정/환경은 아예 positionSide=BOTH 를 요구하기도 한다.
+- 우리는 위쪽(run_bot.py, trader.py) 로직은 그대로 두고, 여기서만 모드 차이를 흡수하고 싶다.
 
 (변경 내용)
-1) place_market(), place_conditional(), close_position_market() 에 폴백 로직 추가
-   - 1차 시도: positionSide 포함해서 보냄
-   - 만약 109400 이면: positionSide 를 빼고 똑같이 다시 보냄
-   - 이렇게 하면 헤지 계정에서는 첫 번째 시도가 성공하고,
-     원웨이 계정에서는 두 번째 시도가 성공해서 공통 코드로 쓸 수 있다.
+1) place_market(), place_conditional(), close_position_market() 에 3단계 폴백 로직 추가
+   - 1차: positionSide=LONG/SHORT 넣어서 보냄 (헤지 계정용)
+   - 2차: 109400 이면 positionSide 를 아예 빼고 다시 보냄 (원웨이 계정용)
+   - 3차: 그래도 109400 이면 positionSide="BOTH" 로 다시 보냄 (일부 단방향 호환)
+   → 이렇게 하면 한 파일로 대부분 계정을 커버할 수 있다.
 
-2) 109400 인지 확인하는 헬퍼 _is_param_error(...) 추가
-   - 에러 메시지 안에 "109400" 이나 "Invalid parameters" 가 있으면 그걸로 간주
+2) 109400 판별 헬퍼(_is_param_error) 그대로 사용
+   - 에러 메시지 안에 "109400" 또는 "Invalid parameters" 있으면 다음 단계로 넘어간다.
 
-3) 나머지 구조는 기존 2025-11-09 버전과 동일
+3) 나머지 구조는 2025-11-09 버전과 동일
    - 수량 0.001 단위 내림
    - 레버리지/마진 설정 실패는 경고만
-   - 잔고 상세 조회 헬퍼 그대로 유지
+   - 잔고 상세 조회 헬퍼 유지
 ----------------------------------------------------
 """
 
@@ -292,46 +290,51 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 # ─────────────────────────────
-# 주문 전송 (109400 폴백 포함)
+# 주문 전송 (109400 3단계 폴백 포함)
 # ─────────────────────────────
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문 발행.
     1) positionSide=LONG/SHORT 포함해보고
     2) 109400 나면 positionSide 없이 다시 전송
+    3) 그래도 109400 나면 positionSide="BOTH" 로 다시 전송
     """
     norm_qty = _normalize_qty(symbol, qty)
-    position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+    side_up = side.upper()
+    hedge_pos_side = "LONG" if side_up == "BUY" else "SHORT"
 
-    payload = {
+    base_payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": position_side,
         "type": "MARKET",
         "quantity": norm_qty,
         "recvWindow": 5000,
     }
-    log(f"[PLACE MARKET REQ] {payload}")
-    try:
-        resp = req("POST", "/openApi/swap/v2/trade/order", payload)
-        log(f"[PLACE MARKET RESP] {resp}")
-        return resp
-    except Exception as e:
-        if _is_param_error(e):
-            # 원웨이 계정일 가능성 → positionSide 빼고 재시도
-            fallback_payload = {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "quantity": norm_qty,
-                "recvWindow": 5000,
-            }
-            log(f"[PLACE MARKET RETRY w/o positionSide] {fallback_payload}")
-            resp = req("POST", "/openApi/swap/v2/trade/order", fallback_payload)
-            log(f"[PLACE MARKET RESP RETRY] {resp}")
+
+    attempts = [
+        {**base_payload, "positionSide": hedge_pos_side},  # 1차: 헤지 스타일
+        {**base_payload},                                  # 2차: 아예 제거
+        {**base_payload, "positionSide": "BOTH"},          # 3차: 단방향 호환
+    ]
+
+    last_exc: Optional[Exception] = None
+
+    for idx, payload in enumerate(attempts, start=1):
+        log(f"[PLACE MARKET REQ {idx}] {payload}")
+        try:
+            resp = req("POST", "/openApi/swap/v2/trade/order", payload)
+            log(f"[PLACE MARKET RESP {idx}] {resp}")
             return resp
-        # 다른 에러면 위로 올려보냄
-        raise
+        except Exception as e:
+            last_exc = e
+            if _is_param_error(e):
+                # 다음 시도
+                continue
+            # 파라미터 말고 다른 에러면 바로 올림
+            raise
+
+    # 3번 다 실패
+    raise last_exc  # type: ignore
 
 
 def place_conditional(
@@ -344,41 +347,44 @@ def place_conditional(
     """
     TP/SL 조건부 주문.
     1) positionSide 포함
-    2) 109400 이면 빼고 재시도
+    2) 109400 이면 빼고
+    3) 그래도 109400 이면 positionSide=BOTH
     """
     norm_qty = _normalize_qty(symbol, qty)
-    position_side = "LONG" if side.upper() == "BUY" else "SHORT"
-    payload = {
+    side_up = side.upper()
+    hedge_pos_side = "LONG" if side_up == "BUY" else "SHORT"
+
+    base_payload = {
         "symbol": symbol,
         "side": side,
-        "positionSide": position_side,
         "type": order_type,
         "quantity": norm_qty,
         "reduceOnly": True,
         "triggerPrice": trigger_price,
         "recvWindow": 5000,
     }
-    log(f"[PLACE CONDITIONAL REQ] {payload}")
-    try:
-        resp = req("POST", "/openApi/swap/v2/trade/order", payload)
-        log(f"[PLACE CONDITIONAL RESP] {resp}")
-        return resp
-    except Exception as e:
-        if _is_param_error(e):
-            fallback_payload = {
-                "symbol": symbol,
-                "side": side,
-                "type": order_type,
-                "quantity": norm_qty,
-                "reduceOnly": True,
-                "triggerPrice": trigger_price,
-                "recvWindow": 5000,
-            }
-            log(f"[PLACE CONDITIONAL RETRY w/o positionSide] {fallback_payload}")
-            resp = req("POST", "/openApi/swap/v2/trade/order", fallback_payload)
-            log(f"[PLACE CONDITIONAL RESP RETRY] {resp}")
+
+    attempts = [
+        {**base_payload, "positionSide": hedge_pos_side},  # 1차
+        {**base_payload},                                  # 2차
+        {**base_payload, "positionSide": "BOTH"},          # 3차
+    ]
+
+    last_exc: Optional[Exception] = None
+
+    for idx, payload in enumerate(attempts, start=1):
+        log(f"[PLACE CONDITIONAL REQ {idx}] {payload}")
+        try:
+            resp = req("POST", "/openApi/swap/v2/trade/order", payload)
+            log(f"[PLACE CONDITIONAL RESP {idx}] {resp}")
             return resp
-        raise
+        except Exception as e:
+            last_exc = e
+            if _is_param_error(e):
+                continue
+            raise
+
+    raise last_exc  # type: ignore
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
@@ -466,40 +472,46 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
     강제 시장가 청산.
-    여기도 계정 모드 따라 positionSide 가 문제될 수 있으니
-    109400 이면 빼고 재시도.
+    1) positionSide=상대방향 으로 보내보고
+    2) 109400 이면 positionSide 없이
+    3) 그래도 109400 이면 positionSide=BOTH 로
     """
-    close_side = "SELL" if side_open == "BUY" else "BUY"
+    close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
-    position_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
-    payload = {
+    hedge_pos_side = "SHORT" if side_open.upper() == "BUY" else "LONG"
+
+    base_payload = {
         "symbol": symbol,
         "side": close_side,
-        "positionSide": position_side,
         "type": "MARKET",
         "quantity": norm_qty,
         "reduceOnly": True,
         "recvWindow": 5000,
     }
-    log(f"[FORCE CLOSE REQ] {payload}")
-    try:
-        req("POST", "/openApi/swap/v2/trade/order", payload)
-        send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
-    except Exception as e:
-        if _is_param_error(e):
-            fallback_payload = {
-                "symbol": symbol,
-                "side": close_side,
-                "type": "MARKET",
-                "quantity": norm_qty,
-                "reduceOnly": True,
-                "recvWindow": 5000,
-            }
-            log(f"[FORCE CLOSE RETRY w/o positionSide] {fallback_payload}")
-            req("POST", "/openApi/swap/v2/trade/order", fallback_payload)
-            send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty} (fallback)")
-        else:
+
+    attempts = [
+        {**base_payload, "positionSide": hedge_pos_side},  # 1차
+        {**base_payload},                                  # 2차
+        {**base_payload, "positionSide": "BOTH"},          # 3차
+    ]
+
+    last_exc: Optional[Exception] = None
+
+    for idx, payload in enumerate(attempts, start=1):
+        log(f"[FORCE CLOSE REQ {idx}] {payload}")
+        try:
+            req("POST", "/openApi/swap/v2/trade/order", payload)
+            send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty} (attempt={idx})")
+            return
+        except Exception as e:
+            last_exc = e
+            if _is_param_error(e):
+                continue
             send_tg(f"❗ 포지션 강제 정리 실패: {e}")
+            return
+
+    # 3번 다 안 되면 마지막 에러 알림
+    send_tg(f"❗ 포지션 강제 정리 실패(3회): {last_exc}")
 
 
 __all__ = [
