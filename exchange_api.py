@@ -12,44 +12,30 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 체결내역 요약(summarize_fills)
 
 2025-11-10 수정
-- 일부 계정/원웨이 모드에서 MARKET/조건부 주문에 positionSide 를 넣으면
-  bingx code=109400 이 나는 현상이 있었다.
-- 그래서 place_market(), place_conditional(), close_position_market() 에
-  "1차: positionSide 포함해서 보내기 → 109400 나오면 positionSide 빼고 다시 보내기"
-  폴백 로직을 넣었다.
-- 이렇게 하면 헤지 모드 계정에서도 되고, 원웨이 계정에서도 같은 코드로 동작한다.
+----------------------------------------------------
+(배경)
+- 어떤 계정은 헤지(양방향) 모드처럼 주문을 보내면 잘 되는데,
+  어떤 계정은 원웨이(단방향) 모드라서 주문에 positionSide(LONG/SHORT)가 들어가면
+  bingx code=109400 "Invalid parameters" 가 발생했다.
+- 우리는 봇 코드(run_bot.py / trader.py) 쪽은 그대로 두고,
+  실제로 BingX에 주문을 던지는 이 레이어에서만 "안 되면 한 번 더" 시도하게 만들면
+  위쪽 코드를 건드리지 않아도 된다.
 
-2025-11-09 수정/추가 내용
-1) 응답 검증 강화
-   - BingX가 HTTP 200을 줘도 JSON 안에 code가 0/None/100400 이 아니면 실패로 보도록 req()를 보강했다.
-   - 일부 엔드포인트가 주는 100400은 여전히 예외 안 던지고 넘겨서 상위에서 처리할 수 있게 했다.
+(변경 내용)
+1) place_market(), place_conditional(), close_position_market() 에 폴백 로직 추가
+   - 1차 시도: positionSide 포함해서 보냄
+   - 만약 109400 이면: positionSide 를 빼고 똑같이 다시 보냄
+   - 이렇게 하면 헤지 계정에서는 첫 번째 시도가 성공하고,
+     원웨이 계정에서는 두 번째 시도가 성공해서 공통 코드로 쓸 수 있다.
 
-2) 주문 응답 로그 추가
-   - place_market(), place_conditional() 이 BingX 원본 응답을 log()로 남기게 했다.
-   - 진입 직후 orderId가 없다고 나올 때 서버 로그로 원인 파악할 수 있게 하기 위함.
+2) 109400 인지 확인하는 헬퍼 _is_param_error(...) 추가
+   - 에러 메시지 안에 "109400" 이나 "Invalid parameters" 가 있으면 그걸로 간주
 
-3) 레버리지/마진 설정 예외 완화
-   - 어떤 계정은 API로 레버리지/마진을 못 바꿔서 109400(Invalid parameters)이 뜬다.
-   - set_leverage_and_mode()에서 LONG/SHORT/marginType 을 각각 시도하되,
-     109400인 경우에는 “지원 안 하는 듯” 하고 경고만 남기고 봇은 계속 돌도록 완화했다.
-   - 이렇게 하면 run_bot.py 시작할 때마다 에러로 죽지 않는다.
-
-4) 선물 수량 정규화 추가 (중요)
-   - BingX 선물 BTC-USDT 등은 보통 quantity step 이 0.001 이라서
-     run_bot.py 에서 계산된 0.005904 같은 값을 그대로 보내면 109400 이 발생할 수 있다.
-   - place_market(), place_conditional(), close_position_market() 에서 모두
-     0.001 단위로 내림(floor) 후 소수 셋째 자리까지로 잘라서 전송하도록 변경했다.
-   - 이 변경으로 전략단(run_bot.py / trader.py)에서 약간 지저분한 수량을 내려보내도
-     실제 API 호출 시에는 거래소가 받는 단위로 정리된다.
-
-5) 잔고 상세(raw) 조회 헬퍼 추가
-   - 일부 계정은 포지션 API가 없어서 run_bot.py 쪽에서 “사람이 들고 있는 포지션이 있는지”를
-     잔고의 usedMargin 으로 추정해야 한다.
-   - 이를 위해 /openApi/swap/v2/user/balance 의 안쪽 balance dict 를 그대로 꺼내는
-     get_balance_detail() 을 추가했다.
-
-6) positionSide 강제 추가 (헤지/원웨이 공통 호환)
-   - (2025-11-10 에서 이 부분을 ‘가능하면 추가, 안 되면 제거’ 방식으로 더 유연하게 바꿨다.)
+3) 나머지 구조는 기존 2025-11-09 버전과 동일
+   - 수량 0.001 단위 내림
+   - 레버리지/마진 설정 실패는 경고만
+   - 잔고 상세 조회 헬퍼 그대로 유지
+----------------------------------------------------
 """
 
 from __future__ import annotations
@@ -80,16 +66,19 @@ _QTY_STEP: Dict[str, float] = {
 # 공통 유틸
 # ─────────────────────────────
 def _ts_ms() -> int:
+    """현재 ms 타임스탬프"""
     return int(time.time() * 1000)
 
 
 def sign_query(params: Dict[str, Any], api_secret: str) -> str:
+    """파라미터를 정렬해서 HMAC-SHA256 서명 붙이기"""
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return qs + "&signature=" + sig
 
 
 def _headers() -> Dict[str, str]:
+    """BingX 필수 헤더"""
     return {
         "X-BX-APIKEY": SET.api_key,
         "Content-Type": "application/json",
@@ -97,6 +86,10 @@ def _headers() -> Dict[str, str]:
 
 
 def _normalize_qty(symbol: str, raw_qty: float) -> float:
+    """
+    선물 수량을 거래소가 받는 최소 단위로 내린다.
+    예: step=0.001, raw=0.005904 → 0.005
+    """
     step = _QTY_STEP.get(symbol, 0.001)
     if step <= 0:
         step = 0.001
@@ -113,6 +106,11 @@ def req(
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    BingX REST 요청 공통부.
+    - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
+    - 상위에서 109400만 따로 잡아서 폴백할 수 있게 한다.
+    """
     params = params or {}
     params["timestamp"] = _ts_ms()
     url = f"{BASE}{path}?{sign_query(params, SET.api_secret)}"
@@ -125,9 +123,8 @@ def req(
 
     if isinstance(data, dict):
         code = data.get("code")
+        # 0 / "0" / None / 100400 은 통과
         if code not in (None, 0, "0", 100400):
-            # 여기서 바로 예외를 던지기 때문에,
-            # 위쪽 함수(place_market 등)에서 109400만 잡아서 폴백하면 된다.
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
             )
@@ -135,8 +132,8 @@ def req(
     return data
 
 
-# 109400 인지 검사하는 작은 헬퍼
 def _is_param_error(exc: Exception) -> bool:
+    """109400, Invalid parameters 같은 파라미터 오류인지 대충 판별"""
     msg = str(exc)
     return "109400" in msg or "Invalid parameters" in msg
 
@@ -145,12 +142,14 @@ def _is_param_error(exc: Exception) -> bool:
 # 계좌/포지션/주문 조회
 # ─────────────────────────────
 def get_available_usdt() -> float:
+    """가용 마진(availableMargin/Balance)을 최대한 평탄화해서 가져온다."""
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
 
         data = res.get("data") or res.get("balances") or res
 
+        # {"data": {"balance": {...}}} 구조
         if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
             bal = data["balance"]
             cand = (
@@ -162,6 +161,7 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
+        # 리스트로 오는 구조
         if isinstance(data, list) and data:
             item = data[0]
         else:
@@ -178,6 +178,7 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
+        # 마지막 일반 케이스
         cand = (
             item.get("availableBalance")
             or item.get("availableMargin")
@@ -193,6 +194,10 @@ def get_available_usdt() -> float:
 
 
 def get_balance_detail() -> Dict[str, Any]:
+    """
+    잔고 전체 구조를 그대로 반환.
+    run_bot.py 에서 usedMargin 등 읽어볼 때 사용.
+    """
     res = req("GET", "/openApi/swap/v2/user/balance", {})
     log(f"[BALANCE RAW for detail] {res}")
 
@@ -214,6 +219,7 @@ def get_balance_detail() -> Dict[str, Any]:
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
+    """열려 있는 포지션 목록 조회 (계정에 따라 안 될 수도 있음)"""
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
@@ -230,6 +236,7 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
 
 
 def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
+    """걸려 있는 주문 목록 조회"""
     try:
         res = req("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
         log(f"[OPEN ORDERS RAW] {res}")
@@ -246,8 +253,13 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # 레버리지/마진
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
+    """
+    레버리지/마진 모드 설정.
+    일부 계정에서는 안 되므로 109400이면 경고만 남기고 넘어간다.
+    """
     errs: List[str] = []
 
+    # LONG/SHORT 각각 시도
     for side in ("LONG", "SHORT"):
         try:
             req("POST", "/openApi/swap/v2/trade/leverage", {
@@ -262,6 +274,7 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
             else:
                 errs.append(f"{side}: {msg}")
 
+    # 마진 모드
     try:
         req("POST", "/openApi/swap/v2/trade/marginType", {
             "symbol": symbol,
@@ -284,8 +297,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문 발행.
-    1) positionSide 포함해서 보냄
-    2) 109400 이면 positionSide 뺀 걸로 다시 보냄
+    1) positionSide=LONG/SHORT 포함해보고
+    2) 109400 나면 positionSide 없이 다시 전송
     """
     norm_qty = _normalize_qty(symbol, qty)
     position_side = "LONG" if side.upper() == "BUY" else "SHORT"
@@ -304,8 +317,8 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
         log(f"[PLACE MARKET RESP] {resp}")
         return resp
     except Exception as e:
-        # 여기서 109400 이면 positionSide 빼고 재시도
         if _is_param_error(e):
+            # 원웨이 계정일 가능성 → positionSide 빼고 재시도
             fallback_payload = {
                 "symbol": symbol,
                 "side": side,
@@ -317,7 +330,7 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
             resp = req("POST", "/openApi/swap/v2/trade/order", fallback_payload)
             log(f"[PLACE MARKET RESP RETRY] {resp}")
             return resp
-        # 다른 에러면 그대로 위로
+        # 다른 에러면 위로 올려보냄
         raise
 
 
@@ -330,8 +343,8 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문.
-    1) positionSide 포함해서 보냄
-    2) 109400 이면 positionSide 빼고 다시 보냄
+    1) positionSide 포함
+    2) 109400 이면 빼고 재시도
     """
     norm_qty = _normalize_qty(symbol, qty)
     position_side = "LONG" if side.upper() == "BUY" else "SHORT"
@@ -369,6 +382,7 @@ def place_conditional(
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
+    """주문 취소"""
     try:
         res = req("POST", "/openApi/swap/v2/trade/cancel", {
             "symbol": symbol,
@@ -380,6 +394,7 @@ def cancel_order(symbol: str, order_id: str) -> None:
 
 
 def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
+    """주문 상태 조회"""
     return req("GET", "/openApi/swap/v2/trade/order", {
         "symbol": symbol,
         "orderId": order_id,
@@ -387,6 +402,7 @@ def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
 
 
 def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
+    """체결 내역 조회"""
     res = req("GET", "/openApi/swap/v2/trade/allFillOrders", {
         "symbol": symbol,
         "orderId": order_id,
@@ -396,6 +412,7 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+    """여러 체결 건을 평균가 등으로 요약"""
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
@@ -427,6 +444,7 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 
 
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
+    """시장가 주문이 실제 FILLED 될 때까지 잠깐 폴링"""
     end = time.time() + timeout
     last_status = None
     while time.time() < end:
@@ -447,9 +465,9 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
-    포지션 강제 종료용.
-    여기도 계정 따라 positionSide 가 문제될 수 있어서
-    109400 이면 빼고 다시 보낸다.
+    강제 시장가 청산.
+    여기도 계정 모드 따라 positionSide 가 문제될 수 있으니
+    109400 이면 빼고 재시도.
     """
     close_side = "SELL" if side_open == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
