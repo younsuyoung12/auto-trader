@@ -4,37 +4,52 @@ run_bot.py (메인 흐름 전용)
 이 파일은 "봇이 어떻게 돈다"만 담당한다.
 세부 기능은 모듈로 분리한다.
 
+2025-11-12 보완 사항 ④  ← 이번 수정
+----------------------------------------------------
+(이번에 반영한 거)
+1) 텔레그램 알림 on/off 플래그 실제 적용
+   - settings.py 에 이미
+       notify_on_entry
+       notify_on_close
+     를 넣어놨으니까, 여기서 진짜로 그 값을 보고 보내도록 바꿨다.
+   - 진입 알림은 notify_on_entry 가 True 일 때만 나간다.
+   - 청산 알림은 notify_on_close 가 True 일 때만 나간다.
+   - 종료 안내, 에러 안내, 포지션 동기화 안내 같은 운영 알림은 계속 보낸다
+     (이건 사람이 봐야 하니까)
+
+2) 주기 상태 메시지에 실제 주기 표기
+   - 기존에는 메시지 제목이 무조건 "(30m)" 이었는데,
+     이제 settings.unrealized_notify_sec 를 읽어서
+     예) 900초면 "(15m)", 3600초면 "(60m)" 이렇게 찍게 했다.
+
+3) 상태 메시지에도 15m 추세 포함 유지
+   - 바로 직전에 넣어둔 15m 추세 표시를 그대로 살렸다.
+
+4) KRW 환산은 settings.krw_per_usdt → settings.krw_rate → 1400 순서로 본다
+   - 혹시 이름이 바뀌어도 안전하게 가져오게 유지.
+
+
+(직전 이력 요약)
+2025-11-12 보완 사항 ③
+----------------------------------------------------
+1) 30분 주기 텔레그램 상태 메시지에 15분봉 추세를 붙임
+2) settings 의 주기 알림 옵션(unrealized_notify_enabled, unrealized_notify_sec) 사용
+3) KRW 환산 값 읽을 때 settings.krw_per_usdt 를 우선
+
+2025-11-11 보완 사항 ②
+----------------------------------------------------
+- 거래소 포지션 sync 때 텔레그램 과다 발송 방지
+- 단방향 포지션 부호로 방향 판정
+- 진입/청산 텔레그램 포맷 정리
+- 포지션 열려있을 때 주기 상태 알림
+
+2025-11-11 보완 사항 ①
+----------------------------------------------------
+- 단방향(one-way) 포지션 모드에서 positionSide 없을 때 positionAmt 부호로 판정
+
 2025-11-10 보완 사항
-- entry_guards.py 쪽에서 3분 거래량 평균이 아주 낮은 시간대는 통과시키도록 완화했다.
-  이 파일은 그 가드를 그대로 호출만 하므로 흐름 설명에 그 점을 명시했다.
-- 나머지 구조는 동일하며, 시그널 → 가드 → 주문 순서는 그대로 유지된다.
-
-의존 모듈 (다음 순서로 제공):
-1) bot_workers.py
-   - start_health_server()
-   - start_drive_sync_thread()
-   - start_telegram_command_thread(on_stop_command)
-2) signal_flow.py
-   - get_trading_signal(...)  → 시그널, 캔들 세트, 부가 정보 반환
-3) entry_guards.py
-   - check_manual_position_guard(...)
-   - check_volume_guard(...)
-   - check_price_jump_guard(...)
-   - check_spread_guard(...)
-
-기존 파일들은 그대로 사용:
-- settings.py, exchange_api.py, trader.py, signals_logger.py, telelog.py
-
-메인 루프 구조:
-1. STOP_FLAG 있으면 바로 종료
-2. 설정 로드 후 health/drive/tg 스레드 시작
-3. 시작 시 거래소 포지션 동기화
-4. 무한 루프 돌면서
-   4-1) TP/SL 체결 확인
-   4-2) 종료 플래그 확인
-   4-3) 포지션 있으면 다음 루프
-   4-4) 시그널 요청 → (완화된) 가드 → 진입 → 로그
-5. 안전 종료면 STOP_FLAG 남기고 끝낸다.
+----------------------------------------------------
+- 3분 거래량 평균이 낮은 시간대는 entry_guards 쪽에서 완화
 """
 
 from __future__ import annotations
@@ -70,6 +85,8 @@ from entry_guards import (
     check_price_jump_guard,
     check_spread_guard,
 )
+from market_data import get_klines
+from strategies_trend import decide_trend_15m
 
 # ─────────────────────────────
 # 전역 상태
@@ -78,6 +95,10 @@ SET = load_settings()
 START_TS: float = time.time()
 RUNNING: bool = True
 TERMINATED_BY_SIGNAL: bool = False
+
+# 텔레그램에 뿌릴 때 KRW로도 보여주려고 추가
+# settings.krw_per_usdt 를 우선 보고, 없으면 krw_rate, 그래도 없으면 1400
+KRW_RATE: float = getattr(SET, "krw_per_usdt", getattr(SET, "krw_rate", 1400.0))
 
 # 간단 메트릭
 METRICS: Dict[str, Any] = {
@@ -103,6 +124,12 @@ CONSEC_LOSSES: int = 0
 SAFE_STOP_REQUESTED: bool = False
 # 거래소 포지션 재동기화 시각
 LAST_EXCHANGE_SYNC_TS: float = 0.0
+# 직전에 거래소에서 몇 건 동기화했는지 기억 → 같으면 텔레 안 보냄
+_LAST_SYNCED_EXCHANGE_POS_COUNT: int = 0
+# 열려 있는 동안 주기적으로 상태 알려주기 위한 타임스탬프
+LAST_STATUS_TG_TS: float = 0.0
+# 주기는 settings 에서 끌어오되, 없으면 1800초(30분)
+STATUS_TG_INTERVAL_SEC: int = getattr(SET, "unrealized_notify_sec", 1800)
 
 
 # ─────────────────────────────
@@ -131,14 +158,75 @@ signal.signal(signal.SIGTERM, _sigterm)
 
 
 # ─────────────────────────────
-# 거래소 → 내부 포지션 동기화 (간단 버전)
+# 15m 추세 문구 만들기
+# ─────────────────────────────
+def _get_15m_trend_text(symbol: str) -> str:
+    """
+    15분봉 캔들을 가져와서 현재 추세를 문자열로 돌려준다.
+    실패하면 빈 문자열.
+    """
+    try:
+        candles_15m = get_klines(symbol, "15m", 120)
+        if not candles_15m:
+            return ""
+        trimmed = [c[:5] for c in candles_15m]
+        trend_dir = decide_trend_15m(trimmed)
+        if trend_dir == "LONG":
+            return " (15m 추세: 상승)"
+        elif trend_dir == "SHORT":
+            return " (15m 추세: 하락)"
+        else:
+            return " (15m 추세: 중립)"
+    except Exception as e:
+        log(f"[STATUS_TG] 15m trend check error: {e}")
+        return ""
+
+
+# ─────────────────────────────
+# 보조: 열려 있는 포지션 상태를 텔레그램으로 던지기
+# ─────────────────────────────
+def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
+    """거래소 포지션을 다시 읽어서 현재 미실현 PnL 을 텔레로 보낸다."""
+    try:
+        positions = fetch_open_positions(symbol)
+    except Exception as e:
+        log(f"[STATUS_TG] fetch_open_positions error: {e}")
+        return
+
+    if not positions:
+        return
+
+    mins = max(1, interval_sec // 60)  # 0분 표시 방지
+    trend_txt = _get_15m_trend_text(symbol)
+    lines = [f"⏱ 포지션 상태({mins}m){trend_txt}:"]
+    for p in positions:
+        qty = float(
+            p.get("positionAmt")
+            or p.get("quantity")
+            or p.get("size")
+            or 0.0
+        )
+        upnl = float(p.get("unrealizedProfit") or 0.0)
+        side_text = "LONG" if qty > 0 else "SHORT"
+        upnl_krw = upnl * KRW_RATE
+        lines.append(
+            f"- {symbol} {side_text} 수량={abs(qty)} 미실현={upnl:.2f} USDT (~{upnl_krw:,.0f} KRW)"
+        )
+    send_tg("\n".join(lines))
+
+
+# ─────────────────────────────
+# 거래소 → 내부 포지션 동기화 (단방향 대응 버전)
 # ─────────────────────────────
 def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
     """
     거래소 포지션/열린 주문을 내부 리스트로 옮겨 중복 진입을 막는다.
     시작할 때 1번, 이후에는 주기적으로 호출한다.
+
+    단방향(one-way)에서는 positionSide 가 비어 있을 수 있으므로
+    1순위로 positionAmt 의 부호로 방향을 정한다.
     """
-    global OPEN_TRADES
+    global OPEN_TRADES, _LAST_SYNCED_EXCHANGE_POS_COUNT
 
     positions = fetch_open_positions(symbol)
     orders = fetch_open_orders(symbol)
@@ -148,23 +236,28 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
 
     if not positions:
         log("[SYNC] 열려 있는 포지션이 없습니다.")
+        _LAST_SYNCED_EXCHANGE_POS_COUNT = 0
         return
 
     for pos in positions:
-        qty = float(
-            pos.get("positionAmt")
-            or pos.get("quantity")
-            or pos.get("size")
-            or 0.0
-        )
-        if qty == 0.0:
+        raw_amt = pos.get("positionAmt") or pos.get("quantity") or pos.get("size") or 0.0
+        try:
+            raw_amt_f = float(raw_amt)
+        except (TypeError, ValueError):
+            raw_amt_f = 0.0
+
+        if raw_amt_f == 0.0:
             continue
 
-        side_raw = (pos.get("positionSide") or pos.get("side") or "").upper()
-        side_open = "BUY" if side_raw in ("LONG", "BUY") else "SELL"
+        if raw_amt_f > 0:
+            side_open = "BUY"
+        else:
+            side_open = "SELL"
+
+        qty = abs(raw_amt_f)
         entry_price = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
 
-        # 열린 주문에서 TP/SL 찾아서 붙인다 (간단 매핑)
+        # 열린 주문에서 TP/SL 찾아서 붙인다
         tp_id: Optional[str] = None
         sl_id: Optional[str] = None
         tp_price: Optional[float] = None
@@ -195,18 +288,17 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
             )
         )
 
-    if OPEN_TRADES:
+    if len(OPEN_TRADES) != _LAST_SYNCED_EXCHANGE_POS_COUNT:
+        # 이건 운영상 중요한 정보라 무조건 보낸다
         send_tg(f"🔁 거래소 포지션 {len(OPEN_TRADES)}건 동기화했습니다. (중복 진입 방지)")
+        _LAST_SYNCED_EXCHANGE_POS_COUNT = len(OPEN_TRADES)
 
 
 # ─────────────────────────────
 # 텔레그램 종료 콜백
 # ─────────────────────────────
 def _on_safe_stop() -> None:
-    """
-    텔레그램 명령 스레드에서 호출하는 콜백.
-    여기서는 플래그만 세우고 실제 종료는 메인 루프가 판단한다.
-    """
+    """텔레그램 명령 스레드에서 호출하는 콜백."""
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
     send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
@@ -219,6 +311,7 @@ def main() -> None:
     global RUNNING
     global OPEN_TRADES, LAST_CLOSE_TS, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
     global CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
+    global LAST_STATUS_TG_TS
 
     # 1) STOP_FLAG 있으면 바로 종료
     if os.path.exists("STOP_FLAG"):
@@ -243,7 +336,6 @@ def main() -> None:
     try:
         set_leverage_and_mode(SET.symbol, SET.leverage, SET.isolated)
     except Exception as e:
-        # 여기서 멈추지 않는 게 중요하다.
         log(f"[WARN] 레버리지/마진 설정 실패: {e}")
 
     # 5) 보조 스레드 시작
@@ -281,7 +373,7 @@ def main() -> None:
                 sync_open_trades_from_exchange(SET.symbol, replace=True)
                 LAST_EXCHANGE_SYNC_TS = now
 
-            # 1) 1분에 한 번 가용 잔고 찍어두기 (에러 추적용)
+            # 1) 1분에 한 번 가용 잔고 찍어두기
             if now - last_balance_log >= 60:
                 get_available_usdt()
                 last_balance_log = now
@@ -322,9 +414,12 @@ def main() -> None:
                     elif t.source == "RANGE":
                         LAST_CLOSE_TS_RANGE = now
 
-                    send_tg(
-                        f"💰 청산({reason}) {t.symbol} {t.side} 수량={closed_qty} 가격={closed_price:.2f} PnL={pnl:.2f} USDT"
-                    )
+                    pnl_krw = pnl * KRW_RATE
+                    if getattr(SET, "notify_on_close", True):
+                        send_tg(
+                            f"💰 청산({reason}) {t.symbol} {t.side} 수량={closed_qty} "
+                            f"가격={closed_price:.2f} PnL={pnl:.2f} USDT (~{pnl_krw:,.0f} KRW)"
+                        )
 
                     log_signal(
                         event="CLOSE",
@@ -353,8 +448,14 @@ def main() -> None:
                     RUNNING = False
                     break
 
-            # 포지션 살아 있으면 신규 진입 안 함
+            # 포지션 살아 있으면 신규 진입 안 함 + 주기 상태만 던짐
             if OPEN_TRADES:
+                if (
+                    getattr(SET, "unrealized_notify_enabled", False)
+                    and now - LAST_STATUS_TG_TS >= STATUS_TG_INTERVAL_SEC
+                ):
+                    _send_open_positions_status(SET.symbol, STATUS_TG_INTERVAL_SEC)
+                    LAST_STATUS_TG_TS = now
                 time.sleep(1)
                 continue
 
@@ -372,19 +473,18 @@ def main() -> None:
                 CONSEC_LOSSES = 0
                 continue
 
-            # 최근 청산 후 쿨다운
+            # 최근 청산 후 공통 쿨다운
             if LAST_CLOSE_TS > 0 and (time.time() - LAST_CLOSE_TS) < SET.cooldown_after_close:
                 time.sleep(1)
                 continue
 
-            # 4) 시그널 + 캔들 가져오기 (여기서 TREND/RANGE/완화 RANGE가 결정된다)
+            # 4) 시그널 + 캔들 가져오기
             signal_ctx = get_trading_signal(
                 settings=SET,
                 last_trend_close_ts=LAST_CLOSE_TS_TREND,
                 last_range_close_ts=LAST_CLOSE_TS_RANGE,
             )
             if signal_ctx is None:
-                # 시그널 없음 → 다음 루프
                 time.sleep(1)
                 continue
 
@@ -398,8 +498,7 @@ def main() -> None:
                 extra,
             ) = signal_ctx
 
-            # 5) 진입 전 가드 실행
-            # 5-1) 수동 포지션/usedMargin 가드
+            # 5) 진입 전 가드
             manual_ok = check_manual_position_guard(
                 get_balance_detail_func=get_balance_detail,
                 symbol=SET.symbol,
@@ -409,8 +508,6 @@ def main() -> None:
                 time.sleep(2)
                 continue
 
-            # 5-2) 거래량 가드
-            #     entry_guards 에서 평균 거래량이 아주 낮은 시간대는 통과시키도록 이미 완화되어 있음.
             vol_ok = check_volume_guard(
                 settings=SET,
                 candles_3m_raw=candles_3m_raw,
@@ -422,7 +519,6 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 5-3) 가격 점프 가드
             price_ok = check_price_jump_guard(
                 settings=SET,
                 candles_3m=candles_3m,
@@ -434,7 +530,6 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 5-4) 스프레드 / 호가 체크
             spread_ok, best_bid, best_ask = check_spread_guard(
                 settings=SET,
                 symbol=SET.symbol,
@@ -461,7 +556,6 @@ def main() -> None:
                 time.sleep(3)
                 continue
 
-            # ATR 에서 리스크를 줄여오면 그걸 우선 사용
             effective_risk_pct = extra.get("effective_risk_pct", SET.risk_pct) if extra else SET.risk_pct
             notional = avail * effective_risk_pct * SET.leverage
             if notional < SET.min_notional_usdt:
@@ -480,7 +574,7 @@ def main() -> None:
             qty = round(notional / last_price, 6)
             side_open = "BUY" if chosen_signal == "LONG" else "SELL"
 
-            # 7) TP/SL 퍼센트는 시그널 쪽에서 넘겨준 게 있으면 그걸 쓰고, 없으면 settings 기본값
+            # 7) TP/SL 퍼센트
             tp_pct = extra.get("tp_pct") if extra else None
             sl_pct = extra.get("sl_pct") if extra else None
             if tp_pct is None or sl_pct is None:
@@ -519,9 +613,18 @@ def main() -> None:
                 time.sleep(2)
                 continue
 
-            send_tg(
-                f"[ENTRY][{signal_source}] 예약완료: TP={trade.tp_price} / SL={trade.sl_price} 수량={trade.qty}"
-            )
+            # 여기서 사람이 보기 좋게 한 줄로
+            side_ko = "롱" if trade.side == "BUY" else "숏"
+            strat_ko = "추세" if signal_source == "TREND" else "박스"
+            if getattr(SET, "notify_on_entry", True):
+                send_tg(
+                    f"[ENTRY] {strat_ko} {side_ko} 진입\n"
+                    f"- 심볼: {trade.symbol}\n"
+                    f"- 진입가: {trade.entry:.2f}\n"
+                    f"- 수량: {trade.qty}\n"
+                    f"- TP: {trade.tp_price} / SL: {trade.sl_price}"
+                )
+
             log_signal(
                 event="ENTRY_OPENED",
                 symbol=trade.symbol,
@@ -534,6 +637,8 @@ def main() -> None:
                 candle_ts=latest_ts,
             )
             OPEN_TRADES.append(trade)
+            # 새로 들어갔으니 상태 알림 타이머는 지금으로 리셋
+            LAST_STATUS_TG_TS = time.time()
 
             time.sleep(SET.cooldown_sec)
 

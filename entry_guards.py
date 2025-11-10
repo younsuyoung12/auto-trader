@@ -11,8 +11,26 @@ run_bot.py → 이 모듈의 함수를 순서대로 호출해서
 3) 가격 점프 가드 (직전 3m 대비 급등/급락 시 스킵)
 4) 스프레드/호가 가드 (orderbook 으로 bid/ask 격차 확인)
 
-각 가드는 True/False 로만 답하고, 내부에서 signals_logger 에 SKIP 을 남긴다.
-이렇게 하면 run_bot.py 는 흐름만 보고 각각의 이유를 몰라도 된다.
+2025-11-12 보완
+----------------------------------------------------
+선물 변동성 때문에 "닫힐 때는 멀리, 들어갈 때는 너무 앞"인 캔들을 걸러내기 위해
+기존 가격 점프 가드에 '현재 캔들 자체 변동성' 체크를 추가했다.
+
+- 기존에는 직전 캔들의 종가(prev_close) 대비 이번 종가(last_close)의 변동만 봤다.
+- 그런데 선물에서는 같은 캔들 안에서 high/low가 크게 나왔다가 종가는 제자리인
+  경우가 있어서 이럴 때 바로 진입하면 다음 틱에서 SL이 맞는 일이 많다.
+- 그래서 아래를 추가했다:
+
+  1) 이번 캔들의 high-low 범위를 종가로 나눈 값(range_pct)을 구한다.
+  2) 이 값이 max_price_jump_pct의 1.8배를 넘으면 이 캔들은 스킵한다.
+     → 예) max_price_jump_pct=0.003 (=0.3%) 라면
+            캔들 하나가 0.54% 이상 흔들렸으면 위험 캔들로 본다.
+
+이렇게 하면 “같은 3분봉 안에서 위아래를 다 찍고 내려온 캔들”을 안 들어가게 돼서
+‘들어가자마자 손절’ 빈도를 줄일 수 있다.
+
+기존 run_bot 의 호출 순서를 깨지 않기 위해 함수 시그니처와 이름은 그대로 두고,
+내부에 캔들 변동성 체크만 추가했다.
 """
 
 from __future__ import annotations
@@ -102,7 +120,7 @@ def check_volume_guard(
 
 
 # ─────────────────────────────
-# 3. 가격 점프 가드
+# 3. 가격 점프 + 캔들 변동성 가드
 # ─────────────────────────────
 def check_price_jump_guard(
     *,
@@ -112,13 +130,19 @@ def check_price_jump_guard(
     signal_source: str,
     direction: str,
 ) -> bool:
-    """직전 3m 대비 가격이 너무 튀면 그 캔들만 스킵"""
+    """직전 3m 대비 가격이 너무 튀거나, 현재 캔들 자체가 너무 흔들렸으면 그 캔들만 스킵"""
     if len(candles_3m) < 2:
         return True
+
     last_price = candles_3m[-1][4]
     prev_price = candles_3m[-2][4]
-    if prev_price <= 0:
+    last_high = candles_3m[-1][2]
+    last_low = candles_3m[-1][3]
+
+    if prev_price <= 0 or last_price <= 0:
         return True
+
+    # 3-1) 직전 종가 대비 점프
     move_pct = abs(last_price - prev_price) / prev_price
     if move_pct > settings.max_price_jump_pct:
         send_skip_tg(
@@ -134,6 +158,32 @@ def check_price_jump_guard(
             extra=f"move_pct={move_pct:.6f}",
         )
         return False
+
+    # 3-2) 같은 캔들 안에서의 변동성 체크 (선물에서 흔들다 내려온 캔들 방지)
+    # high-low 를 종가로 나눠서 퍼센트로 본다.
+    if last_low > 0:
+        range_pct = (last_high - last_low) / last_price
+    else:
+        range_pct = 0.0
+
+    # 기준: 직전 점프 허용치의 1.8배 이상이면 위험 캔들로 본다.
+    # 예) max_price_jump_pct=0.003 → range_pct>0.0054 이면 스킵
+    candle_vol_limit = settings.max_price_jump_pct * 1.8
+    if range_pct > candle_vol_limit:
+        send_skip_tg(
+            f"[SKIP] candle_volatility_guard: {range_pct:.4f} > {candle_vol_limit:.4f}"
+        )
+        log_signal(
+            event="SKIP",
+            symbol=settings.symbol,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="candle_volatility_guard",
+            candle_ts=latest_ts,
+            extra=f"range_pct={range_pct:.6f}",
+        )
+        return False
+
     return True
 
 

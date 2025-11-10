@@ -2,53 +2,53 @@
 trader.py
 포지션 진입/TP·SL 설정/유지/체결 확인을 담당하는 모듈.
 
-2025-11-10 4차 수정
+2025-11-12 7차 수정
 ----------------------------------------------------
-(배경)
-- BingX가 시장가 주문 응답을 아래와 같이 내려주는 계정이 있었다.
-    {
-        "code": 0,
-        "data": {
-            "order": {
-                "orderId": ...,
-                ...
-            }
-        }
-    }
-  기존 코드는 data["orderId"] / data["id"] / data["orderID"]까지만 확인하고
-  data["order"]["orderId"] 는 보지 않아서
-  "시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다." 가 발생했다.
-- 이로 인해 이후 TP/SL 조건부 주문을 깔지 못하고 포지션만 열린 상태가 됐다.
+(요청한 “들어가자마자 손절 빈도 줄이기”를 실행 레벨에서 보완)
 
-(수정 내용)
-1) open_position_with_tp_sl(...) 에서 orderId 를 뽑을 때
-   data["order"]["orderId"] / data["order"]["orderID"] 도 순서대로 확인하도록 했다.
-2) TP/SL 주문을 넣을 때도 동일한 중첩 구조가 올 수 있으므로,
-   _norm_id(...) 에서 data["order"]["orderId"] 도 보도록 보완했다.
+이전까지는 전략(strategies_*.py)에서 TP/SL 퍼센트를 예쁘게 계산해 와도,
+실제 거래 시점(entry)에서
+- 슬리피지가 조금 있었거나
+- 전략이 박스라서 SL을 아주 좁게 줬거나
+하면 선물 변동성에 그대로 맞고 나가는 일이 있었다.
+
+그래서 여기(trader.py)에서 한 번 더 안전장치를 둔다.
+
+1) 설정에 있는 최소 TP/SL 하한을 실제 주문 직전에 강제 반영
+   - settings.min_tp_pct, settings.min_sl_pct 가 있으면
+     전략이 0.004 같은 걸 줘도 최소값(예: 0.005)까지는 끌어올린다.
+   - “너무 좁은” SL로 들어가는 걸 막기 위한 최종 방어선이다.
+
+2) 방향별 SL 바닥값을 한 번 더 적용
+   - settings.range_short_sl_floor_ratio (예: 0.75)를 trader 레벨에서도 받아서
+     숏(SELL) 진입일 때
+        sl_pct = max(sl_pct, tp_pct * range_short_sl_floor_ratio)
+     를 마지막으로 한 번 더 해준다.
+   - 이렇게 하면 전략이 잘못 좁게 준 경우에도
+     “위로 한 번만 털려도 SL”을 줄일 수 있다.
+   - run_bot 이 이 값을 안 줘도 settings 에서 읽어오므로 호환성은 그대로다.
+
+3) soft 모드 시 TP 살짝만 낮추기
+   - open_position_with_tp_sl(...) 에 soft_mode: bool 파라미터를 추가했다.
+   - soft_mode=True 로 들어오면
+       tp_pct = min(tp_pct, settings.range_tp_min * settings.range_soft_tp_factor)
+     로 살짝만 눌러서 “오늘은 애매하니까 빨리 먹고 나오자” 형태를 만들 수 있다.
+   - run_bot 이 이 파라미터를 넘기지 않으면 기존과 동일하게 동작한다.
+
+4) 선물(마진) 기준 TP/SL 옵션을 여기서도 받아서 최종 퍼센트로 변환
+   - settings.use_margin_based_tp_sl 이 켜져 있으면
+     fut_tp_margin_pct, fut_sl_margin_pct 를
+       (마진% / 100) / 레버리지
+     로 바꾼 값을 기존 tp_pct/sl_pct 와 비교해 더 큰 쪽을 쓴다.
+   - 원래는 run_bot 쪽에서 해도 되지만, 여기서도 한 번 더 보정하면
+     호출부가 단순해진다.
+
+이렇게 하면 전략/가드에서 한 번, 실제 주문 직전에서 한 번 더 좁은 SL을 걸러서
+“들어가자마자 잘리는” 패턴을 줄일 수 있다.
+
 ----------------------------------------------------
-
-2025-11-09 3차 수정 (수동/동기화 포지션 보호)
-- run_bot.py 가 거래소에서 그대로 가져와서 source="SYNC" 로 넣어준 포지션은
-  봇이 TP/SL 을 다시 깔거나, 강제 청산하거나, 체결 확인 대상으로 삼지 않도록 했다.
-- 즉, 사람이 수동으로 연 포지션(=거래소에 이미 있던 것)은 봇이 익절/손절을 건드리지 않고
-  그대로 둔다. 봇이 직접 연 것(source가 TREND/RANGE/UNKNOWN 등)만 관리한다.
-
-2025-11-09 2차 설명 보강
-- 지금 구조에서는 "레버리지 몇 배냐", "선물 마진 기준으로 몇 % 먹겠다"를
-  run_bot.py 에서 이미 계산해서 tp_pct / sl_pct 로 넘겨준다.
-  이 모듈(trader.py)은 그 퍼센트를 "그대로 가격에 적용"만 한다.
-  즉, 여기서는 선물이냐 현물이냐를 다시 판단하지 않는다.
-  → 우리는 선물 기준 TP/SL 을 run_bot.py 에서 만들어서 넘긴다. (이미 그렇게 바꿔놨음)
-- 그래서 아래 compute_tp_sl_prices(...) / open_position_with_tp_sl(...) 는
-  "넘어온 퍼센트를 원시 가격(entry)에 곱해서 TP/SL 가격을 만든다"는 역할만 남겨두었다.
-
-2025-11-09 1차 수정
-- settings 에서 추가된 max_entry_slippage_pct 값을 사용해서
-  "실제 체결가(entry_price)가 run_bot 이 넘겨준 진입 힌트(entry_price_hint)보다
-  너무 나쁘면(=슬리피지 초과) 바로 시장가로 닫고 포지션을 포기"하는 가드를 추가했다.
-  → 선물에서 TP/SL 이 아주 짧을 때(예: 0.05% ~ 0.2%) 슬리피지로 바로 손실 나는 걸 막기 위함.
-- 진입 자체는 성공했어도 슬리피지가 과하면 TP/SL 을 안 깔고 None 을 리턴하도록 했다.
-  (짧은 TP 전략 보호용. 상위 run_bot.py 는 None 을 받으면 "이번 진입은 실패"로만 기록하면 된다.)
+2025-11-11 6차 수정  ← 이전 버전 설명
+(단방향 exchange_api 와 맞춰 TP/SL 을 체결 이후에만 거는 구조, 슬리피지 초과시 즉시 청산 등)
 """
 
 from __future__ import annotations
@@ -72,34 +72,43 @@ from exchange_api import (
 # ─────────────────────────────
 @dataclass
 class Trade:
-    """열려 있는 우리 봇 포지션 1건을 표현하는 구조체."""
+    """
+    우리 봇이 열어 둔 포지션 1건을 표현하는 구조체.
+    run_bot.py 에서는 이걸 리스트로만 관리하면 된다.
+    """
 
     symbol: str               # 예: "BTC-USDT"
     side: str                 # "BUY" 또는 "SELL" (진입 방향)
-    qty: float                # 진입 수량
+    qty: float                # 실제 진입 수량
     entry: float              # 실제 진입가 (거래소 체결가)
-    entry_order_id: Optional[str] = None  # 진입 주문 ID (시장가)
+    entry_order_id: Optional[str] = None  # 시장가 진입 주문 ID
     tp_order_id: Optional[str] = None     # 예약된 TP 주문 ID
     sl_order_id: Optional[str] = None     # 예약된 SL 주문 ID
     tp_price: Optional[float] = None      # TP 가격
     sl_price: Optional[float] = None      # SL 가격
-    source: str = "UNKNOWN"               # "TREND" / "RANGE" / "SYNC" 등
+    source: str = "UNKNOWN"               # "TREND" / "RANGE" / "SYNC" 등, 어디서 열었는지 구분
 
 
 @dataclass
 class TraderState:
-    """트레이더 레벨에서 유지해야 하는 런타임 상태."""
+    """
+    트레이더 레벨에서 유지해야 하는 런타임 상태.
+    TP/SL 재설정이 계속 실패하면 봇을 멈추기 위해 카운터를 둔다.
+    """
 
     tp_sl_retry_fails: int = 0
     max_tp_sl_retry_fails: int = 3
 
     def reset_tp_sl_fails(self) -> None:
+        """TP/SL 을 정상적으로 다시 걸었을 때 카운터 리셋"""
         self.tp_sl_retry_fails = 0
 
     def inc_tp_sl_fails(self) -> None:
+        """TP/SL 다시 걸기가 실패했을 때 카운터 +1"""
         self.tp_sl_retry_fails += 1
 
     def should_stop_bot(self) -> bool:
+        """연속 실패 횟수가 한도를 넘었는지 확인"""
         return self.tp_sl_retry_fails >= self.max_tp_sl_retry_fails
 
 
@@ -113,7 +122,12 @@ def compute_tp_sl_prices(
     sl_pct: float,
     precision: int = 2,
 ) -> Tuple[float, float]:
-    """진입 방향과 퍼센트로 실제 TP/SL 가격을 계산한다."""
+    """
+    진입 방향(BUY/SELL)과 퍼센트로 실제 TP/SL 가격을 계산한다.
+
+    - 롱(BUY): TP = entry * (1 + tp_pct), SL = entry * (1 - sl_pct)
+    - 숏(SELL): TP = entry * (1 - tp_pct), SL = entry * (1 + sl_pct)
+    """
     if entry <= 0:
         entry = 0.0
 
@@ -131,24 +145,36 @@ def compute_tp_sl_prices(
 # ─────────────────────────────
 def open_position_with_tp_sl(
     *,
-    settings: Any,
+    settings: Any,              # run_bot.py 에서 load_settings() 해 온 객체
     symbol: str,
     side_open: str,
     qty: float,
-    entry_price_hint: float,
+    entry_price_hint: float,    # run_bot 이 당시 봉에서 계산한 “대략 이 가격쯤 진입” 힌트
     tp_pct: float,
     sl_pct: float,
     source: str = "UNKNOWN",
+    soft_mode: bool = False,    # 박스가 soft 허용으로 온 경우 run_bot 이 True 로 넘겨줄 수 있음
+    sl_floor_ratio: Optional[float] = None,  # 외부에서 강제로 SL 바닥비율을 주고 싶을 때
 ) -> Optional[Trade]:
-    """시장가로 진입하고 곧바로 TP/SL 조건부 주문을 두 개 다 거는 고수준 함수."""
-    # 1) 시장가 진입
+    """
+    1) 시장가로 진입하고
+    2) 실제로 FILLED 되었는지 확인한 다음
+    3) 그 가격으로 TP/SL 을 두 개 다 거는 고수준 함수.
+
+    ⚠️ 아주 중요한 순서:
+      (a) place_market(...) 으로 먼저 주문을 “보낸다”.
+      (b) wait_filled(...) 로 거래소가 실제 체결해줬는지 “확인한다”.
+      (c) 그 다음에만 place_conditional(...) 로 TP 와 SL 을 “각각” 건다.
+      → 중간에 하나라도 실패하면 포지션을 열어두지 않고 종료(return None).
+    """
+    # 1) 시장가 진입 시도
     try:
         resp = place_market(symbol, side_open, qty)
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}")
         return None
 
-    # 응답 파싱: 평평한 구조 먼저 보고, 없으면 data["order"] 안을 본다.
+    # ── 시장가 응답 파싱 ─────────────────────────────────
     data = resp.get("data") or resp
     entry_order_id = (
         data.get("orderId")
@@ -156,7 +182,7 @@ def open_position_with_tp_sl(
         or data.get("orderID")
     )
     if not entry_order_id and isinstance(data, dict):
-        # BingX가 data 안에 order 객체를 중첩으로 넣어서 주는 경우
+        # 중첩 케이스
         order_obj = data.get("order")
         if isinstance(order_obj, dict):
             entry_order_id = (
@@ -166,11 +192,11 @@ def open_position_with_tp_sl(
             )
 
     if not entry_order_id:
-        # 여기서 멈추면 TP/SL 도 안 깐다.
+        # 여기서 멈추면 TP/SL 도 절대 안 건다.
         send_tg("[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다.")
         return None
 
-    # 2) 진입 체결 대기
+    # 2) 진입 체결(FILLED) 대기
     filled = wait_filled(symbol, entry_order_id, timeout=5)
     if not filled:
         send_tg("[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다.")
@@ -196,9 +222,10 @@ def open_position_with_tp_sl(
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
-            # 가격이 너무 나쁘니 바로 정리
+            # 진입은 됐는데 가격이 너무 나쁘다 → 바로 시장가로 닫기
+            close_side = "SELL" if side_open == "BUY" else "BUY"
             try:
-                close_position_market(symbol, side_open, filled_qty)
+                close_position_market(symbol, close_side, filled_qty)
             except Exception as e:
                 send_tg(
                     f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
@@ -209,7 +236,47 @@ def open_position_with_tp_sl(
                 )
             return None
 
-    # 4) TP/SL 가격 계산
+    # ─────────────────────────────────────────────
+    # 3.5) 여기서부터는 “진짜로 열기로 한” 포지션에 대해
+    #      TP/SL 퍼센트를 한 번 더 안전하게 보정한다.
+    # ─────────────────────────────────────────────
+
+    # (a) 선물(마진) 기준 TP/SL 이 켜져 있으면 우선 반영
+    if getattr(settings, "use_margin_based_tp_sl", False):
+        lev = getattr(settings, "leverage", 1) or 1
+        fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
+        fut_sl_margin_pct = getattr(settings, "fut_sl_margin_pct", 0.0)
+        # (마진% / 100) / 레버리지 → 가격 퍼센트
+        m_tp = (fut_tp_margin_pct / 100.0) / lev if lev > 0 else 0.0
+        m_sl = (fut_sl_margin_pct / 100.0) / lev if lev > 0 else 0.0
+        tp_pct = max(tp_pct, m_tp)
+        sl_pct = max(sl_pct, m_sl)
+
+    # (b) 설정에서 최소 TP/SL 이 정해져 있으면 그보다 좁게는 안 쓰도록 한다.
+    min_tp_pct = getattr(settings, "min_tp_pct", 0.0)
+    min_sl_pct = getattr(settings, "min_sl_pct", 0.0)
+    if min_tp_pct > 0:
+        tp_pct = max(tp_pct, min_tp_pct)
+    if min_sl_pct > 0:
+        sl_pct = max(sl_pct, min_sl_pct)
+
+    # (c) soft 모드면 TP 를 너무 멀리 두지 않도록 살짝만 제한
+    if soft_mode:
+        tp_min = getattr(settings, "range_tp_min", tp_pct)
+        soft_factor = getattr(settings, "range_soft_tp_factor", 1.0)
+        # 예: tp_min=0.0035, factor=1.2 → 0.0042 이상은 안 쓰게
+        tp_soft_cap = tp_min * soft_factor
+        tp_pct = min(tp_pct, tp_soft_cap)
+
+    # (d) 숏일 때는 SL 바닥 비율을 한 번 더 적용 (들어가자마자 손절 방지)
+    #     외부에서 sl_floor_ratio 를 넘겨주면 그걸 우선하고, 없으면 settings 값을 쓴다.
+    eff_sl_floor_ratio = sl_floor_ratio or getattr(settings, "range_short_sl_floor_ratio", 0.0)
+    if side_open == "SELL" and eff_sl_floor_ratio > 0 and tp_pct > 0:
+        min_short_sl = tp_pct * eff_sl_floor_ratio
+        if sl_pct < min_short_sl:
+            sl_pct = min_short_sl
+
+    # 4) TP/SL 가격 계산 (이 시점에는 entry_price 가 확정되어 있음)
     tp_price, sl_price = compute_tp_sl_prices(
         side_open=side_open,
         entry=entry_price,
@@ -219,7 +286,7 @@ def open_position_with_tp_sl(
     )
     close_side = "SELL" if side_open == "BUY" else "BUY"
 
-    # 5) TP/SL 두 개 주문
+    # 5) TP/SL 두 개 주문 실제 전송
     try:
         tp_resp = place_conditional(
             symbol,
@@ -236,18 +303,26 @@ def open_position_with_tp_sl(
             "STOP_MARKET",
         )
     except Exception as e:
+        # 한쪽이라도 실패하면 포지션을 열어두면 안 된다.
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
         close_position_market(symbol, close_side, filled_qty)
         return None
 
     # ───── TP/SL 응답에서도 중첩 구조를 확인하는 헬퍼 ─────
     def _norm_id(r: Dict[str, Any]) -> Optional[str]:
+        """
+        BingX 가
+          { "data": { "orderId": ... } }
+        도 주고,
+          { "data": { "order": { "orderId": ... } } }
+        도 주기 때문에 두 경우를 모두 처리한다.
+        """
         d = r.get("data") or r
-        # 평평한 구조 먼저
+        # 1) 평평한 구조
         oid = d.get("orderId") or d.get("id") or d.get("orderID")
         if oid:
             return str(oid)
-        # 중첩 구조 확인
+        # 2) 중첩 구조
         if isinstance(d, dict):
             order_obj = d.get("order")
             if isinstance(order_obj, dict):
@@ -259,6 +334,7 @@ def open_position_with_tp_sl(
                 ) or None
         return None
 
+    # 여기까지 오면 포지션 1건이 완성
     trade = Trade(
         symbol=symbol,
         side=side_open,
@@ -278,8 +354,11 @@ def open_position_with_tp_sl(
 # TP/SL 유지 (사라졌으면 다시 걸기)
 # ─────────────────────────────
 def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
-    """포지션은 살아 있는데 TP/SL 주문이 없는 경우 다시 건다."""
-    # 수동/동기화 포지션은 손대지 않는다.
+    """
+    포지션은 살아 있는데 TP/SL 주문이 없는 경우 다시 건다.
+
+    ⚠️ source == "SYNC" 인 건 손대지 않는다. (사람이 연 포지션)
+    """
     if trade.source == "SYNC":
         return True
 
@@ -381,7 +460,11 @@ def check_closes(
     open_trades: List[Trade],
     state: TraderState,
 ) -> Tuple[List[Trade], List[Dict[str, Any]]]:
-    """열린 포지션 목록을 받아서 TP/SL 체결 여부를 확인하고 결과를 돌려준다."""
+    """
+    열린 포지션 리스트를 받아서,
+    TP/SL 이 체결된 애들은 closed_results 로 빼고,
+    나머지는 still_open 에 남겨서 run_bot.py 에 돌려준다.
+    """
     if not open_trades:
         return [], []
 
@@ -389,7 +472,7 @@ def check_closes(
     closed_results: List[Dict[str, Any]] = []
 
     for t in open_trades:
-        # 수동/동기화 포지션은 건너뜀
+        # 사람이/외부에서 열어준 포지션은 그대로 둔다.
         if t.source == "SYNC":
             still_open.append(t)
             continue
@@ -399,7 +482,7 @@ def check_closes(
         sl_id = t.sl_order_id
         closed = False
 
-        # 1) TP 체크
+        # 1) TP 체결 여부
         if tp_id:
             try:
                 o = get_order(symbol, tp_id)
@@ -412,7 +495,7 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes TP error: {e}")
 
-        # 2) SL 체크
+        # 2) SL 체결 여부
         if (not closed) and sl_id:
             try:
                 o = get_order(symbol, sl_id)
@@ -425,7 +508,7 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes SL error: {e}")
 
-        # 3) TP/SL 재설정 또는 강제청산
+        # 3) TP/SL 다시 걸기 또는 강제청산
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:

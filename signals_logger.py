@@ -8,11 +8,18 @@
 - 분석용으로 ATR, RSI, 15m 방향, 스프레드, 잔고, 명목가도 넣을 수 있음
 - 한 거래를 ENTRY ↔ CLOSE 로 묶을 수 있도록 trade_id / exchange_order_id 도 추가
 
-event 예시:
-- "ENTRY_SIGNAL"   : 조건은 나왔는데 아직 주문 전
-- "ENTRY_OPENED"   : 실제로 주문 나가고 포지션 열린 시점
-- "CLOSE"          : TP/SL/강제청산 등으로 닫혔을 때
-- "SKIP"           : 조건 안 맞아서/가드에 걸려서 안 들어갔을 때
+2025-11-12 추가/변경
+----------------------------------------------------
+(박스 개선 로그 반영)
+1) 박스 전략이 단계적으로 허용되는 경우를 로그에 남길 수 있게 필드를 추가했다.
+   - range_level: RANGE 전략이 어떤 엄격도(0,1,2)에서 찍힌 건지 남긴다.
+   - soft_block_reason: "soft_atr", "soft_ema" 같이 전략에서 완전 차단 대신
+     약하게 허용한 이유를 텍스트로 남길 수 있다.
+2) 박스 TP/SL 을 동적으로 계산했을 때 실제로 사용한 퍼센트를 같이 남길 수 있게 했다.
+   - used_tp_pct, used_sl_pct: 최종으로 주문에 들어간 TP/SL 퍼센트
+   이렇게 남겨두면 나중에 CSV만 봐도 "왜 이 진입은 0.004로 찍혔지?"를 역추적할 수 있다.
+3) 필드가 늘어도 기존 로직이 깨지지 않게, 모듈 로드 시점에 만드는 헤더에도
+   새 컬럼을 포함시켰다.
 
 2025-11-10 추가/변경
 1) 모듈이 import 되는 시점에 그날(KST) 날짜 파일이 없으면 헤더만 있는 빈 CSV를 미리 만들어 둔다.
@@ -60,14 +67,11 @@ def _csv_path_for(day_str: str) -> str:
     return os.path.join(BASE_DIR, fname)
 
 
-def _ensure_today_csv() -> str:
+def _fieldnames() -> list[str]:
+    """모든 로그에서 공통으로 쓸 헤더 정의.
+    - 여기서 컬럼을 추가하면 _ensure_today_csv(), log_signal() 둘 다 반영된다.
     """
-    오늘(KST) 날짜의 CSV가 없으면 헤더만 있는 빈 파일을 만들어둔다.
-    - run_bot 이 켜지는 순간 바로 오늘자 파일이 생기게 하기 위함.
-    """
-    day = _today_kst_str()
-    path = _csv_path_for(day)
-    fieldnames = [
+    return [
         "ts_kst",
         "event",
         "symbol",
@@ -93,10 +97,25 @@ def _ensure_today_csv() -> str:
         "notional",
         "strategy_version",
         "extra",
+        # ─── 2025-11-12 추가 ───
+        "range_level",        # RANGE_STRICT_LEVEL 이나 호출부에서 전달한 엄격도
+        "soft_block_reason",  # "soft_atr" / "soft_ema" 등
+        "used_tp_pct",        # 설정/동적 계산으로 실제 사용한 TP 퍼센트
+        "used_sl_pct",        # 설정/동적 계산으로 실제 사용한 SL 퍼센트
     ]
+
+
+def _ensure_today_csv() -> str:
+    """
+    오늘(KST) 날짜의 CSV가 없으면 헤더만 있는 빈 파일을 만들어둔다.
+    - run_bot 이 켜지는 순간 바로 오늘자 파일이 생기게 하기 위함.
+    """
+    day = _today_kst_str()
+    path = _csv_path_for(day)
+    fields = _fieldnames()
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
     return path
 
@@ -142,6 +161,11 @@ def log_signal(
     notional: Optional[float] = None,
     strategy_version: Optional[str] = None,
     extra: Optional[str] = None,          # "guard=price_jump;cooldown=true" 같은 자유필드
+    # ---- 2025-11-12: 박스 개선용 필드 ----
+    range_level: Optional[int] = None,        # RANGE_STRICT_LEVEL 등
+    soft_block_reason: Optional[str] = None,  # "soft_atr" 등
+    used_tp_pct: Optional[float] = None,      # 실제 사용한 박스 TP (%)
+    used_sl_pct: Optional[float] = None,      # 실제 사용한 박스 SL (%)
 ) -> None:
     """
     한 줄을 CSV에 쓴다. 파일이 없으면 헤더를 먼저 쓴다.
@@ -178,35 +202,14 @@ def log_signal(
         "notional": notional if notional is not None else "",
         "strategy_version": strategy_version or "",
         "extra": extra or "",
+        # 2025-11-12 추가
+        "range_level": range_level if range_level is not None else "",
+        "soft_block_reason": soft_block_reason or "",
+        "used_tp_pct": used_tp_pct if used_tp_pct is not None else "",
+        "used_sl_pct": used_sl_pct if used_sl_pct is not None else "",
     }
 
-    fieldnames = [
-        "ts_kst",
-        "event",
-        "symbol",
-        "strategy_type",
-        "direction",
-        "price",
-        "qty",
-        "tp_price",
-        "sl_price",
-        "reason",
-        "pnl",
-        "trade_id",
-        "exchange_order_id",
-        "step",
-        "candle_ts",
-        "signal_price",
-        "rsi_3m",
-        "trend_15m",
-        "atr_fast",
-        "atr_slow",
-        "spread_pct",
-        "available_usdt",
-        "notional",
-        "strategy_version",
-        "extra",
-    ]
+    fieldnames = _fieldnames()
 
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
