@@ -2,25 +2,12 @@
 exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
-2025-11-12 수정 (7차, one-way 계정 전용 순서 보정)
+2025-11-12 수정 (7차, one-way 계정 전용 순서 보정 + 요청 포맷 정정)
 ----------------------------------------------------
-현 계정 로그를 보면 주문 시에 여전히 109400(Invalid parameters)이 발생했고,
-요청 모양이 `positionSide=LONG/SHORT` 하나뿐이었다. 이건 원웨이 계정에서
-허용하지 않는 형태다. 원웨이 모드에서는 positionSide=BOTH만 허용된다는
-보고가 있으므로 이 계정에서는 BOTH를 1순위로 시도하도록 순서를 바꾼다. :contentReference[oaicite:1]{index=1}
-
-변경 포인트
-1) req() 로그를 보기 쉽게 정리했다.
-2) set_leverage_and_mode(...) 가 먼저
-   symbol + positionSide=BOTH + leverage 만 보낸다.
-   안 되면 심볼만 보내는 최소형으로 폴백한다.
-3) place_market(...), place_conditional(...), close_position_market(...)
-   의 페이로드 순서를
-   (1) positionSide=BOTH
-   (2) positionSide 생략
-   (3) LONG/SHORT
-   으로 재배치했다.
-4) 여전히 파라미터형 오류(109400)이면 다음 모양으로 계속 시도한다.
+- 원웨이 계정이라 positionSide=BOTH 를 먼저 보낸다.
+- 기존 코드가 Content-Type: application/json 과 json=... 으로 보내고 있어
+  선물 v2 주문에서 109400 이 났으므로, 헤더와 요청 방식을
+  문서 예제처럼 "쿼리스트링 + 서명" 형태로 단순화했다.
 """
 
 from __future__ import annotations
@@ -60,9 +47,9 @@ def sign_query(params: Dict[str, Any], api_secret: str) -> str:
 
 
 def _headers() -> Dict[str, str]:
+    # 문서 예제와 동일하게 API 키만 보낸다.
     return {
         "X-BX-APIKEY": SET.api_key,
-        "Content-Type": "application/json",
     }
 
 
@@ -91,8 +78,8 @@ def req(
 ) -> Dict[str, Any]:
     """
     BingX REST 요청 공통부.
-    - HTTP 200이라도 data["code"] 가 0/None/100400 이 아니면 예외로 본다.
-    - signature 는 로그에 남기지 않는다.
+    - 모든 파라미터는 쿼리스트링에 넣고 서명한다.
+    - 본문은 기본적으로 보내지 않는다(data=None).
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
@@ -103,7 +90,8 @@ def req(
     log_params = {k: v for k, v in params.items() if k != "signature"}
     log(f"[REQ] {method} {path} params={log_params}")
 
-    r = requests.request(method, url, json=body, headers=_headers(), timeout=12)
+    # json=... 이 아니라 data=... 으로 보낸다. 대부분의 호출에서는 body 가 None 이다.
+    r = requests.request(method, url, headers=_headers(), data=body or None, timeout=12)
 
     if r.status_code != 200:
         raise RuntimeError(f"{method} {path} -> {r.status_code}: {r.text}")
@@ -241,9 +229,7 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    원웨이 계정에서는 positionSide=BOTH 만 허용되는 케이스가 보고되어 있다.
-    그래서 그 형태를 1순위로 보낸다. :contentReference[oaicite:2]{index=2}
-    실패해도 봇은 계속 돌게 한다.
+    원웨이 계정에서는 positionSide=BOTH 를 먼저 보낸다.
     """
     # 1단계: positionSide=BOTH
     try:
@@ -360,8 +346,7 @@ def place_conditional(
     order_type: str,
 ) -> Dict[str, Any]:
     """
-    TP/SL 조건부 주문
-    위와 동일하게 원웨이 기준으로 BOTH를 앞에 둔다.
+    TP/SL 조건부 주문도 동일한 순서로 시도한다.
     """
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
