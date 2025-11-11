@@ -3,7 +3,8 @@ exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
 2025-11-12 수정 (7차, one-way 계정 전용 순서 보정 + 요청 포맷 정정)
-+ 2025-11-12 추가 수정
++ 2025-11-12 추가 수정 ①
++ 2025-11-12 추가 수정 ② (TP/SL 다중 포맷 시도, reduceOnly 강제청산 보완)
 ----------------------------------------------------
 - 원웨이 계정이라 positionSide=BOTH 를 먼저 보낸다.
 - 이 계정은 로그상 side 가 없으면 109400 을 주므로,
@@ -11,6 +12,10 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 - 주문/조회는 문서 예제처럼 "쿼리스트링 + 서명" 형태로 보낸다.
 - 일부 계정에서 /trade/cancel 이 100400 을 내므로 wait_filled 에서
   타임아웃 시 무조건 cancel 을 치지 않고, cancel_order 도 100400 은 워닝만 남긴다.
+- TP/SL(/trade/order 조건부) 이 110400 을 자주 내서 triggerPrice/stopPrice/
+  activationPrice, positionSide 유/무, reduceOnly 유/무 를 여러 형태로 순차 시도한다.
+- 강제 시장가 청산이 101290(The Reduce Only order can only decrease...) 이 나오는
+  계정이 있어 reduceOnly 제거 재시도를 추가했다.
 """
 
 from __future__ import annotations
@@ -64,7 +69,7 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
-    return float(f"{qty:.3f}")
+    return float(f"{qty:.3f}")  # BingX BTC-USDT는 0.001 단위여서 3째자리까지
 
 
 def _as_int_qty(raw_qty: float) -> str:
@@ -89,7 +94,7 @@ def req(
     signed_qs = sign_query(params, SET.api_secret)
     url = f"{BASE}{path}?{signed_qs}"
 
-    # 보기 쉬운 형태로 남긴다
+    # 보기 쉬운 형태로 남긴다 (signature는 로그에 안 남김)
     log_params = {k: v for k, v in params.items() if k != "signature"}
     log(f"[REQ] {method} {path} params={log_params}")
 
@@ -113,7 +118,7 @@ def req(
 
 def _is_param_error(exc: Exception) -> bool:
     msg = str(exc)
-    return "109400" in msg or "Invalid parameters" in msg
+    return "109400" in msg or "Invalid parameters" in msg or "110400" in msg
 
 
 # ─────────────────────────────
@@ -335,6 +340,7 @@ def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
         except Exception as e:
             last_err = e
             log(f"[PLACE ERR {idx}] {e}")
+            # 파라미터 문제(109400/110400)일 때만 다음 포맷 시도
             if not _is_param_error(e):
                 break
     if last_err:
@@ -395,45 +401,87 @@ def place_conditional(
     order_type: str,
 ) -> Dict[str, Any]:
     """
-    TP/SL 조건부 주문도 동일한 순서로 시도한다.
+    TP/SL 조건부 주문.
+    이 계정은 triggerPrice / stopPrice / activationPrice / reduceOnly / positionSide
+    조합에 따라 110400을 줄 수 있으므로 여러 모양으로 순차 시도한다.
     """
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
 
-    payloads = [
+    base_common = {
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "quantity": norm_qty,
+        "recvWindow": 5000,
+    }
+
+    payloads: List[Dict[str, Any]] = [
+        # 1) positionSide=BOTH + reduceOnly + triggerPrice
         {
-            "symbol": symbol,
-            "side": side,
+            **base_common,
             "positionSide": "BOTH",
-            "type": order_type,
-            "quantity": norm_qty,
             "reduceOnly": True,
             "triggerPrice": trigger_price,
-            "recvWindow": 5000,
         },
+        # 2) positionSide=BOTH + reduceOnly + stopPrice
         {
-            "symbol": symbol,
-            "side": side,
-            "type": order_type,
-            "quantity": norm_qty,
+            **base_common,
+            "positionSide": "BOTH",
+            "reduceOnly": True,
+            "stopPrice": trigger_price,
+        },
+        # 3) positionSide=BOTH + reduceOnly + activationPrice
+        {
+            **base_common,
+            "positionSide": "BOTH",
+            "reduceOnly": True,
+            "activationPrice": trigger_price,
+        },
+        # 4) reduceOnly + triggerPrice
+        {
+            **base_common,
             "reduceOnly": True,
             "triggerPrice": trigger_price,
-            "recvWindow": 5000,
+        },
+        # 5) reduceOnly + stopPrice
+        {
+            **base_common,
+            "reduceOnly": True,
+            "stopPrice": trigger_price,
+        },
+        # 6) reduceOnly + activationPrice
+        {
+            **base_common,
+            "reduceOnly": True,
+            "activationPrice": trigger_price,
+        },
+        # 7) positionSide 없고 reduceOnly도 없는 가장 단순한 형태 (거래소가 칭얼대면 이게 먹힐 때가 있음)
+        {
+            **base_common,
+            "triggerPrice": trigger_price,
         },
         {
-            "symbol": symbol,
-            "side": side,
+            **base_common,
+            "stopPrice": trigger_price,
+        },
+        {
+            **base_common,
+            "activationPrice": trigger_price,
+        },
+        # 10) 방향형 positionSide + reduceOnly
+        {
+            **base_common,
             "positionSide": "LONG" if side.upper() == "BUY" else "SHORT",
-            "type": order_type,
-            "quantity": norm_qty,
             "reduceOnly": True,
             "triggerPrice": trigger_price,
-            "recvWindow": 5000,
         },
     ]
+
     try:
         return _try_order(payloads)
     except Exception:
+        # 실패하면 같은 것들을 정수 수량으로 한 번 더
         payloads_int = [{**p, "quantity": int_qty_str} for p in payloads]
         return _try_order(payloads_int)
 
@@ -546,6 +594,11 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
+    """
+    시장가로 포지션을 닫는다.
+    - 기본은 reduceOnly=True 로 닫고
+    - 101290 이 나오면 reduceOnly 없이 다시 시도한다.
+    """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
@@ -581,13 +634,35 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     try:
         _try_order(payloads)
         send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={norm_qty}")
-    except Exception:
+        return
+    except Exception as e:
+        msg = str(e)
+        # 네 로그에 나온 케이스: reduceOnly 로는 닫을 포지션이 없다 → reduceOnly 빼고 다시
+        if "101290" in msg:
+            no_ro_payloads = [
+                {
+                    "symbol": symbol,
+                    "side": close_side,
+                    "type": "MARKET",
+                    "quantity": norm_qty,
+                    "recvWindow": 5000,
+                }
+            ]
+            try:
+                _try_order(no_ro_payloads)
+                send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다(RO제거). 수량={norm_qty}")
+                return
+            except Exception as e2:
+                send_tg(f"❗ 포지션 강제 정리 실패(RO제거도 실패): {e2}")
+                return
+
+        # 그 외에는 예전처럼 정수 수량으로 한 번 더
         payloads_int = [{**p, "quantity": int_qty_str} for p in payloads]
         try:
             _try_order(payloads_int)
             send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={int_qty_str}")
-        except Exception as e:
-            send_tg(f"❗ 포지션 강제 정리 실패: {e}")
+        except Exception as e3:
+            send_tg(f"❗ 포지션 강제 정리 실패: {e3}")
 
 
 __all__ = [
