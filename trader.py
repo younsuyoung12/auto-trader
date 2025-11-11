@@ -5,6 +5,8 @@ trader.py
 2025-11-12 8차 수정 반영 + exchange_api 7차 시그니처 맞춤
 - exchange_api 가 positionSide 시도를 내부에서 하도록 바뀌었으므로
   여기서는 position_side 인자를 넘기지 않는다.
+- 일부 계정에서 수량을 크게 보내면 바로 Insufficient margin 이 나므로
+  심볼별 최소 단위로 한 번 더 내리는 보정을 추가했다.
 """
 
 from __future__ import annotations
@@ -22,15 +24,36 @@ from exchange_api import (
     close_position_market,
 )
 
+# 심볼별 최소 수량 단위 (봇에서 주로 BTC-USDT 하나만 쓴다고 해서 이렇게 둠)
+_MIN_QTY_STEP = {
+    "BTC-USDT": 0.001,
+}
+
 
 # ─────────────────────────────
-# 작은 유틸: 수량을 계약 단위 정수로 맞추기
+# 작은 유틸: 수량을 거래 가능한 최소 단위로 맞추기
 # ─────────────────────────────
-def _to_contract_qty(q: float) -> int:
-    if q is None:
-        return 1
-    iq = int(round(q))
-    return iq if iq >= 1 else 1
+def _normalize_qty(symbol: str, q: float) -> float:
+    """
+    너무 큰 수량을 보내서 증거금 부족 나지 않도록 최소단위로 깎는다.
+    예: BTC-USDT → 0.001
+    """
+    if q is None or q <= 0:
+        # 최소한 1단위는 보내게 한다
+        step = _MIN_QTY_STEP.get(symbol, 0.001)
+        return float(f"{step:.6f}")
+
+    step = _MIN_QTY_STEP.get(symbol, 0.001)
+    if step <= 0:
+        step = 0.001
+
+    units = int(q / step)
+    qty = units * step
+    if qty <= 0:
+        qty = step
+
+    # 거래소가 소수 3~6자리까지만 받는 경우가 많으니 깔끔하게
+    return float(f"{qty:.6f}")
 
 
 # ─────────────────────────────
@@ -103,9 +126,12 @@ def open_position_with_tp_sl(
     soft_mode: bool = False,
     sl_floor_ratio: Optional[float] = None,
 ) -> Optional[Trade]:
-    # 1) 시장가 진입 (이제 position_side 넘기지 않음)
+    # 1) 수량 보정 먼저
+    norm_qty = _normalize_qty(symbol, qty)
+
+    # 2) 시장가 진입 (position_side 안 넘김)
     try:
-        resp = place_market(symbol, side_open, _to_contract_qty(qty))
+        resp = place_market(symbol, side_open, norm_qty)
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}")
         return None
@@ -129,7 +155,7 @@ def open_position_with_tp_sl(
         send_tg("[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다.")
         return None
 
-    # 2) FILLED 확인
+    # 3) FILLED 확인
     filled = wait_filled(symbol, entry_order_id, timeout=5)
     if not filled:
         send_tg("[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다.")
@@ -138,7 +164,7 @@ def open_position_with_tp_sl(
     filled_qty = float(
         filled.get("quantity")
         or filled.get("executedQty")
-        or qty
+        or norm_qty
     )
     if filled_qty <= 0:
         send_tg("[ENTRY] ⚠️ 시장가 체결 수량이 0입니다. 포지션을 건너뜁니다.")
@@ -149,14 +175,14 @@ def open_position_with_tp_sl(
         or entry_price_hint
     )
 
-    # 3) 슬리피지 가드
+    # 4) 슬리피지 가드
     max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0)
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
             close_side = "SELL" if side_open == "BUY" else "BUY"
             try:
-                close_position_market(symbol, close_side, _to_contract_qty(filled_qty))
+                close_position_market(symbol, close_side, _normalize_qty(symbol, filled_qty))
             except Exception as e:
                 send_tg(
                     f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
@@ -167,7 +193,7 @@ def open_position_with_tp_sl(
                 )
             return None
 
-    # 3.5) TP/SL 퍼센트 보정
+    # 4.5) TP/SL 퍼센트 보정
     if getattr(settings, "use_margin_based_tp_sl", False):
         lev = getattr(settings, "leverage", 1) or 1
         fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
@@ -196,7 +222,7 @@ def open_position_with_tp_sl(
         if sl_pct < min_short_sl:
             sl_pct = min_short_sl
 
-    # 4) TP/SL 가격
+    # 5) TP/SL 가격
     tp_price, sl_price = compute_tp_sl_prices(
         side_open=side_open,
         entry=entry_price,
@@ -206,25 +232,25 @@ def open_position_with_tp_sl(
     )
     close_side = "SELL" if side_open == "BUY" else "BUY"
 
-    # 5) TP/SL 실제 주문 (이제 position_side 안 넘김)
+    # 6) TP/SL 실제 주문
     try:
         tp_resp = place_conditional(
             symbol,
             close_side,
-            _to_contract_qty(filled_qty),
+            _normalize_qty(symbol, filled_qty),
             tp_price,
             "TAKE_PROFIT_MARKET",
         )
         sl_resp = place_conditional(
             symbol,
             close_side,
-            _to_contract_qty(filled_qty),
+            _normalize_qty(symbol, filled_qty),
             sl_price,
             "STOP_MARKET",
         )
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
-        close_position_market(symbol, close_side, _to_contract_qty(filled_qty))
+        close_position_market(symbol, close_side, _normalize_qty(symbol, filled_qty))
         return None
 
     def _norm_id(r: Dict[str, Any]) -> Optional[str]:
@@ -267,8 +293,8 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
 
     symbol = trade.symbol
     side_open = trade.side
-    qty = trade.qty
     close_side = "SELL" if side_open == "BUY" else "BUY"
+    qty_norm = _normalize_qty(symbol, trade.qty)
 
     need_tp = False
     need_sl = False
@@ -306,7 +332,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
             tp_r = place_conditional(
                 symbol,
                 close_side,
-                _to_contract_qty(qty),
+                qty_norm,
                 trade.tp_price,
                 "TAKE_PROFIT_MARKET",
             )
@@ -327,7 +353,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
             sl_r = place_conditional(
                 symbol,
                 close_side,
-                _to_contract_qty(qty),
+                qty_norm,
                 trade.sl_price,
                 "STOP_MARKET",
             )
@@ -402,7 +428,7 @@ def check_closes(
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:
-                close_position_market(symbol, t.side, _to_contract_qty(t.qty))
+                close_position_market(symbol, t.side, _normalize_qty(symbol, t.qty))
                 closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
             else:
                 still_open.append(t)

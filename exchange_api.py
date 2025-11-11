@@ -5,9 +5,9 @@ BingX REST API 호출과 관련된 저수준 함수 모음.
 2025-11-12 수정 (7차, one-way 계정 전용 순서 보정 + 요청 포맷 정정)
 ----------------------------------------------------
 - 원웨이 계정이라 positionSide=BOTH 를 먼저 보낸다.
-- 기존 코드가 Content-Type: application/json 과 json=... 으로 보내고 있어
-  선물 v2 주문에서 109400 이 났으므로, 헤더와 요청 방식을
-  문서 예제처럼 "쿼리스트링 + 서명" 형태로 단순화했다.
+- 이 계정은 로그상 side 가 없으면 109400 을 주므로,
+  레버리지 설정은 side → positionSide → 심볼만 순으로 여러 번 시도한다.
+- 주문/조회는 문서 예제처럼 "쿼리스트링 + 서명" 형태로 보낸다.
 """
 
 from __future__ import annotations
@@ -90,7 +90,6 @@ def req(
     log_params = {k: v for k, v in params.items() if k != "signature"}
     log(f"[REQ] {method} {path} params={log_params}")
 
-    # json=... 이 아니라 data=... 으로 보낸다. 대부분의 호출에서는 body 가 None 이다.
     r = requests.request(method, url, headers=_headers(), data=body or None, timeout=12)
 
     if r.status_code != 200:
@@ -229,36 +228,93 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    원웨이 계정에서는 positionSide=BOTH 를 먼저 보낸다.
+    이 계정 로그에서는 'err:side: This field is required.' 가 나왔으므로
+    side 있는 포맷을 우선적으로 전부 시도하고,
+    그 다음 positionSide, 그 다음 최소 포맷으로 내려간다.
+    실패해도 봇은 계속 돌게 한다.
     """
-    # 1단계: positionSide=BOTH
+    # 1) side=BOTH
+    tried_msgs = []
     try:
         req(
             "POST",
             "/openApi/swap/v2/trade/leverage",
             {
                 "symbol": symbol,
-                "positionSide": "BOTH",
+                "side": "BOTH",
                 "leverage": leverage,
             },
         )
+        log("[LEV OK] side=BOTH")
     except Exception as e:
-        log(f"[WARN] 레버리지 설정 실패(positionSide=BOTH): {e}")
+        msg = f"[LEV FAIL] side=BOTH: {e}"
+        log(msg)
+        tried_msgs.append(msg)
+        # 2) side=LONG
+        try:
+            req(
+                "POST",
+                "/openApi/swap/v2/trade/leverage",
+                {
+                    "symbol": symbol,
+                    "side": "LONG",
+                    "leverage": leverage,
+                },
+            )
+            log("[LEV OK] side=LONG")
+        except Exception as e2:
+            msg = f"[LEV FAIL] side=LONG: {e2}"
+            log(msg)
+            tried_msgs.append(msg)
+            # 3) side=SHORT
+            try:
+                req(
+                    "POST",
+                    "/openApi/swap/v2/trade/leverage",
+                    {
+                        "symbol": symbol,
+                        "side": "SHORT",
+                        "leverage": leverage,
+                    },
+                )
+                log("[LEV OK] side=SHORT")
+            except Exception as e3:
+                msg = f"[LEV FAIL] side=SHORT: {e3}"
+                log(msg)
+                tried_msgs.append(msg)
+                # 4) positionSide=BOTH
+                try:
+                    req(
+                        "POST",
+                        "/openApi/swap/v2/trade/leverage",
+                        {
+                            "symbol": symbol,
+                            "positionSide": "BOTH",
+                            "leverage": leverage,
+                        },
+                    )
+                    log("[LEV OK] positionSide=BOTH")
+                except Exception as e4:
+                    msg = f"[LEV FAIL] positionSide=BOTH: {e4}"
+                    log(msg)
+                    tried_msgs.append(msg)
+                    # 5) 최소형
+                    try:
+                        req(
+                            "POST",
+                            "/openApi/swap/v2/trade/leverage",
+                            {
+                                "symbol": symbol,
+                                "leverage": leverage,
+                            },
+                        )
+                        log("[LEV OK] symbol-only")
+                    except Exception as e5:
+                        msg = f"[LEV FAIL] symbol-only: {e5}"
+                        log(msg)
+                        tried_msgs.append(msg)
 
-    # 2단계: 심볼만
-    try:
-        req(
-            "POST",
-            "/openApi/swap/v2/trade/leverage",
-            {
-                "symbol": symbol,
-                "leverage": leverage,
-            },
-        )
-    except Exception as e:
-        log(f"[WARN] 레버리지 설정 실패(심볼만): {e}")
-
-    # 마진 모드
+    # 마진 모드 설정은 별도로 시도
     try:
         req(
             "POST",

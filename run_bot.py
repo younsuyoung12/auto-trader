@@ -10,26 +10,14 @@ run_bot.py (메인 흐름 전용)
 
 1) trader.open_position_with_tp_sl(...) 에서 새로 받은 파라미터를 실제로 넘겨준다.
    - soft_mode: bool
-     → 시그널에서 extra["soft"] / extra["soft_mode"] / extra["range_soft"] 중 하나라도 True 면
-       soft_mode=True 로 넘겨서 TP 를 살짝만 낮추는 트레이더 레벨 보정이 작동하게 한다.
    - sl_floor_ratio: Optional[float]
-     → 시그널에서 extra["sl_floor_ratio"] 가 오면 그대로 넘겨서
-       숏일 때 SL 이 너무 좁아지는 걸 trader 레벨에서 한 번 더 방어한다.
-     → 시그널에서 안 주면 trader 가 settings.range_short_sl_floor_ratio 를 알아서 쓴다.
 
-2) 위 말고 나머지 흐름(텔레그램 on/off, 주기 상태 메시지, KRW 환산)은
-   2025-11-12 보완 사항 ④ 내용 그대로 유지했다.
-
-
-2025-11-12 보완 사항 ④
++ 2025-11-12 추가 보완
 ----------------------------------------------------
-(이번에 반영한 거)
-1) 텔레그램 알림 on/off 플래그 실제 적용
-2) 주기 상태 메시지에 실제 주기 표기
-3) 상태 메시지에도 15m 추세 포함 유지
-4) KRW 환산은 settings.krw_per_usdt → settings.krw_rate → 1400 순서로 본다
-...
-(이하 기존 변경 이력 원문 유지)
+텔레그램에서 종료를 눌렀을 때 프로세스가 완전히 끝나서
+호스팅쪽에서 다시 재시작되는 걸 막기 위해,
+종료 조건이 충족되면 메인 루프에서 빠져나와도 프로그램은
+죽지 않고 idle 상태로 들어간다.
 """
 
 from __future__ import annotations
@@ -77,7 +65,6 @@ RUNNING: bool = True
 TERMINATED_BY_SIGNAL: bool = False
 
 # 텔레그램에 뿌릴 때 KRW로도 보여주려고 추가
-# settings.krw_per_usdt 를 우선 보고, 없으면 krw_rate, 그래도 없으면 1400
 KRW_RATE: float = getattr(SET, "krw_per_usdt", getattr(SET, "krw_rate", 1400.0))
 
 # 간단 메트릭
@@ -125,6 +112,24 @@ def _write_stop_flag() -> None:
 
 
 # ─────────────────────────────
+# idle 모드 진입 (1번 방법)
+# ─────────────────────────────
+def _enter_idle_forever() -> None:
+    """
+    여기로 들어오면 봇 로직은 멈추고 프로세스만 살아있다.
+    Render 같은 데서 '프로세스 죽었네?' 하고 다시 띄우는 걸 막기 위함.
+    """
+    log("[IDLE] safe stop reached, entering idle loop...")
+    # 너무 자주 보내면 안 되니까 한 번만 보낸다.
+    try:
+        send_tg("🟡 봇을 멈춘 상태로 유지합니다. 재시작은 컨테이너/프로세스로 해주세요.")
+    except Exception:
+        pass
+    while True:
+        time.sleep(60)
+
+
+# ─────────────────────────────
 # SIGTERM 핸들러
 # ─────────────────────────────
 def _sigterm(*_: Any) -> None:
@@ -141,10 +146,6 @@ signal.signal(signal.SIGTERM, _sigterm)
 # 15m 추세 문구 만들기
 # ─────────────────────────────
 def _get_15m_trend_text(symbol: str) -> str:
-    """
-    15분봉 캔들을 가져와서 현재 추세를 문자열로 돌려준다.
-    실패하면 빈 문자열.
-    """
     try:
         candles_15m = get_klines(symbol, "15m", 120)
         if not candles_15m:
@@ -158,7 +159,7 @@ def _get_15m_trend_text(symbol: str) -> str:
         else:
             return " (15m 추세: 중립)"
     except Exception as e:
-        log(f"[STATUS_TG] 15m trend check error: {e}")
+        log(f="[STATUS_TG] 15m trend check error: {e}")
         return ""
 
 
@@ -166,7 +167,6 @@ def _get_15m_trend_text(symbol: str) -> str:
 # 보조: 열려 있는 포지션 상태를 텔레그램으로 던지기
 # ─────────────────────────────
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
-    """거래소 포지션을 다시 읽어서 현재 미실현 PnL 을 텔레로 보낸다."""
     try:
         positions = fetch_open_positions(symbol)
     except Exception as e:
@@ -176,7 +176,7 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
     if not positions:
         return
 
-    mins = max(1, interval_sec // 60)  # 0분 표시 방지
+    mins = max(1, interval_sec // 60)
     trend_txt = _get_15m_trend_text(symbol)
     lines = [f"⏱ 포지션 상태({mins}m){trend_txt}:"]
     for p in positions:
@@ -199,13 +199,6 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
 # 거래소 → 내부 포지션 동기화 (단방향 대응 버전)
 # ─────────────────────────────
 def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
-    """
-    거래소 포지션/열린 주문을 내부 리스트로 옮겨 중복 진입을 막는다.
-    시작할 때 1번, 이후에는 주기적으로 호출한다.
-
-    단방향(one-way)에서는 positionSide 가 비어 있을 수 있으므로
-    1순위로 positionAmt 의 부호로 방향을 정한다.
-    """
     global OPEN_TRADES, _LAST_SYNCED_EXCHANGE_POS_COUNT
 
     positions = fetch_open_positions(symbol)
@@ -237,7 +230,6 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
         qty = abs(raw_amt_f)
         entry_price = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
 
-        # 열린 주문에서 TP/SL 찾아서 붙인다
         tp_id: Optional[str] = None
         sl_id: Optional[str] = None
         tp_price: Optional[float] = None
@@ -269,7 +261,6 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
         )
 
     if len(OPEN_TRADES) != _LAST_SYNCED_EXCHANGE_POS_COUNT:
-        # 이건 운영상 중요한 정보라 무조건 보낸다
         send_tg(f"🔁 거래소 포지션 {len(OPEN_TRADES)}건 동기화했습니다. (중복 진입 방지)")
         _LAST_SYNCED_EXCHANGE_POS_COUNT = len(OPEN_TRADES)
 
@@ -278,7 +269,6 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
 # 텔레그램 종료 콜백
 # ─────────────────────────────
 def _on_safe_stop() -> None:
-    """텔레그램 명령 스레드에서 호출하는 콜백."""
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
     send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
@@ -414,19 +404,17 @@ def main() -> None:
 
                 last_fill_check = now
 
-                # TP/SL 재설정 실패로 인한 종료
+                # TP/SL 재설정 실패로 인한 종료 → idle 진입
                 if TRADER_STATE.should_stop_bot():
                     send_tg("🛑 TP/SL 재설정이 연속 실패해서 봇을 중단합니다.")
                     _write_stop_flag()
-                    RUNNING = False
-                    break
+                    _enter_idle_forever()
 
-                # 종료 명령 들어왔고 포지션이 비었다면 여기서 끝
+                # 종료 명령 들어왔고 포지션이 비었다면 여기서 끝 → idle 진입
                 if SAFE_STOP_REQUESTED and not OPEN_TRADES:
                     send_tg("🛑 종료 명령에 따라 포지션이 없어 종료합니다.")
                     _write_stop_flag()
-                    RUNNING = False
-                    break
+                    _enter_idle_forever()
 
             # 포지션 살아 있으면 신규 진입 안 함 + 주기 상태만 던짐
             if OPEN_TRADES:
@@ -439,12 +427,11 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # 종료 플래그가 있는데 포지션이 없는 경우 → 진입하지 않고 종료
+            # 종료 플래그가 있는데 포지션이 없는 경우 → 진입하지 않고 종료 → idle
             if SAFE_STOP_REQUESTED:
                 send_tg("🛑 종료 명령에 따라 새 진입 없이 종료합니다.")
                 _write_stop_flag()
-                RUNNING = False
-                break
+                _enter_idle_forever()
 
             # 연속 손실 3회면 휴식
             if CONSEC_LOSSES >= 3:
@@ -574,7 +561,6 @@ def main() -> None:
             soft_mode_flag = False
             sl_floor_ratio = None
             if extra:
-                # 시그널에서 아무거나 하나만 True 로 줘도 soft 로 본다
                 soft_mode_flag = bool(
                     extra.get("soft_mode")
                     or extra.get("soft")
@@ -631,7 +617,6 @@ def main() -> None:
                 candle_ts=latest_ts,
             )
             OPEN_TRADES.append(trade)
-            # 새로 들어갔으니 상태 알림 타이머는 지금으로 리셋
             LAST_STATUS_TG_TS = time.time()
 
             time.sleep(SET.cooldown_sec)
@@ -648,11 +633,8 @@ def main() -> None:
             time.sleep(2)
 
     # 루프 끝
-    uptime = time.time() - START_TS
-    if (not TERMINATED_BY_SIGNAL) and (uptime >= SET.min_uptime_for_stop):
-        send_tg("🛑 봇이 종료되었습니다.")
-    else:
-        log(f"[SKIP STOP] sig={TERMINATED_BY_SIGNAL} uptime={uptime:.2f}s")
+    # 예전엔 여기서 종료했는데, 이제는 idle 로 들어간다.
+    _enter_idle_forever()
 
 
 if __name__ == "__main__":
