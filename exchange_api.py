@@ -3,11 +3,14 @@ exchange_api.py
 BingX REST API 호출과 관련된 저수준 함수 모음.
 
 2025-11-12 수정 (7차, one-way 계정 전용 순서 보정 + 요청 포맷 정정)
++ 2025-11-12 추가 수정
 ----------------------------------------------------
 - 원웨이 계정이라 positionSide=BOTH 를 먼저 보낸다.
 - 이 계정은 로그상 side 가 없으면 109400 을 주므로,
   레버리지 설정은 side → positionSide → 심볼만 순으로 여러 번 시도한다.
 - 주문/조회는 문서 예제처럼 "쿼리스트링 + 서명" 형태로 보낸다.
+- 일부 계정에서 /trade/cancel 이 100400 을 내므로 wait_filled 에서
+  타임아웃 시 무조건 cancel 을 치지 않고, cancel_order 도 100400 은 워닝만 남긴다.
 """
 
 from __future__ import annotations
@@ -99,6 +102,7 @@ def req(
 
     if isinstance(data, dict):
         code = data.get("code")
+        # 100400 은 "이 API 없음"이라 패스
         if code not in (None, 0, "0", 100400):
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
@@ -195,6 +199,7 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
     except Exception as e1:
         log(f"[POSITIONS user ERROR] {e1}")
 
+    # 백업 엔드포인트
     try:
         res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
         if res.get("code") == 100400:
@@ -233,8 +238,6 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
     그 다음 positionSide, 그 다음 최소 포맷으로 내려간다.
     실패해도 봇은 계속 돌게 한다.
     """
-    # 1) side=BOTH
-    tried_msgs = []
     try:
         req(
             "POST",
@@ -247,10 +250,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
         )
         log("[LEV OK] side=BOTH")
     except Exception as e:
-        msg = f"[LEV FAIL] side=BOTH: {e}"
-        log(msg)
-        tried_msgs.append(msg)
-        # 2) side=LONG
+        log(f"[LEV FAIL] side=BOTH: {e}")
+        # LONG
         try:
             req(
                 "POST",
@@ -263,10 +264,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
             )
             log("[LEV OK] side=LONG")
         except Exception as e2:
-            msg = f"[LEV FAIL] side=LONG: {e2}"
-            log(msg)
-            tried_msgs.append(msg)
-            # 3) side=SHORT
+            log(f"[LEV FAIL] side=LONG: {e2}")
+            # SHORT
             try:
                 req(
                     "POST",
@@ -279,10 +278,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
                 )
                 log("[LEV OK] side=SHORT")
             except Exception as e3:
-                msg = f"[LEV FAIL] side=SHORT: {e3}"
-                log(msg)
-                tried_msgs.append(msg)
-                # 4) positionSide=BOTH
+                log(f"[LEV FAIL] side=SHORT: {e3}")
+                # positionSide
                 try:
                     req(
                         "POST",
@@ -295,10 +292,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
                     )
                     log("[LEV OK] positionSide=BOTH")
                 except Exception as e4:
-                    msg = f"[LEV FAIL] positionSide=BOTH: {e4}"
-                    log(msg)
-                    tried_msgs.append(msg)
-                    # 5) 최소형
+                    log(f"[LEV FAIL] positionSide=BOTH: {e4}")
+                    # 최소형
                     try:
                         req(
                             "POST",
@@ -310,11 +305,9 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
                         )
                         log("[LEV OK] symbol-only")
                     except Exception as e5:
-                        msg = f"[LEV FAIL] symbol-only: {e5}"
-                        log(msg)
-                        tried_msgs.append(msg)
+                        log(f"[LEV FAIL] symbol-only: {e5}")
 
-    # 마진 모드 설정은 별도로 시도
+    # 마진 모드 설정
     try:
         req(
             "POST",
@@ -446,6 +439,10 @@ def place_conditional(
 
 
 def cancel_order(symbol: str, order_id: str) -> None:
+    """
+    일부 계정에서는 이 API 자체가 없어서 100400 을 주므로,
+    그 경우에는 에러로 안 보고 워닝만 남긴다.
+    """
     try:
         res = req(
             "POST",
@@ -457,7 +454,11 @@ def cancel_order(symbol: str, order_id: str) -> None:
         )
         log(f"[CANCEL] order_id={order_id} resp={res}")
     except Exception as e:
-        log(f"[CANCEL ERROR] {e}")
+        msg = str(e)
+        if "100400" in msg or "this api is not exist" in msg:
+            log(f"[CANCEL WARN] cancel api not available on this account: {e}")
+        else:
+            log(f"[CANCEL ERROR] {e}")
 
 
 def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
@@ -516,21 +517,31 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 
 
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
+    """
+    주문이 FILLED 됐는지 기다린다.
+    - BingX 가 data 안에 order 키를 한 번 더 싸서 보낼 수 있으므로 그 경우도 펼친다.
+    - 타임아웃 되어도 이 계정은 cancel api 가 없을 수 있으니 무조건 cancel 안 친다.
+    """
     end = time.time() + timeout
     last_status = None
     while time.time() < end:
         try:
             o = get_order(symbol, order_id)
             d = o.get("data") or o
-            status = d.get("status") or d.get("orderStatus")
+
+            # some responses: {"code":0,"data":{"order":{...}}}
+            if isinstance(d, dict) and "order" in d and isinstance(d["order"], dict):
+                d = d["order"]
+
+            status = (d.get("status") or d.get("orderStatus") or "").upper()
             last_status = status
             if status in ("FILLED", "PARTIALLY_FILLED"):
                 return d
         except Exception as e:
             log(f"[wait_filled] error: {e}")
         time.sleep(0.5)
-    log(f"[wait_filled] timeout, last_status={last_status}, cancel order")
-    cancel_order(symbol, order_id)
+    log(f"[wait_filled] timeout, last_status={last_status}, skip cancel (api may not exist)")
+    # 이 계정은 cancel 이 100400 을 주므로 여기서는 시도하지 않는다.
     return None
 
 

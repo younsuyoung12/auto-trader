@@ -4,7 +4,7 @@ run_bot.py (메인 흐름 전용)
 이 파일은 "봇이 어떻게 돈다"만 담당한다.
 세부 기능은 모듈로 분리한다.
 
-2025-11-12 보완 사항 ⑤  ← 이번 수정
+2025-11-12 보완 사항 ⑤
 ----------------------------------------------------
 (trader.py 8차 수정과 연동)
 
@@ -18,6 +18,11 @@ run_bot.py (메인 흐름 전용)
 호스팅쪽에서 다시 재시작되는 걸 막기 위해,
 종료 조건이 충족되면 메인 루프에서 빠져나와도 프로그램은
 죽지 않고 idle 상태로 들어간다.
+
++ 2025-11-12 추가 보완 2
+----------------------------------------------------
+BingX 원웨이 응답에서 positionSide 가 들어오면
+수량 부호보다 그걸 먼저 믿도록 동기화/상태출력 쪽을 보정.
 """
 
 from __future__ import annotations
@@ -120,7 +125,6 @@ def _enter_idle_forever() -> None:
     Render 같은 데서 '프로세스 죽었네?' 하고 다시 띄우는 걸 막기 위함.
     """
     log("[IDLE] safe stop reached, entering idle loop...")
-    # 너무 자주 보내면 안 되니까 한 번만 보낸다.
     try:
         send_tg("🟡 봇을 멈춘 상태로 유지합니다. 재시작은 컨테이너/프로세스로 해주세요.")
     except Exception:
@@ -159,7 +163,7 @@ def _get_15m_trend_text(symbol: str) -> str:
         else:
             return " (15m 추세: 중립)"
     except Exception as e:
-        log(f="[STATUS_TG] 15m trend check error: {e}")
+        log(f"[STATUS_TG] 15m trend check error: {e}")
         return ""
 
 
@@ -167,6 +171,7 @@ def _get_15m_trend_text(symbol: str) -> str:
 # 보조: 열려 있는 포지션 상태를 텔레그램으로 던지기
 # ─────────────────────────────
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
+    """거래소 포지션을 다시 읽어서 현재 미실현 PnL 을 텔레로 보낸다."""
     try:
         positions = fetch_open_positions(symbol)
     except Exception as e:
@@ -179,6 +184,7 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
     mins = max(1, interval_sec // 60)
     trend_txt = _get_15m_trend_text(symbol)
     lines = [f"⏱ 포지션 상태({mins}m){trend_txt}:"]
+
     for p in positions:
         qty = float(
             p.get("positionAmt")
@@ -187,7 +193,16 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
             or 0.0
         )
         upnl = float(p.get("unrealizedProfit") or 0.0)
-        side_text = "LONG" if qty > 0 else "SHORT"
+
+        # ✅ positionSide 가 있으면 그걸 우선
+        pos_side_raw = (p.get("positionSide") or "").upper()
+        if pos_side_raw in ("LONG", "BOTH"):
+            side_text = "LONG"
+        elif pos_side_raw == "SHORT":
+            side_text = "SHORT"
+        else:
+            side_text = "LONG" if qty > 0 else "SHORT"
+
         upnl_krw = upnl * KRW_RATE
         lines.append(
             f"- {symbol} {side_text} 수량={abs(qty)} 미실현={upnl:.2f} USDT (~{upnl_krw:,.0f} KRW)"
@@ -199,6 +214,13 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
 # 거래소 → 내부 포지션 동기화 (단방향 대응 버전)
 # ─────────────────────────────
 def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
+    """
+    거래소 포지션/열린 주문을 내부 리스트로 옮겨 중복 진입을 막는다.
+    시작할 때 1번, 이후에는 주기적으로 호출한다.
+
+    원웨이에서도 응답에 positionSide 가 오니,
+    있으면 그걸로 방향을 결정한다.
+    """
     global OPEN_TRADES, _LAST_SYNCED_EXCHANGE_POS_COUNT
 
     positions = fetch_open_positions(symbol)
@@ -222,14 +244,20 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
         if raw_amt_f == 0.0:
             continue
 
-        if raw_amt_f > 0:
+        # ✅ 1순위: 거래소가 알려준 positionSide
+        pos_side_raw = (pos.get("positionSide") or "").upper()
+        if pos_side_raw in ("LONG", "BOTH"):
             side_open = "BUY"
-        else:
+        elif pos_side_raw == "SHORT":
             side_open = "SELL"
+        else:
+            # 백업: 수량 부호
+            side_open = "BUY" if raw_amt_f > 0 else "SELL"
 
         qty = abs(raw_amt_f)
         entry_price = float(pos.get("entryPrice") or pos.get("avgPrice") or 0.0)
 
+        # 열린 주문에서 TP/SL 찾아서 붙인다
         tp_id: Optional[str] = None
         sl_id: Optional[str] = None
         tp_price: Optional[float] = None
@@ -261,6 +289,7 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
         )
 
     if len(OPEN_TRADES) != _LAST_SYNCED_EXCHANGE_POS_COUNT:
+        # 이건 운영상 중요한 정보라 무조건 보낸다
         send_tg(f"🔁 거래소 포지션 {len(OPEN_TRADES)}건 동기화했습니다. (중복 진입 방지)")
         _LAST_SYNCED_EXCHANGE_POS_COUNT = len(OPEN_TRADES)
 
@@ -269,6 +298,7 @@ def sync_open_trades_from_exchange(symbol: str, replace: bool = True) -> None:
 # 텔레그램 종료 콜백
 # ─────────────────────────────
 def _on_safe_stop() -> None:
+    """텔레그램 명령 스레드에서 호출하는 콜백."""
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
     send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
@@ -593,7 +623,7 @@ def main() -> None:
                 time.sleep(2)
                 continue
 
-            # 여기서 사람이 보기 좋게 한 줄로
+            # 사람이 보기 좋게
             side_ko = "롱" if trade.side == "BUY" else "숏"
             strat_ko = "추세" if signal_source == "TREND" else "박스"
             if getattr(SET, "notify_on_entry", True):
@@ -617,6 +647,7 @@ def main() -> None:
                 candle_ts=latest_ts,
             )
             OPEN_TRADES.append(trade)
+            # 새로 들어갔으니 상태 알림 타이머는 지금으로 리셋
             LAST_STATUS_TG_TS = time.time()
 
             time.sleep(SET.cooldown_sec)
@@ -632,8 +663,7 @@ def main() -> None:
             )
             time.sleep(2)
 
-    # 루프 끝
-    # 예전엔 여기서 종료했는데, 이제는 idle 로 들어간다.
+    # 루프 끝 → idle 로
     _enter_idle_forever()
 
 
