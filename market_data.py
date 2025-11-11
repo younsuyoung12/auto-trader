@@ -19,8 +19,14 @@
     1) 원래 심볼로 한 번 호출하고
     2) 결과가 비었고 심볼에 '-'가 있으면, '-'를 뺀 심볼로 한 번 더 호출
   하는 폴백을 넣었다.
-- 이렇게 하면 settings 에는 계속 "BTC-USDT" 넣어두고, 주문도 그걸로 날리면서,
-  캔들만 자동으로 살릴 수 있다.
+
+2025-11-12 추가/변경
+----------------------------------------------------
+1) 6컬럼 캔들 정규화할 때 volume 필드 이름이 다른 경우도 같이 대응하도록 보강
+   - volume / vol / quoteVolume / quote_volume 같은 거 다 받아줌
+2) 오더북(depth) 조회도 캔들과 동일하게 하이픈 있는 심볼이 비었을 때
+   '-' 뺀 심볼로 한 번 더 시도하게 했음
+   → 지금 run_bot.py 에서 스프레드 가드 쓰는 흐름이랑 모양을 맞추기 위함
 """
 
 from __future__ import annotations
@@ -75,6 +81,7 @@ def _normalize_5cols(data: List[Any]) -> List[Tuple[int, float, float, float, fl
                 out.append((ts, o, h, l, c))
             except Exception:
                 continue
+    # 타임스탬프 기준으로 정렬
     out.sort(key=lambda x: x[0])
     return out
 
@@ -93,7 +100,14 @@ def _normalize_6cols(data: List[Any]) -> List[Tuple[int, float, float, float, fl
                 h = float(it.get("high"))
                 l = float(it.get("low"))
                 c = float(it.get("close"))
-                v = float(it.get("volume") or it.get("vol") or 0.0)
+                # volume 이 이름이 제각각인 경우가 있어서 전부 커버
+                v = float(
+                    it.get("volume")
+                    or it.get("vol")
+                    or it.get("quoteVolume")
+                    or it.get("quote_volume")
+                    or 0.0
+                )
             except Exception:
                 continue
             out.append((ts, o, h, l, c, v))
@@ -182,7 +196,10 @@ def get_klines_with_volume(
 # 호가(오더북) 데이터 가져오기 (선물 기준)
 # ─────────────────────────────
 def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
-    """진입 직전에 스프레드를 확인하기 위해 선물 depth 를 조회한다."""
+    """진입 직전에 스프레드를 확인하기 위해 선물 depth 를 조회한다.
+    1) 원래 심볼로 조회
+    2) 결과가 없고 '-' 가 있으면 '-' 뺀 심볼로 한 번 더 조회
+    """
     try:
         resp = requests.get(
             f"{BASE}/openApi/swap/v2/quote/depth",
@@ -190,7 +207,18 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
             timeout=8,
         )
         data = resp.json()
-        return data.get("data") or data
+        payload = data.get("data") or data
+        if payload or "-" not in symbol:
+            return payload
+        # 여기까지 왔다는 건 응답은 왔는데 내용이 없거나 빈 dict 인 케이스 → 하이픈 제거 재시도
+        sym2 = symbol.replace("-", "")
+        resp2 = requests.get(
+            f"{BASE}/openApi/swap/v2/quote/depth",
+            params={"symbol": sym2, "limit": limit},
+            timeout=8,
+        )
+        data2 = resp2.json()
+        return data2.get("data") or data2
     except Exception as e:
         log(f"[ORDERBOOK ERROR] symbol={symbol} err={e}")
         return None

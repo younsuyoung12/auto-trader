@@ -4,6 +4,13 @@ bot_workers.py
 보조 스레드/서비스 모음.
 run_bot.py 에서 이 모듈만 import 해서 호출한다.
 
+[2025-11-12 변경 사항]
+----------------------------------------------------
+1) 차트/시세 스냅샷 CSV도 드라이브에 같이 올리도록 확장
+   - 기존: logs/signals/signals-YYYY-MM-DD.csv 만 업로드
+   - 추가: logs/candles/candles-YYYY-MM-DD.csv 가 있으면 같은 이름으로 업로드
+   - 업로드 주기는 그대로 5분
+
 담당 기능:
 1) health 서버 (/healthz, /metrics)
 2) 드라이브 동기화 스레드 (오늘자 CSV 강제 생성 → 업로드 → 오래된 CSV 정리)
@@ -29,7 +36,8 @@ from typing import Any, Callable
 from settings import load_settings
 from telelog import log
 from drive_uploader import upload_to_drive
-from signals_logger import _ensure_today_csv
+from signals_logger import _ensure_today_csv  # 시그널 CSV
+# ✅ 시세 스냅샷 CSV는 파일이 있을 때만 올릴 것이므로, 여기서는 경로만 계산해서 쓴다.
 
 SET = load_settings()
 
@@ -77,22 +85,33 @@ def start_health_server() -> None:
 # 2. 드라이브 동기화 스레드
 # ─────────────────────────────
 def start_drive_sync_thread() -> None:
-    """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 삭제"""
+    """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 삭제
+    - signals-YYYY-MM-DD.csv 는 무조건 생성해서 올린다.
+    - candles-YYYY-MM-DD.csv 는 run_bot 측에서 만들어둔 경우에만 같이 올린다.
+    """
     SYNC_INTERVAL_SEC = 300  # 5분
     KEEP_DAYS = 3
 
     def _worker() -> None:
         while True:
             try:
-                # 1) 오늘자 파일 확보
+                # 1) 오늘자 시그널 파일 확보
                 local_path = _ensure_today_csv()
                 day_str = os.path.basename(local_path).replace("signals-", "").replace(".csv", "")
 
-                # 2) 드라이브 업로드
+                # 2) 시그널 CSV 업로드
                 upload_to_drive(local_path, f"signals-{day_str}.csv")
                 log("[DRIVE_SYNC] uploaded today's signals csv")
 
-                # 3) 오래된 파일 삭제
+                # 3) 캔들 스냅샷 CSV가 있으면 같이 업로드
+                candle_dir = os.path.join("logs", "candles")
+                candle_name = f"candles-{day_str}.csv"
+                candle_path = os.path.join(candle_dir, candle_name)
+                if os.path.exists(candle_path):
+                    upload_to_drive(candle_path, candle_name)
+                    log("[DRIVE_SYNC] uploaded today's candles csv")
+
+                # 4) 오래된 signals CSV 삭제
                 local_dir = os.path.dirname(local_path)
                 now_ts = time.time()
                 for fname in os.listdir(local_dir):
@@ -106,6 +125,21 @@ def start_drive_sync_thread() -> None:
                             log(f"[DRIVE_SYNC] old csv removed: {fname}")
                         except OSError:
                             pass
+
+                # 5) 오래된 candles CSV 삭제 (있으면)
+                if os.path.isdir(candle_dir):
+                    for fname in os.listdir(candle_dir):
+                        if not (fname.startswith("candles-") and fname.endswith(".csv")):
+                            continue
+                        fpath = os.path.join(candle_dir, fname)
+                        mtime = os.path.getmtime(fpath)
+                        if now_ts - mtime > KEEP_DAYS * 86400:
+                            try:
+                                os.remove(fpath)
+                                log(f"[DRIVE_SYNC] old candle csv removed: {fname}")
+                            except OSError:
+                                pass
+
             except Exception as e:  # 업로드 실패해도 봇은 계속
                 log(f"[DRIVE_SYNC] error: {e}")
             time.sleep(SYNC_INTERVAL_SEC)

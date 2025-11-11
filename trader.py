@@ -1,7 +1,7 @@
 # trader.py
 # 포지션 진입/TP·SL 설정/유지/체결 확인을 담당하는 모듈.
 #
-# 2025-11-12 추가 수정
+# 2025-11-12 추가 수정 (1차)
 # ----------------------------------------------------
 # - BingX 원웨이 계정에서 실제 체결 수량이 0.005 같은 소수인데
 #   이 모듈이 수량을 int(…)로 올려서 1.0으로 보내는 문제가 있었다.
@@ -9,6 +9,16 @@
 #   (110424) 에러가 났고, 강제 정리도 reduceOnly+1.0 이라 또 막혔다.
 # - 그래서 여기서는 "정수로 강제"하지 않고, 소수점을 유지해서 exchange_api 에 넘기도록 수정했다.
 # - exchange_api 가 이미 심볼별 step 으로 0.005, 0.001 이런 걸 깎아주므로 여기서는 그대로 보내는 게 맞다.
+#
+# 2025-11-12 추가 수정 (2차)
+# ----------------------------------------------------
+# - 슬리피지 가드로 포지션을 즉시 닫을 때,
+#   그리고 TP/SL 예약이 실패해서 포지션을 닫을 때
+#   close_position_market(...) 에 “열었던 방향(side_open)” 을 넘기도록 수정했다.
+# - exchange_api.close_position_market(symbol, side_open, qty)는
+#   내부에서 반대쪽으로 바꿔서 닫는 구조이기 때문에
+#   여기서 미리 반대 방향을 넘기면 방향이 한 번 더 뒤집혀 잘못된 주문이 나갈 수 있다.
+# - 따라서 이 모듈에서는 “처음 연 방향”만 넘기도록 통일했다.
 
 from __future__ import annotations
 
@@ -98,7 +108,7 @@ def open_position_with_tp_sl(
 ) -> Optional[Trade]:
     # 1) 시장가 진입
     try:
-        # ⬇⬇ 여기서도 이제 소수 그대로
+        # 체결 수량은 소수 그대로 전달
         resp = place_market(symbol, side_open, _to_contract_qty(qty))
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}")
@@ -173,10 +183,13 @@ def open_position_with_tp_sl(
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
-            close_side = "SELL" if side_open == "BUY" else "BUY"
+            # ❗ 여기서는 '열었던 방향'을 넘겨야 exchange_api 가 반대 주문을 보내며 닫는다.
             try:
-                # ⬇⬇ 실제 체결된 소수 수량으로 닫기
-                close_position_market(symbol, close_side, _to_contract_qty(filled_qty))
+                close_position_market(
+                    symbol,
+                    side_open,  # ← 수정됨: close_side 가 아니라 side_open
+                    _to_contract_qty(filled_qty),
+                )
             except Exception as e:
                 send_tg(
                     f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
@@ -230,7 +243,7 @@ def open_position_with_tp_sl(
 
     # 5) TP/SL 실제 주문
     try:
-        # ⬇⬇ 여기서도 체결된 소수 수량으로 넣는다 (0.005 등)
+        # 체결된 소수 수량으로 넣는다 (0.005 등)
         real_qty = _to_contract_qty(filled_qty)
         tp_resp = place_conditional(
             symbol,
@@ -248,7 +261,12 @@ def open_position_with_tp_sl(
         )
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
-        close_position_market(symbol, close_side, _to_contract_qty(filled_qty))
+        # ❗ 여기서도 열었던 방향을 넘겨야 한다.
+        close_position_market(
+            symbol,
+            side_open,  # ← 수정됨: close_side 아님
+            _to_contract_qty(filled_qty),
+        )
         return None
 
     def _norm_id(r: Dict[str, Any]) -> Optional[str]:
@@ -424,7 +442,7 @@ def check_closes(
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:
-                # 여기서도 소수 수량으로 닫기
+                # TP/SL 재설정이 계속 실패하면 강제로 닫는다.
                 close_position_market(symbol, t.side, _to_contract_qty(t.qty))
                 closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
             else:

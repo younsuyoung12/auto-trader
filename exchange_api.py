@@ -1,21 +1,13 @@
 """
 exchange_api.py
-BingX REST API 호출과 관련된 저수준 함수 모음.
+BingX REST API 호출 모듈 (원웨이 계정 대응)
 
-2025-11-12 수정 (7차, one-way 계정 전용 순서 보정 + 요청 포맷 정정)
-+ 2025-11-12 추가 수정 ①
-+ 2025-11-12 추가 수정 ② (TP/SL 다중 포맷 시도, reduceOnly 강제청산 보완)
-----------------------------------------------------
-- 원웨이 계정이라 positionSide=BOTH 를 먼저 보낸다.
-- 이 계정은 로그상 side 가 없으면 109400 을 주므로,
-  레버리지 설정은 side → positionSide → 심볼만 순으로 여러 번 시도한다.
-- 주문/조회는 문서 예제처럼 "쿼리스트링 + 서명" 형태로 보낸다.
-- 일부 계정에서 /trade/cancel 이 100400 을 내므로 wait_filled 에서
-  타임아웃 시 무조건 cancel 을 치지 않고, cancel_order 도 100400 은 워닝만 남긴다.
-- TP/SL(/trade/order 조건부) 이 110400 을 자주 내서 triggerPrice/stopPrice/
-  activationPrice, positionSide 유/무, reduceOnly 유/무 를 여러 형태로 순차 시도한다.
-- 강제 시장가 청산이 101290(The Reduce Only order can only decrease...) 이 나오는
-  계정이 있어 reduceOnly 제거 재시도를 추가했다.
+주요 포인트
+- 원웨이 계정이라 주문은 positionSide="BOTH" 를 먼저 시도한다.
+- 이 계정은 side 없으면 109400 을 주는 경우가 있어 레버리지/마진 설정은 여러 포맷을 순차로 시도한다.
+- TP/SL 조건부 주문은 triggerPrice / stopPrice / activationPrice, reduceOnly, positionSide 조합을 여러 개 보내서 110400 을 우회한다.
+- 강제 시장가 청산이 101290(The Reduce Only order can only decrease...) 이 뜨면 reduceOnly 없이 다시 보낸다.
+- 2025-11-12: 포지션 조회할 때도 timestamp invalid 를 피하려고 recvWindow=5000 을 붙였다.
 """
 
 from __future__ import annotations
@@ -29,7 +21,7 @@ import requests
 from settings import load_settings
 from telelog import log, send_tg
 
-# 설정 읽기 (전역으로 보관)
+# 설정 읽기 (전역)
 SET = load_settings()
 BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 
@@ -49,19 +41,28 @@ def _ts_ms() -> int:
 
 
 def sign_query(params: Dict[str, Any], api_secret: str) -> str:
+    """
+    BingX 는 쿼리스트링 정렬 후 서명하는 방식.
+    """
     qs = "&".join(f"{k}={params[k]}" for k in sorted(params.keys()))
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return qs + "&signature=" + sig
 
 
 def _headers() -> Dict[str, str]:
-    # 문서 예제와 동일하게 API 키만 보낸다.
+    """
+    문서 예제와 동일: API 키만 헤더에 실어 보낸다.
+    """
     return {
         "X-BX-APIKEY": SET.api_key,
     }
 
 
 def _normalize_qty(symbol: str, raw_qty: float) -> float:
+    """
+    심볼별 최소 수량단위에 맞춰서 내림 정규화.
+    BTC-USDT 는 0.001 단위.
+    """
     step = _QTY_STEP.get(symbol, 0.001)
     if step <= 0:
         step = 0.001
@@ -69,10 +70,14 @@ def _normalize_qty(symbol: str, raw_qty: float) -> float:
     qty = units * step
     if qty <= 0:
         qty = step
-    return float(f"{qty:.3f}")  # BingX BTC-USDT는 0.001 단위여서 3째자리까지
+    return float(f"{qty:.3f}")
 
 
 def _as_int_qty(raw_qty: float) -> str:
+    """
+    어떤 계정은 0.006 같은 소수 수량을 싫어하므로
+    마지막에 정수 문자열로도 다시 한 번 시도할 수 있도록.
+    """
     if raw_qty <= 0:
         return "1"
     return str(int(round(raw_qty)) or 1)
@@ -86,15 +91,15 @@ def req(
 ) -> Dict[str, Any]:
     """
     BingX REST 요청 공통부.
-    - 모든 파라미터는 쿼리스트링에 넣고 서명한다.
-    - 본문은 기본적으로 보내지 않는다(data=None).
+    - 파라미터는 전부 쿼리스트링에 넣고 서명해서 보낸다.
+    - 일부 API 는 없는 계정에서 100400 을 주는데, 그건 예외로 안 터뜨리고 그냥 리턴.
     """
     params = params or {}
     params["timestamp"] = _ts_ms()
     signed_qs = sign_query(params, SET.api_secret)
     url = f"{BASE}{path}?{signed_qs}"
 
-    # 보기 쉬운 형태로 남긴다 (signature는 로그에 안 남김)
+    # signature 빼고 로그 남기기
     log_params = {k: v for k, v in params.items() if k != "signature"}
     log(f"[REQ] {method} {path} params={log_params}")
 
@@ -107,7 +112,7 @@ def req(
 
     if isinstance(data, dict):
         code = data.get("code")
-        # 100400 은 "이 API 없음"이라 패스
+        # 100400: 이 API 없음 → 워닝 수준으로만 본다
         if code not in (None, 0, "0", 100400):
             raise RuntimeError(
                 f"{method} {path} -> bingx code={code}, msg={data.get('msg') or data}"
@@ -117,6 +122,10 @@ def req(
 
 
 def _is_param_error(exc: Exception) -> bool:
+    """
+    주문 포맷을 바꿔서 다시 시도할지 판단할 때 사용.
+    109400 / 110400 / Invalid parameters 는 다음 포맷으로 넘긴다.
+    """
     msg = str(exc)
     return "109400" in msg or "Invalid parameters" in msg or "110400" in msg
 
@@ -125,12 +134,17 @@ def _is_param_error(exc: Exception) -> bool:
 # 계좌/포지션/주문 조회
 # ─────────────────────────────
 def get_available_usdt() -> float:
+    """
+    사용 가능한 마진(USDT)을 float 로 돌려준다.
+    여러 형태의 응답을 커버하도록 되어 있음.
+    """
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
 
         data = res.get("data") or res.get("balances") or res
 
+        # 1) data: { balance: { ... } }
         if isinstance(data, dict) and "balance" in data and isinstance(data["balance"], dict):
             bal = data["balance"]
             cand = (
@@ -142,6 +156,7 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
+        # 2) data: [ { balance: {...} } ]
         if isinstance(data, list) and data:
             item = data[0]
         else:
@@ -158,6 +173,7 @@ def get_available_usdt() -> float:
             )
             return float(cand)
 
+        # 3) 기타 형태
         cand = (
             item.get("availableBalance")
             or item.get("availableMargin")
@@ -173,6 +189,9 @@ def get_available_usdt() -> float:
 
 
 def get_balance_detail() -> Dict[str, Any]:
+    """
+    텔레그램에서 상태 찍을 때 쓰는 상세 밸런스 반환.
+    """
     res = req("GET", "/openApi/swap/v2/user/balance", {})
     log(f"[BALANCE RAW for detail] {res}")
 
@@ -194,8 +213,20 @@ def get_balance_detail() -> Dict[str, Any]:
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
+    """
+    열려 있는 선물 포지션 조회.
+    - 2025-11-12: timestamp is invalid 을 피하려고 recvWindow=5000 추가.
+    - 메인 엔드포인트가 안 되면 백업(/trade/positions)도 시도하되, 그 API 가 없으면 그냥 빈 리스트.
+    """
     try:
-        res = req("GET", "/openApi/swap/v2/user/positions", {"symbol": symbol})
+        res = req(
+            "GET",
+            "/openApi/swap/v2/user/positions",
+            {
+                "symbol": symbol,
+                "recvWindow": 5000,  # ← 여기 보강
+            },
+        )
         log(f"[POSITIONS RAW user] {res}")
         data = res.get("data") or res.get("positions") or []
         if not isinstance(data, list):
@@ -206,7 +237,14 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
 
     # 백업 엔드포인트
     try:
-        res = req("GET", "/openApi/swap/v2/trade/positions", {"symbol": symbol})
+        res = req(
+            "GET",
+            "/openApi/swap/v2/trade/positions",
+            {
+                "symbol": symbol,
+                "recvWindow": 5000,  # ← 백업도 동일하게
+            },
+        )
         if res.get("code") == 100400:
             log("[POSITIONS] this api is not exist -> skip syncing positions")
             return []
@@ -221,6 +259,11 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
 
 
 def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
+    """
+    심볼별 열려 있는 주문 목록.
+    (여기는 네 로그상 timestamp 에러가 안 나서 recvWindow 는 생략해도 되는데,
+     맞춰두고 싶으면 여기에도 넣어도 된다.)
+    """
     try:
         res = req("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
         log(f"[OPEN ORDERS RAW] {res}")
@@ -238,10 +281,9 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
     """
-    이 계정 로그에서는 'err:side: This field is required.' 가 나왔으므로
-    side 있는 포맷을 우선적으로 전부 시도하고,
-    그 다음 positionSide, 그 다음 최소 포맷으로 내려간다.
-    실패해도 봇은 계속 돌게 한다.
+    이 계정은 side 없으면 에러를 내는 로그가 있어서
+    side → (LONG/SHORT) → positionSide → 최소형 순으로 시도한다.
+    실패해도 봇은 계속 돌 수 있게 예외는 내부에서만 처리.
     """
     try:
         req(
@@ -330,6 +372,11 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 # 주문 전송 (여러 모양으로 재시도)
 # ─────────────────────────────
 def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    여러 형태의 payload 를 순서대로 보내서
+    파라미터 에러가 아닌 게 터지면 바로 멈추고,
+    파라미터 에러면 다음 포맷을 시도한다.
+    """
     last_err: Optional[Exception] = None
     for idx, pay in enumerate(payloads, start=1):
         log(f"[PLACE TRY {idx}] {pay}")
@@ -340,7 +387,6 @@ def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
         except Exception as e:
             last_err = e
             log(f"[PLACE ERR {idx}] {e}")
-            # 파라미터 문제(109400/110400)일 때만 다음 포맷 시도
             if not _is_param_error(e):
                 break
     if last_err:
@@ -351,10 +397,10 @@ def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     """
     시장가 주문
-    - (1) side + positionSide=BOTH + MARKET
-    - (2) side + MARKET
-    - (3) side + positionSide=LONG/SHORT + MARKET
-    - 실패하면 quantity 를 정수 문자열로 한 번 더 시도
+    1) side + positionSide=BOTH
+    2) side 만
+    3) side + 방향 positionSide
+    안 되면 정수 수량으로 다시 시도.
     """
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
@@ -402,8 +448,8 @@ def place_conditional(
 ) -> Dict[str, Any]:
     """
     TP/SL 조건부 주문.
-    이 계정은 triggerPrice / stopPrice / activationPrice / reduceOnly / positionSide
-    조합에 따라 110400을 줄 수 있으므로 여러 모양으로 순차 시도한다.
+    triggerPrice / stopPrice / activationPrice, reduceOnly, positionSide 조합을
+    여러 개 보내서 110400 을 피한다.
     """
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
@@ -456,7 +502,7 @@ def place_conditional(
             "reduceOnly": True,
             "activationPrice": trigger_price,
         },
-        # 7) positionSide 없고 reduceOnly도 없는 가장 단순한 형태 (거래소가 칭얼대면 이게 먹힐 때가 있음)
+        # 7) 가장 단순한 형태들
         {
             **base_common,
             "triggerPrice": trigger_price,
@@ -469,7 +515,7 @@ def place_conditional(
             **base_common,
             "activationPrice": trigger_price,
         },
-        # 10) 방향형 positionSide + reduceOnly
+        # 10) 방향 positionSide + reduceOnly
         {
             **base_common,
             "positionSide": "LONG" if side.upper() == "BUY" else "SHORT",
@@ -481,7 +527,7 @@ def place_conditional(
     try:
         return _try_order(payloads)
     except Exception:
-        # 실패하면 같은 것들을 정수 수량으로 한 번 더
+        # 같은 포맷을 정수 수량으로 한 번 더
         payloads_int = [{**p, "quantity": int_qty_str} for p in payloads]
         return _try_order(payloads_int)
 
@@ -510,6 +556,9 @@ def cancel_order(symbol: str, order_id: str) -> None:
 
 
 def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
+    """
+    주문 단건 조회.
+    """
     return req(
         "GET",
         "/openApi/swap/v2/trade/order",
@@ -521,6 +570,9 @@ def get_order(symbol: str, order_id: str) -> Dict[str, Any]:
 
 
 def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
+    """
+    체결 내역 조회.
+    """
     res = req(
         "GET",
         "/openApi/swap/v2/trade/allFillOrders",
@@ -534,6 +586,9 @@ def get_fills(symbol: str, order_id: str) -> List[Dict[str, Any]]:
 
 
 def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+    """
+    여러 체결 건을 합쳐서 평균가/수량/PnL 을 구한다.
+    """
     fills = get_fills(symbol, order_id)
     if not fills:
         return None
@@ -566,9 +621,8 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
     """
-    주문이 FILLED 됐는지 기다린다.
-    - BingX 가 data 안에 order 키를 한 번 더 싸서 보낼 수 있으므로 그 경우도 펼친다.
-    - 타임아웃 되어도 이 계정은 cancel api 가 없을 수 있으니 무조건 cancel 안 친다.
+    주문이 FILLED 됐는지 최대 timeout 초까지 폴링.
+    일부 계정은 cancel 이 안 되므로 타임아웃돼도 cancel 은 시도하지 않는다.
     """
     end = time.time() + timeout
     last_status = None
@@ -577,7 +631,7 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
             o = get_order(symbol, order_id)
             d = o.get("data") or o
 
-            # some responses: {"code":0,"data":{"order":{...}}}
+            # {"code":0,"data":{"order":{...}}} 형태 보정
             if isinstance(d, dict) and "order" in d and isinstance(d["order"], dict):
                 d = d["order"]
 
@@ -589,15 +643,14 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
             log(f"[wait_filled] error: {e}")
         time.sleep(0.5)
     log(f"[wait_filled] timeout, last_status={last_status}, skip cancel (api may not exist)")
-    # 이 계정은 cancel 이 100400 을 주므로 여기서는 시도하지 않는다.
     return None
 
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     """
-    시장가로 포지션을 닫는다.
-    - 기본은 reduceOnly=True 로 닫고
-    - 101290 이 나오면 reduceOnly 없이 다시 시도한다.
+    포지션을 시장가로 강제 청산.
+    1) reduceOnly=True 로 닫아보고
+    2) 101290 이면 reduceOnly 없이 다시 닫는다.
     """
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
@@ -637,8 +690,8 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         return
     except Exception as e:
         msg = str(e)
-        # 네 로그에 나온 케이스: reduceOnly 로는 닫을 포지션이 없다 → reduceOnly 빼고 다시
         if "101290" in msg:
+            # reduceOnly 제거 재시도
             no_ro_payloads = [
                 {
                     "symbol": symbol,
@@ -656,7 +709,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
                 send_tg(f"❗ 포지션 강제 정리 실패(RO제거도 실패): {e2}")
                 return
 
-        # 그 외에는 예전처럼 정수 수량으로 한 번 더
+        # 기타 케이스는 정수 수량으로 재시도
         payloads_int = [{**p, "quantity": int_qty_str} for p in payloads]
         try:
             _try_order(payloads_int)

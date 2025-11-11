@@ -2,15 +2,27 @@
 """
 시그널/진입/청산/스킵 이벤트를 CSV로 기록하는 모듈.
 
+[2025-11-12 추가 사항]
+----------------------------------------------------
+1) 차트/시세 스냅샷 전용 CSV 추가
+   - 파일 위치: logs/candles/candles-YYYY-MM-DD.csv
+   - run_bot.py 등에서 "지금 본 3분봉/15분봉"을 그대로 남길 수 있도록 별도 함수 추가
+   - 컬럼: ts_kst, symbol, tf, candle_ts, open, high, low, close, volume, strategy_type, direction, extra
+   - 신호 CSV와 분리해서 저장하므로 신호 분석과 시세 분석을 따로 할 수 있음
+
+2) 기존 시그널 CSV 형식은 그대로 유지
+   - logs/signals/signals-YYYY-MM-DD.csv
+   - RANGE 개선용 컬럼(range_level, soft_block_reason, used_tp_pct, used_sl_pct) 그대로 둠
+
+이 파일에서 하는 일
 - 날짜별로 파일 분리: logs/signals/signals-YYYY-MM-DD.csv
 - KST 타임스탬프 같이 남김
 - 왜 안 들어갔는지(reason), 어떤 전략이었는지(strategy_type: TREND/RANGE)도 남김
 - 분석용으로 ATR, RSI, 15m 방향, 스프레드, 잔고, 명목가도 넣을 수 있음
 - 한 거래를 ENTRY ↔ CLOSE 로 묶을 수 있도록 trade_id / exchange_order_id 도 추가
 
-2025-11-12 추가/변경
+2025-11-12 추가/변경 (박스 개선 로그 반영)
 ----------------------------------------------------
-(박스 개선 로그 반영)
 1) 박스 전략이 단계적으로 허용되는 경우를 로그에 남길 수 있게 필드를 추가했다.
    - range_level: RANGE 전략이 어떤 엄격도(0,1,2)에서 찍힌 건지 남긴다.
    - soft_block_reason: "soft_atr", "soft_ema" 같이 전략에서 완전 차단 대신
@@ -33,15 +45,22 @@ from __future__ import annotations
 import csv
 import os
 import datetime
-from typing import Optional
+from typing import Optional, List
 
-# 로그가 쌓일 기본 폴더
+# ─────────────────────────────────────────────
+# 경로 설정
+# ─────────────────────────────────────────────
+# 시그널 로그가 쌓일 기본 폴더
 BASE_DIR = os.path.join("logs", "signals")
+# 시세(차트) 스냅샷이 쌓일 기본 폴더
+CANDLE_DIR = os.path.join("logs", "candles")
 
 
+# ─────────────────────────────────────────────
+# 공통 유틸
+# ─────────────────────────────────────────────
 def _now_kst_str() -> str:
     """현재 시간을 KST로 YYYY-MM-DD HH:MM:SS 문자열로 리턴."""
-    # KST = UTC+9
     now_utc = datetime.datetime.utcnow()
     kst = now_utc + datetime.timedelta(hours=9)
     return kst.strftime("%Y-%m-%d %H:%M:%S")
@@ -60,16 +79,20 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
+# ─────────────────────────────────────────────
+# 시그널 CSV 관련
+# ─────────────────────────────────────────────
 def _csv_path_for(day_str: str) -> str:
-    """주어진 날짜(KST)용 CSV 파일 전체 경로를 돌려준다."""
+    """주어진 날짜(KST)용 시그널 CSV 파일 전체 경로를 돌려준다."""
     _ensure_dir(BASE_DIR)
     fname = f"signals-{day_str}.csv"
     return os.path.join(BASE_DIR, fname)
 
 
-def _fieldnames() -> list[str]:
-    """모든 로그에서 공통으로 쓸 헤더 정의.
-    - 여기서 컬럼을 추가하면 _ensure_today_csv(), log_signal() 둘 다 반영된다.
+def _fieldnames() -> List[str]:
+    """
+    시그널 CSV에서 공통으로 쓸 헤더 정의.
+    여기서 컬럼을 추가하면 _ensure_today_csv(), log_signal() 둘 다 반영된다.
     """
     return [
         "ts_kst",
@@ -98,16 +121,16 @@ def _fieldnames() -> list[str]:
         "strategy_version",
         "extra",
         # ─── 2025-11-12 추가 ───
-        "range_level",        # RANGE_STRICT_LEVEL 이나 호출부에서 전달한 엄격도
-        "soft_block_reason",  # "soft_atr" / "soft_ema" 등
-        "used_tp_pct",        # 설정/동적 계산으로 실제 사용한 TP 퍼센트
-        "used_sl_pct",        # 설정/동적 계산으로 실제 사용한 SL 퍼센트
+        "range_level",
+        "soft_block_reason",
+        "used_tp_pct",
+        "used_sl_pct",
     ]
 
 
 def _ensure_today_csv() -> str:
     """
-    오늘(KST) 날짜의 CSV가 없으면 헤더만 있는 빈 파일을 만들어둔다.
+    오늘(KST) 날짜의 시그널 CSV가 없으면 헤더만 있는 빈 파일을 만들어둔다.
     - run_bot 이 켜지는 순간 바로 오늘자 파일이 생기게 하기 위함.
     """
     day = _today_kst_str()
@@ -120,13 +143,13 @@ def _ensure_today_csv() -> str:
     return path
 
 
-# 모듈이 로드될 때 오늘자 파일을 한 번 만들어 둔다.
+# 모듈이 로드될 때 오늘자 시그널 파일을 한 번 만들어 둔다.
 _ensure_today_csv()
 
 
 def _get_csv_path() -> str:
     """
-    오늘 날짜 기준 CSV 파일 경로를 돌려준다.
+    오늘 날짜 기준 시그널 CSV 파일 경로를 돌려준다.
     이때 파일이 없으면 헤더만 있는 새 파일을 만든다.
     """
     return _ensure_today_csv()
@@ -168,7 +191,8 @@ def log_signal(
     used_sl_pct: Optional[float] = None,      # 실제 사용한 박스 SL (%)
 ) -> None:
     """
-    한 줄을 CSV에 쓴다. 파일이 없으면 헤더를 먼저 쓴다.
+    한 줄을 시그널 CSV에 쓴다.
+    파일이 없으면 헤더를 먼저 쓴다.
     (자정 이후에도 신규 파일이 자동으로 생기게 _get_csv_path()가 알아서 처리)
     """
     path = _get_csv_path()
@@ -202,7 +226,7 @@ def log_signal(
         "notional": notional if notional is not None else "",
         "strategy_version": strategy_version or "",
         "extra": extra or "",
-        # 2025-11-12 추가
+        # 박스 개선용
         "range_level": range_level if range_level is not None else "",
         "soft_block_reason": soft_block_reason or "",
         "used_tp_pct": used_tp_pct if used_tp_pct is not None else "",
@@ -215,6 +239,98 @@ def log_signal(
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         # _ensure_today_csv()에서 이미 헤더를 써놨으면 file_exists는 True지만,
         # 자정 지나 새 파일이 생긴 경우에는 여기서도 헤더를 한 번 더 써준다.
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+# ─────────────────────────────────────────────
+# 2025-11-12 추가: 시세(캔들) 스냅샷 로그
+# ─────────────────────────────────────────────
+def _candle_csv_path_for(day_str: str) -> str:
+    """주어진 날짜(KST)용 시세 스냅샷 CSV 전체 경로를 돌려준다."""
+    _ensure_dir(CANDLE_DIR)
+    fname = f"candles-{day_str}.csv"
+    return os.path.join(CANDLE_DIR, fname)
+
+
+def _candle_fieldnames() -> List[str]:
+    """시세 스냅샷 전용 CSV 헤더 정의."""
+    return [
+        "ts_kst",        # 기록 시각(KST)
+        "symbol",        # BTC-USDT
+        "tf",            # 3m, 15m ...
+        "candle_ts",     # 이 캔들의 원래 타임스탬프(ms 또는 sec)
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "strategy_type", # 이 시점에 어떤 전략을 평가 중이었는지
+        "direction",     # LONG/SHORT (없으면 빈칸)
+        "extra",         # 자유 텍스트 (예: "early_exit_check=1")
+    ]
+
+
+def _ensure_today_candle_csv() -> str:
+    """
+    오늘(KST) 날짜의 시세 스냅샷 CSV가 없으면 헤더만 있는 빈 파일을 만든다.
+    signals와 동일한 패턴.
+    """
+    day = _today_kst_str()
+    path = _candle_csv_path_for(day)
+    fields = _candle_fieldnames()
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+    return path
+
+
+# 필요하면 모듈 로드시점에 만들어둬도 된다.
+_ensure_today_candle_csv()
+
+
+def log_candle_snapshot(
+    *,
+    symbol: str,
+    tf: str,
+    candle_ts: int,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+    strategy_type: Optional[str] = "",
+    direction: Optional[str] = "",
+    extra: Optional[str] = "",
+) -> None:
+    """
+    시세(캔들) 스냅샷 한 줄을 별도 CSV에 남긴다.
+    run_bot.py 에서 신호를 실제로 평가했을 때, 또는 조기 익절/청산 체크할 때 호출하면 된다.
+    """
+    path = _ensure_today_candle_csv()
+    file_exists = os.path.exists(path)
+
+    row = {
+        "ts_kst": _now_kst_str(),
+        "symbol": symbol,
+        "tf": tf,
+        "candle_ts": candle_ts,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+        "strategy_type": strategy_type or "",
+        "direction": direction or "",
+        "extra": extra or "",
+    }
+
+    fieldnames = _candle_fieldnames()
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
