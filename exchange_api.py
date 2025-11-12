@@ -8,6 +8,13 @@ BingX REST API 호출 모듈 (원웨이 계정 대응)
 - TP/SL 조건부 주문은 triggerPrice / stopPrice / activationPrice, reduceOnly, positionSide 조합을 여러 개 보내서 110400 을 우회한다.
 - 강제 시장가 청산이 101290(The Reduce Only order can only decrease...) 이 뜨면 reduceOnly 없이 다시 보낸다.
 - 2025-11-12: 포지션 조회할 때도 timestamp invalid 를 피하려고 recvWindow=5000 을 붙였다.
+
+2025-11-12 추가/보강
+----------------------------------------------------
+1) 실시간 확인을 위한 로그 강화
+   - 시장가 진입/강제청산 시점에 심볼·수량·방향을 추가로 로그로 남겨
+     Render 콘솔에서 “position_watch 가 닫으라고 했을 때 실제로 주문이 나갔는지”를 바로 확인할 수 있게 했다.
+2) 강제청산 실패 케이스도 텔레그램으로 바로 알리도록 기존 흐름 유지
 """
 
 from __future__ import annotations
@@ -261,8 +268,6 @@ def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
 def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
     """
     심볼별 열려 있는 주문 목록.
-    (여기는 네 로그상 timestamp 에러가 안 나서 recvWindow 는 생략해도 되는데,
-     맞춰두고 싶으면 여기에도 넣어도 된다.)
     """
     try:
         res = req("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
@@ -405,6 +410,8 @@ def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
 
+    log(f"[PLACE MARKET] symbol={symbol} side={side} qty_req={qty} qty_norm={norm_qty}")
+
     payloads = [
         {
             "symbol": symbol,
@@ -453,6 +460,11 @@ def place_conditional(
     """
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
+
+    log(
+        f"[PLACE COND] symbol={symbol} side={side} qty={qty}(norm={norm_qty}) "
+        f"trigger={trigger_price} type={order_type}"
+    )
 
     base_common = {
         "symbol": symbol,
@@ -656,6 +668,12 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     norm_qty = _normalize_qty(symbol, qty)
     int_qty_str = _as_int_qty(qty)
 
+    # 실시간 확인용 로그
+    log(
+        f"[FORCE CLOSE] symbol={symbol} open_side={side_open} close_side={close_side} "
+        f"qty_req={qty} qty_norm={norm_qty}"
+    )
+
     payloads = [
         {
             "symbol": symbol,
@@ -690,6 +708,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         return
     except Exception as e:
         msg = str(e)
+        log(f"[FORCE CLOSE ERR] {msg}")
         if "101290" in msg:
             # reduceOnly 제거 재시도
             no_ro_payloads = [
@@ -706,6 +725,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
                 send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다(RO제거). 수량={norm_qty}")
                 return
             except Exception as e2:
+                log(f"[FORCE CLOSE ERR NO-RO] {e2}")
                 send_tg(f"❗ 포지션 강제 정리 실패(RO제거도 실패): {e2}")
                 return
 
@@ -715,6 +735,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
             _try_order(payloads_int)
             send_tg(f"⚠️ 포지션을 즉시 시장가로 닫았습니다. 수량={int_qty_str}")
         except Exception as e3:
+            log(f"[FORCE CLOSE ERR INT] {e3}")
             send_tg(f"❗ 포지션 강제 정리 실패: {e3}")
 
 

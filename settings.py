@@ -23,7 +23,37 @@ BingX 자동매매 봇 공통 설정
      → 박스로 들어간 뒤에 생각보다 반대로 세게 가면 거래소 TP/SL 기다리지 않고 먼저 닫기
    - range_early_tp_enabled / range_early_tp_pct
      → 박스로 들어간 뒤에 살짝이라도 수익 나면 바로 챙기기
-   → 실제 실행은 run_bot.py 쪽에서 이 값을 보고 처리한다.
+     (실행은 run_bot.py → position_watch.py 에서 처리)
+
+4) ✅ 추세(TREND) 포지션 조기 청산/익절 옵션 추가
+   - trend_early_exit_enabled / trend_early_exit_loss_pct
+   - trend_early_tp_enabled / trend_early_tp_pct
+     (실행은 position_watch.py 에서 처리)
+
+5) ✅ 추세(TREND) 포지션 횡보 감지 조기 청산 옵션 추가
+   - trend_sideways_enabled
+   - trend_sideways_need_bars
+   - trend_sideways_range_pct
+   - trend_sideways_max_pnl_pct
+
+6) ✅ (기존 그대로) ATR/쿨다운/텔레그램/거래시간 옵션 유지
+
+7) ✅ run_bot.py 에서 position_watch.py 의 실시간 대응을 바로 쓸 수 있도록 기본값 보수적으로 설정
+
+8) ✅ 박스 → 추세 업그레이드 최소 수익률 옵션 추가
+   - range_to_trend_min_gain_pct
+     → 박스로 들어갔는데 다시 보니까 추세가 열렸을 때 “이 정도 이익 나 있으면 닫아라” 기준
+
+9) ✅ 추세 횡보 1분봉 보조 체크 옵션 추가
+   - trend_sideways_use_1m
+   - trend_sideways_1m_need_bars
+   - trend_sideways_1m_range_pct
+     → position_watch.py 의 maybe_sideways_exit_trend() 에서 사용
+
+10) ✅ 반대 시그널 감지 즉시 청산 on/off 추가
+    - close_on_opposite_enabled
+    - (기본값 True)
+    - position_watch.py 의 maybe_close_on_opposite_signal(...) 에서 사용
 """
 
 from __future__ import annotations
@@ -112,13 +142,33 @@ class BotSettings:
     range_short_sl_floor_ratio: float = 0.75
 
     # ✅ 박스 조기 청산/익절
-    # 손실 방향으로 어느 정도 역행하면 TP/SL 기다리지 않고 닫을지
     range_early_exit_enabled: bool = True
     range_early_exit_loss_pct: float = 0.003  # 0.3%
-
-    # 이익이 조금이라도 났을 때 먼저 닫을지
     range_early_tp_enabled: bool = False
     range_early_tp_pct: float = 0.0025        # 0.25%
+
+    # ✅ 추세(TREND) 조기 청산/익절
+    trend_early_exit_enabled: bool = True
+    trend_early_exit_loss_pct: float = 0.003  # 0.3%
+    trend_early_tp_enabled: bool = False
+    trend_early_tp_pct: float = 0.0025        # 0.25%
+
+    # ✅ 추세(TREND) 횡보 감지 조기 청산 (기본 주기)
+    trend_sideways_enabled: bool = True
+    trend_sideways_need_bars: int = 3
+    trend_sideways_range_pct: float = 0.0008      # 0.08% 이하면 납작으로 본다
+    trend_sideways_max_pnl_pct: float = 0.0015    # ±0.15% 안에서만 적용
+
+    # ✅ 추세(TREND) 횡보 감지 1분 보조
+    trend_sideways_use_1m: bool = True
+    trend_sideways_1m_need_bars: int = 3
+    trend_sideways_1m_range_pct: float = 0.0006   # 0.06% 정도로 더 타이트하게
+
+    # ✅ 박스 → 추세 업그레이드 최소 이익률
+    range_to_trend_min_gain_pct: float = 0.002    # 0.2% 이상 나 있으면 정리 허용
+
+    # ✅ 반대 시그널 감지 즉시 청산 on/off
+    close_on_opposite_enabled: bool = True
 
     # ATR/변동성 관련
     use_atr: bool = True
@@ -253,6 +303,24 @@ def load_settings() -> BotSettings:
         range_early_exit_loss_pct=_as_float(os.getenv("RANGE_EARLY_EXIT_LOSS_PCT", "0.003"), 0.003),
         range_early_tp_enabled=_as_bool(os.getenv("RANGE_EARLY_TP_ENABLED", "0"), False),
         range_early_tp_pct=_as_float(os.getenv("RANGE_EARLY_TP_PCT", "0.0025"), 0.0025),
+        # ✅ 추세 조기 청산/익절
+        trend_early_exit_enabled=_as_bool(os.getenv("TREND_EARLY_EXIT_ENABLED", "1"), True),
+        trend_early_exit_loss_pct=_as_float(os.getenv("TREND_EARLY_EXIT_LOSS_PCT", "0.003"), 0.003),
+        trend_early_tp_enabled=_as_bool(os.getenv("TREND_EARLY_TP_ENABLED", "0"), False),
+        trend_early_tp_pct=_as_float(os.getenv("TREND_EARLY_TP_PCT", "0.0025"), 0.0025),
+        # ✅ 추세 횡보 감지 (기본 주기)
+        trend_sideways_enabled=_as_bool(os.getenv("TREND_SIDEWAYS_ENABLED", "1"), True),
+        trend_sideways_need_bars=_as_int(os.getenv("TREND_SIDEWAYS_NEED_BARS", "3"), 3),
+        trend_sideways_range_pct=_as_float(os.getenv("TREND_SIDEWAYS_RANGE_PCT", "0.0008"), 0.0008),
+        trend_sideways_max_pnl_pct=_as_float(os.getenv("TREND_SIDEWAYS_MAX_PNL_PCT", "0.0015"), 0.0015),
+        # ✅ 추세 횡보 1m 보조
+        trend_sideways_use_1m=_as_bool(os.getenv("TREND_SIDEWAYS_USE_1M", "1"), True),
+        trend_sideways_1m_need_bars=_as_int(os.getenv("TREND_SIDEWAYS_1M_NEED_BARS", "3"), 3),
+        trend_sideways_1m_range_pct=_as_float(os.getenv("TREND_SIDEWAYS_1M_RANGE_PCT", "0.0006"), 0.0006),
+        # ✅ 박스 → 추세 업그레이드 최소 이익률
+        range_to_trend_min_gain_pct=_as_float(os.getenv("RANGE_TO_TREND_MIN_GAIN_PCT", "0.002"), 0.002),
+        # ✅ 반대 시그널 컷 on/off
+        close_on_opposite_enabled=_as_bool(os.getenv("CLOSE_ON_OPPOSITE_ENABLED", "1"), True),
         # ATR
         use_atr=_as_bool(os.getenv("USE_ATR", "1"), True),
         atr_len=_as_int(os.getenv("ATR_LEN", "20"), 20),
@@ -278,10 +346,7 @@ def load_settings() -> BotSettings:
         # 가드
         max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.003"), 0.003),
         max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
-        max_entry_slippage_pct=_as_float(
-            os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"),
-            0.0005,
-        ),
+        max_entry_slippage_pct=_as_float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"), 0.0005),
         use_orderbook_entry_hint=_as_bool(os.getenv("USE_ORDERBOOK_ENTRY_HINT", "1"), True),
         # 텔레그램
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),

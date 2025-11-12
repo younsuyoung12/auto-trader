@@ -1,4 +1,5 @@
-"""market_data.py
+"""
+market_data.py
 시세/호가(depth) 관련 함수만 모아 둔 모듈.
 
 이 모듈이 하는 일:
@@ -27,6 +28,9 @@
 2) 오더북(depth) 조회도 캔들과 동일하게 하이픈 있는 심볼이 비었을 때
    '-' 뺀 심볼로 한 번 더 시도하게 했음
    → 지금 run_bot.py 에서 스프레드 가드 쓰는 흐름이랑 모양을 맞추기 위함
+3) ✅ 실시간 확인용 로그 추가
+   - 캔들/호가를 요청할 때마다 symbol, interval, limit 을 로그에 남겨
+     Render 콘솔에서 “매수 후에도 계속 가져오는지”를 바로 확인할 수 있게 함
 """
 
 from __future__ import annotations
@@ -138,11 +142,14 @@ def get_klines(
     1) symbol 그대로 요청
     2) 비어 있고 '-'가 있으면 symbol.replace('-', '') 로 한 번 더 요청
     """
+    # 실시간 확인용 로그
+    log(f"[KLINES REQ] symbol={symbol} tf={interval} limit={limit}")
     try:
         raw = _fetch_klines_raw(symbol, interval, limit)
         if not raw and "-" in symbol:
             # 캔들이 안 왔으면 하이픈 뺀 버전으로 재시도
             sym2 = symbol.replace("-", "")
+            log(f"[KLINES REQ] fallback symbol={sym2} tf={interval} limit={limit}")
             raw = _fetch_klines_raw(sym2, interval, limit)
     except Exception as e:
         log(f"[KLINES ERROR] symbol={symbol} interval={interval} err={e}")
@@ -170,10 +177,13 @@ def get_klines_with_volume(
     1) symbol 그대로 요청
     2) 비어 있고 '-'가 있으면 symbol.replace('-', '') 로 한 번 더 요청
     """
+    # 실시간 확인용 로그
+    log(f"[KLINES VOL REQ] symbol={symbol} tf={interval} limit={limit}")
     try:
         raw = _fetch_klines_raw(symbol, interval, limit)
         if not raw and "-" in symbol:
             sym2 = symbol.replace("-", "")
+            log(f"[KLINES VOL REQ] fallback symbol={sym2} tf={interval} limit={limit}")
             raw = _fetch_klines_raw(sym2, interval, limit)
     except Exception as e:
         log(f"[KLINES VOL ERROR] symbol={symbol} interval={interval} err={e}")
@@ -200,6 +210,8 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
     1) 원래 심볼로 조회
     2) 결과가 없고 '-' 가 있으면 '-' 뺀 심볼로 한 번 더 조회
     """
+    # 실시간 확인용 로그
+    log(f"[ORDERBOOK REQ] symbol={symbol} limit={limit}")
     try:
         resp = requests.get(
             f"{BASE}/openApi/swap/v2/quote/depth",
@@ -212,6 +224,7 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
             return payload
         # 여기까지 왔다는 건 응답은 왔는데 내용이 없거나 빈 dict 인 케이스 → 하이픈 제거 재시도
         sym2 = symbol.replace("-", "")
+        log(f"[ORDERBOOK REQ] fallback symbol={sym2} limit={limit}")
         resp2 = requests.get(
             f"{BASE}/openApi/swap/v2/quote/depth",
             params={"symbol": sym2, "limit": limit},
