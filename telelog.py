@@ -2,7 +2,7 @@
 로그 출력, 텔레그램 전송, '스킵 사유' 전송에 쿨다운을 걸어주는 모듈.
 
 이 모듈은 bot 전체에서 공통으로 쓰는 유틸을 분리한 것이다.
-원래 긴 bot.py 안에 있던 것들을 그대로 가져왔고, settings.py 에서 설정을 읽어온다.
+원래 긴 bot.py 안에 있던 것들을 그대로 가져왔고, settings_ws.py 에서 설정을 읽어온다.
 
 사용 예시:
     from telelog import log, send_tg, send_skip_tg
@@ -22,12 +22,12 @@ import time
 from typing import Dict
 import requests
 
-from settings import load_settings, KST  # KST 는 필요하면 외부에서 같이 쓸 수 있게 가져온다.
+from settings_ws import load_settings, KST  # KST 는 필요하면 외부에서 같이 쓸 수 있게 가져온다.
 
 # 설정을 한 번만 읽어서 전역으로 보관한다. 계속 읽을 필요 없음.
 SET = load_settings()
 
-# 파일 로그 옵션 (settings.py 에서 온다)
+# 파일 로그 옵션 (settings_ws.py 에서 온다)
 LOG_TO_FILE: bool = SET.log_to_file
 LOG_FILE: str = SET.log_file
 
