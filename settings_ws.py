@@ -3,7 +3,7 @@ settings_ws.py
 ====================================================
 웹소켓으로 1m / 5m / 15m 캔들을 받아서 쓰는 구조에 맞춰 정리한 설정 모듈.
 
-▶ 2025-11-14 패치 (이 버전에서 추가/수정된 핵심)
+▶ 2025-11-14 패치 (warmup/bootstrap 포함) — 이번 변경 핵심
 ----------------------------------------------------
 E) RANGE 전용 1m 확인 토글(ENV) 추가
    - `enable_1m_confirm_range` 필드 추가
@@ -15,15 +15,21 @@ F) TREND→RANGE 다운그레이드(갈아타기) 제어 옵션 추가
    - `trend_to_range_max_abs_pnl_pct` (ENV: `TREND_TO_RANGE_MAX_ABS_PNL_PCT`)
    - `trend_to_range_auto_reenter` (ENV: `TREND_TO_RANGE_AUTO_REENTER`)
 
+G) WS 히스토리 웜업/부트스트랩 옵션 추가 (신규)
+   - `min_bars_5m`, `min_bars_15m`: 최소 캔들 개수 기준(미만이면 신호 스킵)
+   - `warmup_target_5m`, `warmup_target_15m`: 웜업 타깃(미만이어도 진행하되 로그만)
+   - `ws_bootstrap_with_rest`: 부팅 직후 REST로 과거 캔들 1회 시드 여부
+   - `ws_bootstrap_lookback_5m`, `ws_bootstrap_lookback_15m`: REST 시드 lookback 개수
+   - 관련 ENV: `MIN_BARS_5M`, `MIN_BARS_15M`, `WARMUP_TARGET_5M`, `WARMUP_TARGET_15M`,
+               `WS_BOOTSTRAP_WITH_REST`, `WS_BOOTSTRAP_LOOKBACK_5M`, `WS_BOOTSTRAP_LOOKBACK_15M`
+
 ▶ 2025-11-13 추가 보정 (이 버전에서 바뀐 핵심)
 ----------------------------------------------------
 A) ENV 훅 추가
-   - `MIN_ENTRY_VOLUME_RATIO`를 로더에서 읽어 `BotSettings.min_entry_volume_ratio`에 주입하도록 수정
-     (기존엔 dataclass 기본값만 사용되어 ENV로 조정이 안 됨 → 진입 보수화가 작동 안 하던 문제 교정)
+   - `MIN_ENTRY_VOLUME_RATIO`를 로더에서 읽어 `BotSettings.min_entry_volume_ratio`에 주입
 
 B) TP/SL 하한 기본값 정합성
    - dataclass 기본값 `min_tp_pct`, `min_sl_pct`을 **0.005(=0.5%)**로 낮춰 로더 기본값과 일치
-     (과대 클램프로 작은 변동에 적응 못 하는 문제 예방)
 
 C) 레인지 TP/SL 기본값 정합성
    - dataclass 기본값을 로더 기본값과 맞춤:
@@ -32,7 +38,7 @@ C) 레인지 TP/SL 기본값 정합성
      * `range_sl_long_pct=0.0035`, `range_sl_short_pct=0.004`
 
 D) WS 스왑 엔드포인트 옵션 추가
-   - `ws_swap_base` 필드와 `BINGX_SWAP_WS_BASE` ENV 추가 (필요 모듈에서 선택적으로 사용 가능)
+   - `ws_swap_base` 필드와 `BINGX_SWAP_WS_BASE` ENV 추가 (필요 모듈에서 선택적으로 사용)
 
 ※ 참고: 박스 상/하단 80%/20% 진입선은 `strategies_range_ws.decide_signal_range()`에 **하드코딩**되어 있습니다.
    본 파일의 `range_entry_upper_pct`/`lower_pct` 값은 보존하되, 실제 적용은 해당 전략 모듈 수정 시 반영됩니다.
@@ -117,11 +123,24 @@ class BotSettings:
     ws_subscribe_tfs: List[str] = None  # 런타임에서 ["1m","5m","15m"]로 채운다
     ws_log_enabled: bool = True  # 캔들 수신 시 로그 남길지
 
+    # ── WS 히스토리 웜업/부트스트랩 ─────────────────────────
+    # * min_bars_*: 이 값 미만이면 신호 자체를 스킵
+    # * warmup_target_*: 이 값 미만이면 진행은 하되 "웜업 진행" 로그만 출력
+    # * ws_bootstrap_with_rest: 부팅 직후 REST로 과거 캔들을 1회 시드하여 웜업 시간을 단축
+    # * ws_bootstrap_lookback_*: REST 시드 시 가져올 lookback 수량
+    min_bars_5m: int = 20
+    min_bars_15m: int = 20
+    warmup_target_5m: int = 50
+    warmup_target_15m: int = 50
+    ws_bootstrap_with_rest: bool = True
+    ws_bootstrap_lookback_5m: int = 120
+    ws_bootstrap_lookback_15m: int = 120
+
     # 전략 on/off
     enable_trend: bool = True
     enable_range: bool = False
     enable_1m_confirm: bool = True
-    enable_1m_confirm_range: bool = False  # ✅ RANGE 전용 1m 확인 토글(미지정 시 enable_1m_confirm으로 fallback)
+    enable_1m_confirm_range: bool = False  # RANGE 전용 1m 확인(미지정 시 enable_1m_confirm으로 fallback)
 
     # 레버리지/리스크
     leverage: int = 10
@@ -134,7 +153,7 @@ class BotSettings:
     tp_pct: float = 0.02
     sl_pct: float = 0.02
 
-    # 박스 기본 TP/SL (로더 기본과 일치시킴)
+    # 박스 기본 TP/SL (로더 기본과 일치)
     range_tp_pct: float = 0.006
     range_sl_pct: float = 0.004
 
@@ -150,33 +169,33 @@ class BotSettings:
     range_soft_tp_factor: float = 1.2
     range_short_sl_floor_ratio: float = 0.75
 
-    # ✅ 박스 조기 청산/익절
+    # 박스 조기 청산/익절
     range_early_exit_enabled: bool = True
     range_early_exit_loss_pct: float = 0.003
     range_early_tp_enabled: bool = False
     range_early_tp_pct: float = 0.0025
 
-    # ✅ 추세 조기 청산/익절
+    # 추세 조기 청산/익절
     trend_early_exit_enabled: bool = True
     trend_early_exit_loss_pct: float = 0.003
     trend_early_tp_enabled: bool = False
     trend_early_tp_pct: float = 0.0025
 
-    # ✅ 추세 횡보 감지
+    # 추세 횡보 감지
     trend_sideways_enabled: bool = True
     trend_sideways_need_bars: int = 3
     trend_sideways_range_pct: float = 0.0008
     trend_sideways_max_pnl_pct: float = 0.0015
 
-    # ✅ 추세 횡보 1m 보조
+    # 추세 횡보 1m 보조
     trend_sideways_use_1m: bool = True
     trend_sideways_1m_need_bars: int = 3
     trend_sideways_1m_range_pct: float = 0.0006
 
-    # ✅ 박스 → 추세 업그레이드 최소 이익률
+    # 박스 → 추세 업그레이드 최소 이익률
     range_to_trend_min_gain_pct: float = 0.002
 
-    # ✅ 반대 시그널 감지 즉시 청산 on/off
+    # 반대 시그널 감지 즉시 청산 on/off
     close_on_opposite_enabled: bool = True
 
     # ATR/변동성
@@ -184,13 +203,13 @@ class BotSettings:
     atr_len: int = 20
     atr_tp_mult: float = 2.0
     atr_sl_mult: float = 1.2
-    min_tp_pct: float = 0.005  # 0.5% (로더 기본과 일치)
-    min_sl_pct: float = 0.005  # 0.5% (로더 기본과 일치)
+    min_tp_pct: float = 0.005  # 0.5%
+    min_sl_pct: float = 0.005  # 0.5%
     atr_risk_high_mult: float = 1.5
     atr_risk_reduction: float = 0.5
 
-    # 진입 거래량 가드 (ENV 훅 추가됨)
-    min_entry_volume_ratio: float = 0.3  # 기본 0.30 (보수화 권장값)
+    # 진입 거래량 가드 (ENV 훅)
+    min_entry_volume_ratio: float = 0.3  # 기본 0.30
 
     # 쿨다운/폴링
     cooldown_sec: int = 15
@@ -206,16 +225,16 @@ class BotSettings:
     max_entry_slippage_pct: float = 0.0005
     use_orderbook_entry_hint: bool = True
 
-    # ✅ 호가 한쪽 쏠림(depth imbalance) 가드 (진입/보유에 공용)
+    # 호가 한쪽 쏠림(depth imbalance) 가드
     depth_imbalance_enabled: bool = True
-    depth_imbalance_min_notional: float = 50.0  # 양쪽 합계가 이거보다 작으면 판단 안 함
-    depth_imbalance_min_ratio: float = 2.0  # 한쪽이 다른쪽의 2배 이상이면 스킵
+    depth_imbalance_min_notional: float = 50.0
+    depth_imbalance_min_ratio: float = 2.0
 
-    # ✅ mark/last 괴리 가드
+    # mark/last 괴리 가드
     price_deviation_guard_enabled: bool = True
     price_deviation_max_pct: float = 0.0015  # 0.15%
 
-    # ✅ 세션별 스프레드/점프 배수 (UTC 기준으로 나눠서 entry_guards_ws/position_watch_ws 에서 공용 사용)
+    # 세션별 스프레드/점프 배수 (UTC)
     session_spread_mult_asia: float = 1.0
     session_spread_mult_eu: float = 1.1
     session_spread_mult_us: float = 1.2
@@ -279,7 +298,7 @@ class BotSettings:
     range_tp_min: float = 0.0035
     range_tp_max: float = 0.0065
 
-    # ✅ TREND→RANGE 다운그레이드 옵션 (보유 중 전략용)
+    # TREND→RANGE 다운그레이드 옵션 (보유 중 전략용)
     trend_to_range_enable: bool = False
     trend_to_range_min_gain_pct: float = 0.0015
     trend_to_range_max_abs_pnl_pct: float = 0.0015
@@ -314,7 +333,7 @@ def load_settings() -> BotSettings:
     enable_1m_confirm_value = _as_bool(os.getenv("ENABLE_1M_CONFIRM", "1"), True)
     range_confirm_env = os.getenv("ENABLE_1M_CONFIRM_RANGE")
     if range_confirm_env is None:
-        enable_1m_confirm_range_value = enable_1m_confirm_value  # ✅ Fallback
+        enable_1m_confirm_range_value = enable_1m_confirm_value  # Fallback
     else:
         enable_1m_confirm_range_value = _as_bool(range_confirm_env, enable_1m_confirm_value)
 
@@ -329,6 +348,14 @@ def load_settings() -> BotSettings:
         ws_swap_base=bingx_ws_swap_base_env,
         ws_subscribe_tfs=ws_tfs,
         ws_log_enabled=_as_bool(os.getenv("WS_LOG_ENABLED", "1"), True),
+        # ── WS 웜업/부트스트랩 ENV 매핑 ──
+        min_bars_5m=_as_int(os.getenv("MIN_BARS_5M", "20"), 20),
+        min_bars_15m=_as_int(os.getenv("MIN_BARS_15M", "20"), 20),
+        warmup_target_5m=_as_int(os.getenv("WARMUP_TARGET_5M", "50"), 50),
+        warmup_target_15m=_as_int(os.getenv("WARMUP_TARGET_15M", "50"), 50),
+        ws_bootstrap_with_rest=_as_bool(os.getenv("WS_BOOTSTRAP_WITH_REST", "1"), True),
+        ws_bootstrap_lookback_5m=_as_int(os.getenv("WS_BOOTSTRAP_LOOKBACK_5M", "120"), 120),
+        ws_bootstrap_lookback_15m=_as_int(os.getenv("WS_BOOTSTRAP_LOOKBACK_15M", "120"), 120),
         # 전략 on/off
         enable_trend=_as_bool(os.getenv("ENABLE_TREND", "1"), True),
         enable_range=_as_bool(os.getenv("ENABLE_RANGE", "0"), False),
@@ -401,14 +428,14 @@ def load_settings() -> BotSettings:
         max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
         max_entry_slippage_pct=_as_float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"), 0.0005),
         use_orderbook_entry_hint=_as_bool(os.getenv("USE_ORDERBOOK_ENTRY_HINT", "1"), True),
-        # ✅ 호가 한쪽 쏠림(depth) env
+        # depth env
         depth_imbalance_enabled=_as_bool(os.getenv("DEPTH_IMBALANCE_ENABLED", "1"), True),
         depth_imbalance_min_notional=_as_float(os.getenv("DEPTH_IMBALANCE_MIN_NOTIONAL", "50"), 50.0),
         depth_imbalance_min_ratio=_as_float(os.getenv("DEPTH_IMBALANCE_MIN_RATIO", "2.0"), 2.0),
-        # ✅ mark/last 괴리 env
+        # mark vs last env
         price_deviation_guard_enabled=_as_bool(os.getenv("PRICE_DEVIATION_GUARD_ENABLED", "1"), True),
         price_deviation_max_pct=_as_float(os.getenv("PRICE_DEVIATION_MAX_PCT", "0.0015"), 0.0015),
-        # ✅ 세션 배수 env
+        # 세션 배수 env
         session_spread_mult_asia=_as_float(os.getenv("SESSION_SPREAD_MULT_ASIA", "1.0"), 1.0),
         session_spread_mult_eu=_as_float(os.getenv("SESSION_SPREAD_MULT_EU", "1.1"), 1.1),
         session_spread_mult_us=_as_float(os.getenv("SESSION_SPREAD_MULT_US", "1.2"), 1.2),
@@ -456,7 +483,7 @@ def load_settings() -> BotSettings:
         use_range_dynamic_tp=_as_bool(os.getenv("USE_RANGE_DYNAMIC_TP", "0"), False),
         range_tp_min=_as_float(os.getenv("RANGE_TP_MIN", "0.0035"), 0.0035),
         range_tp_max=_as_float(os.getenv("RANGE_TP_MAX", "0.0065"), 0.0065),
-        # ✅ TREND→RANGE 다운그레이드 옵션 (ENV 훅)
+        # TREND→RANGE 다운그레이드 ENV 훅
         trend_to_range_enable=_as_bool(os.getenv("TREND_TO_RANGE_ENABLE", "0"), False),
         trend_to_range_min_gain_pct=_as_float(os.getenv("TREND_TO_RANGE_MIN_GAIN_PCT", "0.0015"), 0.0015),
         trend_to_range_max_abs_pnl_pct=_as_float(os.getenv("TREND_TO_RANGE_MAX_ABS_PNL_PCT", "0.0015"), 0.0015),

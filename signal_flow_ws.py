@@ -2,7 +2,7 @@
 signal_flow_ws.py (simultaneous arbitration)
 ====================================================
 시그널 결정 전담 모듈 (웹소켓 기반, 동시 평가 + 중재 버전).
-run_bot.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
+run_bot.py / run_bot_ws.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
 
 PATCH NOTES — 2025-11-14
 ----------------------------------------------------
@@ -21,8 +21,11 @@ D) TP/SL 통일 출력
 E) 기존 1m 확인 로직과 메시지 **그대로 유지**
    - 1m 불일치 시 텔레그램: "[SKIP] 1m_confirm_mismatch" / CSV reason: "1m_confirm_mismatch"
    - RANGE 전용 토글: `enable_1m_confirm_range`(없으면 `enable_1m_confirm` 하위호환)
-F) 설정 키 미존재 대비 안전장치
-   - 코드 전역에서 `getattr(settings, ..., default)` 패턴으로 누락된 ENV/필드를 안전 처리(운영 중 회귀 방지)
+F) 설정 키 미존재 대비 안전장치 강화
+   - 전역적으로 `getattr(settings, ..., default)` 사용 (운영 중 ENV 누락/회귀로 인한 크래시 방지)
+G) 호환성 보강(중요)
+   - `market_data_ws.get_klines_with_volume(...)`가 없을 때 자동으로 `get_klines(...)`로 폴백
+   - TREND TP/SL 은 `settings.trend_tp_pct`가 없으면 `settings.tp_pct`로 자동 폴백
 
 PATCH NOTES — 2025-11-13 (이전 패치 유지)
 ----------------------------------------------------
@@ -52,11 +55,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from telelog import log, send_skip_tg
 from signals_logger import log_signal
-# 웹소켓 버퍼에서 캔들을 읽는다
-from market_data_ws import (
-    get_klines as ws_get_klines,
-    get_klines_with_volume as ws_get_klines_with_volume,
-)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 웹소켓 버퍼에서 캔들을 읽는다 (볼륨 지원 API가 없으면 자동 폴백)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    from market_data_ws import get_klines as ws_get_klines  # 필수
+except Exception as e:
+    raise ImportError("market_data_ws.get_klines 가 필요합니다") from e
+
+try:
+    from market_data_ws import get_klines_with_volume as ws_get_klines_with_volume  # 선택
+except Exception:
+    ws_get_klines_with_volume = None  # type: ignore
+
 from indicators import calc_atr
 from strategies_trend_ws import (
     decide_trend_15m,      # 15m 방향("BUY"/"SELL") 판단기
@@ -83,6 +95,7 @@ except ImportError:
 # ─────────────────────────────
 # 보조: RANGE 1분 확인 스위치(하위호환)
 # ─────────────────────────────
+
 def _is_range_1m_confirm_enabled(settings: Any) -> bool:
     """RANGE에서 1분 확인을 쓸지 결정한다.
     - settings.enable_1m_confirm_range 가 있으면 그 값을 우선.
@@ -94,6 +107,7 @@ def _is_range_1m_confirm_enabled(settings: Any) -> bool:
 # ─────────────────────────────
 # 보조: EMA/시리즈 헬퍼
 # ─────────────────────────────
+
 @dataclass
 class Candidate:
     kind: str                # "TREND" / "RANGE"
@@ -155,6 +169,7 @@ def _decide_signal_5m_trend(candles_5m: List[Tuple[int, float, float, float, flo
 # ─────────────────────────────
 # 후보 생성기: TREND
 # ─────────────────────────────
+
 def _trend_candidate(
     *,
     settings: Any,
@@ -216,9 +231,9 @@ def _trend_candidate(
     if gap_ratio < thr:
         return None
 
-    # TP/SL 기본값 (settings 에 없으면 안전 기본값 사용)
-    tp_pct = float(getattr(settings, "trend_tp_pct", 0.006))
-    sl_pct = float(getattr(settings, "trend_sl_pct", 0.004))
+    # TP/SL (설정 키 폴백: trend_tp_pct → tp_pct → 기본값)
+    tp_pct = float(getattr(settings, "trend_tp_pct", getattr(settings, "tp_pct", 0.006)))
+    sl_pct = float(getattr(settings, "trend_sl_pct", getattr(settings, "sl_pct", 0.004)))
 
     return Candidate(kind="TREND", side=final_dir, score=gap_ratio, tp_pct=tp_pct, sl_pct=sl_pct,
                      reasons=[f"trend gap_ratio={gap_ratio:.4f} (>= {thr:.4f})"])
@@ -227,6 +242,7 @@ def _trend_candidate(
 # ─────────────────────────────
 # 후보 생성기: RANGE
 # ─────────────────────────────
+
 def _range_candidate(
     *,
     settings: Any,
@@ -306,6 +322,7 @@ def _range_candidate(
 # ─────────────────────────────
 # 중재기
 # ─────────────────────────────
+
 def _arbitrate(tr: Optional[Candidate], rg: Optional[Candidate], hysteresis: float) -> Tuple[Optional[Candidate], Optional[str]]:
     """
     - 둘 다 없음 → (None, None)
@@ -337,6 +354,7 @@ def _arbitrate(tr: Optional[Candidate], rg: Optional[Candidate], hysteresis: flo
 # ─────────────────────────────
 # 공개 API
 # ─────────────────────────────
+
 def get_trading_signal(
     *,
     settings: Any,
@@ -344,17 +362,23 @@ def get_trading_signal(
     last_range_close_ts: float,
 ) -> Optional[Tuple[str, str, int, List[Any], List[Any], float, Dict[str, Any]]]:
     """시그널을 하나 결정해서 관련 캔들/부가정보와 함께 넘긴다.
-    이제는 TREND/RANGE 동시 평가 후 중재로 단일 결론을 내린다.
+    이제는 TREND/RANGE 동시 평가 후 중재로 단일 결론을 낸다.
     return: (chosen_signal, signal_source, latest_5m_ts, candles_5m, candles_5m_raw, last_price, extra)
     """
     symbol = settings.symbol
 
-    # 1) 5m 캔들 (거래량 포함)
+    # 1) 5m 캔들 (거래량 포함 시도 → 미지원이면 일반 캔들로 폴백)
     log(f"[SIGNAL] (WS) fetch 5m candles for {symbol} limit=120")
-    candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", 120)
+    if callable(ws_get_klines_with_volume):  # type: ignore[arg-type]
+        candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", 120)  # 포함 포맷: [ts, o, h, l, c, v]
+    else:
+        candles_5m_raw = ws_get_klines(symbol, "5m", 120)             # 포맷: [ts, o, h, l, c]
+
     if not candles_5m_raw or len(candles_5m_raw) < 50:
         log("[SIGNAL] 5m candles not enough (<50) → skip signal")
         return None
+
+    # 볼륨 없이도 동작하도록 앞 5개 칼럼만 사용
     candles_5m = [c[:5] for c in candles_5m_raw]
     latest_5m_ts = int(candles_5m[-1][0])
     last_price = float(candles_5m[-1][4])

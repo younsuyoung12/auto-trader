@@ -49,14 +49,14 @@ from telelog import log
 
 SET = load_settings()
 
-# 환경변수로도 바꿀 수 있게
+# 환경변수로도 바꿀 수 있게 (swap 우선 → 일반 ws 베이스 → 기본값 순)
 WS_URL = (
     os.getenv("BINGX_SWAP_WS_BASE")
     or os.getenv("BINGX_WS_BASE")
     or "wss://open-api-swap.bingx.com/swap-market"
 )
 
-# settings 에 없으면 1m/5m/15m
+# settings 에 없으면 1m/5m/15m 로 기본 구독
 WS_INTERVALS: List[str] = getattr(SET, "ws_subscribe_tfs", None) or ["1m", "5m", "15m"]
 
 # { (symbol, interval): [(ts, o, h, l, c, v), ...] }
@@ -65,7 +65,7 @@ _kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float
 # { symbol: {"bids": [...], "asks": [...], "ts": ..., "exchTs": ..., "markPrice": ..., "lastPrice": ...} }
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 
-# 동시성 보호용 Lock
+# 동시성 보호용 Lock (읽기/쓰기 경쟁 방지)
 _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
 
@@ -86,6 +86,7 @@ def _build_sub_msgs(symbol: str) -> List[Dict[str, Any]]:
     """
     BingX 는 한 번에 여러 개를 list 로 보내도 되고
     하나씩 보내도 되니까 여기서는 하나씩 보낸다고 가정.
+    depth5 포함.
     """
     ws_sym = _to_ws_symbol(symbol)
     msgs: List[Dict[str, Any]] = []
@@ -129,6 +130,7 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
     c = float(item.get("c") or 0)
     v = float(item.get("v") or 0)
 
+    # 마지막 바 갱신/추가 (동시성 보호)
     with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
         if buf and buf[-1][0] == ts:
@@ -313,6 +315,7 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
 
 
 def start_ws_loop(symbol: str) -> None:
+    """백그라운드 스레드에서 무한 재접속 루프로 WS를 유지한다."""
     url = WS_URL
 
     def _runner() -> None:
@@ -325,6 +328,7 @@ def start_ws_loop(symbol: str) -> None:
                     on_error=_on_error,
                     on_close=_on_close,
                 )
+                # 서버 ping/pong과 별개로 클라이언트 ping도 주기적으로 보냄
                 ws.run_forever(ping_interval=25, ping_timeout=10)
             except Exception as e:
                 log(f"[MD-WS] run_forever error: {e}")
@@ -337,7 +341,7 @@ def start_ws_loop(symbol: str) -> None:
 
 
 # ─────────────────────────────
-# getter 들
+# getter 들 (잠금으로 동시성 보장)
 # ─────────────────────────────
 
 def get_klines(symbol: str, interval: str, limit: int = 120):
