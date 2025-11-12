@@ -1,25 +1,9 @@
 """
-bot_workers.py
-====================================================
-보조 스레드/서비스 모음.
-run_bot.py 에서 이 모듈만 import 해서 호출한다.
-
-[2025-11-12 변경 사항]
-----------------------------------------------------
-1) 차트/시세 스냅샷 CSV도 드라이브에 같이 올리도록 확장
-   - 기존: logs/signals/signals-YYYY-MM-DD.csv 만 업로드
-   - 추가: logs/candles/candles-YYYY-MM-DD.csv 가 있으면 같은 이름으로 업로드
-   - 업로드 주기는 그대로 5분
-
-담당 기능:
-1) health 서버 (/healthz, /metrics)
-2) 드라이브 동기화 스레드 (오늘자 CSV 강제 생성 → 업로드 → 오래된 CSV 정리)
-3) 텔레그램 종료 명령 수신 스레드 (종료/안전종료/봇종료/끝나면 종료)
-
-주의:
-- settings.load_settings() 를 이 모듈 안에서도 호출해서 SET 을 얻는다.
-- drive_uploader, signals_logger 는 기존 파일 그대로 사용한다.
-- 텔레그램 스레드는 콜백(on_stop_command) 을 run_bot.py 에서 넘겨받는다.
+수정 내용 (2025-11-13)
+1) 드라이브 업로드 주기/보관일을 환경변수로도 조정할 수 있게 함 (없으면 기존값 300초/3일 유지)
+2) 텔레그램 종료 명령에 영문 'stop', '/stop' 도 허용하여 운영 중 즉시 멈출 수 있게 함
+3) 각 워커 스레드 시작 시 로그를 남겨 run_bot.py 콘솔에서 상태를 바로 확인할 수 있게 함
+4) 기존 2025-11-12 기능(시그널 CSV + 캔들 CSV 동시 업로드, 오래된 파일 정리) 그대로 유지
 """
 
 from __future__ import annotations
@@ -33,19 +17,21 @@ import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Callable
 
-from settings import load_settings
+from settings_ws import load_settings
 from telelog import log
 from drive_uploader import upload_to_drive
-from signals_logger import _ensure_today_csv  # 시그널 CSV
-# ✅ 시세 스냅샷 CSV는 파일이 있을 때만 올릴 것이므로, 여기서는 경로만 계산해서 쓴다.
+from signals_logger import _ensure_today_csv  # 시그널 CSV 생성/보장
 
+# 전역 설정 로드
 SET = load_settings()
+
 
 # ─────────────────────────────
 # 1. health / metrics HTTP 서버
 # ─────────────────────────────
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
+        """/healthz, /metrics 두 개만 응답한다."""
         if self.path == "/healthz":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -53,7 +39,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"ok")
             return
         if self.path == "/metrics":
-            # 최소 정보만 노출 (실제 메트릭은 run_bot 에서 관리)
+            # 최소 메트릭만 실어 보낸다. 상세 메트릭은 run_bot.py 에서 관리.
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -63,7 +49,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, *_: Any) -> None:
-        # 기본 HTTP 로그 숨김
+        # 기본 HTTP 요청 로그는 콘솔을 어지럽히므로 숨긴다.
         return
 
 
@@ -77,7 +63,7 @@ def start_health_server() -> None:
         log(f"[HEALTH] server started on 0.0.0.0:{SET.health_port}")
         httpd.serve_forever()
 
-    th = threading.Thread(target=_run, daemon=True)
+    th = threading.Thread(target=_run, daemon=True, name="health-server")
     th.start()
 
 
@@ -85,17 +71,20 @@ def start_health_server() -> None:
 # 2. 드라이브 동기화 스레드
 # ─────────────────────────────
 def start_drive_sync_thread() -> None:
-    """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 삭제
+    """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 정리.
     - signals-YYYY-MM-DD.csv 는 무조건 생성해서 올린다.
-    - candles-YYYY-MM-DD.csv 는 run_bot 측에서 만들어둔 경우에만 같이 올린다.
+    - candles-YYYY-MM-DD.csv 는 있으면 같이 올린다.
+    - 업로드 주기/보관일은 환경변수로 조정 가능하다.
     """
-    SYNC_INTERVAL_SEC = 300  # 5분
-    KEEP_DAYS = 3
+    # env 없으면 기존 값 유지
+    SYNC_INTERVAL_SEC = int(os.getenv("DRIVE_SYNC_INTERVAL_SEC", "300"))  # 5분
+    KEEP_DAYS = int(os.getenv("DRIVE_KEEP_DAYS", "3"))
 
     def _worker() -> None:
+        log(f"[DRIVE_SYNC] worker started interval={SYNC_INTERVAL_SEC}s keep_days={KEEP_DAYS}")
         while True:
             try:
-                # 1) 오늘자 시그널 파일 확보
+                # 1) 오늘자 시그널 CSV 확보/생성
                 local_path = _ensure_today_csv()
                 day_str = os.path.basename(local_path).replace("signals-", "").replace(".csv", "")
 
@@ -103,7 +92,7 @@ def start_drive_sync_thread() -> None:
                 upload_to_drive(local_path, f"signals-{day_str}.csv")
                 log("[DRIVE_SYNC] uploaded today's signals csv")
 
-                # 3) 캔들 스냅샷 CSV가 있으면 같이 업로드
+                # 3) 캔들 CSV 있으면 같이 업로드
                 candle_dir = os.path.join("logs", "candles")
                 candle_name = f"candles-{day_str}.csv"
                 candle_path = os.path.join(candle_dir, candle_name)
@@ -111,7 +100,7 @@ def start_drive_sync_thread() -> None:
                     upload_to_drive(candle_path, candle_name)
                     log("[DRIVE_SYNC] uploaded today's candles csv")
 
-                # 4) 오래된 signals CSV 삭제
+                # 4) 오래된 signals-* 파일 정리
                 local_dir = os.path.dirname(local_path)
                 now_ts = time.time()
                 for fname in os.listdir(local_dir):
@@ -126,7 +115,7 @@ def start_drive_sync_thread() -> None:
                         except OSError:
                             pass
 
-                # 5) 오래된 candles CSV 삭제 (있으면)
+                # 5) 오래된 candles-* 파일 정리
                 if os.path.isdir(candle_dir):
                     for fname in os.listdir(candle_dir):
                         if not (fname.startswith("candles-") and fname.endswith(".csv")):
@@ -140,11 +129,11 @@ def start_drive_sync_thread() -> None:
                             except OSError:
                                 pass
 
-            except Exception as e:  # 업로드 실패해도 봇은 계속
+            except Exception as e:  # 업로드 실패해도 봇은 계속 돌아가야 한다.
                 log(f"[DRIVE_SYNC] error: {e}")
             time.sleep(SYNC_INTERVAL_SEC)
 
-    th = threading.Thread(target=_worker, daemon=True)
+    th = threading.Thread(target=_worker, daemon=True, name="drive-sync")
     th.start()
 
 
@@ -152,19 +141,20 @@ def start_drive_sync_thread() -> None:
 # 3. 텔레그램 종료 명령 수신 스레드
 # ─────────────────────────────
 def start_telegram_command_thread(*, on_stop_command: Callable[[], None]) -> None:
-    """
-    텔레그램의 getUpdates 를 폴링해서 종료 명령을 받으면 콜백을 실행한다.
-    - on_stop_command: run_bot.py 에서 넘긴 함수 (SAFE_STOP_REQUESTED 켜는 용도)
-    - 409 Conflict 는 로그만 남기고 재시도
+    """텔레그램 getUpdates 폴링으로 종료 명령을 받으면 on_stop_command 를 호출한다.
+    허용 명령어: "종료", "봇종료", "끝나면 종료", "안전종료", "stop", "/stop"
+    run_bot.py 에서는 이 콜백에서 SAFE_STOP_REQUESTED 플래그만 세팅하면 된다.
     """
     if not SET.telegram_bot_token or not SET.telegram_chat_id:
         return
 
     base_url = f"https://api.telegram.org/bot{SET.telegram_bot_token}/getUpdates"
     chat_id_str = str(SET.telegram_chat_id)
+    stop_words = {"종료", "봇종료", "끝나면 종료", "안전종료", "stop", "/stop"}
 
     def _worker() -> None:
         nonlocal base_url, chat_id_str  # type: ignore
+        log("[TG CMD] worker started")
         update_offset = 0
         while True:
             try:
@@ -182,11 +172,12 @@ def start_telegram_command_thread(*, on_stop_command: Callable[[], None]) -> Non
                     if str(msg["chat"]["id"]) != chat_id_str:
                         continue
                     text = (msg.get("text") or "").strip()
-                    if text in ("종료", "봇종료", "끝나면 종료", "안전종료"):
+                    if text in stop_words:
+                        log(f"[TG CMD] stop command received: {text}")
                         on_stop_command()
             except urllib.error.HTTPError as e:
                 if e.code == 409:
-                    log("[TG CMD] 409 Conflict → 무시 후 재시도")
+                    log("[TG CMD] 409 Conflict → ignore and retry")
                 else:
                     log(f"[TG CMD] http error: {e}")
                 time.sleep(5)
@@ -194,5 +185,5 @@ def start_telegram_command_thread(*, on_stop_command: Callable[[], None]) -> Non
                 log(f"[TG CMD] error: {e}")
                 time.sleep(5)
 
-    th = threading.Thread(target=_worker, daemon=True)
+    th = threading.Thread(target=_worker, daemon=True, name="telegram-cmd")
     th.start()

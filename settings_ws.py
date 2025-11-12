@@ -1,78 +1,74 @@
 """
-settings.py
-BingX 자동매매 봇 공통 설정
+settings_ws.py
+====================================================
+웹소켓으로 1m / 5m / 15m 캔들을 받아서 쓰는 구조에 맞춰 정리한 설정 모듈.
 
-이 파일에서 하는 일
-- 환경변수를 읽어서 한 군데(BotSettings)로 묶는다
-- 추세/박스 on-off, TP/SL, 슬리피지, 텔레그램, 박스 세부 옵션을 여기서 관리한다
-
-이번 수정 내용 (2025-11-12)
+▶ 2025-11-14 패치 (이 버전에서 추가/수정된 핵심)
 ----------------------------------------------------
-1) 박스 진입 세분화/비대칭 옵션 유지
-   - range_tp_long_pct / range_tp_short_pct
-   - range_sl_long_pct / range_sl_short_pct
-   - range_entry_upper_pct / range_entry_lower_pct
-   - range_short_sl_floor_ratio
+E) RANGE 전용 1m 확인 토글(ENV) 추가
+   - `enable_1m_confirm_range` 필드 추가
+   - ENV: `ENABLE_1M_CONFIRM_RANGE` (미지정 시 `ENABLE_1M_CONFIRM` 값으로 Fallback)
 
-2) 박스 단계화/동적 TP 옵션 유지
-   - range_strict_level
-   - use_range_dynamic_tp, range_tp_min, range_tp_max
+F) TREND→RANGE 다운그레이드(갈아타기) 제어 옵션 추가
+   - `trend_to_range_enable` (ENV: `TREND_TO_RANGE_ENABLE`)
+   - `trend_to_range_min_gain_pct` (ENV: `TREND_TO_RANGE_MIN_GAIN_PCT`)
+   - `trend_to_range_max_abs_pnl_pct` (ENV: `TREND_TO_RANGE_MAX_ABS_PNL_PCT`)
+   - `trend_to_range_auto_reenter` (ENV: `TREND_TO_RANGE_AUTO_REENTER`)
 
-3) ✅ 박스 포지션 조기 청산/익절 옵션 추가
-   - range_early_exit_enabled / range_early_exit_loss_pct
-     → 박스로 들어간 뒤에 생각보다 반대로 세게 가면 거래소 TP/SL 기다리지 않고 먼저 닫기
-   - range_early_tp_enabled / range_early_tp_pct
-     → 박스로 들어간 뒤에 살짝이라도 수익 나면 바로 챙기기
-     (실행은 run_bot.py → position_watch.py 에서 처리)
+▶ 2025-11-13 추가 보정 (이 버전에서 바뀐 핵심)
+----------------------------------------------------
+A) ENV 훅 추가
+   - `MIN_ENTRY_VOLUME_RATIO`를 로더에서 읽어 `BotSettings.min_entry_volume_ratio`에 주입하도록 수정
+     (기존엔 dataclass 기본값만 사용되어 ENV로 조정이 안 됨 → 진입 보수화가 작동 안 하던 문제 교정)
 
-4) ✅ 추세(TREND) 포지션 조기 청산/익절 옵션 추가
-   - trend_early_exit_enabled / trend_early_exit_loss_pct
-   - trend_early_tp_enabled / trend_early_tp_pct
-     (실행은 position_watch.py 에서 처리)
+B) TP/SL 하한 기본값 정합성
+   - dataclass 기본값 `min_tp_pct`, `min_sl_pct`을 **0.005(=0.5%)**로 낮춰 로더 기본값과 일치
+     (과대 클램프로 작은 변동에 적응 못 하는 문제 예방)
 
-5) ✅ 추세(TREND) 포지션 횡보 감지 조기 청산 옵션 추가
-   - trend_sideways_enabled
-   - trend_sideways_need_bars
-   - trend_sideways_range_pct
-   - trend_sideways_max_pnl_pct
+C) 레인지 TP/SL 기본값 정합성
+   - dataclass 기본값을 로더 기본값과 맞춤:
+     * `range_tp_pct=0.006`, `range_sl_pct=0.004`
+     * `range_tp_long_pct=0.004`, `range_tp_short_pct=0.006`
+     * `range_sl_long_pct=0.0035`, `range_sl_short_pct=0.004`
 
-6) ✅ (기존 그대로) ATR/쿨다운/텔레그램/거래시간 옵션 유지
+D) WS 스왑 엔드포인트 옵션 추가
+   - `ws_swap_base` 필드와 `BINGX_SWAP_WS_BASE` ENV 추가 (필요 모듈에서 선택적으로 사용 가능)
 
-7) ✅ run_bot.py 에서 position_watch.py 의 실시간 대응을 바로 쓸 수 있도록 기본값 보수적으로 설정
+※ 참고: 박스 상/하단 80%/20% 진입선은 `strategies_range_ws.decide_signal_range()`에 **하드코딩**되어 있습니다.
+   본 파일의 `range_entry_upper_pct`/`lower_pct` 값은 보존하되, 실제 적용은 해당 전략 모듈 수정 시 반영됩니다.
 
-8) ✅ 박스 → 추세 업그레이드 최소 수익률 옵션 추가
-   - range_to_trend_min_gain_pct
-     → 박스로 들어갔는데 다시 보니까 추세가 열렸을 때 “이 정도 이익 나 있으면 닫아라” 기준
-
-9) ✅ 추세 횡보 1분봉 보조 체크 옵션 추가
-   - trend_sideways_use_1m
-   - trend_sideways_1m_need_bars
-   - trend_sideways_1m_range_pct
-     → position_watch.py 의 maybe_sideways_exit_trend() 에서 사용
-
-10) ✅ 반대 시그널 감지 즉시 청산 on/off 추가
-    - close_on_opposite_enabled
-    - (기본값 True)
-    - position_watch.py 의 maybe_close_on_opposite_signal(...) 에서 사용
+기존 2025-11-13 변경 사항
+----------------------------------------------------
+1) 기본 interval 을 3m → 5m 로 변경했다. (이제 3m 는 사용하지 않는다.)
+2) WS 전용 플래그(ws_enabled)와 WS 엔드포인트(env: BINGX_WS_BASE)를 추가해서
+   Render 에서도 어떤 모드로 돌고 있는지 로그로 확인할 수 있게 했다.
+3) run_bot / market_data_ws 에서 참조할 수 있도록 "ws_subscribe_tfs" 리스트를 추가해
+   1m, 5m, 15m 세 타임프레임을 한 번에 구독하도록 했다.
+4) 기존 BingX REST BASE 는 그대로 두되, env BINGX_BASE 가 있으면 그걸 우선한다.
+5) position_watch 가 사용하는 close_on_opposite_enabled 주석을 유지했다.
 """
 
 from __future__ import annotations
 import os
 import datetime
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List
 
 # 한국 시간대 (KST)
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 
 def _as_bool(val: str, default: bool = False) -> bool:
+    """ENV 문자열을 불리언으로.
+    허용: 1/true/yes/y (대소문자 무시). None이면 default.
+    """
     if val is None:
         return default
     return val.strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _as_int(val: str, default: int) -> int:
+    """ENV 문자열을 int로 안전 변환."""
     try:
         return int(val)
     except (TypeError, ValueError):
@@ -80,6 +76,7 @@ def _as_int(val: str, default: int) -> int:
 
 
 def _as_float(val: str, default: float) -> float:
+    """ENV 문자열을 float으로 안전 변환."""
     try:
         return float(val)
     except (TypeError, ValueError):
@@ -87,7 +84,9 @@ def _as_float(val: str, default: float) -> float:
 
 
 def _ensure_ascii_env(val: str, name: str) -> str:
-    """API 키처럼 헤더에 들어갈 값은 ASCII 로만 정리"""
+    """API 키처럼 헤더에 들어갈 값은 ASCII 로만 정리한다.
+    비ASCII 문자가 섞여 있으면 제거해서 안전하게 만든다.
+    """
     if not val:
         return val
     try:
@@ -99,20 +98,30 @@ def _ensure_ascii_env(val: str, name: str) -> str:
 
 @dataclass(frozen=True)
 class BotSettings:
-    """봇 전체가 import 해서 쓰는 설정 묶음"""
+    """봇 전체가 import 해서 공통으로 쓰는 설정 묶음 (WS 전용)
+    - dataclass는 불변(frozen)으로 유지: 런타임 변조를 방지하고, 구성은 loader에서만.
+    """
 
     # 필수 인증
     api_key: str
     api_secret: str
 
-    # 기본 심볼/주기
+    # 기본 심볼/주기 (3m → 5m)
     symbol: str = "BTC-USDT"
-    interval: str = "3m"
+    interval: str = "5m"  # 웹소켓에서 기본으로 보는 주기
+
+    # 웹소켓 관련
+    ws_enabled: bool = True  # 웹소켓 사용 여부
+    ws_base: str = "wss://open-api-ws.bingx.com"  # env 로 바뀔 수 있음
+    ws_swap_base: str = "wss://open-api-swap.bingx.com/swap-market"  # 선택적: 스왑 마켓 전용 WS
+    ws_subscribe_tfs: List[str] = None  # 런타임에서 ["1m","5m","15m"]로 채운다
+    ws_log_enabled: bool = True  # 캔들 수신 시 로그 남길지
 
     # 전략 on/off
     enable_trend: bool = True
     enable_range: bool = False
     enable_1m_confirm: bool = True
+    enable_1m_confirm_range: bool = False  # ✅ RANGE 전용 1m 확인 토글(미지정 시 enable_1m_confirm으로 fallback)
 
     # 레버리지/리스크
     leverage: int = 10
@@ -125,15 +134,15 @@ class BotSettings:
     tp_pct: float = 0.02
     sl_pct: float = 0.02
 
-    # 박스장 기본 TP/SL
-    range_tp_pct: float = 0.01
-    range_sl_pct: float = 0.01
+    # 박스 기본 TP/SL (로더 기본과 일치시킴)
+    range_tp_pct: float = 0.006
+    range_sl_pct: float = 0.004
 
-    # 박스장 방향별 비대칭
-    range_tp_long_pct: float = 0.01
-    range_tp_short_pct: float = 0.01
-    range_sl_long_pct: float = 0.01
-    range_sl_short_pct: float = 0.01
+    # 박스 방향별 비대칭 (로더 기본과 일치)
+    range_tp_long_pct: float = 0.004
+    range_tp_short_pct: float = 0.006
+    range_sl_long_pct: float = 0.0035
+    range_sl_short_pct: float = 0.004
 
     # 박스 진입 위치/보정
     range_entry_upper_pct: float = 0.80
@@ -143,45 +152,45 @@ class BotSettings:
 
     # ✅ 박스 조기 청산/익절
     range_early_exit_enabled: bool = True
-    range_early_exit_loss_pct: float = 0.003  # 0.3%
+    range_early_exit_loss_pct: float = 0.003
     range_early_tp_enabled: bool = False
-    range_early_tp_pct: float = 0.0025        # 0.25%
+    range_early_tp_pct: float = 0.0025
 
-    # ✅ 추세(TREND) 조기 청산/익절
+    # ✅ 추세 조기 청산/익절
     trend_early_exit_enabled: bool = True
-    trend_early_exit_loss_pct: float = 0.003  # 0.3%
+    trend_early_exit_loss_pct: float = 0.003
     trend_early_tp_enabled: bool = False
-    trend_early_tp_pct: float = 0.0025        # 0.25%
+    trend_early_tp_pct: float = 0.0025
 
-    # ✅ 추세(TREND) 횡보 감지 조기 청산 (기본 주기)
+    # ✅ 추세 횡보 감지
     trend_sideways_enabled: bool = True
     trend_sideways_need_bars: int = 3
-    trend_sideways_range_pct: float = 0.0008      # 0.08% 이하면 납작으로 본다
-    trend_sideways_max_pnl_pct: float = 0.0015    # ±0.15% 안에서만 적용
+    trend_sideways_range_pct: float = 0.0008
+    trend_sideways_max_pnl_pct: float = 0.0015
 
-    # ✅ 추세(TREND) 횡보 감지 1분 보조
+    # ✅ 추세 횡보 1m 보조
     trend_sideways_use_1m: bool = True
     trend_sideways_1m_need_bars: int = 3
-    trend_sideways_1m_range_pct: float = 0.0006   # 0.06% 정도로 더 타이트하게
+    trend_sideways_1m_range_pct: float = 0.0006
 
     # ✅ 박스 → 추세 업그레이드 최소 이익률
-    range_to_trend_min_gain_pct: float = 0.002    # 0.2% 이상 나 있으면 정리 허용
+    range_to_trend_min_gain_pct: float = 0.002
 
     # ✅ 반대 시그널 감지 즉시 청산 on/off
     close_on_opposite_enabled: bool = True
 
-    # ATR/변동성 관련
+    # ATR/변동성
     use_atr: bool = True
     atr_len: int = 20
     atr_tp_mult: float = 2.0
     atr_sl_mult: float = 1.2
-    min_tp_pct: float = 0.01
-    min_sl_pct: float = 0.01
+    min_tp_pct: float = 0.005  # 0.5% (로더 기본과 일치)
+    min_sl_pct: float = 0.005  # 0.5% (로더 기본과 일치)
     atr_risk_high_mult: float = 1.5
     atr_risk_reduction: float = 0.5
 
-    # 진입 거래량 가드
-    min_entry_volume_ratio: float = 0.15
+    # 진입 거래량 가드 (ENV 훅 추가됨)
+    min_entry_volume_ratio: float = 0.3  # 기본 0.30 (보수화 권장값)
 
     # 쿨다운/폴링
     cooldown_sec: int = 15
@@ -196,6 +205,23 @@ class BotSettings:
     max_spread_pct: float = 0.0008
     max_entry_slippage_pct: float = 0.0005
     use_orderbook_entry_hint: bool = True
+
+    # ✅ 호가 한쪽 쏠림(depth imbalance) 가드 (진입/보유에 공용)
+    depth_imbalance_enabled: bool = True
+    depth_imbalance_min_notional: float = 50.0  # 양쪽 합계가 이거보다 작으면 판단 안 함
+    depth_imbalance_min_ratio: float = 2.0  # 한쪽이 다른쪽의 2배 이상이면 스킵
+
+    # ✅ mark/last 괴리 가드
+    price_deviation_guard_enabled: bool = True
+    price_deviation_max_pct: float = 0.0015  # 0.15%
+
+    # ✅ 세션별 스프레드/점프 배수 (UTC 기준으로 나눠서 entry_guards_ws/position_watch_ws 에서 공용 사용)
+    session_spread_mult_asia: float = 1.0
+    session_spread_mult_eu: float = 1.1
+    session_spread_mult_us: float = 1.2
+    session_jump_mult_asia: float = 1.0
+    session_jump_mult_eu: float = 1.1
+    session_jump_mult_us: float = 1.2
 
     # 텔레그램
     telegram_bot_token: str = ""
@@ -216,13 +242,13 @@ class BotSettings:
     max_kline_fails: int = 5
     kline_fail_sleep: int = 600
 
-    # 거래 시간대
+    # 거래 시간대 (UTC 기준 문자열)
     trading_sessions_utc: str = "0-23"
 
     # health server
     health_port: int = 0
 
-    # 박스 하루 손절 횟수 제한
+    # 박스 하루 손절 제한
     range_max_daily_sl: int = 2
 
     # 텔레그램 스팸 억제
@@ -239,7 +265,7 @@ class BotSettings:
     # 종료 관련
     min_uptime_for_stop: int = 5
 
-    # BingX base url
+    # BingX base url (env 우선)
     bingx_base: str = "https://open-api.bingx.com"
 
     # 마진 기준 TP/SL
@@ -248,33 +274,67 @@ class BotSettings:
     fut_sl_margin_pct: float = 0.5
 
     # 박스 단계화 / 동적 TP
-    range_strict_level: int = 0
     use_range_dynamic_tp: bool = False
+    range_strict_level: int = 0
     range_tp_min: float = 0.0035
     range_tp_max: float = 0.0065
 
+    # ✅ TREND→RANGE 다운그레이드 옵션 (보유 중 전략용)
+    trend_to_range_enable: bool = False
+    trend_to_range_min_gain_pct: float = 0.0015
+    trend_to_range_max_abs_pnl_pct: float = 0.0015
+    trend_to_range_auto_reenter: bool = True
+
     def as_dict(self) -> Dict[str, object]:
-        return self.__dict__.copy()
+        """dict 변환(로깅/디버깅용)."""
+        d = self.__dict__.copy()
+        return d
 
 
 def load_settings() -> BotSettings:
+    """ENV를 읽어 BotSettings 인스턴스를 생성한다.
+    - 문자열 파싱은 _as_* 헬퍼를 통해 일관 처리
+    - enable_1m_confirm_range는 미지정 시 enable_1m_confirm로 fallback
+    - WS 구독 타임프레임은 기본 ["1m","5m","15m"]
+    """
     api_key = os.getenv("BINGX_API_KEY", "")
     api_secret = os.getenv("BINGX_API_SECRET", "")
-
     api_key = _ensure_ascii_env(api_key, "BINGX_API_KEY")
     api_secret = _ensure_ascii_env(api_secret, "BINGX_API_SECRET")
+
+    # REST BASE
+    bingx_base_env = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
+    # WS BASES
+    bingx_ws_base_env = os.getenv("BINGX_WS_BASE", "wss://open-api-ws.bingx.com")
+    bingx_ws_swap_base_env = os.getenv("BINGX_SWAP_WS_BASE", "wss://open-api-swap.bingx.com/swap-market")
+
+    ws_tfs = ["1m", "5m", "15m"]
+
+    # 먼저 공통 1m 확인 값을 계산 (RANGE Fallback에 사용)
+    enable_1m_confirm_value = _as_bool(os.getenv("ENABLE_1M_CONFIRM", "1"), True)
+    range_confirm_env = os.getenv("ENABLE_1M_CONFIRM_RANGE")
+    if range_confirm_env is None:
+        enable_1m_confirm_range_value = enable_1m_confirm_value  # ✅ Fallback
+    else:
+        enable_1m_confirm_range_value = _as_bool(range_confirm_env, enable_1m_confirm_value)
 
     return BotSettings(
         api_key=api_key,
         api_secret=api_secret,
-        # 기본 심볼/주기
         symbol=os.getenv("SYMBOL", "BTC-USDT"),
-        interval=os.getenv("INTERVAL", "3m"),
+        interval=os.getenv("INTERVAL", "5m"),  # 3m → 5m
+        # WS
+        ws_enabled=_as_bool(os.getenv("WS_ENABLED", "1"), True),
+        ws_base=bingx_ws_base_env,
+        ws_swap_base=bingx_ws_swap_base_env,
+        ws_subscribe_tfs=ws_tfs,
+        ws_log_enabled=_as_bool(os.getenv("WS_LOG_ENABLED", "1"), True),
         # 전략 on/off
         enable_trend=_as_bool(os.getenv("ENABLE_TREND", "1"), True),
         enable_range=_as_bool(os.getenv("ENABLE_RANGE", "0"), False),
-        enable_1m_confirm=_as_bool(os.getenv("ENABLE_1M_CONFIRM", "1"), True),
-        # 레버리지/마진/리스크
+        enable_1m_confirm=enable_1m_confirm_value,
+        enable_1m_confirm_range=enable_1m_confirm_range_value,
+        # 레버리지/리스크
         leverage=_as_int(os.getenv("LEVERAGE", "10"), 10),
         isolated=_as_bool(os.getenv("ISOLATED", "1"), True),
         risk_pct=_as_float(os.getenv("RISK_PCT", "0.3"), 0.3),
@@ -290,36 +350,33 @@ def load_settings() -> BotSettings:
         range_tp_short_pct=_as_float(os.getenv("RANGE_TP_SHORT_PCT", "0.006"), 0.006),
         range_sl_long_pct=_as_float(os.getenv("RANGE_SL_LONG_PCT", "0.0035"), 0.0035),
         range_sl_short_pct=_as_float(os.getenv("RANGE_SL_SHORT_PCT", "0.004"), 0.004),
-        # 박스 진입 위치/보정
+        # 박스 진입 위치/보정 (전략 모듈에서 실제 사용 여부 주의)
         range_entry_upper_pct=_as_float(os.getenv("RANGE_ENTRY_UPPER_PCT", "0.80"), 0.80),
         range_entry_lower_pct=_as_float(os.getenv("RANGE_ENTRY_LOWER_PCT", "0.20"), 0.20),
         range_soft_tp_factor=_as_float(os.getenv("RANGE_SOFT_TP_FACTOR", "1.2"), 1.2),
-        range_short_sl_floor_ratio=_as_float(
-            os.getenv("RANGE_SHORT_SL_FLOOR_RATIO", "0.75"),
-            0.75,
-        ),
-        # ✅ 박스 조기 청산/익절
+        range_short_sl_floor_ratio=_as_float(os.getenv("RANGE_SHORT_SL_FLOOR_RATIO", "0.75"), 0.75),
+        # 박스 조기 청산/익절
         range_early_exit_enabled=_as_bool(os.getenv("RANGE_EARLY_EXIT_ENABLED", "1"), True),
         range_early_exit_loss_pct=_as_float(os.getenv("RANGE_EARLY_EXIT_LOSS_PCT", "0.003"), 0.003),
         range_early_tp_enabled=_as_bool(os.getenv("RANGE_EARLY_TP_ENABLED", "0"), False),
         range_early_tp_pct=_as_float(os.getenv("RANGE_EARLY_TP_PCT", "0.0025"), 0.0025),
-        # ✅ 추세 조기 청산/익절
+        # 추세 조기 청산/익절
         trend_early_exit_enabled=_as_bool(os.getenv("TREND_EARLY_EXIT_ENABLED", "1"), True),
         trend_early_exit_loss_pct=_as_float(os.getenv("TREND_EARLY_EXIT_LOSS_PCT", "0.003"), 0.003),
         trend_early_tp_enabled=_as_bool(os.getenv("TREND_EARLY_TP_ENABLED", "0"), False),
         trend_early_tp_pct=_as_float(os.getenv("TREND_EARLY_TP_PCT", "0.0025"), 0.0025),
-        # ✅ 추세 횡보 감지 (기본 주기)
+        # 추세 횡보 감지
         trend_sideways_enabled=_as_bool(os.getenv("TREND_SIDEWAYS_ENABLED", "1"), True),
         trend_sideways_need_bars=_as_int(os.getenv("TREND_SIDEWAYS_NEED_BARS", "3"), 3),
         trend_sideways_range_pct=_as_float(os.getenv("TREND_SIDEWAYS_RANGE_PCT", "0.0008"), 0.0008),
         trend_sideways_max_pnl_pct=_as_float(os.getenv("TREND_SIDEWAYS_MAX_PNL_PCT", "0.0015"), 0.0015),
-        # ✅ 추세 횡보 1m 보조
+        # 추세 횡보 1m 보조
         trend_sideways_use_1m=_as_bool(os.getenv("TREND_SIDEWAYS_USE_1M", "1"), True),
         trend_sideways_1m_need_bars=_as_int(os.getenv("TREND_SIDEWAYS_1M_NEED_BARS", "3"), 3),
         trend_sideways_1m_range_pct=_as_float(os.getenv("TREND_SIDEWAYS_1M_RANGE_PCT", "0.0006"), 0.0006),
-        # ✅ 박스 → 추세 업그레이드 최소 이익률
+        # 박스 → 추세 업그레이드
         range_to_trend_min_gain_pct=_as_float(os.getenv("RANGE_TO_TREND_MIN_GAIN_PCT", "0.002"), 0.002),
-        # ✅ 반대 시그널 컷 on/off
+        # 반대 시그널 컷 on/off
         close_on_opposite_enabled=_as_bool(os.getenv("CLOSE_ON_OPPOSITE_ENABLED", "1"), True),
         # ATR
         use_atr=_as_bool(os.getenv("USE_ATR", "1"), True),
@@ -330,24 +387,34 @@ def load_settings() -> BotSettings:
         min_sl_pct=_as_float(os.getenv("MIN_SL_PCT", "0.005"), 0.005),
         atr_risk_high_mult=_as_float(os.getenv("ATR_RISK_HIGH_MULT", "1.5"), 1.5),
         atr_risk_reduction=_as_float(os.getenv("ATR_RISK_REDUCTION", "0.5"), 0.5),
+        # 진입 거래량 가드 (신규 ENV 훅)
+        min_entry_volume_ratio=_as_float(os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.3"), 0.3),
         # 쿨다운/폴링
         cooldown_sec=_as_int(os.getenv("COOLDOWN_SEC", "15"), 15),
         cooldown_after_close=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"), 30),
         cooldown_after_3loss=_as_int(os.getenv("COOLDOWN_AFTER_3LOSS", "3600"), 3600),
         poll_fills_sec=_as_int(os.getenv("POLL_FILLS_SEC", "2"), 2),
-        cooldown_after_close_trend=_as_int(
-            os.getenv("COOLDOWN_AFTER_CLOSE_TREND", os.getenv("COOLDOWN_AFTER_CLOSE", "30")),
-            30,
-        ),
-        cooldown_after_close_range=_as_int(
-            os.getenv("COOLDOWN_AFTER_CLOSE_RANGE", os.getenv("COOLDOWN_AFTER_CLOSE", "30")),
-            30,
-        ),
+        cooldown_after_close_trend=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE_TREND", "30"), 30),
+        cooldown_after_close_range=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE_RANGE", "30"), 30),
         # 가드
         max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.003"), 0.003),
         max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
         max_entry_slippage_pct=_as_float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"), 0.0005),
         use_orderbook_entry_hint=_as_bool(os.getenv("USE_ORDERBOOK_ENTRY_HINT", "1"), True),
+        # ✅ 호가 한쪽 쏠림(depth) env
+        depth_imbalance_enabled=_as_bool(os.getenv("DEPTH_IMBALANCE_ENABLED", "1"), True),
+        depth_imbalance_min_notional=_as_float(os.getenv("DEPTH_IMBALANCE_MIN_NOTIONAL", "50"), 50.0),
+        depth_imbalance_min_ratio=_as_float(os.getenv("DEPTH_IMBALANCE_MIN_RATIO", "2.0"), 2.0),
+        # ✅ mark/last 괴리 env
+        price_deviation_guard_enabled=_as_bool(os.getenv("PRICE_DEVIATION_GUARD_ENABLED", "1"), True),
+        price_deviation_max_pct=_as_float(os.getenv("PRICE_DEVIATION_MAX_PCT", "0.0015"), 0.0015),
+        # ✅ 세션 배수 env
+        session_spread_mult_asia=_as_float(os.getenv("SESSION_SPREAD_MULT_ASIA", "1.0"), 1.0),
+        session_spread_mult_eu=_as_float(os.getenv("SESSION_SPREAD_MULT_EU", "1.1"), 1.1),
+        session_spread_mult_us=_as_float(os.getenv("SESSION_SPREAD_MULT_US", "1.2"), 1.2),
+        session_jump_mult_asia=_as_float(os.getenv("SESSION_JUMP_MULT_ASIA", "1.0"), 1.0),
+        session_jump_mult_eu=_as_float(os.getenv("SESSION_JUMP_MULT_EU", "1.1"), 1.1),
+        session_jump_mult_us=_as_float(os.getenv("SESSION_JUMP_MULT_US", "1.2"), 1.2),
         # 텔레그램
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -371,7 +438,6 @@ def load_settings() -> BotSettings:
         range_max_daily_sl=_as_int(os.getenv("RANGE_MAX_DAILY_SL", "2"), 2),
         # 텔레그램 스팸
         skip_tg_cooldown=_as_int(os.getenv("SKIP_TG_COOLDOWN", "30"), 30),
-        balance_skip_cooldown=3600,
         # 캔들 지연 허용
         max_kline_delay_sec=_as_int(os.getenv("MAX_KLINE_DELAY_SEC", "190"), 190),
         # RSI
@@ -379,17 +445,22 @@ def load_settings() -> BotSettings:
         rsi_oversold=_as_int(os.getenv("RSI_OVERSOLD", "30"), 30),
         # 종료
         min_uptime_for_stop=_as_int(os.getenv("MIN_UPTIME_FOR_STOP", "5"), 5),
-        # BingX base
-        bingx_base="https://open-api.bingx.com",
+        # BingX BASE
+        bingx_base=bingx_base_env,
         # 마진 기준 TP/SL
         use_margin_based_tp_sl=_as_bool(os.getenv("USE_MARGIN_BASED_TP_SL", "0"), False),
         fut_tp_margin_pct=_as_float(os.getenv("FUT_TP_MARGIN_PCT", "0.5"), 0.5),
         fut_sl_margin_pct=_as_float(os.getenv("FUT_SL_MARGIN_PCT", "0.5"), 0.5),
-        # 박스 단계화/동적 TP
+        # 박스 단계화
         range_strict_level=_as_int(os.getenv("RANGE_STRICT_LEVEL", "0"), 0),
         use_range_dynamic_tp=_as_bool(os.getenv("USE_RANGE_DYNAMIC_TP", "0"), False),
         range_tp_min=_as_float(os.getenv("RANGE_TP_MIN", "0.0035"), 0.0035),
         range_tp_max=_as_float(os.getenv("RANGE_TP_MAX", "0.0065"), 0.0065),
+        # ✅ TREND→RANGE 다운그레이드 옵션 (ENV 훅)
+        trend_to_range_enable=_as_bool(os.getenv("TREND_TO_RANGE_ENABLE", "0"), False),
+        trend_to_range_min_gain_pct=_as_float(os.getenv("TREND_TO_RANGE_MIN_GAIN_PCT", "0.0015"), 0.0015),
+        trend_to_range_max_abs_pnl_pct=_as_float(os.getenv("TREND_TO_RANGE_MAX_ABS_PNL_PCT", "0.0015"), 0.0015),
+        trend_to_range_auto_reenter=_as_bool(os.getenv("TREND_TO_RANGE_AUTO_REENTER", "1"), True),
     )
 
 

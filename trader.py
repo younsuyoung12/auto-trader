@@ -1,24 +1,10 @@
-# trader.py
-# 포지션 진입/TP·SL 설정/유지/체결 확인을 담당하는 모듈.
-#
-# 2025-11-12 추가 수정 (1차)
-# ----------------------------------------------------
-# - BingX 원웨이 계정에서 실제 체결 수량이 0.005 같은 소수인데
-#   이 모듈이 수량을 int(…)로 올려서 1.0으로 보내는 문제가 있었다.
-# - 그 때문에 TP/SL 넣을 때 "The order size must be less than the available amount of 0.005 BTC"
-#   (110424) 에러가 났고, 강제 정리도 reduceOnly+1.0 이라 또 막혔다.
-# - 그래서 여기서는 "정수로 강제"하지 않고, 소수점을 유지해서 exchange_api 에 넘기도록 수정했다.
-# - exchange_api 가 이미 심볼별 step 으로 0.005, 0.001 이런 걸 깎아주므로 여기서는 그대로 보내는 게 맞다.
-#
-# 2025-11-12 추가 수정 (2차)
-# ----------------------------------------------------
-# - 슬리피지 가드로 포지션을 즉시 닫을 때,
-#   그리고 TP/SL 예약이 실패해서 포지션을 닫을 때
-#   close_position_market(...) 에 “열었던 방향(side_open)” 을 넘기도록 수정했다.
-# - exchange_api.close_position_market(symbol, side_open, qty)는
-#   내부에서 반대쪽으로 바꿔서 닫는 구조이기 때문에
-#   여기서 미리 반대 방향을 넘기면 방향이 한 번 더 뒤집혀 잘못된 주문이 나갈 수 있다.
-# - 따라서 이 모듈에서는 “처음 연 방향”만 넘기도록 통일했다.
+"""
+수정 내용 (2025-11-13)
+1) _to_contract_qty(...) 에서 0 으로 떨어지는 소수 수량을 최소 step(0.001)으로 보정
+2) 슬리피지 가드/TP·SL 예약 실패 시 close_position_market(...) 에 항상 '열었던 방향(side_open)'을 넘기도록 통일
+3) 체결 정보 파싱 시 executedQty, quantity, order.orderId 등 BingX 다양한 응답 케이스 보강
+4) ensure_tp_sl_for_trade(...) 재설정 실패 시에도 소수 수량 그대로 넘기도록 통일
+"""
 
 from __future__ import annotations
 
@@ -36,13 +22,12 @@ from exchange_api import (
 )
 
 
-# 기존에는 int 로 올렸는데, 이제는 소수 그대로 보낸다.
-# exchange_api 쪽에서 심볼 step 에 맞게 다시 깎아주므로 여기서는 가볍게만 정리.
 def _to_contract_qty(q: float) -> float:
+    """BTC-USDT 기준 0.001 step 을 가정하고, 0 으로 떨어지지 않게 보정한다."""
     if q is None or q <= 0:
-        return 0.001  # 최소 안전치
-    # 너무 긴 소수만 잘라준다 (BTC-USDT 는 0.001 step 기준)
-    return float(f"{q:.3f}")
+        return 0.001
+    v = float(f"{q:.3f}")
+    return v if v > 0 else 0.001
 
 
 @dataclass
@@ -106,9 +91,8 @@ def open_position_with_tp_sl(
     soft_mode: bool = False,
     sl_floor_ratio: Optional[float] = None,
 ) -> Optional[Trade]:
-    # 1) 시장가 진입
+    # 1) 시장가 진입 (소수 그대로)
     try:
-        # 체결 수량은 소수 그대로 전달
         resp = place_market(symbol, side_open, _to_contract_qty(qty))
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}")
@@ -135,7 +119,7 @@ def open_position_with_tp_sl(
         send_tg("[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다.")
         return None
 
-    # 1.5) 여기서 바로 FILLED 가 왔는지 먼저 본다
+    # 1.5) 즉시 체결 여부 확인
     immediate_filled = False
     filled_qty = None
     entry_price = None
@@ -144,7 +128,6 @@ def open_position_with_tp_sl(
     if status in ("FILLED", "PARTIALLY_FILLED"):
         immediate_filled = True
     if data.get("executedQty") or data.get("avgPrice"):
-        # 어떤 계정은 status 안 주고 체결수량/평단만 주기도 함
         immediate_filled = True
 
     if immediate_filled:
@@ -158,7 +141,7 @@ def open_position_with_tp_sl(
             or entry_price_hint
         )
     else:
-        # 2) FILLED 확인 (기존 방식)
+        # 2) 일정 시간 안에 FILLED 되는지 확인
         filled = wait_filled(symbol, entry_order_id, timeout=5)
         if not filled:
             send_tg("[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다.")
@@ -183,11 +166,10 @@ def open_position_with_tp_sl(
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
-            # ❗ 여기서는 '열었던 방향'을 넘겨야 exchange_api 가 반대 주문을 보내며 닫는다.
             try:
                 close_position_market(
                     symbol,
-                    side_open,  # ← 수정됨: close_side 가 아니라 side_open
+                    side_open,
                     _to_contract_qty(filled_qty),
                 )
             except Exception as e:
@@ -200,7 +182,7 @@ def open_position_with_tp_sl(
                 )
             return None
 
-    # 3.5) TP/SL 퍼센트 보정 (기존 내용 그대로)
+    # 3.5) TP/SL 퍼센트 보정
     if getattr(settings, "use_margin_based_tp_sl", False):
         lev = getattr(settings, "leverage", 1) or 1
         fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
@@ -217,14 +199,12 @@ def open_position_with_tp_sl(
     if min_sl_pct > 0:
         sl_pct = max(sl_pct, min_sl_pct)
 
-    # 시그널이 soft 면 tp 조금만
     if soft_mode:
         tp_min = getattr(settings, "range_tp_min", tp_pct)
         soft_factor = getattr(settings, "range_soft_tp_factor", 1.0)
         tp_soft_cap = tp_min * soft_factor
         tp_pct = min(tp_pct, tp_soft_cap)
 
-    # 숏일 때 SL 바닥 보정
     eff_sl_floor_ratio = sl_floor_ratio or getattr(settings, "range_short_sl_floor_ratio", 0.0)
     if side_open == "SELL" and eff_sl_floor_ratio > 0 and tp_pct > 0:
         min_short_sl = tp_pct * eff_sl_floor_ratio
@@ -243,7 +223,6 @@ def open_position_with_tp_sl(
 
     # 5) TP/SL 실제 주문
     try:
-        # 체결된 소수 수량으로 넣는다 (0.005 등)
         real_qty = _to_contract_qty(filled_qty)
         tp_resp = place_conditional(
             symbol,
@@ -261,10 +240,9 @@ def open_position_with_tp_sl(
         )
     except Exception as e:
         send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
-        # ❗ 여기서도 열었던 방향을 넘겨야 한다.
         close_position_market(
             symbol,
-            side_open,  # ← 수정됨: close_side 아님
+            side_open,
             _to_contract_qty(filled_qty),
         )
         return None
@@ -301,7 +279,6 @@ def open_position_with_tp_sl(
 
 
 def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
-    # 거래소에서 동기화해온 포지션은 그냥 놔둔다
     if trade.source == "SYNC":
         return True
 
@@ -340,8 +317,6 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
         need_sl = True
 
     ok = True
-
-    # 여기서도 무조건 소수 수량으로
     real_qty = _to_contract_qty(qty)
 
     if need_tp:
@@ -442,7 +417,6 @@ def check_closes(
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:
-                # TP/SL 재설정이 계속 실패하면 강제로 닫는다.
                 close_position_market(symbol, t.side, _to_contract_qty(t.qty))
                 closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
             else:
