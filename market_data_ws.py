@@ -5,6 +5,18 @@ BingX swap-market 웹소켓으로 1m/5m/15m 캔들과 depth5를 받아서
 메모리 버퍼에 보관하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
 getter 로 제공하는 모듈.
 
+PATCH NOTES — 2025-11-15 (3차: REST 히스토리 백필 지원)
+----------------------------------------------------
+1) REST 캔들 히스토리 백필용 헬퍼 추가
+   - preload_klines(...): 외부에서 계산/가공된 (ts, o, h, l, c, v) 튜플 리스트를
+     그대로 내부 버퍼(_kline_buffers)에 밀어넣어 초기화.
+   - backfill_klines_from_rest(...): BingX REST /kline 응답(list[list])을 그대로 받아
+     (ts, o, h, l, c, v) 튜플 리스트로 변환한 뒤 preload_klines(...) 를 호출.
+   - 둘 다 MAX_KLINES 를 넘으면 최근 MAX_KLINES 개만 보관.
+   - 백필 시 "[MD-WS BACKFILL] ..." 로그로 실제 채워진 개수와 심볼/타임프레임을 남김.
+   - run_bot_ws 쪽에서 fetch_klines_rest(...) 결과를 받아서 이 헬퍼들을 사용하면,
+     WS 연결 직후에도 5m/15m 지표 계산에 필요한 히스토리 캔들이 바로 준비된다.
+
 PATCH NOTES — 2025-11-15 (2차 보정)
 ----------------------------------------------------
 1) BingX WebSocket kline payload 형식 보정
@@ -404,14 +416,22 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
 
 
 def _on_error(ws: websocket.WebSocketApp, error: Any) -> None:
+    """WS 에러 콜백.
+
+    예) "Connection to remote host was lost" 와 같이 나오면
+    - 네트워크 끊김 / 서버 단절로 인해 연결이 끊어진 상황이고,
+    - start_ws_loop 의 재시도 루프가 RECONNECT_WAIT 초 뒤에 자동 재접속한다.
+    """
     log(f"[MD-WS] error: {error}")
 
 
 def _on_close(ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
+    """WS 연결 종료 콜백."""
     log(f"[MD-WS] closed: {code} {msg}")
 
 
 def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
+    """WS 연결 직후 구독 메시지를 전송한다."""
     msgs = _build_sub_msgs(symbol)
     for m in msgs:
         try:
@@ -422,7 +442,14 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
 
 
 def start_ws_loop(symbol: str) -> None:
-    """백그라운드 스레드에서 무한 재접속 루프로 WS를 유지한다."""
+    """백그라운드 스레드에서 무한 재접속 루프로 WS를 유지한다.
+
+    - run_bot_ws 에서는 보통 다음 순서로 사용하는 것을 권장:
+      1) (선택) REST 로 5m/15m 히스토리 캔들 가져오기
+         → fetch_klines_rest(...) 결과를 backfill_klines_from_rest(...) 에 넣어 백필
+      2) start_ws_loop(symbol) 호출로 실시간 WS 시작
+      3) 이후 get_klines_with_volume(...)/get_orderbook(...) 으로 시세/호가 조회
+    """
     url = WS_URL
 
     def _runner() -> None:
@@ -445,6 +472,85 @@ def start_ws_loop(symbol: str) -> None:
     th = threading.Thread(target=_runner, name=f"md-ws-{symbol}", daemon=True)
     th.start()
     log(f"[MD-WS] background ws started for {symbol}")
+
+
+# ─────────────────────────────
+# REST 히스토리 백필용 헬퍼
+# ─────────────────────────────
+
+
+def preload_klines(
+    symbol: str,
+    interval: str,
+    rows: List[Tuple[int, float, float, float, float, float]],
+) -> None:
+    """(ts, o, h, l, c, v) 튜플 리스트를 그대로 내부 버퍼에 세팅한다.
+
+    - rows 는 오래된 순서 → 최신 순서로 들어있다고 가정한다.
+    - MAX_KLINES 를 초과하면 가장 최근 MAX_KLINES 개만 보관한다.
+    - 보통은 REST /kline 응답을 가공해서 이 함수로 밀어넣는다.
+    """
+    key = (symbol, interval)
+    with _kline_lock:
+        # 너무 길면 뒤에서부터 자르기
+        trimmed = list(rows[-MAX_KLINES:])
+        _kline_buffers[key] = trimmed
+        buf_len = len(trimmed)
+
+    if getattr(SET, "ws_log_enabled", True):
+        try:
+            log(
+                f"[MD-WS BACKFILL] {symbol} {interval} preloaded "
+                f"from REST (len={buf_len})"
+            )
+        except Exception:
+            pass
+
+
+def backfill_klines_from_rest(
+    symbol: str,
+    interval: str,
+    rest_klines: List[List[Any]],
+) -> None:
+    """BingX REST /kline 응답(list[list])을 받아 버퍼에 백필한다.
+
+    예상 REST 포맷 예시:
+        rest_klines = [
+            [openTime, open, high, low, close, volume, closeTime, ...],
+            ...
+        ]
+
+    - openTime/closeTime 는 ms 단위라고 가정한다.
+    - REST 응답을 있는 그대로 넘기되, 필요 없는 필드는 이 함수에서 무시한다.
+    - 변환에 실패하는 행은 건너뛴다.
+    """
+    converted: List[Tuple[int, float, float, float, float, float]] = []
+    for row in rest_klines:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        try:
+            ts = int(row[0])
+            o = float(row[1])
+            h = float(row[2])
+            l = float(row[3])
+            c = float(row[4])
+            v = float(row[5])
+        except Exception:
+            continue
+        converted.append((ts, o, h, l, c, v))
+
+    if not converted:
+        if getattr(SET, "ws_log_enabled", True):
+            try:
+                log(
+                    f"[MD-WS BACKFILL] rest_klines for {symbol} {interval} "
+                    f"had no valid rows"
+                )
+            except Exception:
+                pass
+        return
+
+    preload_klines(symbol, interval, converted)
 
 
 # ─────────────────────────────
@@ -507,6 +613,8 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
 
 __all__ = [
     "start_ws_loop",
+    "preload_klines",
+    "backfill_klines_from_rest",
     "get_klines",
     "get_klines_with_volume",
     "get_orderbook",

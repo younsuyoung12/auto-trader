@@ -4,7 +4,6 @@
 # - 모든 모델은 db_core.Base 를 상속
 # - 테이블 이름은 bt_ 프리픽스로 통일
 # - 스키마를 분리하고 싶으면 __table_args__ 에 schema 지정해서 사용
-
 """
 db_models.py
 ====================================================
@@ -23,6 +22,12 @@ BingX Auto Trader - Postgres ORM 모델 정의 모듈.
      atr_fast/slow, soft_reason, arbitration_label 등)를 JSON 으로 기록.
 3) 대시보드/분석 대비 인덱스 정책 정리
    - symbol + ts 조합 인덱스로 시계열 조회 최적화.
+
+2025-11-15 검토/보완
+----------------------------------------------------
+1) 각 모델에 한국어 주석을 추가해 저장 의도를 더 명확히 했다.
+2) __all__ 정의로 외부에서 가져다 쓸 수 있는 심벌 목록을 명시했다.
+3) 기능적인 변경은 하지 않고, 문서화/가독성만 향상했다.
 """
 
 from datetime import datetime
@@ -52,6 +57,12 @@ NUMERIC_24_8 = Numeric(24, 8)
 # 캔들 (1m / 5m / 15m ...)
 # ─────────────────────────────
 class Candle(Base):
+    """시세 캔들(분봉/시간봉 등)을 저장하는 테이블.
+
+    - timeframe 에 1m / 5m / 15m / 1h 등을 구분해서 넣을 수 있다.
+    - volume/quote_volume 은 선택적이며, 소스에 따라 None 일 수 있다.
+    """
+
     __tablename__ = "bt_candles"
     # __table_args__ = {"schema": "bingx_trader"}  # 스키마 쓰려면 주석 해제 후 DB에 schema 생성
 
@@ -81,6 +92,12 @@ class Candle(Base):
 # 오더북 스냅샷 (depth5 기준)
 # ─────────────────────────────
 class OrderbookSnapshot(Base):
+    """호가창(depth5) 스냅샷 테이블.
+
+    - best_bid / best_ask / spread 를 빠르게 조회하기 위한 구조.
+    - bids_raw / asks_raw 에 depth5 전체를 JSON 으로 넣어둔다.
+    """
+
     __tablename__ = "bt_orderbook_snapshots"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -110,6 +127,12 @@ class OrderbookSnapshot(Base):
 # 지표 (인디케이터) 테이블
 # ─────────────────────────────
 class Indicator(Base):
+    """EMA, ATR, 거래량 관련 지표 등을 저장하는 테이블.
+
+    - 캔들과 1:1 매핑되게 ts/timeframe 을 맞춰 저장하는 것을 권장.
+    - extra_json 으로 실험적인 지표를 쉽게 확장할 수 있다.
+    """
+
     __tablename__ = "bt_indicators"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -153,6 +176,11 @@ class Indicator(Base):
 # Regime 점수 (TREND / RANGE / NO_TRADE)
 # ─────────────────────────────
 class RegimeScore(Base):
+    """시장 레짐(TREND / RANGE / NO_TRADE 등)에 대한 점수를 저장.
+
+    - 시그널 계산 전 단계에서 "지금은 어떤 장인가"를 기록하는 용도.
+    """
+
     __tablename__ = "bt_regime_scores"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -306,6 +334,8 @@ class Trade(Base):
 # 펀딩비
 # ─────────────────────────────
 class FundingRate(Base):
+    """펀딩비 이력을 저장하는 테이블."""
+
     __tablename__ = "bt_funding_rates"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -328,6 +358,8 @@ class FundingRate(Base):
 # 외부 이벤트 (FOMC, CPI 등)
 # ─────────────────────────────
 class ExternalEvent(Base):
+    """FOMC, CPI 같은 외부 이벤트 정보를 저장하는 테이블."""
+
     __tablename__ = "bt_external_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -350,3 +382,16 @@ class ExternalEvent(Base):
     __table_args__ = (
         Index("ix_bt_events_start_time", "start_time", unique=False),
     )
+
+
+__all__ = [
+    "NUMERIC_24_8",
+    "Candle",
+    "OrderbookSnapshot",
+    "Indicator",
+    "RegimeScore",
+    "EntryScore",
+    "Trade",
+    "FundingRate",
+    "ExternalEvent",
+]
