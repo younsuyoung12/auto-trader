@@ -5,13 +5,25 @@ BingX swap-market 웹소켓으로 1m/5m/15m 캔들과 depth5를 받아서
 메모리 버퍼에 보관하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
 getter 로 제공하는 모듈.
 
+PATCH NOTES — 2025-11-15 (4차: REST dict 포맷 백필 호환)
+----------------------------------------------------
+1) REST /kline 응답 포맷 보강
+   - BingX REST /kline 이 list[list] 뿐만 아니라 list[dict]
+     (예: {"t","o","h","l","c","v"} 또는 {"T","open",...}) 형태로도
+     내려오는 것이 확인됨.
+   - backfill_klines_from_rest(...) 가 두 포맷을 모두 파싱하도록 수정.
+   - dict/배열 행이 섞여 있어도 파싱 가능한 행만 골라 (ts, o, h, l, c, v)
+     튜플로 변환해서 버퍼에 적재.
+   - 일부 행 파싱에 실패해도 전체를 버리지 않고, 성공한 행들로만
+     백필을 수행하도록 유지.
+
 PATCH NOTES — 2025-11-15 (3차: REST 히스토리 백필 지원)
 ----------------------------------------------------
 1) REST 캔들 히스토리 백필용 헬퍼 추가
    - preload_klines(...): 외부에서 계산/가공된 (ts, o, h, l, c, v) 튜플 리스트를
      그대로 내부 버퍼(_kline_buffers)에 밀어넣어 초기화.
-   - backfill_klines_from_rest(...): BingX REST /kline 응답(list[list])을 그대로 받아
-     (ts, o, h, l, c, v) 튜플 리스트로 변환한 뒤 preload_klines(...) 를 호출.
+   - backfill_klines_from_rest(...): BingX REST /kline 응답(list[list] 또는 list[dict])을
+     받아 (ts, o, h, l, c, v) 튜플 리스트로 변환한 뒤 preload_klines(...) 를 호출.
    - 둘 다 MAX_KLINES 를 넘으면 최근 MAX_KLINES 개만 보관.
    - 백필 시 "[MD-WS BACKFILL] ..." 로그로 실제 채워진 개수와 심볼/타임프레임을 남김.
    - run_bot_ws 쪽에서 fetch_klines_rest(...) 결과를 받아서 이 헬퍼들을 사용하면,
@@ -512,31 +524,68 @@ def backfill_klines_from_rest(
     interval: str,
     rest_klines: List[List[Any]],
 ) -> None:
-    """BingX REST /kline 응답(list[list])을 받아 버퍼에 백필한다.
+    """BingX REST /kline 응답을 받아 버퍼에 백필한다.
 
     예상 REST 포맷 예시:
+        # 배열 기반 포맷
         rest_klines = [
             [openTime, open, high, low, close, volume, closeTime, ...],
             ...
         ]
 
+        # dict 기반 포맷 (예: swap v3 quote/klines)
+        rest_klines = [
+            {"t": openTime, "o": "...", "h": "...", "l": "...", "c": "...", "v": "..."},
+            ...
+        ]
+
     - openTime/closeTime 는 ms 단위라고 가정한다.
-    - REST 응답을 있는 그대로 넘기되, 필요 없는 필드는 이 함수에서 무시한다.
-    - 변환에 실패하는 행은 건너뛴다.
+    - 배열/딕셔너리 포맷을 모두 지원하며, 변환에 실패하는 행은 건너뛴다.
     """
     converted: List[Tuple[int, float, float, float, float, float]] = []
+
     for row in rest_klines:
-        if not isinstance(row, (list, tuple)) or len(row) < 6:
-            continue
         try:
-            ts = int(row[0])
-            o = float(row[1])
-            h = float(row[2])
-            l = float(row[3])
-            c = float(row[4])
-            v = float(row[5])
+            # 1) 배열(list/tuple) 기반 포맷
+            if isinstance(row, (list, tuple)):
+                if len(row) < 6:
+                    continue
+                ts = int(row[0])
+                o = float(row[1])
+                h = float(row[2])
+                l = float(row[3])
+                c = float(row[4])
+                v = float(row[5])
+
+            # 2) dict 기반 포맷 (v3 quote/klines 등)
+            elif isinstance(row, dict):
+                # 시간 키는 t/T/openTime/startTime 등 다양한 케이스를 고려
+                ts = int(
+                    row.get("t")
+                    or row.get("T")
+                    or row.get("openTime")
+                    or row.get("startTime")
+                    or 0
+                )
+                # 가격/거래량 키도 o/h/l/c/v 또는 open/high/low/close/volume 등 지원
+                o = float(row.get("o") or row.get("open") or 0)
+                h = float(row.get("h") or row.get("high") or 0)
+                l = float(row.get("l") or row.get("low") or 0)
+                c = float(row.get("c") or row.get("close") or 0)
+                v = float(row.get("v") or row.get("volume") or 0)
+
+            else:
+                # 알 수 없는 타입은 스킵
+                continue
+
+            # ts 가 0 이거나 값이 비정상인 경우도 스킵
+            if ts <= 0:
+                continue
+
         except Exception:
+            # 개별 행 파싱 실패는 전체를 막지 않고 스킵
             continue
+
         converted.append((ts, o, h, l, c, v))
 
     if not converted:
