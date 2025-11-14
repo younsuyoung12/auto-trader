@@ -5,6 +5,26 @@
 # - 테이블 이름은 bt_ 프리픽스로 통일
 # - 스키마를 분리하고 싶으면 __table_args__ 에 schema 지정해서 사용
 
+"""
+db_models.py
+====================================================
+BingX Auto Trader - Postgres ORM 모델 정의 모듈.
+
+2025-11-14 변경 요약
+----------------------------------------------------
+1) EntryScore / Trade 구조 정리
+   - bt_entry_scores 테이블에 진입 시점 점수/컴포넌트 저장.
+   - bt_trades 와 1:N 관계를 명시(Trade.entry_scores).
+2) Regime/Entry 스냅샷 설계 문서화
+   - RegimeScore.final_regime 에 매크로 레짐 상태 저장.
+   - Trade.entry_score / EntryScore.entry_score 로
+     "그때 그 시점 점수"를 별도 보존.
+   - EntryScore.components_json 으로 세부 컴포넌트(ema_gap, width_ratio,
+     atr_fast/slow, soft_reason, arbitration_label 등)를 JSON 으로 기록.
+3) 대시보드/분석 대비 인덱스 정책 정리
+   - symbol + ts 조합 인덱스로 시계열 조회 최적화.
+"""
+
 from datetime import datetime
 
 from sqlalchemy import (
@@ -163,6 +183,20 @@ class RegimeScore(Base):
 # Entry Score (진입 점수)
 # ─────────────────────────────
 class EntryScore(Base):
+    """진입 의사결정에 사용된 점수를 저장하는 테이블.
+
+    - 한 번의 진입 시 여러 score 버전을 남길 수 있음 (used_for_entry 플래그로 구분).
+    - components_json 예:
+      {
+        "trend_gap_ratio": 0.0042,
+        "range_width_ratio": 0.0021,
+        "atr_fast": 120.5,
+        "atr_slow": 80.3,
+        "arbitration_label": "HYBRID",
+        "notes": ["5m/15m 정합 ok", "1m_confirm_pass"],
+      }
+    """
+
     __tablename__ = "bt_entry_scores"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -180,7 +214,7 @@ class EntryScore(Base):
     regime_at_entry = Column(String(16), nullable=True)  # TREND / RANGE / NO_TRADE
 
     entry_score = Column(Float, nullable=False)
-    components_json = Column(JSON, nullable=True)  # {"trend": ..., "volume": ..., "funding": ...}
+    components_json = Column(JSON, nullable=True)  # {"trend": ..., "volume": ..., "funding": ..., ...}
 
     # 실제로 이 점수가 진입에 사용됐는지 여부
     used_for_entry = Column(Boolean, default=False, nullable=False)
@@ -201,6 +235,12 @@ class EntryScore(Base):
 # 트레이드 (자동 + 수동 통합)
 # ─────────────────────────────
 class Trade(Base):
+    """실제 체결된 트레이드(자동 + 수동)를 저장하는 테이블.
+
+    - 자동 매매의 경우 is_auto=True, strategy (TREND/RANGE 등) 으로 전략 구분.
+    - EntryScore 와의 관계(entry_scores)를 통해 진입 시점 점수 히스토리와 연결.
+    """
+
     __tablename__ = "bt_trades"
 
     id = Column(Integer, primary_key=True, autoincrement=True)

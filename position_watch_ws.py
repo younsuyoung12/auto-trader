@@ -3,7 +3,27 @@
 # 웹소켓으로 받은 1m/5m/15m 캔들을 기준으로 포지션을 감시해서
 # 조기익절, 조기청산, 박스→추세 전환, 반대 시그널 강제 청산을 수행하는 모듈.
 #
-# 2025-11-14 패치
+# 2025-11-14 패치 (6단계: trades 테이블 연동 + 폴백 금지)
+# ----------------------------------------------------
+# A) 포지션 종료 시 bt_trades 테이블과 상태를 묶어서 저장
+#    - 조기익절 / 조기손절 / 업그레이드(박스→추세) / 다운그레이드(추세→박스)
+#      / 반대 시그널 강제 청산에 대해 Trade ORM 레코드 업데이트 시도
+#    - trade.db_id / trade.id / trade.trade_id 중 하나라도 없으면
+#      절대 임의 PK 로 추정/생성하지 않고, 로그만 남기고 DB 업데이트를 건너뜀
+#    - 종료 가격, 종료 시각(ms), 실현 PnL, PnL% 를 bt_trades 에 반영
+#    - close_reason 은 기존 log_signal 에 쓰는 값과 동일 문자열 사용
+#    - note 필드에는 runtime_close=<reason> 형태로 힌트 남김
+#
+# B) 폴백 금지 방침
+#    - DB 연동에 필요한 데이터(세션, ORM, trade 식별자, 가격/수량/타임스탬프)가
+#      하나라도 빠지면 해당 포지션 종료에 대한 DB 업데이트는 "완전히" 생략
+#    - 이때도 포지션 청산(위험 관리) 자체는 그대로 수행
+#    - 모든 스킵/에러는 log(...) 로 Render 로그에 남김
+#
+# C) 기존 2025-11-14 / 2025-11-13 변경사항은 그대로 유지
+#    - RANGE/TREND 업/다운그레이드, 1m 확인, volume collapse 완화 트리거 등
+#
+# 2025-11-14 패치 (이전 내용)
 # ----------------------------------------------------
 # A) TREND→RANGE 다운그레이드(갈아타기) 로직 추가
 #    - `maybe_downgrade_trend_to_range(...)` 공개 함수 추가
@@ -46,6 +66,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, List, Tuple, Optional
 
 from telelog import log, send_tg
@@ -82,9 +103,17 @@ try:
 except Exception:
     open_position_with_tp_sl = None  # type: ignore
 
+# DB 연동 (bt_trades)
+try:
+    from db_core import SessionLocal  # type: ignore
+    from db_models import Trade as TradeORM  # type: ignore
+except Exception:  # pragma: no cover - DB 미준비 환경 방어
+    SessionLocal = None  # type: ignore
+    TradeORM = None  # type: ignore
+
 
 # ─────────────────────────────────────────
-# 공통 헬퍼
+# 공통 헬퍼 (방향/트렌드/볼륨 등)
 # ─────────────────────────────────────────
 
 def _get_15m_trend_dir(symbol: str) -> str:
@@ -127,8 +156,8 @@ def _all_candles_narrow(candles: List[Tuple], need_bars: int, max_range_pct: flo
 
 
 def _volume_collapse(candles_with_vol: List[Tuple], need_bars: int, ratio: float) -> bool:
-    """
-    가장 최근 봉의 거래량이 직전 봉들 평균보다 ratio 배 미만이면 True.
+    """가장 최근 봉의 거래량이 직전 봉들 평균보다 ratio 배 미만이면 True.
+
     candles_with_vol: (ts,o,h,l,c,v)
     """
     if not candles_with_vol or len(candles_with_vol) < need_bars:
@@ -145,7 +174,8 @@ def _volume_collapse(candles_with_vol: List[Tuple], need_bars: int, ratio: float
 
 
 def _is_range_1m_confirm_enabled(settings: Any) -> bool:
-    """RANGE에서 1분 확인을 사용할지 결정한다.
+    """RANGE에서 1분 확인을 사용할지 결정.
+
     - enable_1m_confirm_range 가 있으면 그 값을 우선
     - 없으면 기존 enable_1m_confirm 값 사용(하위호환)
     """
@@ -164,6 +194,123 @@ def _norm_dir(d: str) -> str:
     if d in {"LONG", "SHORT"}:
         return d
     return ""
+
+
+# ─────────────────────────────────────────
+# DB 연동 헬퍼 (bt_trades 업데이트, 폴백 금지)
+# ─────────────────────────────────────────
+
+def _get_trade_db_id(trade: Trade) -> Optional[int]:
+    """Trade 객체에서 ORM pk 후보를 가져온다.
+
+    - db_id → id → trade_id 순으로 확인
+    - 어떤 것도 없으면 None (이 경우 DB 업데이트는 건너뜀)
+    """
+    for attr in ("db_id", "id", "trade_id"):
+        try:
+            val = getattr(trade, attr, None)
+        except Exception:
+            val = None
+        if isinstance(val, int):
+            return val
+    return None
+
+
+def _update_trade_close_in_db(
+    *,
+    trade: Trade,
+    close_price: float,
+    close_reason: str,
+    event_ts_ms: Optional[int],
+    pnl: Optional[float],
+    cooldown_tag: Optional[str] = None,
+) -> None:
+    """bt_trades 레코드에 종료 정보 반영.
+
+    폴백 금지 정책:
+    - SessionLocal/TradeORM 없음 → 로그만 남기고 종료
+    - trade db_id/id 없음 → 로그만 남기고 종료
+    - 가격/수량/타임스탬프 누락 → 로그만 남기고 종료 (추정값 사용 금지)
+    """
+    if SessionLocal is None or TradeORM is None:
+        log("[TRADE_DB] SessionLocal/TradeORM 없음 → trades 업데이트 생략 (no fallback)")
+        return
+
+    trade_db_id = _get_trade_db_id(trade)
+    if trade_db_id is None:
+        log("[TRADE_DB] trade 객체에 db_id/id/trade_id 없음 → trades 업데이트 생략 (no fallback)")
+        return
+
+    if close_price <= 0 or getattr(trade, "entry", 0.0) <= 0 or getattr(trade, "qty", 0.0) <= 0:
+        log(
+            f"[TRADE_DB] invalid price/entry/qty for trade_id={trade_db_id} "
+            f"entry={getattr(trade, 'entry', None)} close={close_price} qty={getattr(trade, 'qty', None)} → 업데이트 생략"
+        )
+        return
+
+    if event_ts_ms is None:
+        log(f"[TRADE_DB] event_ts_ms 없음 → trade_id={trade_db_id} 업데이트 생략 (no fallback)")
+        return
+
+    try:
+        session = SessionLocal()
+    except Exception as e:  # pragma: no cover - 세션 생성 실패 방어
+        log(f"[TRADE_DB] Session 생성 실패 trade_id={trade_db_id}: {e}")
+        return
+
+    try:
+        orm: Optional[TradeORM] = session.get(TradeORM, trade_db_id)  # type: ignore[arg-type]
+        if orm is None:
+            log(f"[TRADE_DB] TradeORM 레코드 없음 id={trade_db_id} → 업데이트 생략")
+            return
+
+        exit_dt = datetime.fromtimestamp(event_ts_ms / 1000.0, tz=timezone.utc)
+
+        # PnL 계산 (없으면 여기서 계산)
+        real_pnl: float
+        if isinstance(pnl, (int, float)):
+            real_pnl = float(pnl)
+        else:
+            if trade.side == "BUY":
+                real_pnl = (close_price - float(trade.entry)) * float(trade.qty)
+            else:
+                real_pnl = (float(trade.entry) - close_price) * float(trade.qty)
+
+        base_notional = float(trade.entry) * float(trade.qty)
+        pnl_pct = real_pnl / base_notional if base_notional > 0 else None
+
+        orm.exit_ts = exit_dt
+        orm.exit_price = close_price
+        orm.pnl_usdt = real_pnl
+        orm.pnl_pct_futures = pnl_pct
+        orm.close_reason = close_reason
+
+        try:
+            # regime_at_exit 는 가능하면 원래 source 반영
+            if getattr(trade, "source", None):
+                orm.regime_at_exit = getattr(trade, "source")
+        except Exception:
+            pass
+
+        # note 에 runtime close 힌트 추가
+        note_bits: List[str] = []
+        if orm.note:
+            note_bits.append(orm.note)
+        note_bits.append(f"runtime_close={close_reason}")
+        if cooldown_tag:
+            note_bits.append(f"cooldown={cooldown_tag}")
+        orm.note = " | ".join(note_bits)
+
+        session.commit()
+        log(
+            f"[TRADE_DB] updated trade_id={trade_db_id} "
+            f"reason={close_reason} pnl={real_pnl:.4f} pnl_pct={(pnl_pct or 0.0)*100:.4f}%"
+        )
+    except Exception as e:  # pragma: no cover - DB 에러 방어
+        session.rollback()
+        log(f"[TRADE_DB] update 실패 trade_id={trade_db_id}: {e}")
+    finally:
+        session.close()
 
 
 # ─────────────────────────────────────────
@@ -212,6 +359,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
 
     last_close = c
 
+    # RANGE 조기익절
     if getattr(settings, "range_early_tp_enabled", False):
         early_tp_pct = getattr(settings, "range_early_tp_pct", 0.0025)
         if trade.side == "BUY" and last_close > trade.entry:
@@ -225,6 +373,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                         f"진입={trade.entry:.2f} 현재={last_close:.2f} "
                         f"수익={(gain_pct * 100):.2f}%"
                     )
+                    reason = "range_early_tp_runtime"
                     log_signal(
                         event="CLOSE",
                         symbol=trade.symbol,
@@ -232,8 +381,15 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                         direction=trade.side,
                         price=last_close,
                         qty=trade.qty,
-                        reason="range_early_tp_runtime",
+                        reason=reason,
                         pnl=pnl,
+                    )
+                    _update_trade_close_in_db(
+                        trade=trade,
+                        close_price=float(last_close),
+                        close_reason=reason,
+                        event_ts_ms=int(candle_ts),
+                        pnl=float(pnl),
                     )
                     return True
                 except Exception as e:
@@ -249,6 +405,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                         f"진입={trade.entry:.2f} 현재={last_close:.2f} "
                         f"수익={(gain_pct * 100):.2f}%"
                     )
+                    reason = "range_early_tp_runtime"
                     log_signal(
                         event="CLOSE",
                         symbol=trade.symbol,
@@ -256,13 +413,21 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                         direction=trade.side,
                         price=last_close,
                         qty=trade.qty,
-                        reason="range_early_tp_runtime",
+                        reason=reason,
                         pnl=pnl,
+                    )
+                    _update_trade_close_in_db(
+                        trade=trade,
+                        close_price=float(last_close),
+                        close_reason=reason,
+                        event_ts_ms=int(candle_ts),
+                        pnl=float(pnl),
                     )
                     return True
                 except Exception as e:
                     log(f"[EARLY_TP WS] close failed: {e}")
 
+    # RANGE 조기청산
     if not getattr(settings, "range_early_exit_enabled", False):
         return False
 
@@ -291,6 +456,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
             f"진입={trade.entry:.2f} 현재={last_close:.2f} "
             f"역행={(loss_pct * 100):.2f}%"
         )
+        reason = "range_early_exit_runtime"
         log_signal(
             event="CLOSE",
             symbol=trade.symbol,
@@ -298,8 +464,15 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
             direction=trade.side,
             price=last_close,
             qty=trade.qty,
-            reason="range_early_exit_runtime",
+            reason=reason,
             pnl=pnl,
+        )
+        _update_trade_close_in_db(
+            trade=trade,
+            close_price=float(last_close),
+            close_reason=reason,
+            event_ts_ms=int(candle_ts),
+            pnl=float(pnl),
         )
         return True
     except Exception as e:
@@ -338,8 +511,8 @@ def maybe_upgrade_range_to_trend(
     (
         new_signal_dir,
         new_signal_source,
-        _latest_ts,
-        _candles_5m,
+        latest_ts,
+        candles_5m,
         _candles_5m_raw,
         last_price,
         _extra,
@@ -375,6 +548,12 @@ def maybe_upgrade_range_to_trend(
         if gain_pct < upgrade_thresh:
             return False
 
+    # 캔들 ts (없으면 latest_ts 사용)
+    try:
+        candle_ts = int(candles_5m[-1][0]) if candles_5m else int(latest_ts)
+    except Exception:
+        candle_ts = int(latest_ts)
+
     try:
         close_position_market(trade.symbol, trade.side, trade.qty)
         if trade.side == "BUY":
@@ -385,6 +564,7 @@ def maybe_upgrade_range_to_trend(
             f"⚠️ (WS) 박스→추세 전환 감지: {trade.symbol} {trade.side} 수익권에서 정리 "
             f"(현재가={last_price:.2f}, 진입={trade.entry:.2f})"
         )
+        reason = "range_to_trend_upgrade"
         log_signal(
             event="CLOSE",
             symbol=trade.symbol,
@@ -392,8 +572,15 @@ def maybe_upgrade_range_to_trend(
             direction=trade.side,
             price=last_price,
             qty=trade.qty,
-            reason="range_to_trend_upgrade",
+            reason=reason,
             pnl=pnl,
+        )
+        _update_trade_close_in_db(
+            trade=trade,
+            close_price=float(last_price),
+            close_reason=reason,
+            event_ts_ms=candle_ts,
+            pnl=float(pnl),
         )
         return True
     except Exception as e:
@@ -411,9 +598,9 @@ def maybe_downgrade_trend_to_range(
     last_trend_close_ts: float,
     last_range_close_ts: float,
 ) -> bool:
-    """
-    추세 포지션 중이지만 시장이 횡보/박스 컨디션으로 바뀐 것으로 판단되면
-    추세 포지션을 정리하고 박스 전략으로 갈아탄다.
+    """추세 포지션이지만 시장이 박스로 전환됐다고 판단되면 추세 포지션을 정리하고
+    RANGE 전략으로 갈아탄다.
+
     - RANGE 신호가 현재 포지션 방향과 같을 때만 동작(무리한 반전 진입 방지)
     - PnL이 아주 작을 때(±max_abs_pnl) 또는 최소이익 이상일 때만 허용
     - RANGE 전용 1m 확인 토글을 반영
@@ -440,6 +627,7 @@ def maybe_downgrade_trend_to_range(
         return False
 
     last_price = float(candles_5m[-1][4])
+    candle_ts = int(candles_5m[-1][0])
     if last_price <= 0 or trade.entry <= 0:
         return False
 
@@ -453,7 +641,6 @@ def maybe_downgrade_trend_to_range(
             blocked_now, block_reason = False, ""
     else:
         try:
-            # 구버전 호환: 차단 함수 없으면 차단 없음으로 가정
             blocked_now, block_reason = False, ""
         except Exception:
             blocked_now, block_reason = False, ""
@@ -526,15 +713,15 @@ def maybe_downgrade_trend_to_range(
     # 기존 추세 포지션 정리
     try:
         close_position_market(symbol, trade.side, trade.qty)
-        pnl = (
-            (last_price - trade.entry) * trade.qty
-            if trade.side == "BUY"
-            else (trade.entry - last_price) * trade.qty
-        )
+        if trade.side == "BUY":
+            pnl = (last_price - trade.entry) * trade.qty
+        else:
+            pnl = (trade.entry - last_price) * trade.qty
         send_tg(
             f"⚠️ (WS) 추세→박스 다운그레이드: {symbol} {trade.side} 정리 후 RANGE 전환 준비 "
             f"(pnl≈{pnl_pct*100:.3f}%, last={last_price:.2f})"
         )
+        reason = "trend_to_range_downgrade"
         log_signal(
             event="CLOSE",
             symbol=symbol,
@@ -542,8 +729,15 @@ def maybe_downgrade_trend_to_range(
             direction=trade.side,
             price=last_price,
             qty=trade.qty,
-            reason="trend_to_range_downgrade",
+            reason=reason,
             pnl=pnl,
+        )
+        _update_trade_close_in_db(
+            trade=trade,
+            close_price=float(last_price),
+            close_reason=reason,
+            event_ts_ms=candle_ts,
+            pnl=float(pnl),
         )
     except Exception as e:
         log(f"[T2R WS] close failed: {e}")
@@ -629,6 +823,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
 
     last_close = c
 
+    # 추세 조기익절
     if getattr(settings, "trend_early_tp_enabled", False):
         trend_early_tp_pct = getattr(settings, "trend_early_tp_pct", 0.0025)
         if trade.side == "BUY" and last_close > trade.entry:
@@ -642,6 +837,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                         f"진입={trade.entry:.2f} 현재={last_close:.2f} "
                         f"수익={(gain_pct * 100):.2f}%"
                     )
+                    reason = "trend_early_tp_runtime"
                     log_signal(
                         event="CLOSE",
                         symbol=trade.symbol,
@@ -649,8 +845,15 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                         direction=trade.side,
                         price=last_close,
                         qty=trade.qty,
-                        reason="trend_early_tp_runtime",
+                        reason=reason,
                         pnl=pnl,
+                    )
+                    _update_trade_close_in_db(
+                        trade=trade,
+                        close_price=float(last_close),
+                        close_reason=reason,
+                        event_ts_ms=int(candle_ts),
+                        pnl=float(pnl),
                     )
                     return True
                 except Exception as e:
@@ -666,6 +869,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                         f"진입={trade.entry:.2f} 현재={last_close:.2f} "
                         f"수익={(gain_pct * 100):.2f}%"
                     )
+                    reason = "trend_early_tp_runtime"
                     log_signal(
                         event="CLOSE",
                         symbol=trade.symbol,
@@ -673,13 +877,21 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                         direction=trade.side,
                         price=last_close,
                         qty=trade.qty,
-                        reason="trend_early_tp_runtime",
+                        reason=reason,
                         pnl=pnl,
+                    )
+                    _update_trade_close_in_db(
+                        trade=trade,
+                        close_price=float(last_close),
+                        close_reason=reason,
+                        event_ts_ms=int(candle_ts),
+                        pnl=float(pnl),
                     )
                     return True
                 except Exception as e:
                     log(f"[TREND_EARLY_TP WS] close failed: {e}")
 
+    # 추세 조기청산
     if not getattr(settings, "trend_early_exit_enabled", False):
         return False
 
@@ -719,6 +931,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             f"진입={trade.entry:.2f} 현재={last_close:.2f} "
             f"역행={(loss_pct * 100):.2f}% (eff_trig={eff_trig*100:.2f}%)"
         )
+        reason = "trend_early_exit_runtime"
         log_signal(
             event="CLOSE",
             symbol=trade.symbol,
@@ -726,8 +939,15 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             direction=trade.side,
             price=last_close,
             qty=trade.qty,
-            reason="trend_early_exit_runtime",
+            reason=reason,
             pnl=pnl,
+        )
+        _update_trade_close_in_db(
+            trade=trade,
+            close_price=float(last_close),
+            close_reason=reason,
+            event_ts_ms=int(candle_ts),
+            pnl=float(pnl),
         )
         return True
     except Exception as e:
@@ -758,7 +978,7 @@ def maybe_close_on_opposite_signal(
     if sig_ctx is None:
         return False
 
-    new_dir, new_src, _ts, _c5, _c5raw, last_price, _extra = sig_ctx
+    new_dir, new_src, ts_ms, _c5, _c5raw, last_price, _extra = sig_ctx
 
     def _is_opposite(trade_side: str, sig_dir: str) -> bool:
         nd = _norm_dir(sig_dir)
@@ -768,20 +988,21 @@ def maybe_close_on_opposite_signal(
             return True
         return False
 
+    # TREND 포지션: TREND/HYBRID 반대 시그널 시 강제 청산
     if trade.source == "TREND" and new_src in ("TREND", "HYBRID"):
         if _is_opposite(trade.side, new_dir):
             log(f"[OPP WS] TREND opposite detected → close {trade.symbol}")
             try:
                 close_position_market(trade.symbol, trade.side, trade.qty)
-                pnl = (
-                    (last_price - trade.entry) * trade.qty
-                    if trade.side == "BUY"
-                    else (trade.entry - last_price) * trade.qty
-                )
+                if trade.side == "BUY":
+                    pnl = (last_price - trade.entry) * trade.qty
+                else:
+                    pnl = (trade.entry - last_price) * trade.qty
                 send_tg(
                     f"⚠️ (WS) 추세 포지션 반대 TREND/HYBRID 시그널 감지 → 즉시 청산: {trade.symbol} "
                     f"{trade.side}→{new_dir} 현재={last_price:.2f}"
                 )
+                reason = "trend_opposite_signal_close"
                 log_signal(
                     event="CLOSE",
                     symbol=trade.symbol,
@@ -789,28 +1010,36 @@ def maybe_close_on_opposite_signal(
                     direction=trade.side,
                     price=last_price,
                     qty=trade.qty,
-                    reason="trend_opposite_signal_close",
+                    reason=reason,
                     pnl=pnl,
+                )
+                _update_trade_close_in_db(
+                    trade=trade,
+                    close_price=float(last_price),
+                    close_reason=reason,
+                    event_ts_ms=int(ts_ms),
+                    pnl=float(pnl),
                 )
                 return True
             except Exception as e:
                 log(f"[OPP WS] close failed: {e}")
                 return False
 
+    # RANGE 포지션: 어떤 소스든 반대 방향이면 강제 청산
     if trade.source == "RANGE":
         if _is_opposite(trade.side, new_dir):
             log(f"[OPP WS] RANGE opposite detected → close {trade.symbol}")
             try:
                 close_position_market(trade.symbol, trade.side, trade.qty)
-                pnl = (
-                    (last_price - trade.entry) * trade.qty
-                    if trade.side == "BUY"
-                    else (trade.entry - last_price) * trade.qty
-                )
+                if trade.side == "BUY":
+                    pnl = (last_price - trade.entry) * trade.qty
+                else:
+                    pnl = (trade.entry - last_price) * trade.qty
                 send_tg(
                     f"⚠️ (WS) 박스 포지션 반대 시그널 감지 → 즉시 청산: {trade.symbol} "
                     f"{trade.side}→{new_dir} 현재={last_price:.2f}"
                 )
+                reason = "range_opposite_signal_close"
                 log_signal(
                     event="CLOSE",
                     symbol=trade.symbol,
@@ -818,8 +1047,15 @@ def maybe_close_on_opposite_signal(
                     direction=trade.side,
                     price=last_price,
                     qty=trade.qty,
-                    reason="range_opposite_signal_close",
+                    reason=reason,
                     pnl=pnl,
+                )
+                _update_trade_close_in_db(
+                    trade=trade,
+                    close_price=float(last_price),
+                    close_reason=reason,
+                    event_ts_ms=int(ts_ms),
+                    pnl=float(pnl),
                 )
                 return True
             except Exception as e:

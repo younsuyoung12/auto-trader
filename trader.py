@@ -1,9 +1,16 @@
 """
-수정 내용 (2025-11-13)
+수정 내용 (2025-11-13~2025-11-14)
 1) _to_contract_qty(...) 에서 0 으로 떨어지는 소수 수량을 최소 step(0.001)으로 보정
 2) 슬리피지 가드/TP·SL 예약 실패 시 close_position_market(...) 에 항상 '열었던 방향(side_open)'을 넘기도록 통일
 3) 체결 정보 파싱 시 executedQty, quantity, order.orderId 등 BingX 다양한 응답 케이스 보강
 4) ensure_tp_sl_for_trade(...) 재설정 실패 시에도 소수 수량 그대로 넘기도록 통일
+5) (2025-11-14) BingX REST/DB 동기화용 체결 데이터 strict 파싱
+   - _extract_filled_info_strict(...) 추가
+   - open_position_with_tp_sl(...) 에서 filled_qty/entry_price 를 API 응답에서만 가져오고,
+     없거나 0/NaN 이면 에러 로그 + 진입 실패 처리 (qty/entry_price_hint 로 폴백 금지)
+6) (2025-11-14) check_closes(...) 에서 summarize_fills 예외를 잡고 로그만 남기도록 방어
+   - fill 요약을 못 가져온 경우에도 봇이 죽지 않도록 하고,
+     이후 단계(포지션/주문 히스토리 DB 동기화)는 summary 유효성 검사 후에만 실행.
 """
 
 from __future__ import annotations
@@ -28,6 +35,47 @@ def _to_contract_qty(q: float) -> float:
         return 0.001
     v = float(f"{q:.3f}")
     return v if v > 0 else 0.001
+
+
+def _extract_filled_info_strict(payload: Dict[str, Any]) -> Tuple[float, float]:
+    """BingX 체결 응답에서 실제 체결 수량/평균가를 강제 추출한다.
+
+    - executedQty / quantity / origQty / origQuantity 중 하나도 없으면 예외
+    - avgPrice / price 가 없거나 0 이하면 예외
+    - 수량/가격 파싱 실패 시 예외
+
+    → DB 동기화/통계용으로 쓰이는 값이라, 폴백(신호에서 계산한 qty/hint 가격)을
+      전혀 쓰지 않고, 거래소가 준 진짜 값이 없으면 진입 자체를 실패 처리한다.
+    """
+    d = payload.get("data") or payload
+
+    qty_raw = (
+        d.get("executedQty")
+        or d.get("quantity")
+        or d.get("origQty")
+        or d.get("origQuantity")
+    )
+    price_raw = d.get("avgPrice") or d.get("price")
+
+    missing: List[str] = []
+    if qty_raw is None:
+        missing.append("executedQty/quantity/origQty")
+    if price_raw is None:
+        missing.append("avgPrice/price")
+
+    if missing:
+        raise ValueError("missing fields: " + ", ".join(missing))
+
+    try:
+        qty = float(qty_raw)
+        price = float(price_raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid qty/price: qty={qty_raw!r}, price={price_raw!r}")
+
+    if qty <= 0 or price <= 0:
+        raise ValueError(f"non-positive qty/price: qty={qty}, price={price}")
+
+    return qty, price
 
 
 @dataclass
@@ -91,16 +139,24 @@ def open_position_with_tp_sl(
     soft_mode: bool = False,
     sl_floor_ratio: Optional[float] = None,
 ) -> Optional[Trade]:
-    # 1) 시장가 진입 (소수 그대로)
+    """시장가 진입 + TP/SL 예약까지 한 번에 처리.
+
+    - 체결 수량/가격은 반드시 BingX 응답에서 가져오고, 없으면 진입 실패(폴백 금지).
+    - 슬리피지 가드/TP·SL 예약 실패 시에는 '열었던 방향(side_open)' 기준으로 청산 시도.
+    """
+
+    # 1) 시장가 진입 (수량은 거래소 최소단위로 라운딩)
     try:
         resp = place_market(symbol, side_open, _to_contract_qty(qty))
     except Exception as e:
-        send_tg(f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}")
+        msg = f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}"
+        log(msg)
+        send_tg(msg)
         return None
 
     data = resp.get("data") or resp
 
-    # 주문 id 추출
+    # 주문 id 추출 (없으면 진입 자체를 실패 처리)
     entry_order_id = (
         data.get("orderId")
         or data.get("id")
@@ -116,52 +172,52 @@ def open_position_with_tp_sl(
             )
 
     if not entry_order_id:
-        send_tg("[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다.")
+        msg = "[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다."
+        log(msg)
+        send_tg(msg)
         return None
 
     # 1.5) 즉시 체결 여부 확인
     immediate_filled = False
-    filled_qty = None
-    entry_price = None
-
     status = data.get("status") or data.get("orderStatus")
     if status in ("FILLED", "PARTIALLY_FILLED"):
         immediate_filled = True
     if data.get("executedQty") or data.get("avgPrice"):
         immediate_filled = True
 
+    # 2) 체결 수량/가격 strict 파싱
     if immediate_filled:
-        filled_qty = float(
-            data.get("executedQty")
-            or data.get("quantity")
-            or qty
-        )
-        entry_price = float(
-            data.get("avgPrice")
-            or entry_price_hint
-        )
+        try:
+            filled_qty, entry_price = _extract_filled_info_strict(data)
+        except ValueError as e:
+            msg = f"[ENTRY][{source}] ❌ 시장가 체결 데이터 이상(즉시 FILL): {e}"
+            log(msg)
+            send_tg(msg)
+            return None
     else:
-        # 2) 일정 시간 안에 FILLED 되는지 확인
+        # 일정 시간 안에 FILLED 되는지 확인
         filled = wait_filled(symbol, entry_order_id, timeout=5)
         if not filled:
-            send_tg("[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다.")
+            msg = "[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다."
+            log(msg)
+            send_tg(msg)
             return None
 
-        filled_qty = float(
-            filled.get("quantity")
-            or filled.get("executedQty")
-            or qty
-        )
-        entry_price = float(
-            filled.get("avgPrice")
-            or entry_price_hint
-        )
+        try:
+            filled_qty, entry_price = _extract_filled_info_strict(filled)
+        except ValueError as e:
+            msg = f"[ENTRY][{source}] ❌ 시장가 체결 데이터 이상(wait_filled): {e}"
+            log(msg)
+            send_tg(msg)
+            return None
 
     if filled_qty <= 0:
-        send_tg("[ENTRY] ⚠️ 시장가 체결 수량이 0입니다. 포지션을 건너뜁니다.")
+        msg = "[ENTRY] ⚠️ 시장가 체결 수량이 0입니다. 포지션을 건너뜁니다."
+        log(msg)
+        send_tg(msg)
         return None
 
-    # 3) 슬리피지 가드
+    # 3) 슬리피지 가드 (신호 시점의 entry_price_hint 대비)
     max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0)
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
@@ -173,13 +229,19 @@ def open_position_with_tp_sl(
                     _to_contract_qty(filled_qty),
                 )
             except Exception as e:
-                send_tg(
-                    f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} 라서 닫으려 했으나 실패: {e}"
+                msg = (
+                    f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} "
+                    f"라서 닫으려 했으나 실패: {e}"
                 )
+                log(msg)
+                send_tg(msg)
             else:
-                send_tg(
-                    f"[ENTRY][{source}] ❌ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} → 포지션 취소"
+                msg = (
+                    f"[ENTRY][{source}] ❌ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} "
+                    "→ 포지션 취소"
                 )
+                log(msg)
+                send_tg(msg)
             return None
 
     # 3.5) TP/SL 퍼센트 보정
@@ -239,7 +301,9 @@ def open_position_with_tp_sl(
             "STOP_MARKET",
         )
     except Exception as e:
-        send_tg(f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다.")
+        msg = f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다."
+        log(msg)
+        send_tg(msg)
         close_position_market(
             symbol,
             side_open,
@@ -280,6 +344,7 @@ def open_position_with_tp_sl(
 
 def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     if trade.source == "SYNC":
+        # 거래소에서 동기화한 포지션은 TP/SL 을 건드리지 않는다.
         return True
 
     symbol = trade.symbol
@@ -374,6 +439,11 @@ def check_closes(
     open_trades: List[Trade],
     state: TraderState,
 ) -> Tuple[List[Trade], List[Dict[str, Any]]]:
+    """TP/SL 체결 여부를 확인하고, 닫힌 포지션 목록을 돌려준다.
+
+    - summarize_fills(...) 에서 예외가 나면 로그만 남기고 그 포지션은 그대로 유지한다.
+      (DB 동기화/통계 모듈에서 summary 유효성 검사를 거쳐서만 기록하도록 하기 위함.)
+    """
     if not open_trades:
         return [], []
 
@@ -382,6 +452,7 @@ def check_closes(
 
     for t in open_trades:
         if t.source == "SYNC":
+            # 외부에서 동기화한 포지션은 여기서 닫지 않는다.
             still_open.append(t)
             continue
 
@@ -396,9 +467,13 @@ def check_closes(
                 d = o.get("data") or o
                 st = d.get("status") or d.get("orderStatus")
                 if st == "FILLED":
-                    summary = summarize_fills(symbol, tp_id)
-                    closed_results.append({"trade": t, "reason": "TP", "summary": summary})
-                    closed = True
+                    try:
+                        summary = summarize_fills(symbol, tp_id)
+                    except Exception as e:
+                        log(f"check_closes TP summarize_fills error: {e}")
+                    else:
+                        closed_results.append({"trade": t, "reason": "TP", "summary": summary})
+                        closed = True
             except Exception as e:
                 log(f"check_closes TP error: {e}")
 
@@ -408,15 +483,20 @@ def check_closes(
                 d = o.get("data") or o
                 st = d.get("status") or d.get("orderStatus")
                 if st == "FILLED":
-                    summary = summarize_fills(symbol, sl_id)
-                    closed_results.append({"trade": t, "reason": "SL", "summary": summary})
-                    closed = True
+                    try:
+                        summary = summarize_fills(symbol, sl_id)
+                    except Exception as e:
+                        log(f"check_closes SL summarize_fills error: {e}")
+                    else:
+                        closed_results.append({"trade": t, "reason": "SL", "summary": summary})
+                        closed = True
             except Exception as e:
                 log(f"check_closes SL error: {e}")
 
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:
+                # TP/SL 재설정이 연속으로 실패하면 강제 청산 시도
                 close_position_market(symbol, t.side, _to_contract_qty(t.qty))
                 closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
             else:

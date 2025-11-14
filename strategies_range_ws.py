@@ -2,7 +2,17 @@
 strategies_range_ws.py
 웹소켓으로 받은 5m/15m 캔들을 기준으로 박스장(레인지) 전략을 판단하는 모듈.
 
-2025-11-13 추가 보정
+2025-11-14 보강
+----------------------------------------------------
+1) signal_flow_ws 동시 중재(arbitration) 플로우와 인터페이스 정리.
+   - decide_signal_range(...)는 방향("LONG" / "SHORT")만 판단하는 순수 엔진으로 유지.
+   - TP/SL 계산과 soft 차단은 compute_range_params(...) 및 signal_flow_ws 쪽에서 결합.
+2) should_block_range_today_with_level(...)의 반환 reason 규격화.
+   - 강한 차단: "atr" / "ema" → RANGE 전략 자체를 막음.
+   - 완화 차단: "soft_atr" / "soft_ema" → 신호는 허용하되 TP/SL 보수적으로 조정.
+3) settings 접근은 전역적으로 getattr(..., default) 패턴을 사용해 ENV 누락 시 크래시 방지.
+
+2025-11-13 추가 보정 (유지)
 ----------------------------------------------------
 1) settings 연동 강화(하위호환):
    - decide_signal_range(..)에 optional settings 파라미터를 추가(기존 호출은 그대로 동작).
@@ -17,7 +27,7 @@ strategies_range_ws.py
    - ATR 압축 기준: fast < slow * settings.range_atr_fast_ratio_limit (기본 0.6)
    - 15m EMA 이격 기준: dist > settings.range_ema_dist_thresh (기본 0.01 = 1%)
 
-기존 2025-11-13 변경 사항
+기존 2025-11-13 변경 사항(요약)
 ----------------------------------------------------
 1) 기존 버전은 최근 N개 3m 캔들로 박스를 만들었으나, BingX 환경에서 3m가 안정적으로
    오지 않는 문제가 있어 5m 기준으로 전부 변경했다.
@@ -42,7 +52,7 @@ from telelog import log
 if TYPE_CHECKING:
     from settings_ws import BotSettings
 
-# 타입 별칭
+# 타입 별칭: (ts, open, high, low, close)
 Candles = List[Candle]
 
 
@@ -50,15 +60,22 @@ Candles = List[Candle]
 # 내부 유틸: 캔들 정제
 # ─────────────────────────────
 def _clean_candles(candles: Candles) -> Candles:
-    """(ts, o, h, l, c[, v]) 형태가 아닌 값/결측을 배제하고 반환한다."""
+    """(ts, o, h, l, c[, v]) 형태가 아닌 값/결측을 배제하고 반환한다.
+
+    - 숫자로 캐스팅이 안 되거나
+    - NaN / 0 / 음수 close 가 포함된 행은 버린다.
+    → RANGE 로직 전체에서 공통으로 사용되는 방어 필터.
+    """
     cleaned: Candles = []
     for c in candles or []:
         try:
             ts, o, h, l, cclose = c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4])
-            # close가 정상이어야만 포함
-            if cclose > 0 and not (math.isnan(o) or math.isnan(h) or math.isnan(l) or math.isnan(cclose)):
-                cleaned.append(c)
+            if cclose > 0 and not (
+                math.isnan(o) or math.isnan(h) or math.isnan(l) or math.isnan(cclose)
+            ):
+                cleaned.append((ts, o, h, l, cclose))
         except Exception:
+            # 개별 캔들 오류는 전체 전략에 영향을 주지 않게 조용히 스킵
             continue
     return cleaned
 
@@ -75,6 +92,11 @@ def decide_signal_range(
 
     반환값:
         "LONG" / "SHORT" / None
+
+    - 최근 `lookback` 개 5m 캔들의 high/low 로 박스 폭을 계산.
+    - 박스 폭 비율이 너무 작으면(너무 좁은 박스) RANGE 전략 자체를 스킵.
+    - 상단 퍼센타일 이상이면 SHORT, 하단 퍼센타일 이하이면 LONG.
+    - 퍼센타일/폭 임계는 settings 로 오버라이드 가능.
     """
     candles_5m = _clean_candles(candles_5m)
     log(f"[RANGE] (WS) decide_signal_range 5m_count={len(candles_5m)} lookback={lookback}")
@@ -93,17 +115,19 @@ def decide_signal_range(
     box_pct = box_h / lo if lo > 0 else 0.0
 
     # 최소 박스폭 임계 (기본 0.15%)
-    box_min_pct = getattr(settings, "range_box_min_width_pct", 0.0015) if settings else 0.0015
+    box_min_pct = (
+        float(getattr(settings, "range_box_min_width_pct", 0.0015)) if settings else 0.0015
+    )
     if box_pct < box_min_pct:
         log(f"[RANGE] (WS) box too narrow pct={box_pct:.6f} < {box_min_pct}")
         return None
 
     # 상단/하단 퍼센타일 (기본 80% / 20%)
-    up_pct = getattr(settings, "range_entry_upper_pct", 0.80) if settings else 0.80
-    lo_pct = getattr(settings, "range_entry_lower_pct", 0.20) if settings else 0.20
-    # 방어적 클램프
-    up_pct = max(0.5, min(0.99, float(up_pct)))
-    lo_pct = max(0.01, min(0.5, float(lo_pct)))
+    up_pct = float(getattr(settings, "range_entry_upper_pct", 0.80)) if settings else 0.80
+    lo_pct = float(getattr(settings, "range_entry_lower_pct", 0.20)) if settings else 0.20
+    # 방어적 클램프 (완전 상단/하단으로 붙는 값 방지)
+    up_pct = max(0.5, min(0.99, up_pct))
+    lo_pct = max(0.01, min(0.5, lo_pct))
 
     upper_line = lo + box_h * up_pct
     lower_line = lo + box_h * lo_pct
@@ -113,6 +137,7 @@ def decide_signal_range(
         f"upper@{up_pct:.2f}→{upper_line:.2f} lower@{lo_pct:.2f}→{lower_line:.2f}"
     )
 
+    # 상단에 닿으면 숏, 하단에 닿으면 롱 후보로 해석
     if now_price >= upper_line:
         log(f"[RANGE] (WS) SHORT zone hit price={now_price} upper_line={upper_line}")
         return "SHORT"
@@ -124,7 +149,7 @@ def decide_signal_range(
 
 
 # ─────────────────────────────
-# 박스장 TP/SL 계산 보조 (5m 기준이지만 로직은 동일)
+# 박스장 TP/SL 계산 보조
 # ─────────────────────────────
 def compute_range_params(
     direction: str,
@@ -137,20 +162,34 @@ def compute_range_params(
 
     반환 예:
         {"tp_pct": 0.0042, "sl_pct": 0.0035}
+
+    - settings 가 있으면 range_tp_* / range_sl_* 로 기본값을 오버라이드.
+    - use_range_dynamic_tp 가 켜져 있으면 최근 평균 고저폭을 기준으로 TP 를 동적으로 계산.
+    - soft_reason 이 들어오면 TP 상한을 range_soft_tp_factor × tp_min 으로 제한.
+    - SHORT 일 때는 SL 이 지나치게 짧지 않도록 range_short_sl_floor_ratio 로 바닥을 깐다.
     """
     candles_5m = _clean_candles(candles_5m)
 
-    # 기본값
+    # 기본값 (settings 없을 때도 동작하도록)
     base_tp = 0.006
     base_sl = 0.004
 
     if settings is not None:
+        # 방향별 기본 TP/SL
         if direction == "LONG":
-            base_tp = getattr(settings, "range_tp_long_pct", getattr(settings, "range_tp_pct", 0.006))
-            base_sl = getattr(settings, "range_sl_long_pct", getattr(settings, "range_sl_pct", 0.004))
+            base_tp = float(
+                getattr(settings, "range_tp_long_pct", getattr(settings, "range_tp_pct", 0.006))
+            )
+            base_sl = float(
+                getattr(settings, "range_sl_long_pct", getattr(settings, "range_sl_pct", 0.004))
+            )
         else:  # SHORT
-            base_tp = getattr(settings, "range_tp_short_pct", getattr(settings, "range_tp_pct", 0.006))
-            base_sl = getattr(settings, "range_sl_short_pct", getattr(settings, "range_sl_pct", 0.004))
+            base_tp = float(
+                getattr(settings, "range_tp_short_pct", getattr(settings, "range_tp_pct", 0.006))
+            )
+            base_sl = float(
+                getattr(settings, "range_sl_short_pct", getattr(settings, "range_sl_pct", 0.004))
+            )
 
         # 동적 TP (최근 평균 고저폭을 비율화)
         if getattr(settings, "use_range_dynamic_tp", False) and len(candles_5m) >= lookback_for_vol:
@@ -159,20 +198,20 @@ def compute_range_params(
             last_close = float(candles_5m[-1][4])
             if last_close > 0 and not math.isnan(last_close):
                 dyn_tp = avg_hl / last_close
-                tp_min = getattr(settings, "range_tp_min", 0.0035)
-                tp_max = getattr(settings, "range_tp_max", 0.0065)
+                tp_min = float(getattr(settings, "range_tp_min", 0.0035))
+                tp_max = float(getattr(settings, "range_tp_max", 0.0065))
                 dyn_tp = max(tp_min, min(tp_max, dyn_tp))
                 base_tp = dyn_tp
 
         # soft 허용이면 좀 더 보수적으로 (tp ≤ tp_min * soft_factor)
         if soft_reason:
-            tp_min = getattr(settings, "range_tp_min", 0.0035) if settings else 0.0035
-            soft_factor = getattr(settings, "range_soft_tp_factor", 1.2) if settings else 1.2
+            tp_min = float(getattr(settings, "range_tp_min", 0.0035)) if settings else 0.0035
+            soft_factor = float(getattr(settings, "range_soft_tp_factor", 1.2)) if settings else 1.2
             base_tp = min(base_tp, tp_min * soft_factor)
 
-    # 숏일 때 SL 하한을 TP의 ratio로 보정
+    # 숏일 때 SL 하한을 TP의 ratio 로 보정해, 너무 가까운 SL 을 방지
     if direction == "SHORT":
-        ratio = getattr(settings, "range_short_sl_floor_ratio", 0.75) if settings else 0.75
+        ratio = float(getattr(settings, "range_short_sl_floor_ratio", 0.75)) if settings else 0.75
         widened_sl = base_tp * float(ratio)
         base_sl = max(base_sl, widened_sl)
 
@@ -195,9 +234,12 @@ def should_block_range_today(
     candles_5m = _clean_candles(candles_5m)
     candles_15m = _clean_candles(candles_15m)
 
-    atr_fast_ratio_limit = getattr(settings, "range_atr_fast_ratio_limit", 0.6) if settings else 0.6
-    ema_dist_thresh = getattr(settings, "range_ema_dist_thresh", 0.01) if settings else 0.01
+    atr_fast_ratio_limit = (
+        float(getattr(settings, "range_atr_fast_ratio_limit", 0.6)) if settings else 0.6
+    )
+    ema_dist_thresh = float(getattr(settings, "range_ema_dist_thresh", 0.01)) if settings else 0.01
 
+    # ATR 기반: 5m 변동성이 너무 작으면 RANGE 를 막는다.
     atr_fast = calc_atr(candles_5m, 14)
     atr_slow = calc_atr(candles_5m, 40)
     if atr_fast and atr_slow and atr_slow > 0:
@@ -208,6 +250,7 @@ def should_block_range_today(
             )
             return True
 
+    # 15m EMA 기반: 이미 추세장이 너무 강하면 RANGE 를 막는다.
     if candles_15m:
         closes_15 = [float(c[4]) for c in candles_15m]
         if len(closes_15) >= 50:
@@ -236,12 +279,19 @@ def should_block_range_today_with_level(
 
     반환값:
         (blocked: bool, reason: str)
+
+    - level 미지정(settings=None): should_block_range_today 와 동일한 하드 차단.
+    - level == 0: ATR/EMA 조건을 만족하면 무조건 차단.
+    - level == 1: soft_* reason 으로만 반환(신호는 허용, TP/SL 은 보수적으로).
+    - level >= 2: 다시 강하게 차단.
     """
     candles_5m = _clean_candles(candles_5m)
     candles_15m = _clean_candles(candles_15m)
 
-    atr_fast_ratio_limit = getattr(settings, "range_atr_fast_ratio_limit", 0.6) if settings else 0.6
-    ema_dist_thresh = getattr(settings, "range_ema_dist_thresh", 0.01) if settings else 0.01
+    atr_fast_ratio_limit = (
+        float(getattr(settings, "range_atr_fast_ratio_limit", 0.6)) if settings else 0.6
+    )
+    ema_dist_thresh = float(getattr(settings, "range_ema_dist_thresh", 0.01)) if settings else 0.01
 
     atr_fast = calc_atr(candles_5m, 14)
     atr_slow = calc_atr(candles_5m, 40)
@@ -262,6 +312,7 @@ def should_block_range_today_with_level(
                 if dist > ema_dist_thresh:
                     ema_block = True
 
+    # settings 없음: 단순 하드 차단 모드
     if settings is None:
         if atr_block:
             log(
@@ -275,8 +326,9 @@ def should_block_range_today_with_level(
             return True, "ema"
         return False, ""
 
-    level = getattr(settings, "range_strict_level", 0)
+    level = int(getattr(settings, "range_strict_level", 0))
 
+    # level 0: 강한 차단(ATR/EMA 조건 만족 시 바로 막음)
     if level == 0:
         if atr_block:
             log(
@@ -290,6 +342,7 @@ def should_block_range_today_with_level(
             return True, "ema"
         return False, ""
 
+    # level 1: soft 차단(신호는 허용하되 reason 으로만 표시)
     if level == 1:
         if atr_block:
             log(
@@ -303,7 +356,7 @@ def should_block_range_today_with_level(
             return False, "soft_ema"
         return False, ""
 
-    # level 2 이상은 다시 강하게
+    # level 2 이상은 다시 강한 차단
     if atr_block:
         log(
             f"[RANGE_BLOCK] (WS) ATR compressed (level {level}): fast={atr_fast:.6f} slow={atr_slow:.6f}"

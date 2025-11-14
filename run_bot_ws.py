@@ -1,26 +1,38 @@
-"""
-run_bot_ws.py
+"""run_bot_ws.py
 ====================================================
 웹소켓으로 들어오는 1m / 5m / 15m 캔들을 기준으로 포지션을 열고 감시하는 메인 루프.
 이 버전에서는 더 이상 3m 캔들을 사용하지 않는다.
 
 2025-11-13 변경 사항
 ----------------------------------------------------
-1) settings → settings_ws 로 교체해서 기본 주기를 5m 로 사용하도록 변경.
+1) settings → settings_ws 로 교체해서 기본 주기를 5m 로 사용.
 2) 포지션 상태 텔레그램 알림에서 15m 추세를 볼 때 REST 대신 market_data_ws 를 사용.
    (Render 콘솔에서 15m 가 실제로 들어오는지 바로 확인 가능)
-3) position_watch 쪽 호출을 WS 버전(position_watch_ws)으로 교체해서
-   조기익절/조기청산/반대 시그널 컷이 모두 WS 캔들을 쓰도록 맞춤.
+3) position_watch 모듈을 WS 버전(position_watch_ws)으로 교체해서
+   조기익절/조기청산/반대 시그널 컷이 모두 WS 캔들을 쓰도록 정리.
 4) 시작 시점에 현재 WS 설정(ws_enabled, ws_subscribe_tfs)을 로그로 남겨
-   Render 환경에서 “WS 모드로 올라왔는지” 확인 가능하게 함.
+   Render 환경에서 "WS 모드로 올라왔는지" 확인 가능하게 함.
 5) 3m 관련 주석과 interval 언급을 모두 제거하고, 1m/5m/15m 기준으로 다시 작성.
-6) 주문/TP/SL 은 기존과 동일하게 REST(exchange_api)로 처리한다.
+6) 주문/TP/SL 은 기존과 동일하게 REST(exchange_api)로 처리.
 
 2025-11-13 추가 보정
 ----------------------------------------------------
-7) 실제로 웹소켓 수신이 돌아가도록 main() 시작 시
-   market_data_ws.start_ws_loop(SET.symbol)을 한 번만 호출하도록 추가했다.
-   (이거 없으면 위에서 get_klines(...) 해도 버퍼가 비어 있음)
+7) 실제 웹소켓 수신이 돌아가도록 main() 시작 시
+   market_data_ws.start_ws_loop(SET.symbol)을 한 번만 호출하도록 추가.
+
+2025-11-14 변경 사항 (시세 DB 저장 + 레짐 워커 연동)
+----------------------------------------------------
+8) market_data_store 모듈을 사용해 WS 버퍼의 캔들/호가를 Postgres 에 저장하는
+   백그라운드 스레드(_start_market_data_store_thread)를 추가.
+   - 1m/5m/15m 캔들은 bt_candles 테이블에 적재.
+   - depth5 오더북 스냅샷은 bt_orderbook_snapshots 테이블에 적재.
+9) candles 는 interval 별 마지막 저장 timestamp(ts_ms)를 기억해서
+   이미 저장된 캔들은 다시 INSERT 하지 않도록 방어.
+10) 오더북은 일정 간격(기본 5초)마다 한 번만 저장해서 DB I/O 를 과도하게 늘리지 않도록 함.
+11) DB 저장 실패(SQLAlchemyError)는 telelog 로만 남기고
+    메인 매매 루프/WS 루프에는 영향을 주지 않도록 설계.
+12) signal_analysis_worker 를 1분 주기(또는 settings_ws.signal_analysis_interval_sec)로
+    백그라운드에서 돌려 bt_candles 를 읽고 bt_regime_scores 에 레짐 점수를 기록.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ import os
 import time
 import datetime
 import signal
+import threading
 from typing import Any, Dict, List, Optional
 
 from settings_ws import load_settings, KST  # WS 버전 설정
@@ -59,8 +72,14 @@ from position_watch_ws import (  # WS 버전으로 교체
 )
 # 웹소켓 시세 버퍼
 from market_data_ws import (
-    start_ws_loop,            # ★ 추가: 웹소켓 수신 시작
-    get_klines as ws_get_klines,  # 15m 추세 조회용
+    start_ws_loop,                  # 웹소켓 수신 시작
+    get_klines as ws_get_klines,    # 15m 추세 조회용
+    get_klines_with_volume as ws_get_klines_with_volume,  # 캔들+거래량(DB 적재용)
+    get_orderbook as ws_get_orderbook,  # depth5 오더북(DB 적재용)
+)
+from market_data_store import (
+    save_candles_bulk_from_ws,
+    save_orderbook_from_ws,
 )
 from strategies_trend_ws import decide_trend_15m  # 15m 방향 판단
 
@@ -103,10 +122,14 @@ LAST_EXCHANGE_SYNC_TS: float = 0.0
 LAST_STATUS_TG_TS: float = 0.0
 STATUS_TG_INTERVAL_SEC: int = getattr(SET, "unrealized_notify_sec", 1800)
 
+# 레짐 워커 주기 (기본 60초)
+SIGNAL_ANALYSIS_INTERVAL_SEC: int = getattr(SET, "signal_analysis_interval_sec", 60)
+
 
 # ─────────────────────────────
 # STOP_FLAG 유틸
 # ─────────────────────────────
+
 def _write_stop_flag() -> None:
     """프로세스 재시작 시 즉시 종료시키기 위한 플래그 파일 작성."""
     try:
@@ -119,6 +142,7 @@ def _write_stop_flag() -> None:
 # ─────────────────────────────
 # idle 모드
 # ─────────────────────────────
+
 def _enter_idle_forever() -> None:
     """메인 로직만 멈추고 프로세스는 살아 있게 하는 무한 슬립."""
     log("[IDLE] safe stop reached, entering idle loop...")
@@ -133,6 +157,7 @@ def _enter_idle_forever() -> None:
 # ─────────────────────────────
 # SIGTERM 핸들러 등록
 # ─────────────────────────────
+
 def _sigterm(*_: Any) -> None:
     """컨테이너 SIGTERM 시 자연스럽게 메인 루프를 빠져나오도록 한다."""
     global RUNNING, TERMINATED_BY_SIGNAL
@@ -146,11 +171,13 @@ signal.signal(signal.SIGTERM, _sigterm)
 # ─────────────────────────────
 # 포지션 상태 텔레그램 알림 (WS 버전)
 # ─────────────────────────────
+
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
     """열린 포지션이 있을 때 현재 미실현 PnL + 15m 방향을 주기적으로 텔레그램으로 보낸다.
+
     15m 캔들은 웹소켓 버퍼에서 읽는다.
     Render 콘솔에서는 아래 로그로 실제 수신 여부 확인 가능:
-    [STATUS_TG] WS 15m count=...
+      [STATUS_TG] WS 15m count=...
     """
     from exchange_api import fetch_open_positions
 
@@ -206,6 +233,7 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
 # ─────────────────────────────
 # 텔레그램 종료 콜백
 # ─────────────────────────────
+
 def _on_safe_stop() -> None:
     """텔레그램 명령으로 안전 종료를 요청받았을 때 플래그만 세팅한다."""
     global SAFE_STOP_REQUESTED
@@ -214,8 +242,113 @@ def _on_safe_stop() -> None:
 
 
 # ─────────────────────────────
+# WS 시세 → DB 저장 스레드
+# ─────────────────────────────
+
+def _start_market_data_store_thread() -> None:
+    """WS 버퍼에서 캔들/호가를 읽어 주기적으로 Postgres 에 저장하는 백그라운드 스레드.
+
+    - 1m/5m/15m 캔들 → bt_candles
+    - depth5 오더북 스냅샷 → bt_orderbook_snapshots
+    """
+    symbol = SET.symbol
+    flush_sec = getattr(SET, "md_store_flush_sec", 5)
+    ob_interval_sec = getattr(SET, "ob_store_interval_sec", 5)
+
+    # interval 별 마지막 저장 ts_ms (중복 INSERT 방지)
+    last_candle_ts: Dict[str, int] = {
+        "1m": 0,
+        "5m": 0,
+        "15m": 0,
+    }
+    last_ob_ts: float = 0.0
+
+    def _loop() -> None:
+        nonlocal last_ob_ts
+        log(
+            f"[MD-STORE] loop started: flush_sec={flush_sec}, "
+            f"ob_interval_sec={ob_interval_sec}"
+        )
+        while RUNNING:
+            try:
+                now = time.time()
+
+                # 1) 캔들 적재 (1m/5m/15m)
+                candles_to_save: List[Dict[str, Any]] = []
+
+                for iv in ("1m", "5m", "15m"):
+                    buf = ws_get_klines_with_volume(symbol, iv, limit=500)
+                    if not buf:
+                        continue
+
+                    # buf 원소: (ts_ms, o, h, l, c, v)
+                    newest_ts = last_candle_ts.get(iv, 0)
+                    new_rows = [row for row in buf if row[0] > newest_ts]
+                    if not new_rows:
+                        continue
+
+                    for ts_ms, o, h, l, c, v in new_rows:
+                        candles_to_save.append(
+                            {
+                                "symbol": symbol,
+                                "interval": iv,
+                                "ts_ms": int(ts_ms),
+                                "open": float(o),
+                                "high": float(h),
+                                "low": float(l),
+                                "close": float(c),
+                                "volume": float(v),
+                                # quote_volume 은 WS payload 에서 별도로 가져올 수 있을 때만 넣는다.
+                                "quote_volume": None,
+                                "source": "ws",
+                            }
+                        )
+
+                    # 가장 최신 ts_ms 로 갱신
+                    last_candle_ts[iv] = int(new_rows[-1][0])
+
+                if candles_to_save:
+                    save_candles_bulk_from_ws(candles_to_save)
+
+                # 2) 오더북(depth5) 스냅샷 적재 (지나치게 자주 쓰지 않도록 별도 주기 사용)
+                if now - last_ob_ts >= ob_interval_sec:
+                    ob = ws_get_orderbook(symbol, limit=5)
+                    if ob and ob.get("bids") and ob.get("asks"):
+                        ts_ms = None
+                        # exchTs(거래소 타임스탬프) 우선, 없으면 로컬 ts 사용
+                        for k in ("exchTs", "ts"):
+                            if ob.get(k) is not None:
+                                try:
+                                    ts_ms = int(ob[k])
+                                    break
+                                except Exception:
+                                    continue
+                        if ts_ms is None:
+                            ts_ms = int(now * 1000)
+
+                        save_orderbook_from_ws(
+                            symbol=symbol,
+                            ts_ms=ts_ms,
+                            bids=ob["bids"],
+                            asks=ob["asks"],
+                        )
+                        last_ob_ts = now
+
+            except Exception as e:
+                # DB 쪽 문제로 전체 봇이 죽지 않도록 여기서만 잡고 로그만 남긴다.
+                log(f"[MD-STORE] loop error: {e}")
+
+            time.sleep(flush_sec)
+
+    th = threading.Thread(target=_loop, name="md-store-loop", daemon=True)
+    th.start()
+    log("[MD-STORE] background store thread started")
+
+
+# ─────────────────────────────
 # 메인 루프 (WS)
 # ─────────────────────────────
+
 def main() -> None:
     global RUNNING
     global OPEN_TRADES, LAST_CLOSE_TS, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
@@ -231,12 +364,14 @@ def main() -> None:
     # WS 설정 로그로 남기기 (Render 확인용)
     log(
         f"[BOOT] WS_ENABLED={getattr(SET, 'ws_enabled', True)} "
-        f"WS_TF={getattr(SET, 'ws_subscribe_tfs', ['1m','5m','15m'])} INTERVAL={SET.interval}"
+        f"WS_TF={getattr(SET, 'ws_subscribe_tfs', ['1m','5m','15m'])} "
+        f"INTERVAL={SET.interval}"
     )
 
     # ★ 웹소켓 시세 수신 시작 (이거 무조건 먼저 켜야 아래 로직이 ws_get_klines(...) 쓸 수 있음)
     if getattr(SET, "ws_enabled", True):
         start_ws_loop(SET.symbol)
+        _start_market_data_store_thread()
 
     # 필수 API 키 체크
     if not SET.api_key or not SET.api_secret:
@@ -247,7 +382,8 @@ def main() -> None:
 
     # 시작 알림
     log(
-        f"CONFIG: ENABLE_TREND={SET.enable_trend}, ENABLE_RANGE={SET.enable_range}, ENABLE_1M_CONFIRM={SET.enable_1m_confirm}"
+        f"CONFIG: ENABLE_TREND={SET.enable_trend}, "
+        f"ENABLE_RANGE={SET.enable_range}, ENABLE_1M_CONFIRM={SET.enable_1m_confirm}"
     )
     send_tg("✅ [봇 시작] BingX 선물 자동매매 (WS) 시작합니다.")
 
@@ -257,11 +393,11 @@ def main() -> None:
     except Exception as e:
         log(f"[WARN] 레버리지/마진 설정 실패: {e}")
 
-    # 보조 스레드들 시작
+    # 보조 스레드들 시작 (헬스 서버, 드라이브 동기화, 텔레그램 명령, 레짐 워커)
     start_health_server()
     start_drive_sync_thread()
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
-    start_signal_analysis_thread(interval_sec=1800)
+    start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
 
     # 최초 거래소 포지션 동기화
     OPEN_TRADES, _ = sync_open_trades_from_exchange(
@@ -308,7 +444,9 @@ def main() -> None:
             now_kst = datetime.datetime.now(KST)
             today_kst = now_kst.strftime("%Y-%m-%d")
             if now_kst.hour == 0 and now_kst.minute < 1 and last_report_date_kst != today_kst:
-                send_tg(f"📊 일일 정산(KST): PnL {daily_pnl:.2f} USDT, 연속 손실 {CONSEC_LOSSES}")
+                send_tg(
+                    f"📊 일일 정산(KST): PnL {daily_pnl:.2f} USDT, 연속 손실 {CONSEC_LOSSES}"
+                )
                 daily_pnl = 0.0
                 CONSEC_LOSSES = 0
                 last_report_date_kst = today_kst
@@ -434,7 +572,9 @@ def main() -> None:
                 continue
 
             # (i) 새 포지션 진입 시도
-            trade, sleep_sec = try_open_new_position(SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE)
+            trade, sleep_sec = try_open_new_position(
+                SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
+            )
             if trade:
                 OPEN_TRADES.append(trade)
                 LAST_STATUS_TG_TS = time.time()

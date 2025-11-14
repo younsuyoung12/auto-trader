@@ -1,6 +1,19 @@
-"""
-strategies_trend_ws.py
+"""strategies_trend_ws.py
 웹소켓으로 받은 5m/15m/1m 캔들을 기준으로 추세장(트렌드) 신호를 판단하는 모듈.
+
+2025-11-14 변경 요약
+----------------------------------------------------
+1) indicators.py 분리 이후 구조 정리
+   - EMA/RSI/다이버전스 계산은 indicators.py 공용 함수 사용.
+   - Candle 타입 별칭을 indicators.Candle 과 동일하게 유지해서 재사용성 확보.
+2) 역할 분리 및 운영 가이드 명시
+   - 이 모듈은 "추세 신호 판단"에만 집중한다.
+   - DB 적재, 레짐 점수(bt_regime_scores) 저장, 포지션 관리 등은
+     signal_flow_ws / signal_analysis_worker / position_watch_ws 가 담당.
+3) WS 환경 안정성 강화
+   - 캔들 개수 부족, NaN, 0 분모 등의 상황에서는 조용히 None 을 반환하도록 유지.
+   - RSI/횡보 임계치는 settings 기반으로만 읽도록 주석을 보강해서
+     운영 중 ENV 누락/조정 시에도 크래시 없이 동작하게 정리.
 
 2025-11-13 추가 보정
 ----------------------------------------------------
@@ -20,16 +33,6 @@ C) 동작 논리 변경 없음
  - 5m: EMA20/EMA50 크로스 + RSI 필터 + 소폭 변동/스프레드 축소 시 스킵.
  - 15m: EMA20/EMA50로 큰 방향만 판단.
  - 1m: 최종 역주행 캔들 차단 용도로만 사용(데이터 없으면 허용).
-
-기존 2025-11-13 변경 사항
-----------------------------------------------------
-1) 기존 모듈은 3분봉(3m)을 기본 타임프레임으로 삼아 EMA20/EMA50, RSI, 다이버전스를 계산했다.
-   BingX 환경에서 3m 제공이 불안정할 수 있어 5m를 기본 타임프레임으로 전부 변경했다.
-2) 15m로 큰 방향을 보는 구조는 그대로 유지했다.
-3) 1m는 기존과 동일하게 최종 역주행 캔들 차단용으로만 쓴다.
-4) Render 콘솔에서 실시간으로 5m/15m/1m 데이터 길이를 확인할 수 있도록 log(...)를 추가했다.
-   (이 모듈 자체는 데이터를 가져오지 않고, 호출하는 쪽이 웹소켓 버퍼에서 캔들을 넘겨준다.)
-5) 주문/TP/SL 은 여전히 다른 모듈에서 REST 로 처리한다.
 """
 
 from __future__ import annotations
@@ -42,11 +45,11 @@ from indicators import (
     rsi,
     has_bearish_rsi_divergence,
     has_bullish_rsi_divergence,
-    Candle,
+    Candle,  # (ts_ms, open, high, low, close)
 )
 from telelog import log
 
-# 타입 힌트
+# 타입 별칭: 가독성을 위해 타임프레임별로 분리해서 사용
 FiveMCandles = List[Candle]
 FifteenMCandles = List[Candle]
 OneMCandles = List[Candle]
@@ -71,35 +74,43 @@ def decide_signal_5m_trend(
     로직 요약:
       - 캔들 60개 미만이면 계산 안 함(EMA50 필요)
       - EMA20/EMA50 스프레드가 너무 작고, 마지막 봉 변동폭도 작으면 스킵
-      - EMA20↗ EMA50 골든크로스 + RSI<과매수 → LONG
-      - EMA20↘ EMA50 데드크로스 + RSI>과매도 → SHORT
+      - EMA20↗ EMA50 골든크로스 + RSI < 과매수 → LONG
+      - EMA20↘ EMA50 데드크로스 + RSI > 과매도 → SHORT
       - 가격이 50EMA 반대편이면 각각 무효
       - 신호와 반대 RSI 다이버전스면 무효
+
+    NOTE
+    ----------------------------------------------------
+    - 이 함수는 오직 "추세 후보"를 만드는 역할만 한다.
+    - 최종 진입 여부는 signal_flow_ws 의 중재/쿨다운/1m 확인에서 결정한다.
     """
     count_5m = len(candles_5m)
     log(f"[TREND] (WS) decide_signal_5m_trend 5m_count={count_5m}")
 
+    # EMA50, RSI 계산을 위해 최소 60개 이상 필요
     if count_5m < 60:
         return None
 
     closes = [c[4] for c in candles_5m]
 
-    # settings 연계: RSI 임계 덮어쓰기
+    # settings 연계: RSI 임계 및 마지막 캔들 최소 범위 덮어쓰기
     if settings is not None:
         try:
+            # RSI 과열/침체 구간을 ENV 로 조정 가능하게 함
             rsi_overbought = int(getattr(settings, "rsi_overbought", rsi_overbought))
             rsi_oversold = int(getattr(settings, "rsi_oversold", rsi_oversold))
-            # 마지막 캔들 최소 범위 임계는 더 보수적으로 적용(둘 중 큰 값)
+            # 횡보 구간 최소 범위: 기본값과 설정값 중 더 큰 값을 사용(보수적)
             cfg_rng = float(getattr(settings, "trend_sideways_range_pct", min_last_range_pct))
             min_last_range_pct = max(min_last_range_pct, cfg_rng)
-        except Exception as e:
+        except Exception as e:  # pragma: no cover - 방어적 처리
             log(f"[TREND] (WS) settings override failed: {e}")
 
+    # EMA/RSI 계산 (indicators.py 공용 함수 사용)
     e20 = ema(closes, 20)
     e50 = ema(closes, 50)
     r14 = rsi(closes, 14)
 
-    # 지표 유효성(끝단 NaN 방지)
+    # 끝단 NaN 이 하나라도 있으면 계산 중단
     if any(math.isnan(x) for x in (e20[-1], e20[-2], e50[-1], e50[-2], r14[-1])):
         return None
 
@@ -116,7 +127,7 @@ def decide_signal_5m_trend(
         return None
     last_range_pct = (hi - lo) / lo
 
-    # EMA 스프레드(분모 0 방지)
+    # EMA 스프레드(분모 0 방지): |EMA20-EMA50| / |EMA50|
     denom = abs(e50_now) if e50_now != 0 else 1.0
     spread_ratio = abs(e20_now - e50_now) / denom
 
@@ -129,10 +140,11 @@ def decide_signal_5m_trend(
         )
         return None
 
-    # 추가 안전장치: 마지막 봉 자체가 너무 작으면 스킵
+    # 추가 안전장치: 마지막 봉 자체가 너무 작으면 스킵 (횡보 필터)
     if last_range_pct < min_last_range_pct:
         log(
-            f"[TREND] (WS) skip: last 5m range too small {last_range_pct:.6f} < {min_last_range_pct:.6f}"
+            f"[TREND] (WS) skip: last 5m range too small "
+            f"{last_range_pct:.6f} < {min_last_range_pct:.6f}"
         )
         return None
 
@@ -169,6 +181,11 @@ def decide_trend_15m(candles_15m: FifteenMCandles) -> Optional[str]:
     """15분봉 EMA20/EMA50 으로 큰 방향을 본다.
 
     반환값: "LONG" / "SHORT" / None
+
+    NOTE
+    ----------------------------------------------------
+    - 이 함수는 "상위 타임프레임 방향"만 본다.
+    - 실제 진입 여부는 5m 후보 및 1m 확인, 쿨다운, 레짐 여부에 따라 바뀐다.
     """
     count_15m = len(candles_15m)
     log(f"[TREND] (WS) decide_trend_15m 15m_count={count_15m}")
@@ -194,7 +211,9 @@ def decide_trend_15m(candles_15m: FifteenMCandles) -> Optional[str]:
 # ───────────────────────────────────────────────────────────────
 def confirm_1m_direction(candles_1m: OneMCandles, direction: str) -> bool:
     """1분봉을 ‘역주행 캔들 차단’ 용도로만 사용한다.
-    데이터가 없으면 막지 않는다.
+
+    - 데이터가 없으면 막지 않는다(True 반환).
+    - 마지막 1분봉이 LONG 방향이면 양봉, SHORT 방향이면 음봉이어야 통과.
     """
     count_1m = len(candles_1m)
     log(f"[TREND] (WS) confirm_1m_direction 1m_count={count_1m} dir={direction}")

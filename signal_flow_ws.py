@@ -49,7 +49,6 @@ PATCH NOTES — 2025-11-13 (이전 패치 유지)
 from __future__ import annotations
 
 import time
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,13 +60,13 @@ from signals_logger import log_signal
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from market_data_ws import get_klines as ws_get_klines  # 필수
-except Exception as e:
+except Exception as e:  # pragma: no cover - 환경 오류 시 바로 예외
     raise ImportError("market_data_ws.get_klines 가 필요합니다") from e
 
 try:
     from market_data_ws import get_klines_with_volume as ws_get_klines_with_volume  # 선택
 except Exception:
-    ws_get_klines_with_volume = None  # type: ignore
+    ws_get_klines_with_volume = None  # type: ignore[assignment]
 
 from indicators import calc_atr
 from strategies_trend_ws import (
@@ -88,8 +87,8 @@ except ImportError:
         decide_signal_range,
         should_block_range_today,
     )
-    compute_range_params = None  # type: ignore
-    should_block_range_today_with_level = None  # type: ignore
+    compute_range_params = None  # type: ignore[assignment]
+    should_block_range_today_with_level = None  # type: ignore[assignment]
 
 
 # ─────────────────────────────
@@ -98,10 +97,17 @@ except ImportError:
 
 def _is_range_1m_confirm_enabled(settings: Any) -> bool:
     """RANGE에서 1분 확인을 쓸지 결정한다.
+
     - settings.enable_1m_confirm_range 가 있으면 그 값을 우선.
     - 없으면 기존 enable_1m_confirm 값을 그대로 따른다(하위호환).
     """
-    return bool(getattr(settings, "enable_1m_confirm_range", getattr(settings, "enable_1m_confirm", False)))
+    return bool(
+        getattr(
+            settings,
+            "enable_1m_confirm_range",
+            getattr(settings, "enable_1m_confirm", False),
+        )
+    )
 
 
 # ─────────────────────────────
@@ -110,34 +116,49 @@ def _is_range_1m_confirm_enabled(settings: Any) -> bool:
 
 @dataclass
 class Candidate:
+    """중재 단계에서 사용하는 후보 시그널 컨테이너."""
+
     kind: str                # "TREND" / "RANGE"
     side: str                # "BUY" / "SELL"
     score: float             # 중재 비교용 점수 (0~∞)
-    tp_pct: float
-    sl_pct: float
-    reasons: List[str]
+    tp_pct: float            # 이 후보 기준 TP 비율
+    sl_pct: float            # 이 후보 기준 SL 비율
+    reasons: List[str]       # 디버깅/로그용 사유 목록
 
 
 def _ema(values: List[float], period: int) -> Optional[float]:
+    """간단 EMA 계산 (리스트 전체에서 마지막 EMA 값만 반환)."""
     if not values or len(values) < period:
         return None
     k = 2.0 / (period + 1)
-    ema = values[-period]
-    for v in values[-period+1:]:
-        ema = v * k + ema * (1 - k)
-    return ema
+    ema_val = values[-period]
+    for v in values[-period + 1 :]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
 
 
 def _close_series(candles: List[List[float]]) -> List[float]:
-    # 캔들 포맷: [ts, open, high, low, close, (vol)]
+    """캔들 배열에서 종가 시리즈만 추출.
+
+    캔들 포맷: [ts, open, high, low, close, (vol)]
+    """
     return [float(c[4]) for c in candles]
 
 
 def _price(candles: List[List[float]]) -> Optional[float]:
+    """마지막 캔들의 종가를 반환."""
     return float(candles[-1][4]) if candles else None
 
 
-def _range_width_ratio_5m(candles_5m: List[List[float]], window: int = 12) -> Optional[float]:
+def _range_width_ratio_5m(
+    candles_5m: List[List[float]],
+    window: int = 12,
+) -> Optional[float]:
+    """최근 window 구간의 5m 박스 폭 비율을 계산.
+
+    - (구간 최고가 - 최저가) / 마지막 종가
+    - 값이 작을수록 박스 압축이 강함.
+    """
     if len(candles_5m) < window:
         return None
     seg = candles_5m[-window:]
@@ -149,11 +170,15 @@ def _range_width_ratio_5m(candles_5m: List[List[float]], window: int = 12) -> Op
     return (hi - lo) / last
 
 
-def _decide_signal_5m_trend(candles_5m: List[Tuple[int, float, float, float, float]]) -> Optional[str]:
+def _decide_signal_5m_trend(
+    candles_5m: List[Tuple[int, float, float, float, float]],
+) -> Optional[str]:
     """아주 단순한 5m 추세판단.
+
     - 최근 3개 캔들의 종가가 전부 올라가면 "BUY"
     - 최근 3개 캔들의 종가가 전부 내려가면 "SELL"
     - 아니면 None
+
     (기존 3m 대체용 임시 로직)
     """
     if len(candles_5m) < 4:
@@ -170,6 +195,7 @@ def _decide_signal_5m_trend(candles_5m: List[Tuple[int, float, float, float, flo
 # 후보 생성기: TREND
 # ─────────────────────────────
 
+
 def _trend_candidate(
     *,
     settings: Any,
@@ -178,17 +204,37 @@ def _trend_candidate(
     latest_5m_ts: int,
     last_trend_close_ts: float,
 ) -> Optional[Candidate]:
+    """TREND 전략용 후보 시그널 생성.
+
+    - 5m·15m 방향 정합성 체크
+    - 1m 확인(optional)
+    - 15m EMA20/50 갭 비율을 점수로 사용
+    - 쿨다운 및 각종 실패 사유는 signals_logger 에 기록
+    """
     # 쿨다운
-    if (time.time() - last_trend_close_ts) < float(getattr(settings, "cooldown_after_close_trend", 0)):
+    cooldown = float(getattr(settings, "cooldown_after_close_trend", 0))
+    if (time.time() - last_trend_close_ts) < cooldown:
         send_skip_tg("[SKIP] trend_cooldown: 직전 TREND 포지션 대기중")
-        log_signal(event="SKIP", symbol=settings.symbol, strategy_type="TREND", reason="trend_cooldown", candle_ts=latest_5m_ts)
+        log_signal(
+            event="SKIP",
+            symbol=settings.symbol,
+            strategy_type="TREND",
+            reason="trend_cooldown",
+            candle_ts=latest_5m_ts,
+        )
         return None
 
     closes_15 = _close_series(candles_15m)
     last_15 = closes_15[-1] if closes_15 else None
     if not last_15:
         log("[TREND_SKIP] 15m 방향 판단 불가")
-        log_signal(event="SKIP", symbol=settings.symbol, strategy_type="TREND", reason="trend_15m_unknown", candle_ts=latest_5m_ts)
+        log_signal(
+            event="SKIP",
+            symbol=settings.symbol,
+            strategy_type="TREND",
+            reason="trend_15m_unknown",
+            candle_ts=latest_5m_ts,
+        )
         return None
 
     # 5m 방향
@@ -205,11 +251,29 @@ def _trend_candidate(
     else:
         # 불일치/부재 사유 남기기만 하고 후보 무효
         if not sig_5m:
-            log_signal(event="SKIP", symbol=settings.symbol, strategy_type="TREND", reason="trend_5m_no_signal", candle_ts=latest_5m_ts)
+            log_signal(
+                event="SKIP",
+                symbol=settings.symbol,
+                strategy_type="TREND",
+                reason="trend_5m_no_signal",
+                candle_ts=latest_5m_ts,
+            )
         elif not trend_15m_val:
-            log_signal(event="SKIP", symbol=settings.symbol, strategy_type="TREND", reason="trend_15m_unknown", candle_ts=latest_5m_ts)
+            log_signal(
+                event="SKIP",
+                symbol=settings.symbol,
+                strategy_type="TREND",
+                reason="trend_15m_unknown",
+                candle_ts=latest_5m_ts,
+            )
         else:
-            log_signal(event="SKIP", symbol=settings.symbol, strategy_type="TREND", reason="trend_5m_15m_mismatch", candle_ts=latest_5m_ts)
+            log_signal(
+                event="SKIP",
+                symbol=settings.symbol,
+                strategy_type="TREND",
+                reason="trend_5m_15m_mismatch",
+                candle_ts=latest_5m_ts,
+            )
         return None
 
     # 1m 확인 (TREND는 전역 enable_1m_confirm 사용)
@@ -218,13 +282,20 @@ def _trend_candidate(
         candles_1m = ws_get_klines(settings.symbol, "1m", 40)
         if not confirm_1m_direction(candles_1m, final_dir):
             send_skip_tg("[SKIP] 1m_confirm_mismatch")
-            log_signal(event="SKIP", symbol=settings.symbol, strategy_type="TREND", direction=final_dir, reason="1m_confirm_mismatch", candle_ts=latest_5m_ts)
+            log_signal(
+                event="SKIP",
+                symbol=settings.symbol,
+                strategy_type="TREND",
+                direction=final_dir,
+                reason="1m_confirm_mismatch",
+                candle_ts=latest_5m_ts,
+            )
             return None
 
     # 점수: 15m EMA 갭 비율
     ema20 = _ema(closes_15, 20)
     ema50 = _ema(closes_15, 50)
-    if not ema20 or not ema50 or last_15 <= 0:
+    if ema20 is None or ema50 is None or last_15 <= 0:
         return None
     gap_ratio = abs(ema20 - ema50) / last_15
     thr = float(getattr(settings, "trend_ema_gap_min_ratio_15m", 0.003))
@@ -235,13 +306,20 @@ def _trend_candidate(
     tp_pct = float(getattr(settings, "trend_tp_pct", getattr(settings, "tp_pct", 0.006)))
     sl_pct = float(getattr(settings, "trend_sl_pct", getattr(settings, "sl_pct", 0.004)))
 
-    return Candidate(kind="TREND", side=final_dir, score=gap_ratio, tp_pct=tp_pct, sl_pct=sl_pct,
-                     reasons=[f"trend gap_ratio={gap_ratio:.4f} (>= {thr:.4f})"])
+    return Candidate(
+        kind="TREND",
+        side=final_dir,
+        score=gap_ratio,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        reasons=[f"trend gap_ratio={gap_ratio:.4f} (>= {thr:.4f})"],
+    )
 
 
 # ─────────────────────────────
 # 후보 생성기: RANGE
 # ─────────────────────────────
+
 
 def _range_candidate(
     *,
@@ -251,10 +329,24 @@ def _range_candidate(
     latest_5m_ts: int,
     last_range_close_ts: float,
 ) -> Optional[Candidate]:
+    """RANGE 전략용 후보 시그널 생성.
+
+    - 일/세션 차단 로직(should_block_range_today...) 반영
+    - 1m 확인(optional)
+    - 박스 폭 비율의 역수를 점수로 사용
+    - soft 차단일 경우 TP/SL 완화 적용
+    """
     # 쿨다운
-    if (time.time() - last_range_close_ts) < float(getattr(settings, "cooldown_after_close_range", 0)):
+    cooldown = float(getattr(settings, "cooldown_after_close_range", 0))
+    if (time.time() - last_range_close_ts) < cooldown:
         send_skip_tg("[SKIP] range_cooldown: 직전 RANGE 포지션 대기중")
-        log_signal(event="SKIP", symbol=settings.symbol, strategy_type="RANGE", reason="range_cooldown", candle_ts=latest_5m_ts)
+        log_signal(
+            event="SKIP",
+            symbol=settings.symbol,
+            strategy_type="RANGE",
+            reason="range_cooldown",
+            candle_ts=latest_5m_ts,
+        )
         return None
 
     # 일/세션 차단 규칙
@@ -262,15 +354,25 @@ def _range_candidate(
     block_reason = ""
     try:
         if should_block_range_today_with_level is not None:
-            blocked_now, block_reason = should_block_range_today_with_level(candles_5m, candles_15m or [], settings)
+            blocked_now, block_reason = should_block_range_today_with_level(
+                candles_5m,
+                candles_15m or [],
+                settings,
+            )
         else:
             blocked_now = should_block_range_today(candles_5m, candles_15m or [])
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - 방어적 로깅
         log(f"[RANGE block error] {e}")
 
     if blocked_now and not str(block_reason).startswith("soft_"):
         send_skip_tg("[SKIP] range_blocked_today: 박스장 조건 불리")
-        log_signal(event="SKIP", symbol=settings.symbol, strategy_type="RANGE", reason="range_blocked_today", candle_ts=latest_5m_ts)
+        log_signal(
+            event="SKIP",
+            symbol=settings.symbol,
+            strategy_type="RANGE",
+            reason="range_blocked_today",
+            candle_ts=latest_5m_ts,
+        )
         return None
 
     # 방향 산출 (settings 연동 필수)
@@ -284,7 +386,14 @@ def _range_candidate(
         candles_1m = ws_get_klines(settings.symbol, "1m", 40)
         if not confirm_1m_direction(candles_1m, r_dir):
             send_skip_tg("[SKIP] 1m_confirm_mismatch")
-            log_signal(event="SKIP", symbol=settings.symbol, strategy_type="RANGE", direction=r_dir, reason="1m_confirm_mismatch", candle_ts=latest_5m_ts)
+            log_signal(
+                event="SKIP",
+                symbol=settings.symbol,
+                strategy_type="RANGE",
+                direction=r_dir,
+                reason="1m_confirm_mismatch",
+                candle_ts=latest_5m_ts,
+            )
             return None
 
     # 폭/점수 계산
@@ -305,7 +414,7 @@ def _range_candidate(
             params = compute_range_params(r_dir, candles_5m, settings) or {}
             tp_pct = float(params.get("tp_pct", tp_pct))
             sl_pct = float(params.get("sl_pct", sl_pct))
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - 방어적 로깅
         log(f"[RANGE params error] {e}")
 
     # soft 차단이면 완화 계수 적용(로그용 reason 채움)
@@ -313,18 +422,37 @@ def _range_candidate(
         soft = float(getattr(settings, "range_soft_tp_factor", 0.7))
         tp_pct *= soft
         sl_pct *= soft
-        log_signal(event="ENTRY_SIGNAL", symbol=settings.symbol, strategy_type="RANGE", direction=r_dir, reason=f"range_soft_{block_reason}", candle_ts=latest_5m_ts)
+        log_signal(
+            event="ENTRY_SIGNAL",
+            symbol=settings.symbol,
+            strategy_type="RANGE",
+            direction=r_dir,
+            reason=f"range_soft_{block_reason}",
+            candle_ts=latest_5m_ts,
+        )
 
-    return Candidate(kind="RANGE", side=r_dir, score=score, tp_pct=tp_pct, sl_pct=sl_pct,
-                     reasons=[f"range width_ratio={width_ratio:.4f} (<= {width_thr:.4f})"])
+    return Candidate(
+        kind="RANGE",
+        side=r_dir,
+        score=score,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        reasons=[f"range width_ratio={width_ratio:.4f} (<= {width_thr:.4f})"],
+    )
 
 
 # ─────────────────────────────
 # 중재기
 # ─────────────────────────────
 
-def _arbitrate(tr: Optional[Candidate], rg: Optional[Candidate], hysteresis: float) -> Tuple[Optional[Candidate], Optional[str]]:
-    """
+
+def _arbitrate(
+    tr: Optional[Candidate],
+    rg: Optional[Candidate],
+    hysteresis: float,
+) -> Tuple[Optional[Candidate], Optional[str]]:
+    """TREND/RANGE 후보를 단일 결론으로 중재한다.
+
     - 둘 다 없음 → (None, None)
     - 한쪽만 유효 → (that, that.kind)
     - 둘 다 유효:
@@ -355,24 +483,32 @@ def _arbitrate(tr: Optional[Candidate], rg: Optional[Candidate], hysteresis: flo
 # 공개 API
 # ─────────────────────────────
 
+
 def get_trading_signal(
     *,
     settings: Any,
     last_trend_close_ts: float,
     last_range_close_ts: float,
-) -> Optional[Tuple[str, str, int, List[Any], List[Any], float, Dict[str, Any]]]:
-    """시그널을 하나 결정해서 관련 캔들/부가정보와 함께 넘긴다.
-    이제는 TREND/RANGE 동시 평가 후 중재로 단일 결론을 낸다.
-    return: (chosen_signal, signal_source, latest_5m_ts, candles_5m, candles_5m_raw, last_price, extra)
+) -> Optional[Tuple[str, str, int, List[Any], List[Any], float, Dict[Any, Any]]]:
+    """WS 버퍼 기준으로 매수/매도 시그널 하나를 결정한다.
+
+    반환:
+        (chosen_signal, signal_source, latest_5m_ts, candles_5m, candles_5m_raw, last_price, extra)
+
+    - chosen_signal: "BUY" / "SELL"
+    - signal_source: "TREND" / "RANGE" / "HYBRID"
+    - extra: {"tp_pct", "sl_pct", ...}
     """
     symbol = settings.symbol
 
     # 1) 5m 캔들 (거래량 포함 시도 → 미지원이면 일반 캔들로 폴백)
     log(f"[SIGNAL] (WS) fetch 5m candles for {symbol} limit=120")
     if callable(ws_get_klines_with_volume):  # type: ignore[arg-type]
-        candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", 120)  # 포함 포맷: [ts, o, h, l, c, v]
+        # 포함 포맷: [ts, o, h, l, c, v]
+        candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", 120)
     else:
-        candles_5m_raw = ws_get_klines(symbol, "5m", 120)             # 포맷: [ts, o, h, l, c]
+        # 포맷: [ts, o, h, l, c]
+        candles_5m_raw = ws_get_klines(symbol, "5m", 120)
 
     if not candles_5m_raw or len(candles_5m_raw) < 50:
         log("[SIGNAL] 5m candles not enough (<50) → skip signal")
@@ -385,9 +521,16 @@ def get_trading_signal(
 
     # 2) 캔들 지연 체크
     now_ms = int(time.time() * 1000)
-    if now_ms - latest_5m_ts > int(getattr(settings, "max_kline_delay_sec", 10)) * 1000:
+    max_delay_ms = int(getattr(settings, "max_kline_delay_sec", 10)) * 1000
+    if now_ms - latest_5m_ts > max_delay_ms:
         send_skip_tg("[SKIP] 5m_kline_delayed: 최근 5m 캔들이 지연되었습니다.")
-        log_signal(event="SKIP", symbol=symbol, strategy_type="UNKNOWN", reason="5m_kline_delayed", candle_ts=latest_5m_ts)
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type="UNKNOWN",
+            reason="5m_kline_delayed",
+            candle_ts=latest_5m_ts,
+        )
         return None
 
     # 3) 15m 캔들(추세/박스 보조)
@@ -395,21 +538,50 @@ def get_trading_signal(
     candles_15m = ws_get_klines(symbol, "15m", 120)
 
     # 4) 후보 동시 산출
-    trend_cand = _trend_candidate(settings=settings, candles_5m=candles_5m, candles_15m=candles_15m,
-                                  latest_5m_ts=latest_5m_ts, last_trend_close_ts=last_trend_close_ts) if bool(getattr(settings, "enable_trend", True)) else None
-    range_cand = _range_candidate(settings=settings, candles_5m=candles_5m, candles_15m=candles_15m,
-                                  latest_5m_ts=latest_5m_ts, last_range_close_ts=last_range_close_ts) if bool(getattr(settings, "enable_range", True)) else None
+    trend_cand = (
+        _trend_candidate(
+            settings=settings,
+            candles_5m=candles_5m,
+            candles_15m=candles_15m,
+            latest_5m_ts=latest_5m_ts,
+            last_trend_close_ts=last_trend_close_ts,
+        )
+        if bool(getattr(settings, "enable_trend", True))
+        else None
+    )
+
+    range_cand = (
+        _range_candidate(
+            settings=settings,
+            candles_5m=candles_5m,
+            candles_15m=candles_15m,
+            latest_5m_ts=latest_5m_ts,
+            last_range_close_ts=last_range_close_ts,
+        )
+        if bool(getattr(settings, "enable_range", True))
+        else None
+    )
 
     # 5) 중재
     hys = float(getattr(settings, "arbitration_hysteresis", 0.25))
     chosen, label = _arbitrate(trend_cand, range_cand, hys)
     if not chosen:
         rs: List[str] = []
-        if trend_cand: rs.append(f"TREND({trend_cand.side}) s={trend_cand.score:.4f}")
-        if range_cand: rs.append(f"RANGE({range_cand.side}) s={range_cand.score:.4f}")
-        if not rs: rs = ["no-candidate"]
+        if trend_cand:
+            rs.append(f"TREND({trend_cand.side}) s={trend_cand.score:.4f}")
+        if range_cand:
+            rs.append(f"RANGE({range_cand.side}) s={range_cand.score:.4f}")
+        if not rs:
+            rs = ["no-candidate"]
         log(f"[DECIDE] no-entry (arbitration) {', '.join(rs)}")
-        log_signal(event="SKIP", symbol=symbol, strategy_type="UNKNOWN", reason="no_entry_arbitration", candle_ts=latest_5m_ts, extra=", ".join(rs))
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type="UNKNOWN",
+            reason="no_entry_arbitration",
+            candle_ts=latest_5m_ts,
+            extra=", ".join(rs),
+        )
         return None
 
     # 6) HYBRID 시 TP/SL 소스 선택(점수 높은 후보 우선)
@@ -422,14 +594,26 @@ def get_trading_signal(
             tp_pct, sl_pct = range_cand.tp_pct, range_cand.sl_pct
 
     # 7) ATR 기반 리스크 정보 (5m 기준)
-    extra: Dict[str, Any] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
+    extra: Dict[Any, Any] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
     if bool(getattr(settings, "use_atr", False)):
         atr_len = int(getattr(settings, "atr_len", 14))
-        atr_fast = calc_atr(candles_5m, atr_len)
-        atr_slow = calc_atr(candles_5m, max(atr_len * 2, atr_len + 10))
+        # indicators.calc_atr 는 (ts_ms, o, h, l, c) 튜플 리스트를 받도록 구현되어 있음.
+        atr_input = [
+            (int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]))
+            for c in candles_5m
+        ]
+        atr_fast = calc_atr(atr_input, atr_len)
+        atr_slow = calc_atr(atr_input, max(atr_len * 2, atr_len + 10))
         extra["atr_fast"], extra["atr_slow"] = atr_fast, atr_slow
-        if (atr_fast and atr_slow and atr_slow > 0 and atr_fast > atr_slow * float(getattr(settings, "atr_risk_high_mult", 1.8))):
-            extra["effective_risk_pct"] = float(getattr(settings, "risk_pct", 0.01)) * float(getattr(settings, "atr_risk_reduction", 0.5))
+        if (
+            atr_fast
+            and atr_slow
+            and atr_slow > 0
+            and atr_fast > atr_slow * float(getattr(settings, "atr_risk_high_mult", 1.8))
+        ):
+            extra["effective_risk_pct"] = float(getattr(settings, "risk_pct", 0.01)) * float(
+                getattr(settings, "atr_risk_reduction", 0.5)
+            )
 
     log(f"[DECIDE] {label} {chosen.side} tp={tp_pct:.4f} sl={sl_pct:.4f} last={last_price}")
     return (

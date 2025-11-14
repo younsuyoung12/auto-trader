@@ -5,21 +5,37 @@
 원래 긴 bot.py 안에 있던 것들을 그대로 가져왔고, settings_ws.py 에서 설정을 읽어온다.
 
 사용 예시:
-    from telelog import log, send_tg, send_skip_tg
+    from telelog import log, send_tg, send_skip_tg, send_structured_tg
     log("봇 시작")
     send_tg("✅ 봇이 시작되었습니다")
     send_skip_tg("[SKIP] 1m_confirm_range_too_small: 1분봉 변동폭이 너무 작습니다.")
+    send_structured_tg(
+        title="ENTRY / TREND LONG",
+        indicators={"5m_trend": "LONG", "15m_trend": "LONG"},
+        scores={"entry_score": 7.2, "signal_strength": 1.3},
+        cooldown_sec=1.0,
+        cooldown_reason="신규 진입 기본 쿨타임",
+    )
 
 주의:
 - 텔레그램 토큰/챗아이디가 비어 있으면 실제 전송 대신 콘솔 로그로 대체한다.
 - 같은 스킵 사유를 너무 자주 보내지 않도록 reason 별로 시간 쿨다운을 둔다.
 - '가용잔고 0' 같은 건 1시간 쿨다운을 건다 (원래 코드와 동일하게 유지).
+
+2025-11-14 변경 사항
+----------------------------------------------------
+1) 텔레그램 알림 포맷을 "지표·점수·쿨타임·에러" 4섹션 템플릿으로 통일하는 헬퍼 추가
+   - build_tg_template(...) : 실제 문자열을 만들어주는 공통 포맷터
+   - send_structured_tg(...) : 위 템플릿을 사용해 알림을 보내는 래퍼
+2) send_skip_tg(...) 도 템플릿 빌더를 사용해 쿨타임 정보를 함께 표시하도록 변경
+3) 기존 send_tg(...) / log(...) 인터페이스는 그대로 유지 (하위호환)
 """
 
 from __future__ import annotations
 
 import time
-from typing import Dict
+from typing import Dict, Any, Optional
+
 import requests
 
 from settings_ws import load_settings, KST  # KST 는 필요하면 외부에서 같이 쓸 수 있게 가져온다.
@@ -58,6 +74,75 @@ def log(msg: str) -> None:
             pass
 
 
+def _format_dict_block(title: str, data: Optional[Dict[str, Any]]) -> str:
+    """지표/점수 섹션을 공통 포맷으로 만들어준다.
+
+    예)
+        📊 지표
+         - 5m_trend: LONG
+         - 15m_trend: LONG
+    """
+    if not data:
+        return ""
+
+    lines = [title]
+    for k, v in data.items():
+        lines.append(f" - {k}: {v}")
+    return "\n".join(lines)
+
+
+def build_tg_template(
+    *,
+    title: str,
+    indicators: Optional[Dict[str, Any]] = None,
+    scores: Optional[Dict[str, Any]] = None,
+    cooldown_sec: Optional[float] = None,
+    cooldown_reason: Optional[str] = None,
+    error: Optional[str] = None,
+    note: Optional[str] = None,
+) -> str:
+    """"지표·점수·쿨타임·에러" 4섹션을 기준으로 텔레그램 메시지 문자열을 만든다.
+
+    사용 예:
+        text = build_tg_template(
+            title="ENTRY / TREND LONG",
+            indicators={"5m_trend": "LONG"},
+            scores={"entry_score": 7.2},
+            cooldown_sec=1.0,
+            cooldown_reason="신규 진입 기본 쿨타임",
+            error=None,
+        )
+
+    각 섹션은 값이 없으면 생략된다.
+    """
+    parts: list[str] = [f"📌 {title}"]
+
+    block = _format_dict_block("📊 지표", indicators)
+    if block:
+        parts.append(block)
+
+    block = _format_dict_block("⭐ 점수", scores)
+    if block:
+        parts.append(block)
+
+    if cooldown_sec is not None or cooldown_reason:
+        if cooldown_sec is not None:
+            cooldown_line = f"⏱️ 쿨타임: {cooldown_sec:.1f}s"
+        else:
+            cooldown_line = "⏱️ 쿨타임: -"
+        if cooldown_reason:
+            cooldown_line += f" ({cooldown_reason})"
+        parts.append(cooldown_line)
+
+    if error:
+        parts.append(f"⚠️ 에러: {error}")
+
+    if note:
+        parts.append(note)
+
+    return "\n".join(parts)
+
+
 def send_tg(text: str) -> None:
     """중요 알림을 텔레그램으로 보낸다.
 
@@ -83,6 +168,32 @@ def send_tg(text: str) -> None:
         log(f"[TG ERROR] {e} {text}")
 
 
+def send_structured_tg(
+    *,
+    title: str,
+    indicators: Optional[Dict[str, Any]] = None,
+    scores: Optional[Dict[str, Any]] = None,
+    cooldown_sec: Optional[float] = None,
+    cooldown_reason: Optional[str] = None,
+    error: Optional[str] = None,
+    note: Optional[str] = None,
+) -> None:
+    """지표·점수·쿨타임·에러 템플릿을 사용해서 텔레그램을 보내는 헬퍼.
+
+    다른 모듈에서는 가급적 이 함수를 써서 알림 포맷을 통일한다.
+    """
+    text = build_tg_template(
+        title=title,
+        indicators=indicators,
+        scores=scores,
+        cooldown_sec=cooldown_sec,
+        cooldown_reason=cooldown_reason,
+        error=error,
+        note=note,
+    )
+    send_tg(text)
+
+
 def send_skip_tg(reason: str) -> None:
     """신호를 '스킵' 한 이유를 텔레그램으로 보내되, 스팸이 되지 않도록 같은 이유는 일정 시간만에 한 번씩만 보낸다.
 
@@ -94,23 +205,37 @@ def send_skip_tg(reason: str) -> None:
     3) 그 외의 스킵 사유는 settings.skip_tg_cooldown(기본 30초) 으로 막는다.
 
     실제 전송이 스킵됐는지 아닌지는 콘솔 로그로 남겨서 추적 가능하게 한다.
+
+    2025-11-14: 템플릿 빌더를 사용해 쿨타임 정보를 함께 표시하도록 변경.
     """
     now = time.time()
 
     # 1) 잔고 관련 스킵은 무조건 길게
     if reason.startswith("[BALANCE_SKIP]"):
         cooldown = SET.balance_skip_cooldown  # 기본 3600초
+        title = "SKIP / BALANCE"
     # 2) 박스장 막힘 관련 스킵도 길게
     elif "range_blocked_today" in reason:
         cooldown = 3600
+        title = "SKIP / RANGE_BLOCKED"
     else:
         # 3) 나머지는 짧게 (기본 30초)
         cooldown = SET.skip_tg_cooldown
+        title = "SKIP"
 
     last_ts = LAST_SKIP_TG.get(reason, 0.0)
     if now - last_ts >= cooldown:
         # 쿨다운이 지났으면 실제로 텔레그램 전송
-        send_tg(reason)
+        text = build_tg_template(
+            title=title,
+            indicators=None,
+            scores=None,
+            cooldown_sec=float(cooldown),
+            cooldown_reason=reason,
+            error=None,
+            note=None,
+        )
+        send_tg(text)
         LAST_SKIP_TG[reason] = now
     else:
         # 아직 쿨다운 중이면 콘솔에만 남겨둔다.
@@ -118,4 +243,13 @@ def send_skip_tg(reason: str) -> None:
         log(f"[SKIP_TG_SUPPRESS] {reason}")
 
 
-__all__ = ["log", "send_tg", "send_skip_tg", "LAST_SKIP_TG", "SET", "KST"]
+__all__ = [
+    "log",
+    "send_tg",
+    "send_structured_tg",
+    "send_skip_tg",
+    "build_tg_template",
+    "LAST_SKIP_TG",
+    "SET",
+    "KST",
+]
