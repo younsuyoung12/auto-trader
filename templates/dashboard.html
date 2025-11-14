@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>BingX Auto Trader 대시보드</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    body {
+      background: radial-gradient(circle at top, #111827 0, #020617 55%);
+    }
+    .glass-card {
+      background: rgba(15, 23, 42, 0.92);
+      backdrop-filter: blur(18px);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+    .metric-label {
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+    }
+    .kakao-pill {
+      background-color: #fee500;
+      color: #111827;
+      border-radius: 999px;
+      padding: 0.35rem 0.8rem;
+      font-size: 0.7rem;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+    .kakao-pill span.dot {
+      width: 0.4rem;
+      height: 0.4rem;
+      border-radius: 999px;
+      background-color: #16a34a;
+    }
+
+    /* 모바일에서 테이블을 좀 더 읽기 쉬운 카드 느낌으로 */
+    @media (max-width: 768px) {
+      table thead {
+        display: none;
+      }
+      table tbody tr {
+        display: block;
+        margin-bottom: 0.75rem;
+        border-radius: 1rem;
+        background: rgba(15, 23, 42, 0.95);
+        padding: 0.6rem 0.7rem;
+      }
+      table tbody td {
+        display: flex;
+        justify-content: space-between;
+        padding: 0.1rem 0;
+        font-size: 0.75rem;
+      }
+      table tbody td::before {
+        content: attr(data-label);
+        font-weight: 500;
+        color: rgba(148, 163, 184, 0.9);
+        margin-right: 0.5rem;
+      }
+    }
+  </style>
+</head>
+<body class="min-h-screen text-slate-100">
+  <div class="max-w-6xl mx-auto px-4 py-6 md:py-10">
+
+    <!-- 헤더 -->
+    <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+      <div>
+        <div class="flex items-center gap-2 mb-1">
+          <div class="kakao-pill">
+            <span class="dot"></span>
+            실시간 모니터링
+          </div>
+        </div>
+        <h1 class="text-2xl md:text-3xl font-semibold tracking-tight text-white">
+          BingX Auto Trader 대시보드
+        </h1>
+        <p class="text-sm md:text-base text-slate-400 mt-1">
+          최근 거래 성과와 진입 품질을 카톡 대화 보듯 직관적으로 확인하세요.
+        </p>
+      </div>
+      <div class="flex flex-col items-start md:items-end gap-1 text-xs md:text-sm text-slate-400">
+        <span id="last-updated-label">마지막 업데이트: -</span>
+        <button
+          id="refresh-btn"
+          class="inline-flex items-center gap-1 rounded-full bg-slate-800/70 hover:bg-slate-700 px-3 py-1.5 text-xs font-medium text-slate-100 border border-slate-600/60"
+        >
+          <span>새로고침</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- 요약 카드 영역 -->
+    <section class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
+      <!-- 총 거래 -->
+      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
+        <div class="metric-label text-slate-400 uppercase mb-1">총 거래 횟수</div>
+        <div id="summary-total-trades" class="text-xl md:text-2xl font-semibold text-white">-</div>
+      </div>
+
+      <!-- 승률 -->
+      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
+        <div class="metric-label text-slate-400 uppercase mb-1">승률</div>
+        <div id="summary-win-rate" class="text-xl md:text-2xl font-semibold text-emerald-400">-</div>
+        <div id="summary-win-loss" class="text-xs md:text-sm text-slate-400 mt-1">-</div>
+      </div>
+
+      <!-- 총 수익 -->
+      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
+        <div class="metric-label text-slate-400 uppercase mb-1">총 수익(USDT)</div>
+        <div id="summary-total-pnl" class="text-xl md:text-2xl font-semibold">-</div>
+      </div>
+
+      <!-- 평균 수익 -->
+      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
+        <div class="metric-label text-slate-400 uppercase mb-1">거래당 평균 수익</div>
+        <div id="summary-avg-pnl" class="text-xl md:text-2xl font-semibold text-white">-</div>
+      </div>
+    </section>
+
+    <!-- 그래프 2개: 일별 PnL / EntryScore 히스토그램 -->
+    <section class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+      <!-- 일별 손익 -->
+      <div class="glass-card rounded-2xl p-4 shadow-lg">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm md:text-base font-semibold text-white">최근 30일 일별 손익</h2>
+          <span class="text-xs text-slate-400">USDT 기준</span>
+        </div>
+        <div class="h-48 md:h-60">
+          <canvas id="dailyPnlChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+
+      <!-- EntryScore 히스토그램 -->
+      <div class="glass-card rounded-2xl p-4 shadow-lg">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm md:text-base font-semibold text-white">최근 진입 점수 분포</h2>
+          <span class="text-xs text-slate-400">EntryScore 히스토그램</span>
+        </div>
+        <div class="h-48 md:h-60">
+          <canvas id="entryScoreHistChart" class="w-full h-full"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- 최근 거래 리스트 -->
+    <section class="glass-card rounded-2xl p-4 md:p-5 shadow-lg mb-10">
+      <div class="flex items-center justify-between mb-3 md:mb-4">
+        <div>
+          <h2 class="text-sm md:text-base font-semibold text-white">최근 거래 내역</h2>
+          <p class="text-xs md:text-sm text-slate-400 mt-1">
+            자동/수동, 박스장/추세장, 수익/손실 여부를 한 번에 확인할 수 있습니다.
+          </p>
+        </div>
+        <span class="text-xs text-slate-400" id="trades-count-label">최근 50건</span>
+      </div>
+
+      <div class="overflow-x-auto -mx-2 md:mx-0">
+        <table class="min-w-full text-xs md:text-sm text-left text-slate-200">
+          <thead>
+            <tr class="border-b border-slate-700 text-slate-400">
+              <th class="px-2 py-2 whitespace-nowrap">진입시각</th>
+              <th class="px-2 py-2 whitespace-nowrap">자동/수동</th>
+              <th class="px-2 py-2 whitespace-nowrap">장 타입</th>
+              <th class="px-2 py-2 whitespace-nowrap">방향</th>
+              <th class="px-2 py-2 whitespace-nowrap">진입가</th>
+              <th class="px-2 py-2 whitespace-nowrap">청산가</th>
+              <th class="px-2 py-2 whitespace-nowrap">수익(USDT)</th>
+              <th class="px-2 py-2 whitespace-nowrap">청산 이유</th>
+            </tr>
+          </thead>
+          <tbody id="trades-table-body">
+            <!-- JS로 채움 -->
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const fmtNumber = (v, digits = 2) => {
+      const num = Number(v);
+      if (Number.isNaN(num)) return "-";
+      return num.toLocaleString("en-US", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
+    };
+
+    const fmtPnlWithSign = (v, digits = 2) => {
+      const num = Number(v);
+      if (Number.isNaN(num)) return "-";
+      const s = num.toLocaleString("en-US", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
+      return num > 0 ? `+${s}` : s;
+    };
+
+    const fmtDate = (iso) => {
+      if (!iso) return "-";
+      try {
+        const d = new Date(iso);
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, "0");
+        const dd = String(d.getDate()).padStart(2, "0");
+        const hh = String(d.getHours()).padStart(2, "0");
+        const mi = String(d.getMinutes()).padStart(2, "0");
+        return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+      } catch {
+        return iso;
+      }
+    };
+
+    const setLastUpdated = () => {
+      const now = new Date();
+      const yyyy = now.getFullYear();
+      const mm = String(now.getMonth() + 1).padStart(2, "0");
+      const dd = String(now.getDate()).padStart(2, "0");
+      const hh = String(now.getHours()).padStart(2, "0");
+      const mi = String(now.getMinutes()).padStart(2, "0");
+      document.getElementById("last-updated-label").textContent =
+        `마지막 업데이트: ${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+    };
+
+    let dailyPnlChart = null;
+    let entryScoreHistChart = null;
+
+    async function loadSummary() {
+      const res = await fetch("/api/summary");
+      if (!res.ok) return;
+      const data = await res.json();
+
+      document.getElementById("summary-total-trades").textContent =
+        fmtNumber(data.total_trades, 0);
+
+      const winRate = fmtNumber(data.win_rate_pct, 1) + "%";
+      document.getElementById("summary-win-rate").textContent = winRate;
+
+      const winLoss = `이긴 거래 ${fmtNumber(data.wins, 0)} / 진 거래 ${fmtNumber(
+        data.losses,
+        0
+      )} / 본전 ${fmtNumber(data.breakevens, 0)}`;
+      document.getElementById("summary-win-loss").textContent = winLoss;
+
+      const totalPnlElem = document.getElementById("summary-total-pnl");
+      const totalPnl = Number(data.total_pnl_usdt || 0);
+      totalPnlElem.textContent = fmtPnlWithSign(totalPnl);
+      totalPnlElem.classList.remove("text-emerald-400", "text-rose-400", "text-slate-300");
+      if (totalPnl > 0) totalPnlElem.classList.add("text-emerald-400");
+      else if (totalPnl < 0) totalPnlElem.classList.add("text-rose-400");
+      else totalPnlElem.classList.add("text-slate-300");
+
+      const avgPnl = Number(data.avg_pnl_usdt || 0);
+      const avgElem = document.getElementById("summary-avg-pnl");
+      avgElem.textContent = fmtPnlWithSign(avgPnl);
+    }
+
+    async function loadDailyPnlChart() {
+      const res = await fetch("/api/daily-pnl?days=30");
+      if (!res.ok) return;
+      const data = await res.json();
+      const items = data.items || [];
+
+      const labels = items.map((x) => x.date);
+      const pnls = items.map((x) => Number(x.pnl_usdt || 0));
+
+      const ctx = document.getElementById("dailyPnlChart").getContext("2d");
+
+      if (dailyPnlChart) dailyPnlChart.destroy();
+
+      dailyPnlChart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            {
+              label: "일별 손익 (USDT)",
+              data: pnls,
+              borderWidth: 2,
+              tension: 0.3,
+              fill: true,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: {
+                color: "rgba(226,232,240,0.9)",
+                font: { size: 11 },
+              },
+            },
+          },
+          scales: {
+            x: {
+              ticks: { color: "rgba(148,163,184,0.9)", maxTicksLimit: 8 },
+              grid: { color: "rgba(30,64,175,0.3)" },
+            },
+            y: {
+              ticks: { color: "rgba(148,163,184,0.9)" },
+              grid: { color: "rgba(30,64,175,0.3)" },
+            },
+          },
+        },
+      });
+    }
+
+    async function loadEntryScoreHist() {
+      const res = await fetch("/api/entry-scores/recent?limit=300");
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const labels = data.hist_labels || [];
+      const counts = data.hist_counts || [];
+
+      const ctx = document.getElementById("entryScoreHistChart").getContext("2d");
+      if (entryScoreHistChart) entryScoreHistChart.destroy();
+
+      entryScoreHistChart = new Chart(ctx, {
+        type: "bar",
+        data: {
+          labels,
+          datasets: [
+            {
+              label: "진입 점수 개수",
+              data: counts,
+              borderWidth: 1,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: {
+              labels: {
+                color: "rgba(226,232,240,0.9)",
+                font: { size: 11 },
+              },
+            },
+          },
+          scales: {
+            x: {
+              ticks: { color: "rgba(148,163,184,0.9)" },
+              grid: { color: "rgba(30,64,175,0.3)" },
+            },
+            y: {
+              ticks: { color: "rgba(148,163,184,0.9)" },
+              grid: { color: "rgba(30,64,175,0.3)" },
+            },
+          },
+        },
+      });
+    }
+
+    async function loadTrades() {
+      const res = await fetch("/api/trades/recent?limit=50");
+      if (!res.ok) return;
+      const data = await res.json();
+      const items = data.items || [];
+
+      const tbody = document.getElementById("trades-table-body");
+      tbody.innerHTML = "";
+
+      document.getElementById("trades-count-label").textContent =
+        `최근 ${items.length}건`;
+
+      for (const t of items) {
+        const tr = document.createElement("tr");
+
+        const pnl = Number(t.pnl_usdt || 0);
+        const pnlClass =
+          pnl > 0 ? "text-emerald-400" : pnl < 0 ? "text-rose-400" : "text-slate-300";
+
+        const cells = [
+          {
+            label: "진입시각",
+            value: fmtDate(t.entry_ts),
+          },
+          {
+            label: "자동/수동",
+            value: t.trade_type || "",
+          },
+          {
+            label: "장 타입",
+            value: t.regime_label || "",
+          },
+          {
+            label: "방향",
+            value: t.side_label || "",
+          },
+          {
+            label: "진입가",
+            value: t.entry_price ? fmtNumber(t.entry_price, 1) : "-",
+          },
+          {
+            label: "청산가",
+            value: t.exit_price ? fmtNumber(t.exit_price, 1) : "-",
+          },
+          {
+            label: "수익(USDT)",
+            value: fmtPnlWithSign(pnl),
+            extraClass: pnlClass,
+          },
+          {
+            label: "청산 이유",
+            value: t.close_reason_label || "",
+          },
+        ];
+
+        for (const c of cells) {
+          const td = document.createElement("td");
+          td.className = "px-2 py-1 whitespace-nowrap";
+          td.dataset.label = c.label;
+          td.textContent = c.value;
+          if (c.extraClass) td.classList.add(c.extraClass);
+          tr.appendChild(td);
+        }
+
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function loadAll() {
+      await Promise.all([
+        loadSummary(),
+        loadDailyPnlChart(),
+        loadEntryScoreHist(),
+        loadTrades(),
+      ]);
+      setLastUpdated();
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      loadAll();
+      document.getElementById("refresh-btn").addEventListener("click", () => {
+        loadAll();
+      });
+    });
+  </script>
+</body>
+</html>
