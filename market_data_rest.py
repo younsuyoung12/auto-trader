@@ -2,6 +2,14 @@
 # ====================================================
 # BingX REST 캔들 히스토리 조회 모듈
 #
+# 2025-11-15 변경 사항
+# ----------------------------------------------------
+# 1) V3/V2 요청에 limit 파라미터를 추가해서, REST 에서 원하는 개수만큼
+#    캔들을 받아오도록 수정.
+#    - fetch_klines_rest(limit=...) → 내부에서 raw_limit = limit + 20 으로 여유 있게 요청.
+#    - BingX 응답이 raw_limit 개 이상이면 openTime 기준 정렬 후 마지막 limit 개만 사용.
+# 2) 디버깅용으로 REST 요청 로그에 raw_limit 를 함께 출력.
+#
 # 역할
 # ----------------------------------------------------
 # - swap/futures용 REST /kline 엔드포인트를 호출해서
@@ -81,10 +89,12 @@ def _request_klines_v3(
     interval: str,
     start_ms: int,
     end_ms: int,
+    limit: int,
 ) -> Optional[List[List[Any]]]:
-    """
-    swap V3 quote klines 시도
+    """swap V3 quote klines 시도
+
     - 문서: /openApi/swap/v3/quote/klines (공개 마켓 데이터)
+    - limit 파라미터를 함께 보내서 최대 캔들 개수를 제어한다.
     """
     url = f"{BINGX_API_BASE}/openApi/swap/v3/quote/klines"
     params = {
@@ -92,6 +102,8 @@ def _request_klines_v3(
         "interval": interval,
         "startTime": start_ms,
         "endTime": end_ms,
+        # BingX 문서 기준으로 필요 시 limit/pageSize 등으로 조정 가능
+        "limit": limit,
     }
 
     resp = requests.get(url, params=params, timeout=10)
@@ -120,11 +132,13 @@ def _request_klines_v2(
     interval: str,
     start_ms: int,
     end_ms: int,
+    limit: int,
 ) -> Optional[List[List[Any]]]:
-    """
-    swap V2 market kline 시도 (폴백용)
+    """swap V2 market kline 시도 (폴백용)
+
     - 문서: /openApi/swap/v2/market/kline 혹은 유사 경로
     - 일부 환경에서 V3 엔드포인트가 동작하지 않을 경우를 대비.
+    - limit 파라미터를 함께 보내서 최대 캔들 개수를 제어한다.
     """
     # 실제 문서 기준으로 경로가 다를 수 있어서,
     # 여기서는 가장 많이 쓰이는 market/kline 경로를 우선 사용.
@@ -134,6 +148,8 @@ def _request_klines_v2(
         "interval": interval,
         "startTime": start_ms,
         "endTime": end_ms,
+        # 필요 시 BingX 문서에 맞춰 limit/pageSize 이름 조정
+        "limit": limit,
     }
 
     resp = requests.get(url, params=params, timeout=10)
@@ -162,8 +178,7 @@ def fetch_klines_rest(
     interval: str,
     limit: int = 120,
 ) -> List[List[Any]]:
-    """
-    BingX REST /kline 히스토리를 조회해서 list[list] 로 반환한다.
+    """BingX REST /kline 히스토리를 조회해서 list[list] 로 반환한다.
 
     매개변수
     ------------------------------------------------
@@ -192,23 +207,26 @@ def fetch_klines_rest(
     # 약간 여유를 두고 더 넓게 요청
     start_ms = end_ms - iv_ms * (limit + 20)
 
+    # 서버에는 limit 보다 약간 큰 raw_limit 로 요청 (여유분)
+    raw_limit = limit + 20
+
     log(
         f"[REST-KLINES] request symbol={symbol} interval={interval} "
-        f"start={start_ms} end={end_ms} limit≈{limit}"
+        f"start={start_ms} end={end_ms} limit≈{limit}, raw_limit={raw_limit}"
     )
 
     rows: Optional[List[List[Any]]] = None
 
     # 1) V3 먼저 시도
     try:
-        rows = _request_klines_v3(symbol, interval, start_ms, end_ms)
+        rows = _request_klines_v3(symbol, interval, start_ms, end_ms, raw_limit)
     except Exception as e:
         log(f"[REST-KLINES] V3 request error: {e}")
 
     # 2) V3 가 실패했거나 빈 결과 → V2 폴백
     if not rows:
         try:
-            rows = _request_klines_v2(symbol, interval, start_ms, end_ms)
+            rows = _request_klines_v2(symbol, interval, start_ms, end_ms, raw_limit)
         except Exception as e:
             log(f"[REST-KLINES] V2 request error: {e}")
 
@@ -229,7 +247,7 @@ def fetch_klines_rest(
 
     log(
         f"[REST-KLINES] loaded {len(rows)} rows for "
-        f"{symbol} {interval} (requested limit={limit})"
+        f"{symbol} {interval} (requested limit={limit}, raw_limit={raw_limit})"
     )
     return rows
 
