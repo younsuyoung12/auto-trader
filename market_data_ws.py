@@ -1,9 +1,20 @@
 """
 market_data_ws.py
-====================================================
+=====================================================
 BingX swap-market 웹소켓으로 1m/5m/15m 캔들과 depth5를 받아서
 메모리 버퍼에 보관하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
 getter 로 제공하는 모듈.
+
+PATCH NOTES — 2025-11-15
+----------------------------------------------------
+1) BingX 에서 들어오는 WebSocket 프레임/캔들/호가 원본을 Render 로그에서 확인할 수 있도록
+   디버그 로그 옵션을 추가했다.
+   - settings_ws.ws_log_raw_enabled = True  이면 디코딩된 WS 프레임 전체를
+     "[MD-WS RAW] ..." 형식으로 로그에 남긴다.
+   - settings_ws.ws_log_payload_enabled = True 이면 개별 kline/depth payload 를
+     "[MD-WS PAYLOAD] ..." 형식으로 로그에 남긴다.
+   - 로그 폭주 방지를 위해 한 프레임/페이로드당 최대 2000자까지만 출력한 뒤
+     잘라내고 '(truncated, total_len=...)' 표시를 붙인다.
 
 2025-11-14 변경 / 중요사항
 ----------------------------------------------------
@@ -80,6 +91,21 @@ RECONNECT_WAIT = 5
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _safe_dump_for_log(obj: Any, max_len: int = 2000) -> str:
+    """WS raw/payload 를 로그로 찍을 때 문자열로 안전하게 변환한다.
+
+    - JSON 직렬화를 시도하고, 실패하면 str(obj)를 사용한다.
+    - max_len 보다 길면 잘라내고 '(truncated, total_len=...)' 를 붙인다.
+    """
+    try:
+        s = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        s = str(obj)
+    if len(s) > max_len:
+        return s[:max_len] + f"... (truncated, total_len={len(s)})"
+    return s
 
 
 def _to_ws_symbol(sym: str) -> str:
@@ -242,6 +268,18 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
     # kline 예: "BTC-USDT@kline_1m"
     if "@kline_" in data_type and isinstance(payload, dict):
         interval = data_type.split("@kline_")[-1]
+
+        # kline payload 디버그 로그 (옵션)
+        if getattr(SET, "ws_log_payload_enabled", False):
+            try:
+                log(
+                    f"[MD-WS PAYLOAD] {symbol} {interval} kline: "
+                    f"{_safe_dump_for_log(payload)}"
+                )
+            except Exception:
+                # 로깅 실패는 시세 처리에 영향을 주지 않음
+                pass
+
         _push_kline(symbol, interval, payload)
         if getattr(SET, "ws_log_enabled", True):
             log(f"[MD-WS] {symbol} {interval} kline updated")
@@ -249,6 +287,16 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
 
     # depth 예: "BTC-USDT@depth5"
     if "@depth" in data_type:
+        # depth payload 디버그 로그 (옵션)
+        if getattr(SET, "ws_log_payload_enabled", False):
+            try:
+                log(
+                    f"[MD-WS PAYLOAD] {symbol} depth: "
+                    f"{_safe_dump_for_log(payload if isinstance(payload, dict) else {'raw': payload})}"
+                )
+            except Exception:
+                pass
+
         # payload 가 dict 라고 가정하되, list 로 오면 빈 dict 로 넘긴다
         _push_orderbook(symbol, payload if isinstance(payload, dict) else {})
         if getattr(SET, "ws_log_enabled", True):
@@ -261,6 +309,14 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
     data = _decode_msg(message)
     if data is None:
         return
+
+    # RAW 프레임 디버그 로그 (옵션)
+    if getattr(SET, "ws_log_raw_enabled", False):
+        try:
+            log(f"[MD-WS RAW] {_safe_dump_for_log(data)}")
+        except Exception:
+            # 로깅에서 예외가 나더라도 WS 루프는 계속 돌아가야 한다.
+            pass
 
     # Ping 처리(여러 포맷)
     if _handle_ping(ws, data):

@@ -1,5 +1,5 @@
 """
-entry_flow.py (WS 거래량 우선 + arbitration + EntryScore 기록 버전)
+entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT 버전)
 =====================================================
 역할
 ----------------------------------------------------
@@ -7,6 +7,15 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore 기록 버전)
   run_bot.py / run_bot_ws.py 에서 한 줄로 호출할 수 있게 한다.
 - 웹소켓 기반 시그널(signal_flow_ws.get_trading_signal)을 사용하며,
   TREND/RANGE 동시 평가 + 중재(Arbitration) 결과를 그대로 받아서 처리한다.
+
+2025-11-15 변경 사항
+----------------------------------------------------
+1) 진입 성공 시 bt_trades 테이블에 즉시 INSERT 하는 로직 추가.
+   - _create_trade_row_on_entry(...) 헬퍼 함수 신설.
+   - entry_ts/entry_price/qty/is_auto/strategy/regime_at_entry/leverage/risk_pct/tp_pct/sl_pct
+     및 created_at/updated_at 을 함께 저장.
+   - INSERT 시 RETURNING id 를 사용해 생성된 pk 를 받아 trade.db_id 로 심어 둔다.
+   - 이후 EntryScore 저장 시 trade_id 로 연결될 수 있게 설계.
 
 2025-11-14 변경 사항
 ----------------------------------------------------
@@ -75,9 +84,11 @@ from signals_logger import log_signal, log_candle_snapshot
 try:
     from db_core import SessionLocal  # type: ignore
     from db_models import EntryScore as EntryScoreORM  # type: ignore
+    from sqlalchemy import text as sa_text  # type: ignore
 except Exception:  # pragma: no cover - DB가 아직 준비되지 않은 환경 방어
     SessionLocal = None  # type: ignore
     EntryScoreORM = None  # type: ignore
+    sa_text = None  # type: ignore
 
 # ✅ 웹소켓 시세 버퍼에서 거래량까지 있는 캔들을 가져오기
 # - ws_get_klines_with_volume(symbol, interval, limit)
@@ -186,7 +197,7 @@ def _compute_entry_score_components(
     # extra dict 필수
     if not isinstance(extra, dict):
         missing.append("extra(dict)")
-    
+
     # 수치값 기본 검증 유틸
     def _valid_num(name: str, value: Any, *, min_val: float | None = None) -> bool:
         if not isinstance(value, (int, float)):
@@ -336,6 +347,133 @@ def _save_entry_score_to_db(
         session.close()
 
 
+def _create_trade_row_on_entry(
+    *,
+    trade: Trade,
+    symbol: str,
+    latest_ts_ms: int,
+    regime_at_entry: str,
+    signal_source: str,
+    effective_risk_pct: float,
+    tp_pct: float,
+    sl_pct: float,
+    is_auto: bool = True,
+) -> None:
+    """진입 직후 bt_trades 에 1건 INSERT.
+
+    - INSERT 시 RETURNING id 를 사용해 pk 를 받아 trade.db_id 로 심어 둔다.
+    - SessionLocal / sa_text 가 없으면 조용히 패스하고 로그만 남긴다.
+    - DB 에러 발생 시 rollback 후 에러 로그를 남긴다.
+    """
+    if SessionLocal is None or sa_text is None:
+        log("[BT_TRADES] SessionLocal / sa_text 없음 → INSERT 생략")
+        return
+
+    try:
+        session = SessionLocal()
+    except Exception as e:  # pragma: no cover
+        log(f"[BT_TRADES] Session 생성 실패: {e}")
+        return
+
+    try:
+        entry_dt = datetime.fromtimestamp(latest_ts_ms / 1000.0, tz=timezone.utc)
+        created_at = entry_dt
+        updated_at = entry_dt
+
+        params = {
+            "symbol": symbol,
+            "side": trade.side,
+            "entry_ts": entry_dt,
+            "entry_price": float(trade.entry),
+            "qty": float(trade.qty),
+            "is_auto": bool(is_auto),
+            "regime_at_entry": regime_at_entry,
+            "strategy": signal_source,
+            "leverage": float(getattr(trade, "leverage", 0.0)),
+            "risk_pct": float(effective_risk_pct),
+            "tp_pct": float(tp_pct),
+            "sl_pct": float(sl_pct),
+            "note": "",
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+
+        sql = sa_text(
+            """
+            INSERT INTO bt_trades (
+                symbol,
+                side,
+                entry_ts,
+                entry_price,
+                qty,
+                pnl_usdt,
+                pnl_pct_futures,
+                pnl_pct_spot_ref,
+                is_auto,
+                regime_at_entry,
+                regime_at_exit,
+                entry_score,
+                trend_score_at_entry,
+                range_score_at_entry,
+                strategy,
+                close_reason,
+                leverage,
+                risk_pct,
+                tp_pct,
+                sl_pct,
+                note,
+                created_at,
+                updated_at
+            ) VALUES (
+                :symbol,
+                :side,
+                :entry_ts,
+                :entry_price,
+                :qty,
+                NULL,
+                NULL,
+                NULL,
+                :is_auto,
+                :regime_at_entry,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                :strategy,
+                NULL,
+                :leverage,
+                :risk_pct,
+                :tp_pct,
+                :sl_pct,
+                :note,
+                :created_at,
+                :updated_at
+            )
+            RETURNING id
+            """
+        )
+
+        result = session.execute(sql, params)
+        new_id = result.scalar_one_or_none()
+        session.commit()
+
+        if new_id is not None:
+            try:
+                setattr(trade, "db_id", int(new_id))
+            except Exception:
+                pass
+
+        log(
+            f"[BT_TRADES] INSERT ok: symbol={symbol} side={trade.side} "
+            f"price={trade.entry} qty={trade.qty} id={new_id}"
+        )
+    except Exception as e:  # pragma: no cover
+        session.rollback()
+        log(f"[BT_TRADES] INSERT failed: {e}")
+    finally:
+        session.close()
+
+
 def try_open_new_position(
     settings: Any,
     last_trend_close_ts: float,
@@ -460,165 +598,4 @@ def try_open_new_position(
             reason="balance_zero",
             candle_ts=latest_ts,
         )
-        return None, 3.0
-
-    # (4) 주문 수량/명목가 산출
-    #     - signal_flow_ws 에서 ATR 기반으로 줄여준 effective_risk_pct 가 있으면 우선 사용.
-    base_risk_pct = float(getattr(settings, "risk_pct", 0.01))
-    effective_risk_pct = float(extra.get("effective_risk_pct", base_risk_pct)) if isinstance(extra, dict) else base_risk_pct
-    leverage = float(getattr(settings, "leverage", 1.0))
-
-    notional = avail * effective_risk_pct * leverage
-    min_notional = float(getattr(settings, "min_notional_usdt", 5.0))
-    max_notional = float(getattr(settings, "max_notional_usdt", 1_000_000.0))
-
-    if notional < min_notional:
-        send_tg(f"⚠️ 주문 금액이 너무 작습니다: {notional:.2f} USDT")
-        log_signal(
-            event="SKIP",
-            symbol=symbol,
-            strategy_type=signal_source,
-            direction=chosen_signal,
-            reason="notional_too_small",
-            candle_ts=latest_ts,
-        )
-        return None, 3.0
-
-    notional = min(notional, max_notional)
-
-    # 수량은 단순 비율 → 세부 스텝/라운딩은 trader.open_position_with_tp_sl 내부에서
-    # 정밀하게 처리할 수 있게, 일단 6자리 정도로만 반올림.
-    qty = round(notional / last_price, 6)
-    side_open = "BUY" if chosen_signal == "LONG" else "SELL"
-
-    # (5) TP/SL 결정
-    # signal_flow_ws 가 extra 에 실어준 값이 있으면 우선 사용.
-    tp_pct_extra = extra.get("tp_pct") if isinstance(extra, dict) else None
-    sl_pct_extra = extra.get("sl_pct") if isinstance(extra, dict) else None
-
-    if tp_pct_extra is not None and sl_pct_extra is not None:
-        tp_pct = float(tp_pct_extra)
-        sl_pct = float(sl_pct_extra)
-    else:
-        # 전략별 기본값 (없으면 전역 tp_pct/sl_pct를 사용)
-        if signal_source == "RANGE":
-            tp_pct = float(getattr(settings, "range_tp_pct", getattr(settings, "tp_pct", 0.006)))
-            sl_pct = float(getattr(settings, "range_sl_pct", getattr(settings, "sl_pct", 0.004)))
-        else:  # TREND / HYBRID → 추세 기본값
-            tp_pct = float(getattr(settings, "trend_tp_pct", getattr(settings, "tp_pct", 0.006)))
-            sl_pct = float(getattr(settings, "trend_sl_pct", getattr(settings, "sl_pct", 0.004)))
-
-    # (6) 호가 기반 진입가 힌트
-    entry_price_hint = last_price
-    use_ob_hint = bool(getattr(settings, "use_orderbook_entry_hint", False))
-    if use_ob_hint and best_bid and best_ask:
-        entry_price_hint = best_ask if side_open == "BUY" else best_bid
-
-    # (7) trader 에 넘길 보강 플래그 (soft 모드 / SL 바닥 비율 등)
-    soft_mode_flag = False
-    sl_floor_ratio = None
-    if isinstance(extra, dict):
-        soft_mode_flag = bool(
-            extra.get("soft_mode")
-            or extra.get("soft")
-            or extra.get("range_soft")
-        )
-        sl_floor_ratio = extra.get("sl_floor_ratio")
-
-    # (8) 최종 진입 실행
-    trade = open_position_with_tp_sl(
-        settings=settings,
-        symbol=symbol,
-        side_open=side_open,
-        qty=qty,
-        entry_price_hint=entry_price_hint,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        source=signal_source,
-        soft_mode=soft_mode_flag,
-        sl_floor_ratio=sl_floor_ratio,
-    )
-
-    if trade is None:
-        # 거래소 주문 실패 또는 TP/SL 예약 실패 등
-        log_signal(
-            event="SKIP",
-            symbol=symbol,
-            strategy_type=signal_source,
-            direction=chosen_signal,
-            reason="entry_failed",
-            candle_ts=latest_ts,
-        )
-        return None, 2.0
-
-    # (8-1) EntryScore 계산 및 DB 기록
-    try:
-        entry_score, components = _compute_entry_score_components(
-            signal_source=signal_source,
-            chosen_signal=chosen_signal,
-            effective_risk_pct=effective_risk_pct,
-            leverage=leverage,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            extra=extra if isinstance(extra, dict) else None,
-        )
-    except ValueError as e:
-        # 필수 데이터 누락/이상 → 점수 계산/저장 SKIP
-        log(f"[ENTRY_SCORE] SKIP (invalid/missing data): {e}")
-    except Exception as e:  # pragma: no cover - 예기치 못한 계산 에러
-        log(f"[ENTRY_SCORE] compute failed: {e}")
-    else:
-        regime_at_entry = _infer_regime_from_signal(signal_source)
-
-        _save_entry_score_to_db(
-            symbol=symbol,
-            ts_ms=latest_ts,
-            side=trade.side,
-            signal_type=signal_source,
-            regime_at_entry=regime_at_entry,
-            entry_score=entry_score,
-            components=components,
-            trade=trade,
-            used_for_entry=True,
-        )
-
-        # Trade 객체에도 참고용으로 심어 둔다(있어도 되고 없어도 됨).
-        try:
-            setattr(trade, "entry_score", entry_score)
-            setattr(trade, "entry_score_components", components)
-        except Exception:
-            pass
-
-    # (9) 알림 / 로그
-    side_ko = "롱" if trade.side == "BUY" else "숏"
-    if signal_source == "TREND":
-        strat_ko = "추세"
-    elif signal_source == "RANGE":
-        strat_ko = "박스"
-    else:
-        strat_ko = "혼합"  # HYBRID 등
-
-    if bool(getattr(settings, "notify_on_entry", True)):
-        send_tg(
-            f"[ENTRY] {strat_ko} {side_ko} 진입\n"
-            f"- 심볼: {trade.symbol}\n"
-            f"- 진입가: {trade.entry:.2f}\n"
-            f"- 수량: {trade.qty}\n"
-            f"- TP: {trade.tp_price} / SL: {trade.sl_price}"
-        )
-
-    log_signal(
-        event="ENTRY_OPENED",
-        symbol=trade.symbol,
-        strategy_type=trade.source,
-        direction=trade.side,
-        price=trade.entry,
-        qty=trade.qty,
-        tp_price=trade.tp_price,
-        sl_price=trade.sl_price,
-        candle_ts=latest_ts,
-    )
-
-    # 성공적으로 진입했으니 메인 루프 기본 쿨다운을 settings 쪽에서 하도록 반환
-    cooldown_sec = float(getattr(settings, "cooldown_sec", 1.0))
-    return trade, cooldown_sec
+   
