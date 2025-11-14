@@ -1,5 +1,5 @@
 """run_bot_ws.py
-====================================================
+=====================================================
 웹소켓으로 들어오는 1m / 5m / 15m 캔들을 기준으로 포지션을 열고 감시하는 메인 루프.
 이 버전에서는 더 이상 3m 캔들을 사용하지 않는다.
 
@@ -33,6 +33,16 @@
     메인 매매 루프/WS 루프에는 영향을 주지 않도록 설계.
 12) signal_analysis_worker 를 1분 주기(또는 settings_ws.signal_analysis_interval_sec)로
     백그라운드에서 돌려 bt_candles 를 읽고 bt_regime_scores 에 레짐 점수를 기록.
+
+2025-11-15 변경 사항 (REST 히스토리 백필)
+----------------------------------------------------
+13) BingX REST /kline 응답을 이용해 5m/15m 히스토리 캔들을
+    market_data_ws.backfill_klines_from_rest(...) 으로 WS 버퍼에 미리 채우는
+    _backfill_ws_kline_history(...) 헬퍼 추가.
+14) main() 시작 시 ws_enabled=True 이면
+    _backfill_ws_kline_history(...) 실행 후 start_ws_loop(...) 를 호출하도록 변경.
+    → 최초 부팅 직후에도 5m 캔들이 50개 이상 준비되어
+      "[SIGNAL] 5m candles not enough (<50) → skip signal" 현상을 줄임.
 """
 
 from __future__ import annotations
@@ -76,12 +86,14 @@ from market_data_ws import (
     get_klines as ws_get_klines,    # 15m 추세 조회용
     get_klines_with_volume as ws_get_klines_with_volume,  # 캔들+거래량(DB 적재용)
     get_orderbook as ws_get_orderbook,  # depth5 오더북(DB 적재용)
+    backfill_klines_from_rest,      # REST 히스토리 → WS 버퍼 백필용
 )
 from market_data_store import (
     save_candles_bulk_from_ws,
     save_orderbook_from_ws,
 )
 from strategies_trend_ws import decide_trend_15m  # 15m 방향 판단
+from market_data_ws import fetch_klines_rest     # BingX REST /kline 헬퍼
 
 
 # ─────────────────────────────
@@ -242,6 +254,37 @@ def _on_safe_stop() -> None:
 
 
 # ─────────────────────────────
+# WS 시세 초기 REST 백필
+# ─────────────────────────────
+
+def _backfill_ws_kline_history(symbol: str) -> None:
+    """BingX REST /kline 으로 5m/15m 히스토리 캔들을 받아와 WS 버퍼에 미리 채운다.
+
+    - run_bot_ws.main() 시작 시점에 한 번만 호출.
+    - market_data_ws.backfill_klines_from_rest(...) 를 사용해
+      5m/15m 버퍼가 최소 수십 개 이상 채워진 상태에서 신호 계산이 시작되도록 한다.
+    """
+    # 기본은 5m/15m 만 백필, 필요하면 settings_ws.ws_backfill_tfs 로 조정 가능
+    intervals = getattr(SET, "ws_backfill_tfs", ["5m", "15m"])
+    limit = int(getattr(SET, "ws_backfill_limit", 120))
+
+    for iv in intervals:
+        try:
+            log(
+                f"[BOOT] REST backfill start: symbol={symbol} interval={iv} limit={limit}"
+            )
+            rest_rows = fetch_klines_rest(symbol, iv, limit=limit)
+            if not rest_rows:
+                log(
+                    f"[BOOT] REST backfill skipped: empty response for {symbol} {iv}"
+                )
+                continue
+            backfill_klines_from_rest(symbol, iv, rest_rows)
+        except Exception as e:
+            log(f"[BOOT] REST backfill failed for {symbol} {iv}: {e}")
+
+
+# ─────────────────────────────
 # WS 시세 → DB 저장 스레드
 # ─────────────────────────────
 
@@ -368,8 +411,9 @@ def main() -> None:
         f"INTERVAL={SET.interval}"
     )
 
-    # ★ 웹소켓 시세 수신 시작 (이거 무조건 먼저 켜야 아래 로직이 ws_get_klines(...) 쓸 수 있음)
+    # ★ REST 히스토리 백필 + 웹소켓 시세 수신 시작
     if getattr(SET, "ws_enabled", True):
+        _backfill_ws_kline_history(SET.symbol)
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
 

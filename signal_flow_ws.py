@@ -74,6 +74,8 @@ from strategies_trend_ws import (
     confirm_1m_direction,  # 1m 확인
 )
 
+from db_writer import save_indicator_row
+
 # RANGE 모듈은 최신/구버전 둘 다 대응
 try:
     from strategies_range_ws import (
