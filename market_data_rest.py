@@ -1,0 +1,240 @@
+# market_data_rest.py
+# ====================================================
+# BingX REST 캔들 히스토리 조회 모듈
+#
+# 역할
+# ----------------------------------------------------
+# - swap/futures용 REST /kline 엔드포인트를 호출해서
+#   히스토리 캔들을 받아온다.
+# - run_bot_ws.py 에서는 이 모듈의 fetch_klines_rest(...) 결과를
+#   market_data_ws.backfill_klines_from_rest(...) 에 넘겨서
+#   WS 버퍼를 시작 시점에 한 번에 채운다.
+#
+# 반환 포맷
+# ----------------------------------------------------
+# - BingX REST 응답의 data 그대로(list[list])를 돌려준다.
+#   예시:
+#       [
+#         [openTime, open, high, low, close, volume, closeTime, ...],
+#         ...
+#       ]
+#
+# 사용 예시 (run_bot_ws 쪽):
+# ----------------------------------------------------
+#   from market_data_rest import fetch_klines_rest
+#   from market_data_ws import backfill_klines_from_rest
+#
+#   rest_5m = fetch_klines_rest("BTC-USDT", "5m", limit=120)
+#   backfill_klines_from_rest("BTC-USDT", "5m", rest_5m)
+#
+# 주의
+# ----------------------------------------------------
+# - 여기서는 *공개 마켓 데이터* 엔드포인트만 사용하므로
+#   서명/비공개 키가 필요 없다.
+# - 엔드포인트/파라미터는 BingX 공식 문서 기준으로 작성했다.
+#   에러 발생 시 telelog.log(...) 로만 남기고, 호출 측에서
+#   적절히 예외를 처리하도록 한다.
+# ====================================================
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Any, List, Optional
+
+import requests
+
+try:
+    from telelog import log
+except Exception:
+    # telelog 이 없으면 print 로만 대체 (로컬 테스트용)
+    def log(msg: str) -> None:  # type: ignore
+        print(msg)
+
+
+# 기본 REST base URL
+BINGX_API_BASE = os.getenv("BINGX_API_BASE", "https://open-api.bingx.com")
+
+
+# interval 문자열 → 밀리초 변환
+_INTERVAL_MS = {
+    "1m": 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+}
+
+
+class KlineRestError(RuntimeError):
+    """REST 캔들 조회 실패시 사용하는 예외."""
+
+
+def _interval_to_ms(interval: str) -> int:
+    if interval not in _INTERVAL_MS:
+        raise ValueError(f"지원하지 않는 interval: {interval}")
+    return _INTERVAL_MS[interval]
+
+
+def _request_klines_v3(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[List[List[Any]]]:
+    """
+    swap V3 quote klines 시도
+    - 문서: /openApi/swap/v3/quote/klines (공개 마켓 데이터)
+    """
+    url = f"{BINGX_API_BASE}/openApi/swap/v3/quote/klines"
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "startTime": start_ms,
+        "endTime": end_ms,
+    }
+
+    resp = requests.get(url, params=params, timeout=10)
+    if resp.status_code != 200:
+        log(f"[REST-KLINES V3] HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    data = resp.json()
+    code = data.get("code")
+    if code != 0:
+        log(
+            f"[REST-KLINES V3] code={code}, msg={data.get('msg')}, "
+            f"payload={str(data)[:200]}"
+        )
+        return None
+
+    rows = data.get("data") or []
+    if not isinstance(rows, list):
+        log(f"[REST-KLINES V3] unexpected data type: {type(rows)}")
+        return None
+    return rows
+
+
+def _request_klines_v2(
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[List[List[Any]]]:
+    """
+    swap V2 market kline 시도 (폴백용)
+    - 문서: /openApi/swap/v2/market/kline 혹은 유사 경로
+    - 일부 환경에서 V3 엔드포인트가 동작하지 않을 경우를 대비.
+    """
+    # 실제 문서 기준으로 경로가 다를 수 있어서,
+    # 여기서는 가장 많이 쓰이는 market/kline 경로를 우선 사용.
+    url = f"{BINGX_API_BASE}/openApi/swap/v2/market/kline"
+    params = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "startTime": start_ms,
+        "endTime": end_ms,
+    }
+
+    resp = requests.get(url, params=params, timeout=10)
+    if resp.status_code != 200:
+        log(f"[REST-KLINES V2] HTTP {resp.status_code}: {resp.text[:200]}")
+        return None
+
+    data = resp.json()
+    code = data.get("code")
+    if code != 0:
+        log(
+            f"[REST-KLINES V2] code={code}, msg={data.get('msg')}, "
+            f"payload={str(data)[:200]}"
+        )
+        return None
+
+    rows = data.get("data") or []
+    if not isinstance(rows, list):
+        log(f"[REST-KLINES V2] unexpected data type: {type(rows)}")
+        return None
+    return rows
+
+
+def fetch_klines_rest(
+    symbol: str,
+    interval: str,
+    limit: int = 120,
+) -> List[List[Any]]:
+    """
+    BingX REST /kline 히스토리를 조회해서 list[list] 로 반환한다.
+
+    매개변수
+    ------------------------------------------------
+    - symbol  : "BTC-USDT" 같은 심볼 (WS와 동일 포맷)
+    - interval: "1m", "5m", "15m" 등
+    - limit   : 원하는 최대 캔들 수 (기본 120)
+
+    반환값 예시
+    ------------------------------------------------
+    [
+      [openTime, open, high, low, close, volume, closeTime, ...],
+      ...
+    ]
+
+    주의
+    ------------------------------------------------
+    - startTime / endTime 은 현재 시각 기준 뒤로 limit+여유분 만큼 잡는다.
+    - V3(/swap/v3/quote/klines) → 실패 시 V2(/swap/v2/market/kline) 순으로 시도.
+    - 둘 다 실패하면 KlineRestError 예외를 raise 한다.
+    """
+    if limit <= 0:
+        raise ValueError("limit 은 1 이상이어야 합니다.")
+
+    iv_ms = _interval_to_ms(interval)
+    end_ms = int(time.time() * 1000)
+    # 약간 여유를 두고 더 넓게 요청
+    start_ms = end_ms - iv_ms * (limit + 20)
+
+    log(
+        f"[REST-KLINES] request symbol={symbol} interval={interval} "
+        f"start={start_ms} end={end_ms} limit≈{limit}"
+    )
+
+    rows: Optional[List[List[Any]]] = None
+
+    # 1) V3 먼저 시도
+    try:
+        rows = _request_klines_v3(symbol, interval, start_ms, end_ms)
+    except Exception as e:
+        log(f"[REST-KLINES] V3 request error: {e}")
+
+    # 2) V3 가 실패했거나 빈 결과 → V2 폴백
+    if not rows:
+        try:
+            rows = _request_klines_v2(symbol, interval, start_ms, end_ms)
+        except Exception as e:
+            log(f"[REST-KLINES] V2 request error: {e}")
+
+    if not rows:
+        raise KlineRestError(
+            f"REST kline 조회 실패: symbol={symbol}, interval={interval}"
+        )
+
+    # openTime 기준 정렬 후 limit 개까지만 반환
+    try:
+        rows.sort(key=lambda r: int(r[0]))
+    except Exception:
+        # 정렬 실패하면 그대로 사용 (최악의 경우지만 로직은 계속)
+        pass
+
+    if len(rows) > limit:
+        rows = rows[-limit:]
+
+    log(
+        f"[REST-KLINES] loaded {len(rows)} rows for "
+        f"{symbol} {interval} (requested limit={limit})"
+    )
+    return rows
+
+
+__all__ = [
+    "fetch_klines_rest",
+    "KlineRestError",
+]

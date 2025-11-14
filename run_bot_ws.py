@@ -93,7 +93,7 @@ from market_data_store import (
     save_orderbook_from_ws,
 )
 from strategies_trend_ws import decide_trend_15m  # 15m 방향 판단
-from market_data_ws import fetch_klines_rest     # BingX REST /kline 헬퍼
+from market_data_rest import fetch_klines_rest     # BingX REST /kline 헬퍼
 
 
 # ─────────────────────────────
