@@ -70,15 +70,6 @@ PATCH NOTES — 2025-11-15 (2차 보정)
 5) 구독 타임프레임 설정
    - settings.ws_subscribe_tfs 를 우선 사용, 미지정 시 ["1m","5m","15m"] 기본값.
 
-기존 보강 요약
-----------------------------------------------------
-- depth(payload)에 markPrice / lastPrice / time 같은 필드가 섞여서 올 때가 있어서
-  그대로 버퍼에 남겨두도록 했다. (entry_guards_ws 에서 mark/last 괴리 가드가 이걸 본다.)
-- depth 형식이 list / dict 혼합으로 와도 최대한 bids/asks 를 뽑아서 저장하도록 보정했다.
-- WS 주소를 환경변수 BINGX_SWAP_WS_BASE 로도 바꿀 수 있게 했다.
-  (없으면 기존처럼 wss://open-api-swap.bingx.com/swap-market 사용)
-- 모든 저장 시 수신 시각(ts_ms)을 붙여서 나중에 "깊이가 오래됐나?"를 볼 수 있게 했다.
-
 기본 설명
 ----------------------------------------------------
 - URL: wss://open-api-swap.bingx.com/swap-market
@@ -134,11 +125,7 @@ def _now_ms() -> int:
 
 
 def _safe_dump_for_log(obj: Any, max_len: int = 2000) -> str:
-    """WS raw/payload 를 로그로 찍을 때 문자열로 안전하게 변환한다.
-
-    - JSON 직렬화를 시도하고, 실패하면 str(obj)를 사용한다.
-    - max_len 보다 길면 잘라내고 '(truncated, total_len=...)' 를 붙인다.
-    """
+    """WS raw/payload 를 로그로 찍을 때 문자열로 안전하게 변환한다."""
     try:
         s = json.dumps(obj, ensure_ascii=False, default=str)
     except Exception:
@@ -177,18 +164,7 @@ def _build_sub_msgs(symbol: str) -> List[Dict[str, Any]]:
 
 
 def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
-    """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다.
-
-    item 예시 (BingX 현재 포맷):
-        {
-            "c": "96051.0",
-            "o": "96306.1",
-            "h": "96357.6",
-            "l": "96050.8",
-            "v": "56.9695",
-            "T": 1763142300000
-        }
-    """
+    """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다."""
     key = (symbol, interval)
     ts = int(item.get("t") or item.get("T") or 0)
     o = float(item.get("o") or 0)
@@ -197,7 +173,6 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
     c = float(item.get("c") or 0)
     v = float(item.get("v") or 0)
 
-    # 마지막 바 갱신/추가 (동시성 보호)
     with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
         before_len = len(buf)
@@ -226,7 +201,6 @@ def _normalize_depth_side(side_val: Any) -> List[List[float]]:
     out: List[List[float]] = []
     for row in side_val:
         if isinstance(row, list) and len(row) >= 2:
-            # ["103000", "0.123"] 또는 [103000, 0.123]
             try:
                 price = float(row[0])
                 qty = float(row[1])
@@ -254,7 +228,6 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
         "ts": _now_ms(),  # 수신(로컬) 시각
     }
 
-    # 원본에 markPrice / lastPrice / time류가 있으면 보존
     if "markPrice" in payload:
         ob["markPrice"] = payload.get("markPrice")
     if "lastPrice" in payload:
@@ -273,7 +246,6 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
 
 def _decode_msg(raw: Any) -> Any:
     """수신 프레임을 안전하게 JSON 파싱한다."""
-    # bytes
     if isinstance(raw, (bytes, bytearray)):
         try:
             decompressed = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
@@ -288,7 +260,6 @@ def _decode_msg(raw: Any) -> Any:
                 except Exception:
                     return None
 
-    # str
     if isinstance(raw, str):
         try:
             return json.loads(raw)
@@ -300,12 +271,10 @@ def _decode_msg(raw: Any) -> Any:
 
 def _handle_ping(ws: websocket.WebSocketApp, data: Any) -> bool:
     """다양한 Ping 포맷을 감지하면 Pong 응답 후 True 를 반환한다."""
-    # 문자열 Ping
     if isinstance(data, str) and data.strip().lower() == "ping":
         ws.send("Pong")
         return True
 
-    # dict 기반 Ping
     if isinstance(data, dict):
         if "ping" in data or data.get("op") == "ping" or data.get("event") == "ping":
             ws.send("Pong")
@@ -315,14 +284,7 @@ def _handle_ping(ws: websocket.WebSocketApp, data: Any) -> bool:
 
 
 def _iter_kline_items(payload: Any) -> List[Dict[str, Any]]:
-    """kline payload 를 통합 포맷(list[dict])으로 변환.
-
-    BingX 현재 포맷:
-        "data": [{ ... }]  # list 안에 dict 하나 이상
-    과거/다른 포맷:
-        "data": { ... }    # 단일 dict
-    둘 다 지원하기 위해 list[dict] 로 정규화해서 반환한다.
-    """
+    """kline payload 를 통합 포맷(list[dict])으로 변환."""
     if isinstance(payload, dict):
         return [payload]
     if isinstance(payload, list):
@@ -345,11 +307,9 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
     if not data_type:
         return
 
-    # kline 예: "BTC-USDT@kline_1m"
     if "@kline_" in data_type:
         interval = data_type.split("@kline_")[-1]
 
-        # payload 타입에 따라 list/dict 모두 지원
         items = _iter_kline_items(payload)
         if not items:
             try:
@@ -374,7 +334,6 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
             _push_kline(symbol, interval, item)
         return
 
-    # depth 예: "BTC-USDT@depth5"
     if "@depth" in data_type:
         if getattr(SET, "ws_log_payload_enabled", False):
             try:
@@ -436,14 +395,7 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
 
 
 def start_ws_loop(symbol: str) -> None:
-    """백그라운드 스레드에서 무한 재접속 루프로 WS를 유지한다.
-
-    - run_bot_ws 에서는 보통 다음 순서로 사용하는 것을 권장:
-      1) (선택) REST 로 5m/15m 히스토리 캔들 가져오기
-         → fetch_klines_rest(...) 결과를 backfill_klines_from_rest(...) 에 넣어 백필
-      2) start_ws_loop(symbol) 호출로 실시간 WS 시작
-      3) 이후 get_klines_with_volume(...)/get_orderbook(...) 으로 시세/호가 조회
-    """
+    """백그라운드 스레드에서 무한 재접속 루프로 WS를 유지한다."""
     url = WS_URL
 
     def _runner() -> None:
@@ -452,7 +404,8 @@ def start_ws_loop(symbol: str) -> None:
                 ws = websocket.WebSocketApp(
                     url,
                     on_open=lambda w: _on_open(symbol, w),
-                    on_message=lambda w, m: _on_message(symbol, m),
+                    # ✅ 여기 수정
+                    on_message=lambda w, m: _on_message(symbol, w, m),
                     on_error=_on_error,
                     on_close=_on_close,
                 )
@@ -477,12 +430,7 @@ def preload_klines(
     interval: str,
     rows: List[Tuple[int, float, float, float, float, float]],
 ) -> None:
-    """(ts, o, h, l, c, v) 튜플 리스트를 그대로 내부 버퍼에 세팅한다.
-
-    - rows 는 오래된 순서 → 최신 순서로 들어있다고 가정한다.
-    - MAX_KLINES 를 초과하면 가장 최근 MAX_KLINES 개만 보관한다.
-    - 보통은 REST /kline 응답을 가공해서 이 함수로 밀어넣는다.
-    """
+    """(ts, o, h, l, c, v) 튜플 리스트를 그대로 내부 버퍼에 세팅한다."""
     key = (symbol, interval)
     with _kline_lock:
         trimmed = list(rows[-MAX_KLINES:])
@@ -504,24 +452,7 @@ def backfill_klines_from_rest(
     interval: str,
     rest_klines: List[Any],
 ) -> None:
-    """BingX REST /kline 응답을 받아 버퍼에 백필한다.
-
-    예상 REST 포맷 예시:
-        # 배열 기반 포맷
-        rest_klines = [
-            [openTime, open, high, low, close, volume, closeTime, ...],
-            ...
-        ]
-
-        # dict 기반 포맷 (예: swap v3 quote/klines)
-        rest_klines = [
-            {"t": openTime, "o": "...", "h": "...", "l": "...", "c": "...", "v": "..."},
-            ...
-        ]
-
-    - openTime/closeTime 는 ms 단위라고 가정한다.
-    - 배열/딕셔너리 포맷을 모두 지원하며, 변환에 실패하는 행은 건너뛴다.
-    """
+    """BingX REST /kline 응답을 받아 버퍼에 백필한다."""
     converted: List[Tuple[int, float, float, float, float, float]] = []
 
     for row in rest_klines:
@@ -535,7 +466,6 @@ def backfill_klines_from_rest(
                 l = float(row[3])
                 c = float(row[4])
                 v = float(row[5])
-
             elif isinstance(row, dict):
                 ts = int(
                     row.get("t")
@@ -554,7 +484,6 @@ def backfill_klines_from_rest(
 
             if ts <= 0:
                 continue
-
         except Exception:
             continue
 
@@ -580,11 +509,7 @@ def backfill_klines_from_rest(
 
 
 def get_klines(symbol: str, interval: str, limit: int = 120):
-    """(ts, o, h, l, c) 튜플 리스트를 반환한다 (기존 포맷).
-
-    내부 버퍼에는 (ts, o, h, l, c, v)가 저장되어 있으나,
-    기존 호출부 호환을 위해 v 를 잘라서 리턴한다.
-    """
+    """(ts, o, h, l, c) 튜플 리스트를 반환한다 (기존 포맷)."""
     key = (symbol, interval)
     with _kline_lock:
         buf = _kline_buffers.get(key, [])
@@ -595,11 +520,7 @@ def get_klines(symbol: str, interval: str, limit: int = 120):
 
 
 def get_klines_with_volume(symbol: str, interval: str, limit: int = 120):
-    """(ts, o, h, l, c, v) 튜플 리스트를 반환한다.
-
-    - 시그널/지표 계산에서 볼륨까지 필요할 때 사용.
-    - 버퍼가 비어 있으면 Render 로그에 경고를 남긴다.
-    """
+    """(ts, o, h, l, c, v) 튜플 리스트를 반환한다."""
     key = (symbol, interval)
     with _kline_lock:
         buf = _kline_buffers.get(key, [])
