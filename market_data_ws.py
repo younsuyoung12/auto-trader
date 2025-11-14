@@ -209,7 +209,6 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
                 del buf[0 : len(buf) - MAX_KLINES]
         after_len = len(buf)
 
-    # 기본 로그는 _handle_single_msg 쪽에서 통합해서 찍는다.
     if getattr(SET, "ws_log_enabled", True):
         try:
             log(
@@ -284,7 +283,6 @@ def _decode_msg(raw: Any) -> Any:
             try:
                 return json.loads(bytes(raw).decode("utf-8"))
             except Exception:
-                # 마지막으로 바이너리를 문자열로만 리턴(비-JSON)
                 try:
                     return bytes(raw).decode("utf-8", errors="ignore")
                 except Exception:
@@ -310,7 +308,6 @@ def _handle_ping(ws: websocket.WebSocketApp, data: Any) -> bool:
     # dict 기반 Ping
     if isinstance(data, dict):
         if "ping" in data or data.get("op") == "ping" or data.get("event") == "ping":
-            # 서버가 특정 포맷을 요구하지 않는 한 문자열 Pong 으로 통일
             ws.send("Pong")
             return True
 
@@ -355,7 +352,6 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
         # payload 타입에 따라 list/dict 모두 지원
         items = _iter_kline_items(payload)
         if not items:
-            # 어떤 형식인지 Render 에서 바로 확인할 수 있도록 경고 로그 남김
             try:
                 log(
                     f"[MD-WS WARN] kline payload has unexpected type="
@@ -365,7 +361,6 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
                 pass
             return
 
-        # kline payload 디버그 로그 (옵션)
         if getattr(SET, "ws_log_payload_enabled", False):
             try:
                 log(
@@ -373,17 +368,14 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
                     f"{_safe_dump_for_log(items)}"
                 )
             except Exception:
-                # 로깅 실패는 시세 처리에 영향을 주지 않음
                 pass
 
-        # 각 item 을 버퍼에 반영
         for item in items:
             _push_kline(symbol, interval, item)
         return
 
     # depth 예: "BTC-USDT@depth5"
     if "@depth" in data_type:
-        # depth payload 디버그 로그 (옵션)
         if getattr(SET, "ws_log_payload_enabled", False):
             try:
                 log(
@@ -393,7 +385,6 @@ def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> No
             except Exception:
                 pass
 
-        # payload 가 dict 라고 가정하되, list 로 오면 빈 dict 로 넘긴다
         _push_orderbook(symbol, payload if isinstance(payload, dict) else {})
         if getattr(SET, "ws_log_enabled", True):
             log(f"[MD-WS] {symbol} depth updated")
@@ -406,19 +397,15 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
     if data is None:
         return
 
-    # RAW 프레임 디버그 로그 (옵션)
     if getattr(SET, "ws_log_raw_enabled", False):
         try:
             log(f"[MD-WS RAW] {_safe_dump_for_log(data)}")
         except Exception:
-            # 로깅에서 예외가 나더라도 WS 루프는 계속 돌아가야 한다.
             pass
 
-    # Ping 처리(여러 포맷)
     if _handle_ping(ws, data):
         return
 
-    # BingX 가 배열로 여러 개를 보내는 경우도 대비
     if isinstance(data, list):
         for item in data:
             _handle_single_msg(symbol, ws, item)
@@ -428,12 +415,7 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
 
 
 def _on_error(ws: websocket.WebSocketApp, error: Any) -> None:
-    """WS 에러 콜백.
-
-    예) "Connection to remote host was lost" 와 같이 나오면
-    - 네트워크 끊김 / 서버 단절로 인해 연결이 끊어진 상황이고,
-    - start_ws_loop 의 재시도 루프가 RECONNECT_WAIT 초 뒤에 자동 재접속한다.
-    """
+    """WS 에러 콜백."""
     log(f"[MD-WS] error: {error}")
 
 
@@ -470,11 +452,10 @@ def start_ws_loop(symbol: str) -> None:
                 ws = websocket.WebSocketApp(
                     url,
                     on_open=lambda w: _on_open(symbol, w),
-                    on_message=lambda w, m: _on_message(symbol, w, m),
+                    on_message=lambda w, m: _on_message(symbol, m),
                     on_error=_on_error,
                     on_close=_on_close,
                 )
-                # 서버 ping/pong과 별개로 클라이언트 ping도 주기적으로 보냄
                 ws.run_forever(ping_interval=25, ping_timeout=10)
             except Exception as e:
                 log(f"[MD-WS] run_forever error: {e}")
@@ -504,7 +485,6 @@ def preload_klines(
     """
     key = (symbol, interval)
     with _kline_lock:
-        # 너무 길면 뒤에서부터 자르기
         trimmed = list(rows[-MAX_KLINES:])
         _kline_buffers[key] = trimmed
         buf_len = len(trimmed)
@@ -522,7 +502,7 @@ def preload_klines(
 def backfill_klines_from_rest(
     symbol: str,
     interval: str,
-    rest_klines: List[List[Any]],
+    rest_klines: List[Any],
 ) -> None:
     """BingX REST /kline 응답을 받아 버퍼에 백필한다.
 
@@ -546,7 +526,6 @@ def backfill_klines_from_rest(
 
     for row in rest_klines:
         try:
-            # 1) 배열(list/tuple) 기반 포맷
             if isinstance(row, (list, tuple)):
                 if len(row) < 6:
                     continue
@@ -557,9 +536,7 @@ def backfill_klines_from_rest(
                 c = float(row[4])
                 v = float(row[5])
 
-            # 2) dict 기반 포맷 (v3 quote/klines 등)
             elif isinstance(row, dict):
-                # 시간 키는 t/T/openTime/startTime 등 다양한 케이스를 고려
                 ts = int(
                     row.get("t")
                     or row.get("T")
@@ -567,23 +544,18 @@ def backfill_klines_from_rest(
                     or row.get("startTime")
                     or 0
                 )
-                # 가격/거래량 키도 o/h/l/c/v 또는 open/high/low/close/volume 등 지원
                 o = float(row.get("o") or row.get("open") or 0)
                 h = float(row.get("h") or row.get("high") or 0)
                 l = float(row.get("l") or row.get("low") or 0)
                 c = float(row.get("c") or row.get("close") or 0)
                 v = float(row.get("v") or row.get("volume") or 0)
-
             else:
-                # 알 수 없는 타입은 스킵
                 continue
 
-            # ts 가 0 이거나 값이 비정상인 경우도 스킵
             if ts <= 0:
                 continue
 
         except Exception:
-            # 개별 행 파싱 실패는 전체를 막지 않고 스킵
             continue
 
         converted.append((ts, o, h, l, c, v))
@@ -619,7 +591,6 @@ def get_klines(symbol: str, interval: str, limit: int = 120):
         if not buf:
             return []
         sliced = list(buf[-limit:])
-    # (ts, o, h, l, c) 만 주던 기존 포맷 유지
     return [(ts, o, h, l, c) for (ts, o, h, l, c, v) in sliced]
 
 
@@ -650,7 +621,6 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
         ob = _orderbook_buffers.get(symbol)
         if not ob:
             return None
-        # bids/asks 만 잘라서 반환 (markPrice 등은 그대로 둔다)
         if "bids" in ob:
             return {
                 **ob,
