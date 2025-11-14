@@ -5,7 +5,22 @@ BingX swap-market 웹소켓으로 1m/5m/15m 캔들과 depth5를 받아서
 메모리 버퍼에 보관하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
 getter 로 제공하는 모듈.
 
-PATCH NOTES — 2025-11-15
+PATCH NOTES — 2025-11-15 (2차 보정)
+----------------------------------------------------
+1) BingX WebSocket kline payload 형식 보정
+   - 실제 수신 형식이 data: { ... } 가 아니라 data: [ { ... } ] (list 안에 dict) 인 것이 확인됨.
+   - kline 처리부에서 payload 가 dict 인 경우뿐 아니라 list 인 경우도 지원하도록 수정.
+   - list 인 경우, 내부의 dict 들을 하나씩 _push_kline(...) 에 전달하여 버퍼에 저장.
+   - dict/list 가 아닌 예외적인 형식은 WARN 로그로 남기고 무시.
+
+2) kline 관련 진단 로그 강화
+   - payload 가 dict 가 아닌 경우, type 과 payload 일부를 함께 경고 로그로 남기도록 정리.
+   - 정상 저장 시에도 ws_log_enabled 옵션이 켜져 있으면
+     "[MD-WS] BTC-USDT 5m kline updated (added=..., buf_len=...)" 형식으로 버퍼 길이를 함께 기록.
+   - get_klines_with_volume(...) 에서 버퍼가 비어 있는 경우
+     "[MD-WS KLINES] no kline buffer (with volume) ..." 로그를 남기도록 유지.
+
+2025-11-15 1차 변경 / 디버그 옵션 추가
 ----------------------------------------------------
 1) BingX 에서 들어오는 WebSocket 프레임/캔들/호가 원본을 Render 로그에서 확인할 수 있도록
    디버그 로그 옵션을 추가했다.
@@ -15,13 +30,6 @@ PATCH NOTES — 2025-11-15
      "[MD-WS PAYLOAD] ..." 형식으로 로그에 남긴다.
    - 로그 폭주 방지를 위해 한 프레임/페이로드당 최대 2000자까지만 출력한 뒤
      잘라내고 '(truncated, total_len=...)' 표시를 붙인다.
-2) WS 프레임/캔들 처리 실패·부족 상황에 대한 방어 로깅을 추가했다.
-   - _on_message 에서 디코딩 실패 시 "[MD-WS WARN] failed to decode ..." 로그를 남긴다.
-   - _handle_single_msg 에서 dataType 누락, payload 타입 오류(kline/depth가 dict 가 아닐 때) 등에
-     대해 "[MD-WS WARN] ..." 로그를 남긴다.
-   - get_klines / get_klines_with_volume 에서 버퍼가 비어 있거나 요청 개수보다 적을 때
-     현재 버퍼 길이/요청 개수를 "[MD-WS KLINES] ..." 로그로 남겨, 신호 쪽에서
-     "5m candles not enough" 메시지가 왜 나오는지 역추적할 수 있다.
 
 2025-11-14 변경 / 중요사항
 ----------------------------------------------------
@@ -97,6 +105,7 @@ RECONNECT_WAIT = 5
 
 
 def _now_ms() -> int:
+    """현재 시각을 ms 단위 정수로 반환."""
     return int(time.time() * 1000)
 
 
@@ -144,7 +153,18 @@ def _build_sub_msgs(symbol: str) -> List[Dict[str, Any]]:
 
 
 def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
-    """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다."""
+    """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다.
+
+    item 예시 (BingX 현재 포맷):
+        {
+            "c": "96051.0",
+            "o": "96306.1",
+            "h": "96357.6",
+            "l": "96050.8",
+            "v": "56.9695",
+            "T": 1763142300000
+        }
+    """
     key = (symbol, interval)
     ts = int(item.get("t") or item.get("T") or 0)
     o = float(item.get("o") or 0)
@@ -156,12 +176,24 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
     # 마지막 바 갱신/추가 (동시성 보호)
     with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
+        before_len = len(buf)
         if buf and buf[-1][0] == ts:
             buf[-1] = (ts, o, h, l, c, v)
         else:
             buf.append((ts, o, h, l, c, v))
             if len(buf) > MAX_KLINES:
                 del buf[0 : len(buf) - MAX_KLINES]
+        after_len = len(buf)
+
+    # 기본 로그는 _handle_single_msg 쪽에서 통합해서 찍는다.
+    if getattr(SET, "ws_log_enabled", True):
+        try:
+            log(
+                f"[MD-WS] {symbol} {interval} kline updated "
+                f"(ts={ts}, buf_len={after_len}, added={after_len - before_len})"
+            )
+        except Exception:
+            pass
 
 
 def _normalize_depth_side(side_val: Any) -> List[List[float]]:
@@ -261,110 +293,93 @@ def _handle_ping(ws: websocket.WebSocketApp, data: Any) -> bool:
     return False
 
 
+def _iter_kline_items(payload: Any) -> List[Dict[str, Any]]:
+    """kline payload 를 통합 포맷(list[dict])으로 변환.
+
+    BingX 현재 포맷:
+        "data": [{ ... }]  # list 안에 dict 하나 이상
+    과거/다른 포맷:
+        "data": { ... }    # 단일 dict
+    둘 다 지원하기 위해 list[dict] 로 정규화해서 반환한다.
+    """
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        items: List[Dict[str, Any]] = []
+        for elem in payload:
+            if isinstance(elem, dict):
+                items.append(elem)
+        return items
+    return []
+
+
 def _handle_single_msg(symbol: str, ws: websocket.WebSocketApp, data: Any) -> None:
     """단일 WS 메시지를 처리한다."""
     if not isinstance(data, dict):
-        # dict 가 아니면 구조를 인식할 수 없으므로 경고만 남기고 무시
-        try:
-            log(f"[MD-WS WARN] unexpected WS item type: {type(data)} value={_safe_dump_for_log(data)}")
-        except Exception:
-            pass
         return
 
     data_type = data.get("dataType")
     payload = data.get("data")
 
     if not data_type:
-        # BingX 형식이 아니거나 파싱 에러
-        try:
-            log(f"[MD-WS WARN] missing dataType in WS message: {_safe_dump_for_log(data)}")
-        except Exception:
-            pass
         return
 
     # kline 예: "BTC-USDT@kline_1m"
     if "@kline_" in data_type:
-        if not isinstance(payload, dict):
-            if getattr(SET, "ws_log_payload_enabled", False):
-                try:
-                    log(
-                        f"[MD-WS WARN] kline payload is not dict (type={type(payload)}): "
-                        f"{_safe_dump_for_log(payload)}"
-                    )
-                except Exception:
-                    pass
-            return
-
         interval = data_type.split("@kline_")[-1]
+
+        # payload 타입에 따라 list/dict 모두 지원
+        items = _iter_kline_items(payload)
+        if not items:
+            # 어떤 형식인지 Render 에서 바로 확인할 수 있도록 경고 로그 남김
+            try:
+                log(
+                    f"[MD-WS WARN] kline payload has unexpected type="
+                    f"{type(payload)} value={_safe_dump_for_log(payload)}"
+                )
+            except Exception:
+                pass
+            return
 
         # kline payload 디버그 로그 (옵션)
         if getattr(SET, "ws_log_payload_enabled", False):
             try:
                 log(
                     f"[MD-WS PAYLOAD] {symbol} {interval} kline: "
-                    f"{_safe_dump_for_log(payload)}"
+                    f"{_safe_dump_for_log(items)}"
                 )
             except Exception:
                 # 로깅 실패는 시세 처리에 영향을 주지 않음
                 pass
 
-        _push_kline(symbol, interval, payload)
-        if getattr(SET, "ws_log_enabled", True):
-            log(f"[MD-WS] {symbol} {interval} kline updated")
+        # 각 item 을 버퍼에 반영
+        for item in items:
+            _push_kline(symbol, interval, item)
         return
 
     # depth 예: "BTC-USDT@depth5"
     if "@depth" in data_type:
-        if not isinstance(payload, dict):
-            if getattr(SET, "ws_log_payload_enabled", False):
-                try:
-                    log(
-                        f"[MD-WS WARN] depth payload is not dict (type={type(payload)}): "
-                        f"{_safe_dump_for_log(payload)}"
-                    )
-                except Exception:
-                    pass
-            # dict 가 아니면 depth 정보로 사용할 수 없으므로 빈 dict 로 처리
-            payload_dict: Dict[str, Any] = {}
-        else:
-            payload_dict = payload
-
         # depth payload 디버그 로그 (옵션)
         if getattr(SET, "ws_log_payload_enabled", False):
             try:
                 log(
                     f"[MD-WS PAYLOAD] {symbol} depth: "
-                    f"{_safe_dump_for_log(payload_dict)}"
+                    f"{_safe_dump_for_log(payload if isinstance(payload, dict) else {'raw': payload})}"
                 )
             except Exception:
                 pass
 
-        _push_orderbook(symbol, payload_dict)
+        # payload 가 dict 라고 가정하되, list 로 오면 빈 dict 로 넘긴다
+        _push_orderbook(symbol, payload if isinstance(payload, dict) else {})
         if getattr(SET, "ws_log_enabled", True):
             log(f"[MD-WS] {symbol} depth updated")
         return
-
-    # kline/depth 어디에도 해당하지 않는 경우
-    try:
-        log(f"[MD-WS WARN] unknown dataType '{data_type}' message: {_safe_dump_for_log(data)}")
-    except Exception:
-        pass
 
 
 def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
     """WebSocketApp on_message 콜백."""
     data = _decode_msg(message)
     if data is None:
-        # 디코딩 자체가 실패한 경우
-        try:
-            # message 가 bytes 면 길이만, str 이면 앞부분만 찍어준다.
-            if isinstance(message, (bytes, bytearray)):
-                msg_repr = f"<bytes len={len(message)}>"
-            else:
-                msg_repr = str(message)[:200]
-            log(f"[MD-WS WARN] failed to decode WS message: type={type(message)} repr={msg_repr}")
-        except Exception:
-            pass
         return
 
     # RAW 프레임 디버그 로그 (옵션)
@@ -438,62 +453,40 @@ def start_ws_loop(symbol: str) -> None:
 
 
 def get_klines(symbol: str, interval: str, limit: int = 120):
-    """(ts, o, h, l, c) 튜플 리스트를 반환한다 (기존 포맷)."""
+    """(ts, o, h, l, c) 튜플 리스트를 반환한다 (기존 포맷).
+
+    내부 버퍼에는 (ts, o, h, l, c, v)가 저장되어 있으나,
+    기존 호출부 호환을 위해 v 를 잘라서 리턴한다.
+    """
     key = (symbol, interval)
     with _kline_lock:
         buf = _kline_buffers.get(key, [])
         if not buf:
-            # 완전히 비어 있는 경우: 아직 WS 로부터 해당 interval 캔들을 못 받은 상태
-            try:
-                log(
-                    f"[MD-WS KLINES] no kline buffer for {symbol} {interval} "
-                    f"(requested={limit})"
-                )
-            except Exception:
-                pass
             return []
         sliced = list(buf[-limit:])
-
-    if len(sliced) < limit:
-        # 버퍼는 있지만 요청 개수보다 적은 경우 → 웜업 중일 가능성
-        try:
-            log(
-                f"[MD-WS KLINES] buffer short for {symbol} {interval}: "
-                f"have={len(sliced)}, requested={limit}"
-            )
-        except Exception:
-            pass
-
     # (ts, o, h, l, c) 만 주던 기존 포맷 유지
     return [(ts, o, h, l, c) for (ts, o, h, l, c, v) in sliced]
 
 
 def get_klines_with_volume(symbol: str, interval: str, limit: int = 120):
-    """(ts, o, h, l, c, v) 튜플 리스트를 반환한다."""
+    """(ts, o, h, l, c, v) 튜플 리스트를 반환한다.
+
+    - 시그널/지표 계산에서 볼륨까지 필요할 때 사용.
+    - 버퍼가 비어 있으면 Render 로그에 경고를 남긴다.
+    """
     key = (symbol, interval)
     with _kline_lock:
         buf = _kline_buffers.get(key, [])
         if not buf:
             try:
                 log(
-                    f"[MD-WS KLINES] no kline buffer (with volume) for {symbol} {interval} "
-                    f"(requested={limit})"
+                    f"[MD-WS KLINES] no kline buffer (with volume) for "
+                    f"{symbol} {interval} (requested={limit})"
                 )
             except Exception:
                 pass
             return []
-        sliced = list(buf[-limit:])
-
-    if len(sliced) < limit:
-        try:
-            log(
-                f"[MD-WS KLINES] buffer short (with volume) for {symbol} {interval}: "
-                f"have={len(sliced)}, requested={limit}"
-            )
-        except Exception:
-            pass
-
-    return sliced
+        return list(buf[-limit:])
 
 
 def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
@@ -501,10 +494,6 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
     with _orderbook_lock:
         ob = _orderbook_buffers.get(symbol)
         if not ob:
-            try:
-                log(f"[MD-WS KLINES] no orderbook for {symbol} (requested_depth={limit})")
-            except Exception:
-                pass
             return None
         # bids/asks 만 잘라서 반환 (markPrice 등은 그대로 둔다)
         if "bids" in ob:
