@@ -3,45 +3,54 @@ settings_ws.py
 ====================================================
 웹소켓으로 1m / 5m / 15m 캔들을 받아서 쓰는 구조에 맞춰 정리한 설정 모듈.
 
+▶ 2025-11-15 패치 (WS 로우데이터 로그 옵션 추가)
+----------------------------------------------------
+H) WS 로우데이터/페이로드 로그 토글 추가
+   - ws_log_raw_enabled: BingX WS 원시 프레임(raw) 로그 ON/OFF
+       · ENV: WS_LOG_RAW_ENABLED (기본 0)
+   - ws_log_payload_enabled: 정규화된 kline/depth payload 내용 로그 ON/OFF
+       · ENV: WS_LOG_PAYLOAD_ENABLED (기본 0)
+   - market_data_ws.py 에서 이 값을 읽어, 필요할 때만 상세 로우데이터를 Render 로그에 남길 수 있게 한다.
+
 ▶ 2025-11-14 패치 (warmup/bootstrap 포함) — 이번 변경 핵심
 ----------------------------------------------------
 E) RANGE 전용 1m 확인 토글(ENV) 추가
-   - `enable_1m_confirm_range` 필드 추가
-   - ENV: `ENABLE_1M_CONFIRM_RANGE` (미지정 시 `ENABLE_1M_CONFIRM` 값으로 Fallback)
+   - enable_1m_confirm_range 필드 추가
+   - ENV: ENABLE_1M_CONFIRM_RANGE (미지정 시 ENABLE_1M_CONFIRM 값으로 Fallback)
 
 F) TREND→RANGE 다운그레이드(갈아타기) 제어 옵션 추가
-   - `trend_to_range_enable` (ENV: `TREND_TO_RANGE_ENABLE`)
-   - `trend_to_range_min_gain_pct` (ENV: `TREND_TO_RANGE_MIN_GAIN_PCT`)
-   - `trend_to_range_max_abs_pnl_pct` (ENV: `TREND_TO_RANGE_MAX_ABS_PNL_PCT`)
-   - `trend_to_range_auto_reenter` (ENV: `TREND_TO_RANGE_AUTO_REENTER`)
+   - trend_to_range_enable (ENV: TREND_TO_RANGE_ENABLE)
+   - trend_to_range_min_gain_pct (ENV: TREND_TO_RANGE_MIN_GAIN_PCT)
+   - trend_to_range_max_abs_pnl_pct (ENV: TREND_TO_RANGE_MAX_ABS_PNL_PCT)
+   - trend_to_range_auto_reenter (ENV: TREND_TO_RANGE_AUTO_REENTER)
 
 G) WS 히스토리 웜업/부트스트랩 옵션 추가 (신규)
-   - `min_bars_5m`, `min_bars_15m`: 최소 캔들 개수 기준(미만이면 신호 스킵)
-   - `warmup_target_5m`, `warmup_target_15m`: 웜업 타깃(미만이어도 진행하되 로그만)
-   - `ws_bootstrap_with_rest`: 부팅 직후 REST로 과거 캔들 1회 시드 여부
-   - `ws_bootstrap_lookback_5m`, `ws_bootstrap_lookback_15m`: REST 시드 lookback 개수
-   - 관련 ENV: `MIN_BARS_5M`, `MIN_BARS_15M`, `WARMUP_TARGET_5M`, `WARMUP_TARGET_15M`,
-               `WS_BOOTSTRAP_WITH_REST`, `WS_BOOTSTRAP_LOOKBACK_5M`, `WS_BOOTSTRAP_LOOKBACK_15M`
+   - min_bars_5m, min_bars_15m: 최소 캔들 개수 기준(미만이면 신호 스킵)
+   - warmup_target_5m, warmup_target_15m: 웜업 타깃(미만이어도 진행하되 로그만)
+   - ws_bootstrap_with_rest: 부팅 직후 REST로 과거 캔들을 1회 시드 여부
+   - ws_bootstrap_lookback_5m, ws_bootstrap_lookback_15m: REST 시드 lookback 개수
+   - 관련 ENV: MIN_BARS_5M, MIN_BARS_15M, WARMUP_TARGET_5M, WARMUP_TARGET_15M,
+               WS_BOOTSTRAP_WITH_REST, WS_BOOTSTRAP_LOOKBACK_5M, WS_BOOTSTRAP_LOOKBACK_15M
 
 ▶ 2025-11-13 추가 보정 (이 버전에서 바뀐 핵심)
 ----------------------------------------------------
 A) ENV 훅 추가
-   - `MIN_ENTRY_VOLUME_RATIO`를 로더에서 읽어 `BotSettings.min_entry_volume_ratio`에 주입
+   - MIN_ENTRY_VOLUME_RATIO를 로더에서 읽어 BotSettings.min_entry_volume_ratio에 주입
 
 B) TP/SL 하한 기본값 정합성
-   - dataclass 기본값 `min_tp_pct`, `min_sl_pct`을 **0.005(=0.5%)**로 낮춰 로더 기본값과 일치
+   - dataclass 기본값 min_tp_pct, min_sl_pct을 **0.005(=0.5%)**로 낮춰 로더 기본값과 일치
 
 C) 레인지 TP/SL 기본값 정합성
    - dataclass 기본값을 로더 기본값과 맞춤:
-     * `range_tp_pct=0.006`, `range_sl_pct=0.004`
-     * `range_tp_long_pct=0.004`, `range_tp_short_pct=0.006`
-     * `range_sl_long_pct=0.0035`, `range_sl_short_pct=0.004`
+     * range_tp_pct=0.006, range_sl_pct=0.004
+     * range_tp_long_pct=0.004, range_tp_short_pct=0.006
+     * range_sl_long_pct=0.0035, range_sl_short_pct=0.004
 
 D) WS 스왑 엔드포인트 옵션 추가
-   - `ws_swap_base` 필드와 `BINGX_SWAP_WS_BASE` ENV 추가 (필요 모듈에서 선택적으로 사용)
+   - ws_swap_base 필드와 BINGX_SWAP_WS_BASE ENV 추가 (필요 모듈에서 선택적으로 사용)
 
-※ 참고: 박스 상/하단 80%/20% 진입선은 `strategies_range_ws.decide_signal_range()`에 **하드코딩**되어 있습니다.
-   본 파일의 `range_entry_upper_pct`/`lower_pct` 값은 보존하되, 실제 적용은 해당 전략 모듈 수정 시 반영됩니다.
+※ 참고: 박스 상/하단 80%/20% 진입선은 strategies_range_ws.decide_signal_range()에 **하드코딩**되어 있습니다.
+   본 파일의 range_entry_upper_pct/lower_pct 값은 보존하되, 실제 적용은 해당 전략 모듈 수정 시 반영됩니다.
 
 기존 2025-11-13 변경 사항
 ----------------------------------------------------
@@ -121,7 +130,10 @@ class BotSettings:
     ws_base: str = "wss://open-api-ws.bingx.com"  # env 로 바뀔 수 있음
     ws_swap_base: str = "wss://open-api-swap.bingx.com/swap-market"  # 선택적: 스왑 마켓 전용 WS
     ws_subscribe_tfs: List[str] = None  # 런타임에서 ["1m","5m","15m"]로 채운다
-    ws_log_enabled: bool = True  # 캔들 수신 시 로그 남길지
+    ws_log_enabled: bool = True  # 캔들 수신 시 단순 로그 남길지
+    # WS 원시/페이로드 로그 (Render 디버깅용, 기본 OFF 권장)
+    ws_log_raw_enabled: bool = False      # WS 원시 프레임 로깅 (ENV: WS_LOG_RAW_ENABLED)
+    ws_log_payload_enabled: bool = False  # kline/depth payload 상세 로깅 (ENV: WS_LOG_PAYLOAD_ENABLED)
 
     # ── WS 히스토리 웜업/부트스트랩 ─────────────────────────
     # * min_bars_*: 이 값 미만이면 신호 자체를 스킵
@@ -348,6 +360,9 @@ def load_settings() -> BotSettings:
         ws_swap_base=bingx_ws_swap_base_env,
         ws_subscribe_tfs=ws_tfs,
         ws_log_enabled=_as_bool(os.getenv("WS_LOG_ENABLED", "1"), True),
+        # WS 원시/페이로드 로그 ENV 매핑 (디버깅 시에만 ON 권장)
+        ws_log_raw_enabled=_as_bool(os.getenv("WS_LOG_RAW_ENABLED", "0"), False),
+        ws_log_payload_enabled=_as_bool(os.getenv("WS_LOG_PAYLOAD_ENABLED", "0"), False),
         # ── WS 웜업/부트스트랩 ENV 매핑 ──
         min_bars_5m=_as_int(os.getenv("MIN_BARS_5M", "20"), 20),
         min_bars_15m=_as_int(os.getenv("MIN_BARS_15M", "20"), 20),
