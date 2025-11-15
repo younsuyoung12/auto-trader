@@ -3,7 +3,7 @@ settings_ws.py
 ====================================================
 웹소켓으로 1m / 5m / 15m 캔들을 받아서 쓰는 구조에 맞춰 정리한 설정 모듈.
 
-▶ 2025-11-15 패치 (WS 로우데이터 로그 옵션 추가)
+▶ 2025-11-15 패치 (WS 로우데이터 로그 옵션 + RANGE 기본값 조정)
 ----------------------------------------------------
 H) WS 로우데이터/페이로드 로그 토글 추가
    - ws_log_raw_enabled: BingX WS 원시 프레임(raw) 로그 ON/OFF
@@ -11,6 +11,10 @@ H) WS 로우데이터/페이로드 로그 토글 추가
    - ws_log_payload_enabled: 정규화된 kline/depth payload 내용 로그 ON/OFF
        · ENV: WS_LOG_PAYLOAD_ENABLED (기본 0)
    - market_data_ws.py 에서 이 값을 읽어, 필요할 때만 상세 로우데이터를 Render 로그에 남길 수 있게 한다.
+
+I) RANGE 전략 기본값 ON 으로 조정
+   - BotSettings.enable_range 기본값을 True 로 변경
+   - ENV: ENABLE_RANGE 기본값을 "1" 로 변경 (명시적으로 0 을 주면 OFF)
 
 ▶ 2025-11-14 패치 (warmup/bootstrap 포함) — 이번 변경 핵심
 ----------------------------------------------------
@@ -150,7 +154,7 @@ class BotSettings:
 
     # 전략 on/off
     enable_trend: bool = True
-    enable_range: bool = False
+    enable_range: bool = True
     enable_1m_confirm: bool = True
     enable_1m_confirm_range: bool = False  # RANGE 전용 1m 확인(미지정 시 enable_1m_confirm으로 fallback)
 
@@ -373,7 +377,7 @@ def load_settings() -> BotSettings:
         ws_bootstrap_lookback_15m=_as_int(os.getenv("WS_BOOTSTRAP_LOOKBACK_15M", "120"), 120),
         # 전략 on/off
         enable_trend=_as_bool(os.getenv("ENABLE_TREND", "1"), True),
-        enable_range=_as_bool(os.getenv("ENABLE_RANGE", "0"), False),
+        enable_range=_as_bool(os.getenv("ENABLE_RANGE", "1"), True),
         enable_1m_confirm=enable_1m_confirm_value,
         enable_1m_confirm_range=enable_1m_confirm_range_value,
         # 레버리지/리스크
