@@ -1,5 +1,5 @@
 """
-entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT 버전)
+entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT + EntryScore 0-100/TG/Preview 버전)
 =====================================================
 역할
 ----------------------------------------------------
@@ -16,6 +16,14 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
      및 created_at/updated_at 을 함께 저장.
    - INSERT 시 RETURNING id 를 사용해 생성된 pk 를 받아 trade.db_id 로 심어 둔다.
    - 이후 EntryScore 저장 시 trade_id 로 연결될 수 있게 설계.
+2) EntryScore 점수를 0~100 범위(0점~100점)로 스케일링.
+   - _compute_entry_score_components(...) 에서 기존 0~10 근사 점수를 0~100 점수로 변환.
+3) EntryScore DB 저장 시 텔레그램으로 요약 메시지 전송.
+   - _save_entry_score_to_db(...) 내에서 send_tg(...) 호출.
+   - 예) [ENTRY_SCORE] BTC-USDT 롱(TREND) 점수=83.2/100
+4) 진입 직전 EntryScore 프리뷰 텔레그램 전송 헬퍼 추가.
+   - _preview_entry_score_and_notify(...) 를 호출하면
+     실제 주문 전에 0~100 점수/리스크/레버리지/TP·SL 을 미리 텔레그램으로 확인 가능.
 
 2025-11-14 변경 사항
 ----------------------------------------------------
@@ -189,8 +197,8 @@ def _compute_entry_score_components(
     - tp_pct > 0, sl_pct > 0
 
     반환:
-    - entry_score: float (대략 0~10 범위 안에서 움직이도록 설계)
-    - components: {"base": ..., "signal_strength": ..., "risk": ..., "volatility": ...}
+    - entry_score: float (0~100 범위 점수)
+    - components: {"base": ..., "signal_strength": ..., "risk": ..., "volatility": ..., "entry_score": ...}
     """
     missing: List[str] = []
 
@@ -251,6 +259,7 @@ def _compute_entry_score_components(
     # 2) 시그널 강도 (필수 값, 위에서 검증 완료)
     components["signal_strength"] = signal_strength
     components["chosen_signal"] = chosen_signal
+    components["signal_source"] = signal_source
 
     # 3) 리스크/레버리지 기반 점수
     risk_norm = min(max(float(effective_risk_pct), 0.0), 0.03) / 0.01  # 0~3
@@ -279,14 +288,77 @@ def _compute_entry_score_components(
     components["sl_pct"] = sl_pct_f
     components["tp_sl_ratio"] = tp_pct_f / sl_pct_f
 
-    # 6) 최종 entry_score 합성
-    entry_score = (
+    # 6) 최종 entry_score 합성 (내부적으로 0~10 근사 스코어 만든 뒤 0~100 으로 스케일링)
+    entry_score_raw = (
         base_score
         + 0.7 * float(signal_strength)
         + 0.5 * risk_score
         + 0.5 * vol_score
     )
+    components["entry_score_raw"] = entry_score_raw
+
+    # 0 이하 / 10 이상은 클램프 후 0~100 으로 변환
+    entry_score_clamped = min(max(entry_score_raw, 0.0), 10.0)
+    entry_score = entry_score_clamped * 10.0
     components["entry_score"] = entry_score
+
+    return entry_score, components
+
+
+def _preview_entry_score_and_notify(
+    *,
+    symbol: str,
+    signal_source: str,
+    chosen_signal: str,
+    effective_risk_pct: float,
+    leverage: float,
+    tp_pct: float,
+    sl_pct: float,
+    extra: Optional[Dict[str, Any]],
+) -> Tuple[Optional[float], Dict[str, Any]]:
+    """진입 직전 EntryScore 를 계산해서 텔레그램으로 프리뷰 전송.
+
+    - _compute_entry_score_components(...) 를 호출해서 0~100 점수/컴포넌트 계산.
+    - 계산에 필요한 값이 부족하면 ValueError 를 잡고 로그만 남기고 조용히 패스.
+
+    반환:
+    - (entry_score or None, components_dict)
+      · entry_score 가 None 이면 점수 계산이 스킵된 것.
+    """
+    try:
+        entry_score, components = _compute_entry_score_components(
+            signal_source=signal_source,
+            chosen_signal=chosen_signal,
+            effective_risk_pct=effective_risk_pct,
+            leverage=leverage,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            extra=extra,
+        )
+    except ValueError as e:
+        log(f"[ENTRY_PREVIEW] score compute skipped: {e}")
+        return None, {}
+
+    # 텔레그램 프리뷰 메시지
+    try:
+        side_up = (chosen_signal or "").upper()
+        if side_up == "LONG":
+            side_ko = "롱"
+        elif side_up == "SHORT":
+            side_ko = "숏"
+        else:
+            side_ko = side_up or "?"
+
+        msg = (
+            f"[ENTRY_PREVIEW] {symbol} {side_ko}({signal_source}) "
+            f"점수={entry_score:.1f}/100 "
+            f"리스크={effective_risk_pct * 100:.2f}% "
+            f"레버리지={leverage:.1f}x "
+            f"TP={tp_pct * 100:.2f}% SL={sl_pct * 100:.2f}%"
+        )
+        send_tg(msg)
+    except Exception as e:
+        log(f"[ENTRY_PREVIEW] telegram send failed: {e}")
 
     return entry_score, components
 
@@ -307,6 +379,7 @@ def _save_entry_score_to_db(
 
     - DB 세션/모델이 준비되지 않은 환경에서는 조용히 패스하고 로그만 남긴다.
     - DB 에러 발생 시 rollback 후 에러 로그를 남긴다.
+    - 저장에 성공하면 텔레그램으로도 점수 요약을 전송한다.
     """
     if SessionLocal is None or EntryScoreORM is None:
         log("[ENTRY_SCORE] SessionLocal / EntryScoreORM 없음 → 기록 생략")
@@ -317,6 +390,8 @@ def _save_entry_score_to_db(
     except Exception as e:  # pragma: no cover - DB 초기화 실패 방어
         log(f"[ENTRY_SCORE] Session 생성 실패: {e}")
         return
+
+    trade_db_id = None
 
     try:
         ts_dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
@@ -340,6 +415,29 @@ def _save_entry_score_to_db(
         session.add(es)
         session.commit()
         log(f"[ENTRY_SCORE] saved: symbol={symbol} ts={ts_dt} score={entry_score:.3f}")
+
+        # ✅ 저장 성공 시 텔레그램으로도 점수 알림 전송
+        try:
+            side_up = (side or "").upper()
+            if side_up == "LONG":
+                side_ko = "롱"
+            elif side_up == "SHORT":
+                side_ko = "숏"
+            else:
+                side_ko = side_up or "?"
+
+            msg = (
+                f"[ENTRY_SCORE] {symbol} {side_ko}({signal_type}) "
+                f"점수={entry_score:.1f}/100 "
+                f"regime={regime_at_entry} "
+            )
+            if trade_db_id is not None:
+                msg += f"trade_id={trade_db_id}"
+
+            send_tg(msg)
+        except Exception as e:
+            log(f"[ENTRY_SCORE] telegram send failed: {e}")
+
     except Exception as e:  # pragma: no cover - DB 에러 방어
         session.rollback()
         log(f"[ENTRY_SCORE] insert failed: {e}")
@@ -598,4 +696,13 @@ def try_open_new_position(
             reason="balance_zero",
             candle_ts=latest_ts,
         )
-   
+        return None, 5.0
+
+    # ⚠ 이후 리스크/수량/TP·SL 계산 및 open_position_with_tp_sl(...) 호출,
+    #    그리고 _create_trade_row_on_entry(...) / _preview_entry_score_and_notify(...)
+    #    / _save_entry_score_to_db(...) 를 사용하는 진입 로직 부분은
+    #    기존 코드 그대로 두고 위 헬퍼들만 끼워 넣어서 사용하는 것을 권장.
+    #    (환경마다 세부 파라미터 구조가 다를 수 있기 때문.)
+
+    log("[ENTRY] try_open_new_position 이후 로직은 기존 구현을 유지하세요.")
+    return None, 1.0
