@@ -1,5 +1,5 @@
 """
-entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT + EntryScore 0-100/TG/Preview 버전)
+entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT + EntryScore 0-100/TG/Preview + SKIP 사유 TG 버전)
 =====================================================
 역할
 ----------------------------------------------------
@@ -15,7 +15,7 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
    - entry_ts/entry_price/qty/is_auto/strategy/regime_at_entry/leverage/risk_pct/tp_pct/sl_pct
      및 created_at/updated_at 을 함께 저장.
    - INSERT 시 RETURNING id 를 사용해 생성된 pk 를 받아 trade.db_id 로 심어 둔다.
-   - 이후 EntryScore 저장 시 trade_id 로 연결될 수 있게 설계.
+   - 이후 EntryScore 저장 시 trade_id로 연결될 수 있게 설계.
 2) EntryScore 점수를 0~100 범위(0점~100점)로 스케일링.
    - _compute_entry_score_components(...) 에서 기존 0~10 근사 점수를 0~100 점수로 변환.
 3) EntryScore DB 저장 시 텔레그램으로 요약 메시지 전송.
@@ -24,6 +24,11 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
 4) 진입 직전 EntryScore 프리뷰 텔레그램 전송 헬퍼 추가.
    - _preview_entry_score_and_notify(...) 를 호출하면
      실제 주문 전에 0~100 점수/리스크/레버리지/TP·SL 을 미리 텔레그램으로 확인 가능.
+5) try_open_new_position(...) 의 모든 SKIP 경로에서 텔레그램으로 이유 전송.
+   - telelog.send_skip_tg(...) 를 사용해 "왜 안 들어갔는지"를 바로 확인 가능.
+6) try_open_new_position(...) 이 모든 경로에서 (Trade | None, float) 튜플을 반환하도록 정리.
+   - 호출부에서 `trade, sleep_sec = try_open_new_position(...)` 언패킹 시
+     cannot unpack non-iterable NoneType object 에러가 나지 않도록 방지.
 
 2025-11-14 변경 사항
 ----------------------------------------------------
@@ -57,7 +62,7 @@ B) entry_guards_ws 연동
    - check_manual_position_guard: 외부 On/Off / 강제 휴식 등 수동 가드.
    - check_volume_guard: 거래량/틱 수 등 세부 진입 조건.
    - check_price_jump_guard: 직전 캔들 대비 점프/갭 과도 시 차단.
-   - check_spread_guard: WS depth5 기반 스프레드/쏠림 차단 + best_bid/best_ask 제공.
+   - check_spread_guard: WS depth5 기반 스프레드/쏠림 가드 + best_bid/best_ask 제공.
 
 반환값
 ----------------------------------------------------
@@ -73,7 +78,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple, List, Dict
 
-from telelog import send_tg, log
+from telelog import send_tg, log, send_skip_tg
 from signal_flow_ws import get_trading_signal
 from entry_guards_ws import (
     check_manual_position_guard,
@@ -593,6 +598,7 @@ def try_open_new_position(
     )
     if signal_ctx is None:
         # 시그널이 없거나 모든 후보가 중재 단계에서 탈락
+        send_skip_tg(f"[SKIP] no_signal_or_arbitration_rejected: symbol={symbol}")
         return None, 1.0
 
     (
@@ -645,7 +651,7 @@ def try_open_new_position(
         latest_ts=latest_ts,
     )
     if not manual_ok:
-        # 운영자가 막아둔 상태 → 바로 짧게 대기
+        send_skip_tg("[SKIP] manual_guard_blocked (외부 강제 OFF/휴식)")
         return None, 2.0
 
     # 2-2) 거래량 가드
@@ -660,6 +666,7 @@ def try_open_new_position(
         direction=chosen_signal,
     )
     if not vol_ok:
+        send_skip_tg("[SKIP] volume_guard: volume_too_low_for_entry")
         return None, 1.0
 
     # 2-3) 직전/현재 5m 기준 가격 점프·갭 가드
@@ -671,6 +678,7 @@ def try_open_new_position(
         direction=chosen_signal,
     )
     if not price_ok:
+        send_skip_tg("[SKIP] price_jump_guard: recent_price_jump_or_gap")
         return None, 1.0
 
     # 2-4) 호가 스프레드/쏠림 가드 (WS depth5 활용)
@@ -682,6 +690,7 @@ def try_open_new_position(
         direction=chosen_signal,
     )
     if not spread_ok:
+        send_skip_tg("[SKIP] spread_guard: depth_imbalance_or_spread_too_wide")
         return None, 1.0
 
     # (3) 잔고 확인
@@ -698,11 +707,128 @@ def try_open_new_position(
         )
         return None, 5.0
 
-    # ⚠ 이후 리스크/수량/TP·SL 계산 및 open_position_with_tp_sl(...) 호출,
-    #    그리고 _create_trade_row_on_entry(...) / _preview_entry_score_and_notify(...)
-    #    / _save_entry_score_to_db(...) 를 사용하는 진입 로직 부분은
-    #    기존 코드 그대로 두고 위 헬퍼들만 끼워 넣어서 사용하는 것을 권장.
-    #    (환경마다 세부 파라미터 구조가 다를 수 있기 때문.)
+    # (4) 주문 관련 파라미터 계산 (리스크/레버리지/TP·SL)
+    # settings 에 값이 없으면 안전한 기본값으로.
+    leverage = float(getattr(settings, "leverage", 10.0))
+    risk_pct = float(getattr(settings, "risk_pct", 0.01))  # 1% 기본
 
-    log("[ENTRY] try_open_new_position 이후 로직은 기존 구현을 유지하세요.")
-    return None, 1.0
+    # TP/SL 퍼센트 (extra 우선)
+    tp_pct = float(extra.get("tp_pct")) if isinstance(extra, dict) and extra.get("tp_pct") is not None else float(
+        getattr(settings, "tp_pct", 0.02)
+    )
+    sl_pct = float(extra.get("sl_pct")) if isinstance(extra, dict) and extra.get("sl_pct") is not None else float(
+        getattr(settings, "sl_pct", 0.01)
+    )
+
+    effective_risk_pct = float(extra.get("effective_risk_pct")) if isinstance(extra, dict) and extra.get(
+        "effective_risk_pct"
+    ) is not None else risk_pct
+
+    # (4-1) 진입 전 점수 프리뷰
+    preview_score, preview_components = _preview_entry_score_and_notify(
+        symbol=symbol,
+        signal_source=signal_source,
+        chosen_signal=chosen_signal,
+        effective_risk_pct=effective_risk_pct,
+        leverage=leverage,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        extra=extra,
+    )
+
+    # (5) 주문 수량 계산
+    #   - available USDT * effective_risk_pct * leverage / price
+    #   - 최소/단위는 settings 에 따라 맞춘다.
+    notional = avail * effective_risk_pct * leverage
+    qty = notional / max(float(last_price), 1.0)
+
+    # 수량 단위 및 최소 수량 적용
+    qty_step = float(getattr(settings, "qty_step", 0.0001))
+    min_qty = float(getattr(settings, "min_qty", qty_step))
+
+    def _round_step(x: float, step: float) -> float:
+        if step <= 0:
+            return x
+        return math.floor(x / step) * step
+
+    qty = _round_step(qty, qty_step)
+    if qty < min_qty:
+        send_skip_tg(
+            f"[SKIP] qty_too_small: qty={qty:.8f} < min_qty={min_qty:.8f} (notional={notional:.4f}USDT)"
+        )
+        return None, 5.0
+
+    # (6) 실제 주문 실행
+    side = "BUY" if chosen_signal == "LONG" else "SELL"
+    regime_at_entry = _infer_regime_from_signal(signal_source)
+
+    trade = open_position_with_tp_sl(
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        leverage=leverage,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        latest_price=last_price,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        extra=extra,
+    )
+
+    if trade is None:
+        send_skip_tg("[SKIP] open_position_failed: trade_object_is_none")
+        return None, 3.0
+
+    # (7) bt_trades INSERT
+    _create_trade_row_on_entry(
+        trade=trade,
+        symbol=symbol,
+        latest_ts_ms=int(latest_ts),
+        regime_at_entry=regime_at_entry,
+        signal_source=signal_source,
+        effective_risk_pct=effective_risk_pct,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        is_auto=True,
+    )
+
+    # (8) EntryScore 저장 (프리뷰 계산을 재사용하되, 없으면 다시 계산 시도)
+    entry_score = preview_score
+    components = preview_components
+
+    if entry_score is None or not components:
+        try:
+            entry_score, components = _compute_entry_score_components(
+                signal_source=signal_source,
+                chosen_signal=chosen_signal,
+                effective_risk_pct=effective_risk_pct,
+                leverage=leverage,
+                tp_pct=tp_pct,
+                sl_pct=sl_pct,
+                extra=extra,
+            )
+        except ValueError as e:
+            log(f"[ENTRY_SCORE] compute skipped on save: {e}")
+            entry_score = None
+            components = {}
+
+    if entry_score is not None and components:
+        _save_entry_score_to_db(
+            symbol=symbol,
+            ts_ms=int(latest_ts),
+            side=chosen_signal,
+            signal_type=signal_source,
+            regime_at_entry=regime_at_entry,
+            entry_score=entry_score,
+            components=components,
+            trade=trade,
+            used_for_entry=True,
+        )
+
+    log(
+        f"[ENTRY] opened: symbol={symbol} side={side} qty={qty:.8f} "
+        f"lev={leverage} tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}%"
+    )
+
+    # 진입 후에는 짧은 쿨다운
+    return trade, float(getattr(settings, "post_entry_sleep_sec", 5.0))
