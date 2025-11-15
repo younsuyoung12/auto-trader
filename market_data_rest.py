@@ -2,6 +2,19 @@
 # ====================================================
 # BingX REST 캔들 히스토리 조회 모듈
 #
+# 2025-11-15 변경 사항 (4차: REST 응답 포맷 정규화)
+# ----------------------------------------------------
+# 1) V3/V2 응답을 내부 공통 포맷(list[list])으로 변환하도록 변경
+#    - dict 응답(V3 등): [openTime, open, high, low, close, volume, closeTime] 형태로 매핑
+#      · openTime : t / T / time / openTime / startTime 중 하나
+#      · volume   : volume / v 중 하나
+#      · closeTime: openTime + interval_ms 로 계산
+#    - list/tuple 응답(V2 등): 기존 구조를 그대로 유지하되 list 로 캐스팅
+# 2) fetch_klines_rest(...) 는 항상 list[list] 를 반환하도록 스펙 확정
+#    - WS 백필(market_data_ws.backfill_klines_from_rest) 쪽에서 index 기반으로
+#      row[0]/row[5] 등을 사용하는 전제와 일치시키기 위함.
+# 3) 정규화 과정에서 타임스탬프를 추출하지 못한 행은 버리고, 그 개수를 로그로 남김.
+#
 # 2025-11-15 변경 사항 (3차: dict 포맷/타임스탬프 정렬 보강)
 # ----------------------------------------------------
 # 1) REST /kline 행에서 타임스탬프를 추출하는 헬퍼 추가
@@ -47,12 +60,13 @@
 #
 # 반환 포맷
 # ----------------------------------------------------
-# - BingX REST 응답의 data 그대로(list[list] 또는 list[dict])를 돌려준다.
+# - BingX REST 응답을 내부 공통 포맷(list[list])으로 정규화하여 반환한다.
 #   예시:
 #       [
-#         [openTime, open, high, low, close, volume, closeTime, ...],
+#         [openTime, open, high, low, close, volume, closeTime],
 #         ...
 #       ]
+#   ※ openTime/closeTime 은 밀리초(ms) 기준.
 #
 # 사용 예시 (run_bot_ws 쪽):
 # ----------------------------------------------------
@@ -308,12 +322,57 @@ def _request_klines_v2(
     return rows
 
 
+def _normalize_rows_to_common_format(
+    rows: List[Any], interval_ms: int
+) -> List[List[Any]]:
+    """REST 응답 rows(list[dict|list|tuple])를 공통 포맷 list[list] 로 정규화.
+
+    공통 포맷:
+        [openTime_ms, open, high, low, close, volume, closeTime_ms]
+    """
+    normalized: List[List[Any]] = []
+    dropped = 0
+
+    for r in rows:
+        try:
+            if isinstance(r, dict):
+                ts = _extract_ts_from_rest_row(r)
+                if ts <= 0:
+                    dropped += 1
+                    continue
+                open_ = r.get("open") or r.get("o")
+                high = r.get("high") or r.get("h")
+                low = r.get("low") or r.get("l")
+                close = r.get("close") or r.get("c")
+                volume = r.get("volume") or r.get("v")
+                close_ts = ts + interval_ms
+                normalized.append([ts, open_, high, low, close, volume, close_ts])
+            elif isinstance(r, (list, tuple)):
+                if not r:
+                    dropped += 1
+                    continue
+                # 그대로 list 로 캐스팅해서 사용 (기존 V2 포맷 호환)
+                normalized.append(list(r))
+            else:
+                dropped += 1
+        except Exception:
+            dropped += 1
+
+    if dropped > 0:
+        log(
+            f"[REST-KLINES] normalized rows={len(normalized)}, dropped={dropped} "
+            f"(unsupported/invalid format)"
+        )
+
+    return normalized
+
+
 def fetch_klines_rest(
     symbol: str,
     interval: str,
     limit: int = 120,
-) -> List[Any]:
-    """BingX REST /kline 히스토리를 조회해서 list[list|dict] 로 반환한다.
+) -> List[List[Any]]:
+    """BingX REST /kline 히스토리를 조회해서 list[list] 로 반환한다.
 
     매개변수
     ------------------------------------------------
@@ -324,7 +383,7 @@ def fetch_klines_rest(
     반환값 예시
     ------------------------------------------------
     [
-      [openTime, open, high, low, close, volume, closeTime, ...],
+      [openTime, open, high, low, close, volume, closeTime],
       ...
     ]
 
@@ -378,31 +437,42 @@ def fetch_klines_rest(
             f"REST kline 조회 실패: symbol={norm_symbol}, interval={interval}"
         )
 
-    # openTime 기반 정렬 (list/tuple/dict 모두 지원)
+    # 3) 공통 포맷으로 정규화
+    rows_normalized = _normalize_rows_to_common_format(rows, iv_ms)
+    if not rows_normalized:
+        log(
+            "[REST-KLINES] no normalized rows after format conversion: "
+            f"symbol={norm_symbol}, interval={interval}"
+        )
+        raise KlineRestError(
+            f"REST kline 정규화 실패: symbol={norm_symbol}, interval={interval}"
+        )
+
+    # 4) openTime 기반 정렬 (list/tuple/dict 모두 지원) → 이제는 list[list] 기준
     try:
-        rows.sort(key=_extract_ts_from_rest_row)
+        rows_normalized.sort(key=_extract_ts_from_rest_row)
     except Exception as e:
         # 정렬 실패하면 그대로 사용 (최악의 경우지만 로직은 계속)
         log(f"[REST-KLINES] sort error (ignore): {e}")
 
     # 정렬 결과 first/last ts 진단
-    if rows:
-        first_ts = _extract_ts_from_rest_row(rows[0])
-        last_ts = _extract_ts_from_rest_row(rows[-1])
+    if rows_normalized:
+        first_ts = _extract_ts_from_rest_row(rows_normalized[0])
+        last_ts = _extract_ts_from_rest_row(rows_normalized[-1])
         if first_ts <= 0 or last_ts <= 0:
             log(
-                "[REST-KLINES] WARN: unable to extract valid ts from rows "
+                "[REST-KLINES] WARN: unable to extract valid ts from normalized rows "
                 f"(first_ts={first_ts}, last_ts={last_ts})"
             )
 
-    if len(rows) > limit:
-        rows = rows[-limit:]
+    if len(rows_normalized) > limit:
+        rows_normalized = rows_normalized[-limit:]
 
     log(
-        f"[REST-KLINES] loaded {len(rows)} rows for "
+        f"[REST-KLINES] loaded {len(rows_normalized)} rows for "
         f"{norm_symbol} {interval} (requested limit={limit}, raw_limit={raw_limit})"
     )
-    return rows
+    return rows_normalized
 
 
 __all__ = [
