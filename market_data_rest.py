@@ -2,6 +2,21 @@
 # ====================================================
 # BingX REST 캔들 히스토리 조회 모듈
 #
+# 2025-11-15 변경 사항 (3차: dict 포맷/타임스탬프 정렬 보강)
+# ----------------------------------------------------
+# 1) REST /kline 행에서 타임스탬프를 추출하는 헬퍼 추가
+#    - _extract_ts_from_rest_row(row):
+#        · list/tuple → row[0] 기반
+#        · dict → t / T / time / openTime / startTime 순으로 ts 추출
+#        · 실패 시 0 반환
+# 2) fetch_klines_rest(...) 정렬 로직 개선
+#    - rows.sort(key=_extract_ts_from_rest_row) 로 교체.
+#    - 정렬 실패 시 예외 메시지를 로그로 남기고, 기존 rows 를 그대로 사용.
+# 3) 정렬 후 첫/마지막 ts 진단 로그 추가
+#    - first_ts/last_ts 가 0 이하이면 WARN 로그로 형식 문제를 알림.
+# 4) V3/V2 응답에 대해 첫 행 샘플(dict 키/타입)을 디버깅 로그로 남겨,
+#    BingX REST 응답 포맷 변경에 빠르게 대응할 수 있도록 보강.
+#
 # 2025-11-15 변경 사항 (2차: 디버그/심볼 정규화 보강)
 # ----------------------------------------------------
 # 1) 심볼 정규화 유틸 추가
@@ -32,7 +47,7 @@
 #
 # 반환 포맷
 # ----------------------------------------------------
-# - BingX REST 응답의 data 그대로(list[list])를 돌려준다.
+# - BingX REST 응답의 data 그대로(list[list] 또는 list[dict])를 돌려준다.
 #   예시:
 #       [
 #         [openTime, open, high, low, close, volume, closeTime, ...],
@@ -109,13 +124,40 @@ def _normalize_symbol_for_rest(symbol: str) -> str:
     return s
 
 
+def _extract_ts_from_rest_row(row: Any) -> int:
+    """REST /kline 한 행에서 타임스탬프(ms)를 추출한다.
+
+    - list/tuple: row[0] 을 int 로 해석
+    - dict: t / T / time / openTime / startTime 순으로 시도
+    - 실패 시 0 반환
+    """
+    try:
+        if isinstance(row, (list, tuple)):
+            if not row:
+                return 0
+            return int(row[0])
+        if isinstance(row, dict):
+            ts_val = (
+                row.get("t")
+                or row.get("T")
+                or row.get("time")
+                or row.get("openTime")
+                or row.get("startTime")
+                or 0
+            )
+            return int(ts_val)
+    except Exception:
+        return 0
+    return 0
+
+
 def _request_klines_v3(
     symbol: str,
     interval: str,
     start_ms: int,
     end_ms: int,
     limit: int,
-) -> Optional[List[List[Any]]]:
+) -> Optional[List[Any]]:
     """swap V3 quote klines 시도
 
     - 문서: /openApi/swap/v3/quote/klines (공개 마켓 데이터)
@@ -161,6 +203,23 @@ def _request_klines_v3(
         log(f"[REST-KLINES V3] unexpected data type: {type(rows)}")
         return None
 
+    # 샘플 행 디버깅 로그
+    if rows:
+        sample = rows[0]
+        try:
+            if isinstance(sample, dict):
+                log(
+                    "[REST-KLINES V3] sample row(dict) keys="
+                    f"{list(sample.keys())}"
+                )
+            else:
+                log(
+                    f"[REST-KLINES V3] sample row type={type(sample)} "
+                    f"value={str(sample)[:200]}"
+                )
+        except Exception:
+            pass
+
     if not rows:
         log(
             f"[REST-KLINES V3] empty data: symbol={norm_symbol}, interval={interval}, "
@@ -175,7 +234,7 @@ def _request_klines_v2(
     start_ms: int,
     end_ms: int,
     limit: int,
-) -> Optional[List[List[Any]]]:
+) -> Optional[List[Any]]:
     """swap V2 market kline 시도 (폴백용)
 
     - 문서: /openApi/swap/v2/market/kline 혹은 유사 경로
@@ -224,6 +283,23 @@ def _request_klines_v2(
         log(f"[REST-KLINES V2] unexpected data type: {type(rows)}")
         return None
 
+    # 샘플 행 디버깅 로그
+    if rows:
+        sample = rows[0]
+        try:
+            if isinstance(sample, dict):
+                log(
+                    "[REST-KLINES V2] sample row(dict) keys="
+                    f"{list(sample.keys())}"
+                )
+            else:
+                log(
+                    f"[REST-KLINES V2] sample row type={type(sample)} "
+                    f"value={str(sample)[:200]}"
+                )
+        except Exception:
+            pass
+
     if not rows:
         log(
             f"[REST-KLINES V2] empty data: symbol={norm_symbol}, interval={interval}, "
@@ -236,8 +312,8 @@ def fetch_klines_rest(
     symbol: str,
     interval: str,
     limit: int = 120,
-) -> List[List[Any]]:
-    """BingX REST /kline 히스토리를 조회해서 list[list] 로 반환한다.
+) -> List[Any]:
+    """BingX REST /kline 히스토리를 조회해서 list[list|dict] 로 반환한다.
 
     매개변수
     ------------------------------------------------
@@ -277,7 +353,7 @@ def fetch_klines_rest(
         f"start={start_ms} end={end_ms} limit≈{limit}, raw_limit={raw_limit}"
     )
 
-    rows: Optional[List[List[Any]]] = None
+    rows: Optional[List[Any]] = None
 
     # 1) V3 먼저 시도
     try:
@@ -302,12 +378,22 @@ def fetch_klines_rest(
             f"REST kline 조회 실패: symbol={norm_symbol}, interval={interval}"
         )
 
-    # openTime 기준 정렬 후 limit 개까지만 반환
+    # openTime 기반 정렬 (list/tuple/dict 모두 지원)
     try:
-        rows.sort(key=lambda r: int(r[0]))
+        rows.sort(key=_extract_ts_from_rest_row)
     except Exception as e:
         # 정렬 실패하면 그대로 사용 (최악의 경우지만 로직은 계속)
         log(f"[REST-KLINES] sort error (ignore): {e}")
+
+    # 정렬 결과 first/last ts 진단
+    if rows:
+        first_ts = _extract_ts_from_rest_row(rows[0])
+        last_ts = _extract_ts_from_rest_row(rows[-1])
+        if first_ts <= 0 or last_ts <= 0:
+            log(
+                "[REST-KLINES] WARN: unable to extract valid ts from rows "
+                f"(first_ts={first_ts}, last_ts={last_ts})"
+            )
 
     if len(rows) > limit:
         rows = rows[-limit:]
