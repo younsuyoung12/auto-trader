@@ -6,7 +6,7 @@
 # - 스키마를 분리하고 싶으면 __table_args__ 에 schema 지정해서 사용
 """
 db_models.py
-====================================================
+=====================================================
 BingX Auto Trader - Postgres ORM 모델 정의 모듈.
 
 2025-11-14 변경 요약
@@ -28,6 +28,11 @@ BingX Auto Trader - Postgres ORM 모델 정의 모듈.
 1) 각 모델에 한국어 주석을 추가해 저장 의도를 더 명확히 했다.
 2) __all__ 정의로 외부에서 가져다 쓸 수 있는 심벌 목록을 명시했다.
 3) 기능적인 변경은 하지 않고, 문서화/가독성만 향상했다.
+
+2025-11-15 RegimeScore 보완
+----------------------------------------------------
+1) timeframe 컬럼 추가 (예: "5m", "15m").
+2) symbol + timeframe + ts 인덱스 추가로 시계열 레짐 조회 최적화.
 """
 
 from datetime import datetime
@@ -179,6 +184,7 @@ class RegimeScore(Base):
     """시장 레짐(TREND / RANGE / NO_TRADE 등)에 대한 점수를 저장.
 
     - 시그널 계산 전 단계에서 "지금은 어떤 장인가"를 기록하는 용도.
+    - timeframe 으로 5m, 15m 등 분석 기준 타임프레임을 구분한다.
     """
 
     __tablename__ = "bt_regime_scores"
@@ -186,6 +192,7 @@ class RegimeScore(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
 
     symbol = Column(String(32), nullable=False)
+    timeframe = Column(String(8), nullable=True)  # 예: "5m", "15m" (기존 데이터 호환 위해 nullable)
     ts = Column(DateTime(timezone=True), nullable=False)
 
     trend_score = Column(Float, nullable=True)
@@ -203,7 +210,7 @@ class RegimeScore(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
-        Index("ix_bt_regime_symbol_ts", "symbol", "ts", unique=False),
+        Index("ix_bt_regime_symbol_tf_ts", "symbol", "timeframe", "ts", unique=False),
     )
 
 
