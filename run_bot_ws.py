@@ -3,6 +3,18 @@
 웹소켓으로 들어오는 1m / 5m / 15m 캔들을 기준으로 포지션을 열고 감시하는 메인 루프.
 이 버전에서는 더 이상 3m 캔들을 사용하지 않는다.
 
+2025-11-15 변경 사항 (REST 백필 디버그 강화)
+----------------------------------------------------
+15) _backfill_ws_kline_history(...) 디버그 로그 강화
+    - REST 응답 rows 개수, 첫/마지막 openTime(ts) 를 부팅 로그에 남긴다.
+    - backfill_klines_from_rest(...) 호출 후 WS 버퍼 길이(ws_get_klines_with_volume)를
+      즉시 확인해서 "REST 백필 → WS 버퍼 적재" 단계가 실제로 수행됐는지 로그로 남긴다.
+    - KlineRestError / 기타 예외를 구분해서 로깅하고, 실패 시 METRICS["kline_failures"]++.
+16) main() 부팅 직후 WS 버퍼 상태 진단 로그 추가
+    - WS 시작 후 2초 정도 대기 뒤 1m/5m/15m 에 대해 WS 버퍼 길이를 로그.
+      예: [BOOT] WS buffer status: symbol=BTC-USDT interval=5m len=120
+    - REST 백필이 안 먹었는지, WS 실시간 스트림이 안 들어오는지 Render 로그에서 바로 구분 가능.
+
 2025-11-13 변경 사항
 ----------------------------------------------------
 1) settings → settings_ws 로 교체해서 기본 주기를 5m 로 사용.
@@ -93,7 +105,7 @@ from market_data_store import (
     save_orderbook_from_ws,
 )
 from strategies_trend_ws import decide_trend_15m  # 15m 방향 판단
-from market_data_rest import fetch_klines_rest     # BingX REST /kline 헬퍼
+from market_data_rest import fetch_klines_rest, KlineRestError  # BingX REST /kline 헬퍼
 
 
 # ─────────────────────────────
@@ -155,6 +167,7 @@ def _write_stop_flag() -> None:
 # idle 모드
 # ─────────────────────────────
 
+
 def _enter_idle_forever() -> None:
     """메인 로직만 멈추고 프로세스는 살아 있게 하는 무한 슬립."""
     log("[IDLE] safe stop reached, entering idle loop...")
@@ -170,6 +183,7 @@ def _enter_idle_forever() -> None:
 # SIGTERM 핸들러 등록
 # ─────────────────────────────
 
+
 def _sigterm(*_: Any) -> None:
     """컨테이너 SIGTERM 시 자연스럽게 메인 루프를 빠져나오도록 한다."""
     global RUNNING, TERMINATED_BY_SIGNAL
@@ -183,6 +197,7 @@ signal.signal(signal.SIGTERM, _sigterm)
 # ─────────────────────────────
 # 포지션 상태 텔레그램 알림 (WS 버전)
 # ─────────────────────────────
+
 
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
     """열린 포지션이 있을 때 현재 미실현 PnL + 15m 방향을 주기적으로 텔레그램으로 보낸다.
@@ -246,6 +261,7 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
 # 텔레그램 종료 콜백
 # ─────────────────────────────
 
+
 def _on_safe_stop() -> None:
     """텔레그램 명령으로 안전 종료를 요청받았을 때 플래그만 세팅한다."""
     global SAFE_STOP_REQUESTED
@@ -256,6 +272,7 @@ def _on_safe_stop() -> None:
 # ─────────────────────────────
 # WS 시세 초기 REST 백필
 # ─────────────────────────────
+
 
 def _backfill_ws_kline_history(symbol: str) -> None:
     """BingX REST /kline 으로 5m/15m 히스토리 캔들을 받아와 WS 버퍼에 미리 채운다.
@@ -278,15 +295,48 @@ def _backfill_ws_kline_history(symbol: str) -> None:
                 log(
                     f"[BOOT] REST backfill skipped: empty response for {symbol} {iv}"
                 )
+                METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
                 continue
+
+            # REST 응답 요약 로그 (첫/마지막 openTime 기준)
+            try:
+                first_ts = rest_rows[0][0] if isinstance(rest_rows[0], (list, tuple)) and rest_rows[0] else "N/A"
+                last_ts = rest_rows[-1][0] if isinstance(rest_rows[-1], (list, tuple)) and rest_rows[-1] else "N/A"
+            except Exception:
+                first_ts, last_ts = "N/A", "N/A"
+
+            log(
+                f"[BOOT] REST backfill fetched: symbol={symbol} interval={iv} "
+                f"rows={len(rest_rows)} first_ts={first_ts} last_ts={last_ts}"
+            )
+
             backfill_klines_from_rest(symbol, iv, rest_rows)
+
+            # WS 버퍼에 실제로 들어갔는지 즉시 확인
+            try:
+                buf = ws_get_klines_with_volume(symbol, iv, limit=5)
+                buf_len = len(buf) if buf else 0
+                log(
+                    f"[BOOT] REST backfill verify: symbol={symbol} interval={iv} "
+                    f"ws_buf_len={buf_len}"
+                )
+            except Exception as ve:
+                log(
+                    f"[BOOT] REST backfill verify error for {symbol} {iv}: {ve}"
+                )
+
+        except KlineRestError as e:
+            log(f"[BOOT] REST backfill KlineRestError for {symbol} {iv}: {e}")
+            METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
         except Exception as e:
             log(f"[BOOT] REST backfill failed for {symbol} {iv}: {e}")
+            METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
 
 
 # ─────────────────────────────
 # WS 시세 → DB 저장 스레드
 # ─────────────────────────────
+
 
 def _start_market_data_store_thread() -> None:
     """WS 버퍼에서 캔들/호가를 읽어 주기적으로 Postgres 에 저장하는 백그라운드 스레드.
@@ -392,6 +442,7 @@ def _start_market_data_store_thread() -> None:
 # 메인 루프 (WS)
 # ─────────────────────────────
 
+
 def main() -> None:
     global RUNNING
     global OPEN_TRADES, LAST_CLOSE_TS, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
@@ -416,6 +467,18 @@ def main() -> None:
         _backfill_ws_kline_history(SET.symbol)
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
+
+        # 부팅 직후 WS 버퍼 상태 진단 (REST 백필 + WS 스트림 확인용)
+        try:
+            time.sleep(2)
+            for iv in ("1m", "5m", "15m"):
+                buf = ws_get_klines_with_volume(SET.symbol, iv, limit=5)
+                buf_len = len(buf) if buf else 0
+                log(
+                    f"[BOOT] WS buffer status: symbol={SET.symbol} interval={iv} len={buf_len}"
+                )
+        except Exception as e:
+            log(f"[BOOT] WS buffer status check error: {e}")
 
     # 필수 API 키 체크
     if not SET.api_key or not SET.api_secret:

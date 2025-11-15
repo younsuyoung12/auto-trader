@@ -2,7 +2,19 @@
 # ====================================================
 # BingX REST 캔들 히스토리 조회 모듈
 #
-# 2025-11-15 변경 사항
+# 2025-11-15 변경 사항 (2차: 디버그/심볼 정규화 보강)
+# ----------------------------------------------------
+# 1) 심볼 정규화 유틸 추가
+#    - _normalize_symbol_for_rest(symbol):
+#        - "BTCUSDT" → "BTC-USDT" 로 변환 (기타 *USDT 현물/선물 심볼 동일 처리)
+#        - 이미 "BTC-USDT" 형식이면 그대로 사용.
+#    - REST 요청/로그에서 모두 정규화된 심볼을 사용하도록 변경.
+# 2) 디버그 로그 강화
+#    - V3/V2 요청 시 실제 요청 파라미터(symbol/interval/start/end/limit)를 한 번 더 로그.
+#    - code != 0 또는 HTTP 오류 시 응답 payload 앞부분을 함께 로그.
+#    - V3/V2 모두 실패 후 rows 가 비어 있을 때, startTime/endTime/raw_limit 를 포함한 요약 로그를 남김.
+#
+# 2025-11-15 변경 사항 (1차: limit 파라미터 추가)
 # ----------------------------------------------------
 # 1) V3/V2 요청에 limit 파라미터를 추가해서, REST 에서 원하는 개수만큼
 #    캔들을 받아오도록 수정.
@@ -84,6 +96,19 @@ def _interval_to_ms(interval: str) -> int:
     return _INTERVAL_MS[interval]
 
 
+def _normalize_symbol_for_rest(symbol: str) -> str:
+    """REST /kline 요청용 심볼 정규화.
+
+    - "BTCUSDT" 처럼 하이픈(-) 없이 USDT 로 끝나는 경우 → "BTC-USDT" 로 변환.
+    - 이미 "BTC-USDT" 형식이면 그대로 사용.
+    - 그 외 심볼은 대문자 + strip 만 적용.
+    """
+    s = symbol.upper().strip()
+    if "-" not in s and s.endswith("USDT"):
+        return s[:-4] + "-USDT"
+    return s
+
+
 def _request_klines_v3(
     symbol: str,
     interval: str,
@@ -96,9 +121,10 @@ def _request_klines_v3(
     - 문서: /openApi/swap/v3/quote/klines (공개 마켓 데이터)
     - limit 파라미터를 함께 보내서 최대 캔들 개수를 제어한다.
     """
+    norm_symbol = _normalize_symbol_for_rest(symbol)
     url = f"{BINGX_API_BASE}/openApi/swap/v3/quote/klines"
     params = {
-        "symbol": symbol.upper(),
+        "symbol": norm_symbol,
         "interval": interval,
         "startTime": start_ms,
         "endTime": end_ms,
@@ -106,12 +132,22 @@ def _request_klines_v3(
         "limit": limit,
     }
 
+    log(
+        "[REST-KLINES V3] request "
+        f"symbol={norm_symbol}, interval={interval}, start={start_ms}, end={end_ms}, limit={limit}"
+    )
+
     resp = requests.get(url, params=params, timeout=10)
     if resp.status_code != 200:
         log(f"[REST-KLINES V3] HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as e:
+        log(f"[REST-KLINES V3] JSON decode error: {e}, body={resp.text[:200]}")
+        return None
+
     code = data.get("code")
     if code != 0:
         log(
@@ -124,6 +160,12 @@ def _request_klines_v3(
     if not isinstance(rows, list):
         log(f"[REST-KLINES V3] unexpected data type: {type(rows)}")
         return None
+
+    if not rows:
+        log(
+            f"[REST-KLINES V3] empty data: symbol={norm_symbol}, interval={interval}, "
+            f"start={start_ms}, end={end_ms}, limit={limit}"
+        )
     return rows
 
 
@@ -140,11 +182,12 @@ def _request_klines_v2(
     - 일부 환경에서 V3 엔드포인트가 동작하지 않을 경우를 대비.
     - limit 파라미터를 함께 보내서 최대 캔들 개수를 제어한다.
     """
+    norm_symbol = _normalize_symbol_for_rest(symbol)
     # 실제 문서 기준으로 경로가 다를 수 있어서,
     # 여기서는 가장 많이 쓰이는 market/kline 경로를 우선 사용.
     url = f"{BINGX_API_BASE}/openApi/swap/v2/market/kline"
     params = {
-        "symbol": symbol.upper(),
+        "symbol": norm_symbol,
         "interval": interval,
         "startTime": start_ms,
         "endTime": end_ms,
@@ -152,12 +195,22 @@ def _request_klines_v2(
         "limit": limit,
     }
 
+    log(
+        "[REST-KLINES V2] request "
+        f"symbol={norm_symbol}, interval={interval}, start={start_ms}, end={end_ms}, limit={limit}"
+    )
+
     resp = requests.get(url, params=params, timeout=10)
     if resp.status_code != 200:
         log(f"[REST-KLINES V2] HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as e:
+        log(f"[REST-KLINES V2] JSON decode error: {e}, body={resp.text[:200]}")
+        return None
+
     code = data.get("code")
     if code != 0:
         log(
@@ -170,6 +223,12 @@ def _request_klines_v2(
     if not isinstance(rows, list):
         log(f"[REST-KLINES V2] unexpected data type: {type(rows)}")
         return None
+
+    if not rows:
+        log(
+            f"[REST-KLINES V2] empty data: symbol={norm_symbol}, interval={interval}, "
+            f"start={start_ms}, end={end_ms}, limit={limit}"
+        )
     return rows
 
 
@@ -210,8 +269,11 @@ def fetch_klines_rest(
     # 서버에는 limit 보다 약간 큰 raw_limit 로 요청 (여유분)
     raw_limit = limit + 20
 
+    norm_symbol = _normalize_symbol_for_rest(symbol)
+
     log(
-        f"[REST-KLINES] request symbol={symbol} interval={interval} "
+        "[REST-KLINES] request "
+        f"symbol={symbol} (normalized={norm_symbol}) interval={interval} "
         f"start={start_ms} end={end_ms} limit≈{limit}, raw_limit={raw_limit}"
     )
 
@@ -219,35 +281,40 @@ def fetch_klines_rest(
 
     # 1) V3 먼저 시도
     try:
-        rows = _request_klines_v3(symbol, interval, start_ms, end_ms, raw_limit)
+        rows = _request_klines_v3(norm_symbol, interval, start_ms, end_ms, raw_limit)
     except Exception as e:
         log(f"[REST-KLINES] V3 request error: {e}")
 
     # 2) V3 가 실패했거나 빈 결과 → V2 폴백
     if not rows:
         try:
-            rows = _request_klines_v2(symbol, interval, start_ms, end_ms, raw_limit)
+            rows = _request_klines_v2(norm_symbol, interval, start_ms, end_ms, raw_limit)
         except Exception as e:
             log(f"[REST-KLINES] V2 request error: {e}")
 
     if not rows:
+        log(
+            "[REST-KLINES] no rows from REST after V3/V2: "
+            f"symbol={norm_symbol}, interval={interval}, start={start_ms}, "
+            f"end={end_ms}, raw_limit={raw_limit}"
+        )
         raise KlineRestError(
-            f"REST kline 조회 실패: symbol={symbol}, interval={interval}"
+            f"REST kline 조회 실패: symbol={norm_symbol}, interval={interval}"
         )
 
     # openTime 기준 정렬 후 limit 개까지만 반환
     try:
         rows.sort(key=lambda r: int(r[0]))
-    except Exception:
+    except Exception as e:
         # 정렬 실패하면 그대로 사용 (최악의 경우지만 로직은 계속)
-        pass
+        log(f"[REST-KLINES] sort error (ignore): {e}")
 
     if len(rows) > limit:
         rows = rows[-limit:]
 
     log(
         f"[REST-KLINES] loaded {len(rows)} rows for "
-        f"{symbol} {interval} (requested limit={limit}, raw_limit={raw_limit})"
+        f"{norm_symbol} {interval} (requested limit={limit}, raw_limit={raw_limit})"
     )
     return rows
 

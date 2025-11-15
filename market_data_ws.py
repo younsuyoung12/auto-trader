@@ -404,7 +404,6 @@ def start_ws_loop(symbol: str) -> None:
                 ws = websocket.WebSocketApp(
                     url,
                     on_open=lambda w: _on_open(symbol, w),
-                    # ✅ 여기 수정
                     on_message=lambda w, m: _on_message(symbol, w, m),
                     on_error=_on_error,
                     on_close=_on_close,
@@ -454,6 +453,7 @@ def backfill_klines_from_rest(
 ) -> None:
     """BingX REST /kline 응답을 받아 버퍼에 백필한다."""
     converted: List[Tuple[int, float, float, float, float, float]] = []
+    raw_len = len(rest_klines)
 
     for row in rest_klines:
         try:
@@ -494,11 +494,29 @@ def backfill_klines_from_rest(
             try:
                 log(
                     f"[MD-WS BACKFILL] rest_klines for {symbol} {interval} "
-                    f"had no valid rows"
+                    f"had no valid rows (raw_len={raw_len})"
                 )
             except Exception:
                 pass
         return
+
+    # ts 기준 정렬 후, 변환 결과 요약 로그
+    try:
+        converted.sort(key=lambda x: x[0])
+    except Exception:
+        pass
+
+    if getattr(SET, "ws_log_enabled", True):
+        try:
+            first_ts = converted[0][0]
+            last_ts = converted[-1][0]
+            log(
+                f"[MD-WS BACKFILL] parsed REST klines for {symbol} {interval} "
+                f"raw={raw_len} converted={len(converted)} "
+                f"first_ts={first_ts} last_ts={last_ts}"
+            )
+        except Exception:
+            pass
 
     preload_klines(symbol, interval, converted)
 
