@@ -5,7 +5,7 @@
 # - BingX Auto Trader에서 진입/청산/전략 중재 의사결정을 GPT-5.1에 위임하는 어댑터.
 # - entry_flow.py, signal_flow_ws.py, position_watch_ws.py 등에서 이 모듈만 import 해서 사용.
 #
-# 2025-11-17 변경 사항 (타입힌트 정리 + GPT 응답 파싱 보강 + Pylance 문법 오류 대응)
+# 2025-11-17 변경 사항 (타입힌트 정리 + GPT 응답 파싱 보강 + Pylance 문법 오류 대응 + 구버전 openai 호환 + 로깅 강화)
 # ----------------------------------------------------
 # 1) Pylance reportInvalidTypeForm 대응
 #    - Dict[str, Any] | None → Optional[Dict[str, Any]] 로 전부 변경.
@@ -20,6 +20,11 @@
 #    - 진입/청산 판단 실패 시: "기존 규칙으로만 판단" / "포지션 정리/유지" 식으로 안내.
 # 5) Pylance가 한글 docstring 을 코드로 잘못 인식하는 문제 해결
 #    - _extract_text_from_response 의 한글 설명을 주석(#) 기반으로 변경.
+# 6) openai-python 구버전 호환
+#    - Responses.create(...) 가 response_format 인자를 지원하지 않는 경우, TypeError 를 캐치하여
+#      response_format 없이 재호출하는 폴백 로직 추가.
+# 7) GPT 호출 로깅 강화
+#    - _safe_log(...) 헬퍼를 추가하여 GPT 진입/청산/중재 호출 및 결과를 Render 로그에서 확인 가능.
 
 from __future__ import annotations
 
@@ -34,8 +39,25 @@ _client: Optional[OpenAI] = None
 
 
 # ─────────────────────────────────────────
+# 공통 유틸 헬퍼
+# ─────────────────────────────────────────
+
+
+def _safe_log(msg: str) -> None:
+    """telelog.log 를 사용할 수 있으면 사용하고, 실패해도 조용히 무시한다."""
+    try:
+        from telelog import log  # 지연 import 로 순환 의존 방지
+
+        log(msg)
+    except Exception:
+        # 로깅 실패로 인해 트레이딩 로직이 죽지 않도록 무시
+        pass
+
+
+# ─────────────────────────────────────────
 # 공통 GPT 호출 헬퍼
 # ─────────────────────────────────────────
+
 
 def _get_client() -> OpenAI:
     """전역 OpenAI 클라이언트 인스턴스 생성/재사용."""
@@ -107,15 +129,37 @@ def _call_gpt_json(
     client = _get_client()
 
     t0 = time.time()
-    resp = client.responses.create(
-        model=model,
-        input=prompt,
-        response_format={"type": "json_object"},
-        timeout=timeout_sec,
-    )
+    _safe_log(f"[GPT_CALL] start purpose={purpose or '-'} model={model}")
 
-    text = _extract_text_from_response(resp)
-    elapsed = time.time() - t0
+    try:
+        try:
+            # 최신 openai-python (Responses API + response_format 지원)
+            resp = client.responses.create(
+                model=model,
+                input=prompt,
+                response_format={"type": "json_object"},
+                timeout=timeout_sec,
+            )
+        except TypeError as e:
+            # 구버전 openai-python: response_format 인자 미지원
+            if "response_format" not in str(e):
+                raise
+            _safe_log("[GPT_CALL] response_format not supported, retrying without it")
+            resp = client.responses.create(
+                model=model,
+                input=prompt,
+                timeout=timeout_sec,
+            )
+
+        text = _extract_text_from_response(resp)
+        elapsed = time.time() - t0
+        _safe_log(
+            f"[GPT_CALL] done purpose={purpose or '-'} elapsed={elapsed:.2f}s text_len={len(text)}"
+        )
+    except Exception as e:  # pragma: no cover - GPT 오류는 호출측에서 처리
+        _safe_log(f"[GPT_CALL][ERROR] purpose={purpose or '-'} error={e}")
+        raise
+
     if elapsed > timeout_sec:
         raise TimeoutError(f"GPT 응답 지연: {elapsed:.2f}s > {timeout_sec:.2f}s")
 
@@ -244,6 +288,18 @@ def ask_entry_decision_safe(
         action = str(data.get("action", "ENTER")).upper()
         if action not in {"ENTER", "SKIP", "ADJUST"}:
             action = "ENTER"
+
+        # 성공 시 Render 로그에 요약 남김
+        try:
+            new_tp = data.get("tp_pct", tp_pct)
+            new_sl = data.get("sl_pct", sl_pct)
+            new_risk = data.get("effective_risk_pct", effective_risk_pct)
+            _safe_log(
+                f"[GPT_ENTRY] action={action} tp={new_tp} sl={new_sl} risk={new_risk} symbol={symbol} src={signal_source} dir={chosen_signal}"
+            )
+        except Exception:
+            pass
+
         return action, data
     except Exception as e:  # pragma: no cover - GPT 오류 폴백
         from telelog import log, send_tg  # 순환 import 방지용 지연 import
@@ -410,6 +466,14 @@ def ask_exit_decision_safe(
         else:
             action = fa
 
+        # 성공 시 Render 로그에 요약 남김
+        try:
+            _safe_log(
+                f"[GPT_EXIT] scenario={scenario} action={action} symbol={symbol} side={side} reason={data.get('reason')}"
+            )
+        except Exception:
+            pass
+
         return action, data
     except Exception as e:  # pragma: no cover - GPT 오류 폴백
         from telelog import log, send_tg  # 순환 import 방지용 지연 import
@@ -544,6 +608,15 @@ def ask_signal_arbitration(
         "reason": resp_json.get("reason"),
         "raw": resp_json,
     }
+
+    # Render 로그에 요약 남김
+    try:
+        _safe_log(
+            f"[GPT_ARB] action={action} symbol={symbol} last_price={last_price} reason={resp_json.get('reason')}"
+        )
+    except Exception:
+        pass
+
     return result
 
 

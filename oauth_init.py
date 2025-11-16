@@ -1,45 +1,46 @@
-# oauth_init.py
-"""
-한 번만 실행해서 사람 계정으로 구글 드라이브 권한을 받아 token.json 을 만드는 스크립트.
-같은 폴더에 'credentials.json' 이 있어야 한다.
-"""
-
 from __future__ import annotations
 
-import os.path
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+import json
+from pathlib import Path
 
-# 우리가 쓸 드라이브 권한
-SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/drive.file",
-]
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+# Drive 업로드에 쓰는 권한 범위
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
 
 def main() -> None:
-    creds = None
+    """
+    기존 만료된 토큰을 refresh 하지 말고,
+    브라우저에서 다시 로그인해서 새로운 token.json 을 발급받는 스크립트.
+    """
+    cred_file = Path("credentials.json")
+    if not cred_file.exists():
+        raise FileNotFoundError(
+            "credentials.json 파일이 없습니다. "
+            "GCP 콘솔에서 OAuth 클라이언트 비밀키를 내려받아 "
+            "프로젝트 루트에 credentials.json 이름으로 둬야 합니다."
+        )
 
-    # 이미 토큰이 있으면 재사용
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(cred_file),
+        scopes=SCOPES,
+    )
 
-    # 없거나 만료됐으면 다시 인증
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # 여기서 브라우저 열려서 구글 로그인하고 허용 눌러주면 됨
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
-            )
-            creds = flow.run_local_server(port=0)
+    # 브라우저 열려서 구글 계정 로그인/허용
+    creds = flow.run_local_server(port=0)
 
-        # 받아온 토큰 저장
-        with open("token.json", "w", encoding="utf-8") as token:
-            token.write(creds.to_json())
+    # 1) token.json 파일로 저장
+    token_path = Path("token.json")
+    token_json = creds.to_json()
 
-    print("✅ token.json 생성/갱신 완료")
+    token_path.write_text(token_json, encoding="utf-8")
+    print(f"[OK] 새 token.json 저장 완료 → {token_path}")
+
+    # 2) Render ENV 에 넣기 쉽게 그대로 출력도 해 준다
+    print("\n===== 아래 JSON 전체를 Render 환경 변수에 붙여넣으면 됨 =====\n")
+    print(token_json)
+
 
 if __name__ == "__main__":
     main()
