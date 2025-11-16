@@ -3,6 +3,15 @@
 웹소켓으로 들어오는 1m / 5m / 15m 캔들을 기준으로 포지션을 열고 감시하는 메인 루프.
 이 버전에서는 더 이상 3m 캔들을 사용하지 않는다.
 
+2025-11-17 변경 사항 (텔레그램 메시지 한글화 + 직관 표현)
+----------------------------------------------------
+1) 텔레그램으로 나가는 안내 문구를 전부 한국어로 정리하고, 어려운 용어를 줄였다.
+   - 봇 시작/종료, 일일 정산, 연속 손실, 오류 안내, STOP_FLAG 경고 등.
+2) 포지션 청산 알림에서 reason 코드를 사람이 보기 쉬운 문장으로 변환했다.
+   - 예) "tp_hit" → "목표가 도달(익절)", "sl_hit" → "손절가 도달(손절)" 등.
+3) 열린 포지션 상태 알림에서 방향을 "LONG/SHORT" 대신 "롱/숏" 으로 표시하고,
+   15분 추세도 "상승/하락/횡보" 형태로 안내하도록 변경했다.
+
 2025-11-15 변경 사항 (REST 백필 디버그 강화)
 ----------------------------------------------------
 15) _backfill_ws_kline_history(...) 디버그 로그 강화
@@ -151,8 +160,9 @@ SIGNAL_ANALYSIS_INTERVAL_SEC: int = getattr(SET, "signal_analysis_interval_sec",
 
 
 # ─────────────────────────────
-# STOP_FLAG 유틸
+# 유틸: STOP_FLAG 파일
 # ─────────────────────────────
+
 
 def _write_stop_flag() -> None:
     """프로세스 재시작 시 즉시 종료시키기 위한 플래그 파일 작성."""
@@ -170,9 +180,9 @@ def _write_stop_flag() -> None:
 
 def _enter_idle_forever() -> None:
     """메인 로직만 멈추고 프로세스는 살아 있게 하는 무한 슬립."""
-    log("[IDLE] safe stop reached, entering idle loop...")
+    log("[IDLE] 봇이 중지 상태(idle 모드)로 들어갑니다.")
     try:
-        send_tg("🟡 봇을 멈춘 상태로 유지합니다. 재시작은 컨테이너/프로세스로 해주세요.")
+        send_tg("🟡 자동매매를 멈추고 대기 상태로 유지합니다. 다시 돌리려면 서버에서 봇을 재시작해 주세요.")
     except Exception:
         pass
     while True:
@@ -195,12 +205,36 @@ signal.signal(signal.SIGTERM, _sigterm)
 
 
 # ─────────────────────────────
+# 유틸: 청산 사유(reason) 한글 변환
+# ─────────────────────────────
+
+
+def _translate_close_reason(reason: str) -> str:
+    """check_closes 에서 넘어오는 청산 사유를 사람이 보기 쉬운 짧은 문장으로 변환."""
+    if not reason:
+        return "기타"
+
+    r = reason.lower()
+    if "tp" in r or "take" in r:
+        return "목표가 도달(익절)"
+    if "sl" in r or "stop" in r:
+        return "손절가 도달(손절)"
+    if "manual" in r:
+        return "수동으로 종료"
+    if "force" in r or "emergency" in r:
+        return "강제로 종료"
+    if "opposite" in r:
+        return "반대 방향 신호로 종료"
+    return reason
+
+
+# ─────────────────────────────
 # 포지션 상태 텔레그램 알림 (WS 버전)
 # ─────────────────────────────
 
 
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
-    """열린 포지션이 있을 때 현재 미실현 PnL + 15m 방향을 주기적으로 텔레그램으로 보낸다.
+    """열린 포지션이 있을 때 현재 미실현 손익 + 15분 방향을 주기적으로 텔레그램으로 보낸다.
 
     15m 캔들은 웹소켓 버퍼에서 읽는다.
     Render 콘솔에서는 아래 로그로 실제 수신 여부 확인 가능:
@@ -224,11 +258,11 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
         if candles_15m:
             trend_dir = decide_trend_15m(candles_15m)
             if trend_dir == "LONG":
-                trend_txt = " (15m 추세: 상승)"
+                trend_txt = " (15분 차트 기준: 상승 흐름)"
             elif trend_dir == "SHORT":
-                trend_txt = " (15m 추세: 하락)"
+                trend_txt = " (15분 차트 기준: 하락 흐름)"
             else:
-                trend_txt = " (15m 추세: 중립)"
+                trend_txt = " (15분 차트 기준: 횡보)"
         else:
             trend_txt = ""
     except Exception as e:
@@ -236,22 +270,22 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
         trend_txt = ""
 
     mins = max(1, interval_sec // 60)
-    lines = [f"⏱ 포지션 상태({mins}m){trend_txt}:"]
+    lines = [f"⏱ 현재 열린 포지션 안내 (약 {mins}분 간격){trend_txt}"]
 
     for p in positions:
         qty = float(p.get("positionAmt") or p.get("quantity") or p.get("size") or 0.0)
         upnl = float(p.get("unrealizedProfit") or 0.0)
         pos_side_raw = (p.get("positionSide") or "").upper()
         if pos_side_raw in ("LONG", "BOTH"):
-            side_text = "LONG"
+            side_text = "롱"
         elif pos_side_raw == "SHORT":
-            side_text = "SHORT"
+            side_text = "숏"
         else:
-            side_text = "LONG" if qty > 0 else "SHORT"
+            side_text = "롱" if qty > 0 else "숏"
 
         upnl_krw = upnl * KRW_RATE
         lines.append(
-            f"- {symbol} {side_text} 수량={abs(qty)} 미실현={upnl:.2f} USDT (~{upnl_krw:,.0f} KRW)"
+            f"- {symbol} {side_text} / 수량 {abs(qty)} / 미실현 손익 {upnl:.2f} USDT (약 {upnl_krw:,.0f}원)"
         )
 
     send_tg("\n".join(lines))
@@ -266,7 +300,7 @@ def _on_safe_stop() -> None:
     """텔레그램 명령으로 안전 종료를 요청받았을 때 플래그만 세팅한다."""
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
-    send_tg("🛑 종료 명령 수신: 포지션 정리 후 종료합니다.")
+    send_tg("🛑 텔레그램에서 '종료' 버튼을 눌렀습니다. 현재 포지션을 모두 정리한 뒤 자동매매를 멈춥니다.")
 
 
 # ─────────────────────────────
@@ -452,7 +486,10 @@ def main() -> None:
     # 시작 시 STOP_FLAG 있으면 바로 종료
     if os.path.exists("STOP_FLAG"):
         log("STOP_FLAG detected on startup. exiting without start.")
-        send_tg("⛔ 이전 종료 명령이 있어 실행하지 않습니다. (STOP_FLAG 삭제 후 재실행)")
+        send_tg(
+            "⛔ 이전에 '종료' 명령을 받아 STOP_FLAG 파일이 남아 있습니다. "
+            "파일을 삭제한 뒤 다시 실행해 주세요."
+        )
         return
 
     # WS 설정 로그로 남기기 (Render 확인용)
@@ -482,7 +519,10 @@ def main() -> None:
 
     # 필수 API 키 체크
     if not SET.api_key or not SET.api_secret:
-        msg = "❗ BINGX_API_KEY / BINGX_API_SECRET 이 비어있습니다. 환경변수 설정 필요."
+        msg = (
+            "❗ 선물 API 키가 설정되어 있지 않습니다. "
+            "Render 환경변수에 BINGX_API_KEY / BINGX_API_SECRET 값을 확인해 주세요."
+        )
         log(msg)
         send_tg(msg)
         return
@@ -492,7 +532,7 @@ def main() -> None:
         f"CONFIG: ENABLE_TREND={SET.enable_trend}, "
         f"ENABLE_RANGE={SET.enable_range}, ENABLE_1M_CONFIRM={SET.enable_1m_confirm}"
     )
-    send_tg("✅ [봇 시작] BingX 선물 자동매매 (WS) 시작합니다.")
+    send_tg("✅ BingX 비트코인 선물 자동매매(WS 버전)를 시작합니다.")
 
     # 레버리지/마진 모드 세팅 (실패해도 계속 감)
     try:
@@ -551,8 +591,11 @@ def main() -> None:
             now_kst = datetime.datetime.now(KST)
             today_kst = now_kst.strftime("%Y-%m-%d")
             if now_kst.hour == 0 and now_kst.minute < 1 and last_report_date_kst != today_kst:
+                daily_pnl_krw = daily_pnl * KRW_RATE
                 send_tg(
-                    f"📊 일일 정산(KST): PnL {daily_pnl:.2f} USDT, 연속 손실 {CONSEC_LOSSES}"
+                    "📊 하루 정산 (한국시간 기준)\n"
+                    f"- 오늘 손익: {daily_pnl:.2f} USDT (약 {daily_pnl_krw:,.0f}원)\n"
+                    f"- 연속 손실 횟수: {CONSEC_LOSSES}회"
                 )
                 daily_pnl = 0.0
                 CONSEC_LOSSES = 0
@@ -586,10 +629,18 @@ def main() -> None:
                         LAST_CLOSE_TS_RANGE = now
 
                     pnl_krw = pnl * KRW_RATE
+
                     if getattr(SET, "notify_on_close", True):
+                        reason_ko = _translate_close_reason(reason)
+                        side_ko = "롱" if str(t.side).upper() in ("BUY", "LONG") else "숏"
                         send_tg(
-                            f"💰 청산({reason}) {t.symbol} {t.side} 수량={closed_qty} "
-                            f"가격={closed_price:.2f} PnL={pnl:.2f} USDT (~{pnl_krw:,.0f} KRW)"
+                            "💰 포지션 청산 알림\n"
+                            f"- 종목: {t.symbol}\n"
+                            f"- 방향: {side_ko}\n"
+                            f"- 청산 사유: {reason_ko}\n"
+                            f"- 수량: {closed_qty}\n"
+                            f"- 청산가: {closed_price:.2f}\n"
+                            f"- 실현 손익: {pnl:.2f} USDT (약 {pnl_krw:,.0f}원)"
                         )
 
                     log_signal(
@@ -607,13 +658,16 @@ def main() -> None:
 
                 # TP/SL 재설정이 계속 실패하면 봇 중단 → idle
                 if TRADER_STATE.should_stop_bot():
-                    send_tg("🛑 TP/SL 재설정이 연속 실패해서 봇을 중단합니다.")
+                    send_tg(
+                        "🛑 손절/익절 주문을 여러 번 다시 걸었는데 계속 실패합니다. "
+                        "안전을 위해 자동매매를 중단합니다."
+                    )
                     _write_stop_flag()
                     _enter_idle_forever()
 
                 # 안전 종료 요청이 왔고, 이미 포지션이 모두 정리된 상태라면 종료
                 if SAFE_STOP_REQUESTED and not OPEN_TRADES:
-                    send_tg("🛑 종료 명령에 따라 포지션이 없어 종료합니다.")
+                    send_tg("🛑 요청하신 대로 포지션을 모두 정리했고, 자동매매를 종료합니다.")
                     _write_stop_flag()
                     _enter_idle_forever()
 
@@ -662,13 +716,16 @@ def main() -> None:
 
             # (f) 포지션이 없는 상태에서 안전 종료 요청이 들어온 경우 → 즉시 idle
             if SAFE_STOP_REQUESTED:
-                send_tg("🛑 종료 명령에 따라 새 진입 없이 종료합니다.")
+                send_tg("🛑 요청하신 대로 새로운 진입 없이 자동매매를 종료합니다.")
                 _write_stop_flag()
                 _enter_idle_forever()
 
             # (g) 연속 손실 방어 로직
             if CONSEC_LOSSES >= 3:
-                send_tg("⛔ 연속 3회 손실 → 휴식 진입")
+                send_tg(
+                    "⛔ 연속으로 3번 손실이 발생했습니다. "
+                    "설정된 휴식 시간 동안 새로 진입하지 않고 쉬었다가 다시 시작합니다."
+                )
                 time.sleep(SET.cooldown_after_3loss)
                 CONSEC_LOSSES = 0
                 continue
@@ -690,7 +747,11 @@ def main() -> None:
 
         except Exception as e:
             log(f"ERROR: {e}")
-            send_tg(f"❌ 오류 발생: {e}")
+            send_tg(
+                "❌ 예기치 못한 오류가 발생했습니다.\n"
+                f"- 내용: {e}\n"
+                "2초 후 자동으로 다시 시도합니다."
+            )
             log_signal(
                 event="ERROR",
                 symbol=SET.symbol,

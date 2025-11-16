@@ -1,8 +1,46 @@
 """
-signal_flow_ws.py (simultaneous arbitration)
-====================================================
+signal_flow_ws.py (simultaneous arbitration + GPT extra 확장)
+=====================================================
 시그널 결정 전담 모듈 (웹소켓 기반, 동시 평가 + 중재 버전).
 run_bot.py / run_bot_ws.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
+
+PATCH NOTES — 2025-11-17 (방향 정보 확장 + GPT 컨텍스트 정리)
+----------------------------------------------------
+L) GPT 컨텍스트에 방향 정보를 명시적으로 추가
+   - extra["direction_raw"]  : Candidate.side (BUY/SELL)
+   - extra["direction_norm"] : 최종 chosen_signal (LONG/SHORT)
+   → entry_flow / gpt_decider 가 LONG/SHORT 기준으로 일관되게 해석할 수 있도록 보조.
+
+PATCH NOTES — 2025-11-16 (GPT-5 연동용 extra 확장 + 방향 표기 통일 + 보조 중재기)
+----------------------------------------------------
+H) GPT-5 진입 의사결정(gpt_decider.ask_entry_decision)에서 활용할 수 있도록 extra 확장
+   - 최종 선택된 후보의 score 를
+       · extra["signal_score"]
+       · extra["candidate_score"]
+     로 전달 (TREND: 15m EMA 갭 비율, RANGE: 1 / 박스폭 비율).
+   - 전략 레이블(TREND/RANGE/HYBRID)을
+       · extra["regime_level"] (TREND=1.0, RANGE=2.0, HYBRID=1.5)
+     로 숫자 형태로 함께 제공.
+   - 전략별 핵심 지표도 함께 기록:
+       · TREND: extra["gap_ratio_15m"] = gap_ratio
+       · RANGE: extra["width_ratio_5m"] ≈ 1.0 / score
+   - 기존 ATR 기반 필드(extra["atr_fast"], extra["atr_slow"], extra["effective_risk_pct"])는 그대로 유지.
+
+I) get_trading_signal 반환 방향 통일 (BUY/SELL → LONG/SHORT)
+   - 내부 Candidate.side 는 그대로 "BUY"/"SELL" 사용 (여타 모듈 호환 유지).
+   - get_trading_signal 의 반환값 chosen_signal 은
+       · "LONG" (BUY/LONG 계열)
+       · "SHORT" (SELL/SHORT 계열)
+     로 변환해서 돌려줌.
+   - entry_flow.py 등에서 LONG/SHORT 을 기준으로 동작하는 코드와 일관성을 맞추기 위함.
+
+J) TREND/RANGE 중재 실패(no_entry_arbitration) 시 GPT-5 보조 중재기 추가
+   - gpt_decider.ask_signal_arbitration(...) 호출 (있을 때만 사용, 없으면 기존 로직 유지).
+   - 내장 중재(_arbitrate)가 결론을 못 내린 경우에만 TREND vs RANGE vs SKIP 을 한 번 더 판단.
+
+K) extra["signal_reasons"] / extra["block_reason"] 추가
+   - Candidate.reasons / Candidate.block_reason 내용을 extra 로 넘겨서
+     entry_flow → gpt_decider.ask_entry_decision 에서 참고할 수 있게 한다.
 
 PATCH NOTES — 2025-11-14
 ----------------------------------------------------
@@ -76,6 +114,12 @@ from strategies_trend_ws import (
 
 from db_writer import save_indicator_row
 
+# TREND/RANGE no-entry 상황에서 GPT로 한 번 더 중재하는 용도 (없어도 동작하도록 방어)
+try:
+    from gpt_decider import ask_signal_arbitration  # type: ignore
+except Exception:  # pragma: no cover - GPT 모듈이 없거나 실패해도 신호 결정은 돌아가게
+    ask_signal_arbitration = None  # type: ignore[assignment]
+
 # RANGE 모듈은 최신/구버전 둘 다 대응
 try:
     from strategies_range_ws import (
@@ -126,6 +170,22 @@ class Candidate:
     tp_pct: float            # 이 후보 기준 TP 비율
     sl_pct: float            # 이 후보 기준 SL 비율
     reasons: List[str]       # 디버깅/로그용 사유 목록
+    block_reason: Optional[str] = None  # RANGE soft_ 차단 사유 등을 담는 용도
+
+
+def _candidate_to_dict(c: Optional[Candidate]) -> Optional[Dict[str, Any]]:
+    """GPT 프롬프트에 넣기 좋은 단순 dict 로 변환."""
+    if c is None:
+        return None
+    return {
+        "kind": c.kind,
+        "side": c.side,
+        "score": c.score,
+        "tp_pct": c.tp_pct,
+        "sl_pct": c.sl_pct,
+        "reasons": list(c.reasons),
+        "block_reason": c.block_reason,
+    }
 
 
 def _ema(values: List[float], period: int) -> Optional[float]:
@@ -420,7 +480,8 @@ def _range_candidate(
         log(f"[RANGE params error] {e}")
 
     # soft 차단이면 완화 계수 적용(로그용 reason 채움)
-    if str(block_reason).startswith("soft_"):
+    is_soft_block = str(block_reason).startswith("soft_")
+    if is_soft_block:
         soft = float(getattr(settings, "range_soft_tp_factor", 0.7))
         tp_pct *= soft
         sl_pct *= soft
@@ -433,13 +494,20 @@ def _range_candidate(
             candle_ts=latest_5m_ts,
         )
 
+    reasons: List[str] = [
+        f"range width_ratio={width_ratio:.4f} (<= {width_thr:.4f})",
+    ]
+    if block_reason:
+        reasons.append(f"block_reason={block_reason}")
+
     return Candidate(
         kind="RANGE",
         side=r_dir,
         score=score,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
-        reasons=[f"range width_ratio={width_ratio:.4f} (<= {width_thr:.4f})"],
+        reasons=reasons,
+        block_reason=block_reason if is_soft_block else None,
     )
 
 
@@ -497,9 +565,9 @@ def get_trading_signal(
     반환:
         (chosen_signal, signal_source, latest_5m_ts, candles_5m, candles_5m_raw, last_price, extra)
 
-    - chosen_signal: "BUY" / "SELL"
+    - chosen_signal: "LONG" / "SHORT"
     - signal_source: "TREND" / "RANGE" / "HYBRID"
-    - extra: {"tp_pct", "sl_pct", ...}
+    - extra: {"tp_pct", "sl_pct", "signal_score", "candidate_score", "regime_level", ...}
     """
     symbol = settings.symbol
 
@@ -564,27 +632,75 @@ def get_trading_signal(
         else None
     )
 
-    # 5) 중재
+    # 5) 1차 중재 (내장 규칙)
     hys = float(getattr(settings, "arbitration_hysteresis", 0.25))
     chosen, label = _arbitrate(trend_cand, range_cand, hys)
+
+    # 5-1) 내장 중재로는 결론이 안 난 경우 → GPT 보조 중재 시도
     if not chosen:
-        rs: List[str] = []
-        if trend_cand:
-            rs.append(f"TREND({trend_cand.side}) s={trend_cand.score:.4f}")
-        if range_cand:
-            rs.append(f"RANGE({range_cand.side}) s={range_cand.score:.4f}")
-        if not rs:
-            rs = ["no-candidate"]
-        log(f"[DECIDE] no-entry (arbitration) {', '.join(rs)}")
-        log_signal(
-            event="SKIP",
-            symbol=symbol,
-            strategy_type="UNKNOWN",
-            reason="no_entry_arbitration",
-            candle_ts=latest_5m_ts,
-            extra=", ".join(rs),
-        )
-        return None
+        # 후보가 하나도 없거나 GPT 모듈이 없으면 그대로 no-entry
+        if ((trend_cand is None) and (range_cand is None)) or ask_signal_arbitration is None:
+            rs: List[str] = []
+            if trend_cand:
+                rs.append(f"TREND({trend_cand.side}) s={trend_cand.score:.4f}")
+            if range_cand:
+                rs.append(f"RANGE({range_cand.side}) s={range_cand.score:.4f}")
+            if not rs:
+                rs = ["no-candidate"]
+            log(f"[DECIDE] no-entry (arbitration) {', '.join(rs)}")
+            log_signal(
+                event="SKIP",
+                symbol=symbol,
+                strategy_type="UNKNOWN",
+                reason="no_entry_arbitration",
+                candle_ts=latest_5m_ts,
+                extra=", ".join(rs),
+            )
+            return None
+
+        # GPT에게 TREND vs RANGE 중 어느 쪽을 선택할지 한 번 더 물어본다.
+        trend_dict = _candidate_to_dict(trend_cand)
+        range_dict = _candidate_to_dict(range_cand)
+
+        gpt_action = ""
+        gpt_reason: Optional[str] = None
+
+        try:
+            gpt_res = ask_signal_arbitration(  # type: ignore[misc]
+                symbol=symbol,
+                last_price=last_price,
+                trend_candidate=trend_dict,
+                range_candidate=range_dict,
+            )
+            if isinstance(gpt_res, dict):
+                gpt_action = str(gpt_res.get("action", "")).upper()
+                raw_reason = gpt_res.get("reason")
+                gpt_reason = str(raw_reason) if isinstance(raw_reason, str) else None
+        except Exception as e:
+            log(f"[DECIDE][GPT_ARB] error: {e}")
+            gpt_res = None  # noqa: F841
+
+        if gpt_action == "ENTER_TREND" and trend_cand is not None:
+            chosen, label = trend_cand, "TREND"
+        elif gpt_action == "ENTER_RANGE" and range_cand is not None:
+            chosen, label = range_cand, "RANGE"
+        else:
+            # GPT 도 SKIP 이라고 보거나, 응답이 이상한 경우 → 최종 no-entry
+            msg = (
+                f"[DECIDE][GPT_ARB] SKIP action={gpt_action or 'NONE'} "
+                f"reason={gpt_reason or 'no_reason'}"
+            )
+            log(msg)
+            send_skip_tg(msg)
+            log_signal(
+                event="SKIP",
+                symbol=symbol,
+                strategy_type="UNKNOWN",
+                reason="no_entry_arbitration_gpt",
+                candle_ts=latest_5m_ts,
+                extra=gpt_reason or "",
+            )
+            return None
 
     # 6) HYBRID 시 TP/SL 소스 선택(점수 높은 후보 우선)
     tp_pct = chosen.tp_pct
@@ -595,8 +711,35 @@ def get_trading_signal(
         else:
             tp_pct, sl_pct = range_cand.tp_pct, range_cand.sl_pct
 
-    # 7) ATR 기반 리스크 정보 (5m 기준)
-    extra: Dict[Any, Any] = {"tp_pct": tp_pct, "sl_pct": sl_pct}
+    # 7) GPT-5 에 넘길 extra 기본값 구성
+    #   - signal_score/candidate_score: 후보 score 그대로
+    #   - regime_level: TREND=1.0, RANGE=2.0, HYBRID=1.5
+    #   - kind 별 핵심 지표: gap_ratio_15m 또는 width_ratio_5m
+    signal_strength = float(chosen.score)
+    if label == "TREND":
+        regime_level = 1.0
+    elif label == "RANGE":
+        regime_level = 2.0
+    else:  # HYBRID 등
+        regime_level = 1.5
+
+    extra: Dict[Any, Any] = {
+        "tp_pct": float(tp_pct),
+        "sl_pct": float(sl_pct),
+        "signal_score": signal_strength,
+        "candidate_score": signal_strength,
+        "regime_level": regime_level,
+        "signal_kind": chosen.kind,
+    }
+
+    if chosen.kind == "TREND":
+        # TREND: score == gap_ratio (15m EMA 갭 비율)
+        extra["gap_ratio_15m"] = signal_strength
+    elif chosen.kind == "RANGE":
+        # RANGE: score == 1 / width_ratio
+        extra["width_ratio_5m"] = 1.0 / max(signal_strength, 1e-6)
+
+    # 8) ATR 기반 리스크 정보 (5m 기준)
     if bool(getattr(settings, "use_atr", False)):
         atr_len = int(getattr(settings, "atr_len", 14))
         # indicators.calc_atr 는 (ts_ms, o, h, l, c) 튜플 리스트를 받도록 구현되어 있음.
@@ -617,10 +760,38 @@ def get_trading_signal(
                 getattr(settings, "atr_risk_reduction", 0.5)
             )
 
+    # 9) 후보 이유/블록 사유를 extra 에도 남겨서 GPT 진입 게이트에서 참고 가능하게 한다.
+    try:
+        reasons_map: Dict[str, Any] = {}
+        if trend_cand is not None:
+            reasons_map["TREND"] = list(trend_cand.reasons)
+        if range_cand is not None:
+            reasons_map["RANGE"] = list(range_cand.reasons)
+        if reasons_map:
+            extra["signal_reasons"] = reasons_map
+
+        if getattr(chosen, "block_reason", None):
+            extra["block_reason"] = chosen.block_reason
+    except Exception as e:  # pragma: no cover - 디버깅용
+        log(f"[SIGNAL] attach signal_reasons/block_reason failed: {e}")
+
     log(f"[DECIDE] {label} {chosen.side} tp={tp_pct:.4f} sl={sl_pct:.4f} last={last_price}")
+
+    # 10) 외부로는 LONG/SHORT 으로 통일해서 넘긴다.
+    if chosen.side in ("BUY", "LONG"):
+        chosen_signal = "LONG"
+    elif chosen.side in ("SELL", "SHORT"):
+        chosen_signal = "SHORT"
+    else:
+        chosen_signal = str(chosen.side).upper()  # 혹시 모를 예외값 방어
+
+    # 방향 정보도 extra 에 남겨 GPT 프롬프트에서 직접 활용 가능하게 한다.
+    extra["direction_raw"] = chosen.side
+    extra["direction_norm"] = chosen_signal
+
     return (
-        chosen.side,     # chosen_signal: "BUY" / "SELL"
-        label,           # signal_source: "TREND" / "RANGE" / "HYBRID"
+        chosen_signal,  # "LONG" / "SHORT"
+        label,          # signal_source: "TREND" / "RANGE" / "HYBRID"
         latest_5m_ts,
         candles_5m,
         candles_5m_raw,

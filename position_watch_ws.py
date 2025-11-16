@@ -1,7 +1,35 @@
 # position_watch_ws.py
 # ====================================================
 # 웹소켓으로 받은 1m/5m/15m 캔들을 기준으로 포지션을 감시해서
-# 조기익절, 조기청산, 박스→추세 전환, 반대 시그널 강제 청산을 수행하는 모듈.
+# 조기익절, 조기청산, 박스→추세 전환, 추세→박스 다운그레이드,
+# 반대 시그널 강제 청산을 수행하는 모듈.
+#
+# 2025-11-17 패치 (EXIT GPT 컨텍스트에 레짐/지표 스냅샷 추가)
+# ----------------------------------------------------
+# - ask_exit_decision_safe(...) 로 넘기는 extra(=GPT 컨텍스트)에
+#   "regime_features" 필드를 공통으로 추가했다.
+#   · 5m 웹소켓 캔들 기반으로 EMA/ATR/RSI 및 TREND/RANGE/CHOP 점수 계산
+#   · GPT 가 "지금 시장 상태"를 같이 보고 CLOSE/HOLD 를 판단할 수 있도록 함.
+# - 레짐 계산은 indicators.ema/rsi/calc_atr 를 사용하며,
+#   내부 헬퍼 _build_runtime_regime_features_for_gpt(...) 에서만 수행한다.
+#   → 레짐 계산 실패 시에는 regime_features 는 비어 있는 dict 로 들어가며,
+#      기존 동작에는 영향을 주지 않는다.
+#
+# 2025-11-16 패치 (GPT-5.1 런타임 EXIT 의사결정 + gpt_decider 연동 완료)
+# ----------------------------------------------------
+# - 이 모듈의 "조기익절/조기청산/박스↔추세 전환/반대 시그널 강제 청산"은
+#   이제 모두 gpt_decider.ask_exit_decision_safe(...) 를 통해 GPT-5.1 의사결정을 한 번 거친 뒤
+#   CLOSE/HOLD 를 결정한다.
+#   · entry_flow.py 의 진입은 이미 ask_entry_decision_safe(...) 를 사용하고 있음.
+#   · 이 파일에서는 GPT/OpenAI 를 직접 호출하지 않고, gpt_decider 모듈만 import 한다.
+# - GPT 호출이 실패하거나 예외가 발생하면,
+#   ask_exit_decision_safe(...) 가 fallback_action="CLOSE" 로 동작해서
+#   → 기존 Python 로직 그대로(조기익절/조기청산/전환/강제청산) 수행한다.
+#   (진입 쪽과 동일하게 "GPT 추가 레이어"가 실패해도 기본 리스크 가드는 유지되는 구조)
+# - GPT 는 "추가 브레이크" 역할을 한다.
+#   · Python 조건이 모두 만족해서 조기 종료 후보가 되더라도,
+#     GPT 가 action="HOLD" 를 반환하면 실제 청산/전환은 하지 않는다.
+#   · action="CLOSE" 일 때만 close_position_market(...) 을 호출한다.
 #
 # 2025-11-14 패치 (6단계: trades 테이블 연동 + 폴백 금지)
 # ----------------------------------------------------
@@ -23,51 +51,28 @@
 # C) 기존 2025-11-14 / 2025-11-13 변경사항은 그대로 유지
 #    - RANGE/TREND 업/다운그레이드, 1m 확인, volume collapse 완화 트리거 등
 #
-# 2025-11-14 패치 (이전 내용)
+# 2025-11-13 변경 사항 (요약)
 # ----------------------------------------------------
-# A) TREND→RANGE 다운그레이드(갈아타기) 로직 추가
-#    - `maybe_downgrade_trend_to_range(...)` 공개 함수 추가
-#    - 조건: settings.trend_to_range_enable 이고, RANGE 신호가 나오며,
-#            PnL이 소폭(±trend_to_range_max_abs_pnl_pct) 범위이거나
-#            소정의 최소이익(trend_to_range_min_gain_pct) 이상일 때
-#    - RANGE 전용 1m 확인 토글 반영(`enable_1m_confirm_range` → 없으면 `enable_1m_confirm`)
-#    - soft block 시 TP/SL 완화(0.7 배) 동일 적용
-#    - auto re-enter 옵션(`trend_to_range_auto_reenter`)
-#      * 가능한 경우 `trader.open_position_with_tp_sl` 사용 (없으면 스킵하고 로그/알림만)
+# - 3m REST 캔들이 아니라, WS 기반 5m/15m/1m 버퍼를 사용.
+# - 추세 판단은 strategies_trend_ws.decide_trend_15m 사용.
+# - 재시그널은 signal_flow_ws.get_trading_signal 사용.
+# - 각 단계에서 log(...) 를 통해 Render 로그로 상태 확인.
+# - 주문/TP/SL 은 exchange_api.close_position_market(...) 으로 처리.
 #
-# B) RANGE 전용 1m 확인 토글 보조 헬퍼 추가
-#    - `_is_range_1m_confirm_enabled(settings)`
-#
-# C) "동시 평가+중재"(signal_flow_ws) 출력 표준화 대응
-#    - get_trading_signal() 이 방향을 BUY/SELL 로 반환하고 소스는 "TREND"/"RANGE"/"HYBRID" 일 수 있음
-#    - 본 모듈에서 방향은 내부 비교 시 LONG/SHORT 로 정규화해 사용
-#    - 업그레이드(박스→추세) 판단 시 HYBRID 도 추세 계열로 인정
-#    - 반대 시그널 비교(opposite)도 BUY/SELL/LONG/SHORT 혼용 안전 처리
-#
-# D) 추세 조기청산/익절에서 거래량 급감+납작 구간일 때 트리거 완화
-#    - _volume_collapse + _all_candles_narrow 동시 만족 시 loss 트리거를 0.6배로 낮춰 더 기민하게 청산
-#    - 감소 비율은 settings.min_entry_volume_ratio (없으면 0.15)
-#
-# 2025-11-13 변경 사항
+# ⚠ 중요
 # ----------------------------------------------------
-# 1) 기존 코드가 3m(=settings.interval) 기준으로 캔들을 가져오던 부분을 모두 5m 기준으로 변경.
-# 2) 캔들 소스는 REST 가 아니라 `market_data_ws` 에서 웹소켓으로 수신한 버퍼를 읽는다.
-# 3) 15m 추세 확인은 `strategies_trend_ws.decide_trend_15m` 를 사용하도록 변경.
-# 4) 재시그널 확인은 `signal_flow_ws.get_trading_signal` 을 사용하도록 변경.
-# 5) Render 콘솔에서 실시간으로 5m/15m/1m 캔들이 잘 들어오는지 확인할 수 있도록 각 분기마다 log(...)를 추가했다.
-# 6) 주문/TP/SL 은 기존대로 `exchange_api.close_position_market(...)` 를 통해 REST 로 처리한다.
-#
-# 2025-11-13 추가 보정 (volume 사용)
-# ----------------------------------------------------
-# 7) market_data_ws 의 get_klines_with_volume(...) 을 사용해서 ws 캔들에 들어있는 거래량도 같이 읽는다.
-# 8) log_candle_snapshot(...) 에 실제 volume 을 넣어서 나중에 CSV 로 볼 때 “이게 거래 없는 구간이었는지”를 알 수 있게 했다.
-# 9) 추세 횡보 조기청산에서 “가격이 납작 + 거래량도 직전 평균대비 크게 줄었다”면 더 적극적으로 청산하도록 했다.
-#    - 이때 감소 비율은 settings.min_entry_volume_ratio 를 재활용한다. (없으면 0.15 로 본다)
+# - 이 파일은 "런타임 보조 EXIT 레이어" 이다.
+#   → 거래소 TP/SL, 전역 손실 한도(연속 손실, 일일 손실) 등 하드 리스크 가드는
+#     다른 모듈에서 이미 지키고 있다는 전제.
+# - GPT 의 판단(action="HOLD"/"CLOSE")도 "추가 레이어"일 뿐이고,
+#   GPT 가 죽어도 이 레이어가 fallback_action 으로 원래 동작을 그대로 수행하게 설계했다.
+# - 따라서 실서비스 시에는
+#   · gpt_decider 의 OPENAI_API_KEY, GPT_ENTRY_MODEL/GPT_EXIT_MODEL 등만 올바르게 세팅하면 된다.
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 from telelog import log, send_tg
 # ⬇️ volume 있는 버전으로 가져온다
@@ -80,6 +85,8 @@ from signal_flow_ws import get_trading_signal  # WS 기반 시그널 (동시 평
 from strategies_trend_ws import decide_trend_15m, confirm_1m_direction  # WS 기반 15m 추세 + 1m 확인
 from signals_logger import log_signal, log_candle_snapshot
 from trader import Trade
+from gpt_decider import ask_exit_decision_safe  # ✅ EXIT 쪽 GPT 의사결정은 이 함수만 사용
+from indicators import ema, rsi, calc_atr  # ✅ 레짐/지표 스냅샷 계산용
 
 # RANGE 전략 관련 (구/신 버전 모두 대응)
 try:
@@ -116,6 +123,7 @@ except Exception:  # pragma: no cover - DB 미준비 환경 방어
 # 공통 헬퍼 (방향/트렌드/볼륨 등)
 # ─────────────────────────────────────────
 
+
 def _get_15m_trend_dir(symbol: str) -> str:
     """웹소켓 버퍼에서 15m 캔들을 가져와 대략적인 방향만 문자열로 돌려준다."""
     log(f"[PW] (WS) fetch 15m for trend dir symbol={symbol}")
@@ -128,15 +136,6 @@ def _get_15m_trend_dir(symbol: str) -> str:
     except Exception as e:
         log(f"[15m DIR WS] error: {e}")
         return ""
-
-
-def _is_price_near_entry(trade: Trade, last_price: float, max_abs_pnl_pct: float) -> bool:
-    if trade.entry <= 0 or last_price <= 0:
-        return False
-    pnl_pct = (last_price - trade.entry) / trade.entry
-    if trade.side == "SELL":
-        pnl_pct = -pnl_pct
-    return abs(pnl_pct) <= max_abs_pnl_pct
 
 
 def _all_candles_narrow(candles: List[Tuple], need_bars: int, max_range_pct: float) -> bool:
@@ -196,9 +195,160 @@ def _norm_dir(d: str) -> str:
     return ""
 
 
+def _build_runtime_regime_features_for_gpt(symbol: str, settings: Any) -> Dict[str, Any]:
+    """5m 웹소켓 캔들 기반 간단 레짐/지표 스냅샷 생성.
+
+    - indicators.ema / rsi / calc_atr 로 TREND/RANGE/CHOP 점수를 계산한다.
+    - 실패 시에는 빈 dict 반환 (GPT 컨텍스트에서 무시 가능).
+    """
+    try:
+        candles_5m = ws_get_klines(symbol, "5m", 120)
+    except Exception as e:
+        log(f"[PW][REGIME_FEAT] ws_get_klines error symbol={symbol}: {e}")
+        return {}
+
+    if not candles_5m or len(candles_5m) < 30:
+        return {}
+
+    try:
+        closes = [float(c[4]) for c in candles_5m]
+        highs = [float(c[2]) for c in candles_5m]
+        lows = [float(c[3]) for c in candles_5m]
+        last_close = closes[-1]
+        if last_close <= 0:
+            return {}
+
+        # EMA 기반 트렌드 강도
+        ema_fast_len = int(getattr(settings, "ema_fast_len", 20))
+        ema_slow_len = int(getattr(settings, "ema_slow_len", 50))
+
+        ema_fast_list = ema(closes, ema_fast_len)
+        ema_slow_list = ema(closes, ema_slow_len)
+        ema_fast = float(ema_fast_list[-1])
+        ema_slow = float(ema_slow_list[-1])
+
+        ema_diff = ema_fast - ema_slow
+        ema_diff_pct = abs(ema_diff) / last_close if last_close > 0 else 0.0
+
+        # ATR 기반 변동성 (최근 atr_len+1 개)
+        atr_len = int(getattr(settings, "atr_len", 14))
+        tail = candles_5m[-max(atr_len + 1, 15):]
+        atr_input = [
+            (
+                int(c[0]),
+                float(c[1]),
+                float(c[2]),
+                float(c[3]),
+                float(c[4]),
+            )
+            for c in tail
+        ]
+        atr_val = calc_atr(atr_input, length=atr_len) or 0.0
+        atr_pct = (atr_val / last_close) if last_close > 0 else 0.0
+
+        # RSI
+        rsi_len = int(getattr(settings, "rsi_len", 14))
+        rsi_vals = rsi(closes, rsi_len)
+        last_rsi = float(rsi_vals[-1]) if rsi_vals else None
+
+        # 점수 스케일링 (signal_analysis_worker 와 동일한 휴리스틱)
+        trend_raw = min(ema_diff_pct / 0.003, 1.5)  # 0.3% → 1.0, 그 이상은 1.5까지 상한
+        trend_score = max(0.0, min(100.0, trend_raw * 100.0))
+
+        range_raw = max(0.0, (0.0025 - ema_diff_pct) / 0.0025)  # 0~1 사이
+        range_score = max(0.0, min(100.0, range_raw * 100.0))
+
+        chop_raw = max(0.0, min(1.0, atr_pct / 0.004)) * max(0.0, 1.0 - trend_raw)
+        chop_score = max(0.0, min(100.0, chop_raw * 100.0))
+
+        event_risk_score = 0.0  # 뉴스/펀딩 연계 전까지는 0
+
+        if trend_score >= 60 and trend_score >= range_score and trend_score >= chop_score:
+            final_regime = "TREND"
+        elif range_score >= 60 and range_score >= trend_score and range_score >= chop_score:
+            final_regime = "RANGE"
+        elif chop_score >= 60:
+            final_regime = "CHOP"
+        else:
+            final_regime = "NEUTRAL"
+
+        trend15_dir = _get_15m_trend_dir(symbol)
+
+        return {
+            "version": "ws_runtime_v1",
+            "symbol": symbol,
+            "timeframe": "5m",
+            "last_close": last_close,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "ema_diff_pct": ema_diff_pct,
+            "atr_pct_5m": atr_pct,
+            "last_rsi": last_rsi,
+            "trend_score": trend_score,
+            "range_score": range_score,
+            "chop_score": chop_score,
+            "event_risk_score": event_risk_score,
+            "final_regime": final_regime,
+            "trend15_dir": trend15_dir,
+        }
+    except Exception as e:
+        log(f"[PW][REGIME_FEAT] compute error symbol={symbol}: {e}")
+        return {}
+
+
+def _build_exit_context_base(
+    *,
+    trade: Trade,
+    settings: Any,
+    scenario: str,
+    last_price: float,
+    candle_ts_ms: Optional[int] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """GPT에 넘기는 공통 EXIT 컨텍스트 생성.
+
+    - trade, settings 에서 필요한 최소 정보만 요약해서 보낸다.
+    - extra 로 시나리오별 세부 지표(gain_pct, loss_pct, upgrade_thresh 등)를 합친다.
+    - 2025-11-17: 5m/websocket 기반 레짐/지표 스냅샷(regime_features)도 함께 포함.
+    """
+    ctx: Dict[str, Any] = {
+        "scenario": scenario,
+        "symbol": trade.symbol,
+        "source": getattr(trade, "source", ""),
+        "side": trade.side,
+        "entry_price": float(getattr(trade, "entry", 0.0) or 0.0),
+        "qty": float(getattr(trade, "qty", 0.0) or 0.0),
+        "last_price": float(last_price),
+        "leverage": float(getattr(settings, "leverage", 0.0) or 0.0),
+        "event_ts_ms": int(candle_ts_ms) if candle_ts_ms is not None else None,
+    }
+    entry = ctx["entry_price"]
+    if entry > 0 and last_price > 0:
+        pnl_pct = (last_price - entry) / entry
+        if trade.side == "SELL":
+            pnl_pct = -pnl_pct
+        ctx["pnl_pct"] = pnl_pct
+    else:
+        ctx["pnl_pct"] = None
+
+    if extra:
+        ctx.update(extra)
+
+    # ✅ 레짐/지표 스냅샷 추가 (실패해도 기존 동작에는 영향 없음)
+    try:
+        regime_features = _build_runtime_regime_features_for_gpt(symbol=trade.symbol, settings=settings)
+        if regime_features:
+            ctx["regime_features"] = regime_features
+    except Exception as e:  # pragma: no cover - 방어적 로그
+        log(f"[PW][REGIME_FEAT] context build error symbol={trade.symbol}: {e}")
+
+    return ctx
+
+
 # ─────────────────────────────────────────
 # DB 연동 헬퍼 (bt_trades 업데이트, 폴백 금지)
 # ─────────────────────────────────────────
+
 
 def _get_trade_db_id(trade: Trade) -> Optional[int]:
     """Trade 객체에서 ORM pk 후보를 가져온다.
@@ -231,6 +381,10 @@ def _update_trade_close_in_db(
     - SessionLocal/TradeORM 없음 → 로그만 남기고 종료
     - trade db_id/id 없음 → 로그만 남기고 종료
     - 가격/수량/타임스탬프 누락 → 로그만 남기고 종료 (추정값 사용 금지)
+
+    ⚠ GPT-5.1 연동 시에도:
+    - GPT 결정(CLOSE/HOLD)은 위에서 미리 끝내고,
+    - 실제 DB 업데이트는 이 함수만 통해 일관되게 반영한다.
     """
     if SessionLocal is None or TradeORM is None:
         log("[TRADE_DB] SessionLocal/TradeORM 없음 → trades 업데이트 생략 (no fallback)")
@@ -314,10 +468,18 @@ def _update_trade_close_in_db(
 
 
 # ─────────────────────────────────────────
-# 1) 박스 조기익절 / 조기청산 (5m 기준, volume 기록)
+# 1) 박스 조기익절 / 조기청산 (5m 기준, volume 기록 + GPT 확인)
 # ─────────────────────────────────────────
 
+
 def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
+    """RANGE 포지션에 대한 조기익절/조기청산 후보를 판단하고,
+    GPT-5.1 에게 EXIT 여부를 한 번 묻는다.
+
+    - Python 조건이 false 이면 GPT 는 아예 호출하지 않는다.
+    - Python 조건이 true 이면 ask_exit_decision_safe(...) 를 호출해서
+      action="CLOSE" 인 경우에만 실제 청산을 실행한다.
+    """
     if trade.source != "RANGE":
         return False
 
@@ -333,12 +495,12 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
         return False
 
     latest_candle = candles[-1]
-    candle_ts = latest_candle[0]
-    o = latest_candle[1]
-    h = latest_candle[2]
-    l = latest_candle[3]
-    c = latest_candle[4]
-    v = latest_candle[5] if len(latest_candle) >= 6 else 0.0
+    candle_ts = int(latest_candle[0])
+    o = float(latest_candle[1])
+    h = float(latest_candle[2])
+    l = float(latest_candle[3])
+    c = float(latest_candle[4])
+    v = float(latest_candle[5]) if len(latest_candle) >= 6 else 0.0
 
     try:
         log_candle_snapshot(
@@ -358,102 +520,137 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
         log(f"[EARLY_EXIT WS] candle snapshot log failed: {e}")
 
     last_close = c
+    entry = float(trade.entry)
+    qty = float(trade.qty)
 
-    # RANGE 조기익절
-    if getattr(settings, "range_early_tp_enabled", False):
-        early_tp_pct = getattr(settings, "range_early_tp_pct", 0.0025)
-        if trade.side == "BUY" and last_close > trade.entry:
-            gain_pct = (last_close - trade.entry) / trade.entry
-            if gain_pct >= early_tp_pct:
-                try:
-                    close_position_market(trade.symbol, trade.side, trade.qty)
-                    pnl = (last_close - trade.entry) * trade.qty
-                    send_tg(
-                        f"⚠️ (WS) 박스 조기익절 실행: {trade.symbol} {trade.side} "
-                        f"진입={trade.entry:.2f} 현재={last_close:.2f} "
-                        f"수익={(gain_pct * 100):.2f}%"
-                    )
-                    reason = "range_early_tp_runtime"
-                    log_signal(
-                        event="CLOSE",
-                        symbol=trade.symbol,
-                        strategy_type="RANGE",
-                        direction=trade.side,
-                        price=last_close,
-                        qty=trade.qty,
-                        reason=reason,
-                        pnl=pnl,
-                    )
-                    _update_trade_close_in_db(
-                        trade=trade,
-                        close_price=float(last_close),
-                        close_reason=reason,
-                        event_ts_ms=int(candle_ts),
-                        pnl=float(pnl),
-                    )
-                    return True
-                except Exception as e:
-                    log(f"[EARLY_TP WS] close failed: {e}")
-        elif trade.side == "SELL" and last_close < trade.entry:
-            gain_pct = (trade.entry - last_close) / trade.entry
-            if gain_pct >= early_tp_pct:
-                try:
-                    close_position_market(trade.symbol, trade.side, trade.qty)
-                    pnl = (trade.entry - last_close) * trade.qty
-                    send_tg(
-                        f"⚠️ (WS) 박스 조기익절 실행: {trade.symbol} {trade.side} "
-                        f"진입={trade.entry:.2f} 현재={last_close:.2f} "
-                        f"수익={(gain_pct * 100):.2f}%"
-                    )
-                    reason = "range_early_tp_runtime"
-                    log_signal(
-                        event="CLOSE",
-                        symbol=trade.symbol,
-                        strategy_type="RANGE",
-                        direction=trade.side,
-                        price=last_close,
-                        qty=trade.qty,
-                        reason=reason,
-                        pnl=pnl,
-                    )
-                    _update_trade_close_in_db(
-                        trade=trade,
-                        close_price=float(last_close),
-                        close_reason=reason,
-                        event_ts_ms=int(candle_ts),
-                        pnl=float(pnl),
-                    )
-                    return True
-                except Exception as e:
-                    log(f"[EARLY_TP WS] close failed: {e}")
+    # RANGE 조기익절 (수익권에서 아주 빨리 정리)
+    if getattr(settings, "range_early_tp_enabled", False) and entry > 0:
+        early_tp_pct = float(getattr(settings, "range_early_tp_pct", 0.0025))
+        if trade.side == "BUY" and last_close > entry:
+            gain_pct = (last_close - entry) / entry
+        elif trade.side == "SELL" and last_close < entry:
+            gain_pct = (entry - last_close) / entry
+        else:
+            gain_pct = 0.0
 
-    # RANGE 조기청산
+        if gain_pct >= early_tp_pct:
+            # ✅ GPT에 먼저 물어본다
+            ctx_extra = {
+                "check_type": "range_early_tp",
+                "gain_pct": gain_pct,
+                "threshold_pct": early_tp_pct,
+                "candle_5m": {"open": o, "high": h, "low": l, "close": last_close, "volume": v},
+            }
+            gpt_ctx = _build_exit_context_base(
+                trade=trade,
+                settings=settings,
+                scenario="RANGE_EARLY_TP",
+                last_price=last_close,
+                candle_ts_ms=candle_ts,
+                extra=ctx_extra,
+            )
+            action, _gpt_data = ask_exit_decision_safe(
+                symbol=trade.symbol,
+                source=trade.source,
+                side=trade.side,
+                scenario="RANGE_EARLY_TP",
+                last_price=last_close,
+                entry_price=entry,
+                leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+                extra=gpt_ctx,
+                fallback_action="CLOSE",
+            )
+            if action != "CLOSE":
+                log(f"[GPT_EXIT][RANGE_TP] HOLD 결정 → 조기익절 스킵 (pnl≈{gain_pct*100:.3f}%)")
+                return False
+
+            try:
+                close_position_market(trade.symbol, trade.side, qty)
+                pnl = (last_close - entry) * qty if trade.side == "BUY" else (entry - last_close) * qty
+                send_tg(
+                    f"⚠️ (WS) 박스 조기익절 실행(GPT 승인): {trade.symbol} {trade.side} "
+                    f"진입={entry:.2f} 현재={last_close:.2f} "
+                    f"수익={(gain_pct * 100):.2f}%"
+                )
+                reason = "range_early_tp_runtime"
+                log_signal(
+                    event="CLOSE",
+                    symbol=trade.symbol,
+                    strategy_type="RANGE",
+                    direction=trade.side,
+                    price=last_close,
+                    qty=qty,
+                    reason=reason,
+                    pnl=pnl,
+                )
+                _update_trade_close_in_db(
+                    trade=trade,
+                    close_price=float(last_close),
+                    close_reason=reason,
+                    event_ts_ms=int(candle_ts),
+                    pnl=float(pnl),
+                )
+                return True
+            except Exception as e:
+                log(f"[EARLY_TP WS] close failed: {e}")
+                return False
+
+    # RANGE 조기청산 (손실이 빠르게 커질 때)
     if not getattr(settings, "range_early_exit_enabled", False):
         return False
 
-    trigger_pct = getattr(settings, "range_early_exit_loss_pct", 0.003)
+    trigger_pct = float(getattr(settings, "range_early_exit_loss_pct", 0.003))
+    if entry <= 0:
+        return False
 
     if trade.side == "BUY":
-        if last_close >= trade.entry:
+        if last_close >= entry:
             return False
-        loss_pct = (trade.entry - last_close) / trade.entry
+        loss_pct = (entry - last_close) / entry
     else:
-        if last_close <= trade.entry:
+        if last_close <= entry:
             return False
-        loss_pct = (last_close - trade.entry) / trade.entry
+        loss_pct = (last_close - entry) / entry
 
     if loss_pct < trigger_pct:
         return False
 
+    # ✅ GPT에 EXIT 여부 질의
+    ctx_extra = {
+        "check_type": "range_early_exit",
+        "loss_pct": loss_pct,
+        "threshold_pct": trigger_pct,
+        "candle_5m": {"open": o, "high": h, "low": l, "close": last_close, "volume": v},
+    }
+    gpt_ctx = _build_exit_context_base(
+        trade=trade,
+        settings=settings,
+        scenario="RANGE_EARLY_EXIT",
+        last_price=last_close,
+        candle_ts_ms=candle_ts,
+        extra=ctx_extra,
+    )
+    action, _gpt_data = ask_exit_decision_safe(
+        symbol=trade.symbol,
+        source=trade.source,
+        side=trade.side,
+        scenario="RANGE_EARLY_EXIT",
+        last_price=last_close,
+        entry_price=entry,
+        leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+        extra=gpt_ctx,
+        fallback_action="CLOSE",
+    )
+    if action != "CLOSE":
+        log(f"[GPT_EXIT][RANGE_EXIT] HOLD 결정 → 조기청산 스킵 (loss≈{loss_pct*100:.3f}%)")
+        return False
+
     try:
-        close_position_market(trade.symbol, trade.side, trade.qty)
-        if trade.side == "BUY":
-            pnl = (last_close - trade.entry) * trade.qty
-        else:
-            pnl = (trade.entry - last_close) * trade.qty
+        close_position_market(trade.symbol, trade.side, qty)
+        pnl = (last_close - entry) * qty if trade.side == "BUY" else (entry - last_close) * qty
         send_tg(
-            f"⚠️ (WS) 박스 조기청산 실행: {trade.symbol} {trade.side} "
-            f"진입={trade.entry:.2f} 현재={last_close:.2f} "
+            f"⚠️ (WS) 박스 조기청산 실행(GPT 승인): {trade.symbol} {trade.side} "
+            f"진입={entry:.2f} 현재={last_close:.2f} "
             f"역행={(loss_pct * 100):.2f}%"
         )
         reason = "range_early_exit_runtime"
@@ -463,7 +660,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
             strategy_type="RANGE",
             direction=trade.side,
             price=last_close,
-            qty=trade.qty,
+            qty=qty,
             reason=reason,
             pnl=pnl,
         )
@@ -481,8 +678,9 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
 
 
 # ─────────────────────────────────────────
-# 2) 박스 → 추세 전환
+# 2) 박스 → 추세 전환 (GPT 확인 포함)
 # ─────────────────────────────────────────
+
 
 def maybe_upgrade_range_to_trend(
     trade: Trade,
@@ -490,6 +688,12 @@ def maybe_upgrade_range_to_trend(
     last_trend_close_ts: float,
     last_range_close_ts: float,
 ) -> bool:
+    """RANGE 포지션인데 시장이 TREND/HYBRID 쪽으로 강하게 기울었을 때,
+    수익권에서 정리하는 로직.
+
+    - Python 조건(동일 방향 TREND/HYBRID + 15m 동조 + 최소 수익) 만족 시
+      GPT-5.1 에게 "range_to_trend_upgrade" 시나리오로 EXIT 여부를 물어본다.
+    """
     if trade.source != "RANGE":
         return False
 
@@ -515,7 +719,7 @@ def maybe_upgrade_range_to_trend(
         candles_5m,
         _candles_5m_raw,
         last_price,
-        _extra,
+        extra,
     ) = sig_ctx
 
     # HYBRID(동일 방향)도 추세 계열로 인정
@@ -534,19 +738,22 @@ def maybe_upgrade_range_to_trend(
     if trade.side == "SELL" and trend15 != "SHORT":
         return False
 
-    upgrade_thresh = getattr(settings, "range_to_trend_min_gain_pct", 0.002)
+    entry = float(trade.entry)
+    if entry <= 0 or last_price <= 0:
+        return False
+
+    upgrade_thresh = float(getattr(settings, "range_to_trend_min_gain_pct", 0.002))
     if trade.side == "BUY":
-        if last_price <= trade.entry:
+        if last_price <= entry:
             return False
-        gain_pct = (last_price - trade.entry) / trade.entry
-        if gain_pct < upgrade_thresh:
-            return False
+        gain_pct = (last_price - entry) / entry
     else:
-        if last_price >= trade.entry:
+        if last_price >= entry:
             return False
-        gain_pct = (trade.entry - last_price) / trade.entry
-        if gain_pct < upgrade_thresh:
-            return False
+        gain_pct = (entry - last_price) / entry
+
+    if gain_pct < upgrade_thresh:
+        return False
 
     # 캔들 ts (없으면 latest_ts 사용)
     try:
@@ -554,15 +761,48 @@ def maybe_upgrade_range_to_trend(
     except Exception:
         candle_ts = int(latest_ts)
 
+    # ✅ GPT에 RANGE→TREND 업그레이드 여부 질의
+    ctx_extra = {
+        "check_type": "range_to_trend_upgrade",
+        "gain_pct": gain_pct,
+        "min_gain_pct": upgrade_thresh,
+        "trend15_dir": trend15,
+        "signal_source": new_signal_source,
+        "signal_dir": new_signal_dir,
+        "extra_from_signal": extra or {},
+    }
+    gpt_ctx = _build_exit_context_base(
+        trade=trade,
+        settings=settings,
+        scenario="RANGE_TO_TREND_UPGRADE",
+        last_price=float(last_price),
+        candle_ts_ms=candle_ts,
+        extra=ctx_extra,
+    )
+    action, _gpt_data = ask_exit_decision_safe(
+        symbol=trade.symbol,
+        source=trade.source,
+        side=trade.side,
+        scenario="RANGE_TO_TREND_UPGRADE",
+        last_price=float(last_price),
+        entry_price=entry,
+        leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+        extra=gpt_ctx,
+        fallback_action="CLOSE",
+    )
+    if action != "CLOSE":
+        log(f"[GPT_EXIT][R2T] HOLD 결정 → RANGE→TREND 업그레이드 스킵 (pnl≈{gain_pct*100:.3f}%)")
+        return False
+
     try:
         close_position_market(trade.symbol, trade.side, trade.qty)
         if trade.side == "BUY":
-            pnl = (last_price - trade.entry) * trade.qty
+            pnl = (last_price - entry) * trade.qty
         else:
-            pnl = (trade.entry - last_price) * trade.qty
+            pnl = (entry - last_price) * trade.qty
         send_tg(
-            f"⚠️ (WS) 박스→추세 전환 감지: {trade.symbol} {trade.side} 수익권에서 정리 "
-            f"(현재가={last_price:.2f}, 진입={trade.entry:.2f})"
+            f"⚠️ (WS) 박스→추세 전환 감지(GPT 승인): {trade.symbol} {trade.side} 수익권에서 정리 "
+            f"(현재가={last_price:.2f}, 진입={entry:.2f})"
         )
         reason = "range_to_trend_upgrade"
         log_signal(
@@ -589,8 +829,9 @@ def maybe_upgrade_range_to_trend(
 
 
 # ─────────────────────────────────────────
-# 2.5) 추세 → 박스 다운그레이드 (신규)
+# 2.5) 추세 → 박스 다운그레이드 (신규 + GPT 확인)
 # ─────────────────────────────────────────
+
 
 def maybe_downgrade_trend_to_range(
     trade: Trade,
@@ -606,6 +847,7 @@ def maybe_downgrade_trend_to_range(
     - RANGE 전용 1m 확인 토글을 반영
     - soft block 시 TP/SL 0.7배 완화
     - auto re-enter 옵션이 켜져 있고, 재진입 함수가 있으면 즉시 재진입
+    - EXIT 자체는 GPT-5.1 의 승인(action=CLOSE)을 받은 경우에만 수행.
     """
     if trade.source != "TREND":
         return False
@@ -628,22 +870,20 @@ def maybe_downgrade_trend_to_range(
 
     last_price = float(candles_5m[-1][4])
     candle_ts = int(candles_5m[-1][0])
-    if last_price <= 0 or trade.entry <= 0:
+    entry = float(trade.entry)
+    if last_price <= 0 or entry <= 0:
         return False
 
     # 박스 차단 판단
     blocked_now = False
     block_reason = ""
-    if 'should_block_range_today_with_level' in globals() and should_block_range_today_with_level:
+    if "should_block_range_today_with_level" in globals() and should_block_range_today_with_level:
         try:
             blocked_now, block_reason = should_block_range_today_with_level(candles_5m, candles_15m, settings)
         except Exception:
             blocked_now, block_reason = False, ""
     else:
-        try:
-            blocked_now, block_reason = False, ""
-        except Exception:
-            blocked_now, block_reason = False, ""
+        blocked_now, block_reason = False, ""
 
     if blocked_now and not str(block_reason).startswith("soft_"):
         log("[T2R] range blocked today → skip downgrade")
@@ -682,7 +922,7 @@ def maybe_downgrade_trend_to_range(
             return False
 
     # PnL 조건
-    pnl_pct = (last_price - trade.entry) / trade.entry
+    pnl_pct = (last_price - entry) / entry
     if trade.side == "SELL":
         pnl_pct = -pnl_pct
 
@@ -698,7 +938,7 @@ def maybe_downgrade_trend_to_range(
     tp_pct = float(getattr(settings, "range_tp_pct", 0.006))
     sl_pct = float(getattr(settings, "range_sl_pct", 0.004))
 
-    if 'compute_range_params' in globals() and compute_range_params:
+    if "compute_range_params" in globals() and compute_range_params:
         try:
             params = compute_range_params(r_sig, candles_5m, settings)
             tp_pct = float(params.get("tp_pct", tp_pct))
@@ -710,15 +950,49 @@ def maybe_downgrade_trend_to_range(
         tp_pct *= 0.7
         sl_pct *= 0.7
 
+    # ✅ GPT에 TREND→RANGE 다운그레이드 여부 질의
+    ctx_extra = {
+        "check_type": "trend_to_range_downgrade",
+        "pnl_pct": pnl_pct,
+        "min_gain_pct": min_gain,
+        "max_abs_pnl_pct": max_abs,
+        "r_sig": r_sig,
+        "block_reason": block_reason,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
+    }
+    gpt_ctx = _build_exit_context_base(
+        trade=trade,
+        settings=settings,
+        scenario="TREND_TO_RANGE_DOWNGRADE",
+        last_price=last_price,
+        candle_ts_ms=candle_ts,
+        extra=ctx_extra,
+    )
+    action, _gpt_data = ask_exit_decision_safe(
+        symbol=trade.symbol,
+        source=trade.source,
+        side=trade.side,
+        scenario="TREND_TO_RANGE_DOWNGRADE",
+        last_price=last_price,
+        entry_price=entry,
+        leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+        extra=gpt_ctx,
+        fallback_action="CLOSE",
+    )
+    if action != "CLOSE":
+        log(f"[GPT_EXIT][T2R] HOLD 결정 → TREND→RANGE 다운그레이드 스킵 (pnl≈{pnl_pct*100:.3f}%)")
+        return False
+
     # 기존 추세 포지션 정리
     try:
         close_position_market(symbol, trade.side, trade.qty)
         if trade.side == "BUY":
-            pnl = (last_price - trade.entry) * trade.qty
+            pnl = (last_price - entry) * trade.qty
         else:
-            pnl = (trade.entry - last_price) * trade.qty
+            pnl = (entry - last_price) * trade.qty
         send_tg(
-            f"⚠️ (WS) 추세→박스 다운그레이드: {symbol} {trade.side} 정리 후 RANGE 전환 준비 "
+            f"⚠️ (WS) 추세→박스 다운그레이드(GPT 승인): {symbol} {trade.side} 정리 후 RANGE 전환 준비 "
             f"(pnl≈{pnl_pct*100:.3f}%, last={last_price:.2f})"
         )
         reason = "trend_to_range_downgrade"
@@ -778,10 +1052,14 @@ def maybe_downgrade_trend_to_range(
 
 
 # ─────────────────────────────────────────
-# 3) 추세 포지션 조기익절 / 조기청산 (5m 기준, volume 기록)
+# 3) 추세 포지션 조기익절 / 조기청산 (5m 기준, volume 기록 + GPT 확인)
 # ─────────────────────────────────────────
 
+
 def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
+    """TREND 포지션에 대한 조기익절/조기청산 후보를 판단하고,
+    GPT-5.1 에게 EXIT 여부를 한 번 묻는다.
+    """
     if trade.source != "TREND":
         return False
 
@@ -797,12 +1075,12 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
         return False
 
     latest_candle = candles[-1]
-    candle_ts = latest_candle[0]
-    o = latest_candle[1]
-    h = latest_candle[2]
-    l = latest_candle[3]
-    c = latest_candle[4]
-    v = latest_candle[5] if len(latest_candle) >= 6 else 0.0
+    candle_ts = int(latest_candle[0])
+    o = float(latest_candle[1])
+    h = float(latest_candle[2])
+    l = float(latest_candle[3])
+    c = float(latest_candle[4])
+    v = float(latest_candle[5]) if len(latest_candle) >= 6 else 0.0
 
     try:
         log_candle_snapshot(
@@ -822,80 +1100,85 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
         log(f"[TREND_EARLY WS] candle snapshot log failed: {e}")
 
     last_close = c
+    entry = float(trade.entry)
+    qty = float(trade.qty)
 
     # 추세 조기익절
-    if getattr(settings, "trend_early_tp_enabled", False):
-        trend_early_tp_pct = getattr(settings, "trend_early_tp_pct", 0.0025)
-        if trade.side == "BUY" and last_close > trade.entry:
-            gain_pct = (last_close - trade.entry) / trade.entry
-            if gain_pct >= trend_early_tp_pct:
-                try:
-                    close_position_market(trade.symbol, trade.side, trade.qty)
-                    pnl = (last_close - trade.entry) * trade.qty
-                    send_tg(
-                        f"⚠️ (WS) 추세 조기익절 실행: {trade.symbol} {trade.side} "
-                        f"진입={trade.entry:.2f} 현재={last_close:.2f} "
-                        f"수익={(gain_pct * 100):.2f}%"
-                    )
-                    reason = "trend_early_tp_runtime"
-                    log_signal(
-                        event="CLOSE",
-                        symbol=trade.symbol,
-                        strategy_type="TREND",
-                        direction=trade.side,
-                        price=last_close,
-                        qty=trade.qty,
-                        reason=reason,
-                        pnl=pnl,
-                    )
-                    _update_trade_close_in_db(
-                        trade=trade,
-                        close_price=float(last_close),
-                        close_reason=reason,
-                        event_ts_ms=int(candle_ts),
-                        pnl=float(pnl),
-                    )
-                    return True
-                except Exception as e:
-                    log(f"[TREND_EARLY_TP WS] close failed: {e}")
-        elif trade.side == "SELL" and last_close < trade.entry:
-            gain_pct = (trade.entry - last_close) / trade.entry
-            if gain_pct >= trend_early_tp_pct:
-                try:
-                    close_position_market(trade.symbol, trade.side, trade.qty)
-                    pnl = (trade.entry - last_close) * trade.qty
-                    send_tg(
-                        f"⚠️ (WS) 추세 조기익절 실행: {trade.symbol} {trade.side} "
-                        f"진입={trade.entry:.2f} 현재={last_close:.2f} "
-                        f"수익={(gain_pct * 100):.2f}%"
-                    )
-                    reason = "trend_early_tp_runtime"
-                    log_signal(
-                        event="CLOSE",
-                        symbol=trade.symbol,
-                        strategy_type="TREND",
-                        direction=trade.side,
-                        price=last_close,
-                        qty=trade.qty,
-                        reason=reason,
-                        pnl=pnl,
-                    )
-                    _update_trade_close_in_db(
-                        trade=trade,
-                        close_price=float(last_close),
-                        close_reason=reason,
-                        event_ts_ms=int(candle_ts),
-                        pnl=float(pnl),
-                    )
-                    return True
-                except Exception as e:
-                    log(f"[TREND_EARLY_TP WS] close failed: {e}")
+    if getattr(settings, "trend_early_tp_enabled", False) and entry > 0:
+        trend_early_tp_pct = float(getattr(settings, "trend_early_tp_pct", 0.0025))
+        if trade.side == "BUY" and last_close > entry:
+            gain_pct = (last_close - entry) / entry
+        elif trade.side == "SELL" and last_close < entry:
+            gain_pct = (entry - last_close) / entry
+        else:
+            gain_pct = 0.0
+
+        if gain_pct >= trend_early_tp_pct:
+            ctx_extra = {
+                "check_type": "trend_early_tp",
+                "gain_pct": gain_pct,
+                "threshold_pct": trend_early_tp_pct,
+                "candle_5m": {"open": o, "high": h, "low": l, "close": last_close, "volume": v},
+            }
+            gpt_ctx = _build_exit_context_base(
+                trade=trade,
+                settings=settings,
+                scenario="TREND_EARLY_TP",
+                last_price=last_close,
+                candle_ts_ms=candle_ts,
+                extra=ctx_extra,
+            )
+            action, _gpt_data = ask_exit_decision_safe(
+                symbol=trade.symbol,
+                source=trade.source,
+                side=trade.side,
+                scenario="TREND_EARLY_TP",
+                last_price=last_close,
+                entry_price=entry,
+                leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+                extra=gpt_ctx,
+                fallback_action="CLOSE",
+            )
+            if action != "CLOSE":
+                log(f"[GPT_EXIT][TREND_TP] HOLD 결정 → 추세 조기익절 스킵 (pnl≈{gain_pct*100:.3f}%)")
+                return False
+
+            try:
+                close_position_market(trade.symbol, trade.side, qty)
+                pnl = (last_close - entry) * qty if trade.side == "BUY" else (entry - last_close) * qty
+                send_tg(
+                    f"⚠️ (WS) 추세 조기익절 실행(GPT 승인): {trade.symbol} {trade.side} "
+                    f"진입={entry:.2f} 현재={last_close:.2f} "
+                    f"수익={(gain_pct * 100):.2f}%"
+                )
+                reason = "trend_early_tp_runtime"
+                log_signal(
+                    event="CLOSE",
+                    symbol=trade.symbol,
+                    strategy_type="TREND",
+                    direction=trade.side,
+                    price=last_close,
+                    qty=qty,
+                    reason=reason,
+                    pnl=pnl,
+                )
+                _update_trade_close_in_db(
+                    trade=trade,
+                    close_price=float(last_close),
+                    close_reason=reason,
+                    event_ts_ms=int(candle_ts),
+                    pnl=float(pnl),
+                )
+                return True
+            except Exception as e:
+                log(f"[TREND_EARLY_TP WS] close failed: {e}")
+                return False
 
     # 추세 조기청산
     if not getattr(settings, "trend_early_exit_enabled", False):
         return False
 
-    trend_trigger_pct = getattr(settings, "trend_early_exit_loss_pct", 0.003)
+    trend_trigger_pct = float(getattr(settings, "trend_early_exit_loss_pct", 0.003))
 
     # 납작 + 거래량 급감 시 더 적극적으로: 트리거 0.6배
     eff_trig = trend_trigger_pct
@@ -908,27 +1191,60 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
     except Exception:
         pass
 
+    if entry <= 0:
+        return False
+
     if trade.side == "BUY":
-        if last_close >= trade.entry:
+        if last_close >= entry:
             return False
-        loss_pct = (trade.entry - last_close) / trade.entry
+        loss_pct = (entry - last_close) / entry
     else:
-        if last_close <= trade.entry:
+        if last_close <= entry:
             return False
-        loss_pct = (last_close - trade.entry) / trade.entry
+        loss_pct = (last_close - entry) / entry
 
     if loss_pct < eff_trig:
         return False
 
+    ctx_extra = {
+        "check_type": "trend_early_exit",
+        "loss_pct": loss_pct,
+        "trigger_pct": trend_trigger_pct,
+        "effective_trigger_pct": eff_trig,
+        "candle_5m": {"open": o, "high": h, "low": l, "close": last_close, "volume": v},
+    }
+    gpt_ctx = _build_exit_context_base(
+        trade=trade,
+        settings=settings,
+        scenario="TREND_EARLY_EXIT",
+        last_price=last_close,
+        candle_ts_ms=candle_ts,
+        extra=ctx_extra,
+    )
+    action, _gpt_data = ask_exit_decision_safe(
+        symbol=trade.symbol,
+        source=trade.source,
+        side=trade.side,
+        scenario="TREND_EARLY_EXIT",
+        last_price=last_close,
+        entry_price=entry,
+        leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+        extra=gpt_ctx,
+        fallback_action="CLOSE",
+    )
+    if action != "CLOSE":
+        log(
+            f"[GPT_EXIT][TREND_EXIT] HOLD 결정 → 추세 조기청산 스킵 "
+            f"(loss≈{loss_pct*100:.3f}%, eff_trig={eff_trig*100:.3f}%)"
+        )
+        return False
+
     try:
-        close_position_market(trade.symbol, trade.side, trade.qty)
-        if trade.side == "BUY":
-            pnl = (last_close - trade.entry) * trade.qty
-        else:
-            pnl = (trade.entry - last_close) * trade.qty
+        close_position_market(trade.symbol, trade.side, qty)
+        pnl = (last_close - entry) * qty if trade.side == "BUY" else (entry - last_close) * qty
         send_tg(
-            f"⚠️ (WS) 추세 조기청산 실행: {trade.symbol} {trade.side} "
-            f"진입={trade.entry:.2f} 현재={last_close:.2f} "
+            f"⚠️ (WS) 추세 조기청산 실행(GPT 승인): {trade.symbol} {trade.side} "
+            f"진입={entry:.2f} 현재={last_close:.2f} "
             f"역행={(loss_pct * 100):.2f}% (eff_trig={eff_trig*100:.2f}%)"
         )
         reason = "trend_early_exit_runtime"
@@ -938,7 +1254,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             strategy_type="TREND",
             direction=trade.side,
             price=last_close,
-            qty=trade.qty,
+            qty=qty,
             reason=reason,
             pnl=pnl,
         )
@@ -956,8 +1272,9 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
 
 
 # ─────────────────────────────────────────
-# 5) 반대 시그널 감지 시 강제 청산
+# 5) 반대 시그널 감지 시 강제 청산 (GPT 확인 포함)
 # ─────────────────────────────────────────
+
 
 def maybe_close_on_opposite_signal(
     trade: Trade,
@@ -965,6 +1282,12 @@ def maybe_close_on_opposite_signal(
     last_trend_close_ts: float,
     last_range_close_ts: float,
 ) -> bool:
+    """동일 심볼에서 반대 방향 TREND/RANGE/HYBRID 시그널이 나왔을 때 강제 청산하는 로직.
+
+    - TREND 포지션: TREND/HYBRID 반대 시그널일 때만 후보.
+    - RANGE 포지션: 어떤 소스든 반대 방향이면 후보.
+    - 후보가 되면 GPT-5.1 에게 "opposite_signal_close" 시나리오로 EXIT 여부를 묻는다.
+    """
     try:
         sig_ctx = get_trading_signal(
             settings=settings,
@@ -978,7 +1301,9 @@ def maybe_close_on_opposite_signal(
     if sig_ctx is None:
         return False
 
-    new_dir, new_src, ts_ms, _c5, _c5raw, last_price, _extra = sig_ctx
+    new_dir, new_src, ts_ms, candles_5m, _c5raw, last_price, extra = sig_ctx
+    entry = float(trade.entry)
+    qty = float(trade.qty)
 
     def _is_opposite(trade_side: str, sig_dir: str) -> bool:
         nd = _norm_dir(sig_dir)
@@ -988,81 +1313,95 @@ def maybe_close_on_opposite_signal(
             return True
         return False
 
-    # TREND 포지션: TREND/HYBRID 반대 시그널 시 강제 청산
+    scenario = None
+
+    # TREND 포지션: TREND/HYBRID 반대 시그널 시 강제 청산 후보
     if trade.source == "TREND" and new_src in ("TREND", "HYBRID"):
         if _is_opposite(trade.side, new_dir):
-            log(f"[OPP WS] TREND opposite detected → close {trade.symbol}")
-            try:
-                close_position_market(trade.symbol, trade.side, trade.qty)
-                if trade.side == "BUY":
-                    pnl = (last_price - trade.entry) * trade.qty
-                else:
-                    pnl = (trade.entry - last_price) * trade.qty
-                send_tg(
-                    f"⚠️ (WS) 추세 포지션 반대 TREND/HYBRID 시그널 감지 → 즉시 청산: {trade.symbol} "
-                    f"{trade.side}→{new_dir} 현재={last_price:.2f}"
-                )
-                reason = "trend_opposite_signal_close"
-                log_signal(
-                    event="CLOSE",
-                    symbol=trade.symbol,
-                    strategy_type="TREND",
-                    direction=trade.side,
-                    price=last_price,
-                    qty=trade.qty,
-                    reason=reason,
-                    pnl=pnl,
-                )
-                _update_trade_close_in_db(
-                    trade=trade,
-                    close_price=float(last_price),
-                    close_reason=reason,
-                    event_ts_ms=int(ts_ms),
-                    pnl=float(pnl),
-                )
-                return True
-            except Exception as e:
-                log(f"[OPP WS] close failed: {e}")
-                return False
+            scenario = "TREND_OPPOSITE_SIGNAL"
 
-    # RANGE 포지션: 어떤 소스든 반대 방향이면 강제 청산
+    # RANGE 포지션: 어떤 소스든 반대 방향이면 강제 청산 후보
     if trade.source == "RANGE":
         if _is_opposite(trade.side, new_dir):
-            log(f"[OPP WS] RANGE opposite detected → close {trade.symbol}")
-            try:
-                close_position_market(trade.symbol, trade.side, trade.qty)
-                if trade.side == "BUY":
-                    pnl = (last_price - trade.entry) * trade.qty
-                else:
-                    pnl = (trade.entry - last_price) * trade.qty
-                send_tg(
-                    f"⚠️ (WS) 박스 포지션 반대 시그널 감지 → 즉시 청산: {trade.symbol} "
-                    f"{trade.side}→{new_dir} 현재={last_price:.2f}"
-                )
-                reason = "range_opposite_signal_close"
-                log_signal(
-                    event="CLOSE",
-                    symbol=trade.symbol,
-                    strategy_type="RANGE",
-                    direction=trade.side,
-                    price=last_price,
-                    qty=trade.qty,
-                    reason=reason,
-                    pnl=pnl,
-                )
-                _update_trade_close_in_db(
-                    trade=trade,
-                    close_price=float(last_price),
-                    close_reason=reason,
-                    event_ts_ms=int(ts_ms),
-                    pnl=float(pnl),
-                )
-                return True
-            except Exception as e:
-                log(f"[OPP WS] close failed: {e}")
-                return False
+            scenario = "RANGE_OPPOSITE_SIGNAL"
 
-    return False
+    if not scenario:
+        return False
+
+    # ✅ GPT 에 EXIT 여부 질의
+    ctx_extra = {
+        "check_type": "opposite_signal_close",
+        "new_signal_dir": new_dir,
+        "new_signal_source": new_src,
+        "extra_from_signal": extra or {},
+    }
+    gpt_ctx = _build_exit_context_base(
+        trade=trade,
+        settings=settings,
+        scenario=scenario,
+        last_price=float(last_price),
+        candle_ts_ms=int(ts_ms),
+        extra=ctx_extra,
+    )
+    action, _gpt_data = ask_exit_decision_safe(
+        symbol=trade.symbol,
+        source=trade.source,
+        side=trade.side,
+        scenario=scenario,
+        last_price=float(last_price),
+        entry_price=entry,
+        leverage=float(getattr(settings, "leverage", 0.0) or 0.0),
+        extra=gpt_ctx,
+        fallback_action="CLOSE",
+    )
+    if action != "CLOSE":
+        log(f"[GPT_EXIT][OPP] HOLD 결정 → 반대 시그널 강제 청산 스킵 (scenario={scenario})")
+        return False
+
+    # 실제 강제 청산 실행
+    try:
+        close_position_market(trade.symbol, trade.side, qty)
+        if trade.side == "BUY":
+            pnl = (last_price - entry) * qty
+        else:
+            pnl = (entry - last_price) * qty
+
+        if trade.source == "TREND":
+            send_tg(
+                f"⚠️ (WS) 추세 포지션 반대 TREND/HYBRID 시그널 감지(GPT 승인) → 즉시 청산: {trade.symbol} "
+                f"{trade.side}→{new_dir} 현재={last_price:.2f}"
+            )
+            reason = "trend_opposite_signal_close"
+            strategy_type = "TREND"
+        else:
+            send_tg(
+                f"⚠️ (WS) 박스 포지션 반대 시그널 감지(GPT 승인) → 즉시 청산: {trade.symbol} "
+                f"{trade.side}→{new_dir} 현재={last_price:.2f}"
+            )
+            reason = "range_opposite_signal_close"
+            strategy_type = "RANGE"
+
+        log_signal(
+            event="CLOSE",
+            symbol=trade.symbol,
+            strategy_type=strategy_type,
+            direction=trade.side,
+            price=last_price,
+            qty=qty,
+            reason=reason,
+            pnl=pnl,
+        )
+        _update_trade_close_in_db(
+            trade=trade,
+            close_price=float(last_price),
+            close_reason=reason,
+            event_ts_ms=int(ts_ms),
+            pnl=float(pnl),
+        )
+        return True
+    except Exception as e:
+        log(f"[OPP WS] close failed: {e}")
+        return False
 
 
 def maybe_force_close_on_opposite_signal(
@@ -1080,7 +1419,7 @@ def maybe_force_close_on_opposite_signal(
 __all__ = [
     "maybe_early_exit_range",
     "maybe_upgrade_range_to_trend",
-    "maybe_downgrade_trend_to_range",  # 신규
+    "maybe_downgrade_trend_to_range",
     "maybe_early_exit_trend",
     "maybe_close_on_opposite_signal",
     "maybe_force_close_on_opposite_signal",

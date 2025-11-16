@@ -1,8 +1,18 @@
-"""
-signal_analysis_worker.py
-====================================================
+"""signal_analysis_worker.py
+=====================================================
 DB(bt_candles)에 쌓인 웹소켓 캔들을 주기적으로 읽어서
 지표(EMA/RSI/ATR)를 계산하고 레짐 점수(bt_regime_scores)에 저장하는 워커.
+
+[2025-11-17 패치 요약]
+----------------------------------------------------
+1) indicators.build_regime_features_from_candles(...) 를 사용해
+   동일 5m 캔들 시퀀스에 대한 레짐/지표 피처 스냅샷(regime_features)을 계산한다.
+2) RegimeScore 모델에 features_json 컬럼이 정의된 경우,
+   regime_features 전체를 JSON 으로 저장해 대시보드/리포트/GPT 컨텍스트에서
+   공용으로 사용할 수 있게 했다.
+   - features_json 컬럼이 없으면 값 저장은 건너뛰고 로그만 남긴다(폴백 없음).
+3) 기존 레짐 점수(trend/range/chop/event_risk, final_regime) 계산 로직은 유지하고,
+   워커의 동작 방식(주기/에러 처리) 역시 변경하지 않았다.
 
 [2025-11-14 변경 요약]
 ----------------------------------------------------
@@ -21,16 +31,17 @@ DB(bt_candles)에 쌓인 웹소켓 캔들을 주기적으로 읽어서
 
 from __future__ import annotations
 
+import json
 import threading
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from db_core import SessionLocal
 from db_models import Candle, RegimeScore
-from indicators import ema, rsi, calc_atr
+from indicators import ema, rsi, calc_atr, build_regime_features_from_candles
 from settings_ws import load_settings
 from telelog import log
 
@@ -77,6 +88,9 @@ def _compute_regime_from_candles(
     반환: (trend_score, range_score, chop_score, event_risk_score, final_regime)
     - 점수 범위는 0.0~100.0 기준으로 설계.
     - final_regime 은 "TREND" / "RANGE" / "CHOP" / "NEUTRAL" 중 하나.
+
+    ⚠ 레짐 피처(regime_features)는 _analyze_and_store_once() 에서
+      build_regime_features_from_candles(...) 를 통해 별도로 계산/저장한다.
     """
     if len(candles_5m) < 30:
         # 데이터가 너무 적으면 계산하지 않음
@@ -154,7 +168,7 @@ def _compute_regime_from_candles(
 
 
 def _analyze_and_store_once() -> None:
-    """최근 5m 캔들을 읽어 레짐 점수를 bt_regime_scores 에 한 번 기록."""
+    """최근 5m 캔들을 읽어 레짐 점수 및 레짐 피처를 bt_regime_scores 에 한 번 기록."""
     session = SessionLocal()
     try:
         candles_5m = _load_recent_candles(
@@ -175,7 +189,7 @@ def _analyze_and_store_once() -> None:
         trend_score, range_score, chop_score, event_risk_score, final_regime = result
         ts = candles_5m[-1].ts
 
-        # 같은 ts 에 대해 중복 INSERT 방지
+        # 동일 ts 에 대해 중복 INSERT 방지
         exists = (
             session.query(RegimeScore)
             .filter(
@@ -188,6 +202,23 @@ def _analyze_and_store_once() -> None:
         if exists:
             return
 
+        # DB 캔들을 indicators.Candle 포맷으로 변환하여 레짐 피처 계산
+        regime_features: Optional[Dict[str, object]] = None
+        try:
+            candles_for_ind = [
+                (
+                    int(c.ts.timestamp() * 1000),
+                    float(c.open),
+                    float(c.high),
+                    float(c.low),
+                    float(c.close),
+                )
+                for c in candles_5m
+            ]
+            regime_features = build_regime_features_from_candles(candles_for_ind)
+        except Exception as e:  # noqa: BLE001
+            log(f"[SIG-ANALYSIS] regime_features 계산 실패: {e}")
+
         row = RegimeScore(
             symbol=SYMBOL,
             timeframe=ANALYSIS_TF,
@@ -198,13 +229,32 @@ def _analyze_and_store_once() -> None:
             event_risk_score=event_risk_score,
             final_regime=final_regime,
         )
+
+        # RegimeScore 에 features_json 컬럼이 있을 때만 JSON 저장 시도
+        if regime_features:
+            try:
+                if hasattr(RegimeScore, "features_json"):
+                    # type: ignore[attr-defined]
+                    row.features_json = json.dumps(regime_features, ensure_ascii=False)  # noqa: E501
+            except Exception as e:  # noqa: BLE001
+                log(f"[SIG-ANALYSIS] regime_features 저장 실패: {e}")
+
         session.add(row)
         session.commit()
+
+        feat_hint = ""
+        try:
+            if regime_features and isinstance(regime_features, dict):
+                hint = regime_features.get("regime_hint")  # type: ignore[index]
+                if hint:
+                    feat_hint = f" feat={hint}"
+        except Exception:
+            feat_hint = ""
 
         log(
             f"[SIG-ANALYSIS] {SYMBOL} {ANALYSIS_TF} ts={ts.isoformat()} "
             f"trend={trend_score:.1f} range={range_score:.1f} "
-            f"chop={chop_score:.1f} regime={final_regime}"
+            f"chop={chop_score:.1f} regime={final_regime}{feat_hint}"
         )
 
     except SQLAlchemyError as e:

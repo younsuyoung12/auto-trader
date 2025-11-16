@@ -1,6 +1,17 @@
 """strategies_trend_ws.py
 웹소켓으로 받은 5m/15m/1m 캔들을 기준으로 추세장(트렌드) 신호를 판단하는 모듈.
 
+2025-11-16 보강 (GPT 컨텍스트용 요약 빌더 추가)
+----------------------------------------------------
+1) build_trend_gpt_context(...) 추가
+   - 5m/15m/1m 캔들 기반으로 EMA/RSI/박스폭/다이버전스/방향 후보 등을 한 번에 계산해서
+     GPT-5 프롬프트에 바로 넣을 수 있는 dict 형태의 컨텍스트를 생성.
+   - 이 모듈 안에서는 GPT를 직접 호출하지 않으며, 순수 수치 엔진 역할만 유지.
+   - gpt_decider.py / signal_flow_ws.py / position_watch_ws.py 등에서
+     extra["trend_ctx"] 로 실어 보내는 용도로만 사용해야 한다.
+2) decide_signal_5m_trend / decide_trend_15m / confirm_1m_direction 의 기존 동작은 그대로,
+   추가 함수만 도입해서 상위 레이어에서 GPT와의 연계를 쉽게 했다.
+
 2025-11-14 변경 요약
 ----------------------------------------------------
 1) indicators.py 분리 이후 구조 정리
@@ -38,7 +49,7 @@ C) 동작 논리 변경 없음
 from __future__ import annotations
 
 import math
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from indicators import (
     ema,
@@ -229,8 +240,259 @@ def confirm_1m_direction(candles_1m: OneMCandles, direction: str) -> bool:
     return True
 
 
+# ───────────────────────────────────────────────────────────────
+# GPT 연동용: 추세 컨텍스트 요약 빌더
+# ───────────────────────────────────────────────────────────────
+def build_trend_gpt_context(
+    candles_5m: FiveMCandles,
+    candles_15m: Optional[FifteenMCandles] = None,
+    candles_1m: Optional[OneMCandles] = None,
+    *,
+    settings: object | None = None,
+    min_ema_spread_ratio: float = 0.0005,
+    min_last_range_pct: float = 0.0005,
+) -> Dict[str, Any]:
+    """GPT 프롬프트에서 바로 쓸 수 있는 추세 관련 요약 지표를 계산해서 돌려준다.
+
+    반환 예시(dict):
+
+        {
+          "count_5m": 120,
+          "count_15m": 120,
+          "count_1m": 40,
+          "rsi_overbought": 70,
+          "rsi_oversold": 30,
+          "trend_sideways_range_pct_cfg": 0.0008,
+          "min_last_range_pct": 0.0008,
+          "min_ema_spread_ratio": 0.0005,
+
+          "ema20_5m": 94500.1,
+          "ema50_5m": 94010.3,
+          "ema_spread_ratio_5m": 0.0042,
+          "last_range_pct_5m": 0.0012,
+          "price_now_5m": 94600.5,
+          "rsi_14_5m": 62.3,
+          "sideways_flag": false,
+          "small_spread_flag": false,
+
+          "trend_5m_signal": "LONG",        # decide_signal_5m_trend 기준 최종 신호 (없으면 None)
+          "trend_5m_cross_raw": "LONG",     # EMA20/50 크로스+RSI 필터까지만 적용한 신호
+          "has_bullish_rsi_div": false,
+          "has_bearish_rsi_div": false,
+
+          "trend_15m": "LONG",
+          "ema20_15m": 94200.0,
+          "ema50_15m": 93000.0,
+          "ema_gap_ratio_15m": 0.0123,
+
+          "last_1m_open": 94580.0,
+          "last_1m_close": 94620.0,
+          "last_1m_body_dir": "UP",
+          "last_1m_supports_long": true,
+          "last_1m_supports_short": false
+        }
+
+    주의:
+    - 이 함수는 어떤 진입/청산도 결정하지 않는다.
+      → GPT 프롬프트에 넣을 "상태 설명용" 데이터만 제공한다.
+    - decide_signal_5m_trend / decide_trend_15m 의 동작은 건드리지 않는다.
+    """
+    count_5m = len(candles_5m)
+    count_15m = len(candles_15m) if candles_15m else 0
+    count_1m = len(candles_1m) if candles_1m else 0
+
+    # settings 기반 임계치 덮어쓰기 (decide_signal_5m_trend 와 동일 규칙 유지)
+    rsi_overbought = 70
+    rsi_oversold = 30
+    trend_sideways_cfg = None
+    if settings is not None:
+        try:
+            rsi_overbought = int(getattr(settings, "rsi_overbought", rsi_overbought))
+            rsi_oversold = int(getattr(settings, "rsi_oversold", rsi_oversold))
+            cfg_rng = float(getattr(settings, "trend_sideways_range_pct", min_last_range_pct))
+            trend_sideways_cfg = cfg_rng
+            min_last_range_pct = max(min_last_range_pct, cfg_rng)
+        except Exception as e:  # pragma: no cover - 방어적 처리
+            log(f"[TREND] (WS) build_trend_gpt_context settings override failed: {e}")
+
+    ctx: Dict[str, Any] = {
+        "count_5m": count_5m,
+        "count_15m": count_15m,
+        "count_1m": count_1m,
+        "rsi_overbought": rsi_overbought,
+        "rsi_oversold": rsi_oversold,
+        "trend_sideways_range_pct_cfg": trend_sideways_cfg,
+        "min_last_range_pct": min_last_range_pct,
+        "min_ema_spread_ratio": min_ema_spread_ratio,
+        # 5m 기본 값 (계산 실패 대비 None 으로 채워둔다)
+        "ema20_5m": None,
+        "ema50_5m": None,
+        "ema_spread_ratio_5m": None,
+        "last_range_pct_5m": None,
+        "price_now_5m": None,
+        "rsi_14_5m": None,
+        "sideways_flag": None,
+        "small_spread_flag": None,
+        "trend_5m_signal": None,
+        "trend_5m_cross_raw": None,
+        "has_bullish_rsi_div": None,
+        "has_bearish_rsi_div": None,
+        # 15m 기본 값
+        "trend_15m": None,
+        "ema20_15m": None,
+        "ema50_15m": None,
+        "ema_gap_ratio_15m": None,
+        # 1m 기본 값
+        "last_1m_open": None,
+        "last_1m_close": None,
+        "last_1m_body_dir": None,
+        "last_1m_supports_long": None,
+        "last_1m_supports_short": None,
+    }
+
+    # 5m 기반 상세 상태
+    if count_5m >= 60:
+        try:
+            closes_5m = [c[4] for c in candles_5m]
+            e20_5 = ema(closes_5m, 20)
+            e50_5 = ema(closes_5m, 50)
+            r14_5 = rsi(closes_5m, 14)
+
+            if not any(math.isnan(x) for x in (e20_5[-1], e20_5[-2], e50_5[-1], e50_5[-2], r14_5[-1])):
+                e20_prev, e20_now = e20_5[-2], e20_5[-1]
+                e50_prev, e50_now = e50_5[-2], e50_5[-1]
+                r_now = r14_5[-1]
+                price_now = closes_5m[-1]
+
+                last = candles_5m[-1]
+                lo = last[3]
+                hi = last[2]
+                if lo and lo > 0:
+                    last_range_pct = (hi - lo) / lo
+                else:
+                    last_range_pct = None
+
+                denom = abs(e50_now) if e50_now != 0 else 1.0
+                spread_ratio = abs(e20_now - e50_now) / denom
+
+                small_spread = spread_ratio < min_ema_spread_ratio
+                small_range = last_range_pct is not None and last_range_pct < min_last_range_pct
+
+                ctx.update(
+                    {
+                        "ema20_5m": float(e20_now),
+                        "ema50_5m": float(e50_now),
+                        "ema_spread_ratio_5m": float(spread_ratio),
+                        "last_range_pct_5m": float(last_range_pct) if last_range_pct is not None else None,
+                        "price_now_5m": float(price_now),
+                        "rsi_14_5m": float(r_now),
+                        "sideways_flag": bool(small_range) if last_range_pct is not None else None,
+                        "small_spread_flag": bool(small_spread),
+                    }
+                )
+
+                # 골든/데드크로스 + RSI 필터까지만 본 "raw" 방향
+                cross_long_raw = (e20_prev < e50_prev) and (e20_now > e50_now) and (r_now < rsi_overbought)
+                cross_short_raw = (e20_prev > e50_prev) and (e20_now < e50_now) and (r_now > rsi_oversold)
+                trend_5m_cross_raw: Optional[str] = None
+                if cross_long_raw:
+                    trend_5m_cross_raw = "LONG"
+                elif cross_short_raw:
+                    trend_5m_cross_raw = "SHORT"
+                ctx["trend_5m_cross_raw"] = trend_5m_cross_raw
+
+                # 다이버전스 플래그
+                bearish_div = has_bearish_rsi_divergence(candles_5m, r14_5)
+                bullish_div = has_bullish_rsi_divergence(candles_5m, r14_5)
+                ctx["has_bearish_rsi_div"] = bool(bearish_div)
+                ctx["has_bullish_rsi_div"] = bool(bullish_div)
+
+                # decide_signal_5m_trend 와 최대한 동일한 규칙으로 최종 신호를 계산
+                trend_sig: Optional[str] = None
+                if not (small_spread and small_range) and not small_range:
+                    long_sig = cross_long_raw
+                    short_sig = cross_short_raw
+
+                    # 가격이 50EMA 반대편에 있으면 신호 무효화
+                    if long_sig and price_now < e50_now:
+                        long_sig = False
+                    if short_sig and price_now > e50_now:
+                        short_sig = False
+
+                    if long_sig:
+                        if bearish_div:
+                            long_sig = False
+                        else:
+                            trend_sig = "LONG"
+                    elif short_sig:
+                        if bullish_div:
+                            short_sig = False
+                        else:
+                            trend_sig = "SHORT"
+
+                ctx["trend_5m_signal"] = trend_sig
+
+        except Exception as e:  # pragma: no cover - 방어적 처리
+            log(f"[TREND] (WS) build_trend_gpt_context 5m-part failed: {e}")
+
+    # 15m 기반 큰 방향/갭 비율
+    if candles_15m:
+        try:
+            closes_15 = [c[4] for c in candles_15m]
+            if len(closes_15) >= 50:
+                e20_15 = ema(closes_15, 20)
+                e50_15 = ema(closes_15, 50)
+                if not (math.isnan(e20_15[-1]) or math.isnan(e50_15[-1])):
+                    e20_now_15 = e20_15[-1]
+                    e50_now_15 = e50_15[-1]
+                    denom15 = abs(e50_now_15) if e50_now_15 != 0 else 1.0
+                    gap_ratio_15 = abs(e20_now_15 - e50_now_15) / denom15
+
+                    trend_15 = None
+                    if e20_now_15 > e50_now_15:
+                        trend_15 = "LONG"
+                    elif e20_now_15 < e50_now_15:
+                        trend_15 = "SHORT"
+
+                    ctx.update(
+                        {
+                            "trend_15m": trend_15,
+                            "ema20_15m": float(e20_now_15),
+                            "ema50_15m": float(e50_now_15),
+                            "ema_gap_ratio_15m": float(gap_ratio_15),
+                        }
+                    )
+        except Exception as e:  # pragma: no cover - 방어적 처리
+            log(f"[TREND] (WS) build_trend_gpt_context 15m-part failed: {e}")
+
+    # 1m 마지막 캔들 방향 요약
+    if candles_1m:
+        try:
+            _ts, o1, _h1, _l1, c1 = candles_1m[-1]
+            body_dir = "FLAT"
+            if c1 > o1:
+                body_dir = "UP"
+            elif c1 < o1:
+                body_dir = "DOWN"
+
+            ctx.update(
+                {
+                    "last_1m_open": float(o1),
+                    "last_1m_close": float(c1),
+                    "last_1m_body_dir": body_dir,
+                    "last_1m_supports_long": bool(c1 >= o1),
+                    "last_1m_supports_short": bool(c1 <= o1),
+                }
+            )
+        except Exception as e:  # pragma: no cover - 방어적 처리
+            log(f"[TREND] (WS) build_trend_gpt_context 1m-part failed: {e}")
+
+    return ctx
+
+
 __all__ = [
     "decide_signal_5m_trend",
     "decide_trend_15m",
     "confirm_1m_direction",
+    "build_trend_gpt_context",
 ]

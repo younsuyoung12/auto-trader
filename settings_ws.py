@@ -3,6 +3,23 @@ settings_ws.py
 ====================================================
 웹소켓으로 1m / 5m / 15m 캔들을 받아서 쓰는 구조에 맞춰 정리한 설정 모듈.
 
+▶ 2025-11-17 패치 (GPT-5 진입 게이트 쿨다운/상한 설정)
+----------------------------------------------------
+J) GPT 진입 관련 쿨다운/상한 ENV 추가
+   - gpt_error_sleep_sec: GPT 오류 발생 시 루프 대기 시간(sec)
+       · ENV: GPT_ERROR_SLEEP_SEC (기본 5.0)
+   - gpt_skip_sleep_sec: GPT가 SKIP/비정상 응답을 준 후 대기 시간(sec)
+       · ENV: GPT_SKIP_SLEEP_SEC (기본 3.0)
+   - gpt_max_risk_pct: GPT가 제안하는 effective_risk_pct 상한
+       · ENV: GPT_MAX_RISK_PCT (기본 0.03 = 3%)
+   - gpt_max_tp_pct: GPT가 제안하는 tp_pct 상한
+       · ENV: GPT_MAX_TP_PCT (기본 0.10 = 10%)
+   - gpt_max_sl_pct: GPT가 제안하는 sl_pct 상한
+       · ENV: GPT_MAX_SL_PCT (기본 0.05 = 5%)
+   - post_entry_sleep_sec: 진입 성공 후 짧은 쿨다운 시간
+       · ENV: POST_ENTRY_SLEEP_SEC (기본 5.0)
+   ※ entry_flow.try_open_new_position(...) 에서 getattr(...) 으로 읽어 사용한다.
+
 ▶ 2025-11-15 패치 (WS 로우데이터 로그 옵션 + RANGE 기본값 조정)
 ----------------------------------------------------
 H) WS 로우데이터/페이로드 로그 토글 추가
@@ -224,6 +241,14 @@ class BotSettings:
     atr_risk_high_mult: float = 1.5
     atr_risk_reduction: float = 0.5
 
+    # GPT 진입 게이트 설정 (entry_flow.py 에서 사용)
+    gpt_error_sleep_sec: float = 5.0      # GPT 오류 시 루프 대기(sec)
+    gpt_skip_sleep_sec: float = 3.0       # GPT SKIP/비정상 응답 후 대기(sec)
+    gpt_max_risk_pct: float = 0.03        # GPT 제안 리스크 상한 (3%)
+    gpt_max_tp_pct: float = 0.10          # GPT 제안 TP 상한 (10%)
+    gpt_max_sl_pct: float = 0.05          # GPT 제안 SL 상한 (5%)
+    post_entry_sleep_sec: float = 5.0     # 진입 성공 후 짧은 쿨다운(sec)
+
     # 진입 거래량 가드 (ENV 훅)
     min_entry_volume_ratio: float = 0.3  # 기본 0.30
 
@@ -433,6 +458,13 @@ def load_settings() -> BotSettings:
         min_sl_pct=_as_float(os.getenv("MIN_SL_PCT", "0.005"), 0.005),
         atr_risk_high_mult=_as_float(os.getenv("ATR_RISK_HIGH_MULT", "1.5"), 1.5),
         atr_risk_reduction=_as_float(os.getenv("ATR_RISK_REDUCTION", "0.5"), 0.5),
+        # GPT 진입 게이트/상한
+        gpt_error_sleep_sec=_as_float(os.getenv("GPT_ERROR_SLEEP_SEC", "5.0"), 5.0),
+        gpt_skip_sleep_sec=_as_float(os.getenv("GPT_SKIP_SLEEP_SEC", "3.0"), 3.0),
+        gpt_max_risk_pct=_as_float(os.getenv("GPT_MAX_RISK_PCT", "0.03"), 0.03),
+        gpt_max_tp_pct=_as_float(os.getenv("GPT_MAX_TP_PCT", "0.10"), 0.10),
+        gpt_max_sl_pct=_as_float(os.getenv("GPT_MAX_SL_PCT", "0.05"), 0.05),
+        post_entry_sleep_sec=_as_float(os.getenv("POST_ENTRY_SLEEP_SEC", "5.0"), 5.0),
         # 진입 거래량 가드 (신규 ENV 훅)
         min_entry_volume_ratio=_as_float(os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.3"), 0.3),
         # 쿨다운/폴링

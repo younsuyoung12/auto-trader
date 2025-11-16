@@ -2,6 +2,16 @@
 strategies_range_ws.py
 웹소켓으로 받은 5m/15m 캔들을 기준으로 박스장(레인지) 전략을 판단하는 모듈.
 
+2025-11-16 GPT 컨텍스트 확장
+----------------------------------------------------
+1) build_range_gpt_context(...) 추가
+   - decide_signal_range / should_block_range_today_with_level 와 동일한 로직을 재사용해
+     박스 폭(box_pct), 상·하단 경계, ATR 압축 여부, 15m EMA 이격 등 핵심 지표를 한 번에
+     계산해서 dict 로 반환.
+   - entry_flow_ws.py / position_watch_ws.py / gpt_decider.py 에서 이 dict 를 그대로
+     extra 필드에 싣고 GPT-5.1 프롬프트에 포함할 수 있다.
+   - 실제 GPT 호출은 여전히 gpt_decider.py 에서만 수행하고, 이 모듈은 순수 수치 엔진으로 유지.
+
 2025-11-14 보강
 ----------------------------------------------------
 1) signal_flow_ws 동시 중재(arbitration) 플로우와 인터페이스 정리.
@@ -44,7 +54,7 @@ strategies_range_ws.py
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple, Dict, TYPE_CHECKING
+from typing import List, Optional, Tuple, Dict, TYPE_CHECKING, Any
 
 from indicators import ema, calc_atr, Candle
 from telelog import log
@@ -59,6 +69,7 @@ Candles = List[Candle]
 # ─────────────────────────────
 # 내부 유틸: 캔들 정제
 # ─────────────────────────────
+
 def _clean_candles(candles: Candles) -> Candles:
     """(ts, o, h, l, c[, v]) 형태가 아닌 값/결측을 배제하고 반환한다.
 
@@ -83,6 +94,7 @@ def _clean_candles(candles: Candles) -> Candles:
 # ─────────────────────────────
 # 기본 박스장 신호 (5m 기준)
 # ─────────────────────────────
+
 def decide_signal_range(
     candles_5m: Candles,
     lookback: int = 40,
@@ -151,6 +163,7 @@ def decide_signal_range(
 # ─────────────────────────────
 # 박스장 TP/SL 계산 보조
 # ─────────────────────────────
+
 def compute_range_params(
     direction: str,
     candles_5m: Candles,
@@ -206,7 +219,9 @@ def compute_range_params(
         # soft 허용이면 좀 더 보수적으로 (tp ≤ tp_min * soft_factor)
         if soft_reason:
             tp_min = float(getattr(settings, "range_tp_min", 0.0035)) if settings else 0.0035
-            soft_factor = float(getattr(settings, "range_soft_tp_factor", 1.2)) if settings else 1.2
+            soft_factor = (
+                float(getattr(settings, "range_soft_tp_factor", 1.2)) if settings else 1.2
+            )
             base_tp = min(base_tp, tp_min * soft_factor)
 
     # 숏일 때 SL 하한을 TP의 ratio 로 보정해, 너무 가까운 SL 을 방지
@@ -221,6 +236,7 @@ def compute_range_params(
 # ─────────────────────────────
 # 박스장 자체를 오늘은 막을지 판단 (5m/15m)
 # ─────────────────────────────
+
 def should_block_range_today(
     candles_5m: Candles,
     candles_15m: Candles,
@@ -270,6 +286,7 @@ def should_block_range_today(
 # ─────────────────────────────
 # 박스장 차단을 단계적으로 할 수 있는 버전 (5m/15m)
 # ─────────────────────────────
+
 def should_block_range_today_with_level(
     candles_5m: Candles,
     candles_15m: Candles,
@@ -371,9 +388,173 @@ def should_block_range_today_with_level(
     return False, ""
 
 
+# ─────────────────────────────
+# GPT-5.1 프롬프트용 RANGE 컨텍스트 빌더
+# ─────────────────────────────
+
+def build_range_gpt_context(
+    direction: Optional[str],
+    candles_5m: Candles,
+    candles_15m: Candles,
+    settings: Optional["BotSettings"] = None,
+    block_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """GPT-5.1 에 넘길 수 있도록 RANGE 환경을 요약한 dict 를 만든다.
+
+    사용 예 (entry_flow_ws 또는 position_watch_ws 쪽):
+
+        from strategies_range_ws import build_range_gpt_context
+
+        range_ctx = build_range_gpt_context(
+            direction=signal_dir,        # "LONG" / "SHORT" / None
+            candles_5m=candles_5m,
+            candles_15m=candles_15m,
+            settings=settings,
+            block_reason=soft_or_hard_reason,
+        )
+
+        # gpt_decider.ask_entry_decision_safe(..., extra={"range_ctx": range_ctx, ...})
+
+    반환 필드(예시):
+        {
+          "direction": "LONG" / "SHORT" / None,
+          "count_5m": 120,
+          "count_15m": 120,
+          "box_pct": 0.0021,
+          "box_min_pct": 0.0015,
+          "box_valid": true,
+          "now_price": 94500.0,
+          "lo": 94000.0,
+          "hi": 94800.0,
+          "upper_line": ...,  # 상단 진입선
+          "lower_line": ...,  # 하단 진입선
+          "atr_fast": ..., "atr_slow": ...,
+          "atr_fast_ratio_limit": 0.6,
+          "atr_block": false,
+          "ema_dist": 0.0042,
+          "ema_dist_thresh": 0.01,
+          "ema_block": false,
+          "range_strict_level": 1,
+          "block_reason": "soft_atr" / "atr" / "" 등
+        }
+
+    이 함수는 GPT 를 직접 호출하지 않고, 순수하게 컨텍스트만 만들어 준다.
+    실제 GPT 호출은 gpt_decider.py 에서 담당한다.
+    """
+
+    ctx: Dict[str, Any] = {}
+
+    # 방향 정규화
+    if direction is None:
+        norm_dir: Optional[str] = None
+    else:
+        d = direction.upper()
+        if d == "BUY":
+            norm_dir = "LONG"
+        elif d == "SELL":
+            norm_dir = "SHORT"
+        else:
+            norm_dir = d
+    ctx["direction"] = norm_dir
+
+    # 캔들 정제 및 개수
+    c5 = _clean_candles(candles_5m)
+    c15 = _clean_candles(candles_15m)
+    ctx["count_5m"] = len(c5)
+    ctx["count_15m"] = len(c15)
+
+    # 기본값 초기화 (캔들이 부족해도 키는 유지)
+    ctx.update(
+        {
+            "box_pct": None,
+            "box_min_pct": None,
+            "box_valid": False,
+            "now_price": None,
+            "lo": None,
+            "hi": None,
+            "upper_line": None,
+            "lower_line": None,
+            "atr_fast": None,
+            "atr_slow": None,
+            "atr_fast_ratio_limit": None,
+            "atr_block": False,
+            "ema_dist": None,
+            "ema_dist_thresh": None,
+            "ema_block": False,
+            "range_strict_level": int(getattr(settings, "range_strict_level", 0)) if settings else 0,
+            "block_reason": block_reason or "",
+        }
+    )
+
+    # 박스 구조 계산 (decide_signal_range 와 동일한 로직을 요약 형태로 재사용)
+    if len(c5) >= 10:  # lookback 보다 조금 느슨한 최소 개수
+        hi = max(float(c[2]) for c in c5[-40:])  # 40개 기준 박스 (부족하면 Python 이 알아서 슬라이스)
+        lo = min(float(c[3]) for c in c5[-40:])
+        now_price = float(c5[-1][4])
+
+        if lo > 0 and not math.isnan(now_price):
+            box_h = hi - lo
+            box_pct = box_h / lo if lo > 0 else 0.0
+            box_min_pct = (
+                float(getattr(settings, "range_box_min_width_pct", 0.0015)) if settings else 0.0015
+            )
+
+            up_pct = float(getattr(settings, "range_entry_upper_pct", 0.80)) if settings else 0.80
+            lo_pct = float(getattr(settings, "range_entry_lower_pct", 0.20)) if settings else 0.20
+            up_pct = max(0.5, min(0.99, up_pct))
+            lo_pct = max(0.01, min(0.5, lo_pct))
+
+            upper_line = lo + box_h * up_pct
+            lower_line = lo + box_h * lo_pct
+
+            ctx["box_pct"] = box_pct
+            ctx["box_min_pct"] = box_min_pct
+            ctx["box_valid"] = bool(box_pct is not None and box_pct >= box_min_pct)
+            ctx["now_price"] = now_price
+            ctx["lo"] = lo
+            ctx["hi"] = hi
+            ctx["upper_line"] = upper_line
+            ctx["lower_line"] = lower_line
+
+    # ATR/EMA 구조 계산 (should_block_range_today_with_level 와 동일한 기준 요약)
+    atr_fast_ratio_limit = (
+        float(getattr(settings, "range_atr_fast_ratio_limit", 0.6)) if settings else 0.6
+    )
+    ema_dist_thresh = float(getattr(settings, "range_ema_dist_thresh", 0.01)) if settings else 0.01
+    ctx["atr_fast_ratio_limit"] = atr_fast_ratio_limit
+    ctx["ema_dist_thresh"] = ema_dist_thresh
+
+    atr_fast = calc_atr(c5, 14) if c5 else None
+    atr_slow = calc_atr(c5, 40) if c5 else None
+    atr_block = False
+    if atr_fast and atr_slow and atr_slow > 0:
+        if atr_fast < atr_slow * atr_fast_ratio_limit:
+            atr_block = True
+    ctx["atr_fast"] = atr_fast
+    ctx["atr_slow"] = atr_slow
+    ctx["atr_block"] = atr_block
+
+    ema_block = False
+    ema_dist_val: Optional[float] = None
+    if c15:
+        closes_15 = [float(c[4]) for c in c15]
+        if len(closes_15) >= 50:
+            e20_15 = ema(closes_15, 20)
+            e50_15 = ema(closes_15, 50)
+            if not math.isnan(e20_15[-1]) and not math.isnan(e50_15[-1]) and e50_15[-1] != 0:
+                ema_dist_val = abs(e20_15[-1] - e50_15[-1]) / e50_15[-1]
+                if ema_dist_val > ema_dist_thresh:
+                    ema_block = True
+    ctx["ema_dist"] = ema_dist_val
+    ctx["ema_block"] = ema_block
+
+    return ctx
+
+
 __all__ = [
     "decide_signal_range",
     "should_block_range_today",
     "compute_range_params",
     "should_block_range_today_with_level",
+    "build_range_gpt_context",
 ]

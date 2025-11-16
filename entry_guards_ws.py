@@ -1,49 +1,3 @@
-
-"""
-# entry_guards_ws.py
-
-웹소켓으로 받은 캔들/호가를 기준으로 진입 직전에 거는 각종 가드 모듈.
-run_bot.py → 이 모듈의 함수를 순서대로 호출해서
-"이 캔들은 건너뛰자"를 결정한다.
-
-2025-11-14 추가/보강 사항 (이번 패치)
-----------------------------------------------------
-D) 오더북 신선도(지연) 가드 추가
-   - market_data_ws 가 depth에 붙여 둔 ts(밀리초)로 현재시각과의 차이를 계산
-   - settings: max_orderbook_age_ms (기본 3000ms)
-   - 너무 오래된 오더북이면 진입 스킵 → 체결 위험(슬리피지/미체결) 완화
-
-E) 비정상 BBO 가드 추가
-   - bestBid >= bestAsk (크로스 상태)이거나 둘 중 하나라도 0/None 이면 스킵
-   - 로그/텔레그램 사유: "bbo_crossed_or_invalid"
-
-F) 최상위 호가 명목가(quote notional) 최소치 가드 추가
-   - 상단 1레벨 bid/ask 각각 price*qty 를 계산
-   - settings: min_bbo_notional_usdt (기본 0 → 비활성). 값이 >0 이면, 
-     bid/ask 어느 한쪽이라도 이 값을 밑돌면 스킵 (유동성 얕은 구간 회피)
-
-G) 스프레드 절대값(달러) 임계치 옵션 추가 (퍼센트와 병행)
-   - settings: max_spread_abs (USDT, 기본 0 → 비활성)
-   - 퍼센트 임계(base_spread * session_mult) 또는 절대 임계 중 하나라도 초과하면 스킵
-
-H) 오더북 기반 가드들에 보조 메트릭 로깅 강화
-   - log_signal.extra 에 ob_age_ms / spread_abs / spread_pct / top_bid_notional /
-     top_ask_notional 등을 남겨 디버깅 용이
-
-기존 2025-11-14 추가 사항 (요약)
-----------------------------------------------------
-A) depth 5호가 한쪽 쏠림 감지 스킵 (depth_imbalance_*)
-B) mark/last vs mid 괴리 스킵 (price_deviation_*)
-C) 세션별 스프레드/점프 허용치 배수 적용 (session_*_mult)
-
-2025-11-13 변경 사항 (요약)
-----------------------------------------------------
-1) 3m → 5m 기준으로 전환
-2) REST 대신 WS depth 버퍼 우선
-3) 각 가드 log(...) 보강
-4) 주문/TP/SL 은 REST 전제 유지
-"""
-
 from __future__ import annotations
 
 import datetime
@@ -129,25 +83,34 @@ def check_volume_guard(
     signal_source: str,
     direction: str,
 ) -> bool:
-    log(f"[GUARD] (WS) volume len={len(candles_5m_raw)} symbol={settings.symbol}")
+    sym = getattr(settings, "symbol", "UNKNOWN")
+    log(f"[GUARD] (WS) volume len={len(candles_5m_raw)} symbol={sym}")
     min_vol_ratio = float(getattr(settings, "min_entry_volume_ratio", 0.3))
     try:
         last_vol = float(candles_5m_raw[-1][5])
         vols_20 = [float(c[5]) for c in candles_5m_raw[-20:]]
-        avg_vol_20 = sum(vols_20) / len(vols_20)
+        avg_vol_20 = sum(vols_20) / len(vols_20) if vols_20 else 0.0
     except Exception:
         return True
 
-    if avg_vol_20 > 0 and last_vol < avg_vol_20 * min_vol_ratio:
+    if avg_vol_20 <= 0:
+        return True
+
+    ratio = last_vol / avg_vol_20
+
+    if ratio < min_vol_ratio:
         send_skip_tg("[SKIP] volume_too_low_for_entry")
         log_signal(
             event="SKIP",
-            symbol=settings.symbol,
+            symbol=sym,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
             reason="volume_too_low_for_entry",
             candle_ts=latest_ts,
-            extra=f"last_vol={last_vol}, avg_vol_20={avg_vol_20}, ratio={min_vol_ratio}",
+            extra=(
+                f"last_vol={last_vol}, avg_vol_20={avg_vol_20}, "
+                f"ratio={ratio:.4f}, threshold={min_vol_ratio:.4f}"
+            ),
         )
         return False
     return True
@@ -164,7 +127,8 @@ def check_price_jump_guard(
     signal_source: str,
     direction: str,
 ) -> bool:
-    log(f"[GUARD] (WS) price_jump len={len(candles_5m)} symbol={settings.symbol}")
+    sym = getattr(settings, "symbol", "UNKNOWN")
+    log(f"[GUARD] (WS) price_jump len={len(candles_5m)} symbol={sym}")
     if len(candles_5m) < 2:
         return True
 
@@ -188,7 +152,7 @@ def check_price_jump_guard(
         )
         log_signal(
             event="SKIP",
-            symbol=settings.symbol,
+            symbol=sym,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
             reason="price_jump_guard",
@@ -209,7 +173,7 @@ def check_price_jump_guard(
         )
         log_signal(
             event="SKIP",
-            symbol=settings.symbol,
+            symbol=sym,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
             reason="candle_volatility_guard",
@@ -336,7 +300,7 @@ def check_spread_guard(
         send_skip_tg("[SKIP] orderbook_stale")
         log_signal(
             event="SKIP",
-            symbol=settings.symbol,
+            symbol=symbol,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
             reason="orderbook_stale",
@@ -353,8 +317,16 @@ def check_spread_guard(
     try:
         best_bid = float(bids[0][0] if isinstance(bids[0], list) else bids[0].get("price"))
         best_ask = float(asks[0][0] if isinstance(asks[0], list) else asks[0].get("price"))
-        bid_qty = float(bids[0][1] if isinstance(bids[0], list) else bids[0].get("qty") or bids[0].get("quantity") or bids[0].get("size") or 0.0)
-        ask_qty = float(asks[0][1] if isinstance(asks[0], list) else asks[0].get("qty") or asks[0].get("quantity") or asks[0].get("size") or 0.0)
+        bid_qty = float(
+            bids[0][1]
+            if isinstance(bids[0], list)
+            else bids[0].get("qty") or bids[0].get("quantity") or bids[0].get("size") or 0.0
+        )
+        ask_qty = float(
+            asks[0][1]
+            if isinstance(asks[0], list)
+            else asks[0].get("qty") or asks[0].get("quantity") or asks[0].get("size") or 0.0
+        )
     except Exception as e:
         log(f"[SPREAD PARSE ERROR] {e}")
         return True, None, None
@@ -375,9 +347,10 @@ def check_spread_guard(
 
     # F) 최상위 호가 명목가 최소치 가드 (옵션)
     min_bbo_notional = float(getattr(settings, "min_bbo_notional_usdt", 0.0))
+    top_bid_notional = best_bid * bid_qty
+    top_ask_notional = best_ask * ask_qty
+
     if min_bbo_notional > 0:
-        top_bid_notional = best_bid * bid_qty
-        top_ask_notional = best_ask * ask_qty
         if top_bid_notional < min_bbo_notional or top_ask_notional < min_bbo_notional:
             send_skip_tg("[SKIP] bbo_notional_too_small")
             log_signal(
@@ -387,12 +360,12 @@ def check_spread_guard(
                 direction=direction,
                 reason="bbo_notional_too_small",
                 candle_ts=latest_ts,
-                extra=f"bid_notional={top_bid_notional:.2f}, ask_notional={top_ask_notional:.2f}, min={min_bbo_notional}",
+                extra=(
+                    f"bid_notional={top_bid_notional:.2f}, "
+                    f"ask_notional={top_ask_notional:.2f}, min={min_bbo_notional}"
+                ),
             )
             return False, best_bid, best_ask
-    else:
-        top_bid_notional = best_bid * bid_qty
-        top_ask_notional = best_ask * ask_qty
 
     spread_mult, _ = _get_session_multipliers(settings)
     base_spread = float(getattr(settings, "max_spread_pct", 0.0008))
@@ -407,7 +380,10 @@ def check_spread_guard(
     too_wide_by_abs = max_spread_abs > 0 and spread_abs > max_spread_abs
     if too_wide_by_pct or too_wide_by_abs:
         send_skip_tg(
-            f"[SKIP] spread_guard: pct={spread_pct:.5f} (limit={max_spread_pct:.5f}), abs={spread_abs:.2f}{' (limit='+str(max_spread_abs)+')' if max_spread_abs>0 else ''}"
+            "[SKIP] spread_guard: "
+            f"pct={spread_pct:.5f} (limit={max_spread_pct:.5f}), "
+            f"abs={spread_abs:.2f}"
+            f"{' (limit='+str(max_spread_abs)+')' if max_spread_abs > 0 else ''}"
         )
         log_signal(
             event="SKIP",
@@ -417,7 +393,12 @@ def check_spread_guard(
             reason="spread_guard",
             candle_ts=latest_ts,
             spread_pct=spread_pct,
-            extra=f"ob_age_ms={ob_age_ms}, spread_abs={spread_abs:.2f}, sess_mult={spread_mult}, top_bid_notional={top_bid_notional:.2f}, top_ask_notional={top_ask_notional:.2f}",
+            extra=(
+                f"ob_age_ms={ob_age_ms}, spread_abs={spread_abs:.2f}, "
+                f"sess_mult={spread_mult}, "
+                f"top_bid_notional={top_bid_notional:.2f}, "
+                f"top_ask_notional={top_ask_notional:.2f}"
+            ),
         )
         return False, best_bid, best_ask
 

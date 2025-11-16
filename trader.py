@@ -1,5 +1,7 @@
 """
-수정 내용 (2025-11-13~2025-11-14)
+#trader.py
+
+수정 내용 (2025-11-13~2025-11-16)
 1) _to_contract_qty(...) 에서 0 으로 떨어지는 소수 수량을 최소 step(0.001)으로 보정
 2) 슬리피지 가드/TP·SL 예약 실패 시 close_position_market(...) 에 항상 '열었던 방향(side_open)'을 넘기도록 통일
 3) 체결 정보 파싱 시 executedQty, quantity, order.orderId 등 BingX 다양한 응답 케이스 보강
@@ -11,6 +13,9 @@
 6) (2025-11-14) check_closes(...) 에서 summarize_fills 예외를 잡고 로그만 남기도록 방어
    - fill 요약을 못 가져온 경우에도 봇이 죽지 않도록 하고,
      이후 단계(포지션/주문 히스토리 DB 동기화)는 summary 유효성 검사 후에만 실행.
+7) (2025-11-16) open_position_with_tp_sl(...) 시그니처 하위호환 확장
+   - side_open / side 두 키워드 모두 허용해 'unexpected keyword side' 예외 방지
+   - settings / entry_price_hint 를 선택 인자로 바꿔, 미전달 시 슬리피지/TP·SL 보정만 생략
 """
 
 from __future__ import annotations
@@ -128,11 +133,12 @@ def compute_tp_sl_prices(
 
 def open_position_with_tp_sl(
     *,
-    settings: Any,
+    settings: Any = None,
     symbol: str,
-    side_open: str,
+    side_open: Optional[str] = None,
+    side: Optional[str] = None,
     qty: float,
-    entry_price_hint: float,
+    entry_price_hint: float = 0.0,
     tp_pct: float,
     sl_pct: float,
     source: str = "UNKNOWN",
@@ -143,7 +149,19 @@ def open_position_with_tp_sl(
 
     - 체결 수량/가격은 반드시 BingX 응답에서 가져오고, 없으면 진입 실패(폴백 금지).
     - 슬리피지 가드/TP·SL 예약 실패 시에는 '열었던 방향(side_open)' 기준으로 청산 시도.
+    - side_open / side 두 키워드를 모두 허용 (하위호환).
+    - settings / entry_price_hint 미전달 시 슬리피지/마진 기반 보정은 생략.
     """
+
+    # 하위호환: side_open 이 없고 side 가 들어온 경우 보정
+    if side_open is None and side is not None:
+        side_open = side
+
+    if not side_open:
+        msg = "[ENTRY] ⚠️ side_open/side 가 지정되지 않아 포지션을 열 수 없습니다."
+        log(msg)
+        send_tg(msg)
+        return None
 
     # 1) 시장가 진입 (수량은 거래소 최소단위로 라운딩)
     try:
@@ -218,7 +236,7 @@ def open_position_with_tp_sl(
         return None
 
     # 3) 슬리피지 가드 (신호 시점의 entry_price_hint 대비)
-    max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0)
+    max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0) if settings is not None else 0.0
     if max_slip_pct and entry_price_hint and entry_price_hint > 0:
         slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
         if slip_pct > max_slip_pct:
@@ -245,7 +263,7 @@ def open_position_with_tp_sl(
             return None
 
     # 3.5) TP/SL 퍼센트 보정
-    if getattr(settings, "use_margin_based_tp_sl", False):
+    if settings is not None and getattr(settings, "use_margin_based_tp_sl", False):
         lev = getattr(settings, "leverage", 1) or 1
         fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
         fut_sl_margin_pct = getattr(settings, "fut_sl_margin_pct", 0.0)
@@ -254,20 +272,26 @@ def open_position_with_tp_sl(
         tp_pct = max(tp_pct, m_tp)
         sl_pct = max(sl_pct, m_sl)
 
-    min_tp_pct = getattr(settings, "min_tp_pct", 0.0)
-    min_sl_pct = getattr(settings, "min_sl_pct", 0.0)
+    min_tp_pct = getattr(settings, "min_tp_pct", 0.0) if settings is not None else 0.0
+    min_sl_pct = getattr(settings, "min_sl_pct", 0.0) if settings is not None else 0.0
     if min_tp_pct > 0:
         tp_pct = max(tp_pct, min_tp_pct)
     if min_sl_pct > 0:
         sl_pct = max(sl_pct, min_sl_pct)
 
     if soft_mode:
-        tp_min = getattr(settings, "range_tp_min", tp_pct)
-        soft_factor = getattr(settings, "range_soft_tp_factor", 1.0)
+        if settings is not None:
+            tp_min = getattr(settings, "range_tp_min", tp_pct)
+            soft_factor = getattr(settings, "range_soft_tp_factor", 1.0)
+        else:
+            tp_min = tp_pct
+            soft_factor = 1.0
         tp_soft_cap = tp_min * soft_factor
         tp_pct = min(tp_pct, tp_soft_cap)
 
-    eff_sl_floor_ratio = sl_floor_ratio or getattr(settings, "range_short_sl_floor_ratio", 0.0)
+    eff_sl_floor_ratio = sl_floor_ratio
+    if eff_sl_floor_ratio is None:
+        eff_sl_floor_ratio = getattr(settings, "range_short_sl_floor_ratio", 0.0) if settings is not None else 0.0
     if side_open == "SELL" and eff_sl_floor_ratio > 0 and tp_pct > 0:
         min_short_sl = tp_pct * eff_sl_floor_ratio
         if sl_pct < min_short_sl:
