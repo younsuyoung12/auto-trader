@@ -1,4 +1,31 @@
 # signals_logger.py
+# ====================================================
+# 시그널/진입/청산/스킵/에러/GPT 이벤트 및 캔들 스냅샷을 CSV로 기록하는 모듈.
+#
+# 2025-11-17 변경 사항 (이벤트/포지션/GPT/에러 전용 CSV 추가)
+# ----------------------------------------------------
+# 1) logs/events/events-YYYY-MM-DD.csv 추가
+#    - 필드: ts, ts_iso, event_type, symbol, regime, source, side, price,
+#            qty, leverage, tp_pct, sl_pct, risk_pct, pnl_pct, reason, extra_json
+#    - log_event() 를 공통 엔트리로 두고, 다음 편의 함수 제공:
+#        · log_entry_event()
+#        · log_exit_event()
+#        · log_regime_switch_event()
+#        · log_gpt_entry_event()
+#        · log_gpt_exit_event()
+#        · log_skip_event()  (별칭 log_skip)
+#        · log_error_event()
+#    - 나중에 분석할 때 "왜 진입 안 했는지 / 언제 얼마에 진입·청산했는지 /
+#      TREND↔RANGE 전환 / GPT 판단"을 한 파일에서 조회 가능.
+#
+# 2) 기존 signals / candles CSV 는 그대로 유지
+#    - log_signal(): 전략/가드/진입/청산 이벤트를 분석용으로 기록
+#    - log_candle_snapshot(): 캔들(1m/5m/15m 등) 스냅샷 기록
+#
+# 3) KST 기준으로 signals / candles / events 세 종류 모두 헤더 자동 생성
+#    - 모듈 로드시 오늘자 signals-YYYY-MM-DD.csv, candles-YYYY-MM-DD.csv,
+#      events-YYYY-MM-DD.csv 가 없으면 헤더만 있는 빈 파일을 만들어 둔다.
+#    - 자정(KST) 이후에도 각 로그 함수가 호출될 때 자동으로 새 파일 생성.
 """
 시그널/진입/청산/스킵 이벤트를 CSV로 기록하는 모듈.
 
@@ -44,8 +71,9 @@ from __future__ import annotations
 
 import csv
 import os
+import json
 import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 # ─────────────────────────────────────────────
 # 경로 설정
@@ -54,22 +82,28 @@ from typing import Optional, List
 BASE_DIR = os.path.join("logs", "signals")
 # 시세(차트) 스냅샷이 쌓일 기본 폴더
 CANDLE_DIR = os.path.join("logs", "candles")
+# 이벤트(ENTRY/EXIT/GPT/ERROR 등) 로그가 쌓일 기본 폴더
+EVENTS_DIR = os.path.join("logs", "events")
 
 
 # ─────────────────────────────────────────────
 # 공통 유틸
 # ─────────────────────────────────────────────
+def _now_kst() -> datetime.datetime:
+    """현재 시간을 KST timezone 기준 datetime 으로 반환."""
+    now_utc = datetime.datetime.utcnow()
+    return now_utc + datetime.timedelta(hours=9)
+
+
 def _now_kst_str() -> str:
     """현재 시간을 KST로 YYYY-MM-DD HH:MM:SS 문자열로 리턴."""
-    now_utc = datetime.datetime.utcnow()
-    kst = now_utc + datetime.timedelta(hours=9)
+    kst = _now_kst()
     return kst.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _today_kst_str() -> str:
     """오늘 날짜를 KST 기준 YYYY-MM-DD 로 리턴."""
-    now_utc = datetime.datetime.utcnow()
-    kst = now_utc + datetime.timedelta(hours=9)
+    kst = _now_kst()
     return kst.strftime("%Y-%m-%d")
 
 
@@ -90,10 +124,7 @@ def _csv_path_for(day_str: str) -> str:
 
 
 def _fieldnames() -> List[str]:
-    """
-    시그널 CSV에서 공통으로 쓸 헤더 정의.
-    여기서 컬럼을 추가하면 _ensure_today_csv(), log_signal() 둘 다 반영된다.
-    """
+    """시그널 CSV에서 공통으로 쓸 헤더 정의."""
     return [
         "ts_kst",
         "event",
@@ -129,14 +160,12 @@ def _fieldnames() -> List[str]:
 
 
 def _ensure_today_csv() -> str:
-    """
-    오늘(KST) 날짜의 시그널 CSV가 없으면 헤더만 있는 빈 파일을 만들어둔다.
-    - run_bot 이 켜지는 순간 바로 오늘자 파일이 생기게 하기 위함.
-    """
+    """오늘(KST) 날짜의 시그널 CSV가 없으면 헤더만 있는 빈 파일을 만든다."""
     day = _today_kst_str()
     path = _csv_path_for(day)
     fields = _fieldnames()
     if not os.path.exists(path):
+        _ensure_dir(BASE_DIR)
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -148,10 +177,7 @@ _ensure_today_csv()
 
 
 def _get_csv_path() -> str:
-    """
-    오늘 날짜 기준 시그널 CSV 파일 경로를 돌려준다.
-    이때 파일이 없으면 헤더만 있는 새 파일을 만든다.
-    """
+    """오늘 날짜 기준 시그널 CSV 파일 경로를 돌려준다."""
     return _ensure_today_csv()
 
 
@@ -173,8 +199,8 @@ def log_signal(
     exchange_order_id: Optional[str] = None,  # 거래소 주문 ID
     step: Optional[str] = None,           # "before_order" / "after_order" / "guard" ...
     # ---- 분석용 추가 필드 ----
-    candle_ts: Optional[int] = None,      # 이 시그널이 나온 3m 캔들 시간(ms)
-    signal_price: Optional[float] = None, # 시그널이 나온 캔들의 종가(실제 시장상황)
+    candle_ts: Optional[int] = None,      # 이 시그널이 나온 캔들 시간(ms)
+    signal_price: Optional[float] = None, # 시그널이 나온 캔들의 종가
     rsi_3m: Optional[float] = None,
     trend_15m: Optional[str] = None,      # "UP" / "DOWN" / None
     atr_fast: Optional[float] = None,
@@ -190,11 +216,7 @@ def log_signal(
     used_tp_pct: Optional[float] = None,      # 실제 사용한 박스 TP (%)
     used_sl_pct: Optional[float] = None,      # 실제 사용한 박스 SL (%)
 ) -> None:
-    """
-    한 줄을 시그널 CSV에 쓴다.
-    파일이 없으면 헤더를 먼저 쓴다.
-    (자정 이후에도 신규 파일이 자동으로 생기게 _get_csv_path()가 알아서 처리)
-    """
+    """한 줄을 시그널 CSV에 쓴다."""
     path = _get_csv_path()
     file_exists = os.path.exists(path)
 
@@ -237,8 +259,6 @@ def log_signal(
 
     with open(path, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
-        # _ensure_today_csv()에서 이미 헤더를 써놨으면 file_exists는 True지만,
-        # 자정 지나 새 파일이 생긴 경우에는 여기서도 헤더를 한 번 더 써준다.
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
@@ -259,7 +279,7 @@ def _candle_fieldnames() -> List[str]:
     return [
         "ts_kst",        # 기록 시각(KST)
         "symbol",        # BTC-USDT
-        "tf",            # 3m, 15m ...
+        "tf",            # 1m, 5m, 15m ...
         "candle_ts",     # 이 캔들의 원래 타임스탬프(ms 또는 sec)
         "open",
         "high",
@@ -273,21 +293,19 @@ def _candle_fieldnames() -> List[str]:
 
 
 def _ensure_today_candle_csv() -> str:
-    """
-    오늘(KST) 날짜의 시세 스냅샷 CSV가 없으면 헤더만 있는 빈 파일을 만든다.
-    signals와 동일한 패턴.
-    """
+    """오늘(KST) 날짜의 시세 스냅샷 CSV가 없으면 헤더만 있는 빈 파일 생성."""
     day = _today_kst_str()
     path = _candle_csv_path_for(day)
     fields = _candle_fieldnames()
     if not os.path.exists(path):
+        _ensure_dir(CANDLE_DIR)
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
     return path
 
 
-# 필요하면 모듈 로드시점에 만들어둬도 된다.
+# 필요하면 모듈 로드시점에 만들어둔다.
 _ensure_today_candle_csv()
 
 
@@ -305,10 +323,7 @@ def log_candle_snapshot(
     direction: Optional[str] = "",
     extra: Optional[str] = "",
 ) -> None:
-    """
-    시세(캔들) 스냅샷 한 줄을 별도 CSV에 남긴다.
-    run_bot.py 에서 신호를 실제로 평가했을 때, 또는 조기 익절/청산 체크할 때 호출하면 된다.
-    """
+    """시세(캔들) 스냅샷 한 줄을 별도 CSV에 남긴다."""
     path = _ensure_today_candle_csv()
     file_exists = os.path.exists(path)
 
@@ -334,3 +349,306 @@ def log_candle_snapshot(
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+# ─────────────────────────────────────────────
+# 2025-11-17 추가: 이벤트(ENTRY/EXIT/GPT/ERROR 등) CSV
+# ─────────────────────────────────────────────
+def _events_csv_path_for(day_str: str) -> str:
+    """주어진 날짜(KST)용 이벤트 CSV 전체 경로를 돌려준다."""
+    _ensure_dir(EVENTS_DIR)
+    fname = f"events-{day_str}.csv"
+    return os.path.join(EVENTS_DIR, fname)
+
+
+def _event_fieldnames() -> List[str]:
+    """이벤트 CSV 헤더 정의."""
+    return [
+        "ts",           # float timestamp (KST 기준)
+        "ts_iso",       # ISO 포맷 문자열
+        "event_type",   # SIGNAL / SKIP / ENTRY / EXIT / REGIME_SWITCH / GPT_ENTRY / GPT_EXIT / ERROR ...
+        "symbol",
+        "regime",       # TREND / RANGE / HYBRID 등
+        "source",       # 호출 위치, 시나리오 이름 등
+        "side",         # LONG / SHORT / BUY / SELL
+        "price",        # 관련 가격 (진입/청산/체크 가격)
+        "qty",          # 수량
+        "leverage",     # 레버리지
+        "tp_pct",       # 당시 TP 비율
+        "sl_pct",       # 당시 SL 비율
+        "risk_pct",     # effective_risk_pct
+        "pnl_pct",      # 청산 시 손익
+        "reason",       # 한 줄 요약
+        "extra_json",   # JSON 문자열(dict/list)
+    ]
+
+
+def _ensure_today_events_csv() -> str:
+    """오늘(KST) 날짜의 이벤트 CSV가 없으면 헤더만 있는 빈 파일을 만든다."""
+    day = _today_kst_str()
+    path = _events_csv_path_for(day)
+    fields = _event_fieldnames()
+    if not os.path.exists(path):
+        _ensure_dir(EVENTS_DIR)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+    return path
+
+
+# 모듈 로드시 오늘자 이벤트 파일도 한 번 만들어 둔다.
+_ensure_today_events_csv()
+
+
+def _default_event_row(event_type: str) -> Dict[str, Any]:
+    """공통 이벤트 row 기본값 생성."""
+    now = _now_kst()
+    ts = now.timestamp()
+    return {
+        "ts": ts,
+        "ts_iso": now.isoformat(),
+        "event_type": event_type,
+        "symbol": "",
+        "regime": "",
+        "source": "",
+        "side": "",
+        "price": "",
+        "qty": "",
+        "leverage": "",
+        "tp_pct": "",
+        "sl_pct": "",
+        "risk_pct": "",
+        "pnl_pct": "",
+        "reason": "",
+        "extra_json": "",
+    }
+
+
+def log_event(event_type: str, **kwargs: Any) -> None:
+    """이벤트 CSV에 한 줄을 기록한다.
+
+    event_type 예시:
+      - "SIGNAL", "SKIP", "ENTRY", "EXIT", "REGIME_SWITCH",
+        "GPT_ENTRY", "GPT_EXIT", "ERROR" 등
+
+    kwargs 필드는 _event_fieldnames() 에 정의된 키를 사용.
+      · extra 또는 extra_json 으로 dict/list 를 넘기면 JSON 문자열로 저장.
+    """
+    path = _ensure_today_events_csv()
+    file_exists = os.path.exists(path)
+
+    row = _default_event_row(event_type)
+
+    # 기본 필드 매핑
+    for key, val in kwargs.items():
+        if key in row and key != "extra_json":
+            row[key] = val
+
+    # extra / extra_json 처리
+    extra_val: Any = None
+    if "extra_json" in kwargs:
+        extra_val = kwargs["extra_json"]
+    elif "extra" in kwargs:
+        extra_val = kwargs["extra"]
+
+    if isinstance(extra_val, (dict, list)):
+        row["extra_json"] = json.dumps(extra_val, ensure_ascii=False)
+    elif isinstance(extra_val, str):
+        row["extra_json"] = extra_val
+
+    fieldnames = _event_fieldnames()
+
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+# ─────────────────────────────────────────────
+# 이벤트 전용 편의 함수들
+# ─────────────────────────────────────────────
+
+def log_entry_event(
+    *,
+    symbol: str,
+    regime: str,
+    side: str,
+    price: float,
+    qty: float,
+    leverage: float,
+    tp_pct: float,
+    sl_pct: float,
+    risk_pct: float,
+    reason: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """실제 진입(주문 체결) 이벤트 기록."""
+    log_event(
+        "ENTRY",
+        symbol=symbol,
+        regime=regime,
+        side=side,
+        price=price,
+        qty=qty,
+        leverage=leverage,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        risk_pct=risk_pct,
+        reason=reason,
+        extra_json=extra or {},
+    )
+
+
+def log_exit_event(
+    *,
+    symbol: str,
+    regime: str,
+    side: str,
+    price: float,
+    qty: float,
+    leverage: float,
+    pnl_pct: float,
+    scenario: str,
+    reason: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """포지션 청산(일반 TP/SL, 조기청산 등) 이벤트 기록."""
+    log_event(
+        "EXIT",
+        symbol=symbol,
+        regime=regime,
+        side=side,
+        price=price,
+        qty=qty,
+        leverage=leverage,
+        pnl_pct=pnl_pct,
+        source=scenario,
+        reason=reason,
+        extra_json=extra or {},
+    )
+
+
+def log_regime_switch_event(
+    *,
+    symbol: str,
+    from_regime: str,
+    to_regime: str,
+    side: str,
+    price: float,
+    reason: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """RANGE ↔ TREND 등 레짐 전환 시 기록."""
+    log_event(
+        "REGIME_SWITCH",
+        symbol=symbol,
+        regime=f"{from_regime}->{to_regime}",
+        side=side,
+        price=price,
+        reason=reason,
+        extra_json=extra or {},
+    )
+
+
+def log_gpt_entry_event(
+    *,
+    symbol: str,
+    regime: str,
+    side: str,
+    action: str,
+    tp_pct: float,
+    sl_pct: float,
+    risk_pct: float,
+    gpt_json: Dict[str, Any],
+) -> None:
+    """GPT 진입 판단 결과 기록."""
+    log_event(
+        "GPT_ENTRY",
+        symbol=symbol,
+        regime=regime,
+        side=side,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        risk_pct=risk_pct,
+        reason=f"GPT action={action}",
+        extra_json=gpt_json,
+    )
+
+
+def log_gpt_exit_event(
+    *,
+    symbol: str,
+    side: str,
+    action: str,
+    scenario: str,
+    pnl_pct: Optional[float],
+    gpt_json: Dict[str, Any],
+) -> None:
+    """GPT 청산 판단 결과 기록."""
+    log_event(
+        "GPT_EXIT",
+        symbol=symbol,
+        side=side,
+        pnl_pct=pnl_pct if pnl_pct is not None else "",
+        source=scenario,
+        reason=f"GPT action={action}",
+        extra_json=gpt_json,
+    )
+
+
+def log_skip_event(
+    *,
+    symbol: str,
+    regime: str,
+    source: str,
+    side: Optional[str],
+    reason: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """가드/조건/GPT 등으로 인해 진입을 스킵한 경우 이벤트 기록."""
+    log_event(
+        "SKIP",
+        symbol=symbol,
+        regime=regime,
+        source=source,
+        side=side or "",
+        reason=reason,
+        extra_json=extra or {},
+    )
+
+
+# 기존 설계에서 log_skip 이름을 기대할 수 있으므로 별칭 제공
+log_skip = log_skip_event
+
+
+def log_error_event(
+    *,
+    where: str,
+    message: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    """예외/에러 상황 기록."""
+    log_event(
+        "ERROR",
+        source=where,
+        reason=message,
+        extra_json=extra or {},
+    )
+
+
+__all__ = [
+    # 시그널/캔들용
+    "log_signal",
+    "log_candle_snapshot",
+    # 이벤트용
+    "log_event",
+    "log_entry_event",
+    "log_exit_event",
+    "log_regime_switch_event",
+    "log_gpt_entry_event",
+    "log_gpt_exit_event",
+    "log_skip_event",
+    "log_skip",
+    "log_error_event",
+]
