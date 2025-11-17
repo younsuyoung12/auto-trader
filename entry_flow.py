@@ -1,5 +1,5 @@
 """
-entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT + EntryScore 0-100/TG/Preview + SKIP 사유 TG + GPT-5 진입 게이트 - gpt_decider 연동 버전)
+entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT + EntryScore 0-100/TG/Preview + SKIP 사유 TG + GPT-5 진입 게이트 - gpt_trader 연동 버전)
 =====================================================
 역할
 ----------------------------------------------------
@@ -8,20 +8,21 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
 - 웹소켓 기반 시그널(signal_flow_ws.get_trading_signal)을 사용하며,
   TREND/RANGE 동시 평가 + 중재(Arbitration) 결과를 그대로 받아서 처리한다.
 
-2025-11-17 변경 사항 (GPT 장애 시 신규 진입 하드 스톱 + 텔레그램 알림 + 이벤트 CSV 연동)
+2025-11-17 변경 사항 (GPT 장애 시 신규 진입 하드 스톱 + 텔레그램 알림 + 이벤트 CSV 연동 + gpt_trader 연동)
 ----------------------------------------------------
 1) GPT 엔트리 하드 스톱 플래그 추가
    - 모듈 전역 변수 GPT_ENTRY_HARD_DOWN / GPT_ENTRY_HARD_DOWN_NOTIFIED 를 도입.
-   - GPT 호출 예외 발생 시 GPT_ENTRY_HARD_DOWN=True 로 세팅하여 이후 모든 신규 진입을 전면 차단.
+   - GPT 관련 오류가 하드 상태로 확인되면 GPT_ENTRY_HARD_DOWN=True 로 세팅하여 이후 모든 신규 진입을 전면 차단.
 2) try_open_new_position(...) 진입부에서 하드 스톱 플래그를 체크.
    - GPT_ENTRY_HARD_DOWN 이 True 인 상태에서는 시그널/가드/잔고 확인을 수행하지 않고 즉시 SKIP.
    - gpt_error_sleep_sec 만큼 대기 후 (None, sleep_sec) 반환.
 3) 첫 하드 스톱 발생 시 텔레그램 알림 전송.
-   - GPT 호출 예외가 처음 발생하는 시점에 [GPT_ENTRY][HARD_STOP] 메시지를 한 번만 전송.
+   - GPT 장애가 처음 감지되는 시점에 [GPT_ENTRY][HARD_STOP] 메시지를 한 번만 전송.
    - 이후에는 로그/skip 사유만 남기고 추가 알림은 보내지 않는다(스팸 방지).
-4) 기존 GPT 예외 처리 로직 수정.
-   - 종전: GPT 예외 시 해당 시그널만 SKIP.
-   - 변경: GPT 예외 시 하드 스톱 플래그를 세우고, 이후 모든 신규 진입을 막도록 변경.
+4) GPT 예외/호출 실패 처리 로직 수정.
+   - gpt_trader.decide_entry_with_gpt_trader(...) 결과에서
+     · gpt_action == "ERROR" 이고 raw 가 비어 있으면 → GPT 호출 실패로 간주, 하드 스톱 진입.
+     · 그 외의 SKIP 은 단순 GPT 판단에 의한 스킵으로 처리하고 하드 스톱은 걸지 않음.
 5) EntryScore.components_json 에 GPT·시그널 메타 정보 추가.
    - gpt_entry.signal 에 extra["direction_raw"], extra["direction_norm"], extra["regime_level"] 를 함께 저장.
    - signal_extra 블록으로 signal_flow_ws.extra 의 핵심 지표/사유를 별도로 남겨 사후 분석에 활용 가능.
@@ -29,12 +30,19 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
    - GPT 승인 시 log_gpt_entry_event(...) 호출.
    - GPT 거절(SKIP) 및 각종 가드/잔고/수량/주문 실패 SKIP 경로에서 log_skip_event(...) 호출.
    - GPT 장애 및 하드 스톱 상태에서도 log_skip_event(...) 로 events-YYYY-MM-DD.csv 에 기록.
+7) gpt_trader 연동으로 GPT 프롬프트 컨텍스트 강화.
+   - entry_flow 에서 직접 gpt_decider.ask_entry_decision(...) 를 호출하지 않고,
+     gpt_trader.decide_entry_with_gpt_trader(...) 를 통해 GPT 호출/리스크 클램핑/가드 조정까지 일괄 처리.
+   - guard_snapshot(min_entry_volume_ratio, max_spread_pct, max_price_jump_pct, depth_imbalance_min_*)와
+     최근 PnL/skip_streak 이 GPT 프롬프트에 함께 전달되어 장 흐름/가드 상태를 보고 리스크를 조정할 수 있게 함.
+   - gpt_trader 가 돌려준 guard_adjustments 는 settings 의 해당 필드를 한 루프 동안만 override 해서
+     거래량/스프레드/점프 가드에 1회성으로 반영한다.
 
 2025-11-16 변경 사항 (GPT-5 진입 게이트 + gpt_decider.py 일원화)
 ----------------------------------------------------
 1) GPT-5 모델을 사용한 NEW_ENTRY_CANDIDATE 의사결정 레이어를 gpt_decider.py 로 분리.
-   - 이 파일(entry_flow.py)에서는 더 이상 openai 를 직접 import / 호출하지 않는다.
-   - GPT 호출은 gpt_decider.ask_entry_decision(...) 한 곳에서만 수행.
+   - 이 파일(entry_flow.py)에서는 openai 를 직접 import / 호출하지 않는다.
+   - GPT 호출은 gpt_decider.ask_entry_decision(...) 한 곳에서만 수행. (현재는 gpt_trader 에서 래핑 호출)
 2) GPT 응답이 없거나 예외 발생 시 진입 완전 차단(폴백 없음).
    - gpt_decider.ask_entry_decision(...) 예외 → [GPT_ENTRY][SKIP] 텔레그램 전송 후 해당 시그널은 스킵.
    - 기존 "safe" 폴백(그냥 ENTER) 전략은 사용하지 않음.
@@ -48,7 +56,6 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
    - model 값은 환경변수 GPT_ENTRY_MODEL (없으면 "gpt-5.1")을 사용해 로그/메타에 남긴다.
 6) trader.open_position_with_tp_sl(...) 시그니처 변경분 반영.
    - settings / entry_price_hint / source / soft_mode / sl_floor_ratio 를 넘기도록 수정.
-   - Arbitration extra 에서 넘어오는 soft_mode / sl_floor_ratio 값을 그대로 open_position_with_tp_sl(...) 에 전달.
 7) GPT 관련 settings 키와 쿨다운/상한값 정리.
    - gpt_error_sleep_sec, gpt_skip_sleep_sec: GPT 오류/거절 시 대기 시간(sec) 설정.
    - gpt_max_risk_pct, gpt_max_tp_pct, gpt_max_sl_pct: GPT 제안 리스크/TP/SL 상한.
@@ -145,7 +152,7 @@ from signals_logger import (
     log_gpt_entry_event,
     log_skip_event,
 )
-from gpt_decider import ask_entry_decision
+from gpt_trader import decide_entry_with_gpt_trader
 
 # DB 세션/모델 (있으면 사용, 없으면 조용히 패스)
 try:
@@ -698,7 +705,7 @@ def try_open_new_position(
     # GPT 메타 정보 (로그/EntryScore components 에 기록용)
     gpt_model_for_log = os.getenv("GPT_ENTRY_MODEL", DEFAULT_GPT_ENTRY_MODEL)
     gpt_decision: Dict[str, Any] = {}
-    gpt_action = ""
+    gpt_action: str = ""
     gpt_reason: Optional[str] = None
 
     # (1) 시그널 받기 (WS + arbitration 버전)
@@ -764,8 +771,7 @@ def try_open_new_position(
 
     regime_label = _infer_regime_from_signal(signal_source)
 
-    # (2) 진입 전 가드 실행 순서
-    # 2-1) 수동/외부 가드(강제 OFF, 휴식 등)
+    # (2) 진입 전 가드: 수동/외부 가드 (GPT 이전에 항상 체크)
     manual_ok = check_manual_position_guard(
         get_balance_detail_func=get_balance_detail,
         symbol=symbol,
@@ -783,70 +789,7 @@ def try_open_new_position(
         )
         return None, 2.0
 
-    # 2-2) 거래량 가드
-    #      - WS 1m 캔들이 있으면 그걸로 돌리고,
-    #      - 없으면 시그널이 준 5m raw 를 그대로 넘겨준다.
-    vol_source = ws_candles_1m if ws_candles_1m else candles_5m_raw
-    vol_ok = check_volume_guard(
-        settings=settings,
-        candles_5m_raw=vol_source,
-        latest_ts=latest_ts,
-        signal_source=signal_source,
-        direction=chosen_signal,
-    )
-    if not vol_ok:
-        send_skip_tg("[SKIP] volume_guard: volume_too_low_for_entry")
-        log_skip_event(
-            symbol=symbol,
-            regime=regime_label,
-            source="entry_flow.guard.volume",
-            side=chosen_signal,
-            reason="volume_too_low_for_entry",
-            extra={"latest_ts": int(latest_ts)},
-        )
-        return None, 1.0
-
-    # 2-3) 직전/현재 5m 기준 가격 점프·갭 가드
-    price_ok = check_price_jump_guard(
-        settings=settings,
-        candles_5m=candles_5m,
-        latest_ts=latest_ts,
-        signal_source=signal_source,
-        direction=chosen_signal,
-    )
-    if not price_ok:
-        send_skip_tg("[SKIP] price_jump_guard: recent_price_jump_or_gap")
-        log_skip_event(
-            symbol=symbol,
-            regime=regime_label,
-            source="entry_flow.guard.price_jump",
-            side=chosen_signal,
-            reason="price_jump_guard_recent_price_jump_or_gap",
-            extra={"latest_ts": int(latest_ts)},
-        )
-        return None, 1.0
-
-    # 2-4) 호가 스프레드/쏠림 가드 (WS depth5 활용)
-    spread_ok, best_bid, best_ask = check_spread_guard(
-        settings=settings,
-        symbol=symbol,
-        latest_ts=latest_ts,
-        signal_source=signal_source,
-        direction=chosen_signal,
-    )
-    if not spread_ok:
-        send_skip_tg("[SKIP] spread_guard: depth_imbalance_or_spread_too_wide")
-        log_skip_event(
-            symbol=symbol,
-            regime=regime_label,
-            source="entry_flow.guard.spread",
-            side=chosen_signal,
-            reason="depth_imbalance_or_spread_too_wide",
-            extra={"latest_ts": int(latest_ts), "best_bid": best_bid, "best_ask": best_ask},
-        )
-        return None, 1.0
-
-    # (3) 잔고 확인
+    # (3) 잔고 확인 (GPT 호출 전에 0잔고는 바로 컷)
     avail = get_available_usdt()
     if avail <= 0:
         send_tg("[BALANCE_SKIP] 가용 선물 잔고 0 → 진입 안함")
@@ -868,7 +811,7 @@ def try_open_new_position(
         )
         return None, 5.0
 
-    # (4) 주문 관련 파라미터 계산 (리스크/레버리지/TP·SL)
+    # (4) 주문 관련 파라미터 계산 (리스크/레버리지/TP·SL 기본값)
     # settings 에 값이 없으면 안전한 기본값으로.
     leverage = float(getattr(settings, "leverage", 10.0))
     risk_pct = float(getattr(settings, "risk_pct", 0.01))  # 1% 기본
@@ -897,45 +840,53 @@ def try_open_new_position(
         extra=extra,
     )
 
-    # (4-2) GPT-5 진입 의사결정 (gpt_decider.py 사용, 폴백 없음)
-    #   - ask_entry_decision (non-safe) 를 직접 호출한다.
-    #   - 예외가 나면 이 루프의 진입은 완전히 막고, gpt_error_sleep_sec 만큼 대기 후 종료.
+    # (4-2) 현재 가드 스냅샷 구성 (GPT 프롬프트 + guard_adjustments 에 사용)
+    guard_snapshot: Dict[str, float] = {}
+    for key in [
+        "min_entry_volume_ratio",
+        "max_spread_pct",
+        "max_price_jump_pct",
+        "depth_imbalance_min_ratio",
+        "depth_imbalance_min_notional",
+    ]:
+        val = getattr(settings, key, None)
+        if isinstance(val, (int, float)):
+            guard_snapshot[key] = float(val)
+
+    # (4-3) GPT-5 진입 의사결정 (gpt_trader 사용, 폴백 없음)
     try:
-        gpt_decision = ask_entry_decision(
+        gpt_result = decide_entry_with_gpt_trader(
+            settings,
             symbol=symbol,
             signal_source=signal_source,
-            chosen_signal=chosen_signal,
+            direction=chosen_signal,
             last_price=float(last_price),
             entry_score=preview_score,
-            effective_risk_pct=effective_risk_pct,
-            leverage=leverage,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
+            base_risk_pct=effective_risk_pct,
+            base_tp_pct=tp_pct,
+            base_sl_pct=sl_pct,
             extra=extra if isinstance(extra, dict) else None,
+            guard_snapshot=guard_snapshot or None,
         )
-        gpt_action = str(gpt_decision.get("action", "")).upper()
-        raw_reason = gpt_decision.get("reason")
-        gpt_reason = str(raw_reason) if isinstance(raw_reason, str) else None
     except Exception as e:
-        # GPT 를 호출할 수 없으면 이후 신규 진입을 전면 차단 (하드 스톱)
-        msg = f"[GPT_ENTRY][ERROR] {e}"
+        # gpt_trader 내부에서도 예외를 처리하지만, 혹시 모를 오류는 하드 스톱으로 격리
+        msg = f"[GPT_ENTRY][ERROR] gpt_trader unexpected exception → hard stop: {e}"
         log(msg)
         try:
             send_skip_tg(msg)
         except Exception as te:
-            log(f"[GPT_ENTRY] send_skip_tg failed on error: {te}")
+            log(f"[GPT_ENTRY] send_skip_tg failed on gpt_trader exception: {te}")
 
         log_skip_event(
             symbol=symbol,
             regime=regime_label,
             source="entry_flow.gpt_error",
             side=chosen_signal,
-            reason="gpt_entry_exception",
+            reason="gpt_trader_exception",
             extra={"error": str(e)},
         )
 
         GPT_ENTRY_HARD_DOWN = True
-        # 첫 오류 시점에만 하드 스톱 알림을 전송
         if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
             try:
                 send_tg(
@@ -949,8 +900,47 @@ def try_open_new_position(
         sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
         return None, sleep_sec
 
-    # ENTER / ADJUST 만 허용, 나머지는 보수적으로 전부 스킵
-    if gpt_action not in {"ENTER", "ADJUST"}:
+    gpt_action = str(gpt_result.get("gpt_action", "")).upper()
+    final_action = str(gpt_result.get("final_action", "SKIP")).upper()
+    raw_decision = gpt_result.get("raw") or {}
+    reason_val = gpt_result.get("reason")
+    gpt_reason = str(reason_val) if isinstance(reason_val, str) else None
+    gpt_decision = raw_decision  # EntryScore 메타용
+
+    # (4-4) GPT 하드 장애 감지: gpt_action == ERROR 이고 raw 가 비어 있는 경우
+    if gpt_action == "ERROR" and not raw_decision:
+        msg = "[GPT_ENTRY][ERROR] GPT_TRADER returned ERROR with empty raw → hard stop"
+        log(msg)
+        try:
+            send_skip_tg(msg)
+        except Exception as te:
+            log(f"[GPT_ENTRY] send_skip_tg failed on hard error: {te}")
+
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.gpt_error",
+            side=chosen_signal,
+            reason="gpt_entry_exception",
+            extra={"gpt_result": gpt_result},
+        )
+
+        GPT_ENTRY_HARD_DOWN = True
+        if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
+            try:
+                send_tg(
+                    "[GPT_ENTRY][HARD_STOP] GPT 호출 오류가 발생하여 신규 진입을 전면 중단합니다. "
+                    "원인을 확인한 뒤 봇을 재시작해 주세요."
+                )
+            except Exception as te:
+                log(f"[GPT_ENTRY] hard stop telegram send failed: {te}")
+            GPT_ENTRY_HARD_DOWN_NOTIFIED = True
+
+        sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
+        return None, sleep_sec
+
+    # (4-5) GPT 판단에 따른 일반 SKIP (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
+    if final_action != "ENTER":
         msg = f"[GPT_ENTRY][SKIP] action={gpt_action or 'NONE'} reason={gpt_reason or 'no_reason'}"
         log(msg)
         send_skip_tg(msg)
@@ -960,37 +950,28 @@ def try_open_new_position(
             source="entry_flow.gpt_decision",
             side=chosen_signal,
             reason=f"gpt_action_{gpt_action or 'NONE'}",
-            extra={"gpt_decision": gpt_decision},
+            extra={"gpt_result": gpt_result},
         )
-        sleep_sec = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
+        sleep_sec = float(
+            gpt_result.get(
+                "sleep_after_sec",
+                getattr(settings, "gpt_skip_sleep_sec", 3.0),
+            )
+        )
         return None, sleep_sec
 
-    # (4-3) GPT 가 제안한 risk/tp/sl 반영 (안전 범위 내에서만)
-    max_risk_pct = float(getattr(settings, "gpt_max_risk_pct", DEFAULT_GPT_MAX_RISK_PCT))
-    max_tp_pct = float(getattr(settings, "gpt_max_tp_pct", DEFAULT_GPT_MAX_TP_PCT))
-    max_sl_pct = float(getattr(settings, "gpt_max_sl_pct", DEFAULT_GPT_MAX_SL_PCT))
+    # (4-6) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
+    effective_risk_pct = float(gpt_result.get("effective_risk_pct", effective_risk_pct))
+    tp_pct = float(gpt_result.get("tp_pct", tp_pct))
+    sl_pct = float(gpt_result.get("sl_pct", sl_pct))
 
-    gpt_eff_risk = gpt_decision.get("effective_risk_pct")
-    if gpt_eff_risk is None:
-        # 구 버전 호환용 키
-        gpt_eff_risk = gpt_decision.get("risk_pct")
-
-    if isinstance(gpt_eff_risk, (int, float)):
-        gpt_eff_risk_f = float(gpt_eff_risk)
-        if 0.0 < gpt_eff_risk_f <= max_risk_pct:
-            effective_risk_pct = gpt_eff_risk_f
-
-    gpt_tp = gpt_decision.get("tp_pct")
-    if isinstance(gpt_tp, (int, float)):
-        gpt_tp_f = float(gpt_tp)
-        if 0.0 < gpt_tp_f <= max_tp_pct:
-            tp_pct = gpt_tp_f
-
-    gpt_sl = gpt_decision.get("sl_pct")
-    if isinstance(gpt_sl, (int, float)):
-        gpt_sl_f = float(gpt_sl)
-        if 0.0 < gpt_sl_f <= max_sl_pct:
-            sl_pct = gpt_sl_f
+    guard_adjustments: Dict[str, float] = {}
+    raw_ga = gpt_result.get("guard_adjustments") or {}
+    if isinstance(raw_ga, dict):
+        try:
+            guard_adjustments = {k: float(v) for k, v in raw_ga.items()}
+        except Exception:
+            guard_adjustments = {}
 
     # GPT 승인/보정 결과 텔레그램 알림 (정보용)
     try:
@@ -1009,6 +990,8 @@ def try_open_new_position(
         )
         if gpt_reason:
             msg += f" reason={gpt_reason}"
+        if guard_adjustments:
+            msg += f" guards={guard_adjustments}"
         send_tg(msg)
     except Exception as e:
         log(f"[GPT_ENTRY] telegram send failed: {e}")
@@ -1024,13 +1007,96 @@ def try_open_new_position(
         risk_pct=effective_risk_pct,
         gpt_json={
             "model": gpt_model_for_log,
-            "decision": gpt_decision,
+            "decision": raw_decision,
             "reason": gpt_reason,
             "entry_score_preview": preview_score,
+            "guard_adjustments": guard_adjustments,
         },
     )
 
-    # (5) 주문 수량 계산
+    # (5) 거래량/가격 점프/스프레드 가드
+    #     - gpt_trader 가 내려준 guard_adjustments 를 settings 에 1회성으로 반영한 뒤 체크
+    original_guard_values: Dict[str, Any] = {}
+    try:
+        # 5-1) guard_adjustments 를 settings 에 주입 (한 루프 동안만)
+        for key, val in guard_adjustments.items():
+            if hasattr(settings, key):
+                original_guard_values.setdefault(key, getattr(settings, key))
+                try:
+                    setattr(settings, key, val)
+                except Exception:
+                    pass
+
+        # 5-2) 거래량 가드
+        vol_source = ws_candles_1m if ws_candles_1m else candles_5m_raw
+        vol_ok = check_volume_guard(
+            settings=settings,
+            candles_5m_raw=vol_source,
+            latest_ts=latest_ts,
+            signal_source=signal_source,
+            direction=chosen_signal,
+        )
+        if not vol_ok:
+            send_skip_tg("[SKIP] volume_guard: volume_too_low_for_entry")
+            log_skip_event(
+                symbol=symbol,
+                regime=regime_label,
+                source="entry_flow.guard.volume",
+                side=chosen_signal,
+                reason="volume_too_low_for_entry",
+                extra={"latest_ts": int(latest_ts)},
+            )
+            return None, 1.0
+
+        # 5-3) 직전/현재 5m 기준 가격 점프·갭 가드
+        price_ok = check_price_jump_guard(
+            settings=settings,
+            candles_5m=candles_5m,
+            latest_ts=latest_ts,
+            signal_source=signal_source,
+            direction=chosen_signal,
+        )
+        if not price_ok:
+            send_skip_tg("[SKIP] price_jump_guard: recent_price_jump_or_gap")
+            log_skip_event(
+                symbol=symbol,
+                regime=regime_label,
+                source="entry_flow.guard.price_jump",
+                side=chosen_signal,
+                reason="price_jump_guard_recent_price_jump_or_gap",
+                extra={"latest_ts": int(latest_ts)},
+            )
+            return None, 1.0
+
+        # 5-4) 호가 스프레드/쏠림 가드 (WS depth5 활용)
+        spread_ok, best_bid, best_ask = check_spread_guard(
+            settings=settings,
+            symbol=symbol,
+            latest_ts=latest_ts,
+            signal_source=signal_source,
+            direction=chosen_signal,
+        )
+        if not spread_ok:
+            send_skip_tg("[SKIP] spread_guard: depth_imbalance_or_spread_too_wide")
+            log_skip_event(
+                symbol=symbol,
+                regime=regime_label,
+                source="entry_flow.guard.spread",
+                side=chosen_signal,
+                reason="depth_imbalance_or_spread_too_wide",
+                extra={"latest_ts": int(latest_ts), "best_bid": best_bid, "best_ask": best_ask},
+            )
+            return None, 1.0
+
+    finally:
+        # 5-5) settings 의 가드 값 복원 (guard_adjustments 는 1회성)
+        for key, val in original_guard_values.items():
+            try:
+                setattr(settings, key, val)
+            except Exception:
+                pass
+
+    # (6) 실제 주문 수량 계산
     #   - available USDT * effective_risk_pct * leverage / price
     #   - 최소/단위는 settings 에 따라 맞춘다.
     notional = avail * effective_risk_pct * leverage
@@ -1060,7 +1126,7 @@ def try_open_new_position(
         )
         return None, 5.0
 
-    # (6) 실제 주문 실행
+    # (7) 실제 주문 실행
     side = "BUY" if chosen_signal == "LONG" else "SELL"
     regime_at_entry = regime_label
 
@@ -1108,7 +1174,7 @@ def try_open_new_position(
         )
         return None, 3.0
 
-    # (7) bt_trades INSERT
+    # (8) bt_trades INSERT
     _create_trade_row_on_entry(
         trade=trade,
         symbol=symbol,
@@ -1121,7 +1187,7 @@ def try_open_new_position(
         is_auto=True,
     )
 
-    # (8) EntryScore 저장 (GPT 메타 포함)
+    # (9) EntryScore 저장 (GPT 메타 포함)
     entry_score: Optional[float] = None
     components: Dict[str, Any] = {}
 

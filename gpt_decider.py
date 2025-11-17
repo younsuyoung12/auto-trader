@@ -5,7 +5,7 @@
 # - BingX Auto Trader에서 진입/청산/전략 중재 의사결정을 GPT-5.1에 위임하는 어댑터.
 # - entry_flow.py, signal_flow_ws.py, position_watch_ws.py 등에서 이 모듈만 import 해서 사용.
 #
-# 2025-11-17 변경 사항 (타입힌트 정리 + GPT 응답 파싱 보강 + Pylance 문법 오류 대응 + 구버전 openai 호환 + 로깅 강화)
+# 2025-11-17 변경 사항 (타입힌트 정리 + GPT 응답 파싱 보강 + Pylance 문법 오류 대응 + 구버전 openai 호환 + 로깅 강화 + gpt_trader 연동)
 # ----------------------------------------------------
 # 1) Pylance reportInvalidTypeForm 대응
 #    - Dict[str, Any] | None → Optional[Dict[str, Any]] 로 전부 변경.
@@ -25,6 +25,11 @@
 #      response_format 없이 재호출하는 폴백 로직 추가.
 # 7) GPT 호출 로깅 강화
 #    - _safe_log(...) 헬퍼를 추가하여 GPT 진입/청산/중재 호출 및 결과를 Render 로그에서 확인 가능.
+# 8) gpt_trader.py 연동용 프롬프트 확장
+#    - ask_entry_decision 프롬프트에 guard_adjustments 선택 필드를 정의.
+#    - extra.guard_snapshot (현재 가드 스냅샷)을 그대로 JSON 으로 보여주어 GPT가
+#      min_entry_volume_ratio, max_spread_pct, max_price_jump_pct 등의 기준값을 참고해
+#      "너무 강해서 항상 SKIP" 상황을 부드럽게 조정할 수 있게 함.
 
 from __future__ import annotations
 
@@ -189,7 +194,7 @@ def ask_entry_decision(
     sl_pct: float,
     extra: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """GPT-5.1 에게 '이 진입을 할지 말지, 비율을 수정할지' 물어본다.
+    """GPT-5.1 에게 '이 진입을 할지 말지, 비율/가드를 어떻게 조정할지' 물어본다.
 
     반환 예시(JSON):
     {
@@ -197,7 +202,11 @@ def ask_entry_decision(
       "reason": "짧은 요약 한줄",
       "tp_pct": 0.02,             # 선택 (없으면 기존 값 사용)
       "sl_pct": 0.01,             # 선택
-      "effective_risk_pct": 0.01  # 선택
+      "effective_risk_pct": 0.01, # 선택
+      "guard_adjustments": {      # 선택 (없으면 가드 값 그대로 사용)
+        "min_entry_volume_ratio": 0.25,
+        "max_spread_pct": 0.001
+      }
     }
     """
     model = os.getenv("GPT_ENTRY_MODEL", "gpt-5.1")
@@ -211,13 +220,17 @@ def ask_entry_decision(
             "atr_fast",
             "atr_slow",
             "regime_level",
+            "regime",
+            "recent_pnl_pct",
+            "skip_streak",
+            "guard_snapshot",  # gpt_trader 가 넣어주는 현재 가드 스냅샷
         ]:
             if k in extra:
                 trimmed_extra[k] = extra[k]
 
     prompt = f"""
 당신은 BTC-USDT 선물 자동매매 봇의 진입 리스크 컨트롤러입니다.
-아래 정보를 보고 이 진입을 허용할지 결정하세요.
+아래 정보를 보고 이 진입을 허용할지, 그리고 필요하다면 TP/SL/리스크/가드를 어떻게 조정할지 결정하세요.
 
 - 심볼: {symbol}
 - 시그널 소스: {signal_source}   (TREND=추세, RANGE=박스, HYBRID=혼합)
@@ -227,17 +240,32 @@ def ask_entry_decision(
 - 레버리지: {leverage}
 - 현재 설정 리스크 비율: {effective_risk_pct}
 - 현재 TP%: {tp_pct}, SL%: {sl_pct}
-- 추가 지표(extra 요약): {json.dumps(trimmed_extra, ensure_ascii=False)}
+- 추가 지표/가드(extra 요약): {json.dumps(trimmed_extra, ensure_ascii=False)}
+
+extra.guard_snapshot 필드(있다면)는 현재 진입 가드 설정을 JSON 으로 담고 있습니다.
+예: min_entry_volume_ratio, max_spread_pct, max_price_jump_pct,
+    depth_imbalance_min_ratio, depth_imbalance_min_notional 등.
 
 규칙:
-1) 답변은 반드시 JSON 하나만 출력하세요. 자연어 설명 금지.
+1) 답변은 반드시 JSON 하나만 출력하세요. 자연어 설명 따로 쓰지 마세요.
 2) action 값:
    - "ENTER"  : 그대로 진입
    - "SKIP"   : 이번 진입은 건너뛰기
-   - "ADJUST" : 진입은 하되 TP/SL/리스크를 조정
+   - "ADJUST" : 진입은 하되 TP/SL/리스크/가드를 조정
 3) 수치를 수정하고 싶을 때만 해당 필드를 포함합니다.
    - tp_pct / sl_pct / effective_risk_pct 는 0보다 커야 합니다.
    - 리스크 비율은 0.001 ~ 0.03 (0.1% ~ 3%) 범위로 맞추세요.
+4) 필요하다면 guard_adjustments 라는 선택 필드를 포함할 수 있습니다.
+   - guard_adjustments 가 없으면 가드는 변경하지 않습니다.
+   - 사용할 수 있는 키(모두 선택 사항):
+     · min_entry_volume_ratio : 0.10 ~ 0.60 (가능하면 현재 값 기준 ±0.20 이내에서만 조정)
+     · max_spread_pct         : 0.0003 ~ 0.0015
+     · max_price_jump_pct     : 0.0010 ~ 0.0040
+     · depth_imbalance_min_ratio   : 1.5 ~ 4.0
+     · depth_imbalance_min_notional: 20 ~ 200
+   - 너무 공격적으로 완화하기보다는,
+     "장 상태는 괜찮은데 가드가 너무 강해서 계속 SKIP 되는 상황"에서만
+     약간 부드럽게 풀어주는 방향으로 조정하세요.
 
 JSON 스키마 예시는 다음과 같습니다 (그대로 쓰지 말고 값만 채워서 보내세요):
 
@@ -246,7 +274,11 @@ JSON 스키마 예시는 다음과 같습니다 (그대로 쓰지 말고 값만 
   "reason": "여기에 한국어 한 줄 요약",
   "tp_pct": 0.02,
   "sl_pct": 0.01,
-  "effective_risk_pct": 0.01
+  "effective_risk_pct": 0.01,
+  "guard_adjustments": {{
+    "min_entry_volume_ratio": 0.25,
+    "max_spread_pct": 0.001
+  }}
 }}
     """.strip()
 
@@ -574,13 +606,13 @@ def ask_signal_arbitration(
 - reasons: 사람이 디버깅할 때 보는 간단한 설명 리스트
 
 판단 규칙(요약):
-1) 두 후보 모두 위험해 보이거나 정보가 부족하면 "SKIP" 을 선택한다.
-2) 한쪽만 존재하면 그 후보를 기준으로 ENTER 여부를 검토한다.
+1) 두 후보 모두 위험해 보이거나 정보가 부족하면 "SKIP" 을 선택합니다.
+2) 한쪽만 존재하면 그 후보를 기준으로 ENTER 여부를 검토합니다.
 3) 양쪽 모두 존재하면:
-   - 리스크가 과도해 보이는 쪽은 피한다.
+   - 리스크가 과도해 보이는 쪽은 피합니다.
    - score / TP·SL / block_reason / reasons 를 종합해서
-     "조금이라도 더 합리적인" 쪽을 선택한다.
-4) 불확실할 때는 보수적으로 "SKIP" 을 선택한다.
+     "조금이라도 더 합리적인" 쪽을 선택합니다.
+4) 불확실할 때는 보수적으로 "SKIP" 을 선택합니다.
 
 반드시 아래 JSON 하나만 출력하라:
 
