@@ -2,7 +2,7 @@
 # ====================================================
 # 시그널/진입/청산/스킵/에러/GPT 이벤트 및 캔들 스냅샷을 CSV로 기록하는 모듈.
 #
-# 2025-11-17 변경 사항 (이벤트/포지션/GPT/에러 전용 CSV 추가)
+# 2025-11-17 변경 사항 (이벤트/포지션/GPT/에러 전용 CSV 추가 + 점검)
 # ----------------------------------------------------
 # 1) logs/events/events-YYYY-MM-DD.csv 추가
 #    - 필드: ts, ts_iso, event_type, symbol, regime, source, side, price,
@@ -26,6 +26,11 @@
 #    - 모듈 로드시 오늘자 signals-YYYY-MM-DD.csv, candles-YYYY-MM-DD.csv,
 #      events-YYYY-MM-DD.csv 가 없으면 헤더만 있는 빈 파일을 만들어 둔다.
 #    - 자정(KST) 이후에도 각 로그 함수가 호출될 때 자동으로 새 파일 생성.
+#
+# 4) 2025-11-17 점검 사항
+#    - _ensure_today_events_csv() 이 항상 경로 문자열(path)을 반환하도록 확인.
+#    - log_event() 가 extra / extra_json 을 JSON 문자열로 안전하게 직렬화하는지 점검.
+#    - 모듈 import 시점에 세 종류 CSV 가 모두 생성되는지 확인.
 """
 시그널/진입/청산/스킵 이벤트를 CSV로 기록하는 모듈.
 
@@ -439,7 +444,7 @@ def log_event(event_type: str, **kwargs: Any) -> None:
 
     row = _default_event_row(event_type)
 
-    # 기본 필드 매핑
+    # 기본 필드 매핑 (정의되지 않은 키는 무시)
     for key, val in kwargs.items():
         if key in row and key != "extra_json":
             row[key] = val

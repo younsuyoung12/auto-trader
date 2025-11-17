@@ -4,16 +4,21 @@
 # 조기익절, 조기청산, 박스→추세 전환, 추세→박스 다운그레이드,
 # 반대 시그널 강제 청산을 수행하는 모듈.
 #
-# 2025-11-17 패치 (EXIT GPT 컨텍스트에 레짐/지표 스냅샷 추가)
+# 2025-11-17 패치 (EXIT GPT 컨텍스트 + 이벤트/스킵 CSV 로깅 강화)
 # ----------------------------------------------------
 # - ask_exit_decision_safe(...) 로 넘기는 extra(=GPT 컨텍스트)에
 #   "regime_features" 필드를 공통으로 추가했다.
 #   · 5m 웹소켓 캔들 기반으로 EMA/ATR/RSI 및 TREND/RANGE/CHOP 점수 계산
 #   · GPT 가 "지금 시장 상태"를 같이 보고 CLOSE/HOLD 를 판단할 수 있도록 함.
-# - 레짐 계산은 indicators.ema/rsi/calc_atr 를 사용하며,
-#   내부 헬퍼 _build_runtime_regime_features_for_gpt(...) 에서만 수행한다.
-#   → 레짐 계산 실패 시에는 regime_features 는 비어 있는 dict 로 들어가며,
-#      기존 동작에는 영향을 주지 않는다.
+#   · 레짐 계산 실패 시에는 regime_features 는 비어 있는 dict 로 들어가며,
+#     기존 동작에는 영향을 주지 않는다.
+# - signals_logger.log_gpt_exit_event / log_skip_event 연동.
+#   · GPT 가 EXIT 시 action="CLOSE" 를 반환하여 실제 청산이 실행된 경우:
+#       → log_gpt_exit_event(...) 로 events CSV 에 EXIT 이벤트 기록
+#   · GPT 가 action="HOLD" 를 반환하여 청산을 막은 경우:
+#       → log_skip_event(...) 로 "gpt_exit_hold_*" 사유와 컨텍스트 기록
+#   · RANGE/TREND 조기익절/조기청산, 박스↔추세 전환, 반대 시그널 강제청산
+#     모든 GPT EXIT 경로에 적용.
 #
 # 2025-11-16 패치 (GPT-5.1 런타임 EXIT 의사결정 + gpt_decider 연동 완료)
 # ----------------------------------------------------
@@ -83,7 +88,12 @@ from market_data_ws import (
 from exchange_api import close_position_market
 from signal_flow_ws import get_trading_signal  # WS 기반 시그널 (동시 평가 + 중재 버전)
 from strategies_trend_ws import decide_trend_15m, confirm_1m_direction  # WS 기반 15m 추세 + 1m 확인
-from signals_logger import log_signal, log_candle_snapshot
+from signals_logger import (
+    log_signal,
+    log_candle_snapshot,
+    log_gpt_exit_event,
+    log_skip_event,
+)
 from trader import Trade
 from gpt_decider import ask_exit_decision_safe  # ✅ EXIT 쪽 GPT 의사결정은 이 함수만 사용
 from indicators import ema, rsi, calc_atr  # ✅ 레짐/지표 스냅샷 계산용
@@ -483,6 +493,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
     if trade.source != "RANGE":
         return False
 
+    regime_label = trade.source or "RANGE"
     log(f"[PW] (WS) RANGE watch symbol={trade.symbol} tf=5m")
 
     try:
@@ -549,7 +560,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                 candle_ts_ms=candle_ts,
                 extra=ctx_extra,
             )
-            action, _gpt_data = ask_exit_decision_safe(
+            action, gpt_data = ask_exit_decision_safe(
                 symbol=trade.symbol,
                 source=trade.source,
                 side=trade.side,
@@ -562,6 +573,23 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
             )
             if action != "CLOSE":
                 log(f"[GPT_EXIT][RANGE_TP] HOLD 결정 → 조기익절 스킵 (pnl≈{gain_pct*100:.3f}%)")
+                # GPT 가 조기익절을 막은 경우 SKIP 이벤트 로깅
+                try:
+                    log_skip_event(
+                        symbol=trade.symbol,
+                        regime=regime_label,
+                        source="position_watch_ws.range_early_tp",
+                        side=trade.side,
+                        reason="gpt_exit_hold_range_early_tp",
+                        extra={
+                            "gain_pct": gain_pct,
+                            "threshold_pct": early_tp_pct,
+                            "gpt_action": action,
+                            "gpt_data": gpt_data,
+                        },
+                    )
+                except Exception as e:
+                    log(f"[GPT_EXIT_LOG][RANGE_EARLY_TP][SKIP] failed: {e}")
                 return False
 
             try:
@@ -583,6 +611,26 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                     reason=reason,
                     pnl=pnl,
                 )
+                # GPT EXIT 이벤트 CSV 기록
+                try:
+                    pnl_pct_signed = gain_pct  # 수익이므로 양수
+                    log_gpt_exit_event(
+                        symbol=trade.symbol,
+                        regime=regime_label,
+                        side=trade.side,
+                        scenario="RANGE_EARLY_TP",
+                        action="CLOSE",
+                        pnl_pct=pnl_pct_signed,
+                        extra={
+                            "gain_pct": gain_pct,
+                            "threshold_pct": early_tp_pct,
+                            "gpt_data": gpt_data,
+                            "exit_ctx": gpt_ctx,
+                        },
+                    )
+                except Exception as e:
+                    log(f"[GPT_EXIT_LOG][RANGE_EARLY_TP] failed: {e}")
+
                 _update_trade_close_in_db(
                     trade=trade,
                     close_price=float(last_close),
@@ -630,7 +678,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
         candle_ts_ms=candle_ts,
         extra=ctx_extra,
     )
-    action, _gpt_data = ask_exit_decision_safe(
+    action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
         source=trade.source,
         side=trade.side,
@@ -643,6 +691,23 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
     )
     if action != "CLOSE":
         log(f"[GPT_EXIT][RANGE_EXIT] HOLD 결정 → 조기청산 스킵 (loss≈{loss_pct*100:.3f}%)")
+        # GPT 가 조기청산을 막은 경우 SKIP 이벤트 로깅
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="position_watch_ws.range_early_exit",
+                side=trade.side,
+                reason="gpt_exit_hold_range_early_exit",
+                extra={
+                    "loss_pct": loss_pct,
+                    "threshold_pct": trigger_pct,
+                    "gpt_action": action,
+                    "gpt_data": gpt_data,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][RANGE_EARLY_EXIT][SKIP] failed: {e}")
         return False
 
     try:
@@ -664,6 +729,26 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
             reason=reason,
             pnl=pnl,
         )
+        # GPT EXIT 이벤트 CSV 기록 (손실은 음수 부호)
+        try:
+            pnl_pct_signed = -loss_pct
+            log_gpt_exit_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                side=trade.side,
+                scenario="RANGE_EARLY_EXIT",
+                action="CLOSE",
+                pnl_pct=pnl_pct_signed,
+                extra={
+                    "loss_pct": loss_pct,
+                    "threshold_pct": trigger_pct,
+                    "gpt_data": gpt_data,
+                    "exit_ctx": gpt_ctx,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][RANGE_EARLY_EXIT] failed: {e}")
+
         _update_trade_close_in_db(
             trade=trade,
             close_price=float(last_close),
@@ -697,6 +782,7 @@ def maybe_upgrade_range_to_trend(
     if trade.source != "RANGE":
         return False
 
+    regime_label = trade.source or "RANGE"
     log(f"[PW] (WS) RANGE→TREND recheck symbol={trade.symbol}")
 
     try:
@@ -779,7 +865,7 @@ def maybe_upgrade_range_to_trend(
         candle_ts_ms=candle_ts,
         extra=ctx_extra,
     )
-    action, _gpt_data = ask_exit_decision_safe(
+    action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
         source=trade.source,
         side=trade.side,
@@ -792,6 +878,26 @@ def maybe_upgrade_range_to_trend(
     )
     if action != "CLOSE":
         log(f"[GPT_EXIT][R2T] HOLD 결정 → RANGE→TREND 업그레이드 스킵 (pnl≈{gain_pct*100:.3f}%)")
+        # GPT 가 업그레이드를 막은 경우 SKIP 이벤트 로깅
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="position_watch_ws.range_to_trend_upgrade",
+                side=trade.side,
+                reason="gpt_exit_hold_range_to_trend_upgrade",
+                extra={
+                    "gain_pct": gain_pct,
+                    "min_gain_pct": upgrade_thresh,
+                    "trend15_dir": trend15,
+                    "new_signal_source": new_signal_source,
+                    "new_signal_dir": new_signal_dir,
+                    "gpt_action": action,
+                    "gpt_data": gpt_data,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][R2T][SKIP] failed: {e}")
         return False
 
     try:
@@ -815,6 +921,29 @@ def maybe_upgrade_range_to_trend(
             reason=reason,
             pnl=pnl,
         )
+        # GPT EXIT 이벤트 CSV 기록
+        try:
+            pnl_pct_signed = gain_pct  # 수익권에서 정리
+            log_gpt_exit_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                side=trade.side,
+                scenario="RANGE_TO_TREND_UPGRADE",
+                action="CLOSE",
+                pnl_pct=pnl_pct_signed,
+                extra={
+                    "gain_pct": gain_pct,
+                    "min_gain_pct": upgrade_thresh,
+                    "trend15_dir": trend15,
+                    "new_signal_source": new_signal_source,
+                    "new_signal_dir": new_signal_dir,
+                    "gpt_data": gpt_data,
+                    "exit_ctx": gpt_ctx,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][R2T] failed: {e}")
+
         _update_trade_close_in_db(
             trade=trade,
             close_price=float(last_price),
@@ -856,6 +985,7 @@ def maybe_downgrade_trend_to_range(
         return False
 
     symbol = trade.symbol
+    regime_label = trade.source or "TREND"
     log(f"[PW] (WS) TREND→RANGE downgrade check symbol={symbol}")
 
     # 5m/15m 캔들 확보
@@ -969,7 +1099,7 @@ def maybe_downgrade_trend_to_range(
         candle_ts_ms=candle_ts,
         extra=ctx_extra,
     )
-    action, _gpt_data = ask_exit_decision_safe(
+    action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
         source=trade.source,
         side=trade.side,
@@ -982,6 +1112,28 @@ def maybe_downgrade_trend_to_range(
     )
     if action != "CLOSE":
         log(f"[GPT_EXIT][T2R] HOLD 결정 → TREND→RANGE 다운그레이드 스킵 (pnl≈{pnl_pct*100:.3f}%)")
+        # GPT 가 다운그레이드를 막은 경우 SKIP 이벤트 로깅
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="position_watch_ws.trend_to_range_downgrade",
+                side=trade.side,
+                reason="gpt_exit_hold_trend_to_range_downgrade",
+                extra={
+                    "pnl_pct": pnl_pct,
+                    "min_gain_pct": min_gain,
+                    "max_abs_pnl_pct": max_abs,
+                    "r_sig": r_sig,
+                    "block_reason": block_reason,
+                    "tp_pct": tp_pct,
+                    "sl_pct": sl_pct,
+                    "gpt_action": action,
+                    "gpt_data": gpt_data,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][T2R][SKIP] failed: {e}")
         return False
 
     # 기존 추세 포지션 정리
@@ -1006,6 +1158,29 @@ def maybe_downgrade_trend_to_range(
             reason=reason,
             pnl=pnl,
         )
+        # GPT EXIT 이벤트 CSV 기록
+        try:
+            log_gpt_exit_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                side=trade.side,
+                scenario="TREND_TO_RANGE_DOWNGRADE",
+                action="CLOSE",
+                pnl_pct=pnl_pct,
+                extra={
+                    "min_gain_pct": min_gain,
+                    "max_abs_pnl_pct": max_abs,
+                    "r_sig": r_sig,
+                    "block_reason": block_reason,
+                    "tp_pct": tp_pct,
+                    "sl_pct": sl_pct,
+                    "gpt_data": gpt_data,
+                    "exit_ctx": gpt_ctx,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][T2R] failed: {e}")
+
         _update_trade_close_in_db(
             trade=trade,
             close_price=float(last_price),
@@ -1063,6 +1238,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
     if trade.source != "TREND":
         return False
 
+    regime_label = trade.source or "TREND"
     log(f"[PW] (WS) TREND watch symbol={trade.symbol} tf=5m")
 
     try:
@@ -1128,7 +1304,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                 candle_ts_ms=candle_ts,
                 extra=ctx_extra,
             )
-            action, _gpt_data = ask_exit_decision_safe(
+            action, gpt_data = ask_exit_decision_safe(
                 symbol=trade.symbol,
                 source=trade.source,
                 side=trade.side,
@@ -1141,6 +1317,23 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             )
             if action != "CLOSE":
                 log(f"[GPT_EXIT][TREND_TP] HOLD 결정 → 추세 조기익절 스킵 (pnl≈{gain_pct*100:.3f}%)")
+                # GPT 가 조기익절을 막은 경우 SKIP 이벤트 로깅
+                try:
+                    log_skip_event(
+                        symbol=trade.symbol,
+                        regime=regime_label,
+                        source="position_watch_ws.trend_early_tp",
+                        side=trade.side,
+                        reason="gpt_exit_hold_trend_early_tp",
+                        extra={
+                            "gain_pct": gain_pct,
+                            "threshold_pct": trend_early_tp_pct,
+                            "gpt_action": action,
+                            "gpt_data": gpt_data,
+                        },
+                    )
+                except Exception as e:
+                    log(f"[GPT_EXIT_LOG][TREND_EARLY_TP][SKIP] failed: {e}")
                 return False
 
             try:
@@ -1162,6 +1355,26 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                     reason=reason,
                     pnl=pnl,
                 )
+                # GPT EXIT 이벤트 CSV 기록
+                try:
+                    pnl_pct_signed = gain_pct
+                    log_gpt_exit_event(
+                        symbol=trade.symbol,
+                        regime=regime_label,
+                        side=trade.side,
+                        scenario="TREND_EARLY_TP",
+                        action="CLOSE",
+                        pnl_pct=pnl_pct_signed,
+                        extra={
+                            "gain_pct": gain_pct,
+                            "threshold_pct": trend_early_tp_pct,
+                            "gpt_data": gpt_data,
+                            "exit_ctx": gpt_ctx,
+                        },
+                    )
+                except Exception as e:
+                    log(f"[GPT_EXIT_LOG][TREND_EARLY_TP] failed: {e}")
+
                 _update_trade_close_in_db(
                     trade=trade,
                     close_price=float(last_close),
@@ -1221,7 +1434,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
         candle_ts_ms=candle_ts,
         extra=ctx_extra,
     )
-    action, _gpt_data = ask_exit_decision_safe(
+    action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
         source=trade.source,
         side=trade.side,
@@ -1237,6 +1450,24 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             f"[GPT_EXIT][TREND_EXIT] HOLD 결정 → 추세 조기청산 스킵 "
             f"(loss≈{loss_pct*100:.3f}%, eff_trig={eff_trig*100:.3f}%)"
         )
+        # GPT 가 조기청산을 막은 경우 SKIP 이벤트 로깅
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="position_watch_ws.trend_early_exit",
+                side=trade.side,
+                reason="gpt_exit_hold_trend_early_exit",
+                extra={
+                    "loss_pct": loss_pct,
+                    "trigger_pct": trend_trigger_pct,
+                    "effective_trigger_pct": eff_trig,
+                    "gpt_action": action,
+                    "gpt_data": gpt_data,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][TREND_EARLY_EXIT][SKIP] failed: {e}")
         return False
 
     try:
@@ -1258,6 +1489,27 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             reason=reason,
             pnl=pnl,
         )
+        # GPT EXIT 이벤트 CSV 기록 (손실은 음수 부호)
+        try:
+            pnl_pct_signed = -loss_pct
+            log_gpt_exit_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                side=trade.side,
+                scenario="TREND_EARLY_EXIT",
+                action="CLOSE",
+                pnl_pct=pnl_pct_signed,
+                extra={
+                    "loss_pct": loss_pct,
+                    "trigger_pct": trend_trigger_pct,
+                    "effective_trigger_pct": eff_trig,
+                    "gpt_data": gpt_data,
+                    "exit_ctx": gpt_ctx,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][TREND_EARLY_EXIT] failed: {e}")
+
         _update_trade_close_in_db(
             trade=trade,
             close_price=float(last_close),
@@ -1288,6 +1540,8 @@ def maybe_close_on_opposite_signal(
     - RANGE 포지션: 어떤 소스든 반대 방향이면 후보.
     - 후보가 되면 GPT-5.1 에게 "opposite_signal_close" 시나리오로 EXIT 여부를 묻는다.
     """
+    regime_label = trade.source or "UNKNOWN"
+
     try:
         sig_ctx = get_trading_signal(
             settings=settings,
@@ -1343,7 +1597,7 @@ def maybe_close_on_opposite_signal(
         candle_ts_ms=int(ts_ms),
         extra=ctx_extra,
     )
-    action, _gpt_data = ask_exit_decision_safe(
+    action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
         source=trade.source,
         side=trade.side,
@@ -1356,6 +1610,24 @@ def maybe_close_on_opposite_signal(
     )
     if action != "CLOSE":
         log(f"[GPT_EXIT][OPP] HOLD 결정 → 반대 시그널 강제 청산 스킵 (scenario={scenario})")
+        # GPT 가 강제청산을 막은 경우 SKIP 이벤트 로깅
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="position_watch_ws.opposite_signal_close",
+                side=trade.side,
+                reason="gpt_exit_hold_opposite_signal",
+                extra={
+                    "scenario": scenario,
+                    "new_signal_dir": new_dir,
+                    "new_signal_source": new_src,
+                    "gpt_action": action,
+                    "gpt_data": gpt_data,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][OPP][SKIP] failed: {e}")
         return False
 
     # 실제 강제 청산 실행
@@ -1365,6 +1637,10 @@ def maybe_close_on_opposite_signal(
             pnl = (last_price - entry) * qty
         else:
             pnl = (entry - last_price) * qty
+
+        # PnL% (DB 계산과 동일한 방식)
+        base_notional = entry * qty if entry > 0 and qty > 0 else 0.0
+        pnl_pct_signed = (pnl / base_notional) if base_notional > 0 else None
 
         if trade.source == "TREND":
             send_tg(
@@ -1391,6 +1667,25 @@ def maybe_close_on_opposite_signal(
             reason=reason,
             pnl=pnl,
         )
+        # GPT EXIT 이벤트 CSV 기록
+        try:
+            log_gpt_exit_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                side=trade.side,
+                scenario=scenario,
+                action="CLOSE",
+                pnl_pct=pnl_pct_signed,
+                extra={
+                    "new_signal_dir": new_dir,
+                    "new_signal_source": new_src,
+                    "gpt_data": gpt_data,
+                    "exit_ctx": gpt_ctx,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][OPP] failed: {e}")
+
         _update_trade_close_in_db(
             trade=trade,
             close_price=float(last_price),

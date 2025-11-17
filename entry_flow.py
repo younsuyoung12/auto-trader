@@ -8,7 +8,7 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
 - 웹소켓 기반 시그널(signal_flow_ws.get_trading_signal)을 사용하며,
   TREND/RANGE 동시 평가 + 중재(Arbitration) 결과를 그대로 받아서 처리한다.
 
-2025-11-17 변경 사항 (GPT 장애 시 신규 진입 하드 스톱 + 텔레그램 알림)
+2025-11-17 변경 사항 (GPT 장애 시 신규 진입 하드 스톱 + 텔레그램 알림 + 이벤트 CSV 연동)
 ----------------------------------------------------
 1) GPT 엔트리 하드 스톱 플래그 추가
    - 모듈 전역 변수 GPT_ENTRY_HARD_DOWN / GPT_ENTRY_HARD_DOWN_NOTIFIED 를 도입.
@@ -25,6 +25,10 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
 5) EntryScore.components_json 에 GPT·시그널 메타 정보 추가.
    - gpt_entry.signal 에 extra["direction_raw"], extra["direction_norm"], extra["regime_level"] 를 함께 저장.
    - signal_extra 블록으로 signal_flow_ws.extra 의 핵심 지표/사유를 별도로 남겨 사후 분석에 활용 가능.
+6) signals_logger.py 이벤트 CSV 연동.
+   - GPT 승인 시 log_gpt_entry_event(...) 호출.
+   - GPT 거절(SKIP) 및 각종 가드/잔고/수량/주문 실패 SKIP 경로에서 log_skip_event(...) 호출.
+   - GPT 장애 및 하드 스톱 상태에서도 log_skip_event(...) 로 events-YYYY-MM-DD.csv 에 기록.
 
 2025-11-16 변경 사항 (GPT-5 진입 게이트 + gpt_decider.py 일원화)
 ----------------------------------------------------
@@ -135,7 +139,12 @@ from exchange_api import (
     get_balance_detail,
 )
 from trader import open_position_with_tp_sl, Trade
-from signals_logger import log_signal, log_candle_snapshot
+from signals_logger import (
+    log_signal,
+    log_candle_snapshot,
+    log_gpt_entry_event,
+    log_skip_event,
+)
 from gpt_decider import ask_entry_decision
 
 # DB 세션/모델 (있으면 사용, 없으면 조용히 패스)
@@ -662,6 +671,16 @@ def try_open_new_position(
         except Exception as e:
             log(f"[GPT_ENTRY] send_skip_tg failed under hard stop: {e}")
 
+        # 이벤트 CSV에도 하드 스톱 SKIP 기록
+        log_skip_event(
+            symbol=symbol,
+            regime="UNKNOWN",
+            source="entry_flow.gpt_hard_stop",
+            side=None,
+            reason="gpt_entry_hard_down",
+            extra={"note": "GPT hard stop active; new entries blocked"},
+        )
+
         # 첫 시도 시점에만 하드 스톱 상태를 명시적으로 알린다.
         if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
             try:
@@ -691,6 +710,14 @@ def try_open_new_position(
     if signal_ctx is None:
         # 시그널이 없거나 모든 후보가 중재 단계에서 탈락
         send_skip_tg(f"[SKIP] no_signal_or_arbitration_rejected: symbol={symbol}")
+        log_skip_event(
+            symbol=symbol,
+            regime="NO_TRADE",
+            source="entry_flow.signal",
+            side=None,
+            reason="no_signal_or_arbitration_rejected",
+            extra=None,
+        )
         return None, 1.0
 
     (
@@ -735,6 +762,8 @@ def try_open_new_position(
     except Exception as e:  # pragma: no cover - 스냅샷 실패는 무시
         log(f"[SIGNAL_SNAPSHOT] log failed: {e}")
 
+    regime_label = _infer_regime_from_signal(signal_source)
+
     # (2) 진입 전 가드 실행 순서
     # 2-1) 수동/외부 가드(강제 OFF, 휴식 등)
     manual_ok = check_manual_position_guard(
@@ -744,6 +773,14 @@ def try_open_new_position(
     )
     if not manual_ok:
         send_skip_tg("[SKIP] manual_guard_blocked (외부 강제 OFF/휴식)")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.guard.manual",
+            side=chosen_signal,
+            reason="manual_guard_blocked",
+            extra={"latest_ts": int(latest_ts)},
+        )
         return None, 2.0
 
     # 2-2) 거래량 가드
@@ -759,6 +796,14 @@ def try_open_new_position(
     )
     if not vol_ok:
         send_skip_tg("[SKIP] volume_guard: volume_too_low_for_entry")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.guard.volume",
+            side=chosen_signal,
+            reason="volume_too_low_for_entry",
+            extra={"latest_ts": int(latest_ts)},
+        )
         return None, 1.0
 
     # 2-3) 직전/현재 5m 기준 가격 점프·갭 가드
@@ -771,6 +816,14 @@ def try_open_new_position(
     )
     if not price_ok:
         send_skip_tg("[SKIP] price_jump_guard: recent_price_jump_or_gap")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.guard.price_jump",
+            side=chosen_signal,
+            reason="price_jump_guard_recent_price_jump_or_gap",
+            extra={"latest_ts": int(latest_ts)},
+        )
         return None, 1.0
 
     # 2-4) 호가 스프레드/쏠림 가드 (WS depth5 활용)
@@ -783,6 +836,14 @@ def try_open_new_position(
     )
     if not spread_ok:
         send_skip_tg("[SKIP] spread_guard: depth_imbalance_or_spread_too_wide")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.guard.spread",
+            side=chosen_signal,
+            reason="depth_imbalance_or_spread_too_wide",
+            extra={"latest_ts": int(latest_ts), "best_bid": best_bid, "best_ask": best_ask},
+        )
         return None, 1.0
 
     # (3) 잔고 확인
@@ -796,6 +857,14 @@ def try_open_new_position(
             direction=chosen_signal,
             reason="balance_zero",
             candle_ts=latest_ts,
+        )
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.balance",
+            side=chosen_signal,
+            reason="balance_zero",
+            extra={"available_usdt": float(avail)},
         )
         return None, 5.0
 
@@ -856,6 +925,15 @@ def try_open_new_position(
         except Exception as te:
             log(f"[GPT_ENTRY] send_skip_tg failed on error: {te}")
 
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.gpt_error",
+            side=chosen_signal,
+            reason="gpt_entry_exception",
+            extra={"error": str(e)},
+        )
+
         GPT_ENTRY_HARD_DOWN = True
         # 첫 오류 시점에만 하드 스톱 알림을 전송
         if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
@@ -876,6 +954,14 @@ def try_open_new_position(
         msg = f"[GPT_ENTRY][SKIP] action={gpt_action or 'NONE'} reason={gpt_reason or 'no_reason'}"
         log(msg)
         send_skip_tg(msg)
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.gpt_decision",
+            side=chosen_signal,
+            reason=f"gpt_action_{gpt_action or 'NONE'}",
+            extra={"gpt_decision": gpt_decision},
+        )
         sleep_sec = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
         return None, sleep_sec
 
@@ -927,6 +1013,23 @@ def try_open_new_position(
     except Exception as e:
         log(f"[GPT_ENTRY] telegram send failed: {e}")
 
+    # GPT 승인 결과를 이벤트 CSV에도 기록
+    log_gpt_entry_event(
+        symbol=symbol,
+        regime=regime_label,
+        side=chosen_signal,
+        action=gpt_action,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        risk_pct=effective_risk_pct,
+        gpt_json={
+            "model": gpt_model_for_log,
+            "decision": gpt_decision,
+            "reason": gpt_reason,
+            "entry_score_preview": preview_score,
+        },
+    )
+
     # (5) 주문 수량 계산
     #   - available USDT * effective_risk_pct * leverage / price
     #   - 최소/단위는 settings 에 따라 맞춘다.
@@ -947,11 +1050,19 @@ def try_open_new_position(
         send_skip_tg(
             f"[SKIP] qty_too_small: qty={qty:.8f} < min_qty={min_qty:.8f} (notional={notional:.4f}USDT)"
         )
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.qty",
+            side=chosen_signal,
+            reason="qty_too_small",
+            extra={"qty": qty, "min_qty": min_qty, "notional": notional},
+        )
         return None, 5.0
 
     # (6) 실제 주문 실행
     side = "BUY" if chosen_signal == "LONG" else "SELL"
-    regime_at_entry = _infer_regime_from_signal(signal_source)
+    regime_at_entry = regime_label
 
     # RANGE 신호에서 넘어온 soft_mode / SL 바닥 비율(extra)을 open_position_with_tp_sl 에 그대로 전달
     soft_mode = False
@@ -982,6 +1093,19 @@ def try_open_new_position(
 
     if trade is None:
         send_skip_tg("[SKIP] open_position_failed: trade_object_is_none")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_at_entry,
+            source="entry_flow.open_position",
+            side=chosen_signal,
+            reason="open_position_failed_trade_none",
+            extra={
+                "qty": qty,
+                "tp_pct": tp_pct,
+                "sl_pct": sl_pct,
+                "effective_risk_pct": effective_risk_pct,
+            },
+        )
         return None, 3.0
 
     # (7) bt_trades INSERT
