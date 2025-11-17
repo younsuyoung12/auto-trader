@@ -10,6 +10,14 @@ Render 같은 서버에서도 그 토큰으로 업로드할 수 있다.
 필수 환경변수
 - GOOGLE_OAUTH_TOKEN_JSON : token.json 내용 전체 (한 줄로 넣어도 됨)
 - GOOGLE_DRIVE_FOLDER_ID   : 업로드할 드라이브 폴더 ID
+
+2025-11-17 패치 (invalid_scope 방지)
+----------------------------------------------------
+1) token.json 안에 scopes 정보가 있으면 그 값을 그대로 사용하도록 변경.
+   - Credentials.from_authorized_user_info(token_info) 형태로 호출
+   - 서버 코드에서 별도 스코프를 강제로 지정하지 않음
+2) token.json 에 scopes 필드가 없는 구버전만 _DEFAULT_SCOPES 를 fallback 으로 사용.
+   - 이 경우에도 스코프는 하나의 리스트로 명확하게 지정
 """
 
 from __future__ import annotations
@@ -23,9 +31,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
-# 우리가 OAuth에서 요청했던 스코프 그대로
-_SCOPES = [
-    "https://www.googleapis.com/auth/drive",
+# token.json 에 scopes 가 없을 때만 사용하는 기본 스코프(fallback)
+_DEFAULT_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
@@ -45,9 +52,15 @@ def _get_service():
     # token.json 내용이 곧 authorized_user_info 형식이다.
     token_info = json.loads(token_str)
 
-    # refresh_token, client_id, client_secret 이 들어있으면
-    # Credentials 가 알아서 갱신도 해준다.
-    creds = Credentials.from_authorized_user_info(token_info, scopes=_SCOPES)
+    # token.json 에 scopes 가 있으면 그대로 사용
+    token_scopes = token_info.get("scopes")
+
+    if token_scopes:
+        # 이미 발급된 토큰의 스코프를 그대로 사용 → invalid_scope 방지
+        creds = Credentials.from_authorized_user_info(token_info)
+    else:
+        # 아주 구버전 token.json 등에서 scopes 가 비어있을 때만 fallback
+        creds = Credentials.from_authorized_user_info(token_info, scopes=_DEFAULT_SCOPES)
 
     service = build("drive", "v3", credentials=creds)
     return service, folder_id
