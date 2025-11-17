@@ -37,6 +37,12 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
      최근 PnL/skip_streak 이 GPT 프롬프트에 함께 전달되어 장 흐름/가드 상태를 보고 리스크를 조정할 수 있게 함.
    - gpt_trader 가 돌려준 guard_adjustments 는 settings 의 해당 필드를 한 루프 동안만 override 해서
      거래량/스프레드/점프 가드에 1회성으로 반영한다.
+8) GPT 응답 지연(타임아웃) 처리 분리.
+   - gpt_trader 결과에서 status="TIMEOUT" 이거나, gpt_action="ERROR" 이면서 reason 에
+     "응답 지연" / "timeout" 이 포함된 경우를 TIMEOUT 으로 간주.
+   - 이 경우에는 GPT_ENTRY_HARD_DOWN 을 건드리지 않고, 해당 시그널만 SKIP 처리 후 gpt_skip_sleep_sec 만큼 대기.
+   - events CSV 에도 source="entry_flow.gpt_timeout", reason="gpt_timeout" 으로 기록하여
+     진짜 장애(hard error)와 응답 지연(timeout)을 구분할 수 있게 했다.
 
 2025-11-16 변경 사항 (GPT-5 진입 게이트 + gpt_decider.py 일원화)
 ----------------------------------------------------
@@ -905,9 +911,45 @@ def try_open_new_position(
     raw_decision = gpt_result.get("raw") or {}
     reason_val = gpt_result.get("reason")
     gpt_reason = str(reason_val) if isinstance(reason_val, str) else None
+    status_val = gpt_result.get("status")
+    gpt_status = str(status_val).upper() if isinstance(status_val, str) else ""
     gpt_decision = raw_decision  # EntryScore 메타용
 
-    # (4-4) GPT 하드 장애 감지: gpt_action == ERROR 이고 raw 가 비어 있는 경우
+    # (4-4) GPT 타임아웃(응답 지연) → 이 캔들만 SKIP (하드 스톱 금지)
+    is_timeout = False
+    if gpt_status == "TIMEOUT":
+        is_timeout = True
+    elif gpt_action == "ERROR" and gpt_reason:
+        reason_lower = gpt_reason.lower()
+        if "응답 지연" in gpt_reason or "timeout" in reason_lower or "time out" in reason_lower:
+            is_timeout = True
+
+    if is_timeout:
+        msg = f"[GPT_ENTRY][TIMEOUT] {gpt_reason or 'gpt_timeout'} → this signal skipped (no hard stop)"
+        log(msg)
+        try:
+            send_skip_tg(msg)
+        except Exception as te:
+            log(f"[GPT_ENTRY] send_skip_tg failed on timeout: {te}")
+
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.gpt_timeout",
+            side=chosen_signal,
+            reason="gpt_timeout",
+            extra={"gpt_result": gpt_result},
+        )
+
+        sleep_sec = float(
+            gpt_result.get(
+                "sleep_after_sec",
+                getattr(settings, "gpt_skip_sleep_sec", 3.0),
+            )
+        )
+        return None, sleep_sec
+
+    # (4-5) GPT 하드 장애 감지: gpt_action == ERROR 이고 raw 가 비어 있는 경우
     if gpt_action == "ERROR" and not raw_decision:
         msg = "[GPT_ENTRY][ERROR] GPT_TRADER returned ERROR with empty raw → hard stop"
         log(msg)
@@ -939,7 +981,7 @@ def try_open_new_position(
         sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
         return None, sleep_sec
 
-    # (4-5) GPT 판단에 따른 일반 SKIP (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
+    # (4-6) GPT 판단에 따른 일반 SKIP (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
     if final_action != "ENTER":
         msg = f"[GPT_ENTRY][SKIP] action={gpt_action or 'NONE'} reason={gpt_reason or 'no_reason'}"
         log(msg)
@@ -960,7 +1002,7 @@ def try_open_new_position(
         )
         return None, sleep_sec
 
-    # (4-6) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
+    # (4-7) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
     effective_risk_pct = float(gpt_result.get("effective_risk_pct", effective_risk_pct))
     tp_pct = float(gpt_result.get("tp_pct", tp_pct))
     sl_pct = float(gpt_result.get("sl_pct", sl_pct))
