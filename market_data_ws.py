@@ -5,6 +5,21 @@ BingX swap-market 웹소켓으로 1m/5m/15m 캔들과 depth5를 받아서
 메모리 버퍼에 보관하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
 getter 로 제공하는 모듈.
 
+PATCH NOTES — 2025-11-17 (5m/15m 딜레이 디버그 & 폴백 금지 보강)
+----------------------------------------------------
+1) kline 수신 시 교환소 ts 가 0 또는 누락된 레코드는 버퍼에 넣지 않고
+   [MD-WS WARN] 로그만 남기도록 수정했다.
+2) 심볼/주기별 마지막 수신 시각(_kline_last_recv_ts)을 별도 보관한다.
+   - get_last_kline_delay_ms(...) 로 "로컬 수신 기준 딜레이(ms)"를
+     상위 모듈에서 바로 확인할 수 있다.
+   - get_kline_buffer_status(...) 로 버퍼 길이/마지막 ts/딜레이를
+     한 번에 조회할 수 있다.
+3) REST 백필(preload_klines/backfill_klines_from_rest) 시에도
+   최근 수신 시각을 갱신해 WS/REST 모두에 대해 딜레이 체크가
+   일관되게 동작하도록 정리했다.
+4) 이 모듈은 BingX WS/REST 원본만 사용하며, 캔들을 인위적으로
+   생성/보정하는 폴백 로직은 두지 않는다.
+
 PATCH NOTES — 2025-11-15 (4차: REST dict 포맷 백필 호환)
 ----------------------------------------------------
 1) REST /kline 응답 포맷 보강
@@ -108,6 +123,9 @@ WS_INTERVALS: List[str] = getattr(SET, "ws_subscribe_tfs", None) or ["1m", "5m",
 # { (symbol, interval): [(ts, o, h, l, c, v), ...] }
 _kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float, float]]] = {}
 
+# { (symbol, interval): last_recv_ts_ms }
+_kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
+
 # { symbol: {"bids": [...], "asks": [...], "ts": ..., "exchTs": ..., "markPrice": ..., "lastPrice": ...} }
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 
@@ -167,12 +185,24 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
     """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다."""
     key = (symbol, interval)
     ts = int(item.get("t") or item.get("T") or 0)
+    if ts <= 0:
+        # ts 가 비정상이면 버퍼를 오염시키지 않고 경고만 남긴다.
+        try:
+            log(
+                f"[MD-WS WARN] invalid kline ts for {symbol} {interval}: "
+                f"payload={_safe_dump_for_log(item)}"
+            )
+        except Exception:
+            pass
+        return
+
     o = float(item.get("o") or 0)
     h = float(item.get("h") or 0)
     l = float(item.get("l") or 0)
     c = float(item.get("c") or 0)
     v = float(item.get("v") or 0)
 
+    now_ms = _now_ms()
     with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
         before_len = len(buf)
@@ -183,12 +213,14 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
             if len(buf) > MAX_KLINES:
                 del buf[0 : len(buf) - MAX_KLINES]
         after_len = len(buf)
+        _kline_last_recv_ts[key] = now_ms
 
     if getattr(SET, "ws_log_enabled", True):
         try:
+            age_ms = max(0, now_ms - ts)
             log(
                 f"[MD-WS] {symbol} {interval} kline updated "
-                f"(ts={ts}, buf_len={after_len}, added={after_len - before_len})"
+                f"(ts={ts}, age_ms={age_ms}, buf_len={after_len}, added={after_len - before_len})"
             )
         except Exception:
             pass
@@ -419,11 +451,6 @@ def start_ws_loop(symbol: str) -> None:
     log(f"[MD-WS] background ws started for {symbol}")
 
 
-# ─────────────────────────────
-# REST 히스토리 백필용 헬퍼
-# ─────────────────────────────
-
-
 def preload_klines(
     symbol: str,
     interval: str,
@@ -435,6 +462,8 @@ def preload_klines(
         trimmed = list(rows[-MAX_KLINES:])
         _kline_buffers[key] = trimmed
         buf_len = len(trimmed)
+        if trimmed:
+            _kline_last_recv_ts[key] = _now_ms()
 
     if getattr(SET, "ws_log_enabled", True):
         try:
@@ -500,7 +529,6 @@ def backfill_klines_from_rest(
                 pass
         return
 
-    # ts 기준 정렬 후, 변환 결과 요약 로그
     try:
         converted.sort(key=lambda x: x[0])
     except Exception:
@@ -519,11 +547,6 @@ def backfill_klines_from_rest(
             pass
 
     preload_klines(symbol, interval, converted)
-
-
-# ─────────────────────────────
-# getter 들 (잠금으로 동시성 보장)
-# ─────────────────────────────
 
 
 def get_klines(symbol: str, interval: str, limit: int = 120):
@@ -554,6 +577,52 @@ def get_klines_with_volume(symbol: str, interval: str, limit: int = 120):
         return list(buf[-limit:])
 
 
+def get_last_kline_ts(symbol: str, interval: str) -> Optional[int]:
+    """지정 심볼/주기의 마지막 캔들 교환소 타임스탬프(ms)를 반환한다."""
+    key = (symbol, interval)
+    with _kline_lock:
+        buf = _kline_buffers.get(key, [])
+        if not buf:
+            return None
+        return int(buf[-1][0])
+
+
+def get_last_kline_delay_ms(symbol: str, interval: str) -> Optional[int]:
+    """마지막 캔들이 로컬에 도착한 뒤 경과한 시간(ms)을 반환한다.
+
+    - WS 가 멈췄는지/지연됐는지를 상위 레이어에서 판단할 때 사용한다.
+    - kline 자체는 항상 BingX WS/REST 원본만 사용하고, 여기서 인위적으로
+      보정하거나 생성하지 않는다(폴백 금지).
+    """
+    key = (symbol, interval)
+    now = _now_ms()
+    with _kline_lock:
+        recv_ts = _kline_last_recv_ts.get(key)
+    if recv_ts is None:
+        return None
+    return max(0, now - recv_ts)
+
+
+def get_kline_buffer_status(symbol: str, interval: str) -> Dict[str, Any]:
+    """디버그용: 버퍼 길이, 마지막 ts, 지연(ms)을 dict 로 돌려준다."""
+    key = (symbol, interval)
+    with _kline_lock:
+        buf = _kline_buffers.get(key, [])
+        last_ts = buf[-1][0] if buf else None
+        last_recv = _kline_last_recv_ts.get(key)
+    delay_ms = None
+    if last_recv is not None:
+        delay_ms = max(0, _now_ms() - last_recv)
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "buffer_len": len(buf),
+        "last_ts": last_ts,
+        "last_recv_ts": last_recv,
+        "delay_ms": delay_ms,
+    }
+
+
 def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
     """최대 limit 까지 잘린 bids/asks 를 포함해 현재 오더북 스냅샷을 반환한다."""
     with _orderbook_lock:
@@ -575,5 +644,8 @@ __all__ = [
     "backfill_klines_from_rest",
     "get_klines",
     "get_klines_with_volume",
+    "get_last_kline_ts",
+    "get_last_kline_delay_ms",
+    "get_kline_buffer_status",
     "get_orderbook",
 ]

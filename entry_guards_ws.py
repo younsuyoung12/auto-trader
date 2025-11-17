@@ -1,20 +1,37 @@
+"""
+entry_guards_ws.py
+=====================================================
+엔트리 직전 각종 가드를 묶어 놓은 모듈 (WS 버퍼 전용).
+
+PATCH NOTES — 2025-11-17 (WS 원천 데이터 강제 + 폴백 제거)
+----------------------------------------------------
+1) 모든 가드는 WS/실제 데이터가 이상하거나 부족할 때
+   "통과(True)"가 아니라 **SKIP(거래 건너뛰기)** 로 동작하도록 변경.
+   - 거래량 가드: 볼륨 파싱 에러 / 평균값 0 / 샘플 부족 시 진입 금지.
+   - 가격 점프 가드: 5m 캔들 2개 미만 / 가격 0 이하 시 진입 금지.
+   - 스프레드/호가 가드: 오더북 없음 / BBO 파싱 에러 / BBO 비정상 시 진입 금지.
+2) 각 SKIP 상황은 telelog + signals_logger 에 reason/extra 를 남겨
+   나중에 CSV / 로그 분석으로 원인을 역추적할 수 있게 함.
+3) get_orderbook 는 market_data_ws(WS 버퍼)만 사용하며,
+   REST 등 다른 소스로의 폴백은 두지 않는다.
+"""
+
 from __future__ import annotations
 
 import datetime
-import time
 from typing import Any, Callable, List, Optional, Tuple
 
 from telelog import send_skip_tg, log
 from signals_logger import log_signal
-from market_data_ws import get_orderbook  # WS 버퍼에서 호가 읽기
+from market_data_ws import get_orderbook  # WS 버퍼에서 호가 읽기 (폴백 없음)
 
 
 # ─────────────────────────────
 # 세션(시간대) 유틸
 # ─────────────────────────────
+
 def _get_session_multipliers(settings: Any) -> Tuple[float, float]:
-    """
-    현재 UTC 시각을 기반으로 어느 세션인지 대략 나누고,
+    """현재 UTC 시각을 기반으로 어느 세션인지 대략 나누고,
     스프레드/점프 허용치에 곱할 배수를 돌려준다.
     """
     now_utc = datetime.datetime.utcnow()
@@ -36,17 +53,23 @@ def _get_session_multipliers(settings: Any) -> Tuple[float, float]:
 # ─────────────────────────────
 # 1. 수동 포지션 / usedMargin 가드
 # ─────────────────────────────
+
 def check_manual_position_guard(
     *,
     get_balance_detail_func: Callable[[], Any],
     symbol: str,
     latest_ts: int,
 ) -> bool:
+    """usedMargin>0 이면 수동/기존 포지션이 있다고 보고 신규 진입을 막는다.
+
+    - 잔고 조회 에러 자체도 리스크로 보고 진입을 SKIP 한다.
+    """
     try:
         bal_detail = get_balance_detail_func()
         used_margin = float(bal_detail.get("usedMargin") or 0.0)
     except Exception as e:
         log(f"[MANUAL_GUARD] balance detail error: {e}")
+        send_skip_tg("[SKIP] manual_guard_balance_error: 잔고 상세 조회 실패")
         log_signal(
             event="SKIP",
             symbol=symbol,
@@ -75,6 +98,7 @@ def check_manual_position_guard(
 # ─────────────────────────────
 # 2. 거래량 가드 (5m 기준)
 # ─────────────────────────────
+
 def check_volume_guard(
     *,
     settings: Any,
@@ -83,18 +107,61 @@ def check_volume_guard(
     signal_source: str,
     direction: str,
 ) -> bool:
+    """최근 5m 거래량이 직전 20개 평균 대비 너무 작으면 진입을 막는다.
+
+    - WS 5m 캔들 포맷: [ts, open, high, low, close, volume]
+    - 볼륨 파싱 실패 / 샘플 부족 / 평균 0 인 경우도 모두 SKIP (폴백 금지).
+    """
     sym = getattr(settings, "symbol", "UNKNOWN")
     log(f"[GUARD] (WS) volume len={len(candles_5m_raw)} symbol={sym}")
+
     min_vol_ratio = float(getattr(settings, "min_entry_volume_ratio", 0.3))
+
+    # 샘플이 너무 적으면 거래량 가드 자체를 수행하지 않고 진입을 막는다.
+    if len(candles_5m_raw) < 20:
+        send_skip_tg("[SKIP] volume_guard_insufficient_samples: 5m<20")
+        log_signal(
+            event="SKIP",
+            symbol=sym,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="volume_guard_insufficient_samples",
+            candle_ts=latest_ts,
+            extra=f"len_5m={len(candles_5m_raw)}",
+        )
+        return False
+
     try:
         last_vol = float(candles_5m_raw[-1][5])
         vols_20 = [float(c[5]) for c in candles_5m_raw[-20:]]
         avg_vol_20 = sum(vols_20) / len(vols_20) if vols_20 else 0.0
-    except Exception:
-        return True
+    except Exception as e:
+        # 볼륨 파싱 에러 → 진입 금지 (폴백 없음)
+        send_skip_tg("[SKIP] volume_guard_parse_error: 5m volume parsing failed")
+        log_signal(
+            event="SKIP",
+            symbol=sym,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="volume_guard_parse_error",
+            candle_ts=latest_ts,
+            extra=str(e),
+        )
+        return False
 
     if avg_vol_20 <= 0:
-        return True
+        # 기준 평균이 0 이면 거래량 상태가 비정상 → 진입 금지
+        send_skip_tg("[SKIP] volume_guard_no_reference: avg_vol_20<=0")
+        log_signal(
+            event="SKIP",
+            symbol=sym,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="volume_guard_no_reference",
+            candle_ts=latest_ts,
+            extra=f"last_vol={last_vol}, avg_vol_20={avg_vol_20}",
+        )
+        return False
 
     ratio = last_vol / avg_vol_20
 
@@ -119,6 +186,7 @@ def check_volume_guard(
 # ─────────────────────────────
 # 3. 가격 점프 + 캔들 변동성 가드 (5m 기준, 세션 배수 적용)
 # ─────────────────────────────
+
 def check_price_jump_guard(
     *,
     settings: Any,
@@ -127,23 +195,49 @@ def check_price_jump_guard(
     signal_source: str,
     direction: str,
 ) -> bool:
+    """직전 5m 종가/고가/저가를 기준으로 급격한 점프/변동성을 제한한다.
+
+    - 5m 캔들이 2개 미만이면 기준이 없어 진입을 막는다.
+    - 가격이 0 이하 같은 비정상 값도 진입 금지.
+    """
     sym = getattr(settings, "symbol", "UNKNOWN")
     log(f"[GUARD] (WS) price_jump len={len(candles_5m)} symbol={sym}")
+
     if len(candles_5m) < 2:
-        return True
+        send_skip_tg("[SKIP] price_jump_insufficient_candles: 5m<2")
+        log_signal(
+            event="SKIP",
+            symbol=sym,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="price_jump_insufficient_candles",
+            candle_ts=latest_ts,
+            extra=f"len_5m={len(candles_5m)}",
+        )
+        return False
 
     # 세션별 jump 배수
     _, jump_mult = _get_session_multipliers(settings)
     base_jump = float(getattr(settings, "max_price_jump_pct", 0.003))
     max_jump_pct = base_jump * jump_mult
 
-    last_price = candles_5m[-1][4]
-    prev_price = candles_5m[-2][4]
-    last_high = candles_5m[-1][2]
-    last_low = candles_5m[-1][3]
+    last_price = float(candles_5m[-1][4])
+    prev_price = float(candles_5m[-2][4])
+    last_high = float(candles_5m[-1][2])
+    last_low = float(candles_5m[-1][3])
 
     if prev_price <= 0 or last_price <= 0:
-        return True
+        send_skip_tg("[SKIP] price_jump_invalid_price: prev/last<=0")
+        log_signal(
+            event="SKIP",
+            symbol=sym,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="price_jump_invalid_price",
+            candle_ts=latest_ts,
+            extra=f"prev_price={prev_price}, last_price={last_price}",
+        )
+        return False
 
     move_pct = abs(last_price - prev_price) / prev_price
     if move_pct > max_jump_pct:
@@ -188,10 +282,12 @@ def check_price_jump_guard(
 # ─────────────────────────────
 # (보조) depth 한쪽 쏠림 체크
 # ─────────────────────────────
+
 def _is_depth_imbalanced(
     settings: Any,
     orderbook: dict,
 ) -> bool:
+    """5레벨 depth 에서 한쪽(매수/매도) 명목가가 너무 큰지 확인한다."""
     enabled = bool(getattr(settings, "depth_imbalance_enabled", True))
     if not enabled:
         return False
@@ -234,12 +330,14 @@ def _is_depth_imbalanced(
 # ─────────────────────────────
 # (보조) mark/last 괴리 체크
 # ─────────────────────────────
+
 def _is_price_deviation_large(
     settings: Any,
     orderbook: dict,
     best_bid: float,
     best_ask: float,
 ) -> bool:
+    """markPrice/lastPrice 가 mid 에서 과도하게 벗어나 있는지 확인한다."""
     enabled = bool(getattr(settings, "price_deviation_guard_enabled", True))
     if not enabled:
         return False
@@ -278,6 +376,7 @@ def _is_price_deviation_large(
 # ─────────────────────────────
 # 4. 스프레드/호가 가드 (WS depth) + depth 쏠림 + mark/last 괴리
 # ─────────────────────────────
+
 def check_spread_guard(
     *,
     settings: Any,
@@ -286,13 +385,29 @@ def check_spread_guard(
     signal_source: str,
     direction: str,
 ) -> Tuple[bool, Optional[float], Optional[float]]:
+    """WS depth5 기반 스프레드/호가 가드.
+
+    - 오더북 없음 / BBO 파싱 에러 / BBO 비정상 / 너무 넓은 스프레드 → 전부 SKIP.
+    - depth 한쪽 쏠림 / mark·last 괴리도 진입 금지.
+    - 성공 시 True + (best_bid, best_ask)를 반환.
+    """
     orderbook = get_orderbook(symbol, 5)
     log(f"[GUARD] (WS) spread symbol={symbol} ob_ok={bool(orderbook)}")
+
     if not orderbook:
-        return True, None, None
+        send_skip_tg("[SKIP] orderbook_unavailable: WS depth empty")
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="orderbook_unavailable",
+            candle_ts=latest_ts,
+        )
+        return False, None, None
 
     # D) 오더북 신선도(지연) 가드
-    now_ms = int(time.time() * 1000)
+    now_ms = int(datetime.datetime.utcnow().timestamp() * 1000)
     ob_ts = int(orderbook.get("ts") or 0)
     ob_age_ms = now_ms - ob_ts if ob_ts > 0 else -1
     max_ob_age = int(getattr(settings, "max_orderbook_age_ms", 3000))
@@ -312,7 +427,16 @@ def check_spread_guard(
     bids = orderbook.get("bids") or []
     asks = orderbook.get("asks") or []
     if not bids or not asks:
-        return True, None, None
+        send_skip_tg("[SKIP] orderbook_bbo_missing: no bids/asks")
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="orderbook_bbo_missing",
+            candle_ts=latest_ts,
+        )
+        return False, None, None
 
     try:
         best_bid = float(bids[0][0] if isinstance(bids[0], list) else bids[0].get("price"))
@@ -329,7 +453,17 @@ def check_spread_guard(
         )
     except Exception as e:
         log(f"[SPREAD PARSE ERROR] {e}")
-        return True, None, None
+        send_skip_tg("[SKIP] spread_guard_parse_error: BBO parse failed")
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="spread_guard_parse_error",
+            candle_ts=latest_ts,
+            extra=str(e),
+        )
+        return False, None, None
 
     # E) 비정상 BBO 가드
     if not best_bid or not best_ask or best_bid >= best_ask:

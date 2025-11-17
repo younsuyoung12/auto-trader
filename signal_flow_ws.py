@@ -4,12 +4,23 @@ signal_flow_ws.py (simultaneous arbitration + GPT extra 확장)
 시그널 결정 전담 모듈 (웹소켓 기반, 동시 평가 + 중재 버전).
 run_bot.py / run_bot_ws.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
 
-PATCH NOTES — 2025-11-17 (방향 정보 확장 + GPT 컨텍스트 정리)
+PATCH NOTES — 2025-11-17 (WS 원천 데이터 강제 + 방향 정보 확장)
 ----------------------------------------------------
 L) GPT 컨텍스트에 방향 정보를 명시적으로 추가
    - extra["direction_raw"]  : Candidate.side (BUY/SELL)
    - extra["direction_norm"] : 최종 chosen_signal (LONG/SHORT)
    → entry_flow / gpt_decider 가 LONG/SHORT 기준으로 일관되게 해석할 수 있도록 보조.
+
+M) WS 5m 캔들 소스 폴백 제거 (폴백 금지)
+   - market_data_ws.get_klines_with_volume(...) import 를 필수로 변경.
+   - get_trading_signal(...) 에서 5m 캔들은 항상 ws_get_klines_with_volume(...) 로만 읽는다.
+   - 볼륨 없는 get_klines(...) 로의 자동 폴백을 제거해서,
+     WS 버퍼/원천 데이터 문제가 있으면 바로 드러나도록 했다.
+
+N) 5m_kline_delayed 진단 로그 강화
+   - now_ms - latest_5m_ts 를 delay_ms 로 계산해서 log_signal(extra=...)에 함께 남김.
+   - 텔레그램 메시지는 기존 "[SKIP] 5m_kline_delayed: ..." 문자열을 유지해
+     telelog 쿨다운 키를 깨지 않는다.
 
 PATCH NOTES — 2025-11-16 (GPT-5 연동용 extra 확장 + 방향 표기 통일 + 보조 중재기)
 ----------------------------------------------------
@@ -62,8 +73,8 @@ E) 기존 1m 확인 로직과 메시지 **그대로 유지**
 F) 설정 키 미존재 대비 안전장치 강화
    - 전역적으로 `getattr(settings, ..., default)` 사용 (운영 중 ENV 누락/회귀로 인한 크래시 방지)
 G) 호환성 보강(중요)
-   - `market_data_ws.get_klines_with_volume(...)`가 없을 때 자동으로 `get_klines(...)`로 폴백
-   - TREND TP/SL 은 `settings.trend_tp_pct`가 없으면 `settings.tp_pct`로 자동 폴백
+   - (이전 버전) market_data_ws.get_klines_with_volume(...) 가 없으면 get_klines(...) 로 폴백
+   - 현재 버전(2025-11-17)에서는 위 폴백을 제거했고, get_klines_with_volume 가 필수다.
 
 PATCH NOTES — 2025-11-13 (이전 패치 유지)
 ----------------------------------------------------
@@ -94,17 +105,18 @@ from telelog import log, send_skip_tg
 from signals_logger import log_signal
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 웹소켓 버퍼에서 캔들을 읽는다 (볼륨 지원 API가 없으면 자동 폴백)
+# 웹소켓 버퍼에서 캔들을 읽는다 (WS 원천 데이터 강제, 폴백 금지)
 # ──────────────────────────────────────────────────────────────────────────────
 try:
-    from market_data_ws import get_klines as ws_get_klines  # 필수
+    from market_data_ws import (
+        get_klines as ws_get_klines,  # 1m/15m 등 일반 캔들
+        get_klines_with_volume as ws_get_klines_with_volume,  # 5m+volume 전용 (필수)
+    )
 except Exception as e:  # pragma: no cover - 환경 오류 시 바로 예외
-    raise ImportError("market_data_ws.get_klines 가 필요합니다") from e
-
-try:
-    from market_data_ws import get_klines_with_volume as ws_get_klines_with_volume  # 선택
-except Exception:
-    ws_get_klines_with_volume = None  # type: ignore[assignment]
+    raise ImportError(
+        "signal_flow_ws 는 market_data_ws.get_klines / get_klines_with_volume 가 모두 준비된 "
+        "WS 환경에서만 사용할 수 있습니다 (폴백 금지)."
+    ) from e
 
 from indicators import calc_atr
 from strategies_trend_ws import (
@@ -233,6 +245,7 @@ def _range_width_ratio_5m(
 
 
 def _decide_signal_5m_trend(
+    *,
     candles_5m: List[Tuple[int, float, float, float, float]],
 ) -> Optional[str]:
     """아주 단순한 5m 추세판단.
@@ -300,7 +313,7 @@ def _trend_candidate(
         return None
 
     # 5m 방향
-    sig_5m = _decide_signal_5m_trend(candles_5m)
+    sig_5m = _decide_signal_5m_trend(candles_5m=candles_5m)
     trend_15m_val = decide_trend_15m(candles_15m)
 
     # 5m/15m 정합성 검사(완화: 5m 없음→15m만으로 허용)
@@ -571,14 +584,10 @@ def get_trading_signal(
     """
     symbol = settings.symbol
 
-    # 1) 5m 캔들 (거래량 포함 시도 → 미지원이면 일반 캔들로 폴백)
+    # 1) 5m 캔들 (거래량 포함 / 폴백 금지)
     log(f"[SIGNAL] (WS) fetch 5m candles for {symbol} limit=120")
-    if callable(ws_get_klines_with_volume):  # type: ignore[arg-type]
-        # 포함 포맷: [ts, o, h, l, c, v]
-        candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", 120)
-    else:
-        # 포맷: [ts, o, h, l, c]
-        candles_5m_raw = ws_get_klines(symbol, "5m", 120)
+    # ws_get_klines_with_volume 는 위에서 필수 import 이므로, 실패하면 즉시 오류가 드러난다.
+    candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", 120)
 
     if not candles_5m_raw or len(candles_5m_raw) < 50:
         log("[SIGNAL] 5m candles not enough (<50) → skip signal")
@@ -589,10 +598,11 @@ def get_trading_signal(
     latest_5m_ts = int(candles_5m[-1][0])
     last_price = float(candles_5m[-1][4])
 
-    # 2) 캔들 지연 체크
+    # 2) 캔들 지연 체크 (폴백 없이, 실제 딜레이를 extra 로 남김)
     now_ms = int(time.time() * 1000)
     max_delay_ms = int(getattr(settings, "max_kline_delay_sec", 10)) * 1000
-    if now_ms - latest_5m_ts > max_delay_ms:
+    delay_ms = now_ms - latest_5m_ts
+    if delay_ms > max_delay_ms:
         send_skip_tg("[SKIP] 5m_kline_delayed: 최근 5m 캔들이 지연되었습니다.")
         log_signal(
             event="SKIP",
@@ -600,6 +610,7 @@ def get_trading_signal(
             strategy_type="UNKNOWN",
             reason="5m_kline_delayed",
             candle_ts=latest_5m_ts,
+            extra=f"delay_ms={delay_ms}, max_delay_ms={max_delay_ms}",
         )
         return None
 
