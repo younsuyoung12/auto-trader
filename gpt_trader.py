@@ -8,6 +8,25 @@
 #     · 반대로 너무 위험한 완화/레버리지 제안은 settings_ws.BotSettings 상한/하한으로 완전히 차단한다.
 # - 장 흐름(최근 PnL/스킵 패턴 등)에 따라, 가드·리스크 파라미터를 동적으로 조정하는 AI 게이트웨이.
 #
+# 2025-11-19 변경 사항 (GPT 지연/장애 하드 스톱 + 상태 플래그)
+# ----------------------------------------------------
+# 1) decide_entry_with_gpt_trader(...) 에 GPT 진입 장애 상태 관리 레이어 추가:
+#    - 연속 에러/타임아웃 횟수를 전역 카운터로 추적.
+#    - 임계치 이상이면 일정 시간 동안 신규 진입을 강제로 차단(HARD_STOP)한다.
+# 2) 하드 스톱 윈도우 동안에는:
+#    - final_action="SKIP", gpt_action="ERROR", gpt_status="HARD_STOP", hard_stop=True 로 반환.
+#    - sleep_after_sec 를 gpt_entry_hard_stop_cooldown_sec(기본 30초)로 설정하여 쿨타임을 명확히 한다.
+# 3) 단발성 오류(임계치 미만 연속 에러)일 경우:
+#    - gpt_status="ERROR", hard_stop=False 로 표시하고,
+#    - gpt_error_sleep_sec(기본 5초) 만큼만 대기 후 다음 루프를 진행한다.
+# 4) GPT 호출이 정상적으로 성공하면:
+#    - 에러 카운터 및 하드 스톱 상태를 자동으로 리셋.
+#    - gpt_latency_sec 를 gpt_decider.ask_entry_decision 의 _meta.latency_sec 기반으로 result 에 포함한다.
+# 5) 새로운 설정값 (없으면 기본값 사용):
+#    - gpt_entry_hard_stop_min_errors (기본 3회 연속 에러 시 HARD_STOP 진입)
+#    - gpt_entry_hard_stop_cooldown_sec (기본 30.0초, 하드 스톱 유지 시간)
+#    - gpt_entry_error_reset_window_sec (기본 60.0초, 이 시간 이상 지나면 에러 카운터 리셋)
+#
 # 2025-11-18 변경 사항 (GPT 프롬프트 경량화 + 토큰 가드)
 # ----------------------------------------------------
 # 1) _build_extra_for_gpt(...) 에서 extra dict 전체를 그대로 넘기지 않고,
@@ -43,6 +62,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -73,6 +93,24 @@ def _safe_tg(msg: str) -> None:
         send_tg(msg)
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────
+# GPT 진입 장애 상태 전역 관리
+# ─────────────────────────────────────────
+
+
+_gpt_entry_error_streak: int = 0
+_gpt_entry_last_error_ts: float = 0.0
+_gpt_entry_hard_stop_until_ts: float = 0.0
+
+
+def _now_ts() -> float:
+    """time.time() 래퍼 (예외 시 0.0)."""
+    try:
+        return time.time()
+    except Exception:
+        return 0.0
 
 
 # ─────────────────────────────────────────
@@ -412,7 +450,7 @@ def _build_extra_for_gpt(
 
 
 # ─────────────────────────────────────────
-# 메인 엔트리: 진입 + 동적 가드 조절
+# 메인 엔트리: 진입 + 동적 가드 조절 + 지연/장애 하드 스톱
 # ─────────────────────────────────────────
 
 
@@ -445,6 +483,9 @@ def decide_entry_with_gpt_trader(
               "max_spread_pct": 0.001
           },
           "sleep_after_sec": 3.0,   # SKIP 시 다음 루프 전 대기 시간 (옵션)
+          "gpt_status": "OK" | "ERROR" | "HARD_STOP",
+          "gpt_latency_sec": 1.234,  # 옵션 (있을 때만)
+          "hard_stop": False,        # True 이면 상위에서 [GPT_ENTRY][HARD_STOP] 메시지 등에 활용 가능
           "raw": { ... GPT full JSON ... }
         }
 
@@ -455,7 +496,24 @@ def decide_entry_with_gpt_trader(
     - extra / guard_snapshot 는 _build_extra_for_gpt(...) 에서 통합되어
       gpt_decider.ask_entry_decision 의 프롬프트에 들어간다.
       → GPT 가 장 흐름/가드 상태를 보고 진입 강도/리스크를 조절할 수 있게 하기 위한 것.
+    - GPT 진입 장애(연속 에러/타임아웃)가 일정 횟수 이상 누적되면
+      → 일정 시간 동안 하드 스톱(HARD_STOP) 상태로 전환하여 신규 진입을 전부 막는다.
     """
+
+    global _gpt_entry_error_streak, _gpt_entry_last_error_ts, _gpt_entry_hard_stop_until_ts
+
+    # 설정값 (없으면 기본값 사용)
+    hard_stop_min_errors = int(
+        getattr(settings, "gpt_entry_hard_stop_min_errors", 3)
+    )
+    hard_stop_cooldown = float(
+        getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0)
+    )
+    error_reset_window = float(
+        getattr(settings, "gpt_entry_error_reset_window_sec", 60.0)
+    )
+
+    now_ts = _now_ts()
 
     # 기본 응답 틀
     result: Dict[str, Any] = {
@@ -467,8 +525,33 @@ def decide_entry_with_gpt_trader(
         "effective_risk_pct": base_risk_pct,
         "guard_adjustments": {},
         "sleep_after_sec": float(getattr(settings, "gpt_error_sleep_sec", 5.0)),
+        "gpt_status": "OK",   # 기본값 (성공 시 유지)
+        "gpt_latency_sec": None,
+        "hard_stop": False,
         "raw": {},
     }
+
+    # 0) 하드 스톱 윈도우가 아직 유효하면, GPT 호출 자체를 하지 않고 바로 SKIP
+    if _gpt_entry_hard_stop_until_ts and now_ts < _gpt_entry_hard_stop_until_ts:
+        remaining = max(_gpt_entry_hard_stop_until_ts - now_ts, 0.0)
+        result["final_action"] = "SKIP"
+        result["gpt_action"] = "ERROR"
+        result["gpt_status"] = "HARD_STOP"
+        result["hard_stop"] = True
+        result["reason"] = "GPT 진입 판단 장애(HARD_STOP) 상태로 신규 진입을 잠시 중단합니다."
+        # 남은 시간과 설정값 중 더 큰 값으로 쿨타임을 유지 (텔레그램 메시지와 정합성 용이)
+        result["sleep_after_sec"] = max(remaining, hard_stop_cooldown)
+        _safe_log(
+            f"[GPT_TRADER] HARD_STOP window active → skip entry (remaining={remaining:.1f}s)"
+        )
+        return result
+
+    # 하드 스톱 기간이 지났다면 상태 리셋
+    if _gpt_entry_hard_stop_until_ts and now_ts >= _gpt_entry_hard_stop_until_ts:
+        _gpt_entry_hard_stop_until_ts = 0.0
+        _gpt_entry_error_streak = 0
+        _gpt_entry_last_error_ts = 0.0
+        _safe_log("[GPT_TRADER] HARD_STOP window ended → GPT entry gate reopened")
 
     # 1) GPT에 진입 의사결정 요청 (폴백 래퍼 사용 금지)
     extra_for_gpt = _build_extra_for_gpt(
@@ -493,12 +576,53 @@ def decide_entry_with_gpt_trader(
             extra=extra_for_gpt,
         )
         result["raw"] = gpt_json
+
+        # 정상 응답이 오면 에러 카운터/하드 스톱 관련 상태를 리셋
+        _gpt_entry_error_streak = 0
+        _gpt_entry_last_error_ts = 0.0
+
+        # latency 메타 정보 추출 (있을 때만)
+        meta = gpt_json.get("_meta") if isinstance(gpt_json, dict) else None
+        if isinstance(meta, dict):
+            lat = meta.get("latency_sec")
+            if isinstance(lat, (int, float)):
+                result["gpt_latency_sec"] = float(lat)
     except Exception as e:
         # 폴백 진입 없이, 해당 루프는 단순 SKIP 처리
-        msg = f"[GPT_TRADER] ask_entry_decision error → SKIP: {e}"
+        now_ts = _now_ts()
+
+        # 에러 간격이 너무 길면 카운터 리셋
+        if _gpt_entry_last_error_ts and (now_ts - _gpt_entry_last_error_ts) > error_reset_window:
+            _gpt_entry_error_streak = 0
+        _gpt_entry_last_error_ts = now_ts
+        _gpt_entry_error_streak += 1
+
+        msg = f"[GPT_TRADER] ask_entry_decision error (streak={_gpt_entry_error_streak}) → SKIP: {e}"
         _safe_log(msg)
-        _safe_tg("⚠️ GPT 진입 판단 호출에 실패했습니다. 이번 루프는 진입 없이 건너뜁니다.")
-        result["reason"] = "GPT 호출 오류로 진입 스킵"
+
+        # 하드 스톱 진입 여부 판단
+        if _gpt_entry_error_streak >= hard_stop_min_errors:
+            _gpt_entry_hard_stop_until_ts = now_ts + hard_stop_cooldown
+            result["gpt_status"] = "HARD_STOP"
+            result["hard_stop"] = True
+            result["reason"] = (
+                "GPT 진입 판단이 반복적으로 실패하여 일정 시간 신규 진입을 중단합니다."
+            )
+            result["sleep_after_sec"] = hard_stop_cooldown
+            _safe_tg(
+                "⚠️ [GPT_ENTRY][HARD_STOP] GPT 진입 판단 장애가 반복되어 일정 시간 신규 진입을 중단합니다."
+            )
+        else:
+            result["gpt_status"] = "ERROR"
+            result["hard_stop"] = False
+            result["reason"] = "GPT 호출 오류로 이번 루프는 진입 없이 건너뜁니다."
+            result["sleep_after_sec"] = float(
+                getattr(settings, "gpt_error_sleep_sec", 5.0)
+            )
+            _safe_tg(
+                "⚠️ GPT 진입 판단 호출에 실패했습니다. 이번 루프는 진입 없이 건너뜁니다."
+            )
+
         return result
 
     # 2) GPT action 정규화
@@ -507,6 +631,7 @@ def decide_entry_with_gpt_trader(
         _safe_log(f"[GPT_TRADER] invalid action from GPT: {action_raw!r} → SKIP")
         result["reason"] = f"GPT가 알 수 없는 action을 반환했습니다: {action_raw!r}"
         result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
+        result["gpt_status"] = "ERROR"
         return result
 
     result["gpt_action"] = action_raw
@@ -533,6 +658,7 @@ def decide_entry_with_gpt_trader(
         result["sleep_after_sec"] = float(
             getattr(settings, "gpt_skip_sleep_sec", 3.0)
         )
+        result["gpt_status"] = "ERROR"
         _safe_log("[GPT_TRADER] effective_risk_pct <= 0 → SKIP")
         return result
 
@@ -550,9 +676,13 @@ def decide_entry_with_gpt_trader(
     if action_raw in {"ENTER", "ADJUST"}:
         result["final_action"] = "ENTER"
         result["sleep_after_sec"] = 0.0
+        result["gpt_status"] = "OK"
     else:
         result["final_action"] = "SKIP"
         result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
+        # 일반적인 SKIP 은 장애가 아니라 보수적 판단으로 본다.
+        if result["gpt_status"] == "OK":
+            result["gpt_status"] = "OK"
 
     reason = gpt_json.get("reason") or "GPT 판단 결과 반영"
     result["reason"] = str(reason)
@@ -560,7 +690,7 @@ def decide_entry_with_gpt_trader(
     # 6) 요약 로그
     try:
         _safe_log(
-            "[GPT_TRADER] final_action={} gpt_action={} tp={} sl={} risk={} guards={} symbol={} src={} dir={}".format(
+            "[GPT_TRADER] final_action={} gpt_action={} tp={} sl={} risk={} guards={} symbol={} src={} dir={} status={} lat={}".format(
                 result["final_action"],
                 result["gpt_action"],
                 result["tp_pct"],
@@ -570,6 +700,8 @@ def decide_entry_with_gpt_trader(
                 symbol,
                 signal_source,
                 direction,
+                result.get("gpt_status"),
+                result.get("gpt_latency_sec"),
             )
         )
     except Exception:

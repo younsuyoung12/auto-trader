@@ -44,11 +44,22 @@
 #     확인할 수 있게 함.
 # 13) _call_gpt_json 의 timeout_sec 가 None 이면 OPENAI_TRADER_MAX_LATENCY 를 기본값으로 사용하여
 #     EXIT/ARB 경로도 동일한 지연시간 설정을 공유하도록 정리.
+#
+# 2025-11-19 변경 사항 (GPT 진입 지연 CSV 로깅)
+# ----------------------------------------------------
+# 14) ask_entry_decision 경로에서 GPT 왕복 지연 시간을
+#     logs/gpt_latency/gpt_latency-YYYY-MM-DD.csv 로 CSV 기록하는 헬퍼(_log_gpt_latency_csv) 추가.
+# 15) OPENAI_TRADER_SOFT_LATENCY 환경변수로 "소프트 타임아웃" 기준을 분리해,
+#     CSV에 is_slow 플래그로 함께 남기도록 정리.
+
 from __future__ import annotations
 
 import os
 import json
 import time
+import csv
+import datetime
+from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
 from openai import OpenAI
@@ -70,6 +81,102 @@ def _safe_log(msg: str) -> None:
     except Exception:
         # 로깅 실패로 인해 트레이딩 로직이 죽지 않도록 무시
         pass
+
+
+# ─────────────────────────────────────────
+# GPT 지연 시간 CSV 로거
+# ─────────────────────────────────────────
+
+_gpt_latency_lock: Lock = Lock()
+
+
+def _log_gpt_latency_csv(
+    *,
+    kind: str,  # "ENTRY" / "EXIT" / "ARB" 등
+    model: str,
+    symbol: Optional[str],
+    source: Optional[str],
+    direction: Optional[str],
+    latency_sec: Optional[float],
+    soft_limit_sec: Optional[float],
+    hard_limit_sec: Optional[float],
+    success: bool,
+    error_message: Optional[str] = None,
+) -> None:
+    """GPT 왕복 지연 시간을 logs/gpt_latency/*.csv 에 한 줄로 남긴다.
+
+    CSV 스키마:
+        ts_kst, kind, model, symbol, source, direction,
+        latency_sec, soft_limit_sec, hard_limit_sec,
+        success, is_timeout_or_error, is_slow, error
+
+    - 기록 실패 시 트레이딩 로직에는 영향을 주지 않는다.
+    """
+
+    try:
+        base_dir = os.path.join("logs", "gpt_latency")
+        os.makedirs(base_dir, exist_ok=True)
+
+        # KST 기준 현재 시각
+        kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+        date_str = kst_now.strftime("%Y-%m-%d")
+        ts_str = kst_now.strftime("%Y-%m-%d %H:%M:%S")
+
+        path = os.path.join(base_dir, f"gpt_latency-{date_str}.csv")
+
+        # 플래그 계산
+        is_timeout_or_error = (not success) or (
+            latency_sec is not None
+            and hard_limit_sec is not None
+            and latency_sec > hard_limit_sec
+        )
+        is_slow = (
+            latency_sec is not None
+            and soft_limit_sec is not None
+            and latency_sec > soft_limit_sec
+        )
+
+        row = [
+            ts_str,
+            kind,
+            model or "",
+            symbol or "",
+            source or "",
+            direction or "",
+            f"{latency_sec:.3f}" if latency_sec is not None else "",
+            f"{soft_limit_sec:.3f}" if soft_limit_sec is not None else "",
+            f"{hard_limit_sec:.3f}" if hard_limit_sec is not None else "",
+            "1" if success else "0",
+            "1" if is_timeout_or_error else "0",
+            "1" if is_slow else "0",
+            (error_message or "").replace("\n", " ")[:200],
+        ]
+
+        header = [
+            "ts_kst",
+            "kind",
+            "model",
+            "symbol",
+            "source",
+            "direction",
+            "latency_sec",
+            "soft_limit_sec",
+            "hard_limit_sec",
+            "success",
+            "is_timeout_or_error",
+            "is_slow",
+            "error",
+        ]
+
+        with _gpt_latency_lock:
+            file_exists = os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(header)
+                writer.writerow(row)
+    except Exception as e:  # CSV 기록 실패는 트레이딩에 영향 주지 않도록 로그만 남김
+        _safe_log(f"[GPT_LATENCY][ERROR] {e}")
 
 
 # ─────────────────────────────────────────
@@ -333,6 +440,11 @@ def ask_entry_decision(
         max_latency = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
     except Exception:
         max_latency = 8.0
+    try:
+        # soft latency 기준이 별도로 없으면 hard 기준과 동일하게 사용
+        soft_latency = float(os.getenv("OPENAI_TRADER_SOFT_LATENCY", str(max_latency)))
+    except Exception:
+        soft_latency = max_latency
 
     payload = _build_entry_payload(
         symbol=symbol,
@@ -365,14 +477,62 @@ def ask_entry_decision(
             temperature=0.2,
             timeout=max_latency,
         )
+        elapsed = time.perf_counter() - t0
     except Exception as e:
+        # 호출 자체 실패도 CSV 로 남김
+        elapsed = time.perf_counter() - t0
+        try:
+            _log_gpt_latency_csv(
+                kind="ENTRY",
+                model=model,
+                symbol=symbol,
+                source=signal_source,
+                direction=chosen_signal,
+                latency_sec=elapsed,
+                soft_limit_sec=soft_latency,
+                hard_limit_sec=max_latency,
+                success=False,
+                error_message=str(e),
+            )
+        except Exception:
+            pass
         raise RuntimeError(f"GPT 응답 호출 실패: {e}") from e
 
-    elapsed = time.perf_counter() - t0
-
-    # 지연 시간 가드 (응답이 늦게 왔으면 그대로 SKIP 하도록 상위에 알림)
+    # 지연 시간 가드 (하드 타임아웃; soft 기준은 CSV에서 is_slow 플래그로만 사용)
     if elapsed > max_latency:
+        try:
+            _log_gpt_latency_csv(
+                kind="ENTRY",
+                model=model,
+                symbol=symbol,
+                source=signal_source,
+                direction=chosen_signal,
+                latency_sec=elapsed,
+                soft_limit_sec=soft_latency,
+                hard_limit_sec=max_latency,
+                success=False,
+                error_message=f"latency>{max_latency:.2f}s",
+            )
+        except Exception:
+            pass
         raise RuntimeError(f"GPT 응답 지연: {elapsed:.2f}s > {max_latency:.2f}s")
+
+    # 정상 응답도 CSV 로 남김
+    try:
+        _log_gpt_latency_csv(
+            kind="ENTRY",
+            model=model,
+            symbol=symbol,
+            source=signal_source,
+            direction=chosen_signal,
+            latency_sec=elapsed,
+            soft_limit_sec=soft_latency,
+            hard_limit_sec=max_latency,
+            success=True,
+            error_message=None,
+        )
+    except Exception:
+        pass
 
     try:
         text = _extract_text_from_response(resp).strip()

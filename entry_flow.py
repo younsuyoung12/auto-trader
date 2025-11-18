@@ -8,6 +8,24 @@ entry_flow.py (WS 거래량 우선 + arbitration + EntryScore + bt_trades INSERT
 - 웹소켓 기반 시그널(signal_flow_ws.get_trading_signal)을 사용하며,
   TREND/RANGE 동시 평가 + 중재(Arbitration) 결과를 그대로 받아서 처리한다.
 
+2025-11-19 변경 사항 (gpt_trader 하드 스톱/지연 상태 연동 + legacy 플래그 제거)
+----------------------------------------------------
+1) 기존 GPT_ENTRY_HARD_DOWN / GPT_ENTRY_HARD_DOWN_NOTIFIED 전역 플래그를 제거하고,
+   GPT 장애/하드 스톱 상태는 gpt_trader.decide_entry_with_gpt_trader(...) 가
+   반환하는 gpt_status / hard_stop / sleep_after_sec 값을 그대로 사용한다.
+2) try_open_new_position(...) 진입부의 GPT_ENTRY_HARD_DOWN 체크 로직을 제거하고,
+   gpt_result 에서 gpt_status == "HARD_STOP" 또는 hard_stop=True 인 경우
+   신규 진입을 스킵하며, gpt_result.sleep_after_sec (없으면 gpt_entry_hard_stop_cooldown_sec)
+   만큼 쿨타임을 적용한다.
+3) gpt_trader 가 반환하는 상태코드를 반영하기 위해, status 파싱 로직을
+   gpt_status → status 순으로 조회하도록 보강하고, hard_stop 플래그를 함께 읽는다.
+4) gpt_action == "ERROR" 이면서 raw 결정값(raw)이 비어 있는 경우에도,
+   더 이상 entry_flow 차원에서 영구 하드 스톱 플래그를 세우지 않고
+   해당 루프만 gpt_error_sleep_sec 만큼 SKIP 처리한다.
+5) GPT 타임아웃(TIMEOUT) / 하드 스톱(HARD_STOP) / 일반 SKIP 세 케이스를
+   events CSV(source 필드)와 텔레그램 메시지에서 명확히 구분되도록
+   reason/source 를 정리했다.
+
 2025-11-17 변경 사항 (GPT 장애 시 신규 진입 하드 스톱 + 텔레그램 알림 + 이벤트 CSV 연동 + gpt_trader 연동)
 ----------------------------------------------------
 1) GPT 엔트리 하드 스톱 플래그 추가
@@ -177,13 +195,6 @@ DEFAULT_GPT_ENTRY_MODEL = "gpt-5.1"
 DEFAULT_GPT_MAX_RISK_PCT = 0.03  # 3%
 DEFAULT_GPT_MAX_TP_PCT = 0.10    # 10%
 DEFAULT_GPT_MAX_SL_PCT = 0.05    # 5%
-
-# GPT 엔트리 하드 스톱 상태 플래그
-# - GPT_ENTRY_HARD_DOWN 이 True 가 되면, 이후 try_open_new_position(...) 호출에서는
-#   GPT 를 다시 시도하지 않고 즉시 신규 진입을 전면 차단한다.
-# - 하드 스톱이 걸린 상태를 해제하려면 프로세스를 재시작하거나, 별도 관리 코드를 추가해야 한다.
-GPT_ENTRY_HARD_DOWN: bool = False
-GPT_ENTRY_HARD_DOWN_NOTIFIED: bool = False
 
 # ✅ 웹소켓 시세 버퍼에서 거래량까지 있는 캔들을 가져오기
 # - ws_get_klines_with_volume(symbol, interval, limit)
@@ -672,42 +683,6 @@ def try_open_new_position(
     """
     symbol = settings.symbol
 
-    # GPT 엔트리 하드 스톱 상태라면, 신규 진입을 전면 차단한다.
-    # - GPT 장애가 한 번이라도 발생해 GPT_ENTRY_HARD_DOWN 이 True 가 되면,
-    #   이 함수는 GPT 를 다시 호출하지 않고, 즉시 SKIP + 짧은 대기 후 반환한다.
-    global GPT_ENTRY_HARD_DOWN, GPT_ENTRY_HARD_DOWN_NOTIFIED
-    if GPT_ENTRY_HARD_DOWN:
-        msg = "[GPT_ENTRY][HARD_STOP] GPT 장애 상태 → 신규 진입 스킵"
-        log(msg)
-        try:
-            send_skip_tg(msg)
-        except Exception as e:
-            log(f"[GPT_ENTRY] send_skip_tg failed under hard stop: {e}")
-
-        # 이벤트 CSV에도 하드 스톱 SKIP 기록
-        log_skip_event(
-            symbol=symbol,
-            regime="UNKNOWN",
-            source="entry_flow.gpt_hard_stop",
-            side=None,
-            reason="gpt_entry_hard_down",
-            extra={"note": "GPT hard stop active; new entries blocked"},
-        )
-
-        # 첫 시도 시점에만 하드 스톱 상태를 명시적으로 알린다.
-        if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
-            try:
-                send_tg(
-                    "[GPT_ENTRY][HARD_STOP] GPT 오류로 인해 신규 진입을 중단한 상태입니다. "
-                    "원인을 확인한 뒤 봇을 재시작해 주세요."
-                )
-            except Exception as e:
-                log(f"[GPT_ENTRY] hard stop telegram send failed: {e}")
-            GPT_ENTRY_HARD_DOWN_NOTIFIED = True
-
-        sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
-        return None, sleep_sec
-
     # GPT 메타 정보 (로그/EntryScore components 에 기록용)
     gpt_model_for_log = os.getenv("GPT_ENTRY_MODEL", DEFAULT_GPT_ENTRY_MODEL)
     gpt_decision: Dict[str, Any] = {}
@@ -875,8 +850,9 @@ def try_open_new_position(
             guard_snapshot=guard_snapshot or None,
         )
     except Exception as e:
-        # gpt_trader 내부에서도 예외를 처리하지만, 혹시 모를 오류는 하드 스톱으로 격리
-        msg = f"[GPT_ENTRY][ERROR] gpt_trader unexpected exception → hard stop: {e}"
+        # gpt_trader 내부에서도 예외를 처리하지만, 혹시 모를 오류는
+        # 해당 루프만 SKIP 처리하고, 나머지 하드 스톱/쿨타임 관리는 gpt_trader 에 맡긴다.
+        msg = f"[GPT_ENTRY][ERROR] gpt_trader unexpected exception → skip: {e}"
         log(msg)
         try:
             send_skip_tg(msg)
@@ -892,17 +868,6 @@ def try_open_new_position(
             extra={"error": str(e)},
         )
 
-        GPT_ENTRY_HARD_DOWN = True
-        if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
-            try:
-                send_tg(
-                    "[GPT_ENTRY][HARD_STOP] GPT 호출 오류가 발생하여 신규 진입을 전면 중단합니다. "
-                    "원인을 확인한 뒤 봇을 재시작해 주세요."
-                )
-            except Exception as te:
-                log(f"[GPT_ENTRY] hard stop telegram send failed: {te}")
-            GPT_ENTRY_HARD_DOWN_NOTIFIED = True
-
         sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
         return None, sleep_sec
 
@@ -911,8 +876,14 @@ def try_open_new_position(
     raw_decision = gpt_result.get("raw") or {}
     reason_val = gpt_result.get("reason")
     gpt_reason = str(reason_val) if isinstance(reason_val, str) else None
-    status_val = gpt_result.get("status")
+
+    # gpt_trader 가 반환하는 상태코드(gpt_status) 우선 사용, 없으면 legacy status 사용
+    status_val = gpt_result.get("gpt_status")
+    if not isinstance(status_val, str):
+        status_val = gpt_result.get("status")
     gpt_status = str(status_val).upper() if isinstance(status_val, str) else ""
+
+    hard_stop_flag = bool(gpt_result.get("hard_stop"))
     gpt_decision = raw_decision  # EntryScore 메타용
 
     # (4-4) GPT 타임아웃(응답 지연) → 이 캔들만 SKIP (하드 스톱 금지)
@@ -949,39 +920,57 @@ def try_open_new_position(
         )
         return None, sleep_sec
 
-    # (4-5) GPT 하드 장애 감지: gpt_action == ERROR 이고 raw 가 비어 있는 경우
-    if gpt_action == "ERROR" and not raw_decision:
-        msg = "[GPT_ENTRY][ERROR] GPT_TRADER returned ERROR with empty raw → hard stop"
+    # (4-5) gpt_trader 하드 스톱 상태 → 쿨타임 동안 신규 진입 전면 스킵
+    if gpt_status == "HARD_STOP" or hard_stop_flag:
+        msg = (
+            "[GPT_ENTRY][HARD_STOP] GPT 장애 상태 → 신규 진입 스킵"
+            f" (reason={gpt_reason or 'gpt_hard_stop'})"
+        )
         log(msg)
         try:
             send_skip_tg(msg)
         except Exception as te:
-            log(f"[GPT_ENTRY] send_skip_tg failed on hard error: {te}")
+            log(f"[GPT_ENTRY] send_skip_tg failed on hard stop: {te}")
+
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.gpt_hard_stop",
+            side=chosen_signal,
+            reason="gpt_entry_hard_stop",
+            extra={"gpt_result": gpt_result},
+        )
+
+        sleep_sec = float(
+            gpt_result.get(
+                "sleep_after_sec",
+                getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0),
+            )
+        )
+        return None, sleep_sec
+
+    # (4-6) GPT 내부 오류/예외에 의한 ERROR + raw 비어 있음 → 이 캔들만 에러 SKIP
+    if gpt_action == "ERROR" and not raw_decision:
+        msg = "[GPT_ENTRY][ERROR] GPT_TRADER returned ERROR with empty raw → skip this loop"
+        log(msg)
+        try:
+            send_skip_tg(msg)
+        except Exception as te:
+            log(f"[GPT_ENTRY] send_skip_tg failed on empty-raw error: {te}")
 
         log_skip_event(
             symbol=symbol,
             regime=regime_label,
             source="entry_flow.gpt_error",
             side=chosen_signal,
-            reason="gpt_entry_exception",
+            reason="gpt_entry_error_empty_raw",
             extra={"gpt_result": gpt_result},
         )
-
-        GPT_ENTRY_HARD_DOWN = True
-        if not GPT_ENTRY_HARD_DOWN_NOTIFIED:
-            try:
-                send_tg(
-                    "[GPT_ENTRY][HARD_STOP] GPT 호출 오류가 발생하여 신규 진입을 전면 중단합니다. "
-                    "원인을 확인한 뒤 봇을 재시작해 주세요."
-                )
-            except Exception as te:
-                log(f"[GPT_ENTRY] hard stop telegram send failed: {te}")
-            GPT_ENTRY_HARD_DOWN_NOTIFIED = True
 
         sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
         return None, sleep_sec
 
-    # (4-6) GPT 판단에 따른 일반 SKIP (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
+    # (4-7) GPT 판단에 따른 일반 SKIP (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
     if final_action != "ENTER":
         msg = f"[GPT_ENTRY][SKIP] action={gpt_action or 'NONE'} reason={gpt_reason or 'no_reason'}"
         log(msg)
@@ -1002,7 +991,7 @@ def try_open_new_position(
         )
         return None, sleep_sec
 
-    # (4-7) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
+    # (4-8) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
     effective_risk_pct = float(gpt_result.get("effective_risk_pct", effective_risk_pct))
     tp_pct = float(gpt_result.get("tp_pct", tp_pct))
     sl_pct = float(gpt_result.get("sl_pct", sl_pct))

@@ -2,7 +2,7 @@
 =====================================================
 봇 헬스체크 HTTP 서버 / 드라이브 동기화 / 텔레그램 종료 명령 워커 모듈.
 
-2025-11-18 변경 사항 (events CSV 드라이브 동기화 연동)
+2025-11-18 변경 사항 (events CSV + GPT 엔트리/스킵 로그 드라이브 동기화)
 ----------------------------------------------------
 1) logs/events/events-YYYY-MM-DD.csv 를 드라이브 동기화 대상에 추가.
    - start_drive_sync_thread() 에서 오늘자 events CSV 가 있으면 함께 업로드.
@@ -10,6 +10,10 @@
 2) 오래된 events-*.csv 로컬 파일 정리 로직 추가.
    - KEEP_DAYS 기준으로 signals/candles 와 동일하게 삭제.
    - 삭제 로그: "[DRIVE_SYNC] old events csv removed: {fname}".
+3) signals_logger.log_gpt_entry_event(...) / log_skip_event(...) 으로 기록되는
+   GPT 진입 승인/거절/타임아웃/하드스톱 이벤트가 모두 events-YYYY-MM-DD.csv 에
+   함께 쌓이므로, 이 CSV 가 드라이브에 업로드되면 GPT 의사결정 히스토리를
+   구글 드라이브에서 그대로 분석할 수 있다.
 
 수정 내용 (2025-11-13)
 1) 드라이브 업로드 주기/보관일을 환경변수로도 조정할 수 있게 함 (없으면 기존값 300초/3일 유지)
@@ -82,11 +86,14 @@ def start_health_server() -> None:
 # ─────────────────────────────
 # 2. 드라이브 동기화 스레드
 # ─────────────────────────────
+
 def start_drive_sync_thread() -> None:
     """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 정리.
     - signals-YYYY-MM-DD.csv 는 무조건 생성해서 올린다.
     - candles-YYYY-MM-DD.csv 는 있으면 같이 올린다.
     - events-YYYY-MM-DD.csv 도 있으면 같이 올린다.
+      · 이 events CSV 안에는 GPT 엔트리 승인/스킵/타임아웃/하드스톱 이벤트를
+        포함한 각종 트레이딩 이벤트 로그가 signals_logger 를 통해 기록된다.
     - 업로드 주기/보관일은 환경변수로 조정 가능하다.
     """
     # env 없으면 기존 값 유지
@@ -115,7 +122,8 @@ def start_drive_sync_thread() -> None:
 
                 # 3-1) 이벤트 CSV 있으면 같이 업로드
                 #      signals_logger 가 모듈 로드시 logs/events/events-YYYY-MM-DD.csv 를
-                #      만들어 두므로, 파일이 존재하면 같은 규칙으로 드라이브에 올린다.
+                #      만들어 두고, GPT 엔트리/스킵/타임아웃/하드스톱 이벤트도 이 파일에
+                #      기록한다. 존재하면 같은 규칙으로 드라이브에 올린다.
                 events_dir = os.path.join("logs", "events")
                 events_name = f"events-{day_str}.csv"
                 events_path = os.path.join(events_dir, events_name)
