@@ -316,7 +316,7 @@ class BotSettings:
     balance_skip_cooldown: int = 3600
 
     # 캔들 지연 허용치
-    max_kline_delay_sec: int = 190
+    max_kline_delay_sec: int = 600
 
     # RSI 기준
     rsi_overbought: int = 70
@@ -517,7 +517,7 @@ def load_settings() -> BotSettings:
         # 텔레그램 스팸
         skip_tg_cooldown=_as_int(os.getenv("SKIP_TG_COOLDOWN", "30"), 30),
         # 캔들 지연 허용
-        max_kline_delay_sec=_as_int(os.getenv("MAX_KLINE_DELAY_SEC", "190"), 190),
+        max_kline_delay_sec=_as_int(os.getenv("MAX_KLINE_DELAY_SEC", "190"), 600),
         # RSI
         rsi_overbought=_as_int(os.getenv("RSI_OVERBOUGHT", "70"), 70),
         rsi_oversold=_as_int(os.getenv("RSI_OVERSOLD", "30"), 30),
