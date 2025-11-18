@@ -2,6 +2,16 @@
 =====================================================
 봇 헬스체크 HTTP 서버 / 드라이브 동기화 / 텔레그램 종료 명령 워커 모듈.
 
+2025-11-19 변경 사항 (GPT 레이턴시 CSV 드라이브 동기화)
+----------------------------------------------------
+1) gpt_decider._log_gpt_latency_csv(...) 가 생성하는
+   logs/events/gpt-latency-YYYY-MM-DD.csv 파일을 드라이브 동기화 대상에 추가.
+   - start_drive_sync_thread() 에서 오늘자 gpt-latency CSV 가 있으면 함께 업로드.
+   - 업로드 로그: "[DRIVE_SYNC] uploaded today's gpt latency csv".
+2) 오래된 gpt-latency-*.csv 파일도 signals / candles / events 와 동일한 보관일 기준으로
+   정리하도록 변경.
+   - 삭제 로그: "[DRIVE_SYNC] old gpt latency csv removed: {fname}".
+
 2025-11-18 변경 사항 (events CSV + GPT 엔트리/스킵 로그 드라이브 동기화)
 ----------------------------------------------------
 1) logs/events/events-YYYY-MM-DD.csv 를 드라이브 동기화 대상에 추가.
@@ -65,7 +75,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def log_message(self, *_: Any) -> None:
-        # 기본 HTTP 요청 로그는 콘솔을 어지럽히므로 숨긴다.
+        """기본 HTTP 요청 로그는 콘솔을 어지럽히므로 숨긴다."""
         return
 
 
@@ -89,11 +99,13 @@ def start_health_server() -> None:
 
 def start_drive_sync_thread() -> None:
     """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 정리.
+
     - signals-YYYY-MM-DD.csv 는 무조건 생성해서 올린다.
     - candles-YYYY-MM-DD.csv 는 있으면 같이 올린다.
     - events-YYYY-MM-DD.csv 도 있으면 같이 올린다.
       · 이 events CSV 안에는 GPT 엔트리 승인/스킵/타임아웃/하드스톱 이벤트를
         포함한 각종 트레이딩 이벤트 로그가 signals_logger 를 통해 기록된다.
+    - gpt-latency-YYYY-MM-DD.csv 가 있으면 GPT 호출 레이턴시 로그도 함께 올린다.
     - 업로드 주기/보관일은 환경변수로 조정 가능하다.
     """
     # env 없으면 기존 값 유지
@@ -101,12 +113,19 @@ def start_drive_sync_thread() -> None:
     KEEP_DAYS = int(os.getenv("DRIVE_KEEP_DAYS", "3"))
 
     def _worker() -> None:
-        log(f"[DRIVE_SYNC] worker started interval={SYNC_INTERVAL_SEC}s keep_days={KEEP_DAYS}")
+        log(
+            f"[DRIVE_SYNC] worker started interval={SYNC_INTERVAL_SEC}s "
+            f"keep_days={KEEP_DAYS}"
+        )
         while True:
             try:
                 # 1) 오늘자 시그널 CSV 확보/생성
                 local_path = _ensure_today_csv()
-                day_str = os.path.basename(local_path).replace("signals-", "").replace(".csv", "")
+                day_str = (
+                    os.path.basename(local_path)
+                    .replace("signals-", "")
+                    .replace(".csv", "")
+                )
 
                 # 2) 시그널 CSV 업로드
                 upload_to_drive(local_path, f"signals-{day_str}.csv")
@@ -131,6 +150,15 @@ def start_drive_sync_thread() -> None:
                     upload_to_drive(events_path, events_name)
                     log("[DRIVE_SYNC] uploaded today's events csv")
 
+                # 3-2) GPT 레이턴시 CSV 있으면 같이 업로드
+                #      gpt_decider._log_gpt_latency_csv(...) 에서 같은 디렉터리에
+                #      gpt-latency-YYYY-MM-DD.csv 파일을 생성한다.
+                gpt_latency_name = f"gpt-latency-{day_str}.csv"
+                gpt_latency_path = os.path.join(events_dir, gpt_latency_name)
+                if os.path.exists(gpt_latency_path):
+                    upload_to_drive(gpt_latency_path, gpt_latency_name)
+                    log("[DRIVE_SYNC] uploaded today's gpt latency csv")
+
                 # 4) 오래된 signals-* 파일 정리
                 local_dir = os.path.dirname(local_path)
                 now_ts = time.time()
@@ -149,7 +177,9 @@ def start_drive_sync_thread() -> None:
                 # 5) 오래된 candles-* 파일 정리
                 if os.path.isdir(candle_dir):
                     for fname in os.listdir(candle_dir):
-                        if not (fname.startswith("candles-") and fname.endswith(".csv")):
+                        if not (
+                            fname.startswith("candles-") and fname.endswith(".csv")
+                        ):
                             continue
                         fpath = os.path.join(candle_dir, fname)
                         mtime = os.path.getmtime(fpath)
@@ -160,18 +190,32 @@ def start_drive_sync_thread() -> None:
                             except OSError:
                                 pass
 
-                # 6) 오래된 events-* 파일 정리
+                # 6) 오래된 events-*/gpt-latency-* 파일 정리
                 #    signals / candles 와 동일한 보관일 기준으로 정리한다.
                 if os.path.isdir(events_dir):
                     for fname in os.listdir(events_dir):
-                        if not (fname.startswith("events-") and fname.endswith(".csv")):
+                        if not fname.endswith(".csv"):
+                            continue
+                        if not (
+                            fname.startswith("events-")
+                            or fname.startswith("gpt-latency-")
+                        ):
                             continue
                         fpath = os.path.join(events_dir, fname)
                         mtime = os.path.getmtime(fpath)
                         if now_ts - mtime > KEEP_DAYS * 86400:
                             try:
                                 os.remove(fpath)
-                                log(f"[DRIVE_SYNC] old events csv removed: {fname}")
+                                if fname.startswith("gpt-latency-"):
+                                    log(
+                                        "[DRIVE_SYNC] old gpt latency csv removed: "
+                                        f"{fname}"
+                                    )
+                                else:
+                                    log(
+                                        "[DRIVE_SYNC] old events csv removed: "
+                                        f"{fname}"
+                                    )
                             except OSError:
                                 pass
 
@@ -189,6 +233,7 @@ def start_drive_sync_thread() -> None:
 
 def start_telegram_command_thread(*, on_stop_command: Callable[[], None]) -> None:
     """텔레그램 getUpdates 폴링으로 종료 명령을 받으면 on_stop_command 를 호출한다.
+
     허용 명령어: "종료", "봇종료", "끝나면 종료", "안전종료", "stop", "/stop"
     run_bot.py 에서는 이 콜백에서 SAFE_STOP_REQUESTED 플래그만 세팅하면 된다.
     """

@@ -1,7 +1,7 @@
 """
-#trader.py
+# trader.py
 
-수정 내용 (2025-11-13~2025-11-16)
+수정 내용 (2025-11-13~2025-11-19)
 1) _to_contract_qty(...) 에서 0 으로 떨어지는 소수 수량을 최소 step(0.001)으로 보정
 2) 슬리피지 가드/TP·SL 예약 실패 시 close_position_market(...) 에 항상 '열었던 방향(side_open)'을 넘기도록 통일
 3) 체결 정보 파싱 시 executedQty, quantity, order.orderId 등 BingX 다양한 응답 케이스 보강
@@ -16,6 +16,9 @@
 7) (2025-11-16) open_position_with_tp_sl(...) 시그니처 하위호환 확장
    - side_open / side 두 키워드 모두 허용해 'unexpected keyword side' 예외 방지
    - settings / entry_price_hint 를 선택 인자로 바꿔, 미전달 시 슬리피지/TP·SL 보정만 생략
+8) (2025-11-19) 엔트리 슬리피지/체결 디버깅 로그 강화
+   - open_position_with_tp_sl(...)에서 entry_price_hint 대비 슬리피지를 항상 계산/로그.
+   - settings.max_entry_slippage_pct > 0 인 경우, 허용 슬리피지 초과 시 즉시 시장가 강제 청산 후 진입 취소.
 """
 
 from __future__ import annotations
@@ -35,7 +38,12 @@ from exchange_api import (
 
 
 def _to_contract_qty(q: float) -> float:
-    """BTC-USDT 기준 0.001 step 을 가정하고, 0 으로 떨어지지 않게 보정한다."""
+    """BTC-USDT 기준 0.001 step 을 가정하고, 0 으로 떨어지지 않게 보정한다.
+
+    - BingX 최소 수량보다 작은 소수점 수량이 들어와도 최소 0.001 로 맞춘다.
+    - DB/신호 상의 qty 와 실제 주문 qty 가 약간 달라질 수 있으므로,
+      체결 수량은 반드시 거래소 응답(filled_qty) 기준으로 사용해야 한다.
+    """
     if q is None or q <= 0:
         return 0.001
     v = float(f"{q:.3f}")
@@ -119,6 +127,7 @@ def compute_tp_sl_prices(
     sl_pct: float,
     precision: int = 2,
 ) -> Tuple[float, float]:
+    """진입 가격/방향/퍼센트를 받아 TP/SL 가격을 계산한다."""
     if entry <= 0:
         entry = 0.0
 
@@ -235,11 +244,36 @@ def open_position_with_tp_sl(
         send_tg(msg)
         return None
 
-    # 3) 슬리피지 가드 (신호 시점의 entry_price_hint 대비)
-    max_slip_pct = getattr(settings, "max_entry_slippage_pct", 0.0) if settings is not None else 0.0
-    if max_slip_pct and entry_price_hint and entry_price_hint > 0:
-        slip_pct = abs(entry_price - entry_price_hint) / entry_price_hint
-        if slip_pct > max_slip_pct:
+    # 2-1) 체결 결과 로그 (실제 진입 가격/수량 확인용)
+    log(
+        f"[ENTRY FILLED] symbol={symbol} side={side_open} "
+        f"order_id={entry_order_id} qty={filled_qty} entry_price={entry_price} "
+        f"hint={entry_price_hint} source={source}"
+    )
+
+    # 3) 슬리피지 계산/로그 + 가드 (신호 시점의 entry_price_hint 대비)
+    slip_pct: Optional[float] = None
+    slip_abs: Optional[float] = None
+
+    if entry_price_hint and entry_price_hint > 0:
+        # LONG 기준: 체결가가 hint 보다 비싸면 +, 싸면 -
+        # (SHORT 인 경우에도 동일 공식 사용, 해석은 로그에서만 참고)
+        slip_pct = (entry_price / entry_price_hint) - 1.0
+        slip_abs = abs(slip_pct)
+        log(
+            f"[ENTRY SLIPPAGE] symbol={symbol} side={side_open} "
+            f"hint={entry_price_hint} entry={entry_price} "
+            f"slip_pct={slip_pct * 100:.4f}% abs={slip_abs * 100:.4f}%"
+        )
+
+        max_slip_pct = (
+            getattr(settings, "max_entry_slippage_pct", 0.0)
+            if settings is not None
+            else 0.0
+        )
+
+        # max_entry_slippage_pct 는 0.02 (2%) 처럼 비율로 설정한다고 가정.
+        if max_slip_pct and slip_abs is not None and slip_abs > max_slip_pct:
             try:
                 close_position_market(
                     symbol,
@@ -248,21 +282,21 @@ def open_position_with_tp_sl(
                 )
             except Exception as e:
                 msg = (
-                    f"[ENTRY][{source}] ❗ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} "
+                    f"[ENTRY][{source}] ❗ 슬리피지 {slip_abs:.5f} > {max_slip_pct:.5f} "
                     f"라서 닫으려 했으나 실패: {e}"
                 )
                 log(msg)
                 send_tg(msg)
             else:
                 msg = (
-                    f"[ENTRY][{source}] ❌ 슬리피지 {slip_pct:.5f} > {max_slip_pct:.5f} "
+                    f"[ENTRY][{source}] ❌ 슬리피지 {slip_abs:.5f} > {max_slip_pct:.5f} "
                     "→ 포지션 취소"
                 )
                 log(msg)
                 send_tg(msg)
             return None
 
-    # 3.5) TP/SL 퍼센트 보정
+    # 3.5) TP/SL 퍼센트 보정 (마진 기반 옵션)
     if settings is not None and getattr(settings, "use_margin_based_tp_sl", False):
         lev = getattr(settings, "leverage", 1) or 1
         fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
@@ -272,6 +306,7 @@ def open_position_with_tp_sl(
         tp_pct = max(tp_pct, m_tp)
         sl_pct = max(sl_pct, m_sl)
 
+    # 3.6) TP/SL 최소 퍼센트 보정
     min_tp_pct = getattr(settings, "min_tp_pct", 0.0) if settings is not None else 0.0
     min_sl_pct = getattr(settings, "min_sl_pct", 0.0) if settings is not None else 0.0
     if min_tp_pct > 0:
@@ -279,6 +314,7 @@ def open_position_with_tp_sl(
     if min_sl_pct > 0:
         sl_pct = max(sl_pct, min_sl_pct)
 
+    # 3.7) RANGE soft 모드 TP 상한
     if soft_mode:
         if settings is not None:
             tp_min = getattr(settings, "range_tp_min", tp_pct)
@@ -289,9 +325,14 @@ def open_position_with_tp_sl(
         tp_soft_cap = tp_min * soft_factor
         tp_pct = min(tp_pct, tp_soft_cap)
 
+    # 3.8) 숏 SL 바닥 비율 적용 (롱보다 SL 을 더 깊게 가져가는 전략용)
     eff_sl_floor_ratio = sl_floor_ratio
     if eff_sl_floor_ratio is None:
-        eff_sl_floor_ratio = getattr(settings, "range_short_sl_floor_ratio", 0.0) if settings is not None else 0.0
+        eff_sl_floor_ratio = (
+            getattr(settings, "range_short_sl_floor_ratio", 0.0)
+            if settings is not None
+            else 0.0
+        )
     if side_open == "SELL" and eff_sl_floor_ratio > 0 and tp_pct > 0:
         min_short_sl = tp_pct * eff_sl_floor_ratio
         if sl_pct < min_short_sl:
@@ -367,6 +408,7 @@ def open_position_with_tp_sl(
 
 
 def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
+    """열려 있는 Trade 에 TP/SL 이 제대로 붙어 있는지 확인하고, 없으면 재설정한다."""
     if trade.source == "SYNC":
         # 거래소에서 동기화한 포지션은 TP/SL 을 건드리지 않는다.
         return True
@@ -379,6 +421,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     need_tp = False
     need_sl = False
 
+    # TP 주문 상태 확인
     if trade.tp_order_id:
         try:
             o = get_order(symbol, trade.tp_order_id)
@@ -392,6 +435,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     else:
         need_tp = True
 
+    # SL 주문 상태 확인
     if trade.sl_order_id:
         try:
             o = get_order(symbol, trade.sl_order_id)
@@ -408,6 +452,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
     ok = True
     real_qty = _to_contract_qty(qty)
 
+    # TP 재설정
     if need_tp:
         try:
             tp_r = place_conditional(
@@ -429,6 +474,7 @@ def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
             send_tg(f"❗ TP 재설정 실패: {e}")
             ok = False
 
+    # SL 재설정
     if need_sl:
         try:
             sl_r = place_conditional(
@@ -485,6 +531,7 @@ def check_closes(
         sl_id = t.sl_order_id
         closed = False
 
+        # TP 체결 여부 확인
         if tp_id:
             try:
                 o = get_order(symbol, tp_id)
@@ -501,6 +548,7 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes TP error: {e}")
 
+        # SL 체결 여부 확인 (TP 미체결인 경우에만)
         if (not closed) and sl_id:
             try:
                 o = get_order(symbol, sl_id)
@@ -517,6 +565,7 @@ def check_closes(
             except Exception as e:
                 log(f"check_closes SL error: {e}")
 
+        # TP/SL 둘 다 체결 안 된 경우 → TP/SL 재설정 시도
         if not closed:
             ok = ensure_tp_sl_for_trade(t, state)
             if not ok:

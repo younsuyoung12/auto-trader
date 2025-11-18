@@ -3,6 +3,20 @@
 웹소켓으로 들어오는 1m / 5m / 15m 캔들을 기준으로 포지션을 열고 감시하는 메인 루프.
 이 버전에서는 더 이상 3m 캔들을 사용하지 않는다.
 
+2025-11-19 변경 사항 (EXIT GPT 레이어 완전 연동 + 추세→박스 다운그레이드)
+----------------------------------------------------
+1) position_watch_ws.py 의 GPT 기반 EXIT 레이어와 완전 연동.
+   - 조기익절/조기청산/반대 시그널 컷/박스↔추세 전환은 모두
+     gpt_decider.ask_exit_decision_safe(...) 를 한 번 거친 뒤 실행된다.
+   - GPT 오류 시에는 fallback_action 으로 기존 Python 로직만으로 동작.
+2) 추세→박스 다운그레이드(maybe_downgrade_trend_to_range) 를 메인 루프에 추가.
+   - TREND 포지션이 RANGE 환경으로 바뀐 경우, GPT 가 CLOSE 를 승인하면
+     포지션을 정리하고 RANGE 전략으로 갈아타도록 한다.
+3) EXIT 경로별 마지막 청산 시각 업데이트 정리.
+   - RANGE 관련 종료: LAST_CLOSE_TS_RANGE
+   - TREND 관련 종료: LAST_CLOSE_TS_TREND
+   - 공통 종료 시각: LAST_CLOSE_TS
+
 2025-11-17 변경 사항 (텔레그램 메시지 한글화 + 직관 표현)
 ----------------------------------------------------
 1) 텔레그램으로 나가는 안내 문구를 전부 한국어로 정리하고, 어려운 용어를 줄였다.
@@ -94,10 +108,11 @@ from signal_analysis_worker import start_signal_analysis_thread
 
 # 동기화/진입/포지션 감시 모듈
 from sync_exchange import sync_open_trades_from_exchange
-from entry_flow import try_open_new_position  # 필요 시 entry_flow_ws 로 교체 가능
-from position_watch_ws import (  # WS 버전으로 교체
+from entry_flow import try_open_new_position  # 진입 쪽 GPT 결정은 entry_flow/gpt_decider 에서 처리
+from position_watch_ws import (  # WS 버전(GPT EXIT 레이어)으로 교체
     maybe_early_exit_range,
     maybe_upgrade_range_to_trend,
+    maybe_downgrade_trend_to_range,
     maybe_early_exit_trend,
     maybe_force_close_on_opposite_signal,
 )
@@ -671,15 +686,17 @@ def main() -> None:
                     _write_stop_flag()
                     _enter_idle_forever()
 
-            # (e) 열린 포지션에 대한 실시간 대응 (WS 캔들 기반)
+            # (e) 열린 포지션에 대한 실시간 대응 (WS 캔들 기반 + GPT EXIT 레이어)
             if OPEN_TRADES:
                 for t in list(OPEN_TRADES):
+                    # 1) RANGE 조기익절 / 조기청산 (GPT 승인 필요)
                     if maybe_early_exit_range(t, SET):
                         OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
                         LAST_CLOSE_TS = now
                         LAST_CLOSE_TS_RANGE = now
                         continue
 
+                    # 2) 박스→추세 업그레이드 (RANGE → TREND, GPT 승인 필요)
                     if maybe_upgrade_range_to_trend(
                         t, SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
                     ):
@@ -688,15 +705,27 @@ def main() -> None:
                         LAST_CLOSE_TS_RANGE = now
                         continue
 
-                    if maybe_force_close_on_opposite_signal(
+                    # 2.5) 추세→박스 다운그레이드 (TREND → RANGE, GPT 승인 필요)
+                    if maybe_downgrade_trend_to_range(
                         t, SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
                     ):
                         OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
                         LAST_CLOSE_TS = now
                         LAST_CLOSE_TS_TREND = now
+                        continue
+
+                    # 3) 반대 시그널 강제 청산 (TREND/RANGE 공통, GPT 승인 필요)
+                    if maybe_force_close_on_opposite_signal(
+                        t, SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
+                    ):
+                        OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
+                        LAST_CLOSE_TS = now
+                        # 어떤 레짐이든 반대 시그널이면 둘 다 최근 청산으로 본다
+                        LAST_CLOSE_TS_TREND = now
                         LAST_CLOSE_TS_RANGE = now
                         continue
 
+                    # 4) TREND 조기익절 / 조기청산 (GPT 승인 필요)
                     if maybe_early_exit_trend(t, SET):
                         OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
                         LAST_CLOSE_TS = now
@@ -736,6 +765,7 @@ def main() -> None:
                 continue
 
             # (i) 새 포지션 진입 시도
+            # - 진입 신호 계산 + 각종 가드 + GPT 진입 의사결정은 entry_flow.py / gpt_decider 가 담당한다.
             trade, sleep_sec = try_open_new_position(
                 SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
             )

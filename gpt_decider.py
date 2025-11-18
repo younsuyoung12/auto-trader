@@ -54,11 +54,11 @@
 
 from __future__ import annotations
 
-import os
-import json
-import time
 import csv
 import datetime
+import json
+import os
+import time
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
@@ -74,8 +74,10 @@ _client: Optional[OpenAI] = None
 
 def _safe_log(msg: str) -> None:
     """telelog.log 를 사용할 수 있으면 사용하고, 실패해도 조용히 무시한다."""
+
     try:
-        from telelog import log  # 지연 import 로 순환 의존 방지
+        # 지연 import 로 순환 의존 방지
+        from telelog import log
 
         log(msg)
     except Exception:
@@ -175,7 +177,8 @@ def _log_gpt_latency_csv(
                 if not file_exists:
                     writer.writerow(header)
                 writer.writerow(row)
-    except Exception as e:  # CSV 기록 실패는 트레이딩에 영향 주지 않도록 로그만 남김
+    except Exception as e:
+        # CSV 기록 실패는 트레이딩에 영향 주지 않도록 로그만 남김
         _safe_log(f"[GPT_LATENCY][ERROR] {e}")
 
 
@@ -229,6 +232,7 @@ _SYSTEM_PROMPT_ENTRY = """
 
 def _get_client() -> OpenAI:
     """전역 OpenAI 클라이언트 인스턴스 생성/재사용."""
+
     global _client
     if _client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -245,6 +249,7 @@ def _get_client() -> OpenAI:
 
 def _extract_text_from_response(resp: Any) -> str:
     """OpenAI Responses API 응답 객체에서 텍스트를 최대한 안정적으로 추출."""
+
     # 1) output_text 필드가 있으면 우선 사용
     text_attr = getattr(resp, "output_text", None)
     if isinstance(text_attr, str) and text_attr.strip():
@@ -294,6 +299,7 @@ def _call_gpt_json(
       → safe 래퍼 층에서 잡고 폴백 처리.
     - purpose 는 호출 용도 구분용 태그(현재는 로깅·라우팅용 확장 포인트).
     """
+
     client = _get_client()
 
     if timeout_sec is None:
@@ -368,9 +374,10 @@ def _build_entry_payload(
     - extra(dict)는 gpt_trader 에서 이미 경량화가 끝난 상태라고 가정.
     - 여기서는 핵심 메타 필드만 얹어서 하나의 JSON 으로 합친다.
     """
+
     payload: Dict[str, Any] = {}
 
-    if isinstance(extra, dict) and extra:
+    if isinstance(extra, Dict) and extra:
         payload.update(extra)
 
     # 기본 메타 정보는 필요 시만 추가 (중복 키 방지)
@@ -425,6 +432,7 @@ def ask_entry_decision(
     예외:
     - OpenAI API 오류 / 네트워크 오류 / JSON 파싱 오류 / 응답 지연 초과 시 RuntimeError 발생.
     """
+
     client = _get_client()
 
     model = (
@@ -546,7 +554,7 @@ def ask_entry_decision(
     def _parse_json(s: str) -> Dict[str, Any]:
         try:
             obj = json.loads(s)
-            if not isinstance(obj, dict):
+            if not isinstance(obj, Dict):
                 raise ValueError("JSON 루트 타입이 dict 가 아닙니다.")
             return obj
         except Exception:
@@ -555,7 +563,7 @@ def ask_entry_decision(
             if start != -1 and end != -1 and start < end:
                 sub = s[start : end + 1]
                 obj = json.loads(sub)
-                if not isinstance(obj, dict):
+                if not isinstance(obj, Dict):
                     raise ValueError("잘라낸 JSON 루트 타입이 dict 가 아닙니다.")
                 return obj
             raise
@@ -569,7 +577,7 @@ def ask_entry_decision(
     # 메타 정보(지연 시간)를 붙여서 상위에서 참고할 수 있게 한다.
     try:
         meta = data.get("_meta")
-        if not isinstance(meta, dict):
+        if not isinstance(meta, Dict):
             meta = {}
         meta["latency_sec"] = round(elapsed, 3)
         data["_meta"] = meta
@@ -599,6 +607,7 @@ def ask_entry_decision_safe(
       → 기존 Python 로직만 사용하도록 한다.
     - 정상 응답이면 (action, result_json) 반환.
     """
+
     try:
         data = ask_entry_decision(
             symbol=symbol,
@@ -623,10 +632,11 @@ def ask_entry_decision_safe(
             new_risk = data.get("effective_risk_pct", effective_risk_pct)
             latency = None
             meta = data.get("_meta")
-            if isinstance(meta, dict):
+            if isinstance(meta, Dict):
                 latency = meta.get("latency_sec")
             _safe_log(
-                f"[GPT_ENTRY] action={action} tp={new_tp} sl={new_sl} risk={new_risk} lat={latency} symbol={symbol} src={signal_source} dir={chosen_signal}"
+                f"[GPT_ENTRY] action={action} tp={new_tp} sl={new_sl} "
+                f"risk={new_risk} lat={latency} symbol={symbol} src={signal_source} dir={chosen_signal}"
             )
         except Exception:
             pass
@@ -637,7 +647,10 @@ def ask_entry_decision_safe(
 
         log(f"[GPT_ENTRY] 호출 실패, 기존 로직 사용: {e}")
         try:
-            send_tg("⚠️ GPT 진입 판단 호출에 실패했습니다. 이번 진입은 기존 규칙으로만 판단합니다.")
+            send_tg(
+                "⚠️ GPT 진입 판단 호출에 실패했습니다. "
+                "이번 진입은 기존 규칙으로만 판단합니다."
+            )
         except Exception:
             pass
         return "ENTER", {}
@@ -675,8 +688,11 @@ def _make_exit_prompt(payload: Dict[str, Any]) -> str:
         "   - reason: 한국어 한 줄 요약 (예: '박스 조기익절, 목표 수익 도달').\n"
         "   - comment: 사람이 읽을 수 있는 짧은 설명.\n"
         "3) 손익이 크지 않거나 잡음 수준이면 HOLD 를 우선 고려합니다.\n"
-        "4) 손실 확대 가능성이 크거나, 전략 규칙상 포지션 유지 의미가 약해 보이면 과감하게 CLOSE 를 선택합니다.\n\n"
-        "현재 포지션 상태 JSON:\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n\n"
+        "4) 손실 확대 가능성이 크거나, 전략 규칙상 포지션 유지 의미가 약해 보이면 과감하게 "
+        "CLOSE 를 선택합니다.\n\n"
+        "현재 포지션 상태 JSON:\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + "\n\n"
         "반드시 아래 예시와 같은 스키마로만 응답하세요(값만 바꿔서 사용):\n\n"
         "{\n"
         "  \"action\": \"CLOSE\",\n"
@@ -705,6 +721,7 @@ def ask_exit_decision(
     - scenario: 호출 위치/의도 구분용 태그 (ex: "RANGE_EARLY_TP")
     - extra:  캔들/거래량/임계값/시그널 등 추가 컨텍스트
     """
+
     model = os.getenv("GPT_EXIT_MODEL", "gpt-5.1")
 
     # side 정규화
@@ -771,6 +788,7 @@ def ask_exit_decision_safe(
       * fallback_action 기본값은 "CLOSE" 이지만, 호출측에서 "HOLD" 로 바꿀 수 있다.
     - regime/source 두 인자 중 하나만 넘겨도 된다.
     """
+
     # fallback_action 정규화
     fa = str(fallback_action).upper()
     if fa not in {"CLOSE", "HOLD"}:
@@ -800,7 +818,8 @@ def ask_exit_decision_safe(
         # 성공 시 Render 로그에 요약 남김
         try:
             _safe_log(
-                f"[GPT_EXIT] scenario={scenario} action={action} symbol={symbol} side={side} reason={data.get('reason')}"
+                f"[GPT_EXIT] scenario={scenario} action={action} "
+                f"symbol={symbol} side={side} reason={data.get('reason')}"
             )
         except Exception:
             pass
@@ -855,6 +874,7 @@ def ask_signal_arbitration(
     ⚠ 실패 / 이상 응답 시 ValueError 를 발생시킨다.
       호출부(signal_flow_ws.get_trading_signal)에서 잡아서 no-entry 처리한다.
     """
+
     from telelog import log  # 로깅만 사용 (순환 import 방지용 지연 import)
 
     if trend_candidate is None and range_candidate is None:
@@ -943,7 +963,8 @@ def ask_signal_arbitration(
     # Render 로그에 요약 남김
     try:
         _safe_log(
-            f"[GPT_ARB] action={action} symbol={symbol} last_price={last_price} reason={resp_json.get('reason')}"
+            f"[GPT_ARB] action={action} symbol={symbol} "
+            f"last_price={last_price} reason={resp_json.get('reason')}"
         )
     except Exception:
         pass

@@ -4,6 +4,16 @@
 # 조기익절, 조기청산, 박스→추세 전환, 추세→박스 다운그레이드,
 # 반대 시그널 강제 청산을 수행하는 모듈.
 #
+# 2025-11-19 패치 (EXIT 레이어 안정성 보강 + 레짐 피처 공통화)
+# ----------------------------------------------------
+# - 모든 EXIT 경로에서 trade.qty <= 0 인 포지션은 즉시 스킵하도록 방어 로직 추가.
+#   · 실수로 qty=0 인 Trade 객체가 들어와도 거래소 API 에 잘못된 청산 주문을 보내지 않도록 차단.
+# - TREND 조기청산(sideways+거래량 급감) 트리거 계산 시 캔들 수가 부족해도
+#   안전하게 동작하도록 조건을 보강(len(candles) 체크 추가).
+# - log_skip_event 의 source 문자열을 실제 함수명 기준으로 맞춰 로깅 가독성 개선.
+# - EXIT GPT 컨텍스트의 regime_features 는 indicators.build_regime_features_from_candles(...)
+#   를 재사용하여 entry_flow.py 와 포맷을 통일.
+#
 # 2025-11-17 패치 (EXIT GPT 컨텍스트 + 이벤트/스킵 CSV 로깅 강화)
 # ----------------------------------------------------
 # - ask_exit_decision_safe(...) 로 넘기는 extra(=GPT 컨텍스트)에
@@ -28,7 +38,7 @@
 #   · entry_flow.py 의 진입은 이미 ask_entry_decision_safe(...) 를 사용하고 있음.
 #   · 이 파일에서는 GPT/OpenAI 를 직접 호출하지 않고, gpt_decider 모듈만 import 한다.
 # - GPT 호출이 실패하거나 예외가 발생하면,
-#   ask_exit_decision_safe(...) 가 fallback_action="CLOSE" 로 동작해서
+#   ask_exit_decision_safe(...)가 fallback_action="CLOSE" 로 동작해서
 #   → 기존 Python 로직 그대로(조기익절/조기청산/전환/강제청산) 수행한다.
 #   (진입 쪽과 동일하게 "GPT 추가 레이어"가 실패해도 기본 리스크 가드는 유지되는 구조)
 # - GPT 는 "추가 브레이크" 역할을 한다.
@@ -96,7 +106,7 @@ from signals_logger import (
 )
 from trader import Trade
 from gpt_decider import ask_exit_decision_safe  # ✅ EXIT 쪽 GPT 의사결정은 이 함수만 사용
-from indicators import ema, rsi, calc_atr  # ✅ 레짐/지표 스냅샷 계산용
+from indicators import build_regime_features_from_candles  # ✅ 레짐 피처 공통 함수 재사용
 
 # RANGE 전략 관련 (구/신 버전 모두 대응)
 try:
@@ -206,13 +216,15 @@ def _norm_dir(d: str) -> str:
 
 
 def _build_runtime_regime_features_for_gpt(symbol: str, settings: Any) -> Dict[str, Any]:
-    """5m 웹소켓 캔들 기반 간단 레짐/지표 스냅샷 생성.
+    """5m 웹소켓 캔들 기반 레짐/지표 스냅샷 생성.
 
-    - indicators.ema / rsi / calc_atr 로 TREND/RANGE/CHOP 점수를 계산한다.
+    - indicators.build_regime_features_from_candles(...) 를 재사용해서
+      entry_flow.py 의 regime_features_5m 와 일관된 포맷을 만든다.
+    - 필요 시 15m 방향(trend15_dir)을 덧붙인다.
     - 실패 시에는 빈 dict 반환 (GPT 컨텍스트에서 무시 가능).
     """
     try:
-        candles_5m = ws_get_klines(symbol, "5m", 120)
+        candles_5m = ws_get_klines(symbol, "5m", 200)
     except Exception as e:
         log(f"[PW][REGIME_FEAT] ws_get_klines error symbol={symbol}: {e}")
         return {}
@@ -220,90 +232,49 @@ def _build_runtime_regime_features_for_gpt(symbol: str, settings: Any) -> Dict[s
     if not candles_5m or len(candles_5m) < 30:
         return {}
 
-    try:
-        closes = [float(c[4]) for c in candles_5m]
-        highs = [float(c[2]) for c in candles_5m]
-        lows = [float(c[3]) for c in candles_5m]
-        last_close = closes[-1]
-        if last_close <= 0:
-            return {}
+    # build_regime_features_from_candles 는 (ts, o, h, l, c) 리스트를 기대
+    ohlc_rows: List[Tuple[int, float, float, float, float]] = []
+    for row in candles_5m:
+        if len(row) < 5:
+            continue
+        try:
+            ts_i = int(row[0])
+            o_i = float(row[1])
+            h_i = float(row[2])
+            l_i = float(row[3])
+            c_i = float(row[4])
+        except (TypeError, ValueError):
+            continue
+        ohlc_rows.append((ts_i, o_i, h_i, l_i, c_i))
 
-        # EMA 기반 트렌드 강도
-        ema_fast_len = int(getattr(settings, "ema_fast_len", 20))
-        ema_slow_len = int(getattr(settings, "ema_slow_len", 50))
-
-        ema_fast_list = ema(closes, ema_fast_len)
-        ema_slow_list = ema(closes, ema_slow_len)
-        ema_fast = float(ema_fast_list[-1])
-        ema_slow = float(ema_slow_list[-1])
-
-        ema_diff = ema_fast - ema_slow
-        ema_diff_pct = abs(ema_diff) / last_close if last_close > 0 else 0.0
-
-        # ATR 기반 변동성 (최근 atr_len+1 개)
-        atr_len = int(getattr(settings, "atr_len", 14))
-        tail = candles_5m[-max(atr_len + 1, 15):]
-        atr_input = [
-            (
-                int(c[0]),
-                float(c[1]),
-                float(c[2]),
-                float(c[3]),
-                float(c[4]),
-            )
-            for c in tail
-        ]
-        atr_val = calc_atr(atr_input, length=atr_len) or 0.0
-        atr_pct = (atr_val / last_close) if last_close > 0 else 0.0
-
-        # RSI
-        rsi_len = int(getattr(settings, "rsi_len", 14))
-        rsi_vals = rsi(closes, rsi_len)
-        last_rsi = float(rsi_vals[-1]) if rsi_vals else None
-
-        # 점수 스케일링 (signal_analysis_worker 와 동일한 휴리스틱)
-        trend_raw = min(ema_diff_pct / 0.003, 1.5)  # 0.3% → 1.0, 그 이상은 1.5까지 상한
-        trend_score = max(0.0, min(100.0, trend_raw * 100.0))
-
-        range_raw = max(0.0, (0.0025 - ema_diff_pct) / 0.0025)  # 0~1 사이
-        range_score = max(0.0, min(100.0, range_raw * 100.0))
-
-        chop_raw = max(0.0, min(1.0, atr_pct / 0.004)) * max(0.0, 1.0 - trend_raw)
-        chop_score = max(0.0, min(100.0, chop_raw * 100.0))
-
-        event_risk_score = 0.0  # 뉴스/펀딩 연계 전까지는 0
-
-        if trend_score >= 60 and trend_score >= range_score and trend_score >= chop_score:
-            final_regime = "TREND"
-        elif range_score >= 60 and range_score >= trend_score and range_score >= chop_score:
-            final_regime = "RANGE"
-        elif chop_score >= 60:
-            final_regime = "CHOP"
-        else:
-            final_regime = "NEUTRAL"
-
-        trend15_dir = _get_15m_trend_dir(symbol)
-
-        return {
-            "version": "ws_runtime_v1",
-            "symbol": symbol,
-            "timeframe": "5m",
-            "last_close": last_close,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "ema_diff_pct": ema_diff_pct,
-            "atr_pct_5m": atr_pct,
-            "last_rsi": last_rsi,
-            "trend_score": trend_score,
-            "range_score": range_score,
-            "chop_score": chop_score,
-            "event_risk_score": event_risk_score,
-            "final_regime": final_regime,
-            "trend15_dir": trend15_dir,
-        }
-    except Exception as e:
-        log(f"[PW][REGIME_FEAT] compute error symbol={symbol}: {e}")
+    if len(ohlc_rows) < 20:
         return {}
+
+    try:
+        base_features = build_regime_features_from_candles(ohlc_rows)
+    except Exception as e:
+        log(f"[PW][REGIME_FEAT] build_regime_features_from_candles error symbol={symbol}: {e}")
+        return {}
+
+    if not isinstance(base_features, dict) or not base_features:
+        return {}
+
+    features: Dict[str, Any] = dict(base_features)
+
+    # 메타 필드 보강
+    features.setdefault("version", "ws_runtime_v2")
+    features.setdefault("symbol", symbol)
+    features.setdefault("timeframe", "5m")
+
+    # 15m 방향 추가 (있으면)
+    try:
+        trend15_dir = _get_15m_trend_dir(symbol)
+        if trend15_dir:
+            features["trend15_dir"] = trend15_dir
+    except Exception as e:
+        log(f"[PW][REGIME_FEAT] trend15_dir error symbol={symbol}: {e}")
+
+    return features
 
 
 def _build_exit_context_base(
@@ -494,6 +465,11 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
         return False
 
     regime_label = trade.source or "RANGE"
+    qty = float(getattr(trade, "qty", 0.0) or 0.0)
+    if qty <= 0:
+        log(f"[EARLY_EXIT WS] invalid qty<=0 for RANGE trade → skip (symbol={trade.symbol})")
+        return False
+
     log(f"[PW] (WS) RANGE watch symbol={trade.symbol} tf=5m")
 
     try:
@@ -532,7 +508,6 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
 
     last_close = c
     entry = float(trade.entry)
-    qty = float(trade.qty)
 
     # RANGE 조기익절 (수익권에서 아주 빨리 정리)
     if getattr(settings, "range_early_tp_enabled", False) and entry > 0:
@@ -578,7 +553,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
                     log_skip_event(
                         symbol=trade.symbol,
                         regime=regime_label,
-                        source="position_watch_ws.range_early_tp",
+                        source="position_watch_ws.maybe_early_exit_range",
                         side=trade.side,
                         reason="gpt_exit_hold_range_early_tp",
                         extra={
@@ -696,7 +671,7 @@ def maybe_early_exit_range(trade: Trade, settings: Any) -> bool:
             log_skip_event(
                 symbol=trade.symbol,
                 regime=regime_label,
-                source="position_watch_ws.range_early_exit",
+                source="position_watch_ws.maybe_early_exit_range",
                 side=trade.side,
                 reason="gpt_exit_hold_range_early_exit",
                 extra={
@@ -783,6 +758,11 @@ def maybe_upgrade_range_to_trend(
         return False
 
     regime_label = trade.source or "RANGE"
+    qty = float(getattr(trade, "qty", 0.0) or 0.0)
+    if qty <= 0:
+        log(f"[R2T WS] invalid qty<=0 for RANGE trade → skip (symbol={trade.symbol})")
+        return False
+
     log(f"[PW] (WS) RANGE→TREND recheck symbol={trade.symbol}")
 
     try:
@@ -883,7 +863,7 @@ def maybe_upgrade_range_to_trend(
             log_skip_event(
                 symbol=trade.symbol,
                 regime=regime_label,
-                source="position_watch_ws.range_to_trend_upgrade",
+                source="position_watch_ws.maybe_upgrade_range_to_trend",
                 side=trade.side,
                 reason="gpt_exit_hold_range_to_trend_upgrade",
                 extra={
@@ -901,11 +881,11 @@ def maybe_upgrade_range_to_trend(
         return False
 
     try:
-        close_position_market(trade.symbol, trade.side, trade.qty)
+        close_position_market(trade.symbol, trade.side, qty)
         if trade.side == "BUY":
-            pnl = (last_price - entry) * trade.qty
+            pnl = (last_price - entry) * qty
         else:
-            pnl = (entry - last_price) * trade.qty
+            pnl = (entry - last_price) * qty
         send_tg(
             f"⚠️ (WS) 박스→추세 전환 감지(GPT 승인): {trade.symbol} {trade.side} 수익권에서 정리 "
             f"(현재가={last_price:.2f}, 진입={entry:.2f})"
@@ -917,7 +897,7 @@ def maybe_upgrade_range_to_trend(
             strategy_type="RANGE",
             direction=trade.side,
             price=last_price,
-            qty=trade.qty,
+            qty=qty,
             reason=reason,
             pnl=pnl,
         )
@@ -986,6 +966,11 @@ def maybe_downgrade_trend_to_range(
 
     symbol = trade.symbol
     regime_label = trade.source or "TREND"
+    qty = float(getattr(trade, "qty", 0.0) or 0.0)
+    if qty <= 0:
+        log(f"[T2R WS] invalid qty<=0 for TREND trade → skip (symbol={symbol})")
+        return False
+
     log(f"[PW] (WS) TREND→RANGE downgrade check symbol={symbol}")
 
     # 5m/15m 캔들 확보
@@ -1117,7 +1102,7 @@ def maybe_downgrade_trend_to_range(
             log_skip_event(
                 symbol=trade.symbol,
                 regime=regime_label,
-                source="position_watch_ws.trend_to_range_downgrade",
+                source="position_watch_ws.maybe_downgrade_trend_to_range",
                 side=trade.side,
                 reason="gpt_exit_hold_trend_to_range_downgrade",
                 extra={
@@ -1138,11 +1123,11 @@ def maybe_downgrade_trend_to_range(
 
     # 기존 추세 포지션 정리
     try:
-        close_position_market(symbol, trade.side, trade.qty)
+        close_position_market(symbol, trade.side, qty)
         if trade.side == "BUY":
-            pnl = (last_price - entry) * trade.qty
+            pnl = (last_price - entry) * qty
         else:
-            pnl = (entry - last_price) * trade.qty
+            pnl = (entry - last_price) * qty
         send_tg(
             f"⚠️ (WS) 추세→박스 다운그레이드(GPT 승인): {symbol} {trade.side} 정리 후 RANGE 전환 준비 "
             f"(pnl≈{pnl_pct*100:.3f}%, last={last_price:.2f})"
@@ -1154,7 +1139,7 @@ def maybe_downgrade_trend_to_range(
             strategy_type="TREND",
             direction=trade.side,
             price=last_price,
-            qty=trade.qty,
+            qty=qty,
             reason=reason,
             pnl=pnl,
         )
@@ -1196,7 +1181,7 @@ def maybe_downgrade_trend_to_range(
     if getattr(settings, "trend_to_range_auto_reenter", True) and open_position_with_tp_sl:
         try:
             side = "BUY" if nd == "LONG" else "SELL"
-            new_qty = trade.qty  # 단순 동일 수량 재사용(필요 시 별도 정책 적용)
+            new_qty = qty  # 단순 동일 수량 재사용(필요 시 별도 정책 적용)
             open_position_with_tp_sl(
                 symbol=symbol,
                 side=side,
@@ -1239,6 +1224,11 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
         return False
 
     regime_label = trade.source or "TREND"
+    qty = float(getattr(trade, "qty", 0.0) or 0.0)
+    if qty <= 0:
+        log(f"[TREND_EARLY WS] invalid qty<=0 for TREND trade → skip (symbol={trade.symbol})")
+        return False
+
     log(f"[PW] (WS) TREND watch symbol={trade.symbol} tf=5m")
 
     try:
@@ -1277,7 +1267,6 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
 
     last_close = c
     entry = float(trade.entry)
-    qty = float(trade.qty)
 
     # 추세 조기익절
     if getattr(settings, "trend_early_tp_enabled", False) and entry > 0:
@@ -1322,7 +1311,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
                     log_skip_event(
                         symbol=trade.symbol,
                         regime=regime_label,
-                        source="position_watch_ws.trend_early_tp",
+                        source="position_watch_ws.maybe_early_exit_trend",
                         side=trade.side,
                         reason="gpt_exit_hold_trend_early_tp",
                         extra={
@@ -1399,7 +1388,11 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
         need_bars = int(getattr(settings, "trend_sideways_need_bars", 3))
         max_rng = float(getattr(settings, "trend_sideways_range_pct", 0.0008))
         vol_ratio = float(getattr(settings, "min_entry_volume_ratio", 0.15))
-        if _all_candles_narrow(candles, need_bars, max_rng) and _volume_collapse(candles, need_bars, vol_ratio):
+        if (
+            len(candles) >= max(need_bars, 2)
+            and _all_candles_narrow(candles, need_bars, max_rng)
+            and _volume_collapse(candles, need_bars, vol_ratio)
+        ):
             eff_trig = trend_trigger_pct * 0.6
     except Exception:
         pass
@@ -1455,7 +1448,7 @@ def maybe_early_exit_trend(trade: Trade, settings: Any) -> bool:
             log_skip_event(
                 symbol=trade.symbol,
                 regime=regime_label,
-                source="position_watch_ws.trend_early_exit",
+                source="position_watch_ws.maybe_early_exit_trend",
                 side=trade.side,
                 reason="gpt_exit_hold_trend_early_exit",
                 extra={
@@ -1541,6 +1534,10 @@ def maybe_close_on_opposite_signal(
     - 후보가 되면 GPT-5.1 에게 "opposite_signal_close" 시나리오로 EXIT 여부를 묻는다.
     """
     regime_label = trade.source or "UNKNOWN"
+    qty = float(getattr(trade, "qty", 0.0) or 0.0)
+    if qty <= 0:
+        log(f"[OPP WS] invalid qty<=0 for trade → skip (symbol={trade.symbol})")
+        return False
 
     try:
         sig_ctx = get_trading_signal(
@@ -1557,7 +1554,6 @@ def maybe_close_on_opposite_signal(
 
     new_dir, new_src, ts_ms, candles_5m, _c5raw, last_price, extra = sig_ctx
     entry = float(trade.entry)
-    qty = float(trade.qty)
 
     def _is_opposite(trade_side: str, sig_dir: str) -> bool:
         nd = _norm_dir(sig_dir)
@@ -1615,7 +1611,7 @@ def maybe_close_on_opposite_signal(
             log_skip_event(
                 symbol=trade.symbol,
                 regime=regime_label,
-                source="position_watch_ws.opposite_signal_close",
+                source="position_watch_ws.maybe_close_on_opposite_signal",
                 side=trade.side,
                 reason="gpt_exit_hold_opposite_signal",
                 extra={
