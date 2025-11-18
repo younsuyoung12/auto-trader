@@ -30,7 +30,20 @@
 #    - extra.guard_snapshot (현재 가드 스냅샷)을 그대로 JSON 으로 보여주어 GPT가
 #      min_entry_volume_ratio, max_spread_pct, max_price_jump_pct 등의 기준값을 참고해
 #      "너무 강해서 항상 SKIP" 상황을 부드럽게 조정할 수 있게 함.
-
+#
+# 2025-11-18 변경 사항 (진입 프롬프트/토큰 경량화 + 지연 시간 가드 통합)
+# ----------------------------------------------------
+# 9) ask_entry_decision 경로를 완전히 재구성하여:
+#    - SYSTEM 프롬프트는 고정된 짧은 설명만 사용하고,
+#    - USER 메시지는 compact JSON(payload) 하나만 전달하도록 변경.
+# 10) gpt_trader.py 에서 이미 경량화한 extra 를 그대로 받아서 JSON payload 로만 넘기므로,
+#     raw 캔들/시세 리스트가 그대로 프롬프트에 섞이지 않게 함.
+# 11) OPENAI_TRADER_MODEL / OPENAI_TRADER_MAX_TOKENS / OPENAI_TRADER_MAX_LATENCY 환경변수로
+#     모델명, 출력 토큰 수, 허용 지연시간을 조정 가능하게 함.
+# 12) ask_entry_decision 응답에 _meta.latency_sec 를 추가해서 왕복 지연시간을 텔레그램/로그에서
+#     확인할 수 있게 함.
+# 13) _call_gpt_json 의 timeout_sec 가 None 이면 OPENAI_TRADER_MAX_LATENCY 를 기본값으로 사용하여
+#     EXIT/ARB 경로도 동일한 지연시간 설정을 공유하도록 정리.
 from __future__ import annotations
 
 import os
@@ -57,6 +70,49 @@ def _safe_log(msg: str) -> None:
     except Exception:
         # 로깅 실패로 인해 트레이딩 로직이 죽지 않도록 무시
         pass
+
+
+# ─────────────────────────────────────────
+# GPT 시스템 프롬프트 (진입용)
+# ─────────────────────────────────────────
+
+_SYSTEM_PROMPT_ENTRY = """
+당신은 비트코인 선물 자동매매 시스템의 '진입 허용 여부'만 판단하는 작은 에이전트입니다.
+
+입력으로 하나의 JSON 객체를 받습니다. 이 JSON 에는 대략 다음 정보가 들어 있습니다:
+- symbol, regime(TREND/RANGE/HYBRID), direction(LONG/SHORT)
+- last_price, entry_score, effective_risk_pct, leverage
+- base_tp_pct, base_sl_pct
+- guard_snapshot, recent_pnl_pct, skip_streak
+- 그 밖에 요약된 지표/리스크 플래그 등이 들어올 수 있습니다.
+
+할 일:
+1) action: "ENTER" / "SKIP" / "ADJUST" 중 하나를 고르세요.
+   - "ENTER": 지금 조건이면 진입 허용.
+   - "SKIP": 지금은 진입하지 말 것.
+   - "ADJUST": 진입은 허용하지만, TP/SL/리스크/가드 값을 소폭 조정.
+
+2) 숫자 필드 (옵션):
+   - tp_pct: 기본값 근처의 수익 목표 비율 (0보다 크고 0.03~0.12 사이 권장).
+   - sl_pct: 기본값 근처의 손절 비율 (0보다 크고 0.01~0.07 사이 권장).
+   - effective_risk_pct: 계좌 대비 주문 비율. 0 < effective_risk_pct <= 0.03 정도로 작게 유지.
+
+3) guard_adjustments (옵션):
+   - 객체 형태로, 다음 키 중 필요한 것만 포함할 수 있습니다:
+     * min_entry_volume_ratio
+     * max_spread_pct
+     * max_price_jump_pct
+     * depth_imbalance_min_ratio
+     * depth_imbalance_min_notional
+   - 각 값은 현재 guard_snapshot 에서 크게 벗어나지 않는 선에서 소폭 조정합니다.
+
+4) reason:
+   - 한국어로 한 줄 정도의 짧은 설명을 남기세요.
+
+형식 규칙:
+- 반드시 하나의 JSON 객체만 출력하십시오.
+- JSON 바깥에는 아무 텍스트도 쓰지 마십시오.
+""".strip()
 
 
 # ─────────────────────────────────────────
@@ -122,7 +178,7 @@ def _call_gpt_json(
     model: str,
     prompt: str,
     *,
-    timeout_sec: float = 8.0,
+    timeout_sec: Optional[float] = None,
     purpose: Optional[str] = None,
 ) -> Dict[str, Any]:
     """GPT-5.1 을 호출해서 **반드시 JSON**만 받는 헬퍼.
@@ -132,6 +188,12 @@ def _call_gpt_json(
     - purpose 는 호출 용도 구분용 태그(현재는 로깅·라우팅용 확장 포인트).
     """
     client = _get_client()
+
+    if timeout_sec is None:
+        try:
+            timeout_sec = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
+        except Exception:
+            timeout_sec = 8.0
 
     t0 = time.time()
     _safe_log(f"[GPT_CALL] start purpose={purpose or '-'} model={model}")
@@ -177,8 +239,48 @@ def _call_gpt_json(
 
 
 # ─────────────────────────────────────────
-# 1) 진입 의사결정
+# 1) 진입 의사결정 (경량 프롬프트 버전)
 # ─────────────────────────────────────────
+
+
+def _build_entry_payload(
+    *,
+    symbol: str,
+    signal_source: str,
+    chosen_signal: str,
+    last_price: float,
+    entry_score: Optional[float],
+    effective_risk_pct: float,
+    leverage: float,
+    tp_pct: float,
+    sl_pct: float,
+    extra: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """GPT에 넘길 compact JSON payload 구성.
+
+    - extra(dict)는 gpt_trader 에서 이미 경량화가 끝난 상태라고 가정.
+    - 여기서는 핵심 메타 필드만 얹어서 하나의 JSON 으로 합친다.
+    """
+    payload: Dict[str, Any] = {}
+
+    if isinstance(extra, dict) and extra:
+        payload.update(extra)
+
+    # 기본 메타 정보는 필요 시만 추가 (중복 키 방지)
+    payload.setdefault("symbol", symbol)
+    payload.setdefault("regime", signal_source.upper())
+    payload.setdefault("direction", chosen_signal.upper())
+    payload.setdefault("last_price", float(last_price))
+    payload.setdefault("effective_risk_pct", float(effective_risk_pct))
+    payload.setdefault("leverage", float(leverage))
+    payload.setdefault("base_tp_pct", float(tp_pct))
+    payload.setdefault("base_sl_pct", float(sl_pct))
+
+    if entry_score is not None:
+        # score 가 너무 길게 나오지 않도록 float 로만 전달
+        payload.setdefault("entry_score", float(entry_score))
+
+    return payload
 
 
 def ask_entry_decision(
@@ -194,95 +296,128 @@ def ask_entry_decision(
     sl_pct: float,
     extra: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """GPT-5.1 에게 '이 진입을 할지 말지, 비율/가드를 어떻게 조정할지' 물어본다.
+    """GPT 에게 진입 여부/강도 결정을 compact JSON 기반으로 요청한다.
 
-    반환 예시(JSON):
-    {
-      "action": "ENTER",          # ENTER / SKIP / ADJUST
-      "reason": "짧은 요약 한줄",
-      "tp_pct": 0.02,             # 선택 (없으면 기존 값 사용)
-      "sl_pct": 0.01,             # 선택
-      "effective_risk_pct": 0.01, # 선택
-      "guard_adjustments": {      # 선택 (없으면 가드 값 그대로 사용)
-        "min_entry_volume_ratio": 0.25,
-        "max_spread_pct": 0.001
-      }
-    }
+    반환 형식 (예시):
+
+        {
+          "action": "ENTER" | "SKIP" | "ADJUST",
+          "reason": "...",
+          "tp_pct": 0.006,
+          "sl_pct": 0.004,
+          "effective_risk_pct": 0.02,
+          "guard_adjustments": {
+            "min_entry_volume_ratio": 0.25,
+            "max_spread_pct": 0.001
+          },
+          "_meta": {
+            "latency_sec": 1.234
+          }
+        }
+
+    예외:
+    - OpenAI API 오류 / 네트워크 오류 / JSON 파싱 오류 / 응답 지연 초과 시 RuntimeError 발생.
     """
-    model = os.getenv("GPT_ENTRY_MODEL", "gpt-5.1")
+    client = _get_client()
 
-    # extra 는 너무 길 수 있으니 핵심만 잘라서 보낸다.
-    trimmed_extra: Dict[str, Any] = {}
-    if isinstance(extra, dict):
-        for k in [
-            "signal_score",
-            "candidate_score",
-            "atr_fast",
-            "atr_slow",
-            "regime_level",
-            "regime",
-            "recent_pnl_pct",
-            "skip_streak",
-            "guard_snapshot",  # gpt_trader 가 넣어주는 현재 가드 스냅샷
-        ]:
-            if k in extra:
-                trimmed_extra[k] = extra[k]
+    model = (
+        os.getenv("OPENAI_TRADER_MODEL")
+        or os.getenv("GPT_ENTRY_MODEL")
+        or "gpt-5.1"
+    )
+    try:
+        max_tokens = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
+    except Exception:
+        max_tokens = 192
+    try:
+        max_latency = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
+    except Exception:
+        max_latency = 8.0
 
-    prompt = f"""
-당신은 BTC-USDT 선물 자동매매 봇의 진입 리스크 컨트롤러입니다.
-아래 정보를 보고 이 진입을 허용할지, 그리고 필요하다면 TP/SL/리스크/가드를 어떻게 조정할지 결정하세요.
+    payload = _build_entry_payload(
+        symbol=symbol,
+        signal_source=signal_source,
+        chosen_signal=chosen_signal,
+        last_price=last_price,
+        entry_score=entry_score,
+        effective_risk_pct=effective_risk_pct,
+        leverage=leverage,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        extra=extra,
+    )
 
-- 심볼: {symbol}
-- 시그널 소스: {signal_source}   (TREND=추세, RANGE=박스, HYBRID=혼합)
-- 방향: {chosen_signal}          (LONG=매수, SHORT=매도)
-- 현재가: {last_price}
-- EntryScore(0~100): {entry_score}
-- 레버리지: {leverage}
-- 현재 설정 리스크 비율: {effective_risk_pct}
-- 현재 TP%: {tp_pct}, SL%: {sl_pct}
-- 추가 지표/가드(extra 요약): {json.dumps(trimmed_extra, ensure_ascii=False)}
+    user_content = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
-extra.guard_snapshot 필드(있다면)는 현재 진입 가드 설정을 JSON 으로 담고 있습니다.
-예: min_entry_volume_ratio, max_spread_pct, max_price_jump_pct,
-    depth_imbalance_min_ratio, depth_imbalance_min_notional 등.
+    t0 = time.perf_counter()
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": _SYSTEM_PROMPT_ENTRY},
+                {"role": "user", "content": user_content},
+            ],
+            max_output_tokens=max_tokens,
+            temperature=0.2,
+            timeout=max_latency,
+        )
+    except Exception as e:
+        raise RuntimeError(f"GPT 응답 호출 실패: {e}") from e
 
-규칙:
-1) 답변은 반드시 JSON 하나만 출력하세요. 자연어 설명 따로 쓰지 마세요.
-2) action 값:
-   - "ENTER"  : 그대로 진입
-   - "SKIP"   : 이번 진입은 건너뛰기
-   - "ADJUST" : 진입은 하되 TP/SL/리스크/가드를 조정
-3) 수치를 수정하고 싶을 때만 해당 필드를 포함합니다.
-   - tp_pct / sl_pct / effective_risk_pct 는 0보다 커야 합니다.
-   - 리스크 비율은 0.001 ~ 0.03 (0.1% ~ 3%) 범위로 맞추세요.
-4) 필요하다면 guard_adjustments 라는 선택 필드를 포함할 수 있습니다.
-   - guard_adjustments 가 없으면 가드는 변경하지 않습니다.
-   - 사용할 수 있는 키(모두 선택 사항):
-     · min_entry_volume_ratio : 0.10 ~ 0.60 (가능하면 현재 값 기준 ±0.20 이내에서만 조정)
-     · max_spread_pct         : 0.0003 ~ 0.0015
-     · max_price_jump_pct     : 0.0010 ~ 0.0040
-     · depth_imbalance_min_ratio   : 1.5 ~ 4.0
-     · depth_imbalance_min_notional: 20 ~ 200
-   - 너무 공격적으로 완화하기보다는,
-     "장 상태는 괜찮은데 가드가 너무 강해서 계속 SKIP 되는 상황"에서만
-     약간 부드럽게 풀어주는 방향으로 조정하세요.
+    elapsed = time.perf_counter() - t0
 
-JSON 스키마 예시는 다음과 같습니다 (그대로 쓰지 말고 값만 채워서 보내세요):
+    # 지연 시간 가드 (응답이 늦게 왔으면 그대로 SKIP 하도록 상위에 알림)
+    if elapsed > max_latency:
+        raise RuntimeError(f"GPT 응답 지연: {elapsed:.2f}s > {max_latency:.2f}s")
 
-{{
-  "action": "ENTER",
-  "reason": "여기에 한국어 한 줄 요약",
-  "tp_pct": 0.02,
-  "sl_pct": 0.01,
-  "effective_risk_pct": 0.01,
-  "guard_adjustments": {{
-    "min_entry_volume_ratio": 0.25,
-    "max_spread_pct": 0.001
-  }}
-}}
-    """.strip()
+    try:
+        text = _extract_text_from_response(resp).strip()
+    except Exception as e:
+        raise RuntimeError(f"GPT 응답 텍스트 추출 실패: {e}") from e
 
-    return _call_gpt_json(model=model, prompt=prompt, purpose="entry_decision")
+    if not text:
+        raise RuntimeError("GPT 응답이 비어 있습니다.")
+
+    # JSON 파싱 (필요 시 중괄호 부분만 잘라서 재시도)
+    def _parse_json(s: str) -> Dict[str, Any]:
+        try:
+            obj = json.loads(s)
+            if not isinstance(obj, dict):
+                raise ValueError("JSON 루트 타입이 dict 가 아닙니다.")
+            return obj
+        except Exception:
+            start = s.find("{")
+            end = s.rfind("}")
+            if start != -1 and end != -1 and start < end:
+                sub = s[start : end + 1]
+                obj = json.loads(sub)
+                if not isinstance(obj, dict):
+                    raise ValueError("잘라낸 JSON 루트 타입이 dict 가 아닙니다.")
+                return obj
+            raise
+
+    try:
+        data = _parse_json(text)
+    except Exception as e:
+        preview = text[:200]
+        raise RuntimeError(f"GPT 응답 JSON 파싱 실패: {preview!r}") from e
+
+    # 메타 정보(지연 시간)를 붙여서 상위에서 참고할 수 있게 한다.
+    try:
+        meta = data.get("_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["latency_sec"] = round(elapsed, 3)
+        data["_meta"] = meta
+    except Exception:
+        # 메타 추가는 필수가 아니므로 실패해도 무시
+        pass
+
+    return data
 
 
 def ask_entry_decision_safe(
@@ -326,8 +461,12 @@ def ask_entry_decision_safe(
             new_tp = data.get("tp_pct", tp_pct)
             new_sl = data.get("sl_pct", sl_pct)
             new_risk = data.get("effective_risk_pct", effective_risk_pct)
+            latency = None
+            meta = data.get("_meta")
+            if isinstance(meta, dict):
+                latency = meta.get("latency_sec")
             _safe_log(
-                f"[GPT_ENTRY] action={action} tp={new_tp} sl={new_sl} risk={new_risk} symbol={symbol} src={signal_source} dir={chosen_signal}"
+                f"[GPT_ENTRY] action={action} tp={new_tp} sl={new_sl} risk={new_risk} lat={latency} symbol={symbol} src={signal_source} dir={chosen_signal}"
             )
         except Exception:
             pass

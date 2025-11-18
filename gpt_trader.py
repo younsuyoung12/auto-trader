@@ -8,6 +8,18 @@
 #     · 반대로 너무 위험한 완화/레버리지 제안은 settings_ws.BotSettings 상한/하한으로 완전히 차단한다.
 # - 장 흐름(최근 PnL/스킵 패턴 등)에 따라, 가드·리스크 파라미터를 동적으로 조정하는 AI 게이트웨이.
 #
+# 2025-11-18 변경 사항 (GPT 프롬프트 경량화 + 토큰 가드)
+# ----------------------------------------------------
+# 1) _build_extra_for_gpt(...) 에서 extra dict 전체를 그대로 넘기지 않고,
+#    - 숫자/문자/불리언 스칼라 값만 기본 허용,
+#    - 리스트/딥한 dict 는 길이/키 개수가 작은 경우만 요약 허용,
+#    - guard_snapshot 는 기존처럼 핵심 키만 유지
+#    → GPT 프롬프트에 들어가는 JSON 크기를 줄여 응답 시간 단축.
+# 2) extra 필드에 regime/direction/recent_pnl_pct/skip_streak 를 포함하는 규칙은 유지하되
+#    heavy payload 가 들어가지 않도록 필터링 로직 추가.
+# 3) 나머지 리스크/가드 클램핑 로직은 그대로 사용하되, GPT가 리스크를 0%로 만드는
+#    응답은 동일하게 강제 SKIP 처리.
+#
 # 2025-11-17 변경 사항 (GPT 프롬프트 컨텍스트 강화)
 # ----------------------------------------------------
 # 1) ask_entry_decision 호출 전에 _build_extra_for_gpt(...) 로 extra 를 재구성.
@@ -28,7 +40,7 @@
 #           # gpt_result 에서 tp/sl/risk/guard_adjustments 를 읽어 주문/가드에 반영
 #       else:
 #           # 필요하면 gpt_result["sleep_after_sec"] 만큼 sleep 후 다음 루프
-#
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -193,7 +205,9 @@ def _apply_guard_adjustments(
     if "min_entry_volume_ratio" in raw_adj:
         try:
             val = float(raw_adj["min_entry_volume_ratio"])
-            base = float(snap.get("min_entry_volume_ratio", settings.min_entry_volume_ratio))
+            base = float(
+                snap.get("min_entry_volume_ratio", settings.min_entry_volume_ratio)
+            )
             # 너무 과하게 올리면 진입 불능, 너무 낮추면 의미 없음 → 하드 범위 + 근처에서만 허용
             lo = GUARD_BOUNDS.min_entry_volume_ratio_min
             hi = GUARD_BOUNDS.min_entry_volume_ratio_max
@@ -235,7 +249,9 @@ def _apply_guard_adjustments(
     if "depth_imbalance_min_ratio" in raw_adj:
         try:
             val = float(raw_adj["depth_imbalance_min_ratio"])
-            base = float(snap.get("depth_imbalance_min_ratio", settings.depth_imbalance_min_ratio))
+            base = float(
+                snap.get("depth_imbalance_min_ratio", settings.depth_imbalance_min_ratio)
+            )
             lo = GUARD_BOUNDS.depth_imbalance_min_ratio_min
             hi = GUARD_BOUNDS.depth_imbalance_min_ratio_max
             if lo <= val <= hi:
@@ -249,7 +265,11 @@ def _apply_guard_adjustments(
     if "depth_imbalance_min_notional" in raw_adj:
         try:
             val = float(raw_adj["depth_imbalance_min_notional"])
-            base = float(snap.get("depth_imbalance_min_notional", settings.depth_imbalance_min_notional))
+            base = float(
+                snap.get(
+                    "depth_imbalance_min_notional", settings.depth_imbalance_min_notional
+                )
+            )
             lo = GUARD_BOUNDS.depth_imbalance_min_notional_min
             hi = GUARD_BOUNDS.depth_imbalance_min_notional_max
             if lo <= val <= hi:
@@ -269,6 +289,58 @@ def _apply_guard_adjustments(
 # ─────────────────────────────────────────
 
 
+def _sanitize_extra_for_gpt(extra: Dict[str, Any]) -> Dict[str, Any]:
+    """GPT에 넘길 extra 에서 가벼운 정보만 추려낸다.
+
+    - 스칼라(str/int/float/bool/None)는 그대로 허용.
+    - 리스트/튜플은 길이 32 이하 & 요소가 스칼라 또는 소형 dict 인 경우만 허용.
+    - dict 는 키 32개까지, 값이 스칼라인 것만 허용.
+    - 그 외(대형 리스트, 중첩 캔들 raw 등)는 버려서 토큰 수를 줄인다.
+    """
+    sanitized: Dict[str, Any] = {}
+
+    for key, value in extra.items():
+        # 1) 스칼라 타입은 그대로
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            sanitized[key] = value
+            continue
+
+        # 2) 리스트/튜플: 길이 제한 + 요소 타입 제한
+        if isinstance(value, (list, tuple)):
+            if not value or len(value) > 32:
+                continue
+
+            new_list = []
+            for item in value:
+                if isinstance(item, (str, int, float, bool)) or item is None:
+                    new_list.append(item)
+                elif isinstance(item, dict):
+                    small_dict: Dict[str, Any] = {}
+                    for k2, v2 in list(item.items())[:16]:
+                        if isinstance(v2, (str, int, float, bool)) or v2 is None:
+                            small_dict[k2] = v2
+                    if small_dict:
+                        new_list.append(small_dict)
+                # 기타 타입은 스킵
+            if new_list:
+                sanitized[key] = new_list
+            continue
+
+        # 3) dict: 키 개수 제한 + 값 타입 제한
+        if isinstance(value, dict):
+            small_dict: Dict[str, Any] = {}
+            for k2, v2 in list(value.items())[:32]:
+                if isinstance(v2, (str, int, float, bool)) or v2 is None:
+                    small_dict[k2] = v2
+            if small_dict:
+                sanitized[key] = small_dict
+            continue
+
+        # 4) 그 외 타입은 모두 버림
+
+    return sanitized
+
+
 def _build_extra_for_gpt(
     settings: BotSettings,
     *,
@@ -279,7 +351,7 @@ def _build_extra_for_gpt(
 ) -> Dict[str, Any]:
     """ask_entry_decision 에 전달할 extra 컨텍스트를 구성한다.
 
-    - 호출측 extra(dict)를 기본으로 사용.
+    - 호출측 extra(dict)를 기본으로 사용하되, 크기를 줄이기 위해 _sanitize_extra_for_gpt(...) 를 거친다.
     - 장 종류(TREND/RANGE/HYBRID)와 방향(LONG/SHORT)을 regime/direction 필드로 명시.
     - 현재 가드 설정(guard_snapshot)의 핵심 값들을 guard_snapshot 필드로 요약.
     - settings.recent_pnl_pct, settings.skip_streak 가 있으면 최근 성과/스킵 패턴도 포함.
@@ -287,9 +359,11 @@ def _build_extra_for_gpt(
 
     payload: Dict[str, Any] = {}
 
-    if isinstance(extra, dict):
-        payload.update(extra)
+    # 1) 호출측 extra → 경량화해서 병합
+    if isinstance(extra, dict) and extra:
+        payload.update(_sanitize_extra_for_gpt(extra))
 
+    # 2) 장 종류/방향 명시
     src = (signal_source or "").upper()
     if src and "regime" not in payload:
         payload["regime"] = src
@@ -298,7 +372,7 @@ def _build_extra_for_gpt(
     if dir_up and "direction" not in payload:
         payload["direction"] = dir_up
 
-    # 현재 가드 스냅샷 요약
+    # 3) 현재 가드 스냅샷 요약
     if isinstance(guard_snapshot, dict):
         guard_keys = [
             "min_entry_volume_ratio",
@@ -311,15 +385,17 @@ def _build_extra_for_gpt(
             k: guard_snapshot[k] for k in guard_keys if k in guard_snapshot
         }
         if trimmed_guard:
-            # 기존 extra 에 동일 키가 있으면 병합
-            if "guard_snapshot" in payload and isinstance(payload["guard_snapshot"], dict):
-                merged = dict(payload["guard_snapshot"])
+            # 기존 extra 에 guard_snapshot 이 있으면 병합
+            if "guard_snapshot" in payload and isinstance(
+                payload["guard_snapshot"], dict
+            ):
+                merged = dict(payload["guard_snapshot"])  # 얕은 복사 후 업데이트
                 merged.update(trimmed_guard)
                 payload["guard_snapshot"] = merged
             else:
                 payload["guard_snapshot"] = trimmed_guard
 
-    # 최근 PnL / 스킵 패턴 (옵션)
+    # 4) 최근 PnL / 스킵 패턴 (옵션)
     if "recent_pnl_pct" not in payload and hasattr(settings, "recent_pnl_pct"):
         try:
             payload["recent_pnl_pct"] = float(getattr(settings, "recent_pnl_pct"))
@@ -451,8 +527,12 @@ def decide_entry_with_gpt_trader(
     # 리스크가 사실상 0이면, 진입은 의미 없으므로 강제 SKIP
     if risk_params.effective_risk_pct <= 0.0:
         result["final_action"] = "SKIP"
-        result["reason"] = "GPT가 리스크를 0% 이하로 제안했거나, 상한/하한 처리 후 0%가 되었습니다."
-        result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
+        result["reason"] = (
+            "GPT가 리스크를 0% 이하로 제안했거나, 상한/하한 처리 후 0%가 되었습니다."
+        )
+        result["sleep_after_sec"] = float(
+            getattr(settings, "gpt_skip_sleep_sec", 3.0)
+        )
         _safe_log("[GPT_TRADER] effective_risk_pct <= 0 → SKIP")
         return result
 
