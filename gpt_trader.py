@@ -26,6 +26,10 @@
 #    - gpt_entry_hard_stop_min_errors (기본 3회 연속 에러 시 HARD_STOP 진입)
 #    - gpt_entry_hard_stop_cooldown_sec (기본 30.0초, 하드 스톱 유지 시간)
 #    - gpt_entry_error_reset_window_sec (기본 60.0초, 이 시간 이상 지나면 에러 카운터 리셋)
+# 6) ask_entry_decision 예외 및 비정상 응답 포맷 처리 강화:
+#    - 예외 타입과 메시지를 Render 로그에 남기고,
+#    - dict 가 아닌 응답은 별도 오류로 취급하여 동일한 에러 카운터/하드 스톱 로직에 포함.
+#    → GPT 응답 이상으로 인한 "빈 raw" 상태의 원인을 로그에서 쉽게 추적 가능.
 #
 # 2025-11-18 변경 사항 (GPT 프롬프트 경량화 + 토큰 가드)
 # ----------------------------------------------------
@@ -222,7 +226,7 @@ def _apply_guard_adjustments(
     반환 값 예시:
         {
           "min_entry_volume_ratio": 0.25,
-          "max_spread_pct": 0.0010,
+          "max_spread_pct": 0.001,
           ...
         }
 
@@ -553,7 +557,7 @@ def decide_entry_with_gpt_trader(
         _gpt_entry_last_error_ts = 0.0
         _safe_log("[GPT_TRADER] HARD_STOP window ended → GPT entry gate reopened")
 
-    # 1) GPT에 진입 의사결정 요청 (폴백 래퍼 사용 금지)
+    # 1) GPT에 진입 의사결정 요청
     extra_for_gpt = _build_extra_for_gpt(
         settings,
         signal_source=signal_source,
@@ -597,7 +601,10 @@ def decide_entry_with_gpt_trader(
         _gpt_entry_last_error_ts = now_ts
         _gpt_entry_error_streak += 1
 
-        msg = f"[GPT_TRADER] ask_entry_decision error (streak={_gpt_entry_error_streak}) → SKIP: {e}"
+        msg = (
+            f"[GPT_TRADER] ask_entry_decision error "
+            f"(streak={_gpt_entry_error_streak}) → SKIP: {type(e).__name__}: {e}"
+        )
         _safe_log(msg)
 
         # 하드 스톱 진입 여부 판단
@@ -621,6 +628,44 @@ def decide_entry_with_gpt_trader(
             )
             _safe_tg(
                 "⚠️ GPT 진입 판단 호출에 실패했습니다. 이번 루프는 진입 없이 건너뜁니다."
+            )
+
+        return result
+
+    # 1-1) GPT 응답 포맷 검증(dict 미만/이상형 방어)
+    if not isinstance(gpt_json, dict):
+        now_ts = _now_ts()
+
+        if _gpt_entry_last_error_ts and (now_ts - _gpt_entry_last_error_ts) > error_reset_window:
+            _gpt_entry_error_streak = 0
+        _gpt_entry_last_error_ts = now_ts
+        _gpt_entry_error_streak += 1
+
+        _safe_log(
+            f"[GPT_TRADER] invalid response type from ask_entry_decision: "
+            f"{type(gpt_json).__name__} (streak={_gpt_entry_error_streak}) → SKIP"
+        )
+
+        if _gpt_entry_error_streak >= hard_stop_min_errors:
+            _gpt_entry_hard_stop_until_ts = now_ts + hard_stop_cooldown
+            result["gpt_status"] = "HARD_STOP"
+            result["hard_stop"] = True
+            result["reason"] = (
+                "GPT 진입 판단 응답 포맷이 반복적으로 잘못되어 일정 시간 신규 진입을 중단합니다."
+            )
+            result["sleep_after_sec"] = hard_stop_cooldown
+            _safe_tg(
+                "⚠️ [GPT_ENTRY][HARD_STOP] GPT 진입 판단 응답 포맷이 반복적으로 잘못되어 일정 시간 신규 진입을 중단합니다."
+            )
+        else:
+            result["gpt_status"] = "ERROR"
+            result["hard_stop"] = False
+            result["reason"] = "GPT 응답 포맷 오류로 이번 루프는 진입 없이 건너뜁니다."
+            result["sleep_after_sec"] = float(
+                getattr(settings, "gpt_error_sleep_sec", 5.0)
+            )
+            _safe_tg(
+                "⚠️ GPT 진입 판단 응답 포맷이 잘못되었습니다. 이번 루프는 진입 없이 건너뜁니다."
             )
 
         return result
