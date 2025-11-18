@@ -4,6 +4,15 @@ signal_flow_ws.py (simultaneous arbitration + GPT extra 확장)
 시그널 결정 전담 모듈 (웹소켓 기반, 동시 평가 + 중재 버전).
 run_bot.py / run_bot_ws.py 에서 한 줄로 호출해서 시그널/캔들 세트를 받아가게 한다.
 
+PATCH NOTES — 2025-11-19 (5m 지연 가드 완화)
+----------------------------------------------------
+O) 5m_kline_delayed 기준 완화
+   - max_kline_delay_sec 기본값을 10초 → 600초(10분)으로 변경.
+   - 실시간 5m 캔들이 정상적으로 진행 중인 상황(캔들 오픈 후 수 분 경과)을
+     "지연"으로 잘못 판단해서 SKIP 되는 문제를 완화.
+   - 여전히 now_ms - latest_5m_ts > max_kline_delay_sec 인 극단적인 지연 상황에서는
+     이전과 동일하게 [SKIP] 5m_kline_delayed 로 처리.
+
 PATCH NOTES — 2025-11-17 (WS 원천 데이터 강제 + 방향 정보 확장)
 ----------------------------------------------------
 L) GPT 컨텍스트에 방향 정보를 명시적으로 추가
@@ -368,6 +377,7 @@ def _trend_candidate(
             return None
 
     # 점수: 15m EMA 갭 비율
+    closes_15 = _close_series(candles_15m)
     ema20 = _ema(closes_15, 20)
     ema50 = _ema(closes_15, 50)
     if ema20 is None or ema50 is None or last_15 <= 0:
@@ -600,7 +610,10 @@ def get_trading_signal(
 
     # 2) 캔들 지연 체크 (폴백 없이, 실제 딜레이를 extra 로 남김)
     now_ms = int(time.time() * 1000)
-    max_delay_ms = int(getattr(settings, "max_kline_delay_sec", 10)) * 1000
+    # 5m 지연 가드: 기본 600초(10분), settings.max_kline_delay_sec 로 조정 가능
+    default_max_delay_sec = 600.0
+    max_delay_sec = float(getattr(settings, "max_kline_delay_sec", default_max_delay_sec))
+    max_delay_ms = int(max_delay_sec * 1000)
     delay_ms = now_ms - latest_5m_ts
     if delay_ms > max_delay_ms:
         send_skip_tg("[SKIP] 5m_kline_delayed: 최근 5m 캔들이 지연되었습니다.")
