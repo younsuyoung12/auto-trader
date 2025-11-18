@@ -1,4 +1,16 @@
-"""
+"""bot_workers.py
+=====================================================
+봇 헬스체크 HTTP 서버 / 드라이브 동기화 / 텔레그램 종료 명령 워커 모듈.
+
+2025-11-18 변경 사항 (events CSV 드라이브 동기화 연동)
+----------------------------------------------------
+1) logs/events/events-YYYY-MM-DD.csv 를 드라이브 동기화 대상에 추가.
+   - start_drive_sync_thread() 에서 오늘자 events CSV 가 있으면 함께 업로드.
+   - 업로드 로그: "[DRIVE_SYNC] uploaded today's events csv".
+2) 오래된 events-*.csv 로컬 파일 정리 로직 추가.
+   - KEEP_DAYS 기준으로 signals/candles 와 동일하게 삭제.
+   - 삭제 로그: "[DRIVE_SYNC] old events csv removed: {fname}".
+
 수정 내용 (2025-11-13)
 1) 드라이브 업로드 주기/보관일을 환경변수로도 조정할 수 있게 함 (없으면 기존값 300초/3일 유지)
 2) 텔레그램 종료 명령에 영문 'stop', '/stop' 도 허용하여 운영 중 즉시 멈출 수 있게 함
@@ -74,6 +86,7 @@ def start_drive_sync_thread() -> None:
     """5분마다 오늘자 CSV 생성 후 드라이브 업로드 + 오래된 CSV 정리.
     - signals-YYYY-MM-DD.csv 는 무조건 생성해서 올린다.
     - candles-YYYY-MM-DD.csv 는 있으면 같이 올린다.
+    - events-YYYY-MM-DD.csv 도 있으면 같이 올린다.
     - 업로드 주기/보관일은 환경변수로 조정 가능하다.
     """
     # env 없으면 기존 값 유지
@@ -99,6 +112,16 @@ def start_drive_sync_thread() -> None:
                 if os.path.exists(candle_path):
                     upload_to_drive(candle_path, candle_name)
                     log("[DRIVE_SYNC] uploaded today's candles csv")
+
+                # 3-1) 이벤트 CSV 있으면 같이 업로드
+                #      signals_logger 가 모듈 로드시 logs/events/events-YYYY-MM-DD.csv 를
+                #      만들어 두므로, 파일이 존재하면 같은 규칙으로 드라이브에 올린다.
+                events_dir = os.path.join("logs", "events")
+                events_name = f"events-{day_str}.csv"
+                events_path = os.path.join(events_dir, events_name)
+                if os.path.exists(events_path):
+                    upload_to_drive(events_path, events_name)
+                    log("[DRIVE_SYNC] uploaded today's events csv")
 
                 # 4) 오래된 signals-* 파일 정리
                 local_dir = os.path.dirname(local_path)
@@ -129,6 +152,21 @@ def start_drive_sync_thread() -> None:
                             except OSError:
                                 pass
 
+                # 6) 오래된 events-* 파일 정리
+                #    signals / candles 와 동일한 보관일 기준으로 정리한다.
+                if os.path.isdir(events_dir):
+                    for fname in os.listdir(events_dir):
+                        if not (fname.startswith("events-") and fname.endswith(".csv")):
+                            continue
+                        fpath = os.path.join(events_dir, fname)
+                        mtime = os.path.getmtime(fpath)
+                        if now_ts - mtime > KEEP_DAYS * 86400:
+                            try:
+                                os.remove(fpath)
+                                log(f"[DRIVE_SYNC] old events csv removed: {fname}")
+                            except OSError:
+                                pass
+
             except Exception as e:  # 업로드 실패해도 봇은 계속 돌아가야 한다.
                 log(f"[DRIVE_SYNC] error: {e}")
             time.sleep(SYNC_INTERVAL_SEC)
@@ -140,6 +178,7 @@ def start_drive_sync_thread() -> None:
 # ─────────────────────────────
 # 3. 텔레그램 종료 명령 수신 스레드
 # ─────────────────────────────
+
 def start_telegram_command_thread(*, on_stop_command: Callable[[], None]) -> None:
     """텔레그램 getUpdates 폴링으로 종료 명령을 받으면 on_stop_command 를 호출한다.
     허용 명령어: "종료", "봇종료", "끝나면 종료", "안전종료", "stop", "/stop"
