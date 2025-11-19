@@ -33,6 +33,17 @@ settings_ws.py
 3) 두 값은 market_features_ws.get_trading_signal(...) 에서
    저변동성 장(1% 박스장 등)을 진입 대상에서 제외하는 데 사용된다.
 
+2025-11-20 패치 (WS REST 백필/헬스 설정 분리, B안)
+----------------------------------------------------
+1) ws_backfill_tfs / ws_backfill_limit 추가.
+   - run_bot_ws 부팅 단계에서 REST /kline 백필 대상 TF 및 개수를 제어.
+   - 기본값: ["1m","5m","15m"], 120개 (요청하신 B안).
+2) WS 데이터 헬스 체크용 파라미터 추가.
+   - ws_required_tfs, ws_min_kline_buffer, ws_max_kline_delay_sec,
+     ws_orderbook_max_delay_sec
+   - market_data_ws.get_health_snapshot(...) / is_data_healthy(...)에서 사용.
+3) _as_bool(...) 헬퍼 오타 수정 (Pylance 오류 해결).
+
 이 모듈은 반드시 load_settings()를 통해 읽어 사용하며,
 런타임에서 BotSettings 값을 직접 변조하지 않는다.
 """
@@ -48,7 +59,7 @@ from typing import Dict, List
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
 
-def _as_bool(val: str, default: bool = False) -> bool:
+def _as_bool(val: str | None, default: bool = False) -> bool:
     """ENV 문자열을 불리언으로 변환.
     허용: 1/true/yes/y (대소문자 무시). None이면 default.
     """
@@ -57,18 +68,18 @@ def _as_bool(val: str, default: bool = False) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "y"}
 
 
-def _as_int(val: str, default: int) -> int:
+def _as_int(val: str | None, default: int) -> int:
     """ENV 문자열을 int로 안전 변환."""
     try:
-        return int(val)
+        return int(val)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
 
 
-def _as_float(val: str, default: float) -> float:
+def _as_float(val: str | None, default: float) -> float:
     """ENV 문자열을 float으로 안전 변환."""
     try:
-        return float(val)
+        return float(val)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
 
@@ -104,12 +115,26 @@ class BotSettings:
     ws_enabled: bool = True  # 웹소켓 사용 여부
     ws_base: str = "wss://open-api-ws.bingx.com"  # 일반 WS BASE (env로 변경 가능)
     ws_swap_base: str = "wss://open-api-swap.bingx.com/swap-market"  # 스왑 마켓 전용 WS
-    ws_subscribe_tfs: List[str] = None  # 런타임에서 ["1m","5m","15m"]로 채운다
+    ws_subscribe_tfs: List[str] | None = None  # 런타임에서 ["1m","5m","15m"]로 채운다
     ws_log_enabled: bool = True  # 캔들 수신 시 단순 로그 남길지
 
     # WS 원시/페이로드 로그 (Render 디버깅용, 기본 OFF 권장)
     ws_log_raw_enabled: bool = False      # WS 원시 프레임 로깅 (ENV: WS_LOG_RAW_ENABLED)
     ws_log_payload_enabled: bool = False  # kline/depth payload 상세 로깅 (ENV: WS_LOG_PAYLOAD_ENABLED)
+
+    # ── WS 히스토리 백필(B안) 및 헬스 기준 ──────────────────
+    # - ws_backfill_tfs: 부팅 시 REST로 히스토리를 채울 TF 목록 (예: ["1m","5m","15m"])
+    # - ws_backfill_limit: 각 TF당 REST로 가져올 최대 캔들 수
+    # - ws_required_tfs: 데이터 헬스 체크에 필수로 요구하는 TF 목록 (None이면 ws_subscribe_tfs 사용)
+    # - ws_min_kline_buffer: 헬스 체크용 최소 버퍼 길이
+    # - ws_max_kline_delay_sec: 헬스 체크용 kline 최대 지연(sec)
+    # - ws_orderbook_max_delay_sec: 헬스 체크용 오더북 최대 지연(sec)
+    ws_backfill_tfs: List[str] | None = None
+    ws_backfill_limit: int = 120
+    ws_required_tfs: List[str] | None = None
+    ws_min_kline_buffer: int = 120
+    ws_max_kline_delay_sec: int = 600
+    ws_orderbook_max_delay_sec: int = 10
 
     # ── WS 히스토리 웜업/부트스트랩 ─────────────────────────
     # * min_bars_*: 이 값 미만이면 신호 자체를 스킵
@@ -242,7 +267,7 @@ class BotSettings:
     skip_tg_cooldown: int = 30
     balance_skip_cooldown: int = 3600
 
-    # 캔들 지연 허용치
+    # 캔들 지연 허용치 (신호 레벨)
     max_kline_delay_sec: int = 600
 
     # RSI 기준
@@ -282,9 +307,43 @@ def load_settings() -> BotSettings:
     bingx_base_env = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
     # WS BASES
     bingx_ws_base_env = os.getenv("BINGX_WS_BASE", "wss://open-api-ws.bingx.com")
-    bingx_ws_swap_base_env = os.getenv("BINGX_SWAP_WS_BASE", "wss://open-api-swap.bingx.com/swap-market")
+    bingx_ws_swap_base_env = os.getenv(
+        "BINGX_SWAP_WS_BASE", "wss://open-api-swap.bingx.com/swap-market"
+    )
 
-    ws_tfs = ["1m", "5m", "15m"]
+    # WS 구독 타임프레임 (빈값이면 기본값 사용)
+    ws_tfs_env = os.getenv("WS_SUBSCRIBE_TFS")
+    if ws_tfs_env:
+        ws_tfs = [x.strip() for x in ws_tfs_env.split(",") if x.strip()]
+    else:
+        ws_tfs = ["1m", "5m", "15m"]
+
+    # REST 백필 타임프레임(B안): 기본 1m/5m/15m
+    ws_backfill_tfs_env = os.getenv("WS_BACKFILL_TFS")
+    if ws_backfill_tfs_env:
+        ws_backfill_tfs = [x.strip() for x in ws_backfill_tfs_env.split(",") if x.strip()]
+    else:
+        ws_backfill_tfs = ["1m", "5m", "15m"]
+
+    ws_backfill_limit = _as_int(os.getenv("WS_BACKFILL_LIMIT", "120"), 120)
+
+    # WS 데이터 헬스 체크 기준
+    ws_required_tfs_env = os.getenv("WS_REQUIRED_TFS")
+    if ws_required_tfs_env:
+        ws_required_tfs = [x.strip() for x in ws_required_tfs_env.split(",") if x.strip()]
+    else:
+        ws_required_tfs = None  # None이면 market_data_ws 에서 ws_subscribe_tfs 사용
+
+    ws_min_kline_buffer = _as_int(os.getenv("WS_MIN_KLINE_BUFFER", "120"), 120)
+    max_kline_delay_sec_val = _as_int(os.getenv("MAX_KLINE_DELAY_SEC", "600"), 600)
+    ws_max_kline_delay_sec = _as_int(
+        os.getenv("WS_MAX_KLINE_DELAY_SEC", str(max_kline_delay_sec_val)),
+        max_kline_delay_sec_val,
+    )
+    ws_orderbook_max_delay_sec = _as_int(
+        os.getenv("WS_ORDERBOOK_MAX_DELAY_SEC", "10"),
+        10,
+    )
 
     # 1m 보조 확인 사용 여부
     enable_1m_confirm_value = _as_bool(os.getenv("ENABLE_1M_CONFIRM", "1"), True)
@@ -303,14 +362,27 @@ def load_settings() -> BotSettings:
         # WS 원시/페이로드 로그 ENV 매핑 (디버깅 시에만 ON 권장)
         ws_log_raw_enabled=_as_bool(os.getenv("WS_LOG_RAW_ENABLED", "0"), False),
         ws_log_payload_enabled=_as_bool(os.getenv("WS_LOG_PAYLOAD_ENABLED", "0"), False),
+        # WS 백필/헬스 설정
+        ws_backfill_tfs=ws_backfill_tfs,
+        ws_backfill_limit=ws_backfill_limit,
+        ws_required_tfs=ws_required_tfs,
+        ws_min_kline_buffer=ws_min_kline_buffer,
+        ws_max_kline_delay_sec=ws_max_kline_delay_sec,
+        ws_orderbook_max_delay_sec=ws_orderbook_max_delay_sec,
         # ── WS 웜업/부트스트랩 ENV 매핑 ──
         min_bars_5m=_as_int(os.getenv("MIN_BARS_5M", "20"), 20),
         min_bars_15m=_as_int(os.getenv("MIN_BARS_15M", "20"), 20),
         warmup_target_5m=_as_int(os.getenv("WARMUP_TARGET_5M", "50"), 50),
         warmup_target_15m=_as_int(os.getenv("WARMUP_TARGET_15M", "50"), 50),
         ws_bootstrap_with_rest=_as_bool(os.getenv("WS_BOOTSTRAP_WITH_REST", "1"), True),
-        ws_bootstrap_lookback_5m=_as_int(os.getenv("WS_BOOTSTRAP_LOOKBACK_5M", "120"), 120),
-        ws_bootstrap_lookback_15m=_as_int(os.getenv("WS_BOOTSTRAP_LOOKBACK_15M", "120"), 120),
+        ws_bootstrap_lookback_5m=_as_int(
+            os.getenv("WS_BOOTSTRAP_LOOKBACK_5M", "120"),
+            120,
+        ),
+        ws_bootstrap_lookback_15m=_as_int(
+            os.getenv("WS_BOOTSTRAP_LOOKBACK_15M", "120"),
+            120,
+        ),
         # 전략 on/off
         enable_market=_as_bool(os.getenv("ENABLE_MARKET", "1"), True),
         enable_1m_confirm=enable_1m_confirm_value,
@@ -334,10 +406,12 @@ def load_settings() -> BotSettings:
         atr_risk_reduction=_as_float(os.getenv("ATR_RISK_REDUCTION", "0.5"), 0.5),
         # 저변동성(박스장) 필터 기준
         low_vol_range_pct_threshold=_as_float(
-            os.getenv("LOW_VOL_RANGE_PCT_THRESHOLD", "0.01"), 0.01
+            os.getenv("LOW_VOL_RANGE_PCT_THRESHOLD", "0.01"),
+            0.01,
         ),
         low_vol_atr_pct_threshold=_as_float(
-            os.getenv("LOW_VOL_ATR_PCT_THRESHOLD", "0.004"), 0.004
+            os.getenv("LOW_VOL_ATR_PCT_THRESHOLD", "0.004"),
+            0.004,
         ),
         # GPT 진입 게이트/상한
         gpt_error_sleep_sec=_as_float(os.getenv("GPT_ERROR_SLEEP_SEC", "5.0"), 5.0),
@@ -348,47 +422,105 @@ def load_settings() -> BotSettings:
         gpt_max_tp_pct=_as_float(os.getenv("GPT_MAX_TP_PCT", "0.10"), 0.10),
         gpt_min_sl_pct=_as_float(os.getenv("GPT_MIN_SL_PCT", "0.0"), 0.0),
         gpt_max_sl_pct=_as_float(os.getenv("GPT_MAX_SL_PCT", "0.02"), 0.02),
-        post_entry_sleep_sec=_as_float(os.getenv("POST_ENTRY_SLEEP_SEC", "5.0"), 5.0),
+        post_entry_sleep_sec=_as_float(
+            os.getenv("POST_ENTRY_SLEEP_SEC", "5.0"),
+            5.0,
+        ),
         # GPT soft TP 옵션
         gpt_soft_tp_enabled=_as_bool(os.getenv("GPT_SOFT_TP_ENABLED", "1"), True),
         gpt_soft_tp_pct=_as_float(os.getenv("GPT_SOFT_TP_PCT", "0.01"), 0.01),
-        gpt_soft_tp_recheck_sec=_as_int(os.getenv("GPT_SOFT_TP_RECHECK_SEC", "60"), 60),
+        gpt_soft_tp_recheck_sec=_as_int(
+            os.getenv("GPT_SOFT_TP_RECHECK_SEC", "60"),
+            60,
+        ),
         # 진입 거래량 가드
-        min_entry_volume_ratio=_as_float(os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.3"), 0.3),
+        min_entry_volume_ratio=_as_float(
+            os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.3"),
+            0.3,
+        ),
         # 쿨다운/폴링
         cooldown_sec=_as_int(os.getenv("COOLDOWN_SEC", "15"), 15),
         cooldown_after_close=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"), 30),
-        max_consecutive_losses=_as_int(os.getenv("MAX_CONSECUTIVE_LOSSES", "2"), 2),
+        max_consecutive_losses=_as_int(
+            os.getenv("MAX_CONSECUTIVE_LOSSES", "2"),
+            2,
+        ),
         cooldown_after_consec_loss_sec=_as_int(
-            os.getenv("COOLDOWN_AFTER_CONSEC_LOSS_SEC", "10800"), 10800
+            os.getenv("COOLDOWN_AFTER_CONSEC_LOSS_SEC", "10800"),
+            10800,
         ),
         poll_fills_sec=_as_int(os.getenv("POLL_FILLS_SEC", "2"), 2),
         # 가드
         max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.003"), 0.003),
         max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
-        max_entry_slippage_pct=_as_float(os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"), 0.0005),
-        use_orderbook_entry_hint=_as_bool(os.getenv("USE_ORDERBOOK_ENTRY_HINT", "1"), True),
+        max_entry_slippage_pct=_as_float(
+            os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"),
+            0.0005,
+        ),
+        use_orderbook_entry_hint=_as_bool(
+            os.getenv("USE_ORDERBOOK_ENTRY_HINT", "1"),
+            True,
+        ),
         # depth env
-        depth_imbalance_enabled=_as_bool(os.getenv("DEPTH_IMBALANCE_ENABLED", "1"), True),
-        depth_imbalance_min_notional=_as_float(os.getenv("DEPTH_IMBALANCE_MIN_NOTIONAL", "50"), 50.0),
-        depth_imbalance_min_ratio=_as_float(os.getenv("DEPTH_IMBALANCE_MIN_RATIO", "2.0"), 2.0),
+        depth_imbalance_enabled=_as_bool(
+            os.getenv("DEPTH_IMBALANCE_ENABLED", "1"),
+            True,
+        ),
+        depth_imbalance_min_notional=_as_float(
+            os.getenv("DEPTH_IMBALANCE_MIN_NOTIONAL", "50"),
+            50.0,
+        ),
+        depth_imbalance_min_ratio=_as_float(
+            os.getenv("DEPTH_IMBALANCE_MIN_RATIO", "2.0"),
+            2.0,
+        ),
         # mark vs last env
-        price_deviation_guard_enabled=_as_bool(os.getenv("PRICE_DEVIATION_GUARD_ENABLED", "1"), True),
-        price_deviation_max_pct=_as_float(os.getenv("PRICE_DEVIATION_MAX_PCT", "0.0015"), 0.0015),
+        price_deviation_guard_enabled=_as_bool(
+            os.getenv("PRICE_DEVIATION_GUARD_ENABLED", "1"),
+            True,
+        ),
+        price_deviation_max_pct=_as_float(
+            os.getenv("PRICE_DEVIATION_MAX_PCT", "0.0015"),
+            0.0015,
+        ),
         # 세션 배수 env
-        session_spread_mult_asia=_as_float(os.getenv("SESSION_SPREAD_MULT_ASIA", "1.0"), 1.0),
-        session_spread_mult_eu=_as_float(os.getenv("SESSION_SPREAD_MULT_EU", "1.1"), 1.1),
-        session_spread_mult_us=_as_float(os.getenv("SESSION_SPREAD_MULT_US", "1.2"), 1.2),
-        session_jump_mult_asia=_as_float(os.getenv("SESSION_JUMP_MULT_ASIA", "1.0"), 1.0),
-        session_jump_mult_eu=_as_float(os.getenv("SESSION_JUMP_MULT_EU", "1.1"), 1.1),
-        session_jump_mult_us=_as_float(os.getenv("SESSION_JUMP_MULT_US", "1.2"), 1.2),
+        session_spread_mult_asia=_as_float(
+            os.getenv("SESSION_SPREAD_MULT_ASIA", "1.0"),
+            1.0,
+        ),
+        session_spread_mult_eu=_as_float(
+            os.getenv("SESSION_SPREAD_MULT_EU", "1.1"),
+            1.1,
+        ),
+        session_spread_mult_us=_as_float(
+            os.getenv("SESSION_SPREAD_MULT_US", "1.2"),
+            1.2,
+        ),
+        session_jump_mult_asia=_as_float(
+            os.getenv("SESSION_JUMP_MULT_ASIA", "1.0"),
+            1.0,
+        ),
+        session_jump_mult_eu=_as_float(
+            os.getenv("SESSION_JUMP_MULT_EU", "1.1"),
+            1.1,
+        ),
+        session_jump_mult_us=_as_float(
+            os.getenv("SESSION_JUMP_MULT_US", "1.2"),
+            1.2,
+        ),
         # 텔레그램
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         notify_on_entry=_as_bool(os.getenv("NOTIFY_ON_ENTRY", "1"), True),
         notify_on_close=_as_bool(os.getenv("NOTIFY_ON_CLOSE", "1"), True),
-        unrealized_notify_enabled=_as_bool(os.getenv("UNREALIZED_NOTIFY_ENABLED", "0"), False),
-        unrealized_notify_sec=_as_int(os.getenv("UNREALIZED_NOTIFY_SEC", "1800"), 1800),
+        unrealized_notify_enabled=_as_bool(
+            os.getenv("UNREALIZED_NOTIFY_ENABLED", "0"),
+            False,
+        ),
+        unrealized_notify_sec=_as_int(
+            os.getenv("UNREALIZED_NOTIFY_SEC", "1800"),
+            1800,
+        ),
         # KRW 환산
         krw_per_usdt=_as_float(os.getenv("KRW_PER_USDT", "1400"), 1400.0),
         # 로그/기타
@@ -403,9 +535,12 @@ def load_settings() -> BotSettings:
         health_port=_as_int(os.getenv("HEALTH_PORT", "0"), 0),
         # 텔레그램 스팸
         skip_tg_cooldown=_as_int(os.getenv("SKIP_TG_COOLDOWN", "30"), 30),
-        balance_skip_cooldown=_as_int(os.getenv("BALANCE_SKIP_COOLDOWN", "3600"), 3600),
-        # 캔들 지연 허용
-        max_kline_delay_sec=_as_int(os.getenv("MAX_KLINE_DELAY_SEC", "600"), 600),
+        balance_skip_cooldown=_as_int(
+            os.getenv("BALANCE_SKIP_COOLDOWN", "3600"),
+            3600,
+        ),
+        # 캔들 지연 허용 (신호 레벨)
+        max_kline_delay_sec=max_kline_delay_sec_val,
         # RSI
         rsi_overbought=_as_int(os.getenv("RSI_OVERBOUGHT", "70"), 70),
         rsi_oversold=_as_int(os.getenv("RSI_OVERSOLD", "30"), 30),
@@ -414,11 +549,17 @@ def load_settings() -> BotSettings:
         # BingX BASE
         bingx_base=bingx_base_env,
         # 마진 기준 TP/SL
-        use_margin_based_tp_sl=_as_bool(os.getenv("USE_MARGIN_BASED_TP_SL", "0"), False),
+        use_margin_based_tp_sl=_as_bool(
+            os.getenv("USE_MARGIN_BASED_TP_SL", "0"),
+            False,
+        ),
         fut_tp_margin_pct=_as_float(os.getenv("FUT_TP_MARGIN_PCT", "0.5"), 0.5),
         fut_sl_margin_pct=_as_float(os.getenv("FUT_SL_MARGIN_PCT", "0.5"), 0.5),
         # 반대 시그널 컷 on/off
-        close_on_opposite_enabled=_as_bool(os.getenv("CLOSE_ON_OPPOSITE_ENABLED", "1"), True),
+        close_on_opposite_enabled=_as_bool(
+            os.getenv("CLOSE_ON_OPPOSITE_ENABLED", "1"),
+            True,
+        ),
     )
 
 

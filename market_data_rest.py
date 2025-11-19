@@ -8,6 +8,18 @@
 # - run_bot_ws 시작 시 market_data_ws.backfill_klines_from_rest(...) 에 넘겨
 #   WS 버퍼를 부트스트랩하는 용도로만 사용한다.
 # - 라이브 운영 중에는 WS 데이터만 사용하고, REST 는 초기 히스토리 로딩 전용이다.
+# - 반환 포맷은 market_data_ws.backfill_klines_from_rest(...) 가 그대로 사용할 수 있는
+#   공통 포맷 list[list] 이다.
+#   [openTime, open, high, low, close, volume, closeTime]
+#
+# 2025-11-20 변경 사항 (WS 1m/5m/15m 백필 B안 정리)
+# ----------------------------------------------------
+# 1) run_bot_ws._backfill_ws_kline_history 에서 1m/5m/15m REST 히스토리 백필 전용으로
+#    사용하는 모듈임을 주석으로 명시했다.
+# 2) market_data_ws.backfill_klines_from_rest(...) 와의 연동 포맷을 상단에 명시했다.
+#    - fetch_klines_rest(...) → [openTime, open, high, low, close, volume, closeTime] 리스트 반환.
+#    - backfill_klines_from_rest(...) 에서는 앞 6개 필드(openTime~volume)만 사용한다.
+# 3) 로직/시그니처 변경은 없으며, 2025-11-19 버전과 완전 호환된다.
 #
 # 2025-11-19 변경 사항 (WS 멀티 타임프레임 정합성)
 # ----------------------------------------------------

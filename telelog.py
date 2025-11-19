@@ -29,6 +29,13 @@
    - send_structured_tg(...) : 위 템플릿을 사용해 알림을 보내는 래퍼
 2) send_skip_tg(...) 도 템플릿 빌더를 사용해 쿨타임 정보를 함께 표시하도록 변경
 3) 기존 send_tg(...) / log(...) 인터페이스는 그대로 유지 (하위호환)
+
+2025-11-20 변경 사항 (텔레그램 한국어 표현 통일)
+----------------------------------------------------
+1) 텔레그램 메시지의 쿨타임 단위를 "s" 대신 "초"로 한국어 표기로 변경.
+2) send_skip_tg(...) 제목을 "SKIP" → "스킵" 등 한국어로 정리.
+3) 대표 스킵 사유(no_signal_or_arbitration_rejected, BALANCE, range_blocked_today 등)를
+   한국어로 자동 변환하는 헬퍼(_localize_skip_reason)를 추가.
 """
 
 from __future__ import annotations
@@ -127,11 +134,12 @@ def build_tg_template(
 
     if cooldown_sec is not None or cooldown_reason:
         if cooldown_sec is not None:
-            cooldown_line = f"⏱️ 쿨타임: {cooldown_sec:.1f}s"
+            # 예: ⏱️ 쿨타임 30.0초 (사유: ...)
+            cooldown_line = f"⏱️ 쿨타임 {cooldown_sec:.1f}초"
         else:
-            cooldown_line = "⏱️ 쿨타임: -"
+            cooldown_line = "⏱️ 쿨타임 -"
         if cooldown_reason:
-            cooldown_line += f" ({cooldown_reason})"
+            cooldown_line += f" (사유: {cooldown_reason})"
         parts.append(cooldown_line)
 
     if error:
@@ -194,6 +202,34 @@ def send_structured_tg(
     send_tg(text)
 
 
+def _localize_skip_reason(reason: str) -> str:
+    """대표적인 스킵 사유들을 한국어로 매핑한다.
+
+    - 기존 reason 문자열은 그대로 두고, 사용자가 보기 쉬운 설명으로 치환.
+    - 매핑되지 않은 코드는 원문을 그대로 쓴다.
+    """
+    # 1) 시그널/중재 관련: no_signal_or_arbitration_rejected
+    if "no_signal_or_arbitration_rejected" in reason:
+        symbol: Optional[str] = None
+        if "symbol=" in reason:
+            idx = reason.find("symbol=") + len("symbol=")
+            symbol = reason[idx:].strip()
+        if symbol:
+            return f"시그널이 없거나 중재에서 탈락했습니다. (심볼: {symbol})"
+        return "시그널이 없거나 중재에서 탈락했습니다."
+
+    # 2) 잔고 부족 계열
+    if reason.startswith("[BALANCE_SKIP]"):
+        return "가용 잔고가 부족합니다."
+
+    # 3) 박스장 차단 계열
+    if "range_blocked_today" in reason:
+        return "오늘은 박스장 진입이 차단된 상태입니다."
+
+    # 4) 그 외: 기존 문자열 그대로 사용
+    return reason
+
+
 def send_skip_tg(reason: str) -> None:
     """신호를 '스킵' 한 이유를 텔레그램으로 보내되, 스팸이 되지 않도록 같은 이유는 일정 시간만에 한 번씩만 보낸다.
 
@@ -207,31 +243,35 @@ def send_skip_tg(reason: str) -> None:
     실제 전송이 스킵됐는지 아닌지는 콘솔 로그로 남겨서 추적 가능하게 한다.
 
     2025-11-14: 템플릿 빌더를 사용해 쿨타임 정보를 함께 표시하도록 변경.
+    2025-11-20: 쿨타임/사유 문구를 한국어로 표시하도록 변경.
     """
     now = time.time()
 
     # 1) 잔고 관련 스킵은 무조건 길게
     if reason.startswith("[BALANCE_SKIP]"):
         cooldown = SET.balance_skip_cooldown  # 기본 3600초
-        title = "SKIP / BALANCE"
+        title = "스킵 / 잔고"
     # 2) 박스장 막힘 관련 스킵도 길게
     elif "range_blocked_today" in reason:
         cooldown = 3600
-        title = "SKIP / RANGE_BLOCKED"
+        title = "스킵 / 박스장 차단"
     else:
         # 3) 나머지는 짧게 (기본 30초)
         cooldown = SET.skip_tg_cooldown
-        title = "SKIP"
+        title = "스킵"
 
     last_ts = LAST_SKIP_TG.get(reason, 0.0)
     if now - last_ts >= cooldown:
+        # 사용자에게 보여 줄 설명은 한국어로 변환
+        localized_reason = _localize_skip_reason(reason)
+
         # 쿨다운이 지났으면 실제로 텔레그램 전송
         text = build_tg_template(
             title=title,
             indicators=None,
             scores=None,
             cooldown_sec=float(cooldown),
-            cooldown_reason=reason,
+            cooldown_reason=localized_reason,
             error=None,
             note=None,
         )
