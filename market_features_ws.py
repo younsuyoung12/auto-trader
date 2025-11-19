@@ -3,7 +3,7 @@
 BingX WebSocket 로우데이터(멀티 타임프레임 캔들 + depth5 오더북)를
 GPT-5.1 트레이더용 피처로 가공하는 모듈.
 
-2025-11-20 변경 사항 (엔트리 시그널 빌더 통합)
+2025-11-20 변경 사항 (엔트리 시그널 빌더 통합 + 저변동성 필터)
 ----------------------------------------------------
 1) get_trading_signal(...) 추가
    - build_entry_features_ws(...) 결과 + WS 5m 캔들 버퍼를 이용해
@@ -25,6 +25,9 @@ GPT-5.1 트레이더용 피처로 가공하는 모듈.
        · 강한 추세 + ADX 다수 → "TREND"
        · 과열/과매도 MTF 다수 → "RANGE"
        · 그 외 → "GENERIC"
+4) 저변동성(좁은 박스장) 필터 추가
+   - settings.low_vol_range_pct_threshold / low_vol_atr_pct_threshold 기준으로
+     5m range_pct, atr_pct 가 모두 너무 작으면 엔트리 자체를 SKIP 처리.
 
 2025-11-19 변경 사항 (2차 - 지표 확장 + GPT 피드 최적화)
 ----------------------------------------------------
@@ -501,7 +504,7 @@ def _build_timeframe_features(
         "rsi": rsi_last,
         "rsi_len": rsi_len,
         "rsi_overbought": rsi_overbought,
-        "rsi_oversold": rsi_oversold, 
+        "rsi_oversold": rsi_oversold,
         "macd": macd_last,
         "macd_signal": macd_signal_last,
         "macd_hist": macd_hist_last,
@@ -870,6 +873,47 @@ def get_trading_signal(
 
     tf15 = tfs.get("15m")
     tf1 = tfs.get("1m")
+
+    # 1.5) 저변동성 필터: 5m range/ATR 모두 너무 작으면 엔트리 스킵
+    try:
+        range_pct_5 = tf5.get("range_pct")
+        atr_pct_5 = tf5.get("atr_pct")
+
+        low_range_th = float(
+            getattr(
+                settings,
+                "low_vol_range_pct_threshold",
+                getattr(SET, "low_vol_range_pct_threshold", 0.01),
+            )
+        )
+        low_atr_th = float(
+            getattr(
+                settings,
+                "low_vol_atr_pct_threshold",
+                getattr(SET, "low_vol_atr_pct_threshold", 0.004),
+            )
+        )
+
+        is_low_range = (
+            isinstance(range_pct_5, (int, float))
+            and not math.isnan(range_pct_5)
+            and range_pct_5 < low_range_th
+        )
+        is_low_atr = (
+            isinstance(atr_pct_5, (int, float))
+            and not math.isnan(atr_pct_5)
+            and atr_pct_5 < low_atr_th
+        )
+
+        if is_low_range and is_low_atr:
+            log(
+                "[MKT-FEAT] get_trading_signal: 저변동성 구간 스킵 "
+                f"(5m range_pct={range_pct_5:.4f}, atr_pct={atr_pct_5:.4f}, "
+                f"th=({low_range_th:.4f}, {low_atr_th:.4f}))"
+            )
+            return None
+    except Exception as e:
+        log(f"[MKT-FEAT] low-volatility filter 계산 중 예외 발생: {e}")
 
     # 2) 5m 캔들 버퍼 확보 (가드/스냅샷용) - WS 버퍼 그대로 사용
     cfg_5m = TF_CONFIG.get("5m", {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20})

@@ -24,6 +24,15 @@ settings_ws.py
    - max_consecutive_losses, cooldown_after_consec_loss_sec
 5) max_kline_delay_sec 기본값을 600초로 통일.
 
+2025-11-20 패치 (저변동성 시장 회피 옵션 추가)
+----------------------------------------------------
+1) 저변동성(range 기반) 필터 기준 추가.
+   - low_vol_range_pct_threshold (기본 0.01 = 1%)
+2) 선택적으로 ATR 기반 변동성 기준 추가.
+   - low_vol_atr_pct_threshold (기본 0.004 = 0.4%)
+3) 두 값은 market_features_ws.get_trading_signal(...) 에서
+   저변동성 장(1% 박스장 등)을 진입 대상에서 제외하는 데 사용된다.
+
 이 모듈은 반드시 load_settings()를 통해 읽어 사용하며,
 런타임에서 BotSettings 값을 직접 변조하지 않는다.
 """
@@ -142,6 +151,12 @@ class BotSettings:
     min_sl_pct: float = 0.005  # 0.5%
     atr_risk_high_mult: float = 1.5
     atr_risk_reduction: float = 0.5
+
+    # 저변동성(박스장) 필터 기준
+    # - range_pct 가 low_vol_range_pct_threshold 미만이면 "저변동성" 후보로 간주
+    # - atr_pct 가 low_vol_atr_pct_threshold 미만이면 ATR 기준으로도 저변동성으로 간주
+    low_vol_range_pct_threshold: float = 0.01   # 기본 1% 박스장
+    low_vol_atr_pct_threshold: float = 0.004    # 기본 ATR 0.4%
 
     # ── GPT 진입 게이트/TP·SL 제약 ────────────────────────
     gpt_error_sleep_sec: float = 5.0      # GPT 오류 시 루프 대기(sec)
@@ -317,6 +332,13 @@ def load_settings() -> BotSettings:
         min_sl_pct=_as_float(os.getenv("MIN_SL_PCT", "0.005"), 0.005),
         atr_risk_high_mult=_as_float(os.getenv("ATR_RISK_HIGH_MULT", "1.5"), 1.5),
         atr_risk_reduction=_as_float(os.getenv("ATR_RISK_REDUCTION", "0.5"), 0.5),
+        # 저변동성(박스장) 필터 기준
+        low_vol_range_pct_threshold=_as_float(
+            os.getenv("LOW_VOL_RANGE_PCT_THRESHOLD", "0.01"), 0.01
+        ),
+        low_vol_atr_pct_threshold=_as_float(
+            os.getenv("LOW_VOL_ATR_PCT_THRESHOLD", "0.004"), 0.004
+        ),
         # GPT 진입 게이트/상한
         gpt_error_sleep_sec=_as_float(os.getenv("GPT_ERROR_SLEEP_SEC", "5.0"), 5.0),
         gpt_skip_sleep_sec=_as_float(os.getenv("GPT_SKIP_SLEEP_SEC", "3.0"), 3.0),
