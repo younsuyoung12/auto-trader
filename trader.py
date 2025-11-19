@@ -1,588 +1,380 @@
 """
-# trader.py
+ gpt_trader.py
 
-수정 내용 (2025-11-13~2025-11-19)
-1) _to_contract_qty(...) 에서 0 으로 떨어지는 소수 수량을 최소 step(0.001)으로 보정
-2) 슬리피지 가드/TP·SL 예약 실패 시 close_position_market(...) 에 항상 '열었던 방향(side_open)'을 넘기도록 통일
-3) 체결 정보 파싱 시 executedQty, quantity, order.orderId 등 BingX 다양한 응답 케이스 보강
-4) ensure_tp_sl_for_trade(...) 재설정 실패 시에도 소수 수량 그대로 넘기도록 통일
-5) (2025-11-14) BingX REST/DB 동기화용 체결 데이터 strict 파싱
-   - _extract_filled_info_strict(...) 추가
-   - open_position_with_tp_sl(...) 에서 filled_qty/entry_price 를 API 응답에서만 가져오고,
-     없거나 0/NaN 이면 에러 로그 + 진입 실패 처리 (qty/entry_price_hint 로 폴백 금지)
-6) (2025-11-14) check_closes(...) 에서 summarize_fills 예외를 잡고 로그만 남기도록 방어
-   - fill 요약을 못 가져온 경우에도 봇이 죽지 않도록 하고,
-     이후 단계(포지션/주문 히스토리 DB 동기화)는 summary 유효성 검사 후에만 실행.
-7) (2025-11-16) open_position_with_tp_sl(...) 시그니처 하위호환 확장
-   - side_open / side 두 키워드 모두 허용해 'unexpected keyword side' 예외 방지
-   - settings / entry_price_hint 를 선택 인자로 바꿔, 미전달 시 슬리피지/TP·SL 보정만 생략
-8) (2025-11-19) 엔트리 슬리피지/체결 디버깅 로그 강화
-   - open_position_with_tp_sl(...)에서 entry_price_hint 대비 슬리피지를 항상 계산/로그.
-   - settings.max_entry_slippage_pct > 0 인 경우, 허용 슬리피지 초과 시 즉시 시장가 강제 청산 후 진입 취소.
+ 역할
+ ----------------------------------------------------
+ - BingX Auto Trader에서 GPT-5.1 트레이더 모델에 실제 요청을 보내는 모듈.
+ - gpt_decider / entry_flow_ws / market_features_ws 등에서 이 모듈의
+   ask_entry_decision(...) 함수만 import 해서 사용한다.
+
+ 수정 내용 (2025-11-18~2025-11-20)
+ ----------------------------------------------------
+ 1) OPENAI_TRADER_MODEL / OPENAI_TRADER_MAX_TOKENS / OPENAI_TRADER_MAX_LATENCY
+    환경변수로 모델명·토큰 수·최대 대기 시간을 조정할 수 있게 함.
+ 2) OpenAI Python 신규 클라이언트(responses API)와 구버전(ChatCompletion) 둘 다
+    동작하도록 분기 처리.
+ 3) 응답 텍스트 추출 헬퍼(_extract_text_from_response) 추가로 라이브러리 버전에
+    상관없이 최대한 안정적으로 텍스트를 파싱.
+ 4) 에러/지연 시간/원문 텍스트를 모두 반환해 상위 레이어에서 로깅 및
+    디버깅에 활용할 수 있도록 구조 통일.
+ 5) (2025-11-20) ask_entry_decision(...) 시그니처에
+        market_features: dict | None = None
+    파라미터를 추가.
+    - market_features 내용은 그대로 프롬프트 JSON에 포함.
+    - *args / **kwargs 를 그대로 받아 기존 호출부와 하위 호환 유지.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+import os
+import time
+import json
+from typing import Any, Dict, Optional, Tuple
 
 from telelog import log, send_tg
-from exchange_api import (
-    place_market,
-    place_conditional,
-    wait_filled,
-    get_order,
-    summarize_fills,
-    close_position_market,
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI 클라이언트 초기화 (신규/구버전 모두 지원)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    # New style OpenAI client (>=1.0)
+    from openai import OpenAI  # type: ignore
+
+    _OPENAI_CLIENT: Any = OpenAI()
+    _USE_RESPONSES_API = True
+except Exception:  # pragma: no cover - fallback for legacy library
+    try:
+        import openai  # type: ignore
+
+        _OPENAI_CLIENT = openai
+        _USE_RESPONSES_API = False
+    except Exception:
+        _OPENAI_CLIENT = None
+        _USE_RESPONSES_API = False
+
+
+OPENAI_TRADER_MODEL = (
+    os.getenv("OPENAI_TRADER_MODEL")
+    or os.getenv("GPT_ENTRY_MODEL")
+    or "gpt-5.1-mini"
 )
+OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
+OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
 
 
-def _to_contract_qty(q: float) -> float:
-    """BTC-USDT 기준 0.001 step 을 가정하고, 0 으로 떨어지지 않게 보정한다.
-
-    - BingX 최소 수량보다 작은 소수점 수량이 들어와도 최소 0.001 로 맞춘다.
-    - DB/신호 상의 qty 와 실제 주문 qty 가 약간 달라질 수 있으므로,
-      체결 수량은 반드시 거래소 응답(filled_qty) 기준으로 사용해야 한다.
-    """
-    if q is None or q <= 0:
-        return 0.001
-    v = float(f"{q:.3f}")
-    return v if v > 0 else 0.001
+# ──────────────────────────────────────────────────────────────────────────────
+# 유틸 함수들
+# ──────────────────────────────────────────────────────────────────────────────
 
 
-def _extract_filled_info_strict(payload: Dict[str, Any]) -> Tuple[float, float]:
-    """BingX 체결 응답에서 실제 체결 수량/평균가를 강제 추출한다.
+def _safe_to_json(obj: Any, depth: int = 0, max_depth: int = 4) -> Any:
+    """settings, dataclass 등을 JSON 직렬화 가능한 형태로 최대한 변환한다."""
+    if depth > max_depth:
+        return repr(obj)
 
-    - executedQty / quantity / origQty / origQuantity 중 하나도 없으면 예외
-    - avgPrice / price 가 없거나 0 이하면 예외
-    - 수량/가격 파싱 실패 시 예외
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
 
-    → DB 동기화/통계용으로 쓰이는 값이라, 폴백(신호에서 계산한 qty/hint 가격)을
-      전혀 쓰지 않고, 거래소가 준 진짜 값이 없으면 진입 자체를 실패 처리한다.
-    """
-    d = payload.get("data") or payload
+    if isinstance(obj, dict):
+        return {str(k): _safe_to_json(v, depth + 1, max_depth) for k, v in obj.items()}
 
-    qty_raw = (
-        d.get("executedQty")
-        or d.get("quantity")
-        or d.get("origQty")
-        or d.get("origQuantity")
-    )
-    price_raw = d.get("avgPrice") or d.get("price")
+    if isinstance(obj, (list, tuple, set)):
+        return [_safe_to_json(v, depth + 1, max_depth) for v in obj]
 
-    missing: List[str] = []
-    if qty_raw is None:
-        missing.append("executedQty/quantity/origQty")
-    if price_raw is None:
-        missing.append("avgPrice/price")
+    if hasattr(obj, "as_dict") and callable(getattr(obj, "as_dict")):
+        try:
+            return _safe_to_json(obj.as_dict(), depth + 1, max_depth)
+        except Exception:
+            pass
 
-    if missing:
-        raise ValueError("missing fields: " + ", ".join(missing))
+    if hasattr(obj, "__dict__"):
+        try:
+            return _safe_to_json(obj.__dict__, depth + 1, max_depth)
+        except Exception:
+            pass
 
+    return repr(obj)
+
+
+def _extract_text_from_response(resp: Any) -> str:
+    """OpenAI Responses/ChatCompletion/Completion 응답에서 텍스트를 최대한 안전하게 뽑는다."""
+    if resp is None:
+        return ""
+
+    # 1) Responses API (신규)
     try:
-        qty = float(qty_raw)
-        price = float(price_raw)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid qty/price: qty={qty_raw!r}, price={price_raw!r}")
+        output = getattr(resp, "output", None)
+        if output:
+            content0 = output[0].content[0]
+            text_obj = getattr(content0, "text", None)
+            if isinstance(text_obj, str):
+                return text_obj
+            if text_obj is not None:
+                val = getattr(text_obj, "value", None)
+                if isinstance(val, str):
+                    return val
+            # dict 형태인 경우 (직접 접근)
+            if isinstance(content0, dict):
+                t = content0.get("text")
+                if isinstance(t, dict) and "value" in t:
+                    return str(t["value"])
+                if isinstance(t, str):
+                    return t
+    except Exception:
+        pass
 
-    if qty <= 0 or price <= 0:
-        raise ValueError(f"non-positive qty/price: qty={qty}, price={price}")
+    # 2) dict 형태 Responses
+    if isinstance(resp, dict):
+        try:
+            if "output" in resp:
+                content0 = resp["output"][0]["content"][0]
+                t = content0.get("text")
+                if isinstance(t, dict) and "value" in t:
+                    return str(t["value"])
+                if isinstance(t, str):
+                    return t
+        except Exception:
+            pass
 
-    return qty, price
-
-
-@dataclass
-class Trade:
-    symbol: str
-    side: str
-    qty: float
-    entry: float
-    entry_order_id: Optional[str] = None
-    tp_order_id: Optional[str] = None
-    sl_order_id: Optional[str] = None
-    tp_price: Optional[float] = None
-    sl_price: Optional[float] = None
-    source: str = "UNKNOWN"
-
-
-@dataclass
-class TraderState:
-    tp_sl_retry_fails: int = 0
-    max_tp_sl_retry_fails: int = 3
-
-    def reset_tp_sl_fails(self) -> None:
-        self.tp_sl_retry_fails = 0
-
-    def inc_tp_sl_fails(self) -> None:
-        self.tp_sl_retry_fails += 1
-
-    def should_stop_bot(self) -> bool:
-        return self.tp_sl_retry_fails >= self.max_tp_sl_retry_fails
-
-
-def compute_tp_sl_prices(
-    side_open: str,
-    entry: float,
-    tp_pct: float,
-    sl_pct: float,
-    precision: int = 2,
-) -> Tuple[float, float]:
-    """진입 가격/방향/퍼센트를 받아 TP/SL 가격을 계산한다."""
-    if entry <= 0:
-        entry = 0.0
-
-    if side_open == "BUY":
-        tp_price = round(entry * (1 + tp_pct), precision)
-        sl_price = round(entry * (1 - sl_pct), precision)
-    else:
-        tp_price = round(entry * (1 - tp_pct), precision)
-        sl_price = round(entry * (1 + sl_pct), precision)
-    return tp_price, sl_price
-
-
-def open_position_with_tp_sl(
-    *,
-    settings: Any = None,
-    symbol: str,
-    side_open: Optional[str] = None,
-    side: Optional[str] = None,
-    qty: float,
-    entry_price_hint: float = 0.0,
-    tp_pct: float,
-    sl_pct: float,
-    source: str = "UNKNOWN",
-    soft_mode: bool = False,
-    sl_floor_ratio: Optional[float] = None,
-) -> Optional[Trade]:
-    """시장가 진입 + TP/SL 예약까지 한 번에 처리.
-
-    - 체결 수량/가격은 반드시 BingX 응답에서 가져오고, 없으면 진입 실패(폴백 금지).
-    - 슬리피지 가드/TP·SL 예약 실패 시에는 '열었던 방향(side_open)' 기준으로 청산 시도.
-    - side_open / side 두 키워드를 모두 허용 (하위호환).
-    - settings / entry_price_hint 미전달 시 슬리피지/마진 기반 보정은 생략.
-    """
-
-    # 하위호환: side_open 이 없고 side 가 들어온 경우 보정
-    if side_open is None and side is not None:
-        side_open = side
-
-    if not side_open:
-        msg = "[ENTRY] ⚠️ side_open/side 가 지정되지 않아 포지션을 열 수 없습니다."
-        log(msg)
-        send_tg(msg)
-        return None
-
-    # 1) 시장가 진입 (수량은 거래소 최소단위로 라운딩)
+    # 3) ChatCompletion/Completion 스타일
     try:
-        resp = place_market(symbol, side_open, _to_contract_qty(qty))
-    except Exception as e:
-        msg = f"[ENTRY][{source}] ❌ 시장가 진입 실패: {e}"
-        log(msg)
-        send_tg(msg)
-        return None
+        choices = getattr(resp, "choices", None)
+        if choices:
+            ch0 = choices[0]
+            msg = getattr(ch0, "message", None)
+            if msg is not None and getattr(msg, "content", None):
+                return str(msg.content)
+            text_attr = getattr(ch0, "text", None)
+            if text_attr:
+                return str(text_attr)
+    except Exception:
+        pass
 
-    data = resp.get("data") or resp
+    if isinstance(resp, dict) and "choices" in resp:
+        ch0 = resp["choices"][0]
+        if isinstance(ch0, dict):
+            msg = ch0.get("message")
+            if isinstance(msg, dict) and "content" in msg:
+                return str(msg["content"])
+            if "text" in ch0:
+                return str(ch0["text"])
 
-    # 주문 id 추출 (없으면 진입 자체를 실패 처리)
-    entry_order_id = (
-        data.get("orderId")
-        or data.get("id")
-        or data.get("orderID")
-    )
-    if not entry_order_id and isinstance(data, dict):
-        order_obj = data.get("order")
-        if isinstance(order_obj, dict):
-            entry_order_id = (
-                order_obj.get("orderId")
-                or order_obj.get("orderID")
-                or order_obj.get("id")
+    # 마지막 폴백
+    try:
+        return str(resp)
+    except Exception:
+        return ""
+
+
+def _call_openai_trader(prompt: str) -> Tuple[bool, str, float, Optional[Exception]]:
+    """실제 OpenAI API 를 호출하고 (성공여부, 텍스트, 지연, 에러)를 반환."""
+    if _OPENAI_CLIENT is None:
+        err = RuntimeError("openai 라이브러리가 설치되어 있지 않습니다.")
+        log(f"[GPT_TRADER] OpenAI 클라이언트 초기화 실패: {err}")
+        return False, "", 0.0, err
+
+    start = time.time()
+    try:
+        if _USE_RESPONSES_API:
+            resp = _OPENAI_CLIENT.responses.create(
+                model=OPENAI_TRADER_MODEL,
+                input=prompt,
+                max_output_tokens=OPENAI_TRADER_MAX_TOKENS,
             )
-
-    if not entry_order_id:
-        msg = "[ENTRY] ⚠️ 시장가 진입 응답에 orderId 가 없어 포지션을 건너뜁니다."
-        log(msg)
-        send_tg(msg)
-        return None
-
-    # 1.5) 즉시 체결 여부 확인
-    immediate_filled = False
-    status = data.get("status") or data.get("orderStatus")
-    if status in ("FILLED", "PARTIALLY_FILLED"):
-        immediate_filled = True
-    if data.get("executedQty") or data.get("avgPrice"):
-        immediate_filled = True
-
-    # 2) 체결 수량/가격 strict 파싱
-    if immediate_filled:
-        try:
-            filled_qty, entry_price = _extract_filled_info_strict(data)
-        except ValueError as e:
-            msg = f"[ENTRY][{source}] ❌ 시장가 체결 데이터 이상(즉시 FILL): {e}"
-            log(msg)
-            send_tg(msg)
-            return None
-    else:
-        # 일정 시간 안에 FILLED 되는지 확인
-        filled = wait_filled(symbol, entry_order_id, timeout=5)
-        if not filled:
-            msg = "[ENTRY] ⚠️ 시장가 주문이 제한 시간 내 FILLED 되지 않아 포지션을 건너뜁니다."
-            log(msg)
-            send_tg(msg)
-            return None
-
-        try:
-            filled_qty, entry_price = _extract_filled_info_strict(filled)
-        except ValueError as e:
-            msg = f"[ENTRY][{source}] ❌ 시장가 체결 데이터 이상(wait_filled): {e}"
-            log(msg)
-            send_tg(msg)
-            return None
-
-    if filled_qty <= 0:
-        msg = "[ENTRY] ⚠️ 시장가 체결 수량이 0입니다. 포지션을 건너뜁니다."
-        log(msg)
-        send_tg(msg)
-        return None
-
-    # 2-1) 체결 결과 로그 (실제 진입 가격/수량 확인용)
-    log(
-        f"[ENTRY FILLED] symbol={symbol} side={side_open} "
-        f"order_id={entry_order_id} qty={filled_qty} entry_price={entry_price} "
-        f"hint={entry_price_hint} source={source}"
-    )
-
-    # 3) 슬리피지 계산/로그 + 가드 (신호 시점의 entry_price_hint 대비)
-    slip_pct: Optional[float] = None
-    slip_abs: Optional[float] = None
-
-    if entry_price_hint and entry_price_hint > 0:
-        # LONG 기준: 체결가가 hint 보다 비싸면 +, 싸면 -
-        # (SHORT 인 경우에도 동일 공식 사용, 해석은 로그에서만 참고)
-        slip_pct = (entry_price / entry_price_hint) - 1.0
-        slip_abs = abs(slip_pct)
-        log(
-            f"[ENTRY SLIPPAGE] symbol={symbol} side={side_open} "
-            f"hint={entry_price_hint} entry={entry_price} "
-            f"slip_pct={slip_pct * 100:.4f}% abs={slip_abs * 100:.4f}%"
-        )
-
-        max_slip_pct = (
-            getattr(settings, "max_entry_slippage_pct", 0.0)
-            if settings is not None
-            else 0.0
-        )
-
-        # max_entry_slippage_pct 는 0.02 (2%) 처럼 비율로 설정한다고 가정.
-        if max_slip_pct and slip_abs is not None and slip_abs > max_slip_pct:
-            try:
-                close_position_market(
-                    symbol,
-                    side_open,
-                    _to_contract_qty(filled_qty),
-                )
-            except Exception as e:
-                msg = (
-                    f"[ENTRY][{source}] ❗ 슬리피지 {slip_abs:.5f} > {max_slip_pct:.5f} "
-                    f"라서 닫으려 했으나 실패: {e}"
-                )
-                log(msg)
-                send_tg(msg)
-            else:
-                msg = (
-                    f"[ENTRY][{source}] ❌ 슬리피지 {slip_abs:.5f} > {max_slip_pct:.5f} "
-                    "→ 포지션 취소"
-                )
-                log(msg)
-                send_tg(msg)
-            return None
-
-    # 3.5) TP/SL 퍼센트 보정 (마진 기반 옵션)
-    if settings is not None and getattr(settings, "use_margin_based_tp_sl", False):
-        lev = getattr(settings, "leverage", 1) or 1
-        fut_tp_margin_pct = getattr(settings, "fut_tp_margin_pct", 0.0)
-        fut_sl_margin_pct = getattr(settings, "fut_sl_margin_pct", 0.0)
-        m_tp = (fut_tp_margin_pct / 100.0) / lev if lev > 0 else 0.0
-        m_sl = (fut_sl_margin_pct / 100.0) / lev if lev > 0 else 0.0
-        tp_pct = max(tp_pct, m_tp)
-        sl_pct = max(sl_pct, m_sl)
-
-    # 3.6) TP/SL 최소 퍼센트 보정
-    min_tp_pct = getattr(settings, "min_tp_pct", 0.0) if settings is not None else 0.0
-    min_sl_pct = getattr(settings, "min_sl_pct", 0.0) if settings is not None else 0.0
-    if min_tp_pct > 0:
-        tp_pct = max(tp_pct, min_tp_pct)
-    if min_sl_pct > 0:
-        sl_pct = max(sl_pct, min_sl_pct)
-
-    # 3.7) RANGE soft 모드 TP 상한
-    if soft_mode:
-        if settings is not None:
-            tp_min = getattr(settings, "range_tp_min", tp_pct)
-            soft_factor = getattr(settings, "range_soft_tp_factor", 1.0)
         else:
-            tp_min = tp_pct
-            soft_factor = 1.0
-        tp_soft_cap = tp_min * soft_factor
-        tp_pct = min(tp_pct, tp_soft_cap)
-
-    # 3.8) 숏 SL 바닥 비율 적용 (롱보다 SL 을 더 깊게 가져가는 전략용)
-    eff_sl_floor_ratio = sl_floor_ratio
-    if eff_sl_floor_ratio is None:
-        eff_sl_floor_ratio = (
-            getattr(settings, "range_short_sl_floor_ratio", 0.0)
-            if settings is not None
-            else 0.0
-        )
-    if side_open == "SELL" and eff_sl_floor_ratio > 0 and tp_pct > 0:
-        min_short_sl = tp_pct * eff_sl_floor_ratio
-        if sl_pct < min_short_sl:
-            sl_pct = min_short_sl
-
-    # 4) TP/SL 가격 계산
-    tp_price, sl_price = compute_tp_sl_prices(
-        side_open=side_open,
-        entry=entry_price,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        precision=2,
-    )
-    close_side = "SELL" if side_open == "BUY" else "BUY"
-
-    # 5) TP/SL 실제 주문
-    try:
-        real_qty = _to_contract_qty(filled_qty)
-        tp_resp = place_conditional(
-            symbol,
-            close_side,
-            real_qty,
-            tp_price,
-            "TAKE_PROFIT_MARKET",
-        )
-        sl_resp = place_conditional(
-            symbol,
-            close_side,
-            real_qty,
-            sl_price,
-            "STOP_MARKET",
-        )
-    except Exception as e:
-        msg = f"[ENTRY][{source}] ❌ TP/SL 예약 실패: {e}, 포지션을 즉시 닫습니다."
-        log(msg)
-        send_tg(msg)
-        close_position_market(
-            symbol,
-            side_open,
-            _to_contract_qty(filled_qty),
-        )
-        return None
-
-    def _norm_id(r: Dict[str, Any]) -> Optional[str]:
-        d = r.get("data") or r
-        oid = d.get("orderId") or d.get("id") or d.get("orderID")
-        if oid:
-            return str(oid)
-        if isinstance(d, dict):
-            order_obj = d.get("order")
-            if isinstance(order_obj, dict):
-                return str(
-                    order_obj.get("orderId")
-                    or order_obj.get("orderID")
-                    or order_obj.get("id")
-                    or ""
-                ) or None
-        return None
-
-    trade = Trade(
-        symbol=symbol,
-        side=side_open,
-        qty=filled_qty,
-        entry=entry_price,
-        entry_order_id=entry_order_id,
-        tp_order_id=_norm_id(tp_resp),
-        sl_order_id=_norm_id(sl_resp),
-        tp_price=tp_price,
-        sl_price=sl_price,
-        source=source,
-    )
-    return trade
-
-
-def ensure_tp_sl_for_trade(trade: Trade, state: TraderState) -> bool:
-    """열려 있는 Trade 에 TP/SL 이 제대로 붙어 있는지 확인하고, 없으면 재설정한다."""
-    if trade.source == "SYNC":
-        # 거래소에서 동기화한 포지션은 TP/SL 을 건드리지 않는다.
-        return True
-
-    symbol = trade.symbol
-    side_open = trade.side
-    qty = trade.qty
-    close_side = "SELL" if side_open == "BUY" else "BUY"
-
-    need_tp = False
-    need_sl = False
-
-    # TP 주문 상태 확인
-    if trade.tp_order_id:
-        try:
-            o = get_order(symbol, trade.tp_order_id)
-            d = o.get("data") or o
-            st = d.get("status") or d.get("orderStatus")
-            if st in ("CANCELED", "REJECTED", "EXPIRED"):
-                need_tp = True
-        except Exception as e:
-            log(f"[ensure_tp_sl] TP check error: {e}")
-            need_tp = True
-    else:
-        need_tp = True
-
-    # SL 주문 상태 확인
-    if trade.sl_order_id:
-        try:
-            o = get_order(symbol, trade.sl_order_id)
-            d = o.get("data") or o
-            st = d.get("status") or d.get("orderStatus")
-            if st in ("CANCELED", "REJECTED", "EXPIRED"):
-                need_sl = True
-        except Exception as e:
-            log(f"[ensure_tp_sl] SL check error: {e}")
-            need_sl = True
-    else:
-        need_sl = True
-
-    ok = True
-    real_qty = _to_contract_qty(qty)
-
-    # TP 재설정
-    if need_tp:
-        try:
-            tp_r = place_conditional(
-                symbol,
-                close_side,
-                real_qty,
-                trade.tp_price,
-                "TAKE_PROFIT_MARKET",
+            # 구버전 호환 (ChatCompletion 우선)
+            resp = _OPENAI_CLIENT.ChatCompletion.create(
+                model=OPENAI_TRADER_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=OPENAI_TRADER_MAX_TOKENS,
             )
-            d = tp_r.get("data") or tp_r
-            trade.tp_order_id = (
-                d.get("orderId")
-                or d.get("id")
-                or d.get("orderID")
-                or (d.get("order") or {}).get("orderId")
-            )
-            send_tg(f"🔄 TP 재설정: {symbol} {trade.tp_price}")
-        except Exception as e:
-            send_tg(f"❗ TP 재설정 실패: {e}")
-            ok = False
-
-    # SL 재설정
-    if need_sl:
-        try:
-            sl_r = place_conditional(
-                symbol,
-                close_side,
-                real_qty,
-                trade.sl_price,
-                "STOP_MARKET",
-            )
-            d = sl_r.get("data") or sl_r
-            trade.sl_order_id = (
-                d.get("orderId")
-                or d.get("id")
-                or d.get("orderID")
-                or (d.get("order") or {}).get("orderId")
-            )
-            send_tg(f"🔄 SL 재설정: {symbol} {trade.sl_price}")
-        except Exception as e:
-            send_tg(f"❗ SL 재설정 실패: {e}")
-            ok = False
-
-    if ok:
-        state.reset_tp_sl_fails()
-    else:
-        state.inc_tp_sl_fails()
-        log(f"[ensure_tp_sl] reapply failed count={state.tp_sl_retry_fails}")
-
-    return ok
+        latency = time.time() - start
+        text = _extract_text_from_response(resp).strip()
+        return True, text, latency, None
+    except Exception as e:  # pragma: no cover - 네트워크 오류 등
+        latency = time.time() - start
+        log(f"[GPT_TRADER] OpenAI 호출 오류: {e}")
+        return False, "", latency, e
 
 
-def check_closes(
-    open_trades: List[Trade],
-    state: TraderState,
-) -> Tuple[List[Trade], List[Dict[str, Any]]]:
-    """TP/SL 체결 여부를 확인하고, 닫힌 포지션 목록을 돌려준다.
+# ──────────────────────────────────────────────────────────────────────────────
+# 외부에서 사용하는 메인 엔트리 포인트
+# ──────────────────────────────────────────────────────────────────────────────
 
-    - summarize_fills(...) 에서 예외가 나면 로그만 남기고 그 포지션은 그대로 유지한다.
-      (DB 동기화/통계 모듈에서 summary 유효성 검사를 거쳐서만 기록하도록 하기 위함.)
+
+def ask_entry_decision(
+    *args: Any,
+    market_features: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """진입 여부/리스크/TP·SL 을 GPT 에게 물어보는 상위 헬퍼.
+
+    - 기존 호출부와 하위호환을 위해 *args / **kwargs 를 그대로 받아서
+      모두 JSON 컨텍스트로 넘긴다.
+    - 새로 추가된 market_features 인자는 선택적이며, prompt 에 함께 포함된다.
+
+    반환 형식 예시:
+    {
+        "status": "OK" | "ERROR" | "PARSE_ERROR",
+        "raw": "<GPT 원문>",
+        "latency": 1.23,
+        "take_trade": true/false,
+        "side": "BUY" | "SELL" | null,
+        "effective_risk_pct": 0.02,
+        "tp_pct": 0.01,
+        "sl_pct": 0.02,
+        "score": 37.5,
+        "reason": "..."
+    }
     """
-    if not open_trades:
-        return [], []
+    # 1) 컨텍스트 정리
+    context: Dict[str, Any] = {
+        "args": _safe_to_json(args),
+        "kwargs": _safe_to_json(kwargs),
+    }
+    if market_features is not None:
+        context["market_features"] = _safe_to_json(market_features)
 
-    still_open: List[Trade] = []
-    closed_results: List[Dict[str, Any]] = []
+    try:
+        context_json = json.dumps(context, ensure_ascii=False)
+    except Exception as e:
+        log(f"[GPT_TRADER] 컨텍스트 JSON 직렬화 실패: {e}")
+        return {
+            "status": "ERROR",
+            "raw": "",
+            "latency": 0.0,
+            "take_trade": False,
+            "side": None,
+            "effective_risk_pct": 0.0,
+            "tp_pct": 0.0,
+            "sl_pct": 0.0,
+            "score": 0.0,
+            "reason": f"컨텍스트 직렬화 실패: {e}",
+        }
 
-    for t in open_trades:
-        if t.source == "SYNC":
-            # 외부에서 동기화한 포지션은 여기서 닫지 않는다.
-            still_open.append(t)
-            continue
+    # 2) 프롬프트 구성
+    prompt = f"""
+당신은 비트코인 선물 자동매매용 GPT 트레이더입니다.
 
-        symbol = t.symbol
-        tp_id = t.tp_order_id
-        sl_id = t.sl_order_id
-        closed = False
+아래 JSON 은 자동매매 엔진이 계산한 현재 시장 정보입니다.
+- 최근 캔들/호가 데이터
+- 기본 진입 시그널과 방향
+- 리스크/TP/SL 기본값 및 가드 결과
+- 저변동성 여부, 세션 정보 등 (market_features 포함)
 
-        # TP 체결 여부 확인
-        if tp_id:
-            try:
-                o = get_order(symbol, tp_id)
-                d = o.get("data") or o
-                st = d.get("status") or d.get("orderStatus")
-                if st == "FILLED":
-                    try:
-                        summary = summarize_fills(symbol, tp_id)
-                    except Exception as e:
-                        log(f"check_closes TP summarize_fills error: {e}")
-                    else:
-                        closed_results.append({"trade": t, "reason": "TP", "summary": summary})
-                        closed = True
-            except Exception as e:
-                log(f"check_closes TP error: {e}")
+이 정보를 바탕으로, '지금 이 시점에 새로운 포지션을 여는 것이 합리적인지' 판단하고,
+가능하다면 방향/리스크/TP/SL 을 제안하세요.
 
-        # SL 체결 여부 확인 (TP 미체결인 경우에만)
-        if (not closed) and sl_id:
-            try:
-                o = get_order(symbol, sl_id)
-                d = o.get("data") or o
-                st = d.get("status") or d.get("orderStatus")
-                if st == "FILLED":
-                    try:
-                        summary = summarize_fills(symbol, sl_id)
-                    except Exception as e:
-                        log(f"check_closes SL summarize_fills error: {e}")
-                    else:
-                        closed_results.append({"trade": t, "reason": "SL", "summary": summary})
-                        closed = True
-            except Exception as e:
-                log(f"check_closes SL error: {e}")
+입력 JSON:
+{context_json}
 
-        # TP/SL 둘 다 체결 안 된 경우 → TP/SL 재설정 시도
-        if not closed:
-            ok = ensure_tp_sl_for_trade(t, state)
-            if not ok:
-                # TP/SL 재설정이 연속으로 실패하면 강제 청산 시도
-                close_position_market(symbol, t.side, _to_contract_qty(t.qty))
-                closed_results.append({"trade": t, "reason": "FORCE_CLOSE", "summary": None})
-            else:
-                still_open.append(t)
+출력은 아래 스키마를 따르는 **순수 JSON 문자열**만 출력해야 합니다.
 
-    return still_open, closed_results
+스키마:
+{{
+  "take_trade": true | false,
+  "side": "BUY" | "SELL" | null,
+  "effective_risk_pct": 0.0,
+  "tp_pct": 0.0,
+  "sl_pct": 0.0,
+  "score": 0.0,
+  "reason": "설명 문자열"
+}}
+
+규칙:
+- take_trade 가 false 인 경우 side 는 null 이거나 "BUY"/"SELL" 이더라도 실제로는 진입하지 않는다.
+- 모든 비율(effective_risk_pct, tp_pct, sl_pct)은 0.0 ~ 0.5 사이 소수(예: 0.01 = 1%)로 작성한다.
+- JSON 바깥에 다른 텍스트를 절대 출력하지 말라.
+"""
+
+    ok, text, latency, err = _call_openai_trader(prompt)
+
+    if not ok or not text:
+        reason = f"OpenAI 호출 실패: {err}" if err else "OpenAI 응답 없음"
+        send_tg(f"⚠️ GPT 진입 판단 호출 실패: {reason}")
+        return {
+            "status": "ERROR",
+            "raw": text,
+            "latency": latency,
+            "take_trade": False,
+            "side": None,
+            "effective_risk_pct": 0.0,
+            "tp_pct": 0.0,
+            "sl_pct": 0.0,
+            "score": 0.0,
+            "reason": reason,
+        }
+
+    # 3) JSON 파싱
+    try:
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON 최상위가 객체(dict)가 아닙니다.")
+    except Exception as e:
+        log(f"[GPT_TRADER] 응답 JSON 파싱 실패: {e} raw={text!r}")
+        send_tg(f"⚠️ GPT 응답 파싱 실패: {e}")
+        return {
+            "status": "PARSE_ERROR",
+            "raw": text,
+            "latency": latency,
+            "take_trade": False,
+            "side": None,
+            "effective_risk_pct": 0.0,
+            "tp_pct": 0.0,
+            "sl_pct": 0.0,
+            "score": 0.0,
+            "reason": f"응답 JSON 파싱 실패: {e}",
+        }
+
+    # 4) 필드 추출 및 기본값 보정
+    def _as_float(v: Any, default: float) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    take_trade = bool(parsed.get("take_trade", False))
+    side = parsed.get("side")
+    if side not in ("BUY", "SELL"):
+        side = None
+
+    eff_risk = _as_float(parsed.get("effective_risk_pct"), 0.0)
+    tp_pct = _as_float(parsed.get("tp_pct"), 0.0)
+    sl_pct = _as_float(parsed.get("sl_pct"), 0.0)
+    score = _as_float(parsed.get("score"), 0.0)
+    reason_text = str(parsed.get("reason", "") or "")
+
+    # 5) settings 에 따른 상한/하한 클램프 (있으면)
+    settings = kwargs.get("settings")
+    if settings is not None:
+        try:
+            max_risk = getattr(settings, "gpt_max_risk_pct", getattr(settings, "risk_pct", 0.03))
+            max_tp = getattr(settings, "gpt_max_tp_pct", getattr(settings, "tp_pct", 0.10))
+            min_tp = getattr(settings, "gpt_min_tp_pct", 0.0)
+            max_sl = getattr(settings, "gpt_max_sl_pct", getattr(settings, "sl_pct", 0.02))
+            min_sl = getattr(settings, "gpt_min_sl_pct", 0.0)
+
+            if max_risk > 0:
+                eff_risk = max(0.0, min(eff_risk, max_risk))
+            if max_tp > 0:
+                tp_pct = max(min_tp, min(tp_pct, max_tp))
+            if max_sl > 0:
+                sl_pct = max(min_sl, min(sl_pct, max_sl))
+        except Exception as e:
+            log(f"[GPT_TRADER] settings 기반 클램프 중 오류: {e}")
+
+    return {
+        "status": "OK",
+        "raw": text,
+        "latency": latency,
+        "take_trade": take_trade,
+        "side": side,
+        "effective_risk_pct": eff_risk,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
+        "score": score,
+        "reason": reason_text,
+    }
 
 
-__all__ = [
-    "Trade",
-    "TraderState",
-    "compute_tp_sl_prices",
-    "open_position_with_tp_sl",
-    "ensure_tp_sl_for_trade",
-    "check_closes",
-]
+__all__ = ["ask_entry_decision"]
