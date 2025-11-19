@@ -3,6 +3,29 @@
 BingX WebSocket 로우데이터(멀티 타임프레임 캔들 + depth5 오더북)를
 GPT-5.1 트레이더용 피처로 가공하는 모듈.
 
+2025-11-20 변경 사항 (엔트리 시그널 빌더 통합)
+----------------------------------------------------
+1) get_trading_signal(...) 추가
+   - build_entry_features_ws(...) 결과 + WS 5m 캔들 버퍼를 이용해
+     엔트리 후보 방향/시그널 메타/캔들 세트를 entry_flow.py 가
+     바로 사용할 수 있는 형태로 제공한다.
+   - 반환 포맷:
+       (chosen_signal, signal_source, latest_ts,
+        candles_5m, candles_5m_raw, last_price, extra)
+2) EntryScore / GPT 트레이더 연동용 extra 필드 구성
+   - extra["signal_score"]      : 0~3 근사 시그널 강도 점수
+   - extra["atr_fast"]          : 5m ATR
+   - extra["atr_slow"]          : 15m ATR (없으면 5m ATR로 대체)
+   - extra["direction_raw"]     : LONG=+1, SHORT=-1
+   - extra["direction_norm"]    : 위와 동일 (정규화 형태)
+   - extra["regime_level"]      : TREND=1.0, RANGE=2.0, GENERIC=1.5
+   - extra["market_features"]   : build_entry_features_ws(...) 전체 dict
+3) 시장 레이블 단순화
+   - signal_source 는 로그/분석용 레이블로만 사용:
+       · 강한 추세 + ADX 다수 → "TREND"
+       · 과열/과매도 MTF 다수 → "RANGE"
+       · 그 외 → "GENERIC"
+
 2025-11-19 변경 사항 (2차 - 지표 확장 + GPT 피드 최적화)
 ----------------------------------------------------
 1) indicators.py 에 새로 추가된 고급 지표들을 통합했다.
@@ -380,7 +403,7 @@ def _build_timeframe_features(
     ret_5 = _ret(5)
 
     # ATR 및 박스 폭
-    atr_val = calc_atr(candles_for_calc[-(atr_len + 1) :], length=atr_len)
+    atr_val = calc_atr(candles_for_calc[-(atr_len + 1):], length=atr_len)
     atr_pct = (atr_val / last_close) if (atr_val is not None and last_close > 0) else math.nan
 
     window_for_range = (
@@ -439,7 +462,7 @@ def _build_timeframe_features(
     # 골든/데드 크로스
     cross_type, cross_bars_ago = _detect_last_cross(ema_fast_vals, ema_slow_vals)
 
-    # 단순 상태 플래그 (GPT 가 해석하기 쉬운 0/1/‑1 값)
+    # 단순 상태 플래그 (GPT 가 해석하기 쉬운 0/1/-1 값)
     def _flag(condition: bool) -> int:
         return 1 if condition else 0
 
@@ -478,7 +501,7 @@ def _build_timeframe_features(
         "rsi": rsi_last,
         "rsi_len": rsi_len,
         "rsi_overbought": rsi_overbought,
-        "rsi_oversold": rsi_oversold,
+        "rsi_oversold": rsi_oversold, 
         "macd": macd_last,
         "macd_signal": macd_signal_last,
         "macd_hist": macd_hist_last,
@@ -772,7 +795,267 @@ def build_entry_features_ws(
     }
 
 
+# ─────────────────────────────────────────────────────
+# 엔트리 시그널 빌더: entry_flow.try_open_new_position(...) 에서 사용
+# ─────────────────────────────────────────────────────
+
+
+def get_trading_signal(
+    *,
+    settings: Any,
+    last_trend_close_ts: float,
+    last_range_close_ts: float,
+    symbol: Optional[str] = None,
+) -> Optional[
+    Tuple[
+        str,                     # chosen_signal ("LONG"|"SHORT")
+        str,                     # signal_source ("TREND"/"RANGE"/"GENERIC"...)
+        int,                     # latest_ts (ms)
+        List[List[float]],       # candles_5m (ts, o, h, l, c)
+        List[List[float]],       # candles_5m_raw (ts, o, h, l, c, v)
+        float,                   # last_price
+        Dict[str, Any],          # extra (GPT/EntryScore용 메타)
+    ]
+]:
+    """WS 기반 엔트리 시그널/컨텍스트를 생성한다.
+
+    반환 형식:
+        (chosen_signal, signal_source, latest_ts,
+         candles_5m, candles_5m_raw, last_price, extra)
+
+    - chosen_signal : "LONG" / "SHORT"
+    - signal_source : 로그/DB용 전략 라벨 ("TREND", "RANGE", "GENERIC" 등)
+    - latest_ts     : 기준 5m 캔들 타임스탬프(ms)
+    - candles_5m    : [[ts, o, h, l, c], ...]
+    - candles_5m_raw: [[ts, o, h, l, c, v], ...]
+    - last_price    : 현재 기준가(오더북 last/mark/5m 종가 순으로 선택)
+    - extra         :
+        · signal_score  : 0~3 근사 시그널 강도
+        · atr_fast      : 5m ATR
+        · atr_slow      : 15m ATR
+        · direction_raw : LONG=+1, SHORT=-1
+        · direction_norm: 위와 동일
+        · regime_level  : TREND=1.0, RANGE=2.0, GENERIC=1.5
+        · market_features: build_entry_features_ws(...) 전체 dict
+        · last_trend_close_ts / last_range_close_ts: 그대로 포함
+    """
+    # 심볼 결정: 우선 settings.symbol, 없으면 글로벌 SET.symbol
+    if symbol is None:
+        symbol = getattr(settings, "symbol", None) or SET.symbol
+
+    # 1) WS 피처 빌더 실행 (필수 데이터/헬스 체크는 여기서 끝낸다)
+    try:
+        features = build_entry_features_ws(symbol)
+    except FeatureBuildError as e:
+        log(f"[MKT-FEAT] get_trading_signal FeatureBuildError: {e}")
+        # 여기서 텔레그램 알림은 이미 _fail 에서 보냈으므로 추가 전송은 하지 않는다.
+        return None
+    except Exception as e:
+        msg = f"[MKT-FEAT] get_trading_signal unexpected error: {e}"
+        log(msg)
+        try:
+            send_tg("❌ [get_trading_signal 예외]\n" + msg)
+        except Exception:
+            pass
+        return None
+
+    tfs: Dict[str, Dict[str, Any]] = features.get("timeframes", {})
+    ob: Dict[str, Any] = features.get("orderbook", {})
+    mtf: Dict[str, Any] = features.get("multi_timeframe", {})
+
+    tf5 = tfs.get("5m")
+    if not tf5:
+        log("[MKT-FEAT] get_trading_signal: 5m timeframes 가 없습니다.")
+        return None
+
+    tf15 = tfs.get("15m")
+    tf1 = tfs.get("1m")
+
+    # 2) 5m 캔들 버퍼 확보 (가드/스냅샷용) - WS 버퍼 그대로 사용
+    cfg_5m = TF_CONFIG.get("5m", {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20})
+    try:
+        buf_5m = _fetch_candles_strict(
+            symbol,
+            "5m",
+            cfg=cfg_5m,
+            required=True,
+        )
+    except FeatureBuildError as e:
+        log(f"[MKT-FEAT] get_trading_signal: 5m fetch FeatureBuildError: {e}")
+        return None
+    except Exception as e:
+        log(f"[MKT-FEAT] get_trading_signal: 5m fetch unexpected error: {e}")
+        return None
+
+    if not buf_5m:
+        log("[MKT-FEAT] get_trading_signal: 5m buf_5m 이 비어 있습니다.")
+        return None
+
+    candles_5m_raw: List[List[float]] = [
+        [float(ts), float(o), float(h), float(l), float(c), float(v)]
+        for (ts, o, h, l, c, v) in buf_5m
+    ]
+    candles_5m: List[List[float]] = [
+        [float(ts), float(o), float(h), float(l), float(c)]
+        for (ts, o, h, l, c, v) in buf_5m
+    ]
+
+    latest_ts = int(buf_5m[-1][0])
+
+    # 3) 기준 가격(last_price) 선택
+    last_price_candidates: List[float] = []
+
+    ob_last = ob.get("last_price")
+    if isinstance(ob_last, (int, float)):
+        last_price_candidates.append(float(ob_last))
+
+    ob_mark = ob.get("mark_price")
+    if isinstance(ob_mark, (int, float)):
+        last_price_candidates.append(float(ob_mark))
+
+    tf5_close = tf5.get("last_close")
+    if isinstance(tf5_close, (int, float)):
+        last_price_candidates.append(float(tf5_close))
+
+    if tf1:
+        tf1_close = tf1.get("last_close")
+        if isinstance(tf1_close, (int, float)):
+            last_price_candidates.append(float(tf1_close))
+
+    if last_price_candidates:
+        last_price = last_price_candidates[0]
+    else:
+        # 최후 보루: 5m 마지막 종가
+        last_price = float(buf_5m[-1][4])
+
+    # 4) 방향 편향(chosen_signal) 계산
+    majority_trend = str(mtf.get("majority_trend", "NEUTRAL")).upper()
+    depth_imbalance = ob.get("depth_imbalance")
+
+    trend_bias = 0  # LONG=+1 / SHORT=-1 / 0=중립
+
+    if majority_trend == "LONG":
+        trend_bias = 1
+    elif majority_trend == "SHORT":
+        trend_bias = -1
+    else:
+        # MTF가 애매하면 오더북 쏠림을 참고
+        if isinstance(depth_imbalance, (int, float)) and abs(depth_imbalance) >= 0.05:
+            trend_bias = 1 if depth_imbalance > 0 else -1
+
+    # 여전히 0이면 5m EMA 정렬로 최소 방향은 정해준다.
+    if trend_bias == 0:
+        ema_fast_5 = tf5.get("ema_fast")
+        ema_slow_5 = tf5.get("ema_slow")
+        if isinstance(ema_fast_5, (int, float)) and isinstance(ema_slow_5, (int, float)):
+            if ema_fast_5 > ema_slow_5:
+                trend_bias = 1
+            elif ema_fast_5 < ema_slow_5:
+                trend_bias = -1
+
+    # 완전히 애매한 경우라도 GPT 가 최종 판단하므로 한쪽을 기본값으로 둔다.
+    if trend_bias >= 0:
+        chosen_signal = "LONG"
+        direction_num = 1.0
+    else:
+        chosen_signal = "SHORT"
+        direction_num = -1.0
+
+    # 5) signal_source (레짐 라벨) 결정 - 완전 단순화
+    signal_source = "GENERIC"
+    try:
+        adx_trend_tfs = int(mtf.get("adx_trend_tfs") or 0)
+        overbought_tfs = int(mtf.get("overbought_tfs") or 0)
+        oversold_tfs = int(mtf.get("oversold_tfs") or 0)
+        strong_trend_flag = tf5.get("strong_trend_flag")
+
+        if adx_trend_tfs >= 2 and strong_trend_flag == 1:
+            signal_source = "TREND"
+        elif (overbought_tfs + oversold_tfs) >= 1:
+            signal_source = "RANGE"
+    except Exception:
+        # 어떤 이유로든 계산 실패하면 GENERIC 유지
+        pass
+
+    # regime_level 숫자 라벨 (EntryScore/GPT 메타용)
+    if signal_source == "TREND":
+        regime_level = 1.0
+    elif signal_source == "RANGE":
+        regime_level = 2.0
+    else:
+        regime_level = 1.5
+
+    # 6) signal_score / ATR fast/slow 계산 (EntryScore용 필수 필드)
+    atr_fast = tf5.get("atr")
+    if isinstance(atr_fast, (int, float)):
+        atr_fast_val = float(atr_fast)
+    else:
+        atr_fast_val = float("nan")
+
+    if tf15:
+        atr_slow = tf15.get("atr")
+    else:
+        atr_slow = atr_fast
+
+    if isinstance(atr_slow, (int, float)):
+        atr_slow_val = float(atr_slow)
+    else:
+        atr_slow_val = float("nan")
+
+    # 간단한 시그널 강도 점수 (0~3 근사)
+    signal_score = 1.0
+    try:
+        vol_z = tf5.get("volume_zscore")
+        if signal_source == "TREND":
+            signal_score += 0.5
+        if majority_trend in ("LONG", "SHORT"):
+            signal_score += 0.3
+        if isinstance(vol_z, (int, float)) and abs(vol_z) >= 2.0:
+            signal_score += 0.4
+    except Exception:
+        pass
+
+    if signal_score < 0.1:
+        signal_score = 0.1
+    if signal_score > 3.0:
+        signal_score = 3.0
+
+    # 7) extra 메타 구성 (GPT/gpt_trader + EntryScore 공용)
+    extra: Dict[str, Any] = {
+        "signal_score": float(signal_score),
+        "atr_fast": atr_fast_val,
+        "atr_slow": atr_slow_val,
+        "direction_raw": direction_num,
+        "direction_norm": direction_num,
+        "regime_level": regime_level,
+        "market_features": features,
+        "last_trend_close_ts": float(last_trend_close_ts),
+        "last_range_close_ts": float(last_range_close_ts),
+    }
+
+    # 참고용으로 일부 핵심 값도 함께 넣어 준다.
+    try:
+        extra["majority_trend"] = majority_trend
+        extra["depth_imbalance"] = depth_imbalance
+        extra["spread_pct"] = ob.get("spread_pct")
+        extra["volume_zscore_5m"] = tf5.get("volume_zscore")
+        extra["strong_trend_flag_5m"] = tf5.get("strong_trend_flag")
+    except Exception:
+        pass
+
+    return (
+        chosen_signal,
+        signal_source,
+        latest_ts,
+        candles_5m,
+        candles_5m_raw,
+        float(last_price),
+        extra,
+    )
+
+
 __all__ = [
     "FeatureBuildError",
     "build_entry_features_ws",
+    "get_trading_signal",
 ]
