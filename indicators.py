@@ -1,53 +1,27 @@
 """indicators.py
 ====================================================
-기술적 지표 및 다이버전스 보조 함수 모듈.
+기술적 지표 및 레짐 피처 계산 모듈.
 
 역할
 ----------------------------------------------------
-- EMA, RSI, ATR 같은 기본 기술적 지표 계산을 전담한다.
-- 최근 고점/저점 피벗과 RSI 다이버전스를 판별하는 보조 함수를 제공한다.
-- 신호 판단(strategies_*.py, signal_flow_ws.py 등)에서 공통으로 사용하는
-  "계산 전용" 유틸리티 레이어이며, DB I/O 나 텔레그램 로깅은 하지 않는다.
+- WebSocket / DB 에서 얻은 캔들(1m/5m/15m ...)에 대해
+  EMA, RSI, ATR, MACD, 스토캐스틱, 볼린저 밴드, ADX 등을 계산한다.
+- 신호 판단/전략/GPT 레이어는 이 모듈의 함수만 호출해서
+  순수 수치 지표를 얻고, I/O 나 텔레그램 로깅은 전혀 수행하지 않는다.
 
-2025-11-14 변경 / 중요사항
+2025-11-19 변경 요약
 ----------------------------------------------------
-1) 기존 bot.py 안에 섞여 있던 EMA, RSI, ATR, RSI 다이버전스 계산을 분리해
-   단일 모듈(indicators.py)에 통합했다.
-2) Candle 타입을 (ts_ms, open, high, low, close) 튜플로 정의해
-   - WebSocket 캔들(1m/5m/15m)과
-   - DB 기반 분석(signal_analysis_worker)의 공용 입력 포맷으로 사용 가능하게 했다.
-3) 이 모듈은 **계산만** 담당하며, 신호/레짐 판단 및 DB 저장은
-   strategies_*, signal_flow_ws.py, signal_analysis_worker.py 에서 처리한다.
-
-2025-11-17 변경 / 레짐·대시보드용 피처 헬퍼 추가
-----------------------------------------------------
-4) 단순 이동평균(sma) 함수를 추가해 EMA 외에 기본 평균선도 손쉽게 계산할 수 있게 했다.
-5) build_regime_features_from_candles(...) 함수를 추가해
-   - 최근 캔들 시퀀스에서 추세/변동성/박스 여부를 가늠하는 간단한 피처 집합을
-   - 하나의 dict로 만들어 돌려준다.
-   이 dict는
-     · signal_analysis_worker 에서 레짐 점수 계산·저장용으로 쓰거나,
-     · signal_flow_ws / position_watch_ws 에서 extra["regime_features"] 에 그대로 실어
-       GPT 의사결정 레이어에 참고 정보로 전달하는 용도로 사용한다.
-   DB 접근은 하지 않고, 순수 캔들 리스트만 받아서 계산하는 순수 함수로 유지한다.
-
-제공 함수
-----------------------------------------------------
-- sma(values, length): 단순 이동평균(SMA) 리스트 계산
-- ema(values, length): 지수 이동평균(EMA) 리스트 계산
-- rsi(closes, length=14): 표준 RSI 리스트 계산
-- calc_atr(candles, length=14): (ts_ms, o, h, l, c) 캔들 시퀀스에서 ATR 값 1개 계산
-- has_bearish_rsi_divergence(...): RSI 매도 다이버전스 여부
-- has_bullish_rsi_divergence(...): RSI 매수 다이버전스 여부
-- build_regime_features_from_candles(...): 캔들 배열에서 레짐 힌트·변동성 피처 dict 생성
-
-여기서는 로깅을 최소화해 지표 계산 자체를 가볍게 유지한다.
+1) MACD, 스토캐스틱(Stoch), 볼린저 밴드(BBands), ADX, OBV 지표를 추가했다.
+2) build_regime_features_from_candles(...) 를 확장해
+   - EMA20/50/100/200, ATR, RSI, BBands 폭, ADX, Stoch, MACD 를 한 번에 계산해
+   - GPT 컨텍스트에 바로 실어 보낼 수 있는 피처 dict 를 돌려준다.
+3) 기존 함수 시그니처는 유지해 이전 호출부와 완전히 호환된다.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Iterable
 
 # WebSocket / DB 공용 캔들 타입
 # ts_ms: epoch milliseconds (int)
@@ -185,7 +159,7 @@ def calc_atr(candles: List[Candle], length: int = 14) -> Optional[float]:
     trs: List[float] = []
     for i in range(1, len(candles)):
         _, _, high, low, close = candles[i]
-        _, _, prev_high, prev_low, prev_close = candles[i - 1]
+        _, _, _, _, prev_close = candles[i - 1]
         tr = max(
             high - low,
             abs(high - prev_close),
@@ -202,6 +176,198 @@ def calc_atr(candles: List[Candle], length: int = 14) -> Optional[float]:
 
 
 # ─────────────────────────────
+# MACD
+# ─────────────────────────────
+
+def macd(
+    values: List[float],
+    fast_len: int = 12,
+    slow_len: int = 26,
+    signal_len: int = 9,
+) -> Tuple[List[float], List[float], List[float]]:
+    """MACD(12·26·9 기본값) 계산.
+
+    반환:
+        macd_line, signal_line, hist 리스트 (길이는 values 와 동일)
+    초반부 데이터가 부족하면 NaN 으로 채운다.
+    """
+    n = len(values)
+    if n == 0:
+        return [], [], []
+
+    ema_fast = ema(values, fast_len)
+    ema_slow = ema(values, slow_len)
+
+    macd_line: List[float] = []
+    for f, s in zip(ema_fast, ema_slow):
+        if math.isnan(f) or math.isnan(s):
+            macd_line.append(math.nan)
+        else:
+            macd_line.append(f - s)
+
+    # signal 은 macd_line 에 대해 EMA 를 적용하되, 앞쪽 NaN 은 그대로 둔다.
+    signal_line: List[float] = [math.nan] * n
+    # 유효 구간만 잘라서 EMA 계산
+    first_valid = next((i for i, v in enumerate(macd_line) if not math.isnan(v)), None)
+    if first_valid is not None:
+        segment = macd_line[first_valid:]
+        ema_seg = ema(segment, signal_len)
+        for idx, v in enumerate(ema_seg):
+            signal_line[first_valid + idx] = v
+
+    hist: List[float] = []
+    for m, s in zip(macd_line, signal_line):
+        if math.isnan(m) or math.isnan(s):
+            hist.append(math.nan)
+        else:
+            hist.append(m - s)
+
+    return macd_line, signal_line, hist
+
+
+# ─────────────────────────────
+# 볼린저 밴드
+# ─────────────────────────────
+
+def bollinger_bands(
+    values: List[float],
+    length: int = 20,
+    num_std: float = 2.0,
+) -> Tuple[List[float], List[float], List[float]]:
+    """볼린저 밴드 (중심선, 상단, 하단) 계산.
+
+    - 길이가 length 미만인 구간은 NaN.
+    """
+    n = len(values)
+    if n == 0:
+        return [], [], []
+    if length <= 0:
+        return [math.nan] * n, [math.nan] * n, [math.nan] * n
+
+    mid: List[float] = [math.nan] * n
+    upper: List[float] = [math.nan] * n
+    lower: List[float] = [math.nan] * n
+
+    for i in range(length - 1, n):
+        window = values[i - length + 1 : i + 1]
+        if len(window) < length:
+            continue
+        mean = sum(window) / length
+        var = sum((x - mean) ** 2 for x in window) / length
+        std = math.sqrt(var)
+
+        mid[i] = mean
+        upper[i] = mean + num_std * std
+        lower[i] = mean - num_std * std
+
+    return mid, upper, lower
+
+
+# ─────────────────────────────
+# OBV (On-Balance Volume)
+# ─────────────────────────────
+
+def obv(closes: List[float], volumes: List[float]) -> List[float]:
+    """OBV 계산. 길이가 맞지 않으면 공통 구간까지만 사용한다."""
+    n = min(len(closes), len(volumes))
+    if n == 0:
+        return []
+
+    closes = closes[:n]
+    volumes = volumes[:n]
+
+    out: List[float] = [0.0] * n
+    for i in range(1, n):
+        if closes[i] > closes[i - 1]:
+            out[i] = out[i - 1] + volumes[i]
+        elif closes[i] < closes[i - 1]:
+            out[i] = out[i - 1] - volumes[i]
+        else:
+            out[i] = out[i - 1]
+    return out
+
+
+# ─────────────────────────────
+# ADX
+# ─────────────────────────────
+
+def adx(candles: List[Candle], length: int = 14) -> Optional[float]:
+    """ADX(평균 방향성 지수) 마지막 값 1개를 계산한다.
+
+    - candles 가 2 * length 개 미만이면 None.
+    - Wilder 방식으로 +DM, -DM, TR, DX, ADX 를 계산한다.
+    """
+    n = len(candles)
+    if length <= 0 or n < 2 * length:
+        return None
+
+    plus_dm: List[float] = []
+    minus_dm: List[float] = []
+    trs: List[float] = []
+
+    for i in range(1, n):
+        _, _, high, low, close = candles[i]
+        _, _, prev_high, prev_low, prev_close = candles[i - 1]
+
+        up_move = high - prev_high
+        down_move = prev_low - low
+
+        plus = up_move if (up_move > down_move and up_move > 0) else 0.0
+        minus = down_move if (down_move > up_move and down_move > 0) else 0.0
+
+        tr = max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        )
+
+        plus_dm.append(plus)
+        minus_dm.append(minus)
+        trs.append(tr)
+
+    if len(trs) < length:
+        return None
+
+    # 초기 smoothed 값
+    tr_n = sum(trs[:length])
+    plus_dm_n = sum(plus_dm[:length])
+    minus_dm_n = sum(minus_dm[:length])
+
+    def _calc_di(tr_val: float, plus_val: float, minus_val: float) -> Tuple[float, float, float]:
+        if tr_val <= 0:
+            return 0.0, 0.0, 0.0
+        plus_di = 100.0 * plus_val / tr_val
+        minus_di = 100.0 * minus_val / tr_val
+        denom = plus_di + minus_di
+        if denom <= 0:
+            return plus_di, minus_di, 0.0
+        dx = 100.0 * abs(plus_di - minus_di) / denom
+        return plus_di, minus_di, dx
+
+    _, _, first_dx = _calc_di(tr_n, plus_dm_n, minus_dm_n)
+    dx_values: List[float] = [first_dx]
+
+    # 이후 smoothed 값
+    for i in range(length, len(trs)):
+        tr_n = tr_n - (tr_n / length) + trs[i]
+        plus_dm_n = plus_dm_n - (plus_dm_n / length) + plus_dm[i]
+        minus_dm_n = minus_dm_n - (minus_dm_n / length) + minus_dm[i]
+        _, _, dx_val = _calc_di(tr_n, plus_dm_n, minus_dm_n)
+        dx_values.append(dx_val)
+
+    if len(dx_values) < length:
+        # 샘플이 부족하면 마지막 DX 를 그대로 ADX 로 사용
+        return dx_values[-1]
+
+    # 첫 ADX 는 앞 length 개 DX 의 평균
+    adx_val = sum(dx_values[:length]) / length
+    for dx_val in dx_values[length:]:
+        adx_val = ((adx_val * (length - 1)) + dx_val) / length
+
+    return adx_val
+
+
+# ─────────────────────────────
 # 레짐·대시보드용 피처 헬퍼 (순수 캔들 기반)
 # ─────────────────────────────
 
@@ -214,7 +380,7 @@ def build_regime_features_from_candles(
     rsi_len: int = 14,
     range_window: int = 50,
 ) -> Optional[Dict[str, float]]:
-    """캔들 배열에서 추세/변동성/박스 여부를 가늠하는 간단한 피처 묶음을 생성한다.
+    """캔들 배열에서 추세/변동성/박스 여부를 가늠하는 피처 묶음을 생성한다.
 
     반환 예시(dict):
         {
@@ -227,9 +393,17 @@ def build_regime_features_from_candles(
           "atr_pct": 0.0037,
           "range_pct": 0.0052,
           "rsi_last": 57.3,
+          "adx_last": 27.1,
+          "bb_width_pct": 0.004,
+          "stoch_k": 65.0,
+          "stoch_d": 60.0,
+          "macd": ...,
+          "macd_signal": ...,
+          "macd_hist": ...,
           "trend_strength": 1.5,
           "range_strength": 0.8,
-          "regime_hint": "TREND_LIKE"  # / "RANGE_LIKE" / "MIXED" / "UNKNOWN"
+          "_regime_hint": ...,
+          "_regime_label": ...,
         }
 
     - DB 를 직접 보지 않고, 넘겨받은 candles 리스트만 사용한다.
@@ -239,24 +413,30 @@ def build_regime_features_from_candles(
     """
     n = len(candles)
     need = max(fast_ema_len, slow_ema_len, atr_len + 1, rsi_len + 1, range_window)
-    if n < need or n == 0:
+    if n == 0 or n < need:
         return None
 
     closes = [c[4] for c in candles]
-    highs = [c[2] for c in candles[-range_window:]]
-    lows = [c[3] for c in candles[-range_window:]]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
     last_close = closes[-1]
     if last_close <= 0:
         return None
 
-    # EMA 기반 추세 강도
+    # EMA 기반 추세 강도 (20/50 기본)
     ema_fast_list = ema(closes, fast_ema_len)
     ema_slow_list = ema(closes, slow_ema_len)
     ema_fast_val = ema_fast_list[-1]
     ema_slow_val = ema_slow_list[-1]
 
+    # 추가로 EMA100/200 계산 (유명 트레이더 기준선)
+    ema_100_list = ema(closes, 100)
+    ema_200_list = ema(closes, 200)
+    ema_100_val = ema_100_list[-1] if ema_100_list else math.nan
+    ema_200_val = ema_200_list[-1] if ema_200_list else math.nan
+
     # 유효한 이전 EMA 값을 하나 더 찾아 기울기(최근 기울기)를 계산한다.
-    def _last_two_valid(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    def _last_two_valid(vals: Iterable[float]) -> Tuple[Optional[float], Optional[float]]:
         valid: List[float] = [v for v in vals if not math.isnan(v)]
         if len(valid) < 2:
             return None, None
@@ -274,17 +454,48 @@ def build_regime_features_from_candles(
     else:
         ema_fast_slope_pct = (ema_fast_last - ema_fast_prev) / last_close
 
+    # EMA200 대비 종가 위치
+    if ema_200_list and not math.isnan(ema_200_val):
+        ema_200_dist_pct = (last_close - ema_200_val) / last_close
+    else:
+        ema_200_dist_pct = math.nan
+
     # ATR 및 가격 밴드 폭
     atr_val = calc_atr(candles[-(atr_len + 1) :], length=atr_len)
     atr_pct = (atr_val / last_close) if (atr_val is not None and last_close > 0) else math.nan
 
-    high_recent = max(highs)
-    low_recent = min(lows)
+    high_recent = max(highs[-range_window:])
+    low_recent = min(lows[-range_window:])
     range_pct = (high_recent - low_recent) / last_close if last_close > 0 else math.nan
 
     # RSI 마지막 값
     rsi_vals = rsi(closes, length=rsi_len)
     rsi_last = rsi_vals[-1] if rsi_vals else math.nan
+
+    # MACD / 시그널 / 히스토그램
+    macd_line, macd_signal, macd_hist = macd(closes)
+    macd_last = macd_line[-1] if macd_line else math.nan
+    macd_signal_last = macd_signal[-1] if macd_signal else math.nan
+    macd_hist_last = macd_hist[-1] if macd_hist else math.nan
+
+    # 볼린저 밴드 폭/위치
+    bb_mid, bb_upper, bb_lower = bollinger_bands(closes)
+    bb_width_pct = math.nan
+    bb_pos = math.nan
+    if bb_upper and bb_lower:
+        u = bb_upper[-1]
+        l = bb_lower[-1]
+        if not math.isnan(u) and not math.isnan(l) and (u - l) > 0:
+            bb_width_pct = (u - l) / last_close
+            bb_pos = (last_close - l) / (u - l)
+
+    # 스토캐스틱 (14, 3 기본)
+    stoch_k_vals, stoch_d_vals = stochastic_oscillator(highs, lows, closes)
+    stoch_k_last = stoch_k_vals[-1] if stoch_k_vals else math.nan
+    stoch_d_last = stoch_d_vals[-1] if stoch_d_vals else math.nan
+
+    # ADX
+    adx_val = adx(candles, length=atr_len)
 
     # 간단한 레짐 힌트 (실제 전략 로직이 아니라 GPT/대시보드 참고용)
     regime_hint = "UNKNOWN"
@@ -301,10 +512,21 @@ def build_regime_features_from_candles(
         # 박스 강도: 가격 밴드 폭 대비 ATR (단순 휴리스틱)
         range_strength = range_pct / atr_pct if atr_pct > 0 else range_pct
 
-        # 매우 단순한 휴리스틱 레이블링
-        if abs(ema_dist_pct) >= 0.003 and atr_pct >= 0.003 and trend_strength >= 1.2:
+        # 매우 단순한 휴리스틱 레이블링 (+ ADX 반영)
+        strong_trend = (
+            abs(ema_dist_pct) >= 0.003
+            and atr_pct >= 0.003
+            and (trend_strength >= 1.2 or (adx_val is not None and adx_val >= 25))
+        )
+        strong_range = (
+            range_pct <= 0.004
+            and abs(ema_dist_pct) <= 0.002
+            and (adx_val is None or adx_val < 20)
+        )
+
+        if strong_trend:
             regime_hint = "TREND_LIKE"
-        elif range_pct <= 0.004 and abs(ema_dist_pct) <= 0.002:
+        elif strong_range:
             regime_hint = "RANGE_LIKE"
         else:
             regime_hint = "MIXED"
@@ -315,28 +537,35 @@ def build_regime_features_from_candles(
         "ema_slow": float(ema_slow_val),
         "ema_dist_pct": float(ema_dist_pct),
         "ema_fast_slope_pct": float(ema_fast_slope_pct),
+        "ema_100": float(ema_100_val),
+        "ema_200": float(ema_200_val),
+        "ema_200_dist_pct": float(ema_200_dist_pct),
         "atr": float(atr_val) if atr_val is not None else math.nan,
         "atr_pct": float(atr_pct),
         "range_pct": float(range_pct),
         "rsi_last": float(rsi_last),
+        "adx_last": float(adx_val) if adx_val is not None else math.nan,
+        "bb_width_pct": float(bb_width_pct),
+        "bb_pos": float(bb_pos),
+        "stoch_k": float(stoch_k_last),
+        "stoch_d": float(stoch_d_last),
+        "macd": float(macd_last),
+        "macd_signal": float(macd_signal_last),
+        "macd_hist": float(macd_hist_last),
         "trend_strength": float(trend_strength),
         "range_strength": float(range_strength),
     }
 
-    # regime_hint 는 문자열이라 dict 를 Dict[str, float] 로만 한정하지 않고
-    # 호출부에서 필요하면 별도 필드로 저장해서 사용한다.
-    # 여기서는 편의상 dict 에 같이 실어 보내되, 타입 경고를 피하기 위해
-    # 호출부에서 typing.TypedDict 등을 사용해 래핑하는 것을 권장한다.
-    features["_regime_hint"] = {  # type: ignore[assignment]
+    # regime_hint 를 숫자값으로 같이 싣는다 (GPT / 통계처리 편의용)
+    features["_regime_hint"] = {
         "TREND_LIKE": 1.0,
         "RANGE_LIKE": 0.0,
         "MIXED": 0.5,
         "UNKNOWN": math.nan,
     }.get(regime_hint, math.nan)
 
-    # 문자열 레이블은 별도 키로 돌려준다.
-    # (GPT extra / 대시보드에서 그대로 쓰기 좋게)
-    features["_regime_label"] = {  # type: ignore[assignment]
+    # 문자열 레이블을 -1/0/1 로 인코딩
+    features["_regime_label"] = {
         "TREND_LIKE": 1.0,
         "RANGE_LIKE": -1.0,
         "MIXED": 0.0,
@@ -440,11 +669,63 @@ def has_bullish_rsi_divergence(candles: List[Candle], rsi_vals: List[float]) -> 
     return price_down and rsi_up
 
 
+# ─────────────────────────────
+# 스토캐스틱 (보조지표로도 직접 사용 가능)
+# ─────────────────────────────
+
+def stochastic_oscillator(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    k_len: int = 14,
+    d_len: int = 3,
+) -> Tuple[List[float], List[float]]:
+    """스토캐스틱 오실레이터 (%K, %D) 계산."""
+    n = min(len(highs), len(lows), len(closes))
+    if n == 0:
+        return [], []
+
+    highs = highs[:n]
+    lows = lows[:n]
+    closes = closes[:n]
+
+    k_vals: List[float] = [math.nan] * n
+    for i in range(n):
+        if i + 1 < k_len:
+            continue
+        start = i + 1 - k_len
+        window_high = max(highs[start : i + 1])
+        window_low = min(lows[start : i + 1])
+        denom = window_high - window_low
+        if denom <= 0:
+            k_vals[i] = 50.0  # 변동성 거의 없으면 중립값
+        else:
+            k_vals[i] = 100.0 * (closes[i] - window_low) / denom
+
+    # %D = %K 의 이동평균 (NaN 은 제외한 윈도우 평균)
+    d_vals: List[float] = [math.nan] * n
+    for i in range(n):
+        if i + 1 < d_len:
+            continue
+        window = k_vals[i + 1 - d_len : i + 1]
+        valid = [v for v in window if not math.isnan(v)]
+        if len(valid) < d_len:
+            continue
+        d_vals[i] = sum(valid) / len(valid)
+
+    return k_vals, d_vals
+
+
 __all__ = [
     "sma",
     "ema",
     "rsi",
     "calc_atr",
+    "macd",
+    "bollinger_bands",
+    "obv",
+    "adx",
+    "stochastic_oscillator",
     "has_bearish_rsi_divergence",
     "has_bullish_rsi_divergence",
     "build_regime_features_from_candles",

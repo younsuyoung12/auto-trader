@@ -2,45 +2,41 @@
 # ====================================================
 # 역할
 # ----------------------------------------------------
-# - BingX Auto Trader에서 "GPT 판단"과 "하드 리스크 가드" 사이의 중간 레이어.
-# - gpt_decider.ask_entry_decision 이 반환한 JSON을 해석해서
-#     · 너무 보수적인 조건 때문에 항상 SKIP 나는 상황에서는 GPT가 부드럽게 조정할 수 있게 하고,
-#     · 반대로 너무 위험한 완화/레버리지 제안은 settings_ws.BotSettings 상한/하한으로 완전히 차단한다.
-# - 장 흐름(최근 PnL/스킵 패턴 등)에 따라, 가드·리스크 파라미터를 동적으로 조정하는 AI 게이트웨이.
+# - BingX Auto Trader에서 "GPT 판단"과 "하드 리스크/가드" 사이의 중간 레이어.
+# - market_features_ws.build_entry_features_ws(...) 로 만든 WS 피처를
+#   gpt_decider.ask_entry_decision(...) 에 전달하고,
+#   settings_ws.BotSettings 기반 상·하한 가드를 적용한다.
+# - 지나치게 보수적인 조건 때문에 항상 SKIP 나는 상황에서는 GPT가 부드럽게 조정할 수 있게 하고,
+#   반대로 너무 위험한 완화/레버리지 제안은 settings_ws.BotSettings 상한/하한으로 완전히 차단한다.
+# - 장 흐름(최근 PnL/스킵 패턴 등)과 데이터/모델 헬스에 따라, 
+#   가드·리스크 파라미터를 동적으로 조정하는 AI 게이트웨이.
 #
-# 2025-11-19 변경 사항 (GPT 지연/장애 하드 스톱 + 상태 플래그)
+# 2025-11-19 변경 사항 (WS 피처 연동 + 데이터 오류 처리 강화 + GPT 지연/장애 하드 스톱 정리)
 # ----------------------------------------------------
-# 1) decide_entry_with_gpt_trader(...) 에 GPT 진입 장애 상태 관리 레이어 추가:
-#    - 연속 에러/타임아웃 횟수를 전역 카운터로 추적.
-#    - 임계치 이상이면 일정 시간 동안 신규 진입을 강제로 차단(HARD_STOP)한다.
-# 2) 하드 스톱 윈도우 동안에는:
-#    - final_action="SKIP", gpt_action="ERROR", gpt_status="HARD_STOP", hard_stop=True 로 반환.
-#    - sleep_after_sec 를 gpt_entry_hard_stop_cooldown_sec(기본 30초)로 설정하여 쿨타임을 명확히 한다.
-# 3) 단발성 오류(임계치 미만 연속 에러)일 경우:
-#    - gpt_status="ERROR", hard_stop=False 로 표시하고,
-#    - gpt_error_sleep_sec(기본 5초) 만큼만 대기 후 다음 루프를 진행한다.
-# 4) GPT 호출이 정상적으로 성공하면:
-#    - 에러 카운터 및 하드 스톱 상태를 자동으로 리셋.
-#    - gpt_latency_sec 를 gpt_decider.ask_entry_decision 의 _meta.latency_sec 기반으로 result 에 포함한다.
-# 5) 새로운 설정값 (없으면 기본값 사용):
-#    - gpt_entry_hard_stop_min_errors (기본 3회 연속 에러 시 HARD_STOP 진입)
-#    - gpt_entry_hard_stop_cooldown_sec (기본 30.0초, 하드 스톱 유지 시간)
-#    - gpt_entry_error_reset_window_sec (기본 60.0초, 이 시간 이상 지나면 에러 카운터 리셋)
-# 6) ask_entry_decision 예외 및 비정상 응답 포맷 처리 강화:
-#    - 예외 타입과 메시지를 Render 로그에 남기고,
-#    - dict 가 아닌 응답은 별도 오류로 취급하여 동일한 에러 카운터/하드 스톱 로직에 포함.
-#    → GPT 응답 이상으로 인한 "빈 raw" 상태의 원인을 로그에서 쉽게 추적 가능.
+# 1) market_features_ws.build_entry_features_ws(...) 연동
+#    - decide_entry_with_gpt_trader(...)에 market_features 파라미터 추가.
+#    - 호출측에서 피처를 이미 계산한 경우 그대로 사용하고,
+#      없으면 이 모듈에서 build_entry_features_ws(...)를 호출해 GPT에 전달.
+# 2) FeatureBuildError 처리
+#    - WS 캔들/오더북이 부족하거나 지연된 경우 GPT를 호출하지 않고
+#      final_action="SKIP", gpt_action="SKIP", gpt_status="DATA_ERROR" 로 반환.
+#    - 기존 GPT 에러 카운터/하드 스톱 로직과는 별개로 취급해,
+#      데이터가 애매한 구간에서 불필요한 HARD_STOP 이 걸리지 않도록 함.
+# 3) GPT 지연/장애 하드 스톱 로직 정리
+#    - 연속 에러 수(gpt_entry_hard_stop_min_errors 이상) 발생 시
+#      gpt_entry_hard_stop_cooldown_sec 동안 신규 진입 HARD_STOP.
+#    - HARD_STOP 윈도우 내에서는 GPT 호출과 WS 피처 계산을 모두 생략하여
+#      서버 자원을 아끼고 상태를 명확하게 유지.
 #
 # 2025-11-18 변경 사항 (GPT 프롬프트 경량화 + 토큰 가드)
 # ----------------------------------------------------
-# 1) _build_extra_for_gpt(...) 에서 extra dict 전체를 그대로 넘기지 않고,
+# 1) _sanitize_extra_for_gpt(...) 에서 extra dict 전체를 그대로 넘기지 않고,
 #    - 숫자/문자/불리언 스칼라 값만 기본 허용,
 #    - 리스트/딥한 dict 는 길이/키 개수가 작은 경우만 요약 허용,
-#    - guard_snapshot 는 기존처럼 핵심 키만 유지
-#    → GPT 프롬프트에 들어가는 JSON 크기를 줄여 응답 시간 단축.
+#    - guard_snapshot 는 핵심 키만 유지하여 프롬프트 JSON 크기를 축소.
 # 2) extra 필드에 regime/direction/recent_pnl_pct/skip_streak 를 포함하는 규칙은 유지하되
 #    heavy payload 가 들어가지 않도록 필터링 로직 추가.
-# 3) 나머지 리스크/가드 클램핑 로직은 그대로 사용하되, GPT가 리스크를 0%로 만드는
+# 3) 리스크/가드 클램핑 로직은 그대로 사용하되, GPT가 리스크를 0%로 만드는
 #    응답은 동일하게 강제 SKIP 처리.
 #
 # 2025-11-17 변경 사항 (GPT 프롬프트 컨텍스트 강화)
@@ -55,7 +51,7 @@
 #
 # 사용 대상
 # ----------------------------------------------------
-# - entry_flow_ws.py (또는 entry_flow.py)의 try_open_new_position(...) 상단에서 호출.
+# - entry_flow_ws.py 의 try_open_new_position(...) 상단에서 호출.
 #   예시 흐름:
 #       settings = load_settings()
 #       gpt_result = decide_entry_with_gpt_trader(settings, ...)
@@ -72,6 +68,7 @@ from typing import Any, Dict, Optional
 
 from settings_ws import BotSettings
 from gpt_decider import ask_entry_decision
+from market_features_ws import build_entry_features_ws, FeatureBuildError
 
 
 # ─────────────────────────────────────────
@@ -127,7 +124,7 @@ class GuardBounds:
     """GPT가 조정할 수 있는 일부 가드 값의 안전 범위.
 
     - 이 범위를 벗어나는 조정은 무시된다.
-    - 기준값은 '실제로 써 본 값' 주변으로 보수적으로 설정.
+    - 기준값은 "실제로 써 본 값" 주변으로 보수적으로 설정.
     """
 
     # 최소 진입 거래량 비율 (최근 N캔들 평균 대비)
@@ -232,7 +229,6 @@ def _apply_guard_adjustments(
 
     - guard_snapshot 은 현재 가드 설정(옵션)으로, GPT가 과하게 낮춰 버린 경우
       여기 기준으로 '조금만 완화/강화' 시킬 때 참고용이다.
-      (지금 버전에서는 범위 체크에만 사용하고, 추후 프롬프트 튜닝 시 더 활용할 수 있다.)
     """
 
     adjustments: Dict[str, float] = {}
@@ -253,10 +249,8 @@ def _apply_guard_adjustments(
             # 너무 과하게 올리면 진입 불능, 너무 낮추면 의미 없음 → 하드 범위 + 근처에서만 허용
             lo = GUARD_BOUNDS.min_entry_volume_ratio_min
             hi = GUARD_BOUNDS.min_entry_volume_ratio_max
-            if lo <= val <= hi:
-                # base 대비 ±0.2 이내에서만 허용 (과한 조정 방지)
-                if abs(val - base) <= 0.2:
-                    adjustments["min_entry_volume_ratio"] = val
+            if lo <= val <= hi and abs(val - base) <= 0.2:
+                adjustments["min_entry_volume_ratio"] = val
         except Exception:
             pass
 
@@ -267,10 +261,8 @@ def _apply_guard_adjustments(
             base = float(snap.get("max_spread_pct", settings.max_spread_pct))
             lo = GUARD_BOUNDS.max_spread_pct_min
             hi = GUARD_BOUNDS.max_spread_pct_max
-            if lo <= val <= hi:
-                # base 대비 2배 이상 풀지 않게 제한
-                if val <= base * 2.0:
-                    adjustments["max_spread_pct"] = val
+            if lo <= val <= hi and val <= base * 2.0:
+                adjustments["max_spread_pct"] = val
         except Exception:
             pass
 
@@ -281,9 +273,8 @@ def _apply_guard_adjustments(
             base = float(snap.get("max_price_jump_pct", settings.max_price_jump_pct))
             lo = GUARD_BOUNDS.max_price_jump_pct_min
             hi = GUARD_BOUNDS.max_price_jump_pct_max
-            if lo <= val <= hi:
-                if val <= base * 2.0:
-                    adjustments["max_price_jump_pct"] = val
+            if lo <= val <= hi and val <= base * 2.0:
+                adjustments["max_price_jump_pct"] = val
         except Exception:
             pass
 
@@ -296,10 +287,8 @@ def _apply_guard_adjustments(
             )
             lo = GUARD_BOUNDS.depth_imbalance_min_ratio_min
             hi = GUARD_BOUNDS.depth_imbalance_min_ratio_max
-            if lo <= val <= hi:
-                # 너무 낮추면 가드 무력화 → base의 0.5배 미만은 허용하지 않음
-                if val >= base * 0.5:
-                    adjustments["depth_imbalance_min_ratio"] = val
+            if lo <= val <= hi and val >= base * 0.5:
+                adjustments["depth_imbalance_min_ratio"] = val
         except Exception:
             pass
 
@@ -314,9 +303,8 @@ def _apply_guard_adjustments(
             )
             lo = GUARD_BOUNDS.depth_imbalance_min_notional_min
             hi = GUARD_BOUNDS.depth_imbalance_min_notional_max
-            if lo <= val <= hi:
-                if val >= base * 0.5:
-                    adjustments["depth_imbalance_min_notional"] = val
+            if lo <= val <= hi and val >= base * 0.5:
+                adjustments["depth_imbalance_min_notional"] = val
         except Exception:
             pass
 
@@ -339,6 +327,7 @@ def _sanitize_extra_for_gpt(extra: Dict[str, Any]) -> Dict[str, Any]:
     - dict 는 키 32개까지, 값이 스칼라인 것만 허용.
     - 그 외(대형 리스트, 중첩 캔들 raw 등)는 버려서 토큰 수를 줄인다.
     """
+
     sanitized: Dict[str, Any] = {}
 
     for key, value in extra.items():
@@ -363,7 +352,6 @@ def _sanitize_extra_for_gpt(extra: Dict[str, Any]) -> Dict[str, Any]:
                             small_dict[k2] = v2
                     if small_dict:
                         new_list.append(small_dict)
-                # 기타 타입은 스킵
             if new_list:
                 sanitized[key] = new_list
             continue
@@ -427,10 +415,7 @@ def _build_extra_for_gpt(
             k: guard_snapshot[k] for k in guard_keys if k in guard_snapshot
         }
         if trimmed_guard:
-            # 기존 extra 에 guard_snapshot 이 있으면 병합
-            if "guard_snapshot" in payload and isinstance(
-                payload["guard_snapshot"], dict
-            ):
+            if "guard_snapshot" in payload and isinstance(payload["guard_snapshot"], dict):
                 merged = dict(payload["guard_snapshot"])  # 얕은 복사 후 업데이트
                 merged.update(trimmed_guard)
                 payload["guard_snapshot"] = merged
@@ -454,7 +439,7 @@ def _build_extra_for_gpt(
 
 
 # ─────────────────────────────────────────
-# 메인 엔트리: 진입 + 동적 가드 조절 + 지연/장애 하드 스톱
+# 메인 엔트리: 진입 + 동적 가드 조절 + 지연/장애 하드 스톱 + WS 피처 연동
 # ─────────────────────────────────────────
 
 
@@ -462,7 +447,7 @@ def decide_entry_with_gpt_trader(
     settings: BotSettings,
     *,
     symbol: str,
-    signal_source: str,  # "TREND" / "RANGE" / "HYBRID"
+    signal_source: str,  # "TREND" / "RANGE" / "HYBRID" (또는 호출측 정의)
     direction: str,  # "LONG" / "SHORT"
     last_price: float,
     entry_score: Optional[float],
@@ -471,8 +456,9 @@ def decide_entry_with_gpt_trader(
     base_sl_pct: float,
     extra: Optional[Dict[str, Any]] = None,
     guard_snapshot: Optional[Dict[str, Any]] = None,
+    market_features: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """GPT + 하드 리스크/가드 조합으로 최종 진입 결정을 내린다.
+    """GPT + 하드 리스크/가드 + WS 피처 조합으로 최종 진입 결정을 내린다.
 
     반환 예시:
         {
@@ -487,19 +473,20 @@ def decide_entry_with_gpt_trader(
               "max_spread_pct": 0.001
           },
           "sleep_after_sec": 3.0,   # SKIP 시 다음 루프 전 대기 시간 (옵션)
-          "gpt_status": "OK" | "ERROR" | "HARD_STOP",
+          "gpt_status": "OK" | "ERROR" | "HARD_STOP" | "DATA_ERROR",
           "gpt_latency_sec": 1.234,  # 옵션 (있을 때만)
-          "hard_stop": False,        # True 이면 상위에서 [GPT_ENTRY][HARD_STOP] 메시지 등에 활용 가능
+          "hard_stop": False,
           "raw": { ... GPT full JSON ... }
         }
 
     중요한 점:
     - GPT 호출 실패 / JSON 이상 / 위험한 제안 등 모든 비정상 상황은
-      → **final_action="SKIP"** 으로 통일 (폴백 진입 금지).
+      → final_action="SKIP" 으로 통일 (폴백 진입 금지).
     - 리스크/TP/SL 은 항상 settings.gpt_max_* 으로 상한이 걸린 값만 사용.
     - extra / guard_snapshot 는 _build_extra_for_gpt(...) 에서 통합되어
       gpt_decider.ask_entry_decision 의 프롬프트에 들어간다.
-      → GPT 가 장 흐름/가드 상태를 보고 진입 강도/리스크를 조절할 수 있게 하기 위한 것.
+    - market_features 는 market_features_ws.build_entry_features_ws(...) 가 만든
+      WS 기반 피처 dict 로, GPT 가 차트/지표/오더북 상태를 한 번에 이해하기 위한 데이터.
     - GPT 진입 장애(연속 에러/타임아웃)가 일정 횟수 이상 누적되면
       → 일정 시간 동안 하드 스톱(HARD_STOP) 상태로 전환하여 신규 진입을 전부 막는다.
     """
@@ -507,15 +494,9 @@ def decide_entry_with_gpt_trader(
     global _gpt_entry_error_streak, _gpt_entry_last_error_ts, _gpt_entry_hard_stop_until_ts
 
     # 설정값 (없으면 기본값 사용)
-    hard_stop_min_errors = int(
-        getattr(settings, "gpt_entry_hard_stop_min_errors", 3)
-    )
-    hard_stop_cooldown = float(
-        getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0)
-    )
-    error_reset_window = float(
-        getattr(settings, "gpt_entry_error_reset_window_sec", 60.0)
-    )
+    hard_stop_min_errors = int(getattr(settings, "gpt_entry_hard_stop_min_errors", 3))
+    hard_stop_cooldown = float(getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0))
+    error_reset_window = float(getattr(settings, "gpt_entry_error_reset_window_sec", 60.0))
 
     now_ts = _now_ts()
 
@@ -535,7 +516,7 @@ def decide_entry_with_gpt_trader(
         "raw": {},
     }
 
-    # 0) 하드 스톱 윈도우가 아직 유효하면, GPT 호출 자체를 하지 않고 바로 SKIP
+    # 0) 하드 스톱 윈도우가 아직 유효하면, GPT/WS 피처 호출 없이 바로 SKIP
     if _gpt_entry_hard_stop_until_ts and now_ts < _gpt_entry_hard_stop_until_ts:
         remaining = max(_gpt_entry_hard_stop_until_ts - now_ts, 0.0)
         result["final_action"] = "SKIP"
@@ -543,7 +524,7 @@ def decide_entry_with_gpt_trader(
         result["gpt_status"] = "HARD_STOP"
         result["hard_stop"] = True
         result["reason"] = "GPT 진입 판단 장애(HARD_STOP) 상태로 신규 진입을 잠시 중단합니다."
-        # 남은 시간과 설정값 중 더 큰 값으로 쿨타임을 유지 (텔레그램 메시지와 정합성 용이)
+        # 남은 시간과 설정값 중 더 큰 값으로 쿨타임을 유지
         result["sleep_after_sec"] = max(remaining, hard_stop_cooldown)
         _safe_log(
             f"[GPT_TRADER] HARD_STOP window active → skip entry (remaining={remaining:.1f}s)"
@@ -556,6 +537,39 @@ def decide_entry_with_gpt_trader(
         _gpt_entry_error_streak = 0
         _gpt_entry_last_error_ts = 0.0
         _safe_log("[GPT_TRADER] HARD_STOP window ended → GPT entry gate reopened")
+
+    # 0-1) WS 기반 피처 생성/주입
+    #      - 호출측에서 market_features 를 넘겼으면 그대로 사용.
+    #      - 없으면 build_entry_features_ws(...) 로 생성.
+    try:
+        if market_features is None:
+            market_features = build_entry_features_ws(symbol)
+    except FeatureBuildError as e:
+        # WS 데이터 부족/지연 → GPT 를 부르지 않고 안전하게 SKIP
+        result["final_action"] = "SKIP"
+        result["gpt_action"] = "SKIP"
+        result["gpt_status"] = "DATA_ERROR"
+        result["reason"] = (
+            "WS 시세 피처를 만들지 못해 이번 루프는 진입 없이 건너뜁니다. "
+            f"({type(e).__name__}: {e})"
+        )
+        result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
+        _safe_log(f"[GPT_TRADER] feature build error → SKIP: {e}")
+        return result
+    except Exception as e:
+        # 예기치 못한 피처 빌드 예외는 GPT 에러 카운터에 포함하지 않고 단순 SKIP
+        result["final_action"] = "SKIP"
+        result["gpt_action"] = "ERROR"
+        result["gpt_status"] = "ERROR"
+        result["reason"] = (
+            "WS 피처 생성 중 알 수 없는 오류로 이번 루프는 진입 없이 건너뜁니다. "
+            f"({type(e).__name__}: {e})"
+        )
+        result["sleep_after_sec"] = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
+        _safe_log(
+            f"[GPT_TRADER] unexpected feature build error → SKIP: {type(e).__name__}: {e}"
+        )
+        return result
 
     # 1) GPT에 진입 의사결정 요청
     extra_for_gpt = _build_extra_for_gpt(
@@ -578,6 +592,7 @@ def decide_entry_with_gpt_trader(
             tp_pct=base_tp_pct,
             sl_pct=base_sl_pct,
             extra=extra_for_gpt,
+            market_features=market_features,
         )
         result["raw"] = gpt_json
 

@@ -1,88 +1,28 @@
 # market_data_rest.py
 # ====================================================
-# BingX REST 캔들 히스토리 조회 모듈
+# BingX REST /kline 히스토리 조회 모듈
 #
-# 2025-11-15 변경 사항 (4차: REST 응답 포맷 정규화)
+# 주요 역할
 # ----------------------------------------------------
-# 1) V3/V2 응답을 내부 공통 포맷(list[list])으로 변환하도록 변경
-#    - dict 응답(V3 등): [openTime, open, high, low, close, volume, closeTime] 형태로 매핑
-#      · openTime : t / T / time / openTime / startTime 중 하나
-#      · volume   : volume / v 중 하나
-#      · closeTime: openTime + interval_ms 로 계산
-#    - list/tuple 응답(V2 등): 기존 구조를 그대로 유지하되 list 로 캐스팅
-# 2) fetch_klines_rest(...) 는 항상 list[list] 를 반환하도록 스펙 확정
-#    - WS 백필(market_data_ws.backfill_klines_from_rest) 쪽에서 index 기반으로
-#      row[0]/row[5] 등을 사용하는 전제와 일치시키기 위함.
-# 3) 정규화 과정에서 타임스탬프를 추출하지 못한 행은 버리고, 그 개수를 로그로 남김.
+# - swap/futures 공개 /kline 엔드포인트에서 히스토리 캔들을 조회한다.
+# - run_bot_ws 시작 시 market_data_ws.backfill_klines_from_rest(...) 에 넘겨
+#   WS 버퍼를 부트스트랩하는 용도로만 사용한다.
+# - 라이브 운영 중에는 WS 데이터만 사용하고, REST 는 초기 히스토리 로딩 전용이다.
 #
-# 2025-11-15 변경 사항 (3차: dict 포맷/타임스탬프 정렬 보강)
+# 2025-11-19 변경 사항 (WS 멀티 타임프레임 정합성)
 # ----------------------------------------------------
-# 1) REST /kline 행에서 타임스탬프를 추출하는 헬퍼 추가
-#    - _extract_ts_from_rest_row(row):
-#        · list/tuple → row[0] 기반
-#        · dict → t / T / time / openTime / startTime 순으로 ts 추출
-#        · 실패 시 0 반환
-# 2) fetch_klines_rest(...) 정렬 로직 개선
-#    - rows.sort(key=_extract_ts_from_rest_row) 로 교체.
-#    - 정렬 실패 시 예외 메시지를 로그로 남기고, 기존 rows 를 그대로 사용.
-# 3) 정렬 후 첫/마지막 ts 진단 로그 추가
-#    - first_ts/last_ts 가 0 이하이면 WARN 로그로 형식 문제를 알림.
-# 4) V3/V2 응답에 대해 첫 행 샘플(dict 키/타입)을 디버깅 로그로 남겨,
-#    BingX REST 응답 포맷 변경에 빠르게 대응할 수 있도록 보강.
+# 1) interval→ms 매핑을 WebSocket 모듈과 동일한 타임프레임 세트로 확장했다.
+#    - "1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d","3d","1w","1M" 지원.
+# 2) fetch_klines_rest(...) 가 항상 "정상 히스토리 or KlineRestError" 만 반환하도록
+#    하는 기존 정책을 유지하며, 상단 주석을 실제 운영에 필요한 수준으로 압축했다.
+# 3) dict/list 응답을 공통 포맷(list[list])으로 정규화하는 2025-11-15 변경 사항은
+#    요약만 남기고 내부 구현은 그대로 유지했다.
 #
-# 2025-11-15 변경 사항 (2차: 디버그/심볼 정규화 보강)
+# 이전 변경 요약 (2025-11-15)
 # ----------------------------------------------------
-# 1) 심볼 정규화 유틸 추가
-#    - _normalize_symbol_for_rest(symbol):
-#        - "BTCUSDT" → "BTC-USDT" 로 변환 (기타 *USDT 현물/선물 심볼 동일 처리)
-#        - 이미 "BTC-USDT" 형식이면 그대로 사용.
-#    - REST 요청/로그에서 모두 정규화된 심볼을 사용하도록 변경.
-# 2) 디버그 로그 강화
-#    - V3/V2 요청 시 실제 요청 파라미터(symbol/interval/start/end/limit)를 한 번 더 로그.
-#    - code != 0 또는 HTTP 오류 시 응답 payload 앞부분을 함께 로그.
-#    - V3/V2 모두 실패 후 rows 가 비어 있을 때, startTime/endTime/raw_limit 를 포함한 요약 로그를 남김.
-#
-# 2025-11-15 변경 사항 (1차: limit 파라미터 추가)
-# ----------------------------------------------------
-# 1) V3/V2 요청에 limit 파라미터를 추가해서, REST 에서 원하는 개수만큼
-#    캔들을 받아오도록 수정.
-#    - fetch_klines_rest(limit=...) → 내부에서 raw_limit = limit + 20 으로 여유 있게 요청.
-#    - BingX 응답이 raw_limit 개 이상이면 openTime 기준 정렬 후 마지막 limit 개만 사용.
-# 2) 디버깅용으로 REST 요청 로그에 raw_limit 를 함께 출력.
-#
-# 역할
-# ----------------------------------------------------
-# - swap/futures용 REST /kline 엔드포인트를 호출해서
-#   히스토리 캔들을 받아온다.
-# - run_bot_ws.py 에서는 이 모듈의 fetch_klines_rest(...) 결과를
-#   market_data_ws.backfill_klines_from_rest(...) 에 넘겨서
-#   WS 버퍼를 시작 시점에 한 번에 채운다.
-#
-# 반환 포맷
-# ----------------------------------------------------
-# - BingX REST 응답을 내부 공통 포맷(list[list])으로 정규화하여 반환한다.
-#   예시:
-#       [
-#         [openTime, open, high, low, close, volume, closeTime],
-#         ...
-#       ]
-#   ※ openTime/closeTime 은 밀리초(ms) 기준.
-#
-# 사용 예시 (run_bot_ws 쪽):
-# ----------------------------------------------------
-#   from market_data_rest import fetch_klines_rest
-#   from market_data_ws import backfill_klines_from_rest
-#
-#   rest_5m = fetch_klines_rest("BTC-USDT", "5m", limit=120)
-#   backfill_klines_from_rest("BTC-USDT", "5m", rest_5m)
-#
-# 주의
-# ----------------------------------------------------
-# - 여기서는 *공개 마켓 데이터* 엔드포인트만 사용하므로
-#   서명/비공개 키가 필요 없다.
-# - 엔드포인트/파라미터는 BingX 공식 문서 기준으로 작성했다.
-#   에러 발생 시 telelog.log(...) 로만 남기고, 호출 측에서
-#   적절히 예외를 처리하도록 한다.
+# - V3/V2 응답 포맷을 공통 list[list] 로 정규화.
+# - 심볼 정규화(_normalize_symbol_for_rest) 및 디버그 로그 보강.
+# - limit/raw_limit 기반으로 startTime/endTime 윈도우와 개수 제어.
 # ====================================================
 
 from __future__ import annotations
@@ -105,13 +45,113 @@ except Exception:
 BINGX_API_BASE = os.getenv("BINGX_API_BASE", "https://open-api.bingx.com")
 
 
+def _extract_ts_from_rest_row(row: Any) -> int:
+    """REST /kline 응답 한 행에서 타임스탬프(openTime 계열)를 추출한다.
+
+    - list/tuple: row[0] 를 ts 로 간주
+    - dict      : t / T / time / openTime / startTime 중 하나를 ts 로 사용
+    - 실패 시 0 반환
+    """
+    try:
+        if isinstance(row, (list, tuple)) and row:
+            return int(row[0])
+        if isinstance(row, dict):
+            ts_val = (
+                row.get("t")
+                or row.get("T")
+                or row.get("time")
+                or row.get("openTime")
+                or row.get("startTime")
+                or 0
+            )
+            return int(ts_val)
+    except Exception:
+        return 0
+    return 0
+
+
+def _normalize_rows_to_common_format(
+    rows: List[Any], interval_ms: int
+) -> List[List[Any]]:
+    """REST 응답 rows(list[dict|list|tuple])를 공통 포맷 list[list] 로 정규화.
+
+    공통 포맷:
+        [openTime_ms, open, high, low, close, volume, closeTime_ms]
+    """
+    normalized: List[List[Any]] = []
+    dropped = 0
+
+    for r in rows:
+        try:
+            if isinstance(r, dict):
+                ts = _extract_ts_from_rest_row(r)
+                if ts <= 0:
+                    dropped += 1
+                    continue
+                o = float(r.get("open") or r.get("o") or 0)
+                h = float(r.get("high") or r.get("h") or 0)
+                l = float(r.get("low") or r.get("l") or 0)
+                c = float(r.get("close") or r.get("c") or 0)
+                v = float(r.get("volume") or r.get("v") or 0)
+                close_time = ts + interval_ms
+                normalized.append([ts, o, h, l, c, v, close_time])
+            elif isinstance(r, (list, tuple)):
+                if len(r) < 6:
+                    dropped += 1
+                    continue
+                # [openTime, open, high, low, close, volume, (optional closeTime ...)]
+                lst = list(r)
+                ts = int(lst[0])
+                o = float(lst[1])
+                h = float(lst[2])
+                l = float(lst[3])
+                c = float(lst[4])
+                v = float(lst[5])
+                # closeTime 이 없으면 interval 기반으로 보정
+                if len(lst) > 6:
+                    try:
+                        close_time = int(lst[6])
+                    except Exception:
+                        close_time = ts + interval_ms
+                else:
+                    close_time = ts + interval_ms
+                normalized.append([ts, o, h, l, c, v, close_time])
+            else:
+                dropped += 1
+        except Exception:
+            dropped += 1
+
+    if dropped:
+        log(
+            f"[REST-KLINES] dropped {dropped} rows during normalization "
+            f"(interval_ms={interval_ms})"
+        )
+
+    return normalized
+
+
 # interval 문자열 → 밀리초 변환
+_MINUTE_MS = 60_000
+_HOUR_MS = 60 * 60_000
+_DAY_MS = 24 * _HOUR_MS
+
 _INTERVAL_MS = {
-    "1m": 60_000,
-    "5m": 5 * 60_000,
-    "15m": 15 * 60_000,
-    "30m": 30 * 60_000,
-    "1h": 60 * 60_000,
+    "1m": _MINUTE_MS,
+    "3m": 3 * _MINUTE_MS,
+    "5m": 5 * _MINUTE_MS,
+    "15m": 15 * _MINUTE_MS,
+    "30m": 30 * _MINUTE_MS,
+    "1h": _HOUR_MS,
+    "2h": 2 * _HOUR_MS,
+    "4h": 4 * _HOUR_MS,
+    "6h": 6 * _HOUR_MS,
+    "12h": 12 * _HOUR_MS,
+    "1d": _DAY_MS,
+    "3d": 3 * _DAY_MS,
+    "1w": 7 * _DAY_MS,
+    # 월 봉은 정확한 길이가 고정되어 있지 않으므로 REST 윈도우 계산용으로만
+    # 30일 기준 근사값을 사용한다.
+    "1M": 30 * _DAY_MS,
 }
 
 
@@ -138,33 +178,6 @@ def _normalize_symbol_for_rest(symbol: str) -> str:
     return s
 
 
-def _extract_ts_from_rest_row(row: Any) -> int:
-    """REST /kline 한 행에서 타임스탬프(ms)를 추출한다.
-
-    - list/tuple: row[0] 을 int 로 해석
-    - dict: t / T / time / openTime / startTime 순으로 시도
-    - 실패 시 0 반환
-    """
-    try:
-        if isinstance(row, (list, tuple)):
-            if not row:
-                return 0
-            return int(row[0])
-        if isinstance(row, dict):
-            ts_val = (
-                row.get("t")
-                or row.get("T")
-                or row.get("time")
-                or row.get("openTime")
-                or row.get("startTime")
-                or 0
-            )
-            return int(ts_val)
-    except Exception:
-        return 0
-    return 0
-
-
 def _request_klines_v3(
     symbol: str,
     interval: str,
@@ -184,7 +197,6 @@ def _request_klines_v3(
         "interval": interval,
         "startTime": start_ms,
         "endTime": end_ms,
-        # BingX 문서 기준으로 필요 시 limit/pageSize 등으로 조정 가능
         "limit": limit,
     }
 
@@ -217,28 +229,11 @@ def _request_klines_v3(
         log(f"[REST-KLINES V3] unexpected data type: {type(rows)}")
         return None
 
-    # 샘플 행 디버깅 로그
+    # 첫 행 샘플 로그
     if rows:
         sample = rows[0]
-        try:
-            if isinstance(sample, dict):
-                log(
-                    "[REST-KLINES V3] sample row(dict) keys="
-                    f"{list(sample.keys())}"
-                )
-            else:
-                log(
-                    f"[REST-KLINES V3] sample row type={type(sample)} "
-                    f"value={str(sample)[:200]}"
-                )
-        except Exception:
-            pass
+        log(f"[REST-KLINES V3] first row sample: {str(sample)[:200]}")
 
-    if not rows:
-        log(
-            f"[REST-KLINES V3] empty data: symbol={norm_symbol}, interval={interval}, "
-            f"start={start_ms}, end={end_ms}, limit={limit}"
-        )
     return rows
 
 
@@ -249,7 +244,7 @@ def _request_klines_v2(
     end_ms: int,
     limit: int,
 ) -> Optional[List[Any]]:
-    """swap V2 market kline 시도 (폴백용)
+    """swap V2 market kline 시도
 
     - 문서: /openApi/swap/v2/market/kline 혹은 유사 경로
     - 일부 환경에서 V3 엔드포인트가 동작하지 않을 경우를 대비.
@@ -297,74 +292,12 @@ def _request_klines_v2(
         log(f"[REST-KLINES V2] unexpected data type: {type(rows)}")
         return None
 
-    # 샘플 행 디버깅 로그
+    # 첫 행 샘플 로그
     if rows:
         sample = rows[0]
-        try:
-            if isinstance(sample, dict):
-                log(
-                    "[REST-KLINES V2] sample row(dict) keys="
-                    f"{list(sample.keys())}"
-                )
-            else:
-                log(
-                    f"[REST-KLINES V2] sample row type={type(sample)} "
-                    f"value={str(sample)[:200]}"
-                )
-        except Exception:
-            pass
+        log(f"[REST-KLINES V2] first row sample: {str(sample)[:200]}")
 
-    if not rows:
-        log(
-            f"[REST-KLINES V2] empty data: symbol={norm_symbol}, interval={interval}, "
-            f"start={start_ms}, end={end_ms}, limit={limit}"
-        )
     return rows
-
-
-def _normalize_rows_to_common_format(
-    rows: List[Any], interval_ms: int
-) -> List[List[Any]]:
-    """REST 응답 rows(list[dict|list|tuple])를 공통 포맷 list[list] 로 정규화.
-
-    공통 포맷:
-        [openTime_ms, open, high, low, close, volume, closeTime_ms]
-    """
-    normalized: List[List[Any]] = []
-    dropped = 0
-
-    for r in rows:
-        try:
-            if isinstance(r, dict):
-                ts = _extract_ts_from_rest_row(r)
-                if ts <= 0:
-                    dropped += 1
-                    continue
-                open_ = r.get("open") or r.get("o")
-                high = r.get("high") or r.get("h")
-                low = r.get("low") or r.get("l")
-                close = r.get("close") or r.get("c")
-                volume = r.get("volume") or r.get("v")
-                close_ts = ts + interval_ms
-                normalized.append([ts, open_, high, low, close, volume, close_ts])
-            elif isinstance(r, (list, tuple)):
-                if not r:
-                    dropped += 1
-                    continue
-                # 그대로 list 로 캐스팅해서 사용 (기존 V2 포맷 호환)
-                normalized.append(list(r))
-            else:
-                dropped += 1
-        except Exception:
-            dropped += 1
-
-    if dropped > 0:
-        log(
-            f"[REST-KLINES] normalized rows={len(normalized)}, dropped={dropped} "
-            f"(unsupported/invalid format)"
-        )
-
-    return normalized
 
 
 def fetch_klines_rest(
@@ -377,7 +310,7 @@ def fetch_klines_rest(
     매개변수
     ------------------------------------------------
     - symbol  : "BTC-USDT" 같은 심볼 (WS와 동일 포맷)
-    - interval: "1m", "5m", "15m" 등
+    - interval: BingX 지원 K라인 interval (예: "1m", "5m", "1h", "1d" 등)
     - limit   : 원하는 최대 캔들 수 (기본 120)
 
     반환값 예시
@@ -418,9 +351,9 @@ def fetch_klines_rest(
     try:
         rows = _request_klines_v3(norm_symbol, interval, start_ms, end_ms, raw_limit)
     except Exception as e:
-        log(f"[REST-KLINES] V3 request error: {e}")
+        log(f"[REST-KLINES] V3 request error (ignore and fallback to V2): {e}")
 
-    # 2) V3 가 실패했거나 빈 결과 → V2 폴백
+    # 2) V3 가 실패했거나 빈 결과면 V2 시도
     if not rows:
         try:
             rows = _request_klines_v2(norm_symbol, interval, start_ms, end_ms, raw_limit)
@@ -429,9 +362,8 @@ def fetch_klines_rest(
 
     if not rows:
         log(
-            "[REST-KLINES] no rows from REST after V3/V2: "
-            f"symbol={norm_symbol}, interval={interval}, start={start_ms}, "
-            f"end={end_ms}, raw_limit={raw_limit}"
+            "[REST-KLINES] both V3/V2 returned no rows: "
+            f"symbol={norm_symbol}, interval={interval}, start={start_ms}, end={end_ms}, raw_limit={raw_limit}"
         )
         raise KlineRestError(
             f"REST kline 조회 실패: symbol={norm_symbol}, interval={interval}"
@@ -464,7 +396,12 @@ def fetch_klines_rest(
                 "[REST-KLINES] WARN: unable to extract valid ts from normalized rows "
                 f"(first_ts={first_ts}, last_ts={last_ts})"
             )
+        else:
+            log(
+                f"[REST-KLINES] normalized ts range: first_ts={first_ts}, last_ts={last_ts}"
+            )
 
+    # 5) limit 개수만큼만 뒤에서 자르기
     if len(rows_normalized) > limit:
         rows_normalized = rows_normalized[-limit:]
 

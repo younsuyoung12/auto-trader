@@ -1,58 +1,43 @@
-# gpt_decider.py
-# ====================================================
-# 역할
-# ----------------------------------------------------
-# - BingX Auto Trader에서 진입/청산/전략 중재 의사결정을 GPT-5.1에 위임하는 어댑터.
-# - entry_flow.py, signal_flow_ws.py, position_watch_ws.py 등에서 이 모듈만 import 해서 사용.
-#
-# 2025-11-17 변경 사항 (타입힌트 정리 + GPT 응답 파싱 보강 + Pylance 문법 오류 대응 + 구버전 openai 호환 + 로깅 강화 + gpt_trader 연동)
-# ----------------------------------------------------
-# 1) Pylance reportInvalidTypeForm 대응
-#    - Dict[str, Any] | None → Optional[Dict[str, Any]] 로 전부 변경.
-#    - 그 외 Union 연산자(|) 사용을 모두 typing.Optional/typing.Union 기반으로 정리.
-# 2) GPT 응답 텍스트 추출 안정화
-#    - _extract_text_from_response(resp: Any) 헬퍼 추가.
-#    - resp.output_text, resp.output[0].content[0].text / .text.value 등을 순서대로 시도.
-#    - 어떤 포맷이 와도 최대한 JSON 문자열을 뽑아내고, 실패 시 str(resp) 로 폴백.
-# 3) OpenAI 클라이언트 생성시 OPENAI_API_BASE 지원
-#    - OPENAI_API_BASE 가 설정되어 있으면 base_url 로 사용.
-# 4) GPT 오류 시 텔레그램 알림 문구 한글로 직관적으로 정리
-#    - 진입/청산 판단 실패 시: "기존 규칙으로만 판단" / "포지션 정리/유지" 식으로 안내.
-# 5) Pylance가 한글 docstring 을 코드로 잘못 인식하는 문제 해결
-#    - _extract_text_from_response 의 한글 설명을 주석(#) 기반으로 변경.
-# 6) openai-python 구버전 호환
-#    - Responses.create(...) 가 response_format 인자를 지원하지 않는 경우, TypeError 를 캐치하여
-#      response_format 없이 재호출하는 폴백 로직 추가.
-# 7) GPT 호출 로깅 강화
-#    - _safe_log(...) 헬퍼를 추가하여 GPT 진입/청산/중재 호출 및 결과를 Render 로그에서 확인 가능.
-# 8) gpt_trader.py 연동용 프롬프트 확장
-#    - ask_entry_decision 프롬프트에 guard_adjustments 선택 필드를 정의.
-#    - extra.guard_snapshot (현재 가드 스냅샷)을 그대로 JSON 으로 보여주어 GPT가
-#      min_entry_volume_ratio, max_spread_pct, max_price_jump_pct 등의 기준값을 참고해
-#      "너무 강해서 항상 SKIP" 상황을 부드럽게 조정할 수 있게 함.
-#
-# 2025-11-18 변경 사항 (진입 프롬프트/토큰 경량화 + 지연 시간 가드 통합)
-# ----------------------------------------------------
-# 9) ask_entry_decision 경로를 완전히 재구성하여:
-#    - SYSTEM 프롬프트는 고정된 짧은 설명만 사용하고,
-#    - USER 메시지는 compact JSON(payload) 하나만 전달하도록 변경.
-# 10) gpt_trader.py 에서 이미 경량화한 extra 를 그대로 받아서 JSON payload 로만 넘기므로,
-#     raw 캔들/시세 리스트가 그대로 프롬프트에 섞이지 않게 함.
-# 11) OPENAI_TRADER_MODEL / OPENAI_TRADER_MAX_TOKENS / OPENAI_TRADER_MAX_LATENCY 환경변수로
-#     모델명, 출력 토큰 수, 허용 지연시간을 조정 가능하게 함.
-# 12) ask_entry_decision 응답에 _meta.latency_sec 를 추가해서 왕복 지연시간을 텔레그램/로그에서
-#     확인할 수 있게 함.
-# 13) _call_gpt_json 의 timeout_sec 가 None 이면 OPENAI_TRADER_MAX_LATENCY 를 기본값으로 사용하여
-#     EXIT/ARB 경로도 동일한 지연시간 설정을 공유하도록 정리.
-#
-# 2025-11-19 변경 사항 (GPT 진입 지연 CSV 로깅)
-# ----------------------------------------------------
-# 14) ask_entry_decision 경로에서 GPT 왕복 지연 시간을
-#     logs/gpt_latency/gpt_latency-YYYY-MM-DD.csv 로 CSV 기록하는 헬퍼(_log_gpt_latency_csv) 추가.
-# 15) OPENAI_TRADER_SOFT_LATENCY 환경변수로 "소프트 타임아웃" 기준을 분리해,
-#     CSV에 is_slow 플래그로 함께 남기도록 정리.
-
 from __future__ import annotations
+
+"""
+gpt_decider.py
+====================================================
+역할
+----------------------------------------------------
+- BingX Auto Trader에서 진입/청산 의사결정을 GPT-5.1에 위임하는 어댑터(브레인 모듈).
+- 엔트리 루프 / 포지션 감시 루프에서 이 모듈만 import 해서 사용한다.
+
+2025-11-19 변경 사항 (TREND/RANGE/ARB 제거 + 브레인 단순화)
+----------------------------------------------------
+1) TREND/RANGE 전략 중재용 ask_signal_arbitration(...) 및 관련 설명/레거시 제거.
+   - 박스장/추세장 구분 대신, 하나의 "시장 상태(market features)"만 GPT에 전달하는 구조로 단순화.
+2) 모듈 역할을 "진입/청산 의사결정 전용 브레인"으로 명확히 재정의.
+3) SYSTEM 프롬프트와 주석에서 TREND/RANGE/HYBRID 등의 전략 구분 용어 삭제.
+   - regime 필드는 단순 태그(예: "MARKET") 정도로만 사용 가능하도록 설명 정리.
+4) __all__ 정리: 공개 API를 ask_entry_decision(_safe), ask_exit_decision(_safe) 네 개로 한정.
+
+2025-11-18 변경 사항 (진입 프롬프트/토큰 경량화 + 지연 시간 가드 통합)
+----------------------------------------------------
+1) ask_entry_decision 경로를 완전히 재구성:
+   - SYSTEM 프롬프트는 고정된 짧은 설명만 사용.
+   - USER 메시지는 compact JSON(payload) 하나만 전달.
+2) gpt_trader.py 에서 경량화한 extra 를 그대로 받아서 JSON payload 로만 넘기므로,
+   raw 캔들/시세 리스트가 그대로 프롬프트에 섞이지 않게 함.
+3) OPENAI_TRADER_MODEL / OPENAI_TRADER_MAX_TOKENS / OPENAI_TRADER_MAX_LATENCY 환경변수로
+   모델명, 출력 토큰 수, 허용 지연시간을 조정 가능하게 함.
+4) ask_entry_decision 응답에 _meta.latency_sec 를 추가해서 왕복 지연시간을 로그/CSV에서
+   확인할 수 있게 함.
+5) _call_gpt_json 의 timeout_sec 가 None 이면 OPENAI_TRADER_MAX_LATENCY 를 기본값으로 사용하여
+   EXIT 경로도 동일한 지연시간 설정을 공유하도록 정리.
+
+2025-11-19 변경 사항 (GPT 진입 지연 CSV 로깅)
+----------------------------------------------------
+1) ask_entry_decision 경로에서 GPT 왕복 지연 시간을
+   logs/gpt_latency/gpt_latency-YYYY-MM-DD.csv 로 CSV 기록하는 헬퍼(_log_gpt_latency_csv) 추가.
+2) OPENAI_TRADER_SOFT_LATENCY 환경변수로 "소프트 타임아웃" 기준을 분리해,
+   CSV에 is_slow 플래그로 함께 남기도록 정리.
+"""
 
 import csv
 import datetime
@@ -74,7 +59,6 @@ _client: Optional[OpenAI] = None
 
 def _safe_log(msg: str) -> None:
     """telelog.log 를 사용할 수 있으면 사용하고, 실패해도 조용히 무시한다."""
-
     try:
         # 지연 import 로 순환 의존 방지
         from telelog import log
@@ -94,7 +78,7 @@ _gpt_latency_lock: Lock = Lock()
 
 def _log_gpt_latency_csv(
     *,
-    kind: str,  # "ENTRY" / "EXIT" / "ARB" 등
+    kind: str,  # "ENTRY" / "EXIT" 등
     model: str,
     symbol: Optional[str],
     source: Optional[str],
@@ -114,7 +98,6 @@ def _log_gpt_latency_csv(
 
     - 기록 실패 시 트레이딩 로직에는 영향을 주지 않는다.
     """
-
     try:
         base_dir = os.path.join("logs", "gpt_latency")
         os.makedirs(base_dir, exist_ok=True)
@@ -190,7 +173,7 @@ _SYSTEM_PROMPT_ENTRY = """
 당신은 비트코인 선물 자동매매 시스템의 '진입 허용 여부'만 판단하는 작은 에이전트입니다.
 
 입력으로 하나의 JSON 객체를 받습니다. 이 JSON 에는 대략 다음 정보가 들어 있습니다:
-- symbol, regime(TREND/RANGE/HYBRID), direction(LONG/SHORT)
+- symbol, regime(예: "MARKET" 등 단순 태그), direction(LONG/SHORT)
 - last_price, entry_score, effective_risk_pct, leverage
 - base_tp_pct, base_sl_pct
 - guard_snapshot, recent_pnl_pct, skip_streak
@@ -226,13 +209,12 @@ _SYSTEM_PROMPT_ENTRY = """
 
 
 # ─────────────────────────────────────────
-# 공통 GPT 호출 헬퍼
+# 공통 GPT 클라이언트/호출 헬퍼
 # ─────────────────────────────────────────
 
 
 def _get_client() -> OpenAI:
     """전역 OpenAI 클라이언트 인스턴스 생성/재사용."""
-
     global _client
     if _client is None:
         api_key = os.getenv("OPENAI_API_KEY")
@@ -249,7 +231,6 @@ def _get_client() -> OpenAI:
 
 def _extract_text_from_response(resp: Any) -> str:
     """OpenAI Responses API 응답 객체에서 텍스트를 최대한 안정적으로 추출."""
-
     # 1) output_text 필드가 있으면 우선 사용
     text_attr = getattr(resp, "output_text", None)
     if isinstance(text_attr, str) and text_attr.strip():
@@ -264,17 +245,14 @@ def _extract_text_from_response(resp: Any) -> str:
             if content:
                 first = content[0]
 
-                # 새 포맷: first.text.value
                 txt_obj = getattr(first, "text", None)
                 if isinstance(txt_obj, str):
-                    # 구 포맷: text 가 바로 문자열
                     return txt_obj
                 if txt_obj is not None:
                     val = getattr(txt_obj, "value", None)
                     if isinstance(val, str):
                         return val
 
-                # 혹시 text 필드가 바로 문자열인 구버전 포맷
                 direct = getattr(first, "text", None)
                 if isinstance(direct, str):
                     return direct
@@ -296,10 +274,8 @@ def _call_gpt_json(
     """GPT-5.1 을 호출해서 **반드시 JSON**만 받는 헬퍼.
 
     - 실패/타임아웃/JSON 파싱 에러 시 예외를 던진다.
-      → safe 래퍼 층에서 잡고 폴백 처리.
     - purpose 는 호출 용도 구분용 태그(현재는 로깅·라우팅용 확장 포인트).
     """
-
     client = _get_client()
 
     if timeout_sec is None:
@@ -374,13 +350,11 @@ def _build_entry_payload(
     - extra(dict)는 gpt_trader 에서 이미 경량화가 끝난 상태라고 가정.
     - 여기서는 핵심 메타 필드만 얹어서 하나의 JSON 으로 합친다.
     """
-
     payload: Dict[str, Any] = {}
 
     if isinstance(extra, Dict) and extra:
         payload.update(extra)
 
-    # 기본 메타 정보는 필요 시만 추가 (중복 키 방지)
     payload.setdefault("symbol", symbol)
     payload.setdefault("regime", signal_source.upper())
     payload.setdefault("direction", chosen_signal.upper())
@@ -391,7 +365,6 @@ def _build_entry_payload(
     payload.setdefault("base_sl_pct", float(sl_pct))
 
     if entry_score is not None:
-        # score 가 너무 길게 나오지 않도록 float 로만 전달
         payload.setdefault("entry_score", float(entry_score))
 
     return payload
@@ -400,7 +373,7 @@ def _build_entry_payload(
 def ask_entry_decision(
     *,
     symbol: str,
-    signal_source: str,  # "TREND" / "RANGE" / "HYBRID"
+    signal_source: str,  # 예: "MARKET"
     chosen_signal: str,  # "LONG" / "SHORT"
     last_price: float,
     entry_score: Optional[float],
@@ -432,7 +405,6 @@ def ask_entry_decision(
     예외:
     - OpenAI API 오류 / 네트워크 오류 / JSON 파싱 오류 / 응답 지연 초과 시 RuntimeError 발생.
     """
-
     client = _get_client()
 
     model = (
@@ -449,7 +421,6 @@ def ask_entry_decision(
     except Exception:
         max_latency = 8.0
     try:
-        # soft latency 기준이 별도로 없으면 hard 기준과 동일하게 사용
         soft_latency = float(os.getenv("OPENAI_TRADER_SOFT_LATENCY", str(max_latency)))
     except Exception:
         soft_latency = max_latency
@@ -487,7 +458,6 @@ def ask_entry_decision(
         )
         elapsed = time.perf_counter() - t0
     except Exception as e:
-        # 호출 자체 실패도 CSV 로 남김
         elapsed = time.perf_counter() - t0
         try:
             _log_gpt_latency_csv(
@@ -607,7 +577,6 @@ def ask_entry_decision_safe(
       → 기존 Python 로직만 사용하도록 한다.
     - 정상 응답이면 (action, result_json) 반환.
     """
-
     try:
         data = ask_entry_decision(
             symbol=symbol,
@@ -667,7 +636,7 @@ def _make_exit_prompt(payload: Dict[str, Any]) -> str:
     payload 예시:
     {
       "symbol": "BTC-USDT",
-      "regime": "TREND" 또는 "RANGE",
+      "regime": "MARKET" 등 단순 태그,
       "side": "BUY"/"SELL"/"LONG"/"SHORT",
       "scenario": "RANGE_EARLY_TP" 등,
       "last_price": 95000.0,
@@ -677,7 +646,6 @@ def _make_exit_prompt(payload: Dict[str, Any]) -> str:
       "extra": { ... }  # 캔들 스냅샷, 임계값, 볼륨 정보 등
     }
     """
-
     return (
         "당신은 BTC-USDT 선물 자동매매 봇의 '포지션 종료 리스크 컨트롤러'입니다.\n"
         "아래 JSON 상태를 보고, 지금 포지션을 청산할지(HARD CLOSE) 보유할지(HOLD) 결정하세요.\n\n"
@@ -685,7 +653,7 @@ def _make_exit_prompt(payload: Dict[str, Any]) -> str:
         "1) 반드시 JSON 하나만 출력합니다.\n"
         "2) 필드:\n"
         "   - action: 'CLOSE' 또는 'HOLD' 혹은 'KEEP' 중 하나만 사용.\n"
-        "   - reason: 한국어 한 줄 요약 (예: '박스 조기익절, 목표 수익 도달').\n"
+        "   - reason: 한국어 한 줄 요약 (예: '조기익절, 목표 수익 도달').\n"
         "   - comment: 사람이 읽을 수 있는 짧은 설명.\n"
         "3) 손익이 크지 않거나 잡음 수준이면 HOLD 를 우선 고려합니다.\n"
         "4) 손실 확대 가능성이 크거나, 전략 규칙상 포지션 유지 의미가 약해 보이면 과감하게 "
@@ -716,12 +684,11 @@ def ask_exit_decision(
 ) -> Dict[str, Any]:
     """GPT-5.1 에게 '이 포지션을 지금 청산할지 말지'를 묻는다.
 
-    - regime/source: 전략 종류 (TREND/RANGE/HYBRID 등). 둘 중 하나만 넘겨도 됨.
+    - regime/source: 전략 종류 태그. 둘 중 하나만 넘겨도 됨.
     - side:   포지션 방향
     - scenario: 호출 위치/의도 구분용 태그 (ex: "RANGE_EARLY_TP")
     - extra:  캔들/거래량/임계값/시그널 등 추가 컨텍스트
     """
-
     model = os.getenv("GPT_EXIT_MODEL", "gpt-5.1")
 
     # side 정규화
@@ -788,7 +755,6 @@ def ask_exit_decision_safe(
       * fallback_action 기본값은 "CLOSE" 이지만, 호출측에서 "HOLD" 로 바꿀 수 있다.
     - regime/source 두 인자 중 하나만 넘겨도 된다.
     """
-
     # fallback_action 정규화
     fa = str(fallback_action).upper()
     if fa not in {"CLOSE", "HOLD"}:
@@ -842,140 +808,9 @@ def ask_exit_decision_safe(
         return fa, {"error": str(e), "fallback_action": fa}
 
 
-# ─────────────────────────────────────────
-# 3) TREND/RANGE 전략 중재 의사결정 (보조 레이어)
-# ─────────────────────────────────────────
-
-
-def ask_signal_arbitration(
-    *,
-    symbol: str,
-    last_price: float,
-    trend_candidate: Optional[Dict[str, Any]],
-    range_candidate: Optional[Dict[str, Any]],
-    model: Optional[str] = None,
-) -> Dict[str, Any]:
-    """TREND/RANGE 후보 둘 다 애매해서 _arbitrate(...) 결과가 None 인 경우,
-    GPT-5에게 한 번 더 물어보는 보조 중재기.
-
-    입력:
-        - symbol: 예) "BTC-USDT"
-        - last_price: 현재가
-        - trend_candidate: {"kind","side","score","tp_pct","sl_pct","reasons","block_reason"} 또는 None
-        - range_candidate: 동일 구조 또는 None
-
-    반환:
-        {
-          "action": "ENTER_TREND" | "ENTER_RANGE" | "SKIP",
-          "reason": "자연어 설명",
-          "raw":   GPT 전체 응답(JSON Object)
-        }
-
-    ⚠ 실패 / 이상 응답 시 ValueError 를 발생시킨다.
-      호출부(signal_flow_ws.get_trading_signal)에서 잡아서 no-entry 처리한다.
-    """
-
-    from telelog import log  # 로깅만 사용 (순환 import 방지용 지연 import)
-
-    if trend_candidate is None and range_candidate is None:
-        raise ValueError("ask_signal_arbitration: no candidates")
-
-    use_model = model or os.getenv("GPT_ENTRY_MODEL", "gpt-5.1")
-
-    # 프롬프트에 넣을 간단한 구조만 남긴다(안전/길이 제한용).
-    def _trim_cand(c: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        if not c:
-            return {}
-        return {
-            "kind": c.get("kind"),
-            "side": c.get("side"),
-            "score": c.get("score"),
-            "tp_pct": c.get("tp_pct"),
-            "sl_pct": c.get("sl_pct"),
-            "block_reason": c.get("block_reason"),
-            "reasons": c.get("reasons"),
-        }
-
-    trend_json = _trim_cand(trend_candidate)
-    range_json = _trim_cand(range_candidate)
-
-    payload = {
-        "symbol": symbol,
-        "last_price": float(last_price),
-        "trend_candidate": trend_json or None,
-        "range_candidate": range_json or None,
-    }
-    payload_str = json.dumps(payload, ensure_ascii=False)
-
-    prompt = f"""
-당신은 BTC-USDT 선물 자동매매 봇의 전략 중재 컨트롤러입니다.
-현재 루프에서 TREND / RANGE 전략 후보가 동시에 존재하지만,
-내장 중재 규칙으로는 어느 한쪽도 명확히 선택하지 못한 상태입니다.
-
-입력 JSON:
-{payload_str}
-
-각 후보 필드 의미:
-- kind: "TREND" 또는 "RANGE"
-- side: "BUY" / "SELL" (진입 방향)
-- score: 전략별 내부 점수 (값이 클수록 해당 전략이 유리)
-- tp_pct / sl_pct: 해당 전략이 제안하는 TP / SL 비율 (예: 0.006 → +0.6%)
-- block_reason:
-    - RANGE 에서 soft_... 로 시작하면 "조건이 나쁘긴 한데 완전 차단은 아님" 의미
-- reasons: 사람이 디버깅할 때 보는 간단한 설명 리스트
-
-판단 규칙(요약):
-1) 두 후보 모두 위험해 보이거나 정보가 부족하면 "SKIP" 을 선택합니다.
-2) 한쪽만 존재하면 그 후보를 기준으로 ENTER 여부를 검토합니다.
-3) 양쪽 모두 존재하면:
-   - 리스크가 과도해 보이는 쪽은 피합니다.
-   - score / TP·SL / block_reason / reasons 를 종합해서
-     "조금이라도 더 합리적인" 쪽을 선택합니다.
-4) 불확실할 때는 보수적으로 "SKIP" 을 선택합니다.
-
-반드시 아래 JSON 하나만 출력하라:
-
-{{
-  "action": "ENTER_TREND" 또는 "ENTER_RANGE" 또는 "SKIP",
-  "reason": "사람이 이해하기 쉬운 한국어 한 줄 설명"
-}}
-""".strip()
-
-    resp_json = _call_gpt_json(
-        model=use_model,
-        prompt=prompt,
-        purpose="signal_arbitration",
-    )
-
-    action_raw = resp_json.get("action", "")
-    action = str(action_raw).upper().strip()
-
-    if action not in {"ENTER_TREND", "ENTER_RANGE", "SKIP"}:
-        log(f"[GPT_ARB] invalid action from GPT: {action_raw!r}")
-        raise ValueError(f"invalid action from GPT arbitration: {action_raw!r}")
-
-    result: Dict[str, Any] = {
-        "action": action,
-        "reason": resp_json.get("reason"),
-        "raw": resp_json,
-    }
-
-    # Render 로그에 요약 남김
-    try:
-        _safe_log(
-            f"[GPT_ARB] action={action} symbol={symbol} "
-            f"last_price={last_price} reason={resp_json.get('reason')}"
-        )
-    except Exception:
-        pass
-
-    return result
-
-
 __all__ = [
     "ask_entry_decision",
     "ask_entry_decision_safe",
     "ask_exit_decision",
     "ask_exit_decision_safe",
-    "ask_signal_arbitration",
 ]

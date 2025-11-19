@@ -1,96 +1,34 @@
 """
 market_data_ws.py
 =====================================================
-BingX swap-market 웹소켓으로 1m/5m/15m 캔들과 depth5를 받아서
-메모리 버퍼에 보관하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
-getter 로 제공하는 모듈.
+BingX swap-market WebSocket으로 멀티 타임프레임 K라인과 depth5 오더북을 받아
+메모리 버퍼에 저장하고, 상위 모듈(run_bot_ws, entry_guards_ws 등)에
+getter / 데이터 헬스 체크 유틸을 제공하는 모듈.
 
-PATCH NOTES — 2025-11-17 (5m/15m 딜레이 디버그 & 폴백 금지 보강)
+주요 역할
 ----------------------------------------------------
-1) kline 수신 시 교환소 ts 가 0 또는 누락된 레코드는 버퍼에 넣지 않고
-   [MD-WS WARN] 로그만 남기도록 수정했다.
-2) 심볼/주기별 마지막 수신 시각(_kline_last_recv_ts)을 별도 보관한다.
-   - get_last_kline_delay_ms(...) 로 "로컬 수신 기준 딜레이(ms)"를
-     상위 모듈에서 바로 확인할 수 있다.
-   - get_kline_buffer_status(...) 로 버퍼 길이/마지막 ts/딜레이를
-     한 번에 조회할 수 있다.
-3) REST 백필(preload_klines/backfill_klines_from_rest) 시에도
-   최근 수신 시각을 갱신해 WS/REST 모두에 대해 딜레이 체크가
-   일관되게 동작하도록 정리했다.
-4) 이 모듈은 BingX WS/REST 원본만 사용하며, 캔들을 인위적으로
-   생성/보정하는 폴백 로직은 두지 않는다.
+- 설정된 타임프레임의 K라인 스트림 구독 및 버퍼링
+  · 기본값: ["1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d","3d","1w","1M"]
+- 심볼별 depth5 오더북(bids/asks, bestBid/bestAsk, spreadPct) 버퍼링
+- REST 히스토리 백필(preload_klines/backfill_klines_from_rest) 지원
+  · run_bot_ws 부트스트랩(시작 시 초기 히스토리 채우기)에서만 사용
+  · 라이브 운영 중에는 WS 데이터만 사용(인위적인 캔들 생성/보정 없음)
+- 버퍼 길이/지연/오더북 최신 여부 기반 데이터 헬스 스냅샷
+  · get_health_snapshot(symbol), is_data_healthy(symbol)
 
-PATCH NOTES — 2025-11-15 (4차: REST dict 포맷 백필 호환)
+2025-11-19 변경 사항 (데이터 헬스 & 멀티 TF 설명 정리)
 ----------------------------------------------------
-1) REST /kline 응답 포맷 보강
-   - BingX REST /kline 이 list[list] 뿐만 아니라 list[dict]
-     (예: {"t","o","h","l","c","v"} 또는 {"T","open",...}) 형태로도
-     내려오는 것이 확인됨.
-   - backfill_klines_from_rest(...) 가 두 포맷을 모두 파싱하도록 수정.
-   - dict/배열 행이 섞여 있어도 파싱 가능한 행만 골라 (ts, o, h, l, c, v)
-     튜플로 변환해서 버퍼에 적재.
-   - 일부 행 파싱에 실패해도 전체를 버리지 않고, 성공한 행들로만
-     백필을 수행하도록 유지.
-
-PATCH NOTES — 2025-11-15 (3차: REST 히스토리 백필 지원)
-----------------------------------------------------
-1) REST 캔들 히스토리 백필용 헬퍼 추가
-   - preload_klines(...): 외부에서 계산/가공된 (ts, o, h, l, c, v) 튜플 리스트를
-     그대로 내부 버퍼(_kline_buffers)에 밀어넣어 초기화.
-   - backfill_klines_from_rest(...): BingX REST /kline 응답(list[list] 또는 list[dict])을
-     받아 (ts, o, h, l, c, v) 튜플 리스트로 변환한 뒤 preload_klines(...) 를 호출.
-   - 둘 다 MAX_KLINES 를 넘으면 최근 MAX_KLINES 개만 보관.
-   - 백필 시 "[MD-WS BACKFILL] ..." 로그로 실제 채워진 개수와 심볼/타임프레임을 남김.
-   - run_bot_ws 쪽에서 fetch_klines_rest(...) 결과를 받아서 이 헬퍼들을 사용하면,
-     WS 연결 직후에도 5m/15m 지표 계산에 필요한 히스토리 캔들이 바로 준비된다.
-
-PATCH NOTES — 2025-11-15 (2차 보정)
-----------------------------------------------------
-1) BingX WebSocket kline payload 형식 보정
-   - 실제 수신 형식이 data: { ... } 가 아니라 data: [ { ... } ] (list 안에 dict) 인 것이 확인됨.
-   - kline 처리부에서 payload 가 dict 인 경우뿐 아니라 list 인 경우도 지원하도록 수정.
-   - list 인 경우, 내부의 dict 들을 하나씩 _push_kline(...) 에 전달하여 버퍼에 저장.
-   - dict/list 가 아닌 예외적인 형식은 WARN 로그로 남기고 무시.
-
-2) kline 관련 진단 로그 강화
-   - payload 가 dict 가 아닌 경우, type 과 payload 일부를 함께 경고 로그로 남기도록 정리.
-   - 정상 저장 시에도 ws_log_enabled 옵션이 켜져 있으면
-     "[MD-WS] BTC-USDT 5m kline updated (added=..., buf_len=...)" 형식으로 버퍼 길이를 함께 기록.
-   - get_klines_with_volume(...) 에서 버퍼가 비어 있는 경우
-     "[MD-WS KLINES] no kline buffer (with volume) ..." 로그를 남기도록 유지.
-
-2025-11-15 1차 변경 / 디버그 옵션 추가
-----------------------------------------------------
-1) BingX 에서 들어오는 WebSocket 프레임/캔들/호가 원본을 Render 로그에서 확인할 수 있도록
-   디버그 로그 옵션을 추가했다.
-   - settings_ws.ws_log_raw_enabled = True  이면 디코딩된 WS 프레임 전체를
-     "[MD-WS RAW] ..." 형식으로 로그에 남긴다.
-   - settings_ws.ws_log_payload_enabled = True 이면 개별 kline/depth payload 를
-     "[MD-WS PAYLOAD] ..." 형식으로 로그에 남긴다.
-   - 로그 폭주 방지를 위해 한 프레임/페이로드당 최대 2000자까지만 출력한 뒤
-     잘라내고 '(truncated, total_len=...)' 표시를 붙인다.
-
-2025-11-14 변경 / 중요사항
-----------------------------------------------------
-1) 메시지 디코더 안전화
-   - gzip 여부와 무관하게 bytes/str 모두 처리.
-   - 비압축 JSON 텍스트/바이너리 혼용 수신도 파싱.
-2) Ping 포맷 다양성 대응
-   - "Ping"(문자열), {"ping": ts}, {"op":"ping"}, {"event":"ping"} 모두에 대해
-     "Pong" 문자열로 응답해 세션 유지.
-3) 버퍼 동시성 안전화
-   - 캔들/오더북 버퍼 접근에 Lock 적용(쓰기/읽기 경쟁 방지).
-4) depth 원본 timestamp 보존
-   - payload 내 time/T/E(있을 경우)를 exchTs 로 저장.
-5) 구독 타임프레임 설정
-   - settings.ws_subscribe_tfs 를 우선 사용, 미지정 시 ["1m","5m","15m"] 기본값.
-
-기본 설명
-----------------------------------------------------
-- URL: wss://open-api-swap.bingx.com/swap-market
-- 구독: {"id": "...", "reqType": "sub", "dataType": "BTC-USDT@kline_1m"}
-- 메시지는 gzip 으로 올 수 있다 → 반드시 풀어야 한다
-- Ping 이 오면 Pong 으로 응답해야 연결이 유지된다
+1) 필수 타임프레임/버퍼 길이/최대 지연 설정을 기반으로
+   get_health_snapshot / is_data_healthy 헬퍼를 추가했다.
+   - settings_ws.ws_required_tfs: 필수 타임프레임 목록
+     (미지정 시 ws_subscribe_tfs 또는 기본 타임프레임 사용)
+   - settings_ws.ws_min_kline_buffer: TF 공통 최소 버퍼 길이 (기본 120)
+   - settings_ws.ws_max_kline_delay_sec: TF 공통 최대 허용 지연(sec, 기본 600)
+   - settings_ws.ws_orderbook_max_delay_sec: 오더북 최대 허용 지연(sec, 기본 10)
+2) 오더북 버퍼에 bestBid / bestAsk / spreadPct(%) 를 함께 저장해
+   유동성 상태를 상위 레이어에서 바로 확인할 수 있게 했다.
+3) 상단 설명에서 1m/5m/15m 언급을 제거하고, BingX가 지원하는
+   멀티 타임프레임 구조로 정리했다.
 """
 
 from __future__ import annotations
@@ -117,8 +55,32 @@ WS_URL = (
     or "wss://open-api-swap.bingx.com/swap-market"
 )
 
-# settings 에 없으면 1m/5m/15m 로 기본 구독
-WS_INTERVALS: List[str] = getattr(SET, "ws_subscribe_tfs", None) or ["1m", "5m", "15m"]
+# BingX K라인 기본 타임프레임 세트 (분/시간/일/주/월)
+DEFAULT_INTERVALS: List[str] = [
+    "1m",
+    "3m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "4h",
+    "6h",
+    "12h",
+    "1d",
+    "3d",
+    "1w",
+    "1M",
+]
+
+# settings 에 없으면 DEFAULT_INTERVALS 로 기본 구독
+WS_INTERVALS: List[str] = getattr(SET, "ws_subscribe_tfs", None) or DEFAULT_INTERVALS
+
+# 데이터 헬스 체크용 필수 타임프레임 / 지연/버퍼 기준값
+REQUIRED_INTERVALS: List[str] = getattr(SET, "ws_required_tfs", None) or WS_INTERVALS
+KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 120))
+KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 600.0))  # 기본 10분
+ORDERBOOK_MAX_DELAY_SEC: float = float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0))
 
 # { (symbol, interval): [(ts, o, h, l, c, v), ...] }
 _kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float, float]]] = {}
@@ -126,7 +88,7 @@ _kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float
 # { (symbol, interval): last_recv_ts_ms }
 _kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
 
-# { symbol: {"bids": [...], "asks": [...], "ts": ..., "exchTs": ..., "markPrice": ..., "lastPrice": ...} }
+# { symbol: {"bids": [...], "asks": [...], "ts": ..., "exchTs": ..., "markPrice": ..., "lastPrice": ..., "bestBid": ..., "bestAsk": ..., "spreadPct": ...} }
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 
 # 동시성 보호용 Lock (읽기/쓰기 경쟁 방지)
@@ -159,7 +121,7 @@ def _to_ws_symbol(sym: str) -> str:
 
 
 def _build_sub_msgs(symbol: str) -> List[Dict[str, Any]]:
-    """구독 메시지들을 구성한다 (1m/5m/15m + depth5)."""
+    """구독 메시지들을 구성한다 (설정된 타임프레임 + depth5)."""
     ws_sym = _to_ws_symbol(symbol)
     msgs: List[Dict[str, Any]] = []
     for iv in WS_INTERVALS:
@@ -249,16 +211,41 @@ def _normalize_depth_side(side_val: Any) -> List[List[float]]:
     return out
 
 
+def _compute_spread_pct(bids: List[List[float]], asks: List[List[float]]) -> Optional[float]:
+    """오더북 상단 bid/ask 기준 스프레드(%)를 계산한다."""
+    if not bids or not asks:
+        return None
+    try:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+    except Exception:
+        return None
+    if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
+        return None
+    mid = (best_bid + best_ask) / 2.0
+    return (best_ask - best_bid) / mid * 100.0
+
+
 def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     """depth payload 를 내부 버퍼에 저장한다."""
     normalized_bids = _normalize_depth_side(payload.get("bids") or payload.get("buys") or [])
     normalized_asks = _normalize_depth_side(payload.get("asks") or payload.get("sells") or [])
 
+    now_ms = _now_ms()
+    spread_pct = _compute_spread_pct(normalized_bids, normalized_asks)
+
     ob: Dict[str, Any] = {
         "bids": normalized_bids,
         "asks": normalized_asks,
-        "ts": _now_ms(),  # 수신(로컬) 시각
+        "ts": now_ms,  # 수신(로컬) 시각
     }
+
+    if normalized_bids:
+        ob["bestBid"] = normalized_bids[0][0]
+    if normalized_asks:
+        ob["bestAsk"] = normalized_asks[0][0]
+    if spread_pct is not None:
+        ob["spreadPct"] = spread_pct
 
     if "markPrice" in payload:
         ob["markPrice"] = payload.get("markPrice")
@@ -456,7 +443,11 @@ def preload_klines(
     interval: str,
     rows: List[Tuple[int, float, float, float, float, float]],
 ) -> None:
-    """(ts, o, h, l, c, v) 튜플 리스트를 그대로 내부 버퍼에 세팅한다."""
+    """(ts, o, h, l, c, v) 튜플 리스트를 그대로 내부 버퍼에 세팅한다.
+
+    - run_bot_ws 부트스트랩(REST 히스토리 로딩) 단계에서만 사용하는 것을 권장한다.
+    - 라이브 운영 중에는 WS 데이터만 사용하는 것이 원칙이다.
+    """
     key = (symbol, interval)
     with _kline_lock:
         trimmed = list(rows[-MAX_KLINES:])
@@ -480,7 +471,11 @@ def backfill_klines_from_rest(
     interval: str,
     rest_klines: List[Any],
 ) -> None:
-    """BingX REST /kline 응답을 받아 버퍼에 백필한다."""
+    """BingX REST /kline 응답을 받아 버퍼에 백필한다.
+
+    - list[list] / list[dict] 포맷 모두 지원한다.
+    - 유효한 행만 골라 (ts,o,h,l,c,v) 튜플로 변환 후 preload_klines 를 호출한다.
+    """
     converted: List[Tuple[int, float, float, float, float, float]] = []
     raw_len = len(rest_klines)
 
@@ -629,13 +624,127 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
         ob = _orderbook_buffers.get(symbol)
         if not ob:
             return None
-        if "bids" in ob:
-            return {
-                **ob,
-                "bids": ob["bids"][:limit],
-                "asks": ob.get("asks", [])[:limit],
-            }
-        return dict(ob)
+        result = dict(ob)
+        if "bids" in result:
+            result["bids"] = result.get("bids", [])[:limit]
+            result["asks"] = result.get("asks", [])[:limit]
+        return result
+
+
+def _compute_kline_health(
+    symbol: str,
+    interval: str,
+) -> Dict[str, Any]:
+    """단일 타임프레임에 대한 버퍼 길이/지연/헬스 상태를 계산한다."""
+    status = get_kline_buffer_status(symbol, interval)
+    buffer_len = status["buffer_len"]
+    delay_ms = status["delay_ms"]
+    ok = True
+    reasons: List[str] = []
+
+    if buffer_len < KLINE_MIN_BUFFER:
+        ok = False
+        reasons.append(f"buffer_len<{KLINE_MIN_BUFFER} (got={buffer_len})")
+
+    if delay_ms is None:
+        ok = False
+        reasons.append("no_recv_ts")
+    else:
+        delay_sec = delay_ms / 1000.0
+        if delay_sec > KLINE_MAX_DELAY_SEC:
+            ok = False
+            reasons.append(f"delay_sec>{KLINE_MAX_DELAY_SEC} (got={delay_sec:.1f})")
+
+    status["ok"] = ok
+    status["reasons"] = reasons
+    return status
+
+
+def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
+    """오더북 버퍼의 최신 여부/헬스 상태를 계산한다."""
+    now_ms = _now_ms()
+    with _orderbook_lock:
+        ob = _orderbook_buffers.get(symbol)
+
+    result: Dict[str, Any] = {
+        "symbol": symbol,
+        "has_orderbook": ob is not None,
+        "delay_ms": None,
+        "ok": False,
+        "reasons": [],
+    }
+
+    if ob is None:
+        result["reasons"].append("no_orderbook")
+        return result
+
+    ts = ob.get("ts")
+    if ts is None:
+        result["reasons"].append("no_ts")
+        return result
+
+    delay_ms = max(0, now_ms - int(ts))
+    delay_sec = delay_ms / 1000.0
+    result["delay_ms"] = delay_ms
+
+    if delay_sec > ORDERBOOK_MAX_DELAY_SEC:
+        result["reasons"].append(
+            f"delay_sec>{ORDERBOOK_MAX_DELAY_SEC} (got={delay_sec:.1f})"
+        )
+        result["ok"] = False
+    else:
+        result["ok"] = True
+
+    return result
+
+
+def get_health_snapshot(symbol: str) -> Dict[str, Any]:
+    """심볼 기준 전체 데이터 헬스 스냅샷을 반환한다.
+
+    반환 예시:
+    {
+        "symbol": "BTC-USDT",
+        "overall_ok": True/False,
+        "klines": {
+            "1m": {...},
+            "5m": {...},
+            ...
+        },
+        "orderbook": {...},
+        "checked_at_ms": 1234567890,
+    }
+    """
+    snapshot: Dict[str, Any] = {
+        "symbol": symbol,
+        "overall_ok": True,
+        "klines": {},
+        "orderbook": {},
+        "checked_at_ms": _now_ms(),
+    }
+
+    overall_ok = True
+    kline_map: Dict[str, Any] = {}
+
+    for iv in REQUIRED_INTERVALS:
+        k_status = _compute_kline_health(symbol, iv)
+        kline_map[iv] = k_status
+        if not k_status.get("ok", False):
+            overall_ok = False
+
+    ob_status = _compute_orderbook_health(symbol)
+    if not ob_status.get("ok", False):
+        overall_ok = False
+
+    snapshot["klines"] = kline_map
+    snapshot["orderbook"] = ob_status
+    snapshot["overall_ok"] = overall_ok
+    return snapshot
+
+
+def is_data_healthy(symbol: str) -> bool:
+    """심볼 기준 WS 데이터 헬스가 양호한지 여부만 간단히 반환한다."""
+    snap = get_health_snapshot(symbol)
+    return bool(snap.get("overall_ok", False))
 
 
 __all__ = [
@@ -648,4 +757,6 @@ __all__ = [
     "get_last_kline_delay_ms",
     "get_kline_buffer_status",
     "get_orderbook",
+    "get_health_snapshot",
+    "is_data_healthy",
 ]

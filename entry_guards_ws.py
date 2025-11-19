@@ -1,37 +1,54 @@
 """
 entry_guards_ws.py
 =====================================================
-엔트리 직전 각종 가드를 묶어 놓은 모듈 (WS 버퍼 전용).
+엔트리 직전 각종 하드 가드를 묶어 놓은 모듈 (WS 버퍼 전용).
 
-PATCH NOTES — 2025-11-17 (WS 원천 데이터 강제 + 폴백 제거, GPT 트레이더와 정합성 점검)
+역할 (GPT 원탑 구조 기준)
 ----------------------------------------------------
-1) 모든 가드는 WS/실제 데이터가 이상하거나 부족할 때
-   "통과(True)"가 아니라 **SKIP(거래 건너뛰기)** 로 동작하도록 유지.
-   - 거래량 가드: 볼륨 파싱 에러 / 평균값 0 / 샘플 부족 시 진입 금지.
-   - 가격 점프 가드: 5m 캔들 2개 미만 / 가격 0 이하 시 진입 금지.
-   - 스프레드/호가 가드: 오더북 없음 / BBO 파싱 에러 / BBO 비정상 시 진입 금지.
-2) entry_flow.try_open_new_position(...) 에서 WS 1m 캔들을 우선 넘기도록 변경된
-   구조와 맞춰, 거래량 가드 docstring 을 1m/5m 겸용으로 정리.
-3) gpt_trader.GuardBounds 와 필드명을 맞추기 위해, depth/스프레드/점프 관련
-   설정 키를 재점검 (min_entry_volume_ratio / max_spread_pct /
-   max_price_jump_pct / depth_imbalance_min_ratio / depth_imbalance_min_notional).
-4) 각 SKIP 상황에서 telelog + signals_logger.log_signal 로 reason/extra 를 남겨
-   이후 signals_logger 의 events CSV (log_skip_event) 와 함께 분석에 사용할 수 있도록
-   코멘트 보강.
-5) 5m_kline_delayed 판정 로직을 완화.
-   - 단순히 마지막 5m ts 기준으로 now-ts 가 일정 시간(X ms)을 넘으면 무조건
-     딜레이로 보지 않고,
-   - WS 1m/5m 캔들의 ts 를 함께 사용해 "실제로 5m 캔들이 한두 개 이상 비어 있거나
-     누락된 경우"에만 딜레이로 간주.
-   - 시간 임계값도 5m 캔들 1~2개 정도 지연까지는 허용하도록 상향 조정
-     (settings.max_5m_delay_ms 기반).
-6) 2025-11-19: 5m 딜레이 가드 디버그 로그 보강.
-   - delayed_by_gap/delayed_by_time 이 False 인 경우에도 ts/누락 개수/지연(ms)
-     등을 Render 로그에 남겨, "왜 5m_kline_delayed SKIP 이 안 떴는지"를 바로
-     추적할 수 있도록 함.
+- market_data_ws 의 WS 버퍼(캔들/오더북)를 사용해서
+  "시장/데이터 상태가 정상인지"만 판단하는 레이어.
+- 전략(TREND/RANGE/GPT 등)과는 독립적으로 동작하며,
+  아래 조건 중 하나라도 만족하면 **무조건 진입을 SKIP** 시킨다.
 
-이 모듈 자체는 "가드 판단"만 담당하며, 최종 SKIP 이벤트 CSV 기록은
-entry_flow 쪽에서 log_skip_event(...) 를 호출해 완성된다.
+  1) 수동/기존 포지션이 이미 열려 있음 (usedMargin > 0)
+  2) 최근 거래량이 직전 20개 평균 대비 비정상적으로 작음
+  3) 5m 캔들이 실제로 지연되었거나 여러 개 비어 있음
+  4) 바로 직전 5m 가격 점프/캔들 변동성이 과도함
+  5) 스프레드/호가 이상, depth 한쪽 쏠림, mark/last 괴리
+
+- 이 모듈은 "가드 판단"만 담당한다.
+  실제 SKIP 이벤트 CSV 집계/분석은 signals_logger / entry_flow 쪽에서 수행한다.
+
+환경 설정(주요 키)
+----------------------------------------------------
+- min_entry_volume_ratio      : 거래량 가드 기준 비율 (기본 0.3)
+- max_5m_delay_ms             : 5m 딜레이 허용 한도 (기본 10분)
+- max_price_jump_pct          : 5m 가격 점프 허용 비율 (세션 배수 적용)
+- max_spread_pct / max_spread_abs : 스프레드 허용 한도 (퍼센트/절대값)
+- depth_imbalance_min_notional / depth_imbalance_min_ratio : depth 쏠림 가드
+- price_deviation_guard_enabled / price_deviation_max_pct : mark/last 괴리 가드
+- max_orderbook_age_ms        : 오더북 지연 허용 한도
+- session_spread_mult_*       : 세션별(아시아/유럽/미국) 스프레드 배수
+- session_jump_mult_*         : 세션별(아시아/유럽/미국) 점프 배수
+- min_bbo_notional_usdt       : 최상위 호가 명목가 최소치
+
+PATCH NOTES — 2025-11-19 (GPT 구조 정리 + 헤더 압축)
+----------------------------------------------------
+- 이 모듈을 "전략 독립 하드 리스크 가드 레이어"로 명확히 정의.
+  · signal_source, direction 은 단순 태그용 문자열로 사용 (예: "GPT_ENTRY" / "LONG").
+- 기존 패치 노트(WS 원천 데이터 강제, 5m 딜레이 완화, 디버그 로그 강화)를 요약하고
+  실제 운영에 필요한 설정 키/동작만 헤더에 정리.
+- 로직은 기존과 동일하게 유지하되, GPT 원탑 구조에서 그대로 사용할 수 있도록
+  주석과 문맥만 정리.
+
+기존 변경사항(요약)
+----------------------------------------------------
+- 모든 가드는 WS/실제 데이터가 이상하거나 부족할 때
+  "통과(True)"가 아니라 **SKIP(거래 건너뛰기)** 로 동작.
+- 5m_kline_delayed 판정은 단순 now-ts 가 아니라
+  WS 1m/5m ts 를 함께 사용해 "실제 누락/지연"일 때만 발생하도록 완화.
+- 각 SKIP 상황에서 telelog + signals_logger.log_signal 로 reason/extra 를 남겨
+  이후 events CSV 와 함께 분석이 가능하도록 함.
 """
 
 from __future__ import annotations
@@ -228,11 +245,9 @@ def check_5m_delay_guard(
 ) -> bool:
     """5m_kline_delayed 완화 버전.
 
-    - 예전 버전: 마지막 5m 캔들 ts 기준으로 now - ts > X(ms)이면 바로 딜레이로 간주하고 SKIP.
-    - 이번 버전:
-        · WS 1m/5m 캔들의 ts 를 함께 사용해,
-        · 5m 캔들이 실제로 한두 개 이상 비어 있거나
-        · 1m 캔들 ts 흐름 대비 5m 집계가 명확히 따라오지 못하는 경우에만 delayed 로 본다.
+    - 마지막 5m ts 만 보는 것이 아니라, WS 1m/5m ts 를 함께 사용해
+      "실제로 5m 캔들이 여러 개 비어 있거나, 집계가 명확히 따라오지 못하는 경우"에만
+      delayed 로 본다.
     - 단순 시간 기준 X(ms)도 5m 캔들 1~2개 정도 지연까지 허용하도록 상향
       (settings.max_5m_delay_ms, 기본 10분).
     """
@@ -293,7 +308,7 @@ def check_5m_delay_guard(
     delayed_by_gap = missing_5m_count >= 2  # "한두 개 이상" → 2개 이상이면 지연으로 본다.
     delayed_by_time = (now_ms - last_5m_ts) > max_delay_ms
 
-    # 2025-11-19 디버그 로그 보강: SKIP 여부와 상관없이 내부 상태를 남긴다.
+    # 디버그 로그: SKIP 여부와 상관없이 내부 상태를 남긴다.
     log(
         "[GUARD] (WS) 5m_delay_detail: "
         f"last_1m_ts={last_1m_ts}, last_5m_ts={last_5m_ts}, "
@@ -457,7 +472,12 @@ def _is_depth_imbalanced(
                 qty = float(r[1])
             else:
                 price = float(r.get("price"))
-                qty = float(r.get("qty") or r.get("quantity") or r.get("size") or 0.0)
+                qty = float(
+                    r.get("qty")
+                    or r.get("quantity")
+                    or r.get("size")
+                    or 0.0
+                )
             total += price * qty
         return total
 
@@ -558,7 +578,7 @@ def check_spread_guard(
         )
         return False, None, None
 
-    # D) 오더북 신선도(지연) 가드
+    # 오더북 신선도(지연) 가드
     now_ms = int(datetime.datetime.utcnow().timestamp() * 1000)
     ob_ts = int(orderbook.get("ts") or 0)
     ob_age_ms = now_ms - ob_ts if ob_ts > 0 else -1
@@ -596,12 +616,18 @@ def check_spread_guard(
         bid_qty = float(
             bids[0][1]
             if isinstance(bids[0], list)
-            else bids[0].get("qty") or bids[0].get("quantity") or bids[0].get("size") or 0.0
+            else bids[0].get("qty")
+            or bids[0].get("quantity")
+            or bids[0].get("size")
+            or 0.0
         )
         ask_qty = float(
             asks[0][1]
             if isinstance(asks[0], list)
-            else asks[0].get("qty") or asks[0].get("quantity") or asks[0].get("size") or 0.0
+            else asks[0].get("qty")
+            or asks[0].get("quantity")
+            or asks[0].get("size")
+            or 0.0
         )
     except Exception as e:
         log(f"[SPREAD PARSE ERROR] {e}")
@@ -617,7 +643,7 @@ def check_spread_guard(
         )
         return False, None, None
 
-    # E) 비정상 BBO 가드
+    # 비정상 BBO 가드
     if not best_bid or not best_ask or best_bid >= best_ask:
         send_skip_tg("[SKIP] bbo_crossed_or_invalid")
         log_signal(
@@ -631,7 +657,7 @@ def check_spread_guard(
         )
         return False, best_bid, best_ask
 
-    # F) 최상위 호가 명목가 최소치 가드 (옵션)
+    # 최상위 호가 명목가 최소치 가드 (옵션)
     min_bbo_notional = float(getattr(settings, "min_bbo_notional_usdt", 0.0))
     top_bid_notional = best_bid * bid_qty
     top_ask_notional = best_ask * ask_qty
@@ -660,7 +686,7 @@ def check_spread_guard(
     spread_abs = best_ask - best_bid
     spread_pct = spread_abs / best_bid if best_bid > 0 else 0.0
 
-    # G) 스프레드 임계 (퍼센트/절대 동시 지원)
+    # 스프레드 임계 (퍼센트/절대 동시 지원)
     max_spread_abs = float(getattr(settings, "max_spread_abs", 0.0))
     too_wide_by_pct = spread_pct > max_spread_pct
     too_wide_by_abs = max_spread_abs > 0 and spread_abs > max_spread_abs
@@ -688,7 +714,7 @@ def check_spread_guard(
         )
         return False, best_bid, best_ask
 
-    # A) 한쪽 쏠림
+    # depth 한쪽 쏠림
     if _is_depth_imbalanced(settings, orderbook):
         send_skip_tg("[SKIP] depth_imbalance_guard: one side dominates 5-level depth")
         log_signal(
@@ -702,7 +728,7 @@ def check_spread_guard(
         )
         return False, best_bid, best_ask
 
-    # B) mark/last 괴리
+    # mark/last 괴리
     if _is_price_deviation_large(settings, orderbook, best_bid, best_ask):
         send_skip_tg("[SKIP] price_deviation_guard: mark/last deviated from mid")
         log_signal(

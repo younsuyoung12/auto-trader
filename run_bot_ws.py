@@ -1,83 +1,34 @@
 """run_bot_ws.py
 =====================================================
-웹소켓으로 들어오는 1m / 5m / 15m 캔들을 기준으로 포지션을 열고 감시하는 메인 루프.
-이 버전에서는 더 이상 3m 캔들을 사용하지 않는다.
+BingX WebSocket + REST 히스토리 기반 비트코인 선물 자동매매 메인 루프.
 
-2025-11-19 변경 사항 (EXIT GPT 레이어 완전 연동 + 추세→박스 다운그레이드)
-----------------------------------------------------
-1) position_watch_ws.py 의 GPT 기반 EXIT 레이어와 완전 연동.
-   - 조기익절/조기청산/반대 시그널 컷/박스↔추세 전환은 모두
-     gpt_decider.ask_exit_decision_safe(...) 를 한 번 거친 뒤 실행된다.
-   - GPT 오류 시에는 fallback_action 으로 기존 Python 로직만으로 동작.
-2) 추세→박스 다운그레이드(maybe_downgrade_trend_to_range) 를 메인 루프에 추가.
-   - TREND 포지션이 RANGE 환경으로 바뀐 경우, GPT 가 CLOSE 를 승인하면
-     포지션을 정리하고 RANGE 전략으로 갈아타도록 한다.
-3) EXIT 경로별 마지막 청산 시각 업데이트 정리.
-   - RANGE 관련 종료: LAST_CLOSE_TS_RANGE
-   - TREND 관련 종료: LAST_CLOSE_TS_TREND
-   - 공통 종료 시각: LAST_CLOSE_TS
+- WS: 멀티 타임프레임 K라인 + depth5 오더북 수신
+- REST: 부팅 시 K라인 히스토리 백필 전용
+- 진입 의사결정: entry_flow + gpt_decider (GPT-5.1 진입 게이트)
+- 청산 의사결정: position_watch_ws.maybe_exit_with_gpt + gpt_decider (GPT-5.1 EXIT 레이어)
+- 이 파일은 "메인 오케스트레이터" 역할만 수행하고,
+  매수/매도·손절/익절·포지션 변경에 대한 실제 판단 로직은 gpt_decider.py 에서 관리한다.
 
-2025-11-17 변경 사항 (텔레그램 메시지 한글화 + 직관 표현)
+2025-11-19 변경 사항 (EXIT GPT 레이어 단순화 + 데이터 헬스 모니터링)
 ----------------------------------------------------
-1) 텔레그램으로 나가는 안내 문구를 전부 한국어로 정리하고, 어려운 용어를 줄였다.
-   - 봇 시작/종료, 일일 정산, 연속 손실, 오류 안내, STOP_FLAG 경고 등.
-2) 포지션 청산 알림에서 reason 코드를 사람이 보기 쉬운 문장으로 변환했다.
-   - 예) "tp_hit" → "목표가 도달(익절)", "sl_hit" → "손절가 도달(손절)" 등.
-3) 열린 포지션 상태 알림에서 방향을 "LONG/SHORT" 대신 "롱/숏" 으로 표시하고,
-   15분 추세도 "상승/하락/횡보" 형태로 안내하도록 변경했다.
+1) position_watch_ws.py 의 GPT 기반 EXIT 어댑터(maybe_exit_with_gpt)와 완전 연동.
+   - 박스/추세/업그레이드/다운그레이드/반대 시그널 등의 개별 Python EXIT 규칙을 전부 제거했다.
+   - 런타임 EXIT 는
+       · run_bot_ws → 열린 Trade 에 대해 maybe_exit_with_gpt(trade, settings) 호출
+       · position_watch_ws → WS 캔들·레짐 피처 생성 + gpt_decider.ask_exit_decision_safe(...)
+       · gpt_decider → GPT-5.1 프롬프트로 HOLD/CLOSE 결정
+     구조로 단순화되었다.
+2) REST /kline 히스토리 백필 상태와 WS 버퍼 길이/지연을 METRICS 에 기록하고,
+   백필 실패(KlineRestError 등) 시 사유를 텔레그램으로 즉시 전송한다.
+3) market_data_ws.get_health_snapshot(...) 를 사용해 WS/오더북 데이터 헬스를
+   주기적으로 점검하고, 결과를 텔레그램으로 요약 전송한다.
 
-2025-11-15 변경 사항 (REST 백필 디버그 강화)
+이전 변경 요약 (압축)
 ----------------------------------------------------
-15) _backfill_ws_kline_history(...) 디버그 로그 강화
-    - REST 응답 rows 개수, 첫/마지막 openTime(ts) 를 부팅 로그에 남긴다.
-    - backfill_klines_from_rest(...) 호출 후 WS 버퍼 길이(ws_get_klines_with_volume)를
-      즉시 확인해서 "REST 백필 → WS 버퍼 적재" 단계가 실제로 수행됐는지 로그로 남긴다.
-    - KlineRestError / 기타 예외를 구분해서 로깅하고, 실패 시 METRICS["kline_failures"]++.
-16) main() 부팅 직후 WS 버퍼 상태 진단 로그 추가
-    - WS 시작 후 2초 정도 대기 뒤 1m/5m/15m 에 대해 WS 버퍼 길이를 로그.
-      예: [BOOT] WS buffer status: symbol=BTC-USDT interval=5m len=120
-    - REST 백필이 안 먹었는지, WS 실시간 스트림이 안 들어오는지 Render 로그에서 바로 구분 가능.
-
-2025-11-13 변경 사항
-----------------------------------------------------
-1) settings → settings_ws 로 교체해서 기본 주기를 5m 로 사용.
-2) 포지션 상태 텔레그램 알림에서 15m 추세를 볼 때 REST 대신 market_data_ws 를 사용.
-   (Render 콘솔에서 15m 가 실제로 들어오는지 바로 확인 가능)
-3) position_watch 모듈을 WS 버전(position_watch_ws)으로 교체해서
-   조기익절/조기청산/반대 시그널 컷이 모두 WS 캔들을 쓰도록 정리.
-4) 시작 시점에 현재 WS 설정(ws_enabled, ws_subscribe_tfs)을 로그로 남겨
-   Render 환경에서 "WS 모드로 올라왔는지" 확인 가능하게 함.
-5) 3m 관련 주석과 interval 언급을 모두 제거하고, 1m/5m/15m 기준으로 다시 작성.
-6) 주문/TP/SL 은 기존과 동일하게 REST(exchange_api)로 처리.
-
-2025-11-13 추가 보정
-----------------------------------------------------
-7) 실제 웹소켓 수신이 돌아가도록 main() 시작 시
-   market_data_ws.start_ws_loop(SET.symbol)을 한 번만 호출하도록 추가.
-
-2025-11-14 변경 사항 (시세 DB 저장 + 레짐 워커 연동)
-----------------------------------------------------
-8) market_data_store 모듈을 사용해 WS 버퍼의 캔들/호가를 Postgres 에 저장하는
-   백그라운드 스레드(_start_market_data_store_thread)를 추가.
-   - 1m/5m/15m 캔들은 bt_candles 테이블에 적재.
-   - depth5 오더북 스냅샷은 bt_orderbook_snapshots 테이블에 적재.
-9) candles 는 interval 별 마지막 저장 timestamp(ts_ms)를 기억해서
-   이미 저장된 캔들은 다시 INSERT 하지 않도록 방어.
-10) 오더북은 일정 간격(기본 5초)마다 한 번만 저장해서 DB I/O 를 과도하게 늘리지 않도록 함.
-11) DB 저장 실패(SQLAlchemyError)는 telelog 로만 남기고
-    메인 매매 루프/WS 루프에는 영향을 주지 않도록 설계.
-12) signal_analysis_worker 를 1분 주기(또는 settings_ws.signal_analysis_interval_sec)로
-    백그라운드에서 돌려 bt_candles 를 읽고 bt_regime_scores 에 레짐 점수를 기록.
-
-2025-11-15 변경 사항 (REST 히스토리 백필)
-----------------------------------------------------
-13) BingX REST /kline 응답을 이용해 5m/15m 히스토리 캔들을
-    market_data_ws.backfill_klines_from_rest(...) 으로 WS 버퍼에 미리 채우는
-    _backfill_ws_kline_history(...) 헬퍼 추가.
-14) main() 시작 시 ws_enabled=True 이면
-    _backfill_ws_kline_history(...) 실행 후 start_ws_loop(...) 를 호출하도록 변경.
-    → 최초 부팅 직후에도 5m 캔들이 50개 이상 준비되어
-      "[SIGNAL] 5m candles not enough (<50) → skip signal" 현상을 줄임.
+- 2025-11-17: 텔레그램 안내 한글화, 청산 사유/포지션 상태 메시지 정리.
+- 2025-11-15: REST 히스토리 백필 및 WS 버퍼 상태 디버그 로그 강화.
+- 2025-11-14: WS 캔들/오더북 DB 저장 + signal_analysis_worker 기반 레짐/지표 기록.
+- 2025-11-13: 3m 캔들 제거, position_watch_ws/market_data_ws 도입, WS 설정 로깅.
 """
 
 from __future__ import annotations
@@ -109,26 +60,21 @@ from signal_analysis_worker import start_signal_analysis_thread
 # 동기화/진입/포지션 감시 모듈
 from sync_exchange import sync_open_trades_from_exchange
 from entry_flow import try_open_new_position  # 진입 쪽 GPT 결정은 entry_flow/gpt_decider 에서 처리
-from position_watch_ws import (  # WS 버전(GPT EXIT 레이어)으로 교체
-    maybe_early_exit_range,
-    maybe_upgrade_range_to_trend,
-    maybe_downgrade_trend_to_range,
-    maybe_early_exit_trend,
-    maybe_force_close_on_opposite_signal,
+from position_watch_ws import (  # WS 버전 GPT EXIT 어댑터
+    maybe_exit_with_gpt,
 )
 # 웹소켓 시세 버퍼
 from market_data_ws import (
     start_ws_loop,                  # 웹소켓 수신 시작
-    get_klines as ws_get_klines,    # 15m 추세 조회용
     get_klines_with_volume as ws_get_klines_with_volume,  # 캔들+거래량(DB 적재용)
     get_orderbook as ws_get_orderbook,  # depth5 오더북(DB 적재용)
     backfill_klines_from_rest,      # REST 히스토리 → WS 버퍼 백필용
+    get_health_snapshot,            # WS/오더북 데이터 헬스 스냅샷
 )
 from market_data_store import (
     save_candles_bulk_from_ws,
     save_orderbook_from_ws,
 )
-from strategies_trend_ws import decide_trend_15m  # 15m 방향 판단
 from market_data_rest import fetch_klines_rest, KlineRestError  # BingX REST /kline 헬퍼
 
 
@@ -156,10 +102,8 @@ METRICS: Dict[str, Any] = {
 OPEN_TRADES: List[Trade] = []
 # TP/SL 재설정 실패 횟수 관리용
 TRADER_STATE: TraderState = TraderState()
-# 최근 청산 시각들
+# 최근 청산 시각
 LAST_CLOSE_TS: float = 0.0
-LAST_CLOSE_TS_TREND: float = 0.0
-LAST_CLOSE_TS_RANGE: float = 0.0
 # 연속 손실 횟수
 CONSEC_LOSSES: int = 0
 # 텔레그램에서 들어오는 안전 종료 플래그
@@ -170,8 +114,15 @@ LAST_EXCHANGE_SYNC_TS: float = 0.0
 LAST_STATUS_TG_TS: float = 0.0
 STATUS_TG_INTERVAL_SEC: int = getattr(SET, "unrealized_notify_sec", 1800)
 
-# 레짐 워커 주기 (기본 60초)
+# 레짐/시그널 분석 워커 주기 (기본 60초)
 SIGNAL_ANALYSIS_INTERVAL_SEC: int = getattr(SET, "signal_analysis_interval_sec", 60)
+
+# 데이터 헬스 텔레그램 리포트 주기 (기본 15분)
+DATA_HEALTH_TG_INTERVAL_SEC: int = int(getattr(SET, "data_health_notify_sec", 900))
+LAST_DATA_HEALTH_TG_TS: float = 0.0
+
+# 마지막 REST /kline 백필 성공 시각 (epoch seconds)
+LAST_REST_BACKFILL_AT: float = 0.0
 
 
 # ─────────────────────────────
@@ -249,11 +200,10 @@ def _translate_close_reason(reason: str) -> str:
 
 
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
-    """열린 포지션이 있을 때 현재 미실현 손익 + 15분 방향을 주기적으로 텔레그램으로 보낸다.
+    """열린 포지션이 있을 때 현재 미실현 손익을 주기적으로 텔레그램으로 보낸다.
 
-    15m 캔들은 웹소켓 버퍼에서 읽는다.
-    Render 콘솔에서는 아래 로그로 실제 수신 여부 확인 가능:
-      [STATUS_TG] WS 15m count=...
+    - 과거 버전에서는 15m 방향(상승/하락/횡보)을 함께 붙였으나,
+      추세/박스 레짐 Python 로직을 모두 제거하면서 단순 PnL 안내만 남긴다.
     """
     from exchange_api import fetch_open_positions
 
@@ -266,26 +216,8 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
     if not positions:
         return
 
-    # 15m 추세 정보 붙이기 (WS)
-    try:
-        candles_15m = ws_get_klines(symbol, "15m", 120)
-        log(f"[STATUS_TG] WS 15m count={len(candles_15m) if candles_15m else 0}")
-        if candles_15m:
-            trend_dir = decide_trend_15m(candles_15m)
-            if trend_dir == "LONG":
-                trend_txt = " (15분 차트 기준: 상승 흐름)"
-            elif trend_dir == "SHORT":
-                trend_txt = " (15분 차트 기준: 하락 흐름)"
-            else:
-                trend_txt = " (15분 차트 기준: 횡보)"
-        else:
-            trend_txt = ""
-    except Exception as e:
-        log(f"[STATUS_TG] WS 15m error: {e}")
-        trend_txt = ""
-
     mins = max(1, interval_sec // 60)
-    lines = [f"⏱ 현재 열린 포지션 안내 (약 {mins}분 간격){trend_txt}"]
+    lines = [f"⏱ 현재 열린 포지션 안내 (약 {mins}분 간격)"]
 
     for p in positions:
         qty = float(p.get("positionAmt") or p.get("quantity") or p.get("size") or 0.0)
@@ -324,12 +256,14 @@ def _on_safe_stop() -> None:
 
 
 def _backfill_ws_kline_history(symbol: str) -> None:
-    """BingX REST /kline 으로 5m/15m 히스토리 캔들을 받아와 WS 버퍼에 미리 채운다.
+    """BingX REST /kline 으로 히스토리 캔들을 받아 WS 버퍼에 미리 채운다.
 
     - run_bot_ws.main() 시작 시점에 한 번만 호출.
     - market_data_ws.backfill_klines_from_rest(...) 를 사용해
-      5m/15m 버퍼가 최소 수십 개 이상 채워진 상태에서 신호 계산이 시작되도록 한다.
+      각 타임프레임 버퍼가 최소 수십 개 이상 채워진 상태에서 신호 계산이 시작되도록 한다.
     """
+    global LAST_REST_BACKFILL_AT
+
     # 기본은 5m/15m 만 백필, 필요하면 settings_ws.ws_backfill_tfs 로 조정 가능
     intervals = getattr(SET, "ws_backfill_tfs", ["5m", "15m"])
     limit = int(getattr(SET, "ws_backfill_limit", 120))
@@ -345,12 +279,29 @@ def _backfill_ws_kline_history(symbol: str) -> None:
                     f"[BOOT] REST backfill skipped: empty response for {symbol} {iv}"
                 )
                 METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
+                try:
+                    send_tg(
+                        "⚠ REST 백필 결과가 비어 있습니다.\n"
+                        f"- 심볼: {symbol}\n"
+                        f"- 주기: {iv}\n"
+                        "- 사유: 응답 rows=0"
+                    )
+                except Exception:
+                    pass
                 continue
 
             # REST 응답 요약 로그 (첫/마지막 openTime 기준)
             try:
-                first_ts = rest_rows[0][0] if isinstance(rest_rows[0], (list, tuple)) and rest_rows[0] else "N/A"
-                last_ts = rest_rows[-1][0] if isinstance(rest_rows[-1], (list, tuple)) and rest_rows[-1] else "N/A"
+                first_ts = (
+                    rest_rows[0][0]
+                    if isinstance(rest_rows[0], (list, tuple)) and rest_rows[0]
+                    else "N/A"
+                )
+                last_ts = (
+                    rest_rows[-1][0]
+                    if isinstance(rest_rows[-1], (list, tuple)) and rest_rows[-1]
+                    else "N/A"
+                )
             except Exception:
                 first_ts, last_ts = "N/A", "N/A"
 
@@ -374,12 +325,32 @@ def _backfill_ws_kline_history(symbol: str) -> None:
                     f"[BOOT] REST backfill verify error for {symbol} {iv}: {ve}"
                 )
 
+            LAST_REST_BACKFILL_AT = time.time()
+
         except KlineRestError as e:
             log(f"[BOOT] REST backfill KlineRestError for {symbol} {iv}: {e}")
             METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
+            try:
+                send_tg(
+                    "⛔ REST 히스토리 백필 중 오류가 발생했습니다.\n"
+                    f"- 심볼: {symbol}\n"
+                    f"- 주기: {iv}\n"
+                    f"- 내용: {e}"
+                )
+            except Exception:
+                pass
         except Exception as e:
             log(f"[BOOT] REST backfill failed for {symbol} {iv}: {e}")
             METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
+            try:
+                send_tg(
+                    "⛔ REST 히스토리 백필 중 예기치 못한 오류가 발생했습니다.\n"
+                    f"- 심볼: {symbol}\n"
+                    f"- 주기: {iv}\n"
+                    f"- 내용: {e}"
+                )
+            except Exception:
+                pass
 
 
 # ─────────────────────────────
@@ -488,15 +459,102 @@ def _start_market_data_store_thread() -> None:
 
 
 # ─────────────────────────────
+# 데이터 헬스 텔레그램 리포트
+# ─────────────────────────────
+
+
+def _send_data_health_report(symbol: str) -> None:
+    """REST 백필 및 WS/오더북 데이터 상태를 1회 텔레그램으로 전송한다."""
+    try:
+        snap = get_health_snapshot(symbol)
+    except Exception as e:
+        log(f"[DATA-HEALTH] snapshot error: {e}")
+        try:
+            send_tg(
+                "⚠ 데이터 헬스 스냅샷 조회 중 오류가 발생했습니다.\n"
+                f"- 내용: {e}"
+            )
+        except Exception:
+            pass
+        return
+
+    overall_ok = bool(snap.get("overall_ok", False))
+    klines = snap.get("klines", {}) or {}
+    ob_status = snap.get("orderbook", {}) or {}
+
+    # REST 백필 상태 요약
+    kline_failures = int(METRICS.get("kline_failures", 0))
+    if LAST_REST_BACKFILL_AT > 0:
+        last_dt = datetime.datetime.fromtimestamp(LAST_REST_BACKFILL_AT, KST)
+        last_rest_str = last_dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        last_rest_str = "한 번도 성공한 적 없음"
+
+    header_emoji = "✅" if overall_ok else "⚠️"
+    lines: List[str] = [
+        f"{header_emoji} 데이터 수집 상태 점검 (REST/WS)",
+        f"- 심볼: {symbol}",
+        f"- 마지막 REST 백필 시각: {last_rest_str}",
+        f"- REST 백필 실패 누적: {kline_failures}회",
+    ]
+
+    # 주요 타임프레임만 요약 (없으면 건너뜀)
+    key_intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
+    lines.append("")
+    lines.append("📈 K라인 버퍼 상태:")
+    for iv in key_intervals:
+        st = klines.get(iv)
+        if not st:
+            continue
+        buffer_len = st.get("buffer_len", 0)
+        delay_ms = st.get("delay_ms")
+        if delay_ms is None:
+            delay_str = "N/A"
+        else:
+            delay_str = f"{delay_ms / 1000.0:.1f}s"
+        ok = bool(st.get("ok", False))
+        ok_mark = "O" if ok else "X"
+        lines.append(f"· {iv}: len={buffer_len}, delay={delay_str}, ok={ok_mark}")
+
+    # 오더북 상태
+    if ob_status:
+        ob_ok = bool(ob_status.get("ok", False))
+        ob_delay_ms = ob_status.get("delay_ms")
+        if ob_delay_ms is None:
+            ob_delay_str = "N/A"
+        else:
+            ob_delay_str = f"{ob_delay_ms / 1000.0:.1f}s"
+        lines.append("")
+        lines.append(
+            f"📊 오더북(depth5) 상태: ok={'O' if ob_ok else 'X'}, delay={ob_delay_str}"
+        )
+
+    if overall_ok and LAST_REST_BACKFILL_AT > 0:
+        lines.append("")
+        lines.append("→ GPT 트레이더가 사용할 WS/REST 로우데이터는 현재 정상 상태입니다.")
+    else:
+        lines.append("")
+        lines.append(
+            "→ 데이터 이상으로 GPT 판단에 사용할 로우데이터가 부족할 수 있습니다. "
+            "로그를 함께 확인해 주세요."
+        )
+
+    try:
+        send_tg("\n".join(lines))
+    except Exception as e:
+        log(f"[DATA-HEALTH] send_tg error: {e}")
+
+
+# ─────────────────────────────
 # 메인 루프 (WS)
 # ─────────────────────────────
 
 
 def main() -> None:
     global RUNNING
-    global OPEN_TRADES, LAST_CLOSE_TS, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
+    global OPEN_TRADES, LAST_CLOSE_TS
     global CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
-    global LAST_STATUS_TG_TS
+    global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS
 
     # 시작 시 STOP_FLAG 있으면 바로 종료
     if os.path.exists("STOP_FLAG"):
@@ -555,7 +613,7 @@ def main() -> None:
     except Exception as e:
         log(f"[WARN] 레버리지/마진 설정 실패: {e}")
 
-    # 보조 스레드들 시작 (헬스 서버, 드라이브 동기화, 텔레그램 명령, 레짐 워커)
+    # 보조 스레드들 시작 (헬스 서버, 드라이브 동기화, 텔레그램 명령, 레짐/지표 워커)
     start_health_server()
     start_drive_sync_thread()
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
@@ -616,6 +674,14 @@ def main() -> None:
                 CONSEC_LOSSES = 0
                 last_report_date_kst = today_kst
 
+            # (c.5) 데이터 헬스 텔레그램 리포트 (기본 15분 간격)
+            if (
+                DATA_HEALTH_TG_INTERVAL_SEC > 0
+                and now - LAST_DATA_HEALTH_TG_TS >= DATA_HEALTH_TG_INTERVAL_SEC
+            ):
+                _send_data_health_report(SET.symbol)
+                LAST_DATA_HEALTH_TG_TS = now
+
             # (d) 거래소 TP/SL 체결 확인 및 내부 포지션 리스트 정리
             if now - last_fill_check >= SET.poll_fills_sec:
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
@@ -636,12 +702,6 @@ def main() -> None:
                         CONSEC_LOSSES += 1
                     else:
                         CONSEC_LOSSES = 0
-
-                    # 전략별 마지막 청산 시각 업데이트
-                    if t.source == "TREND":
-                        LAST_CLOSE_TS_TREND = now
-                    elif t.source == "RANGE":
-                        LAST_CLOSE_TS_RANGE = now
 
                     pnl_krw = pnl * KRW_RATE
 
@@ -686,50 +746,13 @@ def main() -> None:
                     _write_stop_flag()
                     _enter_idle_forever()
 
-            # (e) 열린 포지션에 대한 실시간 대응 (WS 캔들 기반 + GPT EXIT 레이어)
+            # (e) 열린 포지션에 대한 실시간 대응 (WS 캔들 기반 GPT EXIT 레이어)
             if OPEN_TRADES:
                 for t in list(OPEN_TRADES):
-                    # 1) RANGE 조기익절 / 조기청산 (GPT 승인 필요)
-                    if maybe_early_exit_range(t, SET):
+                    # GPT-5.1 이 EXIT 여부(HOLD/CLOSE)를 전적으로 결정
+                    if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
                         OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
                         LAST_CLOSE_TS = now
-                        LAST_CLOSE_TS_RANGE = now
-                        continue
-
-                    # 2) 박스→추세 업그레이드 (RANGE → TREND, GPT 승인 필요)
-                    if maybe_upgrade_range_to_trend(
-                        t, SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
-                    ):
-                        OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
-                        LAST_CLOSE_TS = now
-                        LAST_CLOSE_TS_RANGE = now
-                        continue
-
-                    # 2.5) 추세→박스 다운그레이드 (TREND → RANGE, GPT 승인 필요)
-                    if maybe_downgrade_trend_to_range(
-                        t, SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
-                    ):
-                        OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
-                        LAST_CLOSE_TS = now
-                        LAST_CLOSE_TS_TREND = now
-                        continue
-
-                    # 3) 반대 시그널 강제 청산 (TREND/RANGE 공통, GPT 승인 필요)
-                    if maybe_force_close_on_opposite_signal(
-                        t, SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
-                    ):
-                        OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
-                        LAST_CLOSE_TS = now
-                        # 어떤 레짐이든 반대 시그널이면 둘 다 최근 청산으로 본다
-                        LAST_CLOSE_TS_TREND = now
-                        LAST_CLOSE_TS_RANGE = now
-                        continue
-
-                    # 4) TREND 조기익절 / 조기청산 (GPT 승인 필요)
-                    if maybe_early_exit_trend(t, SET):
-                        OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
-                        LAST_CLOSE_TS = now
-                        LAST_CLOSE_TS_TREND = now
                         continue
 
                 # 포지션이 여전히 남아 있으면 상태만 알리고 다음 루프로 넘어감
@@ -767,7 +790,7 @@ def main() -> None:
             # (i) 새 포지션 진입 시도
             # - 진입 신호 계산 + 각종 가드 + GPT 진입 의사결정은 entry_flow.py / gpt_decider 가 담당한다.
             trade, sleep_sec = try_open_new_position(
-                SET, LAST_CLOSE_TS_TREND, LAST_CLOSE_TS_RANGE
+                SET, LAST_CLOSE_TS
             )
             if trade:
                 OPEN_TRADES.append(trade)
@@ -777,11 +800,14 @@ def main() -> None:
 
         except Exception as e:
             log(f"ERROR: {e}")
-            send_tg(
-                "❌ 예기치 못한 오류가 발생했습니다.\n"
-                f"- 내용: {e}\n"
-                "2초 후 자동으로 다시 시도합니다."
-            )
+            try:
+                send_tg(
+                    "❌ 예기치 못한 오류가 발생했습니다.\n"
+                    f"- 내용: {e}\n"
+                    "2초 후 자동으로 다시 시도합니다."
+                )
+            except Exception:
+                pass
             log_signal(
                 event="ERROR",
                 symbol=SET.symbol,
