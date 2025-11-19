@@ -571,15 +571,14 @@ def _create_trade_row_on_entry(
 
 def try_open_new_position(
     settings: Any,
-    last_trend_close_ts: float,
-    last_range_close_ts: float,
+    last_close_ts: float,
 ) -> Tuple[Optional[Trade], float]:
     """시그널을 받아서 조건이 되면 실제로 포지션을 연다.
 
     아무 것도 못 열면 (None, sleep_sec)을 돌려준다.
 
-    - settings: BotSettings (settings_ws.load_settings 결과)
-    - last_trend_close_ts / last_range_close_ts: 최근 전략별 청산 시각(쿨다운/컨텍스트용)
+    - settings   : BotSettings (settings_ws.load_settings 결과)
+    - last_close_ts: 최근 청산 시각(쿨다운/컨텍스트용, 현재는 단일 전략 기준)
     """
     symbol = settings.symbol
 
@@ -592,8 +591,7 @@ def try_open_new_position(
     # (1) 시그널 받기 (WS 기반 market_features_ws 버전)
     signal_ctx = get_trading_signal(
         settings=settings,
-        last_trend_close_ts=last_trend_close_ts,
-        last_range_close_ts=last_range_close_ts,
+        last_close_ts=last_close_ts,
     )
     if signal_ctx is None:
         # 시그널이 없거나 모든 후보가 필터링 단계에서 탈락
@@ -1121,7 +1119,7 @@ def try_open_new_position(
     regime_at_entry = regime_label
 
     # RANGE 신호에서 넘어온 soft_mode / SL 바닥 비율(extra)을
-    # open_position_with_tp_sl 에 그대로 전달
+    # open_position_with_tp_sl 에 그대로 전달 (과거 호환용)
     soft_mode = False
     sl_floor_ratio = None
     if isinstance(extra, dict):
@@ -1256,3 +1254,4 @@ def try_open_new_position(
 
     # 진입 후에는 짧은 쿨다운
     return trade, float(getattr(settings, "post_entry_sleep_sec", 5.0))
+

@@ -17,7 +17,7 @@ GPT-5.1 트레이더용 피처로 가공하는 모듈.
    - extra["atr_fast"]          : 5m ATR
    - extra["atr_slow"]          : 15m ATR (없으면 5m ATR로 대체)
    - extra["direction_raw"]     : LONG=+1, SHORT=-1
-   - extra["direction_norm"]    : 위와 동일 (정규화 형태)
+   - extra["direction_norm"]    : 위와 동일
    - extra["regime_level"]      : TREND=1.0, RANGE=2.0, GENERIC=1.5
    - extra["market_features"]   : build_entry_features_ws(...) 전체 dict
 3) 시장 레이블 단순화
@@ -114,6 +114,17 @@ from indicators import (
 )
 
 SET = load_settings()
+
+# 반환 타입 alias: get_trading_signal 이 돌려주는 튜플 구조
+EntrySignal = Tuple[
+    str,                 # chosen_signal ("LONG"|"SHORT")
+    str,                 # signal_source ("TREND"/"RANGE"/"GENERIC"...)
+    int,                 # latest_ts (ms)
+    List[List[float]],   # candles_5m (ts, o, h, l, c)
+    List[List[float]],   # candles_5m_raw (ts, o, h, l, c, v)
+    float,               # last_price
+    Dict[str, Any],      # extra (GPT/EntryScore용 메타)
+]
 
 # 필수/옵션 타임프레임
 # - REQUIRED_TFS: 이 목록의 타임프레임은 부족/지연 시 곧바로 오류로 본다.
@@ -806,20 +817,9 @@ def build_entry_features_ws(
 def get_trading_signal(
     *,
     settings: Any,
-    last_trend_close_ts: float,
-    last_range_close_ts: float,
+    last_close_ts: float,
     symbol: Optional[str] = None,
-) -> Optional[
-    Tuple[
-        str,                     # chosen_signal ("LONG"|"SHORT")
-        str,                     # signal_source ("TREND"/"RANGE"/"GENERIC"...)
-        int,                     # latest_ts (ms)
-        List[List[float]],       # candles_5m (ts, o, h, l, c)
-        List[List[float]],       # candles_5m_raw (ts, o, h, l, c, v)
-        float,                   # last_price
-        Dict[str, Any],          # extra (GPT/EntryScore용 메타)
-    ]
-]:
+) -> Optional[EntrySignal]:
     """WS 기반 엔트리 시그널/컨텍스트를 생성한다.
 
     반환 형식:
@@ -840,7 +840,7 @@ def get_trading_signal(
         · direction_norm: 위와 동일
         · regime_level  : TREND=1.0, RANGE=2.0, GENERIC=1.5
         · market_features: build_entry_features_ws(...) 전체 dict
-        · last_trend_close_ts / last_range_close_ts: 그대로 포함
+        · last_close_ts : 최근 청산 시각(단일 전략 기준)
     """
     # 심볼 결정: 우선 settings.symbol, 없으면 글로벌 SET.symbol
     if symbol is None:
@@ -916,7 +916,10 @@ def get_trading_signal(
         log(f"[MKT-FEAT] low-volatility filter 계산 중 예외 발생: {e}")
 
     # 2) 5m 캔들 버퍼 확보 (가드/스냅샷용) - WS 버퍼 그대로 사용
-    cfg_5m = TF_CONFIG.get("5m", {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20})
+    cfg_5m = TF_CONFIG.get(
+        "5m",
+        {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    )
     try:
         buf_5m = _fetch_candles_strict(
             symbol,
@@ -1073,8 +1076,7 @@ def get_trading_signal(
         "direction_norm": direction_num,
         "regime_level": regime_level,
         "market_features": features,
-        "last_trend_close_ts": float(last_trend_close_ts),
-        "last_range_close_ts": float(last_range_close_ts),
+        "last_close_ts": float(last_close_ts),
     }
 
     # 참고용으로 일부 핵심 값도 함께 넣어 준다.

@@ -796,10 +796,13 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # (i) 새 포지션 진입 시도
-            # - 진입 신호 계산 + 각종 가드 + GPT 진입 의사결정은 entry_flow.py / gpt_decider 가 담당한다.
+           # (i) 새 포지션 진입 시도
+           # - 지금은 전략을 하나로 쓰기 때문에
+           #   last_trend_close_ts / last_range_close_ts 둘 다 동일한 LAST_CLOSE_TS 를 넘긴다.
             trade, sleep_sec = try_open_new_position(
-                SET, LAST_CLOSE_TS
+                SET, 
+                LAST_CLOSE_TS,  # last_trend_close_ts 역할
+                LAST_CLOSE_TS,  # last_range_close_ts 역할 (실제로는 같은 의미)
             )
             if trade:
                 OPEN_TRADES.append(trade)
