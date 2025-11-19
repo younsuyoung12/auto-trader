@@ -1,32 +1,14 @@
 """entry_flow.py (WS + GPT 트레이더 오케스트레이터)
 =====================================================
 역할
-----------------------------------------------------
-- run_bot.py / run_bot_ws.py 에서 한 줄로 호출하는 "진입 실행 레이어".
-- 시그널/시장 피처 계산, GPT 판단, 리스크/가드 조정은 아래 모듈이 담당한다.
-  · market_features_ws: WS 기반 시장 피처/시그널 계산
-  · gpt_trader → gpt_decider: GPT-5.1 을 이용한 진입 허용/조정 결정
-- entry_flow.py 는 다음만 담당한다.
-  1) GPT 이전 공통 가드 (수동 OFF, 잔고 0 차단)
-  2) GPT 결과에 따른 리스크/TP/SL/가드 값 적용
-  3) 거래량/가격점프/스프레드 가드 최종 확인
-  4) 수량 계산 후 open_position_with_tp_sl(...) 호출
-  5) bt_trades / bt_entry_scores / 각종 이벤트 로그 기록
+-----------------------------------------------------
+- run_bot.py / run_bot_ws.py 에서 호출하는 진입 실행 레이어.
+- WS 시세 + market_features_ws 시그널 → gpt_trader 판단 → 가드 → 주문 → 로그/DB 기록.
 
-2025-11-20 변경 사항 (레거시 레짐 제거 + GPT 전담 구조)
-----------------------------------------------------
-1) TREND/RANGE 점수·레벨·레짐 기반 자체 의사결정 로직 완전 제거.
-   - 시장 상태 판단은 market_features_ws + gpt_trader/gpt_decider 에서만 수행.
-2) regime_at_entry 및 이벤트 CSV 의 regime 필드는 전략/시그널 이름
-   (예: "TREND", "RANGE", "HYBRID", 또는 "GENERIC")만 기록.
-3) 진입/점수/DB 기록 등 엔트리 파이프라인 전체를
-   "WS 데이터 → GPT 판단 → 가드 → 주문 → bt_trades/EntryScore" 순서로 정리.
-4) entry_flow 내부에는 GPT 모델 설정/프롬프트 로직을 두지 않고,
-   gpt_trader/gpt_decider 모듈을 단순 호출만 하도록 정리.
-   - 엔트리용 후보 시그널/캔들/마지막 가격은
-     market_features_ws.get_trading_signal(...) 결과를 사용한다.
-5) market_features_ws.get_trading_signal 이 미구현/ImportError 인 경우,
-   임시 스텁을 사용하여 봇 프로세스가 죽지 않고 모든 진입을 SKIP 처리하도록 방어.
+2025-11-20 변경 요약
+-----------------------------------------------------
+- 레거시 레짐 전용 의사결정 로직 제거.
+- GPT 전담 엔트리 구조로 단순화.
 """
 
 from __future__ import annotations
@@ -59,7 +41,7 @@ from gpt_trader import decide_entry_with_gpt_trader
 
 # ✅ 시그널/피처 공급자
 # - market_features_ws.get_trading_signal 이 아직 없더라도 ImportError 로
-#   프로세스가 바로 죽지 않도록 try/except 로 방어.
+#   프로세스가 바로 죽지 않도록 방어.
 try:
     from market_features_ws import get_trading_signal  # type: ignore[attr-defined]
 except ImportError:
@@ -492,7 +474,6 @@ def _create_trade_row_on_entry(
             "updated_at": updated_at,
         }
 
-        # trend_score_at_entry / range_score_at_entry 는 레거시 컬럼 → NULL 고정
         sql = sa_text(
             """
             INSERT INTO bt_trades (
@@ -508,8 +489,6 @@ def _create_trade_row_on_entry(
                 regime_at_entry,
                 regime_at_exit,
                 entry_score,
-                trend_score_at_entry,
-                range_score_at_entry,
                 strategy,
                 close_reason,
                 leverage,
@@ -531,8 +510,6 @@ def _create_trade_row_on_entry(
                 NULL,
                 :is_auto,
                 :regime_at_entry,
-                NULL,
-                NULL,
                 NULL,
                 NULL,
                 :strategy,
@@ -608,7 +585,7 @@ def try_open_new_position(
 
     (
         chosen_signal,  # "LONG" / "SHORT"
-        signal_source,  # "TREND" / "RANGE" / "HYBRID" 등 전략 이름 (실제 의사결정은 GPT)
+        signal_source,  # 전략 이름 (실제 의사결정은 GPT)
         latest_ts,
         candles_5m,      # 기본 5m 캔들(OHLC)
         candles_5m_raw,  # 필요 시 거래량까지 포함된 원본 캔들
@@ -616,7 +593,7 @@ def try_open_new_position(
         extra,
     ) = signal_ctx
 
-    # 시장 레짐 라벨: 현재는 별도 계산 없이 시그널/전략 이름 정도만 기록용으로 사용
+    # 시장 레짐 라벨: 현재는 시그널/전략 이름 정도만 기록용으로 사용
     if isinstance(signal_source, str) and signal_source:
         regime_label: str = str(signal_source)
     else:
@@ -717,7 +694,7 @@ def try_open_new_position(
     )
 
     # (4-1) 진입 전 점수 프리뷰 (GPT 프롬프트에도 같이 들어갈 요약 정보)
-    preview_score, preview_components = _preview_entry_score_and_notify(
+    preview_score, _ = _preview_entry_score_and_notify(
         symbol=symbol,
         signal_source=signal_source,
         chosen_signal=chosen_signal,
@@ -795,6 +772,20 @@ def try_open_new_position(
     gpt_status = str(status_val).upper() if isinstance(status_val, str) else ""
     hard_stop_flag = bool(gpt_result.get("hard_stop"))
     gpt_decision = raw_decision  # EntryScore 메타용
+
+    # entry_score_preview (옵션) 안전 파싱
+    preview_score_raw = gpt_result.get("entry_score_preview")
+    try:
+        if preview_score_raw is None:
+            preview_score = None
+        elif isinstance(preview_score_raw, (int, float)):
+            preview_score = float(preview_score_raw)
+        elif isinstance(preview_score_raw, str):
+            preview_score = float(preview_score_raw)
+        else:
+            preview_score = None
+    except (TypeError, ValueError):
+        preview_score = None
 
     # (4-5) GPT 타임아웃(응답 지연) → 이 캔들만 SKIP (하드 스톱 금지)
     is_timeout = False
@@ -891,7 +882,10 @@ def try_open_new_position(
             f"reason={gpt_reason or 'no_reason'}"
         )
         log(msg)
-        send_skip_tg(msg)
+        try:
+            send_skip_tg(msg)
+        except Exception as te:
+            log(f"[GPT_ENTRY] send_skip_tg failed on general-skip: {te}")
         log_skip_event(
             symbol=symbol,
             regime=regime_label,
@@ -990,7 +984,10 @@ def try_open_new_position(
             direction=chosen_signal,
         )
         if not vol_ok:
-            send_skip_tg("[SKIP] volume_guard: volume_too_low_for_entry")
+            try:
+                send_skip_tg("[SKIP] volume_guard: volume_too_low_for_entry")
+            except Exception as te:
+                log(f"[ENTRY_GUARD] send_skip_tg failed on volume_guard: {te}")
             log_skip_event(
                 symbol=symbol,
                 regime=regime_label,
@@ -1010,7 +1007,10 @@ def try_open_new_position(
             direction=chosen_signal,
         )
         if not price_ok:
-            send_skip_tg("[SKIP] price_jump_guard: recent_price_jump_or_gap")
+            try:
+                send_skip_tg("[SKIP] price_jump_guard: recent_price_jump_or_gap")
+            except Exception as te:
+                log(f"[ENTRY_GUARD] send_skip_tg failed on price_jump_guard: {te}")
             log_skip_event(
                 symbol=symbol,
                 regime=regime_label,
@@ -1030,9 +1030,12 @@ def try_open_new_position(
             direction=chosen_signal,
         )
         if not spread_ok:
-            send_skip_tg(
-                "[SKIP] spread_guard: depth_imbalance_or_spread_too_wide"
-            )
+            try:
+                send_skip_tg(
+                    "[SKIP] spread_guard: depth_imbalance_or_spread_too_wide"
+                )
+            except Exception as te:
+                log(f"[ENTRY_GUARD] send_skip_tg failed on spread_guard: {te}")
             log_skip_event(
                 symbol=symbol,
                 regime=regime_label,
@@ -1100,10 +1103,13 @@ def try_open_new_position(
 
     qty = _round_step(qty, qty_step)
     if qty < min_qty:
-        send_skip_tg(
-            f"[SKIP] qty_too_small: qty={qty:.8f} < "
-            f"min_qty={min_qty:.8f} (notional={notional:.4f}USDT)"
-        )
+        try:
+            send_skip_tg(
+                f"[SKIP] qty_too_small: qty={qty:.8f} < "
+                f"min_qty={min_qty:.8f} (notional={notional:.4f}USDT)"
+            )
+        except Exception as te:
+            log(f"[ENTRY_QTY] send_skip_tg failed on qty_too_small: {te}")
         log_skip_event(
             symbol=symbol,
             regime=regime_label,
@@ -1118,7 +1124,7 @@ def try_open_new_position(
     side = "BUY" if chosen_signal == "LONG" else "SELL"
     regime_at_entry = regime_label
 
-    # RANGE 신호에서 넘어온 soft_mode / SL 바닥 비율(extra)을
+    # 시그널에서 넘어온 soft_mode / SL 바닥 비율(extra)을
     # open_position_with_tp_sl 에 그대로 전달 (과거 호환용)
     soft_mode = False
     sl_floor_ratio = None
@@ -1126,7 +1132,6 @@ def try_open_new_position(
         soft_mode = bool(
             extra.get("soft_mode")
             or extra.get("soft")
-            or extra.get("range_soft")
             or False
         )
         _sl_floor = extra.get("sl_floor_ratio")
@@ -1146,7 +1151,10 @@ def try_open_new_position(
         sl_floor_ratio=sl_floor_ratio,
     )
     if trade is None:
-        send_skip_tg("[SKIP] open_position_failed: trade_object_is_none")
+        try:
+            send_skip_tg("[SKIP] open_position_failed: trade_object_is_none")
+        except Exception as te:
+            log(f"[ENTRY_OPEN] send_skip_tg failed on trade_none: {te}")
         log_skip_event(
             symbol=symbol,
             regime=regime_at_entry,
@@ -1254,4 +1262,3 @@ def try_open_new_position(
 
     # 진입 후에는 짧은 쿨다운
     return trade, float(getattr(settings, "post_entry_sleep_sec", 5.0))
-
