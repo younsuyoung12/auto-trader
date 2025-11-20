@@ -41,6 +41,73 @@ _QTY_STEP: Dict[str, float] = {
 from decimal import Decimal, ROUND_DOWN, getcontext
 from urllib.parse import urlencode
 getcontext().prec = 28  # [PATCH] 수량/서명 계산 안전 여유
+def open_position_with_tp_sl(
+    settings,
+    symbol: str,
+    side_open: str,
+    qty: float,
+    entry_price_hint: float,
+    tp_pct: float,
+    sl_pct: float,
+    source: str,
+    soft_mode: bool = False,
+    sl_floor_ratio: float = None,
+):
+    """
+    run_bot_ws → entry_flow → 여기서 호출됨.
+    주문 실행 + TP/SL 설정까지 처리하는 핵심 함수.
+    """
+
+    from telelog import log, send_tg
+    from trader import Trade
+    from exchange_api import open_order_market, set_tp_sl
+
+    try:
+        # 1) 시장가 주문 실행
+        order = open_order_market(
+            symbol=symbol,
+            side=side_open,
+            qty=qty,
+        )
+        if not order:
+            log("[OPEN_POS] open_order_market failed")
+            return None
+
+        entry_price = float(order.get("avgPrice") or entry_price_hint or 0)
+
+        # 2) TP/SL 가격 계산
+        if side_open == "BUY":
+            tp_price = entry_price * (1 + tp_pct)
+            sl_price = entry_price * (1 - sl_pct)
+        else:
+            tp_price = entry_price * (1 - tp_pct)
+            sl_price = entry_price * (1 + sl_pct)
+
+        # 3) TP/SL 설정
+        set_tp_sl(
+            symbol=symbol,
+            side=side_open,
+            tp_price=tp_price,
+            sl_price=sl_price,
+        )
+
+        # 4) Trade 객체 반환
+        trade = Trade(
+            symbol=symbol,
+            side=side_open,
+            qty=qty,
+            entry_price=entry_price,
+            leverage=float(getattr(settings, "leverage", 10)),
+            source=source,
+            tp_price=tp_price,
+            sl_price=sl_price,
+        )
+
+        return trade
+
+    except Exception as e:
+        log(f"[OPEN_POS] exception: {e}")
+        return None
 
 
 def _ts_ms() -> int:
