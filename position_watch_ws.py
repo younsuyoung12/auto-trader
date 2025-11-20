@@ -5,29 +5,7 @@
 # - 웹소켓 캔들/호가에서 현재 시장 상태 요약 피처를 만들고,
 #   열린 포지션(Trade)에 대해 GPT-5.1(gpt_decider)을 통해
 #   EXIT 여부(HOLD/CLOSE)만 판단한 뒤, 실제 청산/로그/DB 업데이트만 수행하는 얇은 레이어.
-#
-# 2025-11-19 패치 (v2: 전면 GPT EXIT 레이어화)
-# ----------------------------------------------------
-# - 기존 RANGE/TREND 조기익절/조기청산, 박스↔추세 전환, 반대 시그널 강제 청산 등
-#   모든 Python 규칙 기반 EXIT 로직을 제거했다.
-# - position_watch_ws.py 는 더 이상 "전략/레짐 판단"을 하지 않고,
-#   · WS 캔들에서 last_price 와 레짐 피처(regime_features_5m)만 계산,
-#   · gpt_decider.ask_exit_decision_safe(...) 를 호출하여
-#     GPT-5.1 이 포지션 단위로 HOLD/CLOSE 를 결정,
-#   · action="CLOSE" 일 때만 거래소 청산 + CSV/DB/Telegram 후처리만 담당한다.
-# - GPT 호출 실패 시 fallback_action="HOLD" 로 동작하여
-#   추가적인 런타임 EXIT 레이어만 비활성화되고,
-#   거래소 TP/SL / 전역 손실 한도 등 하드 리스크 가드는 그대로 유지된다는 전제.
-#
-# 사용 방법 (run_bot_ws 예시)
-# ----------------------------------------------------
-#   from position_watch_ws import maybe_exit_with_gpt
-#
-#   for trade in open_trades:
-#       maybe_exit_with_gpt(trade, settings)
-#
-# - 이 파일은 "EXIT 어댑터" 이고, 실제 판단 로직은 gpt_decider.py 의
-#   ask_exit_decision_safe / GPT 프롬프트에서 관리한다.
+
 
 from __future__ import annotations
 

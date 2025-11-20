@@ -3,7 +3,7 @@
 BingX WebSocket 로우데이터(멀티 타임프레임 캔들 + depth5 오더북)를
 GPT-5.1 트레이더용 피처로 가공하는 모듈.
 
-2025-11-20 변경 사항 (엔트리 시그널 빌더 통합 + 저변동성 필터)
+2025-11-20 변경 사항 (엔트리 시그널 빌더 통합 + 저변동성 필터 + 피처 문서화/강화)
 ----------------------------------------------------
 1) get_trading_signal(...) 추가
    - build_entry_features_ws(...) 결과 + WS 5m 캔들 버퍼를 이용해
@@ -28,6 +28,12 @@ GPT-5.1 트레이더용 피처로 가공하는 모듈.
 4) 저변동성(좁은 박스장) 필터 추가
    - settings.low_vol_range_pct_threshold / low_vol_atr_pct_threshold 기준으로
      5m range_pct, atr_pct 가 모두 너무 작으면 엔트리 자체를 SKIP 처리.
+5) indicators.py 에서 계산된 고급 지표/상태 플래그를 정리해
+   GPT 프롬프트에서 바로 활용할 수 있도록 key 목록을 문서화.
+6) 저변동성/가격 정지 구간에 대한 방어 로직 강화
+   - 타임프레임별 is_low_volatility 플래그 추가.
+   - 멀티 타임프레임 요약에 low_vol_tfs(저변동성 타임프레임 수) 추가.
+   - 극단적으로 가격/거래량이 정지된 구간은 FeatureBuildError 로 취급.
 
 2025-11-19 변경 사항 (2차 - 지표 확장 + GPT 피드 최적화)
 ----------------------------------------------------
@@ -81,6 +87,82 @@ GPT-5.1 트레이더용 피처로 가공하는 모듈.
 - 데이터가 불완전한 상태에서 잘못된 판단을 내리지 않도록,
   필수 데이터가 비정상일 때는 백필/추론 없이 바로 예외를 던지고
   텔레그램 알림으로 사람에게 원인을 명확히 전달하는 것을 최우선으로 한다.
+
+
+Key Overview
+----------------------------------------------------
+[표 1] build_entry_features_ws(...) 최상위 키
+
+- symbol: str
+- checked_at_ms: int (ms 단위 헬스 체크 시각)
+- timeframes: Dict[str, Dict[str, Any]]  # "1m" / "5m" / "15m" / "1h" / "4h" / "1d"
+- orderbook: Dict[str, Any]
+- multi_timeframe: Dict[str, Any]
+
+[표 2] timeframes[iv] 공통 키 (단일 타임프레임 피처)
+
+- interval: str ("1m"/"5m"/...)
+- buffer_len: int (WS 버퍼에 사용한 캔들 개수)
+- last_close: float
+- prev_close: float
+- return_1 / return_3 / return_5: float (최근 1/3/5봉 수익률)
+- ema_fast / ema_slow: float
+- ema_fast_len / ema_slow_len: int
+- ema_dist_pct: float (fast-slow 간격 / 가격)
+- ema_fast_slope_pct: float (fast EMA 기울기 / 가격)
+- atr: float
+- atr_pct: float (ATR / 가격)
+- range_pct: float (최근 range_window 고가-저가 / 가격)
+- rsi / rsi_len: float/int
+- rsi_overbought / rsi_oversold: int (0/1 플래그)
+- macd / macd_signal / macd_hist: float
+- macd_bias: int (-1/0/1, MACD 방향)
+- bb_width_pct / bb_pos: float (볼린저 폭/위치)
+- stoch_k / stoch_d: float
+- stoch_overbought / stoch_oversold: int
+- adx: float | None
+- strong_trend_flag: int (ADX 25 이상이면 1)
+- volume_last / volume_ma / volume_ratio / volume_zscore: float
+- obv: float
+- cross_type: str ("GOLDEN"/"DEAD"/"NONE")
+- cross_bars_ago: Optional[int]
+- is_low_volatility: int (0/1, 저변동성 플래그)
+- raw_ohlcv_last20: List[Dict[str, float]]  # interval 이 1m/5m/15m 인 경우에만 존재
+- regime: Dict[str, Any]  # interval 이 5m/15m/1h 인 경우에만 존재
+
+[표 3] orderbook 피처 키
+
+- ts_ms: int (오더북 기준 시각)
+- age_sec: float (스냅샷 지연 시간)
+- best_bid / best_ask / mid_price: float
+- spread_abs / spread_pct: float
+- bid_notional / ask_notional: float
+- depth_imbalance: float in [-1, 1] or None
+- mark_price / last_price: float | None
+
+[표 4] multi_timeframe 요약 키
+
+- trend_votes: Dict[str, int]  # 각 TF 의 LONG(+1)/SHORT(-1)/중립(0) 편향
+- long_votes / short_votes: int
+- trend_align_long / trend_align_short: bool
+- majority_trend: str ("LONG"/"SHORT"/"NEUTRAL"/"MIXED")
+- adx_trend_tfs: int  # ADX >= 25 인 타임프레임 개수
+- overbought_tfs / oversold_tfs: int  # 과열/과매도 TF 수
+- low_vol_tfs: int  # is_low_volatility == 1 인 타임프레임 수
+
+[표 5] get_trading_signal(...) extra 키
+
+- signal_score: float (0~3 근사 시그널 강도)
+- atr_fast / atr_slow: float
+- direction_raw / direction_norm: float (+1 LONG / -1 SHORT)
+- regime_level: float (TREND=1.0 / RANGE=2.0 / GENERIC=1.5)
+- market_features: Dict[str, Any]  # build_entry_features_ws(...) 전체 반환값
+- last_close_ts: float (최근 청산 시각)
+- majority_trend: str
+- depth_imbalance: float | None
+- spread_pct: float | None
+- volume_zscore_5m: float | None
+- strong_trend_flag_5m: int | None
 """
 
 from __future__ import annotations
@@ -466,15 +548,31 @@ def _build_timeframe_features(
     # ADX (추세 강도)
     adx_val = adx(candles_for_calc, length=atr_len)
 
-    # OBV (On-Balance Volume)
+    # 거래량 통계 및 OBV
+    vol_last, vol_ma, vol_ratio, vol_z = _volume_stats(vols, vol_ma_len)
     obv_vals = obv(closes, vols)
     obv_last = obv_vals[-1] if obv_vals else math.nan
 
-    # 거래량 통계
-    vol_last, vol_ma, vol_ratio, vol_z = _volume_stats(vols, vol_ma_len)
-
     # 골든/데드 크로스
     cross_type, cross_bars_ago = _detect_last_cross(ema_fast_vals, ema_slow_vals)
+
+    # 극단적인 가격/거래량 정지 구간 방어
+    try:
+        if (
+            not math.isnan(range_pct)
+            and range_pct <= 0.0
+            and atr_val is not None
+            and atr_val <= 0.0
+            and isinstance(vol_ma, (int, float))
+            and vol_ma == 0.0
+        ):
+            reason = (
+                f"{interval} 최근 {range_len}개 구간 동안 가격 변동과 평균 거래량이 모두 0에 가깝습니다. "
+                "WS 시세가 멈췄거나 비정상일 수 있습니다."
+            )
+            _fail(symbol, f"flat_{interval}", reason)
+    except Exception as e:
+        log(f"[MKT-FEAT] flat-market check error interval={interval}: {e}")
 
     # 단순 상태 플래그 (GPT 가 해석하기 쉬운 0/1/-1 값)
     def _flag(condition: bool) -> int:
@@ -494,6 +592,23 @@ def _build_timeframe_features(
         strong_trend_flag = _flag(adx_val >= 25.0)
     else:
         strong_trend_flag = 0
+
+    # 저변동성 플래그 (타임프레임 단위)
+    is_low_volatility = 0
+    try:
+        if (
+            isinstance(atr_pct, (int, float))
+            and not math.isnan(atr_pct)
+            and isinstance(range_pct, (int, float))
+            and not math.isnan(range_pct)
+        ):
+            # 이 값들은 get_trading_signal 의 기본 threshold 와 동일하게 맞춘다.
+            low_range_th_local = 0.01
+            low_atr_th_local = 0.004
+            if atr_pct < low_atr_th_local and range_pct < low_range_th_local:
+                is_low_volatility = 1
+    except Exception as e:
+        log(f"[MKT-FEAT] is_low_volatility 계산 중 예외 interval={interval}: {e}")
 
     tf_features: Dict[str, Any] = {
         "interval": interval,
@@ -535,6 +650,7 @@ def _build_timeframe_features(
         "obv": obv_last,
         "cross_type": cross_type,      # "GOLDEN" / "DEAD" / "NONE"
         "cross_bars_ago": cross_bars_ago,
+        "is_low_volatility": is_low_volatility,
     }
 
     # GPT 프롬프트에서 직접 차트 패턴을 해석할 수 있게,
@@ -544,16 +660,19 @@ def _build_timeframe_features(
 
     # 5m / 15m / 1h 등의 타임프레임는 regime 피처도 같이 계산
     if interval in ("5m", "15m", "1h"):
-        regime = build_regime_features_from_candles(
-            candles_for_calc,
-            fast_ema_len=ema_fast_len,
-            slow_ema_len=ema_slow_len,
-            atr_len=atr_len,
-            rsi_len=rsi_len,
-            range_window=range_len,
-        )
-        if regime is not None:
-            tf_features["regime"] = regime
+        try:
+            regime = build_regime_features_from_candles(
+                candles_for_calc,
+                fast_ema_len=ema_fast_len,
+                slow_ema_len=ema_slow_len,
+                atr_len=atr_len,
+                rsi_len=rsi_len,
+                range_window=range_len,
+            )
+            if regime is not None:
+                tf_features["regime"] = regime
+        except Exception as e:
+            log(f"[MKT-FEAT] regime feature 계산 중 예외 interval={interval}: {e}")
 
     return tf_features
 
@@ -598,6 +717,7 @@ def _build_multi_timeframe_summary(
     adx_trend_tfs = 0
     overbought_tfs = 0
     oversold_tfs = 0
+    low_vol_tfs = 0
     for feats in tf_map.values():
         adx_val = feats.get("adx")
         if isinstance(adx_val, (int, float)) and not math.isnan(adx_val) and adx_val >= 25.0:
@@ -615,6 +735,11 @@ def _build_multi_timeframe_summary(
         elif isinstance(stoch_k_val, (int, float)) and not math.isnan(stoch_k_val) and stoch_k_val <= 20.0:
             oversold_tfs += 1
 
+        # 저변동성 타임프레임 개수 집계
+        is_lv = feats.get("is_low_volatility")
+        if isinstance(is_lv, int) and is_lv == 1:
+            low_vol_tfs += 1
+
     return {
         "trend_votes": trend_votes,
         "long_votes": long_votes,
@@ -625,6 +750,7 @@ def _build_multi_timeframe_summary(
         "adx_trend_tfs": adx_trend_tfs,       # ADX 25 이상인 타임프레임 수
         "overbought_tfs": overbought_tfs,     # RSI/스토캐스틱 과열 타임프레임 수
         "oversold_tfs": oversold_tfs,         # RSI/스토캐스틱 과매도 타임프레임 수
+        "low_vol_tfs": low_vol_tfs,           # 저변동성 타임프레임 수
     }
 
 
@@ -878,6 +1004,7 @@ def get_trading_signal(
     try:
         range_pct_5 = tf5.get("range_pct")
         atr_pct_5 = tf5.get("atr_pct")
+        is_low_vol_5 = tf5.get("is_low_volatility") == 1
 
         low_range_th = float(
             getattr(
@@ -905,11 +1032,15 @@ def get_trading_signal(
             and atr_pct_5 < low_atr_th
         )
 
-        if is_low_range and is_low_atr:
+        # 멀티 타임프레임에서 저변동성 타임프레임 수
+        low_vol_tfs = int(mtf.get("low_vol_tfs") or 0)
+
+        if (is_low_range and is_low_atr) or (is_low_vol_5 and low_vol_tfs >= 2):
             log(
                 "[MKT-FEAT] get_trading_signal: 저변동성 구간 스킵 "
-                f"(5m range_pct={range_pct_5:.4f}, atr_pct={atr_pct_5:.4f}, "
-                f"th=({low_range_th:.4f}, {low_atr_th:.4f}))"
+                f"(5m range_pct={range_pct_5:.4f if isinstance(range_pct_5, (int, float)) else float('nan')}, "
+                f"atr_pct={atr_pct_5:.4f if isinstance(atr_pct_5, (int, float)) else float('nan')}, "
+                f"th=({low_range_th:.4f}, {low_atr_th:.4f}), low_vol_tfs={low_vol_tfs})"
             )
             return None
     except Exception as e:
