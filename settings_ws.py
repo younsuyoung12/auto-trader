@@ -44,6 +44,12 @@ settings_ws.py
    - market_data_ws.get_health_snapshot(...) / is_data_healthy(...)에서 사용.
 3) _as_bool(...) 헬퍼 오타 수정 (Pylance 오류 해결).
 
+2025-11-21 패치 (GPT 진입 호출 쿨다운 추가)
+----------------------------------------------------
+1) gpt_entry_cooldown_sec 설정 추가.
+   - ENV: GPT_ENTRY_COOLDOWN_SEC (기본 120초)
+   - gpt_trader.py 에서 GPT ENTRY 호출 간 최소 간격(쿨다운)으로 사용.
+
 이 모듈은 반드시 load_settings()를 통해 읽어 사용하며,
 런타임에서 BotSettings 값을 직접 변조하지 않는다.
 """
@@ -187,6 +193,7 @@ class BotSettings:
     gpt_error_sleep_sec: float = 5.0      # GPT 오류 시 루프 대기(sec)
     gpt_skip_sleep_sec: float = 3.0       # GPT SKIP/비정상 응답 후 대기(sec)
     gpt_max_risk_pct: float = 0.03        # GPT 제안 리스크 상한 (3%)
+    gpt_entry_cooldown_sec: int = 120     # GPT ENTRY 호출 쿨다운(sec) — ENV: GPT_ENTRY_COOLDOWN_SEC
 
     # GPT가 제안하는 TP/SL 범위 (가격 기준)
     gpt_min_tp_pct: float = 0.01          # TP 하한 (기본 1%)
@@ -316,7 +323,7 @@ def load_settings() -> BotSettings:
     if ws_tfs_env:
         ws_tfs = [x.strip() for x in ws_tfs_env.split(",") if x.strip()]
     else:
-         ws_tfs = ["1m", "5m", "15m"]
+        ws_tfs = ["1m", "5m", "15m"]
 
     # REST 백필 타임프레임(B안): 기본 1m/5m/15m
     ws_backfill_tfs_env = os.getenv("WS_BACKFILL_TFS")
@@ -417,6 +424,10 @@ def load_settings() -> BotSettings:
         gpt_error_sleep_sec=_as_float(os.getenv("GPT_ERROR_SLEEP_SEC", "5.0"), 5.0),
         gpt_skip_sleep_sec=_as_float(os.getenv("GPT_SKIP_SLEEP_SEC", "3.0"), 3.0),
         gpt_max_risk_pct=_as_float(os.getenv("GPT_MAX_RISK_PCT", "0.03"), 0.03),
+        gpt_entry_cooldown_sec=_as_int(
+            os.getenv("GPT_ENTRY_COOLDOWN_SEC", "120"),
+            120,
+        ),
         # GPT TP/SL 범위
         gpt_min_tp_pct=_as_float(os.getenv("GPT_MIN_TP_PCT", "0.01"), 0.01),
         gpt_max_tp_pct=_as_float(os.getenv("GPT_MAX_TP_PCT", "0.10"), 0.10),

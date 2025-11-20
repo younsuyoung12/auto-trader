@@ -11,6 +11,13 @@
 # - 장 흐름(최근 PnL/스킵 패턴 등)과 데이터/모델 헬스에 따라, 
 #   가드·리스크 파라미터를 동적으로 조정하는 AI 게이트웨이.
 #
+# 2025-11-21 변경 사항 (GPT ENTRY 호출 쿨다운 추가)
+# ----------------------------------------------------
+# 1) settings.gpt_entry_cooldown_sec 기반 GPT ENTRY 호출 쿨다운 추가.
+#    - 마지막 GPT ENTRY 호출 이후 gpt_entry_cooldown_sec(기본 120초) 이내에는
+#      ask_entry_decision 를 호출하지 않고 즉시 SKIP 처리.
+#    - rate limit/비용 폭주 및 중복 판단 호출 방지.
+#
 # 2025-11-19 변경 사항 (WS 피처 연동 + 데이터 오류 처리 강화 + GPT 지연/장애 하드 스톱 정리)
 # ----------------------------------------------------
 # 1) market_features_ws.build_entry_features_ws(...) 연동
@@ -107,6 +114,7 @@ def _safe_tg(msg: str) -> None:
 _gpt_entry_error_streak: int = 0
 _gpt_entry_last_error_ts: float = 0.0
 _gpt_entry_hard_stop_until_ts: float = 0.0
+_gpt_entry_last_call_ts: float = 0.0  # 마지막 GPT ENTRY 호출 시각 (쿨다운용)
 
 
 def _now_ts() -> float:
@@ -492,9 +500,11 @@ def decide_entry_with_gpt_trader(
       WS 기반 피처 dict 로, GPT 가 차트/지표/오더북 상태를 한 번에 이해하기 위한 데이터.
     - GPT 진입 장애(연속 에러/타임아웃)가 일정 횟수 이상 누적되면
       → 일정 시간 동안 하드 스톱(HARD_STOP) 상태로 전환하여 신규 진입을 전부 막는다.
+    - settings.gpt_entry_cooldown_sec 에 따라 GPT ENTRY 호출 간 최소 간격을 두어
+      API rate limit 및 중복 판단 호출을 방지한다.
     """
 
-    global _gpt_entry_error_streak, _gpt_entry_last_error_ts, _gpt_entry_hard_stop_until_ts
+    global _gpt_entry_error_streak, _gpt_entry_last_error_ts, _gpt_entry_hard_stop_until_ts, _gpt_entry_last_call_ts
 
     # 설정값 (없으면 기본값 사용)
     hard_stop_min_errors = int(getattr(settings, "gpt_entry_hard_stop_min_errors", 3))
@@ -541,9 +551,31 @@ def decide_entry_with_gpt_trader(
         _gpt_entry_last_error_ts = 0.0
         _safe_log("[GPT_TRADER] HARD_STOP window ended → GPT entry gate reopened")
 
+    # 0-0) GPT ENTRY 호출 쿨다운
+    cooldown_sec = int(getattr(settings, "gpt_entry_cooldown_sec", 120))
+    if _gpt_entry_last_call_ts > 0:
+        elapsed = now_ts - _gpt_entry_last_call_ts
+        if elapsed < cooldown_sec:
+            remaining = int(cooldown_sec - elapsed)
+            result["final_action"] = "SKIP"
+            result["gpt_action"] = "SKIP"
+            result["gpt_status"] = "OK"
+            result["reason"] = (
+                "GPT ENTRY 호출 쿨다운으로 이번 루프는 진입 없이 건너뜁니다. "
+                f"({remaining}s 남음)"
+            )
+            result["sleep_after_sec"] = float(
+                getattr(settings, "gpt_skip_sleep_sec", 3.0)
+            )
+            _safe_log(
+                f"[GPT_TRADER] entry cooldown → SKIP (elapsed={elapsed:.1f}s, "
+                f"remaining={remaining}s, cooldown={cooldown_sec}s)"
+            )
+            return result
+
     # 0-1) WS 기반 피처 생성/주입
     #      - 호출측에서 market_features 를 넘겼으면 그대로 사용.
-    #      - 없으면 build_entry_features_ws(...) 로 생성.
+    #      - 없으면 build_unified_features(...) 로 생성.
     try:
         if market_features is None:
             market_features = build_unified_features(symbol=symbol)
@@ -584,6 +616,9 @@ def decide_entry_with_gpt_trader(
     )
 
     try:
+        # ENTRY 호출 시각 기록 (쿨다운용)
+        _gpt_entry_last_call_ts = _now_ts()
+
         gpt_json = ask_entry_decision(
             symbol=symbol,
             signal_source=signal_source,
