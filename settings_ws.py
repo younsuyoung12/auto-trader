@@ -316,7 +316,7 @@ def load_settings() -> BotSettings:
     if ws_tfs_env:
         ws_tfs = [x.strip() for x in ws_tfs_env.split(",") if x.strip()]
     else:
-        ws_tfs = ["1m", "5m", "15m", "1h", "4h", "1d"]
+         ws_tfs = ["1m", "5m", "15m"]
 
     # REST 백필 타임프레임(B안): 기본 1m/5m/15m
     ws_backfill_tfs_env = os.getenv("WS_BACKFILL_TFS")
