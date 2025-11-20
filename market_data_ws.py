@@ -85,7 +85,7 @@ DEFAULT_INTERVALS: List[str] = [
 WS_INTERVALS: List[str] = getattr(SET, "ws_subscribe_tfs", None) or DEFAULT_INTERVALS
 
 # 데이터 헬스 체크용 필수 타임프레임 / 지연/버퍼 기준값
-REQUIRED_INTERVALS: List[str] = getattr(SET, "ws_required_tfs", None) or WS_INTERVALS
+REQUIRED_INTERVALS: List[str] = ["1m", "5m", "15m"]
 KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 120))
 KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 600.0))  # 기본 10분
 ORDERBOOK_MAX_DELAY_SEC: float = float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0))
