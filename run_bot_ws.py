@@ -72,6 +72,7 @@ from sync_exchange import sync_open_trades_from_exchange
 from entry_flow import try_open_new_position  # 진입 쪽 GPT 결정은 entry_flow/gpt_decider 에서 처리
 from position_watch_ws import (  # WS 버전 GPT EXIT 어댑터
     maybe_exit_with_gpt,
+    EXIT_CHECK_INTERVAL_SEC,  # ★ 1분 간격 상수
 )
 # 웹소켓 시세 버퍼
 from market_data_ws import (
@@ -133,6 +134,102 @@ LAST_DATA_HEALTH_TG_TS: float = 0.0
 
 # 마지막 REST /kline 백필 성공 시각 (epoch seconds)
 LAST_REST_BACKFILL_AT: float = 0.0
+
+# GPT EXIT 체크 마지막 수행 시각 (5분 간격)
+LAST_GPT_EXIT_CHECK_TS: float = 0.0
+
+
+# ─────────────────────────────────────────────
+# GPT Latency Reporter (내장형)
+# ─────────────────────────────────────────────
+
+import threading
+import os
+import csv
+import datetime
+from telelog import send_tg, log
+
+LATENCY_DIR = os.path.join("logs", "gpt_latency")
+REPORT_INTERVAL_SEC = 1800  # 30분
+
+def _read_recent_latency(minutes=30):
+    if not os.path.isdir(LATENCY_DIR):
+        return []
+
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+    cutoff = now - datetime.timedelta(minutes=minutes)
+    rec = []
+
+    for fname in os.listdir(LATENCY_DIR):
+        if not fname.startswith("gpt-latency") and not fname.startswith("gpt_latency"):
+            continue
+        if not fname.endswith(".csv"):
+            continue
+
+        fpath = os.path.join(LATENCY_DIR, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        ts = datetime.datetime.strptime(row["ts_kst"], "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        continue
+                    if ts >= cutoff:
+                        rec.append(row)
+        except Exception as e:
+            log(f"[GPT_REPORTER] CSV read error: {e}")
+
+    return rec
+
+
+def _build_summary(records):
+    if not records:
+        return "📉 최근 30분 동안 GPT 호출 기록이 없습니다."
+
+    latencies, slow_count, err_count = [], 0, 0
+
+    for r in records:
+        if r["latency_sec"]:
+            try:
+                latencies.append(float(r["latency_sec"]))
+            except:
+                pass
+        if r.get("is_slow") == "1":
+            slow_count += 1
+        if r.get("is_timeout_or_error") == "1":
+            err_count += 1
+
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0
+    max_latency = max(latencies) if latencies else 0
+
+    summary = (
+        "📊 *GPT Latency Report — 최근 30분*\n"
+        f"• 호출 수: {len(records)}\n"
+        f"• 평균 응답 시간: {avg_latency:.2f}초\n"
+        f"• 최대 응답 시간: {max_latency:.2f}초\n"
+        f"• 느린 응답: {slow_count}건\n"
+        f"• 오류/타임아웃: {err_count}건\n"
+        f"• 성공률: {((len(records)-err_count)/len(records))*100:.1f}%\n"
+    )
+    return summary
+
+
+def start_gpt_latency_reporter():
+    def _worker():
+        log("[GPT_REPORTER] started")
+        while True:
+            try:
+                rec = _read_recent_latency(30)
+                summary = _build_summary(rec)
+                send_tg(summary)
+            except Exception as e:
+                log(f"[GPT_REPORTER ERROR] {e}")
+                send_tg(f"[GPT_REPORTER ERROR] {e}")
+            time.sleep(REPORT_INTERVAL_SEC)
+
+    t = threading.Thread(target=_worker, daemon=True, name="gpt-latency-reporter")
+    t.start()
 
 
 # ─────────────────────────────
@@ -564,7 +661,7 @@ def main() -> None:
     global RUNNING
     global OPEN_TRADES, LAST_CLOSE_TS
     global CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
-    global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS
+    global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS, LAST_GPT_EXIT_CHECK_TS
 
     # 시작 시 STOP_FLAG 있으면 바로 종료
     if os.path.exists("STOP_FLAG"):
@@ -630,6 +727,7 @@ def main() -> None:
     start_drive_sync_thread()
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
+    start_gpt_latency_reporter()   # ★ GPT 레이턴시 30분 리포트 스레드
 
     # 최초 거래소 포지션 동기화
     OPEN_TRADES, _ = sync_open_trades_from_exchange(
@@ -742,7 +840,6 @@ def main() -> None:
                         pnl=pnl,
                     )
 
-
                 last_fill_check = now
 
                 # TP/SL 재설정이 계속 실패하면 봇 중단 → idle
@@ -762,12 +859,14 @@ def main() -> None:
 
             # (e) 열린 포지션에 대한 실시간 대응 (WS 캔들 기반 GPT EXIT 레이어)
             if OPEN_TRADES:
-                for t in list(OPEN_TRADES):
-                    # GPT-5.1 이 EXIT 여부(HOLD/CLOSE)를 전적으로 결정
-                    if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
-                        OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
-                        LAST_CLOSE_TS = now
-                        continue
+                # ★ 1분(60초) 간격으로만 GPT EXIT 체크
+                if now - LAST_GPT_EXIT_CHECK_TS >= EXIT_CHECK_INTERVAL_SEC:
+                    for t in list(OPEN_TRADES):
+                        # GPT-5.1 이 EXIT 여부(HOLD/CLOSE)를 전적으로 결정
+                        if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
+                            OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
+                            LAST_CLOSE_TS = now
+                    LAST_GPT_EXIT_CHECK_TS = now
 
                 # 포지션이 여전히 남아 있으면 상태만 알리고 다음 루프로 넘어감
                 if OPEN_TRADES:

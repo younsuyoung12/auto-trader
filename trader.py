@@ -1,381 +1,464 @@
-"""
- gpt_trader.py
-
- 역할
- ----------------------------------------------------
- - BingX Auto Trader에서 GPT-5.1 트레이더 모델에 실제 요청을 보내는 모듈.
- - gpt_decider / entry_flow_ws / market_features_ws 등에서 이 모듈의
-   ask_entry_decision(...) 함수만 import 해서 사용한다.
-
- 수정 내용 (2025-11-18~2025-11-20)
- ----------------------------------------------------
- 1) OPENAI_TRADER_MODEL / OPENAI_TRADER_MAX_TOKENS / OPENAI_TRADER_MAX_LATENCY
-    환경변수로 모델명·토큰 수·최대 대기 시간을 조정할 수 있게 함.
- 2) OpenAI Python 신규 클라이언트(responses API)와 구버전(ChatCompletion) 둘 다
-    동작하도록 분기 처리.
- 3) 응답 텍스트 추출 헬퍼(_extract_text_from_response) 추가로 라이브러리 버전에
-    상관없이 최대한 안정적으로 텍스트를 파싱.
- 4) 에러/지연 시간/원문 텍스트를 모두 반환해 상위 레이어에서 로깅 및
-    디버깅에 활용할 수 있도록 구조 통일.
- 5) (2025-11-20) ask_entry_decision(...) 시그니처에
-        market_features: dict | None = None
-    파라미터를 추가.
-    - market_features 내용은 그대로 프롬프트 JSON에 포함.
-    - *args / **kwargs 를 그대로 받아 기존 호출부와 하위 호환 유지.
-"""
-
 from __future__ import annotations
 
-import os
-import time
-import json
-from typing import Any, Dict, Optional, Tuple
+"""
+trader.py
+====================================================
+포지션 엔진 (WS 버전)
+----------------------------------------------------
+- BingX Auto Trader에서 실제 포지션 상태를 나타내는 Trade 객체와
+  TP/SL 체결 여부를 확인하는 check_closes 함수를 제공한다.
+- GPT 의사결정(gpt_decider.py)은 이 파일을 직접 사용하지 않고,
+  run_bot_ws / entry_flow / position_watch_ws 가 이 모듈을 통해
+  "현재 열린 포지션 리스트"만 관리한다.
 
-from telelog import log, send_tg
-
-
-OPENAI_TRADER_MODEL = (
-    os.getenv("OPENAI_TRADER_MODEL")
-    or os.getenv("GPT_ENTRY_MODEL")
-    or "gpt-5.1-mini"
-)
-OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
-OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# OpenAI 클라이언트 초기화 (신규/구버전 모두 지원)
-# ──────────────────────────────────────────────────────────────────────────────
-try:
-    # New style OpenAI client (>=1.0)
-    from openai import OpenAI  # type: ignore
-
-    _OPENAI_CLIENT: Any = OpenAI()
-    _USE_RESPONSES_API = True
-except Exception:  # pragma: no cover - fallback for legacy library
-    try:
-        import openai  # type: ignore
-
-        _OPENAI_CLIENT = openai
-        _USE_RESPONSES_API = False
-    except Exception:
-        _OPENAI_CLIENT = None
-        _USE_RESPONSES_API = False
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 유틸 함수들
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def _safe_to_json(obj: Any, depth: int = 0, max_depth: int = 4) -> Any:
-    """settings, dataclass 등을 JSON 직렬화 가능한 형태로 최대한 변환한다."""
-    if depth > max_depth:
-        return repr(obj)
-
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-
-    if isinstance(obj, dict):
-        return {str(k): _safe_to_json(v, depth + 1, max_depth) for k, v in obj.items()}
-
-    if isinstance(obj, (list, tuple, set)):
-        return [_safe_to_json(v, depth + 1, max_depth) for v in obj]
-
-    if hasattr(obj, "as_dict") and callable(getattr(obj, "as_dict")):
-        try:
-            return _safe_to_json(obj.as_dict(), depth + 1, max_depth)
-        except Exception:
-            pass
-
-    if hasattr(obj, "__dict__"):
-        try:
-            return _safe_to_json(obj.__dict__, depth + 1, max_depth)
-        except Exception:
-            pass
-
-    return repr(obj)
-
-
-def _extract_text_from_response(resp: Any) -> str:
-    """OpenAI Responses/ChatCompletion/Completion 응답에서 텍스트를 최대한 안전하게 뽑는다."""
-    if resp is None:
-        return ""
-
-    # 1) Responses API (신규)
-    try:
-        output = getattr(resp, "output", None)
-        if output:
-            content0 = output[0].content[0]
-            text_obj = getattr(content0, "text", None)
-            if isinstance(text_obj, str):
-                return text_obj
-            if text_obj is not None:
-                val = getattr(text_obj, "value", None)
-                if isinstance(val, str):
-                    return val
-            # dict 형태인 경우 (직접 접근)
-            if isinstance(content0, dict):
-                t = content0.get("text")
-                if isinstance(t, dict) and "value" in t:
-                    return str(t["value"])
-                if isinstance(t, str):
-                    return t
-    except Exception:
-        pass
-
-    # 2) dict 형태 Responses
-    if isinstance(resp, dict):
-        try:
-            if "output" in resp:
-                content0 = resp["output"][0]["content"][0]
-                t = content0.get("text")
-                if isinstance(t, dict) and "value" in t:
-                    return str(t["value"])
-                if isinstance(t, str):
-                    return t
-        except Exception:
-            pass
-
-    # 3) ChatCompletion/Completion 스타일
-    try:
-        choices = getattr(resp, "choices", None)
-        if choices:
-            ch0 = choices[0]
-            msg = getattr(ch0, "message", None)
-            if msg is not None and getattr(msg, "content", None):
-                return str(msg.content)
-            text_attr = getattr(ch0, "text", None)
-            if text_attr:
-                return str(text_attr)
-    except Exception:
-        pass
-
-    if isinstance(resp, dict) and "choices" in resp:
-        ch0 = resp["choices"][0]
-        if isinstance(ch0, dict):
-            msg = ch0.get("message")
-            if isinstance(msg, dict) and "content" in msg:
-                return str(msg["content"])
-            if "text" in ch0:
-                return str(ch0["text"])
-
-    # 마지막 폴백
-    try:
-        return str(resp)
-    except Exception:
-        return ""
-
-
-def _call_openai_trader(prompt: str) -> Tuple[bool, str, float, Optional[Exception]]:
-    """실제 OpenAI API 를 호출하고 (성공여부, 텍스트, 지연, 에러)를 반환."""
-    if _OPENAI_CLIENT is None:
-        err = RuntimeError("openai 라이브러리가 설치되어 있지 않습니다.")
-        log(f"[GPT_TRADER] OpenAI 클라이언트 초기화 실패: {err}")
-        return False, "", 0.0, err
-
-    start = time.time()
-    try:
-        if _USE_RESPONSES_API:
-            resp = _OPENAI_CLIENT.responses.create(
-                model=OPENAI_TRADER_MODEL,
-                input=prompt,
-                max_output_tokens=OPENAI_TRADER_MAX_TOKENS,
-            )
-        else:
-            # 구버전 호환 (ChatCompletion 우선)
-            resp = _OPENAI_CLIENT.ChatCompletion.create(
-                model=OPENAI_TRADER_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=OPENAI_TRADER_MAX_TOKENS,
-            )
-        latency = time.time() - start
-        text = _extract_text_from_response(resp).strip()
-        return True, text, latency, None
-    except Exception as e:  # pragma: no cover - 네트워크 오류 등
-        latency = time.time() - start
-        log(f"[GPT_TRADER] OpenAI 호출 오류: {e}")
-        return False, "", latency, e
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 외부에서 사용하는 메인 엔트리 포인트
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def ask_entry_decision(
-    *args: Any,
-    market_features: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    """진입 여부/리스크/TP·SL 을 GPT 에게 물어보는 상위 헬퍼.
-
-    - 기존 호출부와 하위호환을 위해 *args / **kwargs 를 그대로 받아서
-      모두 JSON 컨텍스트로 넘긴다.
-    - 새로 추가된 market_features 인자는 선택적이며, prompt 에 함께 포함된다.
-
-    반환 형식 예시:
-    {
-        "status": "OK" | "ERROR" | "PARSE_ERROR",
-        "raw": "<GPT 원문>",
-        "latency": 1.23,
-        "take_trade": true/false,
-        "side": "BUY" | "SELL" | null,
-        "effective_risk_pct": 0.02,
-        "tp_pct": 0.01,
-        "sl_pct": 0.02,
-        "score": 37.5,
-        "reason": "..."
-    }
-    """
-    # 1) 컨텍스트 정리
-    context: Dict[str, Any] = {
-        "args": _safe_to_json(args),
-        "kwargs": _safe_to_json(kwargs),
-    }
-    if market_features is not None:
-        context["market_features"] = _safe_to_json(market_features)
-
-    try:
-        context_json = json.dumps(context, ensure_ascii=False)
-    except Exception as e:
-        log(f"[GPT_TRADER] 컨텍스트 JSON 직렬화 실패: {e}")
-        return {
-            "status": "ERROR",
-            "raw": "",
-            "latency": 0.0,
-            "take_trade": False,
-            "side": None,
-            "effective_risk_pct": 0.0,
-            "tp_pct": 0.0,
-            "sl_pct": 0.0,
-            "score": 0.0,
-            "reason": f"컨텍스트 직렬화 실패: {e}",
-        }
-
-    # 2) 프롬프트 구성
-    prompt = f"""
-당신은 비트코인 선물 자동매매용 GPT 트레이더입니다.
-
-아래 JSON 은 자동매매 엔진이 계산한 현재 시장 정보입니다.
-- 최근 캔들/호가 데이터
-- 기본 진입 시그널과 방향
-- 리스크/TP/SL 기본값 및 가드 결과
-- 저변동성 여부, 세션 정보 등 (market_features 포함)
-
-이 정보를 바탕으로, '지금 이 시점에 새로운 포지션을 여는 것이 합리적인지' 판단하고,
-가능하다면 방향/리스크/TP/SL 을 제안하세요.
-
-입력 JSON:
-{context_json}
-
-출력은 아래 스키마를 따르는 **순수 JSON 문자열**만 출력해야 합니다.
-
-스키마:
-{{
-  "take_trade": true | false,
-  "side": "BUY" | "SELL" | null,
-  "effective_risk_pct": 0.0,
-  "tp_pct": 0.0,
-  "sl_pct": 0.0,
-  "score": 0.0,
-  "reason": "설명 문자열"
-}}
-
-규칙:
-- take_trade 가 false 인 경우 side 는 null 이거나 "BUY"/"SELL" 이더라도 실제로는 진입하지 않는다.
-- 모든 비율(effective_risk_pct, tp_pct, sl_pct)은 0.0 ~ 0.5 사이 소수(예: 0.01 = 1%)로 작성한다.
-- JSON 바깥에 다른 텍스트를 절대 출력하지 말라.
+2025-11-20 변경 사항 (엔진 복구 + 슬리피지 가드 유틸 추가)
+----------------------------------------------------
+1) 기존 GPT 트레이더 로직(trader.py → gpt_trader.py 역할)을 분리하고,
+   이 파일을 원래처럼 포지션 엔진(Trade / TraderState / check_closes) 전용으로 사용한다.
+2) '진입 시 20틱 이상 비싸게 체결되는' 이상 체결을 감지할 수 있도록
+   슬리피지 체크 유틸(check_entry_slippage_once)과 계산 함수(evaluate_slippage)를 추가했다.
+   - tick_size, 허용 틱 수, 허용 퍼센트는 환경변수/설정으로 조정 가능:
+       · PRICE_TICK_SIZE (기본 0.1)
+       · MAX_ENTRY_SLIPPAGE_TICKS (기본 20)
+       · MAX_ENTRY_SLIPPAGE_PCT   (기본 0.0015 ≒ 0.15%)
+   - 슬리피지 경고만 보내거나, 심각한 경우 봇을 멈추도록 설정 가능:
+       · settings_ws.BotSettings.stop_on_heavy_slippage (기본 False)
+3) check_closes 는 BingX 측 open position 스냅샷을 기준으로
+   '더 이상 열려 있지 않은' 포지션을 CLOSED 이벤트로 돌려준다.
+   - 청산가는 WS 1분봉 현재가로 근사 계산한다.
+   - TP/SL 근처에서 닫힌 경우 reason 을 TP/SL 로 추정한다.
 """
 
-    ok, text, latency, err = _call_openai_trader(prompt)
+import math
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-    if not ok or not text:
-        reason = f"OpenAI 호출 실패: {err}" if err else "OpenAI 응답 없음"
-        send_tg(f"⚠️ GPT 진입 판단 호출 실패: {reason}")
-        return {
-            "status": "ERROR",
-            "raw": text,
-            "latency": latency,
-            "take_trade": False,
-            "side": None,
-            "effective_risk_pct": 0.0,
-            "tp_pct": 0.0,
-            "sl_pct": 0.0,
-            "score": 0.0,
-            "reason": reason,
-        }
+from settings_ws import load_settings
+from telelog import log, send_tg
 
-    # 3) JSON 파싱
+# settings_ws 는 다른 모듈에서도 이미 사용하므로, 여기서도 동일 인스턴스를 써도 무방하다.
+SET = load_settings()
+
+
+# ─────────────────────────────────────────
+# Trade 데이터 구조
+# ─────────────────────────────────────────
+
+
+@dataclass
+class Trade:
+    """현재 열려 있는 포지션 1건을 표현하는 경량 객체.
+
+    - symbol: "BTC-USDT" 등
+    - side  : "BUY"/"SELL" 또는 "LONG"/"SHORT" (내부에서는 LONG/SHORT 방향만 사용)
+    - qty   : 계약 수량(기본 단위는 BingX positionAmt 와 동일하게 맞춘다)
+    - entry_price: 평균 진입가
+    - leverage   : 레버리지 (PnL 계산에는 직접 사용하지 않지만 참고용으로 유지)
+    - source     : 전략/시그널 출처 (예: "MARKET", "BACKTEST", "MANUAL")
+    """
+
+    symbol: str
+    side: str
+    qty: float
+    entry_price: float
+    leverage: float
+    source: str = "MARKET"
+
+    # SL/TP 레벨 (있을 때만 사용)
+    tp_price: Optional[float] = None
+    sl_price: Optional[float] = None
+
+    # 기타 메타데이터
+    opened_at: float = field(default_factory=time.time)
+    position_side: Optional[str] = None  # "LONG"/"SHORT"/"BOTH"
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    # 슬리피지 체크 등에서 동일 포지션을 식별하기 위한 내부 ID
+    uid: str = field(
+        default_factory=lambda: f"trade-{int(time.time() * 1000)}",
+    )
+
+    def direction(self) -> str:
+        """포지션 방향을 LONG/SHORT 로 통일."""
+        s = str(self.side).upper()
+        if s in ("BUY", "LONG"):
+            return "LONG"
+        if s in ("SELL", "SHORT"):
+            return "SHORT"
+        # 알 수 없는 경우 수량 부호로 추정
+        return "LONG" if self.qty >= 0 else "SHORT"
+
+    def sign(self) -> int:
+        """PnL 계산용 방향 부호 (+1: LONG, -1: SHORT)."""
+        return 1 if self.direction() == "LONG" else -1
+
+
+# ─────────────────────────────────────────
+# TraderState: TP/SL 재설정 & 슬리피지 상태
+# ─────────────────────────────────────────
+
+
+class TraderState:
+    """봇 전체에서 공유하는 포지션 엔진 상태.
+
+    - TP/SL 재설정 실패 누적 관리 (여러 번 실패 시 봇 중단)
+    - 심각한 슬리피지 감지 시 봇 중단 플래그 관리
+    """
+
+    def __init__(
+        self,
+        *,
+        max_tp_sl_reset_failures: Optional[int] = None,
+    ) -> None:
+        if max_tp_sl_reset_failures is None:
+            # settings 또는 환경변수에서 기본값 가져오기
+            max_tp_sl_reset_failures = int(
+                getattr(SET, "max_tp_sl_reset_failures", 5)
+            )
+        self.max_tp_sl_reset_failures: int = max_tp_sl_reset_failures
+        self.tp_sl_reset_failures: int = 0
+        self.last_error: Optional[str] = None
+
+        # 슬리피지 관련 상태
+        self.slippage_checked_ids: set[str] = set()
+        self.heavy_slippage_detected: bool = False
+
+    # TP/SL 재설정 실패 관련 ------------------------------
+
+    def register_tp_sl_reset_failure(self, msg: str) -> None:
+        """TP/SL 재설정 실패 1회 기록."""
+        self.tp_sl_reset_failures += 1
+        self.last_error = msg
+        log(
+            f"[TRADER_STATE] TP/SL 재설정 실패 {self.tp_sl_reset_failures}/{self.max_tp_sl_reset_failures}: {msg}"
+        )
+
+    def reset_tp_sl_failures(self) -> None:
+        """성공적으로 TP/SL 재설정 시 카운터 초기화."""
+        if self.tp_sl_reset_failures:
+            log(
+                f"[TRADER_STATE] TP/SL 재설정 실패 카운터 초기화 "
+                f"({self.tp_sl_reset_failures} → 0)"
+            )
+        self.tp_sl_reset_failures = 0
+        self.last_error = None
+
+    # 슬리피지 관련 --------------------------------------
+
+    def mark_heavy_slippage(self) -> None:
+        """심각한 슬리피지 발생 플래그를 세팅."""
+        self.heavy_slippage_detected = True
+        log("[TRADER_STATE] 심각한 슬리피지 감지: stop_on_heavy_slippage 설정을 확인하세요.")
+
+    def should_stop_bot(self) -> bool:
+        """봇을 중단해야 할지 여부를 반환.
+
+        - TP/SL 재설정 실패가 max_tp_sl_reset_failures 이상인 경우
+        - stop_on_heavy_slippage 설정이 True 이고, heavy_slippage_detected 가 True 인 경우
+        """
+        if self.tp_sl_reset_failures >= self.max_tp_sl_reset_failures:
+            return True
+
+        stop_on_heavy = bool(getattr(SET, "stop_on_heavy_slippage", False))
+        if stop_on_heavy and self.heavy_slippage_detected:
+            return True
+
+        return False
+
+
+# ─────────────────────────────────────────
+# 슬리피지 계산/체크 유틸
+# ─────────────────────────────────────────
+
+
+def _get_env_float(name: str, default: float) -> float:
     try:
-        parsed = json.loads(text)
-        if not isinstance(parsed, dict):
-            raise ValueError("JSON 최상위가 객체(dict)가 아닙니다.")
-    except Exception as e:
-        log(f"[GPT_TRADER] 응답 JSON 파싱 실패: {e} raw={text!r}")
-        send_tg(f"⚠️ GPT 응답 파싱 실패: {e}")
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def evaluate_slippage(
+    *,
+    expected_price: float,
+    fill_price: float,
+    tick_size: Optional[float] = None,
+    max_ticks: Optional[float] = None,
+    max_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    """슬리피지 크기를 계산하고 허용 범위를 넘었는지 여부를 반환.
+
+    반환 예시:
+        {
+          "ok": False,
+          "diff_abs": 3.5,
+          "diff_ticks": 35.0,
+          "diff_pct": 0.0037,
+          "reason": "diff_ticks=35.0 > max_ticks=20.0"
+        }
+    """
+    if expected_price <= 0 or fill_price <= 0:
         return {
-            "status": "PARSE_ERROR",
-            "raw": text,
-            "latency": latency,
-            "take_trade": False,
-            "side": None,
-            "effective_risk_pct": 0.0,
-            "tp_pct": 0.0,
-            "sl_pct": 0.0,
-            "score": 0.0,
-            "reason": f"응답 JSON 파싱 실패: {e}",
+            "ok": True,
+            "diff_abs": 0.0,
+            "diff_ticks": 0.0,
+            "diff_pct": 0.0,
+            "reason": "invalid_price",
         }
 
-    # 4) 필드 추출 및 기본값 보정
-    def _as_float(v: Any, default: float) -> float:
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return default
+    if tick_size is None:
+        tick_size = _get_env_float("PRICE_TICK_SIZE", 0.1)
+    if max_ticks is None:
+        max_ticks = _get_env_float("MAX_ENTRY_SLIPPAGE_TICKS", 20.0)
+    if max_pct is None:
+        max_pct = _get_env_float("MAX_ENTRY_SLIPPAGE_PCT", 0.0015)
 
-    take_trade = bool(parsed.get("take_trade", False))
-    side = parsed.get("side")
-    if side not in ("BUY", "SELL"):
-        side = None
+    diff_abs = abs(fill_price - expected_price)
+    diff_ticks = diff_abs / tick_size if tick_size > 0 else 0.0
+    diff_pct = diff_abs / expected_price
 
-    eff_risk = _as_float(parsed.get("effective_risk_pct"), 0.0)
-    tp_pct = _as_float(parsed.get("tp_pct"), 0.0)
-    sl_pct = _as_float(parsed.get("sl_pct"), 0.0)
-    score = _as_float(parsed.get("score"), 0.0)
-    reason_text = str(parsed.get("reason", "") or "")
+    ok = True
+    reasons: List[str] = []
 
-    # 5) settings 에 따른 상한/하한 클램프 (있으면)
-    settings = kwargs.get("settings")
-    if settings is not None:
-        try:
-            max_risk = getattr(settings, "gpt_max_risk_pct", getattr(settings, "risk_pct", 0.03))
-            max_tp = getattr(settings, "gpt_max_tp_pct", getattr(settings, "tp_pct", 0.10))
-            min_tp = getattr(settings, "gpt_min_tp_pct", 0.0)
-            max_sl = getattr(settings, "gpt_max_sl_pct", getattr(settings, "sl_pct", 0.02))
-            min_sl = getattr(settings, "gpt_min_sl_pct", 0.0)
-
-            if max_risk > 0:
-                eff_risk = max(0.0, min(eff_risk, max_risk))
-            if max_tp > 0:
-                tp_pct = max(min_tp, min(tp_pct, max_tp))
-            if max_sl > 0:
-                sl_pct = max(min_sl, min(sl_pct, max_sl))
-        except Exception as e:
-            log(f"[GPT_TRADER] settings 기반 클램프 중 오류: {e}")
+    if max_ticks > 0 and diff_ticks > max_ticks:
+        ok = False
+        reasons.append(f"diff_ticks={diff_ticks:.1f} > max_ticks={max_ticks:.1f}")
+    if max_pct > 0 and diff_pct > max_pct:
+        ok = False
+        reasons.append(f"diff_pct={diff_pct:.6f} > max_pct={max_pct:.6f}")
 
     return {
-        "status": "OK",
-        "raw": text,
-        "latency": latency,
-        "take_trade": take_trade,
-        "side": side,
-        "effective_risk_pct": eff_risk,
-        "tp_pct": tp_pct,
-        "sl_pct": sl_pct,
-        "score": score,
-        "reason": reason_text,
+        "ok": ok,
+        "diff_abs": diff_abs,
+        "diff_ticks": diff_ticks,
+        "diff_pct": diff_pct,
+        "reason": ", ".join(reasons) if reasons else "",
     }
 
 
-__all__ = ["ask_entry_decision"]
+def _get_last_ws_price(symbol: str) -> Optional[float]:
+    """WS 버퍼에서 최근 1m 종가를 가져온다.
+
+    - market_data_ws.get_klines_with_volume(symbol, interval, limit=1)의
+      반환 형식이 (ts_ms, o, h, l, c, v) 라는 전제를 따른다.
+    """
+    try:
+        from market_data_ws import get_klines_with_volume as ws_get_klines_with_volume
+    except Exception as e:  # pragma: no cover - 순환 import/환경 문제
+        log(f"[TRADER] WS 캔들 함수 import 실패: {e}")
+        return None
+
+    try:
+        interval = getattr(SET, "interval", "1m") or "1m"
+        rows = ws_get_klines_with_volume(symbol, interval, limit=1)
+        if not rows:
+            return None
+        _, _o, _h, _l, c, _v = rows[-1]
+        return float(c)
+    except Exception as e:  # pragma: no cover - WS 버퍼 문제
+        log(f"[TRADER] 최근 WS 가격 조회 실패: {e}")
+        return None
+
+
+def check_entry_slippage_once(trade: Trade, state: TraderState) -> None:
+    """특정 Trade 에 대해 '1번만' 슬리피지 체크를 수행한다.
+
+    - 엔트리 직후 몇 루프 이내에 check_closes(...) 에서 호출되도록 설계했다.
+    - 기준 가격은 WS 1m 현재가를 사용한다.
+    - 허용 틱 수/퍼센트는 evaluate_slippage 의 설명을 따른다.
+    - 심각한 슬리피지이면 Telegram 경고를 보내고, stop_on_heavy_slippage 가 True 이면
+      TraderState.mark_heavy_slippage() 를 호출해 봇을 멈출 수 있게 한다.
+    """
+    if trade.uid in state.slippage_checked_ids:
+        return
+
+    last_price = _get_last_ws_price(trade.symbol)
+    if last_price is None:
+        # 데이터가 없으면 체크하지 않고 넘어간다.
+        state.slippage_checked_ids.add(trade.uid)
+        return
+
+    result = evaluate_slippage(expected_price=last_price, fill_price=trade.entry_price)
+    state.slippage_checked_ids.add(trade.uid)
+
+    if result.get("ok", True):
+        return
+
+    diff_abs = result.get("diff_abs", 0.0)
+    diff_ticks = result.get("diff_ticks", 0.0)
+    diff_pct = result.get("diff_pct", 0.0) * 100.0  # %
+    reason = result.get("reason") or ""
+
+    side_ko = "롱" if trade.direction() == "LONG" else "숏"
+
+    msg = (
+        "⚠️ 진입 슬리피지 경고\n"
+        f"- 심볼: {trade.symbol}\n"
+        f"- 방향: {side_ko}\n"
+        f"- WS 기준 현재가: {last_price:.2f}\n"
+        f"- 체결가(엔트리): {trade.entry_price:.2f}\n"
+        f"- 차이: {diff_abs:.2f} (≈ {diff_ticks:.1f}틱, {diff_pct:.3f}%)\n"
+    )
+    if reason:
+        msg += f"- 판정 사유: {reason}\n"
+
+    try:
+        send_tg(msg)
+    except Exception:
+        log(msg)
+
+    # 심각한 슬리피지 발생 시 봇을 멈출지 여부는 settings 에서 제어
+    stop_on_heavy = bool(getattr(SET, "stop_on_heavy_slippage", False))
+    if stop_on_heavy:
+        state.mark_heavy_slippage()
+
+
+# ─────────────────────────────────────────
+# TP/SL 체결 및 포지션 종료 확인
+# ─────────────────────────────────────────
+
+
+def _infer_close_reason(trade: Trade, close_price: float) -> str:
+    """TP/SL 근처면 이유를 추정해서 문자열로 돌려준다.
+
+    - TP 근처: 'tp_hit'
+    - SL 근처: 'sl_hit'
+    - 나머지: 'manual_close'
+    """
+    try:
+        tol_pct = 0.001  # 0.1% 이내면 같은 가격으로 본다.
+        if trade.tp_price:
+            if abs(close_price - trade.tp_price) / trade.tp_price <= tol_pct:
+                return "tp_hit"
+        if trade.sl_price:
+            if abs(close_price - trade.sl_price) / trade.sl_price <= tol_pct:
+                return "sl_hit"
+    except Exception:
+        pass
+    return "manual_close"
+
+
+def _approx_close_price(symbol: str, fallback: float) -> float:
+    """WS 기준 가격이 있으면 그것을, 없으면 fallback 을 사용."""
+    last_price = _get_last_ws_price(symbol)
+    if last_price is None or last_price <= 0:
+        return fallback
+    return last_price
+
+
+def check_closes(
+    open_trades: List[Trade],
+    state: TraderState,
+) -> Tuple[List[Trade], List[Dict[str, Any]]]:
+    """현재 열린 포지션 목록에서 '더 이상 거래소에 존재하지 않는' 포지션을 CLOSED 로 처리한다.
+
+    반환:
+        (new_open_trades, closed_list)
+
+    closed_list 원소 예시:
+        {
+          "trade": <Trade>,
+          "reason": "tp_hit" | "sl_hit" | "manual_close",
+          "summary": {
+              "qty": 0.001,
+              "avg_price": 93000.5,
+              "pnl": 12.34,
+          },
+        }
+    """
+    # 1) 먼저, 아직 슬리피지 체크가 안 된 Trade 들에 대해 1회씩만 체크.
+    for t in open_trades:
+        try:
+            check_entry_slippage_once(t, state)
+        except Exception as e:  # pragma: no cover - 슬리피지 체크 오류는 치명적 아님
+            log(f"[TRADER] 슬리피지 체크 중 오류: {e}")
+
+    if not open_trades:
+        return open_trades, []
+
+    # 2) 거래소의 현재 open position 스냅샷 조회
+    try:
+        from exchange_api import fetch_open_positions
+    except Exception as e:  # pragma: no cover - 환경 문제
+        log(f"[TRADER] fetch_open_positions import 실패: {e}")
+        # 거래소 상태를 알 수 없으면 청산 이벤트 없이 그대로 반환
+        return open_trades, []
+
+    # 심볼별/방향별로 남아 있는 포지션을 매핑
+    positions_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    symbols = sorted({t.symbol for t in open_trades})
+    for symbol in symbols:
+        try:
+            pos_list = fetch_open_positions(symbol) or []
+        except Exception as e:  # pragma: no cover - API 오류
+            log(f"[TRADER] fetch_open_positions({symbol}) 호출 오류: {e}")
+            continue
+
+        for p in pos_list:
+            try:
+                qty = float(
+                    p.get("positionAmt")
+                    or p.get("quantity")
+                    or p.get("size")
+                    or 0.0
+                )
+            except Exception:
+                qty = 0.0
+            if abs(qty) <= 0:
+                continue
+
+            raw_side = str(p.get("positionSide") or "").upper()
+            if raw_side in ("LONG", "SHORT"):
+                side = raw_side
+            else:
+                side = "LONG" if qty > 0 else "SHORT"
+
+            key = (symbol, side)
+            positions_by_key[key] = p
+
+    # 3) open_trades 와 비교해서 사라진 포지션을 CLOSED 로 판단
+    new_open: List[Trade] = []
+    closed_events: List[Dict[str, Any]] = []
+
+    for t in open_trades:
+        dir_key = t.direction()
+        key = (t.symbol, dir_key)
+
+        if key in positions_by_key:
+            # 아직 거래소에 포지션이 살아 있으므로 open 으로 유지
+            new_open.append(t)
+            continue
+
+        # 거래소 스냅샷에서 해당 방향 포지션이 사라졌다면 → TP/SL/수동청산으로 본다.
+        close_price = _approx_close_price(t.symbol, t.entry_price)
+
+        # PnL 근사 계산 (선물 PnL = (close - entry) * qty * 방향부호)
+        pnl = (close_price - t.entry_price) * t.qty * t.sign()
+
+        reason = _infer_close_reason(t, close_price)
+        summary = {
+            "qty": t.qty,
+            "avg_price": close_price,
+            "pnl": pnl,
+        }
+        closed_events.append(
+            {
+                "trade": t,
+                "reason": reason,
+                "summary": summary,
+            }
+        )
+
+    return new_open, closed_events
+
+
+__all__ = [
+    "Trade",
+    "TraderState",
+    "evaluate_slippage",
+    "check_entry_slippage_once",
+    "check_closes",
+]

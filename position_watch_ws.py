@@ -5,7 +5,13 @@
 # - 웹소켓 캔들/호가에서 현재 시장 상태 요약 피처를 만들고,
 #   열린 포지션(Trade)에 대해 GPT-5.1(gpt_decider)을 통해
 #   EXIT 여부(HOLD/CLOSE)만 판단한 뒤, 실제 청산/로그/DB 업데이트만 수행하는 얇은 레이어.
-
+#
+# 사용 방식
+# ----------------------------------------------------
+# - run_bot_ws / 별도 워커 루프에서 열린 포지션마다
+#     maybe_exit_with_gpt(trade, settings, scenario="GENERIC_EXIT_CHECK")
+#   를 **약 5분(300초)** 간격으로 호출하는 것을 권장한다.
+#   (이 주기는 아래 EXIT_CHECK_INTERVAL_SEC 상수로 노출한다.)
 
 from __future__ import annotations
 
@@ -27,6 +33,9 @@ from signals_logger import (
 from trader import Trade
 from gpt_decider import ask_exit_decision_safe
 from indicators import build_regime_features_from_candles
+
+# 이 모듈에서 권장하는 EXIT 체크 주기 (초 단위, 현재 5분)
+EXIT_CHECK_INTERVAL_SEC: float = 60
 
 # DB 연동 (bt_trades)
 try:
@@ -508,4 +517,5 @@ def maybe_exit_with_gpt(
 
 __all__ = [
     "maybe_exit_with_gpt",
+    "EXIT_CHECK_INTERVAL_SEC",
 ]

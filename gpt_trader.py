@@ -68,7 +68,7 @@ from typing import Any, Dict, Optional
 
 from settings_ws import BotSettings
 from gpt_decider import ask_entry_decision
-from market_features_ws import build_entry_features_ws, FeatureBuildError
+from unified_features_builder import build_unified_features, UnifiedFeatureError
 
 
 # ─────────────────────────────────────────
@@ -543,8 +543,8 @@ def decide_entry_with_gpt_trader(
     #      - 없으면 build_entry_features_ws(...) 로 생성.
     try:
         if market_features is None:
-            market_features = build_entry_features_ws(symbol)
-    except FeatureBuildError as e:
+            market_features = build_unified_features(symbol=symbol)
+    except UnifiedFeatureError as e:
         # WS 데이터 부족/지연 → GPT 를 부르지 않고 안전하게 SKIP
         result["final_action"] = "SKIP"
         result["gpt_action"] = "SKIP"
