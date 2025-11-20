@@ -9,6 +9,13 @@
 -----------------------------------------------------
 - 레거시 레짐 전용 의사결정 로직 제거.
 - GPT 전담 엔트리 구조로 단순화.
+
+2025-11-21 변경 요약 (GPT 엔트리 쿨다운 + PREVIEW 스팸 제어)
+-----------------------------------------------------
+- GPT 엔트리 쿨다운을 entry_flow 레벨에서 추가.
+  · settings.gpt_entry_cooldown_sec / ENV GPT_ENTRY_COOLDOWN_SEC 로 설정 (기본 30초).
+  · 쿨다운 중에는 PREVIEW/GPT 호출 모두 SKIP, gpt_entry_cooldown 이벤트만 기록.
+- GPT 쿨다운 구간에서는 Entry PREVIEW 텔레그램도 발생하지 않도록 차단.
 """
 
 from __future__ import annotations
@@ -75,6 +82,37 @@ except Exception:  # pragma: no cover - DB가 아직 준비되지 않은 환경 
 
 # GPT-5 메타 정보 (entry_flow 에서는 로깅/메타 정보용으로만 사용)
 DEFAULT_GPT_ENTRY_MODEL = "gpt-5.1"
+
+# GPT 엔트리 쿨다운 (PREVIEW + GPT 호출 공통)
+_DEFAULT_GPT_ENTRY_COOLDOWN_SEC = 30.0
+_LAST_GPT_ENTRY_TS: float = 0.0
+
+
+def _get_gpt_entry_cooldown_sec(settings: Any) -> float:
+    """GPT 엔트리 쿨다운(초)을 settings/env 에서 읽어서 돌려준다.
+
+    우선순위:
+    1) settings.gpt_entry_cooldown_sec (숫자형) 이 있으면 사용
+    2) ENV GPT_ENTRY_COOLDOWN_SEC 이 있으면 float 로 파싱해서 사용
+    3) 둘 다 없으면 _DEFAULT_GPT_ENTRY_COOLDOWN_SEC (기본 30초)
+    """
+    val = getattr(settings, "gpt_entry_cooldown_sec", None)
+    if isinstance(val, (int, float)):
+        return float(val)
+
+    env_val = os.getenv("GPT_ENTRY_COOLDOWN_SEC")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            log(
+                f"[GPT_ENTRY] invalid GPT_ENTRY_COOLDOWN_SEC env: {env_val} "
+                f"→ fallback to default={_DEFAULT_GPT_ENTRY_COOLDOWN_SEC}"
+            )
+            return _DEFAULT_GPT_ENTRY_COOLDOWN_SEC
+
+    return _DEFAULT_GPT_ENTRY_COOLDOWN_SEC
+
 
 # ✅ 웹소켓 시세 버퍼에서 거래량까지 있는 캔들을 가져오기
 # - ws_get_klines_with_volume(symbol, interval, limit)
@@ -693,6 +731,44 @@ def try_open_new_position(
         if isinstance(extra, dict) and extra.get("effective_risk_pct") is not None
         else risk_pct
     )
+
+    # (4-0) GPT 엔트리 쿨다운 (PREVIEW/GPT 모두 포함)
+    # - 너무 잦은 WS 시그널로 인해 PREVIEW + GPT SKIP 이 몇 초 간격으로 반복되는 현상 방지.
+    global _LAST_GPT_ENTRY_TS
+    cooldown_sec = _get_gpt_entry_cooldown_sec(settings)
+    now_ts = time.time()
+    if cooldown_sec > 0 and _LAST_GPT_ENTRY_TS > 0.0:
+        elapsed = now_ts - _LAST_GPT_ENTRY_TS
+        if elapsed < cooldown_sec:
+            remain = max(cooldown_sec - elapsed, 0.0)
+            msg = (
+                f"[GPT_ENTRY][COOLDOWN] gpt_entry_cooldown active → "
+                f"skip preview+gpt ({remain:.0f}s remaining)"
+            )
+            log(msg)
+            try:
+                send_skip_tg(msg)
+            except Exception as te:
+                log(f"[GPT_ENTRY] send_skip_tg failed on cooldown: {te}")
+            log_skip_event(
+                symbol=symbol,
+                regime=regime_label,
+                source="entry_flow.gpt_entry_cooldown",
+                side=chosen_signal,
+                reason="gpt_entry_cooldown_active",
+                extra={
+                    "remain_sec": float(remain),
+                    "cooldown_sec": float(cooldown_sec),
+                },
+            )
+            # 남은 쿨다운 시간과 GPT_SKIP_SLEEP_SEC 중 큰 값으로 슬립
+            sleep_sec = float(
+                max(remain, getattr(settings, "gpt_skip_sleep_sec", 3.0))
+            )
+            return None, sleep_sec
+
+    # 이 캔들을 GPT 후보로 평가하기로 했으므로 타임스탬프 갱신
+    _LAST_GPT_ENTRY_TS = now_ts
 
     # (4-1) 진입 전 점수 프리뷰 (GPT 프롬프트에도 같이 들어갈 요약 정보)
     preview_score, _ = _preview_entry_score_and_notify(
