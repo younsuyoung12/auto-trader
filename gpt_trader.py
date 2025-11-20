@@ -68,8 +68,10 @@ from typing import Any, Dict, Optional
 
 from settings_ws import BotSettings
 from gpt_decider import ask_entry_decision
-from unified_features_builder import build_unified_features, UnifiedFeatureError
-
+from unified_features_builder import (
+    build_unified_features,
+    UnifiedFeaturesError as UnifiedFeatureError,   # 이름 통일
+)
 
 # ─────────────────────────────────────────
 # 내부 유틸 (텔레그램/로그)
@@ -83,7 +85,7 @@ def _safe_log(msg: str) -> None:
 
         log(msg)
     except Exception:
-        pass
+        pass      
 
 
 def _safe_tg(msg: str) -> None:
@@ -94,6 +96,7 @@ def _safe_tg(msg: str) -> None:
         send_tg(msg)
     except Exception:
         pass
+        
 
 
 # ─────────────────────────────────────────
