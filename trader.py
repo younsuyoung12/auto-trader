@@ -33,6 +33,16 @@ from typing import Any, Dict, Optional, Tuple
 
 from telelog import log, send_tg
 
+
+OPENAI_TRADER_MODEL = (
+    os.getenv("OPENAI_TRADER_MODEL")
+    or os.getenv("GPT_ENTRY_MODEL")
+    or "gpt-5.1-mini"
+)
+OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
+OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # OpenAI 클라이언트 초기화 (신규/구버전 모두 지원)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -51,15 +61,6 @@ except Exception:  # pragma: no cover - fallback for legacy library
     except Exception:
         _OPENAI_CLIENT = None
         _USE_RESPONSES_API = False
-
-
-OPENAI_TRADER_MODEL = (
-    os.getenv("OPENAI_TRADER_MODEL")
-    or os.getenv("GPT_ENTRY_MODEL")
-    or "gpt-5.1-mini"
-)
-OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
-OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
