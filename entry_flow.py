@@ -30,7 +30,8 @@ from exchange_api import (
     get_available_usdt,
     get_balance_detail,
 )
-from trader import open_position_with_tp_sl, Trade
+from trader import Trade
+from exchange_api import open_position_with_tp_sl
 from signals_logger import (
     log_signal,
     log_candle_snapshot,
