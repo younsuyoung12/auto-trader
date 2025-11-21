@@ -6,12 +6,30 @@
 #   열린 포지션(Trade)에 대해 GPT-5.1(gpt_decider)을 통해
 #   EXIT 여부(HOLD/CLOSE)만 판단한 뒤, 실제 청산/로그/DB 업데이트만 수행하는 얇은 레이어.
 #
+# 2025-11-21 변경 사항 (1m 캔들 종가 기반 run_bot_ws 연동)
+# ----------------------------------------------------
+# - run_bot_ws.py 가 1m WS 캔들이 새로 생성되는 시점(직전 1분봉 종가 확정 시점)에
+#   maybe_exit_with_gpt(...) 를 호출하도록 변경되었으며,
+#   이 모듈은 "한 번 호출 시의 EXIT 판단" 로직에만 집중한다.
+# - EXIT_CHECK_INTERVAL_SEC 는 여전히 이 모듈을 별도 워커에서 재사용할 때 참고용으로
+#   권장 최소 호출 주기(현재 60초)를 의미하지만, run_bot_ws 메인 루프에서는 사용하지 않는다.
+#
+# 2025-11-22 변경 사항 (EXIT 실시간 분석 텔레그램 요약)
+# ----------------------------------------------------
+# - maybe_exit_with_gpt(...) 에서 GPT EXIT 판단 직후, 진입 때와 유사한 형태의
+#   상세 분석 요약을 텔레그램으로 전송하는 옵션(exit_debug_notify)을 추가했다.
+#   · BotSettings.exit_debug_notify 가 True 인 경우에만 전송(기본값 False).
+#   · 심볼/방향/시나리오/PnL%/1m 캔들/레짐 요약/GPT 코멘트가 포함된다.
+# - 기존 EXIT/HOLD 로직, DB 업데이트, CSV 로깅 동작에는 영향을 주지 않는다.
+#
 # 사용 방식
 # ----------------------------------------------------
-# - run_bot_ws / 별도 워커 루프에서 열린 포지션마다
+# - run_bot_ws 메인 루프:
+#     · 1m WS 캔들이 새로 생성된 타이밍에 열린 포지션마다
+#       maybe_exit_with_gpt(trade, settings, scenario="RUNTIME_EXIT_CHECK") 호출.
+# - 별도 워커/스크립트에서 이 모듈을 직접 사용할 때는
 #     maybe_exit_with_gpt(trade, settings, scenario="GENERIC_EXIT_CHECK")
-#   를 **약 5분(300초)** 간격으로 호출하는 것을 권장한다.
-#   (이 주기는 아래 EXIT_CHECK_INTERVAL_SEC 상수로 노출한다.)
+#   를 **약 1분(60초)** 간격(EXIT_CHECK_INTERVAL_SEC)으로 호출하는 패턴을 권장한다.
 
 from __future__ import annotations
 
@@ -34,7 +52,7 @@ from trader import Trade
 from gpt_decider import ask_exit_decision_safe
 from indicators import build_regime_features_from_candles
 
-# 이 모듈에서 권장하는 EXIT 체크 주기 (초 단위, 현재 5분)
+# 이 모듈에서 권장하는 EXIT 체크 주기 (초 단위, 현재 60초)
 EXIT_CHECK_INTERVAL_SEC: float = 60
 
 # DB 연동 (bt_trades)
@@ -346,6 +364,165 @@ def _update_trade_close_in_db(
 
 
 # ─────────────────────────────────────────
+# EXIT 디버그 요약 텔레그램 전송 헬퍼
+# ─────────────────────────────────────────
+
+
+def _extract_gpt_reason_for_tg(gpt_data: Any) -> str:
+    """gpt_decider 가 돌려준 데이터에서 사람 눈으로 볼 만한 코멘트만 추출한다."""
+    text: str = ""
+    try:
+        if isinstance(gpt_data, dict):
+            for key in ("reason", "exit_reason", "summary", "comment", "explanation"):
+                val = gpt_data.get(key)
+                if isinstance(val, str) and val.strip():
+                    text = val.strip()
+                    break
+            if not text:
+                parsed = gpt_data.get("parsed")
+                if isinstance(parsed, dict):
+                    for key in ("reason", "summary", "comment"):
+                        val = parsed.get(key)
+                        if isinstance(val, str) and val.strip():
+                            text = val.strip()
+                            break
+            if not text:
+                for key in ("raw_text", "response_text", "content"):
+                    val = gpt_data.get(key)
+                    if isinstance(val, str) and val.strip():
+                        text = val.strip()
+                        break
+        elif isinstance(gpt_data, str):
+            text = gpt_data.strip()
+        else:
+            text = ""
+    except Exception:
+        text = ""
+
+    if not text:
+        return ""
+    if len(text) > 400:
+        return text[:400] + " ... (생략)"
+    return text
+
+
+def _build_regime_summary_for_tg(regime_features: Dict[str, Any]) -> str:
+    """regime_features dict 에서 몇 가지 핵심 지표만 골라 한 줄 요약 문자열로 만든다."""
+    if not isinstance(regime_features, dict) or not regime_features:
+        return ""
+
+    key_candidates = [
+        "trend_label",
+        "trend_strength",
+        "trend_score",
+        "boxiness",
+        "volatility_score",
+        "rsi",
+        "stoch_rsi",
+        "adx",
+        "macd_hist",
+        "atr_pct",
+    ]
+
+    parts: List[str] = []
+    for key in key_candidates:
+        if key not in regime_features:
+            continue
+        val = regime_features.get(key)
+        try:
+            if isinstance(val, float):
+                parts.append(f"{key}={val:.3f}")
+            else:
+                parts.append(f"{key}={val}")
+        except Exception:
+            parts.append(f"{key}={val}")
+
+    if not parts:
+        return ""
+    return ", ".join(parts)
+
+
+def _send_exit_debug_summary(
+    *,
+    trade: Trade,
+    scenario: str,
+    action: str,
+    gpt_ctx: Dict[str, Any],
+    gpt_data: Any,
+) -> None:
+    """EXIT 판단 시 진입처럼 상세 분석 요약을 텔레그램으로 전송한다.
+
+    - settings.exit_debug_notify 가 True 일 때만 호출되도록 maybe_exit_with_gpt 에서 제어한다.
+    - 예외가 발생하더라도 본래 EXIT 흐름에는 영향을 주지 않는다.
+    """
+    try:
+        pnl_pct = gpt_ctx.get("pnl_pct")
+        if isinstance(pnl_pct, (int, float)):
+            pnl_pct_str = f"{pnl_pct*100:.3f}%"
+        else:
+            pnl_pct_str = "n/a"
+
+        candle = gpt_ctx.get("candle_1m") or {}
+        o = candle.get("open")
+        h = candle.get("high")
+        l = candle.get("low")
+        c = candle.get("close")
+        v = candle.get("volume")
+
+        candle_bits: List[str] = []
+        try:
+            if all(isinstance(x, (int, float)) for x in (o, h, l, c)):
+                candle_bits.append(
+                    f"O/H/L/C={float(o):.2f}/{float(h):.2f}/{float(l):.2f}/{float(c):.2f}"
+                )
+            if isinstance(v, (int, float)):
+                candle_bits.append(f"거래량={float(v):.3f}")
+        except Exception:
+            pass
+        candle_line = " / ".join(candle_bits) if candle_bits else "캔들 정보 부족"
+
+        regime_features = gpt_ctx.get("regime_features") or {}
+        regime_summary = _build_regime_summary_for_tg(regime_features)
+
+        gpt_reason = _extract_gpt_reason_for_tg(gpt_data)
+
+        side_raw = (trade.side or "").upper()
+        if side_raw in ("BUY", "LONG"):
+            side_text = "롱"
+        elif side_raw in ("SELL", "SHORT"):
+            side_text = "숏"
+        else:
+            side_text = side_raw or "UNKNOWN"
+
+        lines: List[str] = [
+            "📘 [EXIT 실시간 분석 요약]",
+            f"- 심볼: {trade.symbol}",
+            f"- 방향: {side_text}",
+            f"- 시나리오: {scenario}",
+            f"- GPT 결론: {action}",
+            f"- 현재 PnL: {pnl_pct_str}",
+            "",
+            "📈 1분봉 캔들:",
+            f"  · {candle_line}",
+        ]
+
+        if regime_summary:
+            lines.append("")
+            lines.append("📊 레짐/지표 요약:")
+            lines.append(f"  · {regime_summary}")
+
+        if gpt_reason:
+            lines.append("")
+            lines.append("🧠 GPT 코멘트:")
+            lines.append(f"  {gpt_reason}")
+
+        msg = "\n".join(lines)
+        send_tg(msg)
+    except Exception as e:  # pragma: no cover - 디버그 요약은 실패해도 무시
+        log(f"[PW][EXIT_DEBUG] build/send summary failed: {e}")
+
+
+# ─────────────────────────────────────────
 # 공개 함수: GPT 기반 단일 EXIT 체크
 # ─────────────────────────────────────────
 
@@ -427,6 +604,16 @@ def maybe_exit_with_gpt(
         extra=gpt_ctx,
         fallback_action="HOLD",  # GPT 오류/타임아웃 시 추가 EXIT 레이어만 비활성화
     )
+
+    # 옵션 B: 진입처럼 상세 EXIT 분석 요약을 텔레그램으로 전송 (settings.exit_debug_notify=True 인 경우)
+    if getattr(settings, "exit_debug_notify", False):
+        _send_exit_debug_summary(
+            trade=trade,
+            scenario=scenario,
+            action=action,
+            gpt_ctx=gpt_ctx,
+            gpt_data=gpt_data,
+        )
 
     if action != "CLOSE":
         # HOLD or 기타 → 청산하지 않음

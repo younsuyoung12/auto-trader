@@ -28,7 +28,7 @@ trader.py
    - 청산가는 WS 1분봉 현재가로 근사 계산한다.
    - TP/SL 근처에서 닫힌 경우 reason 을 TP/SL 로 추정한다.
 
-2025-11-21 변경 사항 (Trade.entry 필드 추가 + entry_price 동기화)
+2025-11-21 변경 사항 (Trade.entry 필드 추가 + entry_price 동기화 + entry_order_id 지원)
 ----------------------------------------------------
 1) DB/EXIT 레이어에서 사용하는 trade.entry 필드를 Trade dataclass 에 정식 필드로 추가했다.
    - 기존 코드에서 trade.entry 를 getattr(..., "entry", ...) 형식으로 사용하던 부분과,
@@ -36,6 +36,9 @@ trader.py
 2) entry_price 와 entry 가 항상 같은 값을 가지도록 __post_init__ 에서 동기화 로직을 추가했다.
    - entry_price 만 설정된 경우 → entry 를 entry_price 로 자동 보정.
    - (향후) entry 만 설정된 경우 → entry_price 를 entry 로 자동 보정.
+3) 수동/자동 진입 공통으로 최초 진입 주문 ID 를 저장할 수 있도록 entry_order_id 필드를 추가했다.
+   - Trade(..., entry_order_id=...) 형태의 생성자를 정식으로 허용한다.
+   - 없으면 None 으로 유지한다.
 """
 
 import math
@@ -60,13 +63,14 @@ SET = load_settings()
 class Trade:
     """현재 열려 있는 포지션 1건을 표현하는 경량 객체.
 
-    - symbol: "BTC-USDT" 등
-    - side  : "BUY"/"SELL" 또는 "LONG"/"SHORT" (내부에서는 LONG/SHORT 방향만 사용)
-    - qty   : 계약 수량(기본 단위는 BingX positionAmt 와 동일하게 맞춘다)
-    - entry_price: 평균 진입가 (기존 필드, entry 와 항상 동일하게 유지)
-    - leverage   : 레버리지 (PnL 계산에는 직접 사용하지 않지만 참고용으로 유지)
-    - source     : 전략/시그널 출처 (예: "MARKET", "BACKTEST", "MANUAL")
-    - entry      : DB/EXIT/리포트 레이어에서 사용하는 통합 진입가 필드 (entry_price alias)
+    - symbol         : "BTC-USDT" 등
+    - side           : "BUY"/"SELL" 또는 "LONG"/"SHORT" (내부에서는 LONG/SHORT 방향만 사용)
+    - qty            : 계약 수량(기본 단위는 BingX positionAmt 와 동일하게 맞춘다)
+    - entry_price    : 평균 진입가 (기존 필드, entry 와 항상 동일하게 유지)
+    - leverage       : 레버리지 (PnL 계산에는 직접 사용하지 않지만 참고용으로 유지)
+    - source         : 전략/시그널 출처 (예: "MARKET", "BACKTEST", "MANUAL")
+    - entry          : DB/EXIT/리포트 레이어에서 사용하는 통합 진입가 필드 (entry_price alias)
+    - entry_order_id : 최초 진입 주문의 ID (자동/수동 공통, 있을 때만 사용)
     """
 
     symbol: str
@@ -95,6 +99,11 @@ class Trade:
     # - GPT EXIT/DB 로깅 코드: trade.entry 를 사용.
     # - __post_init__ 에서 entry 와 entry_price 를 서로 동기화한다.
     entry: float = 0.0
+
+    # 최초 진입 주문 ID (자동/수동 공통).
+    # - 수동 진입 시 open_position_with_tp_sl(..., entry_order_id=...) 에서 채워질 수 있다.
+    # - 없으면 None 으로 남겨두고, 필요 시 로깅/리포트에서만 사용한다.
+    entry_order_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         """entry_price 와 entry 필드를 상호 동기화한다.
