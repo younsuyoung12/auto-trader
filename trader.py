@@ -27,6 +27,15 @@ trader.py
    '더 이상 열려 있지 않은' 포지션을 CLOSED 이벤트로 돌려준다.
    - 청산가는 WS 1분봉 현재가로 근사 계산한다.
    - TP/SL 근처에서 닫힌 경우 reason 을 TP/SL 로 추정한다.
+
+2025-11-21 변경 사항 (Trade.entry 필드 추가 + entry_price 동기화)
+----------------------------------------------------
+1) DB/EXIT 레이어에서 사용하는 trade.entry 필드를 Trade dataclass 에 정식 필드로 추가했다.
+   - 기존 코드에서 trade.entry 를 getattr(..., "entry", ...) 형식으로 사용하던 부분과,
+     open_position_with_tp_sl(...) 가 Trade(..., entry=...) 로 생성하던 부분을 정식 지원.
+2) entry_price 와 entry 가 항상 같은 값을 가지도록 __post_init__ 에서 동기화 로직을 추가했다.
+   - entry_price 만 설정된 경우 → entry 를 entry_price 로 자동 보정.
+   - (향후) entry 만 설정된 경우 → entry_price 를 entry 로 자동 보정.
 """
 
 import math
@@ -54,9 +63,10 @@ class Trade:
     - symbol: "BTC-USDT" 등
     - side  : "BUY"/"SELL" 또는 "LONG"/"SHORT" (내부에서는 LONG/SHORT 방향만 사용)
     - qty   : 계약 수량(기본 단위는 BingX positionAmt 와 동일하게 맞춘다)
-    - entry_price: 평균 진입가
+    - entry_price: 평균 진입가 (기존 필드, entry 와 항상 동일하게 유지)
     - leverage   : 레버리지 (PnL 계산에는 직접 사용하지 않지만 참고용으로 유지)
     - source     : 전략/시그널 출처 (예: "MARKET", "BACKTEST", "MANUAL")
+    - entry      : DB/EXIT/리포트 레이어에서 사용하는 통합 진입가 필드 (entry_price alias)
     """
 
     symbol: str
@@ -79,6 +89,35 @@ class Trade:
     uid: str = field(
         default_factory=lambda: f"trade-{int(time.time() * 1000)}",
     )
+
+    # 통합 진입가 필드 (백워드 호환용)
+    # - 기존 코드: entry_price 만 사용.
+    # - GPT EXIT/DB 로깅 코드: trade.entry 를 사용.
+    # - __post_init__ 에서 entry 와 entry_price 를 서로 동기화한다.
+    entry: float = 0.0
+
+    def __post_init__(self) -> None:
+        """entry_price 와 entry 필드를 상호 동기화한다.
+
+        - 기존 코드에서는 entry_price 만 사용했기 때문에
+          entry 가 0 이하이면 entry_price 값을 그대로 복사한다.
+        - (향후) 만약 entry 만 설정하고 entry_price 가 0 이하라면
+          entry_price 를 entry 값으로 복사한다.
+        """
+        # dataclass(frozen=False)이므로 object.__setattr__ 로 안전하게 보정
+        try:
+            ep = float(self.entry_price)
+        except Exception:
+            ep = 0.0
+        try:
+            e_val = float(getattr(self, "entry", 0.0) or 0.0)
+        except Exception:
+            e_val = 0.0
+
+        if e_val <= 0 and ep > 0:
+            object.__setattr__(self, "entry", ep)
+        elif e_val > 0 and ep <= 0:
+            object.__setattr__(self, "entry_price", e_val)
 
     def direction(self) -> str:
         """포지션 방향을 LONG/SHORT 로 통일."""
