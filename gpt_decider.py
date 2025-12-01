@@ -619,7 +619,7 @@ def _normalize_and_validate_entry_response(
         v = _check_float("tp_pct", data["tp_pct"], 0.0, 0.5)
         if base_tp_pct > 0:
             ratio = v / base_tp_pct
-            if not (0.25 <= ratio <= 4.0):
+            if not (0.02 <= ratio <= 4.0):
                 raise ValueError(
                     f"GPT entry response 의 tp_pct={v:.6f} 가 base_tp_pct 대비 비정상 비율(ratio={ratio:.2f})입니다."
                 )
@@ -629,7 +629,7 @@ def _normalize_and_validate_entry_response(
         v = _check_float("sl_pct", data["sl_pct"], 0.0, 0.5)
         if base_sl_pct > 0:
             ratio = v / base_sl_pct
-            if not (0.25 <= ratio <= 4.0):
+            if not (0.02 <= ratio <= 4.0):
                 raise ValueError(
                     f"GPT entry response 의 sl_pct={v:.6f} 가 base_sl_pct 대비 비정상 비율(ratio={ratio:.2f})입니다."
                 )
@@ -639,7 +639,7 @@ def _normalize_and_validate_entry_response(
         v = _check_float("effective_risk_pct", data["effective_risk_pct"], 0.0, 0.2)
         if base_risk_pct > 0:
             ratio = v / base_risk_pct
-            if not (0.25 <= ratio <= 4.0):
+            if not (0.02 <= ratio <= 4.0):
                 raise ValueError(
                     "GPT entry response 의 effective_risk_pct="
                     f"{v:.6f} 가 기존 리스크 대비 비정상 비율(ratio={ratio:.2f})입니다."
