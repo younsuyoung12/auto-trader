@@ -1,114 +1,94 @@
 from __future__ import annotations
 
-"""
-gpt_decider.py
-====================================================
-역할
-----------------------------------------------------
-- BingX Auto Trader에서 진입/청산 의사결정을 GPT-5.1에 위임하는 브레인 모듈.
-- gpt_trader / position_watch_ws 등에서 이 모듈만 import 해서 사용한다.
-
-2025-12-01 변경 사항 (WS market_features + NaN/None 직렬화 보정)
-----------------------------------------------------
-1) market_features 및 extra 안의 숫자 필드에서 None/NaN/Infinity 값을 GPT 프롬프트 직전에 0으로 단순 치환해,
-   "None"/"NaN" 문자열이 프롬프트에 그대로 노출되지 않도록 했다.
-2) pattern_score, trend_strength, range_strength, volatility_score, multi_timeframe signals, risk_flags,
-   liquidity_event_score 등 주요 지표가 모두 유한한 숫자로만 GPT 입력에 포함되도록 정규화했다.
-3) 지표 계산 단계(indicators.py / market_features_ws.py / entry_flow.py)에서의 '폴백 금지' 정책은 그대로 유지하고,
-   gpt_decider.py는 오직 직렬화 포맷 안정화만 담당하도록 분리했다.
-4) EXIT(청산) 프롬프트에 포함되는 market_features/extra payload 에도 동일한 NaN/None 보정을 적용해,
-   청산 판단 시에도 이상값이 들어가지 않도록 했다.
-
-2025-11-21 변경 사항 (Unified Features + 백필 금지 + 레짐 제거)
-----------------------------------------------------
-1) unified_features_builder.build_unified_features(...) 가 만든 market_features dict 를
-   진입/청산 프롬프트의 핵심 입력으로 사용한다.
-2) 박스장/추세장 같은 레짐 태그(RANGE/TREND)를 쓰지 않고,
-   trend_strength, boxiness_score, pattern_score 등 숫자 기반 피처만 전달받아 판단한다.
-3) market_features 가 None 이거나 빈 dict 인 경우 치명적 오류로 간주하고,
-   Render 로그 + Telegram 알림을 남긴 뒤 예외를 그대로 전파한다(백필 금지).
-4) GPT 오류/JSON 파싱 오류/지연 초과 시에도 폴백 진입·청산을 하지 않고 예외를 전파한다.
-5) EXIT(청산) 프롬프트에 소량 익절, 변동성 감소, 반대 신호 발생 등 실시간 대응 규칙을 명확히 서술했다.
-6) ask_exit_decision 호출 시 extra.market_features 가 없거나 비어 있으면 치명적 오류로 처리하고,
-   EXIT 측 GPT 호출도 gpt_latency CSV 에 기록되도록 했다.
-
-설계 핵심
-----------------------------------------------------
-- 입력: unified_features_builder 에서 온 market_features(패턴/지표/MTF/유동성 통합),
-  guard_snapshot, recent_pnl_pct/skip_streak 등 경량 JSON.
-- 출력: 진입용 action/TP/SL/리스크/가드 조정, 청산용 CLOSE/HOLD 결정(JSON).
-- GPT 가 정상 JSON 을 주지 않으면 어떤 주문도 실행되지 않는다.
-- GPT 왕복 시간을 logs/gpt_latency/*.csv 에 CSV 로 기록한다.
-
-공개 API
-----------------------------------------------------
-- ask_entry_decision / ask_entry_decision_safe
-- ask_exit_decision / ask_exit_decision_safe
-"""
-
 import csv
-import datetime
+import datetime as dt
 import json
 import math
 import os
 import time
 from threading import Lock
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional
 
 from openai import OpenAI
 
-_client: Optional[OpenAI] = None
+try:
+    import telelog  # type: ignore
+except Exception:  # pragma: no cover
+    telelog = None  # type: ignore
 
 
-# ─────────────────────────────────────────
-# 공통 유틸 헬퍼
-# ─────────────────────────────────────────
+# =============================================================================
+# 설정 / 상수
+# =============================================================================
+
+GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-5.1-mini")
+
+OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "4.0"))
+OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
+
+GPT_LATENCY_CSV = os.getenv("GPT_LATENCY_CSV", "gpt_latency.csv")
+
+TELELOG_CHAT_ID = os.getenv("TELELOG_CHAT_ID", "")
+TELELOG_LEVEL = os.getenv("TELELOG_LEVEL", "INFO").upper()
+
+GPT_MAX_RISK_PCT = float(os.getenv("GPT_MAX_RISK_PCT", "0.03"))  # 3% 기본 한도
+
+gpt_entry_call_count = 0  # ENTRY 호출 횟수 카운터
+
+_gpt_latency_lock = Lock()
 
 
-def _safe_log(msg: str) -> None:
-    """telelog.log 를 사용할 수 있으면 사용하고, 실패해도 조용히 무시한다."""
+# =============================================================================
+# 공용 유틸
+# =============================================================================
+
+
+def _safe_log(level: str, msg: str) -> None:
+    """
+    telelog.log(...) 호출을 감싸서, telelog 미설치/에러가 있어도
+    gpt_decider 자체 로직에는 영향을 주지 않도록 한다.
+    """
+    if telelog is None:
+        return
+
     try:
-        # 지연 import 로 순환 의존 방지
-        from telelog import log
-
-        log(msg)
+        level = (level or "INFO").upper()
+        if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            level = "INFO"
+        telelog.log(level, msg)  # type: ignore
     except Exception:
-        # 로깅 실패로 인해 트레이딩 로직이 죽지 않도록 무시
+        # 로깅 실패는 무시
         pass
 
 
 def _safe_tg(msg: str) -> None:
-    """텔레그램 알림을 보낼 수 있으면 보내고, 실패해도 조용히 무시한다."""
-    try:
-        from telelog import send_tg
+    """
+    텔레그램 알림을 보낼 수 있으면 보내고, 실패해도 예외로 이어지지 않도록 보호.
+    """
+    if telelog is None:
+        return
+    if not TELELOG_CHAT_ID:
+        return
 
-        send_tg(msg)
+    try:
+        telelog.tg(msg)  # type: ignore
     except Exception:
         pass
 
 
-def _fatal_log_and_raise(prefix: str, exc: Exception) -> None:
-    """치명적인 오류를 Render 로그와 Telegram 에 남기고 예외를 다시 던진다."""
-    try:
-        from telelog import log
+def _fatal_log_and_raise(msg: str, *, exc: Optional[Exception] = None) -> None:
+    """
+    치명적 오류 상황에서 로그를 남기고 RuntimeError로 감싼 뒤 raise.
+    트레이딩 엔진 쪽에서는 이 예외를 잡아서 정상적인 폴백 로직을 수행하면 된다.
+    """
+    full_msg = f"[gpt_decider:FATAL] {msg}"
+    if exc is not None:
+        full_msg += f" | exc={type(exc).__name__}: {exc}"
 
-        log(f"{prefix}: {exc}")
-        _safe_tg(
-            "⚠️ GPT 브레인 모듈 치명적 오류 발생\n"
-            f"위치: {prefix}\n"
-            f"에러: {exc}"
-        )
-    except Exception:
-        # telelog 가 실패해도 예외 자체는 그대로 올라가도록 한다.
-        pass
-    raise exc
+    _safe_log("ERROR", full_msg)
+    _safe_tg(full_msg)
 
-
-# ─────────────────────────────────────────
-# GPT 지연 시간 CSV 로거
-# ─────────────────────────────────────────
-
-_gpt_latency_lock: Lock = Lock()
+    raise RuntimeError(full_msg) from exc
 
 
 def _log_gpt_latency_csv(
@@ -118,1029 +98,903 @@ def _log_gpt_latency_csv(
     symbol: Optional[str],
     source: Optional[str],
     direction: Optional[str],
-    latency_sec: Optional[float],
-    soft_limit_sec: Optional[float],
-    hard_limit_sec: Optional[float],
+    latency: float,
     success: bool,
-    error_message: Optional[str] = None,
+    error_type: str = "",
+    error_msg: str = "",
 ) -> None:
-    """GPT 왕복 지연 시간을 logs/gpt_latency/*.csv 에 한 줄로 남긴다.
-
-    CSV 스키마:
-        ts_kst, kind, model, symbol, source, direction,
-        latency_sec, soft_limit_sec, hard_limit_sec,
-        success, is_timeout_or_error, is_slow, error
-
-    - 기록 실패 시 트레이딩 로직에는 영향을 주지 않는다.
     """
+    GPT 호출 레이턴시를 CSV 파일에 append.
+    파일 쓰기 충돌을 피하기 위해 Lock 사용.
+    """
+    row = {
+        "timestamp": dt.datetime.utcnow().isoformat(),
+        "kind": kind,
+        "model": model,
+        "symbol": symbol or "",
+        "source": source or "",
+        "direction": direction or "",
+        "latency_sec": f"{latency:.4f}",
+        "success": "1" if success else "0",
+        "error_type": error_type,
+        "error_msg": error_msg[:512],
+    }
+
     try:
-        base_dir = os.path.join("logs", "gpt_latency")
-        os.makedirs(base_dir, exist_ok=True)
-
-        # KST 기준 현재 시각
-        kst_now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-        date_str = kst_now.strftime("%Y-%m-%d")
-        ts_str = kst_now.strftime("%Y-%m-%d %H:%M:%S")
-
-        path = os.path.join(base_dir, f"gpt_latency-{date_str}.csv")
-
-        # 플래그 계산
-        is_timeout_or_error = (not success) or (
-            latency_sec is not None
-            and hard_limit_sec is not None
-            and latency_sec > hard_limit_sec
-        )
-        is_slow = (
-            latency_sec is not None
-            and soft_limit_sec is not None
-            and latency_sec > soft_limit_sec
-        )
-
-        row = [
-            ts_str,
-            kind,
-            model or "",
-            symbol or "",
-            source or "",
-            direction or "",
-            f"{latency_sec:.3f}" if latency_sec is not None else "",
-            f"{soft_limit_sec:.3f}" if soft_limit_sec is not None else "",
-            f"{hard_limit_sec:.3f}" if hard_limit_sec is not None else "",
-            "1" if success else "0",
-            "1" if is_timeout_or_error else "0",
-            "1" if is_slow else "0",
-            (error_message or "").replace("\n", " ")[:200],
-        ]
-
-        header = [
-            "ts_kst",
-            "kind",
-            "model",
-            "symbol",
-            "source",
-            "direction",
-            "latency_sec",
-            "soft_limit_sec",
-            "hard_limit_sec",
-            "success",
-            "is_timeout_or_error",
-            "is_slow",
-            "error",
-        ]
-
         with _gpt_latency_lock:
-            file_exists = os.path.exists(path)
-            with open(path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
+            file_exists = os.path.exists(GPT_LATENCY_CSV)
+            with open(GPT_LATENCY_CSV, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
                 if not file_exists:
-                    writer.writerow(header)
+                    writer.writeheader()
                 writer.writerow(row)
-    except Exception as e:
-        # CSV 기록 실패는 트레이딩에 영향 주지 않도록 로그만 남김
-        _safe_log(f"[GPT_LATENCY][ERROR] {e}")
-
-
-def _sanitize_for_gpt(obj: Any, *, _depth: int = 0, _max_depth: int = 8) -> Any:
-    """GPT 프롬프트에 들어가는 payload 에서 None/NaN/Infinity 를 정규화한다.
-
-    - 지표 계산 단계의 값을 '추정해서 보정'하지 않고,
-      GPT 가 읽는 JSON 직렬화 포맷을 안정화하는 용도만 담당한다.
-    - 규칙:
-      * None → 0
-      * float 가 NaN/Infinity → 0.0
-      * dict/list/tuple 는 재귀적으로 동일 규칙 적용
-      * 그 외(str/bool 등)는 그대로 둔다.
-    """
-    if _depth > _max_depth:
-        # 너무 깊은 중첩은 그대로 두되, 상위에서 이미 주요 지표는 정규화된 상태라고 가정한다.
-        return obj
-
-    if obj is None:
-        return 0
-
-    # float 인 경우 유한 실수만 허용
-    if isinstance(obj, float):
-        return float(obj) if math.isfinite(obj) else 0.0
-
-    # int/bool 은 그대로 사용
-    if isinstance(obj, (int, bool)):
-        return obj
-
-    # dict 는 각 값에 재귀 적용
-    if isinstance(obj, dict):
-        return {
-            k: _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
-            for k, v in obj.items()
-        }
-
-    # list/tuple 등 시퀀스는 요소별 재귀 적용
-    if isinstance(obj, (list, tuple)):
-        return [
-            _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth) for v in obj
-        ]
-
-    # 문자열/그 외 타입은 그대로 둔다.
-    return obj
-
-
-# ─────────────────────────────────────────
-# GPT 시스템 프롬프트 (진입용)
-# ─────────────────────────────────────────
-
-_SYSTEM_PROMPT_ENTRY = """
-당신은 비트코인 선물 자동매매 시스템의 '진입 허용 여부'만 판단하는 작은 에이전트입니다.
-
-입력으로 하나의 JSON 객체를 받습니다. 이 JSON 에는 대략 다음 정보가 들어 있습니다:
-- symbol: "BTC-USDT" 등 거래 종목
-- regime: 예) "MARKET" · 세션/전략 태그(단순 문자열)
-- direction: "LONG" / "SHORT"
-- last_price: 현재 가격
-- entry_score: 진입 점수(높을수록 유리한 방향일 가능성)
-- effective_risk_pct: 현재 기본 주문 비율
-- leverage: 레버리지 배율
-- base_tp_pct, base_sl_pct: 기본 TP/SL 비율
-- guard_snapshot: 거래량·스프레드·점프·호가 불균형 등 각종 가드 값
-- recent_pnl_pct, skip_streak: 최근 손익과 연속 손실/스킵 횟수 등 리스크 컨텍스트
-- market_features: unified_features_builder 가 만든 시장 상태·패턴 요약 dict
-  * timeframes: 1m/5m/15m 가격·거래량·변동성 피처(숫자 위주)
-  * pattern_features: pattern_score, trend_strength, range_strength(또는 boxiness_score), volatility_score, reversal_probability, continuation_probability,
-    momentum_score, volume_confirmation, wick_strength, liquidity_event_score 등
-  * pattern_summary: 사람이 읽기 쉬운 한 줄 설명
-  * risk_flags / liquidity 정보: 멀티타임프레임 신호, 갑작스러운 변동성, 유동성 스윕 등
-
-당신의 목표는:
-- "지금 이 방향으로 진입하는 것이 합리적인지"를,
-- 시장 피처(market_features)와 최근 리스크 상태를 함께 고려해서 결정하는 것입니다.
-
-1) action 선택
-----------------------------------------
-action 필드는 반드시 다음 중 하나여야 합니다.
-- "ENTER": 지금 조건이면 진입 허용.
-- "SKIP": 지금은 진입하지 말 것.
-- "ADJUST": 진입은 허용하지만, TP/SL/리스크/가드 값을 소폭 조정.
-
-선택 가이드:
-- trend_strength, momentum_score, volume_confirmation 이 모두 포지션 방향을 지지하고
-  패턴 관련 점수(pattern_score, continuation_probability 등)가 높다면
-  → ENTER 또는 ADJUST 를 고려할 수 있습니다.
-- boxiness_score 가 크고 trend_strength 가 작으며, 패턴/유동성 신호가 혼재되어
-  방향성이 뚜렷하지 않다면
-  → 작은 TP, 타이트한 SL, 낮은 리스크를 선호하고
-    entry_score 가 낮거나 패턴 신뢰도가 떨어지면 SKIP 을 더 자주 선택합니다.
-- 최근 손실이 누적(recent_pnl_pct 가 크게 음수, skip_streak/연속 손실 횟수 증가)된 상태에서는
-  → 리스크를 줄이거나(SKIP/ADJUST) 과도한 레버리지 진입을 피해야 합니다.
-- ADJUST 는 방향은 맞다고 보지만,
-  → base_tp_pct / base_sl_pct / effective_risk_pct 를 "작게 미세 조정"할 때만 사용합니다.
-  → 기본값 대비 ±50% 범위를 크게 벗어나지 않는다고 가정하고 설계합니다.
-  → 최근 손실 구간에서는 ADJUST 보다는 SKIP 을 우선 고려합니다.
-
-2) 숫자 필드 (옵션)
-----------------------------------------
-다음 숫자 필드는 필요할 때만 넣습니다. 없으면 기본값(base_*)을 그대로 사용한다고 가정합니다.
-- tp_pct:
-  * 0 < tp_pct <= 0.12 범위 권장 (아주 예외적인 경우에도 0.20 을 넘지 말 것).
-  * 변동성이 크지 않거나 패턴 확신이 낮을 때는 base_tp_pct 보다 작게 조정하는 것을 우선 고려.
-- sl_pct:
-  * 0 < sl_pct <= 0.07 범위 권장 (예외 상황에서도 0.15 를 넘지 말 것).
-  * 노이즈 구간에서는 SL 을 너무 넓게 두지 말고, 구조가 불리하게 무너졌다고 판단되면
-    진입 자체를 SKIP 하는 것을 고려합니다.
-- effective_risk_pct:
-  * 0 < effective_risk_pct <= 0.03 범위 권장.
-  * 기존 값보다 크게 늘리는 것보다, 위험할 때 과감히 줄이거나(SKIP/ADJUST) 유지하는 쪽을 우선.
-
-3) guard_adjustments (옵션)
-----------------------------------------
-guard_adjustments 는 다음 키 중 필요한 것만 포함하는 객체입니다.
-- min_entry_volume_ratio
-- max_spread_pct
-- max_price_jump_pct
-- depth_imbalance_min_ratio
-- depth_imbalance_min_notional
-
-규칙:
-- guard_snapshot 및 market_features 에서 보이는 위험 신호를 기준으로
-  "조금 더 보수적으로" 조정하는 용도로만 사용합니다.
-- 갑자기 스프레드를 크게 허용하거나, price_jump 한계를 과도하게 늘리지는 마십시오.
-
-4) reason (필수)
-----------------------------------------
-- 한국어로 1~2줄 정도의 짧은 설명을 넣습니다.
-- 예: "상승 모멘텀과 아래꼬리·거래량이 강해 롱 진입 허용, TP 소폭 확대"
-
-5) 출력 JSON 형식 (템플릿 예시)
-----------------------------------------
-반드시 아래와 같은 JSON 스키마를 따릅니다. 필요 없는 키는 생략해도 됩니다.
-
-{
-  "action": "ENTER",
-  "reason": "상승 모멘텀과 아래꼬리·거래량이 강해 롱 진입 허용, TP 소폭 확대",
-  "tp_pct": 0.008,
-  "sl_pct": 0.004,
-  "effective_risk_pct": 0.02,
-  "guard_adjustments": {
-    "min_entry_volume_ratio": 0.30,
-    "max_spread_pct": 0.0008,
-    "max_price_jump_pct": 0.0040,
-    "depth_imbalance_min_ratio": 1.8,
-    "depth_imbalance_min_notional": 150000
-  },
-  "_meta": {
-    "pattern_note": "상승 모멘텀 + 아래꼬리 강함",
-    "market_comment": "단기 저항 재돌파 시도, 위쪽 유동성에 매물 집중"
-  }
-}
-
-형식 규칙 (아주 중요):
-- 반드시 JSON 객체 하나만 출력하십시오.
-- JSON 바깥에는 아무 텍스트도 쓰지 마십시오.
-- 코드블록 마크다운(예: ```json) · 주석(//, # 등) · NaN/Infinity 는 절대 사용하지 마십시오.
-- 모든 키는 큰따옴표(")로 감싸고, 문자열도 큰따옴표(")를 사용하십시오.
-""".strip()
-
-
-# ─────────────────────────────────────────
-# 공통 GPT 클라이언트/호출 헬퍼
-# ─────────────────────────────────────────
-
-
-def _get_client() -> OpenAI:
-    """전역 OpenAI 클라이언트 인스턴스 생성/재사용."""
-    global _client
-    if _client is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY 환경변수가 없습니다.")
-
-        base_url = os.getenv("OPENAI_API_BASE")
-        if base_url:
-            _client = OpenAI(api_key=api_key, base_url=base_url)
-        else:
-            _client = OpenAI(api_key=api_key)
-    return _client
+    except Exception:
+        # 로깅 실패는 전체 로직에 영향을 주지 않게 무시
+        pass
 
 
 def _extract_text_from_response(resp: Any) -> str:
-    """OpenAI Responses API 응답 객체에서 텍스트를 최대한 안정적으로 추출."""
-    # 1) output_text 필드가 있으면 우선 사용
+    """
+    OpenAI Responses API 응답 객체에서 텍스트 부분을 최대한 안전하게 추출한다.
+
+    - 우선 resp.output_text 같은 direct 속성이 있으면 그것을 사용
+    - 없으면 resp.output[0].content[0].text.value 루트를 시도
+    - 그래도 안 되면 repr(resp) 일부를 잘라서라도 반환 (완전 실패보다는 낫다)
+    """
+    # 1) direct text 속성
     text_attr = getattr(resp, "output_text", None)
     if isinstance(text_attr, str) and text_attr.strip():
         return text_attr
 
-    # 2) output[0].content[0].text(.value) 계열 시도
-    try:
-        output = getattr(resp, "output", None)
-        if output:
+    # 2) output -> content -> text.value 경로
+    output = getattr(resp, "output", None)
+    if output and isinstance(output, (list, tuple)):
+        try:
+            # 첫 번째 블록
             block = output[0]
             content = getattr(block, "content", None)
-            if content:
+            if content and isinstance(content, (list, tuple)) and content:
                 first = content[0]
-
                 txt_obj = getattr(first, "text", None)
-                if isinstance(txt_obj, str):
+                # text.value
+                value = getattr(txt_obj, "value", None)
+                if isinstance(value, str) and value.strip():
+                    return value
+
+                # 혹시 모를 직접 문자열
+                if isinstance(txt_obj, str) and txt_obj.strip():
                     return txt_obj
-                if txt_obj is not None:
-                    val = getattr(txt_obj, "value", None)
-                    if isinstance(val, str):
-                        return val
+        except Exception:
+            pass
 
-                direct = getattr(first, "text", None)
-                if isinstance(direct, str):
-                    return direct
-    except Exception:
-        # 응답 포맷이 예상과 다르더라도 여기서는 조용히 폴백으로 넘긴다.
-        pass
+    # 3) 최후의 수단: repr 일부
+    return repr(resp)[:2000]
 
-    # 3) 마지막 폴백
-    return str(resp)
+
+# =============================================================================
+# GPT JSON 헬퍼 (EXIT용 공통)
+# =============================================================================
 
 
 def _call_gpt_json(
+    *,
     model: str,
     prompt: str,
-    *,
+    purpose: str = "EXIT",
     timeout_sec: Optional[float] = None,
-    purpose: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """GPT-5.1 을 호출해서 **반드시 JSON**만 받는 헬퍼.
-
-    - 실패/타임아웃/JSON 파싱 에러 시 예외를 던진다.
-    - purpose 는 호출 용도 구분용 태그(현재는 로깅·라우팅용 확장 포인트).
     """
+    Responses API를 사용해 JSON 응답을 기대하는 GPT 호출을 공통 처리.
+
+    - response_format={"type": "json_object"} 사용
+    - 레이턴시 측정 및 CSV 로깅
+    - 단일 dict로 파싱 실패 시 예외
+    """
+    if timeout_sec is None:
+        timeout_sec = OPENAI_TRADER_MAX_LATENCY
+
     client = _get_client()
 
-    if timeout_sec is None:
-        try:
-            timeout_sec = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
-        except Exception:
-            timeout_sec = 8.0
-
-    t0 = time.time()
-    _safe_log(f"[GPT_CALL] start purpose={purpose or '-'} model={model}")
-
-    elapsed: float = 0.0
-    text: str = ""
-    kind = (purpose or "OTHER").upper()
-
+    start = time.monotonic()
     try:
-        try:
-            # 최신 openai-python (Responses API + response_format 지원)
-            resp = client.responses.create(
-                model=model,
-                input=prompt,
-                response_format={"type": "json_object"},
-                timeout=timeout_sec,
-            )
-        except TypeError as e:
-            # 구버전 openai-python: response_format 인자 미지원
-            if "response_format" not in str(e):
-                raise
-            _safe_log("[GPT_CALL] response_format not supported, retrying without it")
-            resp = client.responses.create(
-                model=model,
-                input=prompt,
-                timeout=timeout_sec,
-            )
+        resp = client.responses.create(
+            model=model,
+            input=prompt,
+            response_format={"type": "json_object"},
+            timeout=timeout_sec,
+        )
+        latency = time.monotonic() - start
 
         text = _extract_text_from_response(resp)
-        elapsed = time.time() - t0
-        _safe_log(
-            f"[GPT_CALL] done purpose={purpose or '-'} elapsed={elapsed:.2f}s text_len={len(text)}"
-        )
-        # EXIT 등 공통 GPT 호출도 레이턴시 CSV 에 기록
         try:
+            data = json.loads(text)
+        except Exception as e:
             _log_gpt_latency_csv(
-                kind=kind,
+                kind=purpose.upper(),
                 model=model,
                 symbol=None,
                 source=None,
                 direction=None,
-                latency_sec=elapsed,
-                soft_limit_sec=timeout_sec,
-                hard_limit_sec=timeout_sec,
-                success=True,
-                error_message=None,
-            )
-        except Exception:
-            pass
-    except Exception as e:  # pragma: no cover - GPT 오류는 호출측에서 처리
-        elapsed = time.time() - t0
-        try:
-            _log_gpt_latency_csv(
-                kind=kind,
-                model=model,
-                symbol=None,
-                source=None,
-                direction=None,
-                latency_sec=elapsed,
-                soft_limit_sec=timeout_sec,
-                hard_limit_sec=timeout_sec,
+                latency=latency,
                 success=False,
-                error_message=str(e),
+                error_type=type(e).__name__,
+                error_msg=f"JSON parse error: {e}",
             )
-        except Exception:
-            pass
-        _safe_log(f"[GPT_CALL][ERROR] purpose={purpose or '-'} error={e}")
+            raise
+
+        _log_gpt_latency_csv(
+            kind=purpose.upper(),
+            model=model,
+            symbol=None,
+            source=None,
+            direction=None,
+            latency=latency,
+            success=True,
+        )
+        if not isinstance(data, dict):
+            raise ValueError(f"JSON 응답이 dict가 아님: {type(data).__name__}")
+        return data
+
+    except Exception as e:
+        latency = time.monotonic() - start
+        _log_gpt_latency_csv(
+            kind=purpose.upper(),
+            model=model,
+            symbol=None,
+            source=None,
+            direction=None,
+            latency=latency,
+            success=False,
+            error_type=type(e).__name__,
+            error_msg=str(e),
+        )
         raise
 
-    if elapsed > timeout_sec:
-        raise TimeoutError(f"GPT 응답 지연: {elapsed:.2f}s > {timeout_sec:.2f}s")
+
+# =============================================================================
+# ENTRY 쪽 GPT 응답 정규화 / 검증
+# =============================================================================
+
+
+def _normalize_and_validate_entry_response(
+    resp: Dict[str, Any],
+    *,
+    base_tv_pct: float,
+    base_sl_pct: float,
+    base_risk_pct: float,
+    symbol: str,
+    source: str,
+    gpt_max_risk_pct: float,
+) -> Dict[str, Any]:
+    """
+    ENTRY GPT의 JSON 응답을 정규화하고, 위험/타겟/손절 관련 필드를 검증한다.
+
+    기대 JSON 스키마(요약):
+    {
+      "direction": "LONG" | "SHORT" | "PASS",
+      "confidence": 0.0~1.0 실수,
+      "tv_pct": 0.0~0.5 실수,  # 타겟 수익률
+      "sl_pct": 0.0~0.5 실수,  # 손절 수익률
+      "effective_risk_pct": 0.0~gpt_max_risk_pct 실수,
+      "note": "string",
+      "raw_response": "원본 문자열(JSON을 파싱하기 전의 텍스트)"
+    }
+
+    - direction이 PASS인 경우 tv/sl/effective_risk_pct는 모두 0으로 강제
+    - tv_pct/sl_pct는 base_*와의 비율 제한(0.02 ~ 4.0배) 및 절대값 제한(0~0.5) 적용
+    - effective_risk_pct는 0 < v <= gpt_max_risk_pct
+    """
+    direction = str(resp.get("direction", "PASS")).upper().strip()
+    if direction not in ("LONG", "SHORT", "PASS"):
+        direction = "PASS"
+
+    def _as_float(key: str, default: float = 0.0) -> float:
+        v = resp.get(key, default)
+        try:
+            if v is None:
+                return default
+            if isinstance(v, (int, float)):
+                if math.isnan(float(v)) or math.isinf(float(v)):
+                    return default
+                return float(v)
+            return float(str(v))
+        except Exception:
+            return default
+
+    def _check_float(
+        key: str,
+        v: float,
+        min_val: float,
+        max_val: float,
+        *,
+        allow_zero: bool = False,
+    ) -> float:
+        # NaN/Inf 보호
+        if math.isnan(v) or math.isinf(v):
+            _fatal_log_and_raise(
+                f"[ENTRY_VALIDATE] {key} is NaN/Inf: {v} | symbol={symbol} source={source}"
+            )
+        # 범위 체크
+        if allow_zero:
+            if not (min_val <= v <= max_val):
+                _fatal_log_and_raise(
+                    f"[ENTRY_VALIDATE] {key} out of range {min_val}~{max_val}: {v} | "
+                    f"symbol={symbol} source={source}"
+                )
+        else:
+            if not (min_val < v < max_val):
+                _fatal_log_and_raise(
+                    f"[ENTRY_VALIDATE] {key} out of range ({min_val},{max_val}): {v} | "
+                    f"symbol={symbol} source={source}"
+                )
+        return v
+
+    # direction PASS면 나머지는 0으로
+    if direction == "PASS":
+        tv_pct = 0.0
+        sl_pct = 0.0
+        effective_risk_pct = 0.0
+    else:
+        tv_pct = _as_float("tv_pct", base_tv_pct)
+        sl_pct = _as_float("sl_pct", base_sl_pct)
+        effective_risk_pct = _as_float("effective_risk_pct", base_risk_pct)
+
+        tv_pct = _check_float("tv_pct", tv_pct, 0.0, 0.5)
+        sl_pct = _check_float("sl_pct", sl_pct, 0.0, 0.5)
+
+        if base_tv_pct > 0:
+            ratio_tv = tv_pct / base_tv_pct
+            if ratio_tv < 0.02 or ratio_tv > 4.0:
+                _fatal_log_and_raise(
+                    "[ENTRY_VALIDATE] tv_pct/base_tv_pct ratio out of range 0.02~4.0: "
+                    f"{ratio_tv:.4f} (tv={tv_pct}, base={base_tv_pct}) | "
+                    f"symbol={symbol} source={source}"
+                )
+
+        if base_sl_pct > 0:
+            ratio_sl = sl_pct / base_sl_pct
+            if ratio_sl < 0.02 or ratio_sl > 4.0:
+                _fatal_log_and_raise(
+                    "[ENTRY_VALIDATE] sl_pct/base_sl_pct ratio out of range 0.02~4.0: "
+                    f"{ratio_sl:.4f} (sl={sl_pct}, base={base_sl_pct}) | "
+                    f"symbol={symbol} source={source}"
+                )
+
+        if base_risk_pct > 0:
+            effective_risk_pct = _check_float(
+                "effective_risk_pct", effective_risk_pct, 0.0, gpt_max_risk_pct
+            )
+            if effective_risk_pct > gpt_max_risk_pct + 1e-9:
+                _fatal_log_and_raise(
+                    "[ENTRY_VALIDATE] effective_risk_pct exceeds GPT max risk limit: "
+                    f"{effective_risk_pct} > {gpt_max_risk_pct} | "
+                    f"symbol={symbol} source={source}"
+                )
+        else:
+            effective_risk_pct = 0.0
+
+    confidence = _as_float("confidence", 0.5)
+    confidence = max(0.0, min(1.0, confidence))
+
+    note = str(resp.get("note", "") or "").strip()
+    raw_response = str(resp.get("raw_response", "") or "").strip()
+
+    normalized = {
+        "direction": direction,
+        "confidence": confidence,
+        "tv_pct": tv_pct,
+        "sl_pct": sl_pct,
+        "effective_risk_pct": effective_risk_pct,
+        "note": note,
+        "raw_response": raw_response,
+    }
+    return normalized
+
+
+# =============================================================================
+# NaN/Inf/None 정규화 유틸 (GPT 입력 직전용)
+# =============================================================================
+
+
+def _sanitize_for_gpt(
+    obj: Any,
+    *,
+    _depth: int = 0,
+    _max_depth: int = 8,
+) -> Any:
+    """
+    GPT 호출 직전에 JSON으로 직렬화할 payload에 들어 있는
+    NaN / Infinity / None 값을 비교적 단순하게 정규화한다.
+
+    - 숫자:
+        - NaN, ±Inf      -> 0.0
+        - 그 외 실수/정수 -> 그대로
+    - None: 0
+    - dict / list / tuple: 재귀 처리 (최대 _max_depth)
+    - 그 외 타입: 그대로 둔다 (문자열 등)
+
+    지표 계산 단계에서 '폴백'을 넣지 않고,
+    오직 GPT API가 요구하는 직렬화 포맷만 안정화한다는 취지다.
+    """
+    if _depth > _max_depth:
+        return obj  # 너무 깊으면 더 이상 파고들지 않는다
+
+    # 숫자 계열
+    if isinstance(obj, (int, bool)):  # bool은 int의 서브클래스지만 그대로 둠
+        return obj
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+
+    # None -> 0
+    if obj is None:
+        return 0
+
+    # dict 재귀
+    if isinstance(obj, dict):
+        return {
+            str(k): _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
+            for k, v in obj.items()
+        }
+
+    # list/tuple 재귀
+    if isinstance(obj, (list, tuple)):
+        return [
+            _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
+            for v in obj
+        ]
+
+    return obj
+
+
+# =============================================================================
+# GPT 프롬프트 정의 (ENTRY)
+# =============================================================================
+
+
+_SYSTEM_PROMPT_ENTRY = """
+You are an expert trading decision assistant for intraday crypto futures trading.
+
+[중요 규칙 요약]
+
+1) Direction 결정
+   - LONG: 상승 기대 시
+   - SHORT: 하락 기대 시
+   - PASS: 방향성이 애매하거나 리스크가 과도하면 진입하지 않음
+
+2) 수익/손절/위험 제어
+   - tv_pct (take profit, 목표 수익률 비율):
+       - 대략 0 < tv_pct <= 0.12 (12%) 정도가 자연스러운 범위
+       - "천천히 추세를 탄다" 수준이면 0.02~0.06, 강한 모멘텀이면 최대 0.12 정도까지 허용
+       - 극단적으로 20% 이상(0.20)을 넘기지 않는 것이 좋다.
+   - sl_pct (stop loss, 손절 비율):
+       - 일반적으로 0 < sl_pct <= 0.06 (6%) 안쪽
+       - 변동성이 큰 장이라면 0.03~0.06 사이에서 조정
+       - sl_pct가 tv_pct보다 지나치게 크면 비대칭 리스크가 되므로 지양
+   - effective_risk_pct (실제 계좌 기준 1회 진입 시 허용 위험 비율):
+       - 0 < effective_risk_pct <= {gpt_max_risk_pct} (기본 3%)
+       - 단일 포지션에서 계좌의 {gpt_max_risk_pct*100:.1f}%를 초과해서는 안 됨
+       - 방향성이 애매하거나, 근거가 약하다고 느껴지면 더 낮은 값(예: 0.005~0.01)으로 보수적으로 잡는다.
+
+3) 리스크 관리
+   - 리스크가 과도하면 PASS를 택하는 것이 좋다.
+   - "지금 안 들어가도 아쉬울 것 없는" 상황에서 무리해서 진입하지 않는다.
+   - 높은 변동성 구간(급등/급락 직후, 주요 뉴스 직후 등)이라면
+     tv_pct / sl_pct / effective_risk_pct 모두 평소보다 보수적으로 조정한다.
+
+4) JSON 응답 포맷
+   - 아래 JSON 스키마에 맞춰 응답한다.
+   - 반드시 JSON만, 추가 텍스트 없이 출력한다.
+   - NaN, Infinity, null, 문자열 "NaN"/"Infinity"/"None" 등은 절대 사용하지 않는다.
+   - 모든 수치는 실수(float)로 응답한다.
+
+[응답 JSON 스키마]
+
+필수 필드:
+- direction: "LONG" | "SHORT" | "PASS"
+- confidence: 0.0 ~ 1.0 사이의 숫자 (매매 아이디어에 대한 자신감)
+- tv_pct: 0.0 ~ 0.5 사이의 숫자 (목표 수익률 비율, 예: 0.03 = 3%)
+- sl_pct: 0.0 ~ 0.5 사이의 숫자 (손절 비율, 예: 0.01 = 1%)
+- effective_risk_pct: 0.0 ~ {gpt_max_risk_pct} 사이의 숫자 (계좌 대비 위험 비율)
+- note: 문자열 (간단한 설명)
+- raw_response: 문자열 (필요시 시스템이 사용할 수 있도록, 핵심 요약 등 자유롭게 기입)
+
+제약 조건:
+- direction이 "PASS"일 경우:
+    - tv_pct = 0.0
+    - sl_pct = 0.0
+    - effective_risk_pct = 0.0
+- direction이 "LONG" 또는 "SHORT"일 경우:
+    - 0 < tv_pct <= 0.5
+    - 0 < sl_pct <= 0.5
+    - 0 < effective_risk_pct <= {gpt_max_risk_pct}
+- NaN / Infinity / null / "NaN" / "Infinity" / "None" 등의 값은 절대 사용하지 않는다.
+
+JSON 예시 (단, 실제 응답에서는 한국어 note 사용 가능):
+
+```json
+{
+  "direction": "LONG",
+  "confidence": 0.74,
+  "tv_pct": 0.032,
+  "sl_pct": 0.012,
+  "effective_risk_pct": 0.018,
+  "note": "상승 추세가 이어질 가능성이 크지만, 변동성도 있으므로 손절은 다소 타이트하게 설정.",
+  "raw_response": "간단한 요약 또는 내부용 메모"
+}
+"""
+
+_USER_PROMPT_TEMPLATE_ENTRY = """
+[거래 정보]
+
+Symbol: {symbol}
+Source: {source}
+Current Price: {current_price}
+
+Base Parameters:
+- base_tv_pct: {base_tv_pct}
+- base_sl_pct: {base_sl_pct}
+- base_risk_pct: {base_risk_pct}
+
+Market Features (JSON 직렬화):
+{market_features_json}
+
+[요구사항]
+
+위 정보를 바탕으로 이번 진입에 대한 다음 항목을 JSON 형식으로만 응답해 주세요.
+
+- direction: "LONG" | "SHORT" | "PASS"
+- confidence: 0.0 ~ 1.0
+- tv_pct: 0.0 ~ 0.5
+- sl_pct: 0.0 ~ 0.5
+- effective_risk_pct: 0.0 ~ {gpt_max_risk_pct}
+- note: string
+- raw_response: string
+
+주의:
+- direction이 "PASS"일 경우 tv_pct, sl_pct, effective_risk_pct는 모두 0.0으로 설정합니다.
+- NaN / Infinity / null / 문자열 "NaN" / "Infinity" / "None" 등은 절대 사용하지 않습니다.
+- 반드시 JSON만, 추가 설명 텍스트 없이 응답합니다.
+"""
+
+
+# =============================================================================
+# OpenAI 클라이언트 헬퍼
+# =============================================================================
+
+
+def _get_client() -> OpenAI:
+    """
+    OpenAI 클라이언트를 생성한다.
+    """
+    api_base = os.getenv("OPENAI_API_BASE", "").strip() or None
+    client = OpenAI(base_url=api_base)
+    return client
+
+
+def _parse_json(text: str) -> Dict[str, Any]:
+    """
+    GPT가 반환한 텍스트에서 JSON을 파싱.
+    - 일단 전체를 json.loads 시도
+    - 실패하면 '{'와 '}' 사이만 잘라내 재시도
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("GPT 응답이 비어 있습니다.")
 
     try:
-        data: Dict[str, Any] = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"GPT JSON 파싱 실패: {e} / raw={text[:200]!r}")
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+        raise ValueError(f"JSON 최상위 타입이 dict가 아님: {type(data).__name__}")
+    except Exception:
+        pass
 
-    if not isinstance(data, dict):
-        raise ValueError(f"GPT JSON 루트 타입이 dict 가 아닙니다: {type(data)!r}")
+    try:
+        first = text.index("{")
+        last = text.rindex("}")
+        snippet = text[first : last + 1]
+        data = json.loads(snippet)
+        if isinstance(data, dict):
+            return data
+        raise ValueError(
+            f"중괄호 추출 후에도 dict가 아님: {type(data).__name__}, snippet={snippet[:200]}"
+        )
+    except Exception as e:
+        raise ValueError(f"GPT JSON 파싱 실패: {e} | text={text[:500]}") from e
 
-    return data
 
-
-# ─────────────────────────────────────────
-# 1) 진입 의사결정 (경량 프롬프트 버전)
-# ─────────────────────────────────────────
+# =============================================================================
+# ENTRY GPT 호출 메인 함수
+# =============================================================================
 
 
 def _build_entry_payload(
     *,
     symbol: str,
-    signal_source: str,
-    chosen_signal: str,
-    last_price: float,
-    entry_score: Optional[float],
-    effective_risk_pct: float,
-    leverage: float,
-    tp_pct: float,
-    sl_pct: float,
-    extra: Optional[Dict[str, Any]],
-    market_features: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """GPT에 넘길 compact JSON payload 구성.
-
-    - extra(dict)는 gpt_trader 에서 이미 경량화가 끝난 상태라고 가정.
-    - market_features(dict)는 unified_features_builder 에서 만든
-      시장 상태·패턴/지표/MTF 요약 dict 라고 가정한다.
-    """
-    payload: Dict[str, Any] = {}
-
-    if isinstance(extra, Dict) and extra:
-        payload.update(extra)
-
-    if market_features is not None:
-        if not isinstance(market_features, Dict) or not market_features:
-            raise RuntimeError(
-                "market_features 가 비어 있거나 dict 가 아닙니다. "
-                "unified_features_builder 결과를 확인하세요."
-            )
-        # GPT 가 전체 시장 상태를 한 번에 볼 수 있도록 별도 키로 붙인다.
-        payload["market_features"] = market_features
-        # 사람이 이해하기 쉬운 한 줄 요약이 있으면 최상위에도 복사
-        pattern_summary = market_features.get("pattern_summary")
-        if isinstance(pattern_summary, str) and pattern_summary:
-            payload.setdefault("pattern_summary", pattern_summary)
-
-    payload.setdefault("symbol", symbol)
-    payload.setdefault("regime", signal_source.upper())
-    payload.setdefault("direction", chosen_signal.upper())
-    payload.setdefault("last_price", float(last_price))
-    payload.setdefault("effective_risk_pct", float(effective_risk_pct))
-    payload.setdefault("leverage", float(leverage))
-    payload.setdefault("base_tp_pct", float(tp_pct))
-    payload.setdefault("base_sl_pct", float(sl_pct))
-
-    if entry_score is not None:
-        payload.setdefault("entry_score", float(entry_score))
-
-    return payload
-
-
-def _normalize_and_validate_entry_response(
-    data: Dict[str, Any],
-    *,
-    base_tp_pct: float,
+    source: str,
+    current_price: float,
+    base_tv_pct: float,
     base_sl_pct: float,
     base_risk_pct: float,
+    market_features: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """GPT 진입 응답 JSON 을 정규화/검증한다.
-
-    - action: "ENTER"/"SKIP"/"ADJUST" 이 아니면 에러.
-    - tp_pct/sl_pct/effective_risk_pct: 존재할 경우 타입/범위 검증.
     """
-    # action 필수
-    action = data.get("action")
-    if not isinstance(action, str):
-        raise ValueError("GPT entry response 에 'action' 문자열 필드가 없습니다.")
-    action_u = action.strip().upper()
-    if action_u not in {"ENTER", "SKIP", "ADJUST"}:
-        raise ValueError(f"GPT entry response 의 action 값이 잘못되었습니다: {action_u!r}")
-    data["action"] = action_u
+    ENTRY 결정에 사용할 payload dict를 구성한다.
+    이 payload는 GPT 프롬프트에 JSON으로 직렬화되어 전달되며,
+    NaN/Inf/None은 _sanitize_for_gpt 단계에서 보정된다.
+    """
+    extra = dict(market_features) if market_features else {}
+    meaningful_keys = [
+        "trend_strength",
+        "volatility",
+        "volume_score",
+        "pattern_summary",
+        "regime",
+        "time_features",
+    ]
+    extra_filtered: Dict[str, Any] = {}
+    for k in meaningful_keys:
+        if k in extra:
+            extra_filtered[k] = extra[k]
 
-    # 숫자 필드 검증 (있을 때만)
-    def _check_float(
-        key: str,
-        value: Any,
-        min_val: float,
-        max_val: float,
-    ) -> float:
-        try:
-            v = float(value)
-        except Exception:
-            raise ValueError(f"GPT entry response 의 {key} 는 숫자여야 합니다: {value!r}")
-        if not math.isfinite(v):
-            raise ValueError(f"GPT entry response 의 {key} 가 유한 실수가 아닙니다: {v!r}")
-        if not (min_val < v < max_val):
-            raise ValueError(
-                f"GPT entry response 의 {key}={v:.6f} 가 허용 범위({min_val}~{max_val})를 벗어납니다."
-            )
-        return v
+    payload = {
+        "symbol": symbol,
+        "source": source,
+        "current_price": current_price,
+        "base_tv_pct": base_tv_pct,
+        "base_sl_pct": base_sl_pct,
+        "base_risk_pct": base_risk_pct,
+        "market_features": extra_filtered,
+    }
 
-    if "tp_pct" in data and data.get("tp_pct") is not None:
-        # 기본값의 0.25배 ~ 4배 사이, 절대값은 0~0.5 안쪽 정도로 제한
-        v = _check_float("tp_pct", data["tp_pct"], 0.0, 0.5)
-        if base_tp_pct > 0:
-            ratio = v / base_tp_pct
-            if not (0.02 <= ratio <= 4.0):
-                raise ValueError(
-                    f"GPT entry response 의 tp_pct={v:.6f} 가 base_tp_pct 대비 비정상 비율(ratio={ratio:.2f})입니다."
-                )
-        data["tp_pct"] = v
+    if isinstance(market_features, dict):
+        for k, v in market_features.items():
+            if k not in extra_filtered and k not in payload:
+                payload[k] = v
 
-    if "sl_pct" in data and data.get("sl_pct") is not None:
-        v = _check_float("sl_pct", data["sl_pct"], 0.0, 0.5)
-        if base_sl_pct > 0:
-            ratio = v / base_sl_pct
-            if not (0.02 <= ratio <= 4.0):
-                raise ValueError(
-                    f"GPT entry response 의 sl_pct={v:.6f} 가 base_sl_pct 대비 비정상 비율(ratio={ratio:.2f})입니다."
-                )
-        data["sl_pct"] = v
-
-    if "effective_risk_pct" in data and data.get("effective_risk_pct") is not None:
-        v = _check_float("effective_risk_pct", data["effective_risk_pct"], 0.0, 0.2)
-        if base_risk_pct > 0:
-            ratio = v / base_risk_pct
-            if not (0.02 <= ratio <= 4.0):
-                raise ValueError(
-                    "GPT entry response 의 effective_risk_pct="
-                    f"{v:.6f} 가 기존 리스크 대비 비정상 비율(ratio={ratio:.2f})입니다."
-                )
-        # 절대 상한(환경변수)도 한 번 더 체크
-        try:
-            gpt_max_risk = float(os.getenv("GPT_MAX_RISK_PCT", "0.03"))
-        except Exception:
-            gpt_max_risk = 0.03
-        if v > gpt_max_risk:
-            raise ValueError(
-                "GPT entry response 의 effective_risk_pct="
-                f"{v:.6f} 가 GPT_MAX_RISK_PCT={gpt_max_risk:.6f} 를 초과합니다."
-            )
-        data["effective_risk_pct"] = v
-
-    # guard_adjustments 타입만 간단히 체크
-    ga = data.get("guard_adjustments")
-    if ga is not None and not isinstance(ga, dict):
-        raise ValueError("GPT entry response 의 guard_adjustments 는 객체여야 합니다.")
-
-    return data
+    return payload
 
 
 def ask_entry_decision(
     *,
     symbol: str,
-    signal_source: str,  # 예: "MARKET"
-    chosen_signal: str,  # "LONG" / "SHORT"
-    last_price: float,
-    entry_score: Optional[float],
-    effective_risk_pct: float,
-    leverage: float,
-    tp_pct: float,
-    sl_pct: float,
-    extra: Optional[Dict[str, Any]],
-    market_features: Optional[Dict[str, Any]],
+    source: str,
+    current_price: float,
+    base_tv_pct: float,
+    base_sl_pct: float,
+    base_risk_pct: float,
+    market_features: Dict[str, Any],
+    model: str = GPT_MODEL_DEFAULT,
+    gpt_max_risk_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """GPT 에게 진입 여부/강도 결정을 compact JSON 기반으로 요청한다.
+    """
+    ENTRY 결정을 위해 GPT에게 질의하고, 응답을 정규화/검증하여 반환한다.
 
-    반환 형식 (예시):
+    Parameters
+    ----------
+    symbol : str
+        종목 심볼 (예: "BTCUSDT").
+    source : str
+        시그널/전략 이름 또는 출처 태그.
+    current_price : float
+        현재 가격.
+    base_tv_pct : float
+        기본 타겟 수익률 비율 (예: 0.03 = 3%).
+    base_sl_pct : float
+        기본 손절 비율 (예: 0.01 = 1%).
+    base_risk_pct : float
+        기본 1회 진입 시 계좌 대비 위험 비율.
+    market_features : Dict[str, Any]
+        마켓 상태를 요약한 피처 딕셔너리.
+    model : str, optional
+        사용할 GPT 모델 이름. 기본값은 환경변수 OPENAI_TRADER_MODEL 또는 "gpt-5.1-mini".
+    gpt_max_risk_pct : float, optional
+        GPT가 설정할 수 있는 최대 effective_risk_pct. 기본값은 GPT_MAX_RISK_PCT.
 
+    Returns
+    -------
+    Dict[str, Any]
+        정규화/검증된 ENTRY 결정 정보:
         {
-          "action": "ENTER" | "SKIP" | "ADJUST",
-          "reason": "...",
-          "tp_pct": 0.006,
-          "sl_pct": 0.004,
-          "effective_risk_pct": 0.02,
-          "guard_adjustments": {
-            "min_entry_volume_ratio": 0.25,
-            "max_spread_pct": 0.001
-          },
-          "_meta": {
-            "latency_sec": 1.234
-          }
+          "direction": "LONG" | "SHORT" | "PASS",
+          "confidence": float,
+          "tv_pct": float,
+          "sl_pct": float,
+          "effective_risk_pct": float,
+          "note": str,
+          "raw_response": str
         }
 
-    예외:
-    - OpenAI API 오류 / 네트워크 오류 / JSON 파싱 오류 / 응답 지연 초과 /
-      JSON 스키마 검증 실패 / market_features 이상 시 RuntimeError 발생.
+    Raises
+    ------
+    RuntimeError
+        - OpenAI API 오류 / 네트워크 오류 / JSON 파싱 오류 / 응답 지연 초과 / JSON 스키마 검증 실패 / market_features 이상 시
+          치명적 오류로 간주하고 RuntimeError를 발생시킨다.
     """
-    client = _get_client()
+    global gpt_entry_call_count
 
-    model = (
-        os.getenv("OPENAI_TRADER_MODEL")
-        or os.getenv("GPT_ENTRY_MODEL")
-        or "gpt-5.1"
-    )
-    try:
-        max_tokens = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
-    except Exception:
-        max_tokens = 192
-    try:
-        max_latency = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "8.0"))
-    except Exception:
-        max_latency = 8.0
-    try:
-        soft_latency = float(os.getenv("OPENAI_TRADER_SOFT_LATENCY", str(max_latency)))
-    except Exception:
-        soft_latency = max_latency
-
-    # market_features 는 필수라고 간주 (백필 금지)
-    if market_features is None:
-        raise RuntimeError(
-            "ask_entry_decision 호출 시 market_features 가 None 입니다. "
-            "unified_features_builder 파이프라인을 확인하세요."
-        )
+    if gpt_max_risk_pct is None:
+        gpt_max_risk_pct = GPT_MAX_RISK_PCT
 
     payload = _build_entry_payload(
         symbol=symbol,
-        signal_source=signal_source,
-        chosen_signal=chosen_signal,
-        last_price=last_price,
-        entry_score=entry_score,
-        effective_risk_pct=effective_risk_pct,
-        leverage=leverage,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        extra=extra,
+        source=source,
+        current_price=current_price,
+        base_tv_pct=base_tv_pct,
+        base_sl_pct=base_sl_pct,
+        base_risk_pct=base_risk_pct,
         market_features=market_features,
     )
 
-    # NaN/None/Infinity 방지용으로 payload 를 한 번 정규화해서 GPT 에 전달한다.
     sanitized_payload = _sanitize_for_gpt(payload)
-
-    user_content = json.dumps(
-        sanitized_payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
+    market_features_json = json.dumps(
+        sanitized_payload, ensure_ascii=False, separators=(",", ":")
     )
 
-    t0 = time.perf_counter()
-    try:
-        try:
-            # 최신 openai-python (Responses API + response_format 지원)
-            resp = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": _SYSTEM_PROMPT_ENTRY},
-                    {"role": "user", "content": user_content},
-                ],
-                response_format={"type": "json_object"},
-                max_output_tokens=max_tokens,
-                temperature=0.2,
-                timeout=max_latency,
-            )
-        except TypeError as e:
-            # 구버전 openai-python: response_format 인자 미지원
-            if "response_format" not in str(e):
-                raise
-            _safe_log(
-                "[GPT_CALL][ENTRY] response_format not supported, retrying without it"
-            )
-            resp = client.responses.create(
-                model=model,
-                input=[
-                    {"role": "system", "content": _SYSTEM_PROMPT_ENTRY},
-                    {"role": "user", "content": user_content},
-                ],
-                max_output_tokens=max_tokens,
-                temperature=0.2,
-                timeout=max_latency,
-            )
-        elapsed = time.perf_counter() - t0
-    except Exception as e:
-        elapsed = time.perf_counter() - t0
-        try:
-            _log_gpt_latency_csv(
-                kind="ENTRY",
-                model=model,
-                symbol=symbol,
-                source=signal_source,
-                direction=chosen_signal,
-                latency_sec=elapsed,
-                soft_limit_sec=soft_latency,
-                hard_limit_sec=max_latency,
-                success=False,
-                error_message=str(e),
-            )
-        except Exception:
-            pass
-        _fatal_log_and_raise("[GPT_ENTRY] 호출 실패", RuntimeError(str(e)))
+    system_prompt = _SYSTEM_PROMPT_ENTRY.format(gpt_max_risk_pct=gpt_max_risk_pct)
+    user_prompt = _USER_PROMPT_TEMPLATE_ENTRY.format(
+        symbol=symbol,
+        source=source,
+        current_price=current_price,
+        base_tv_pct=base_tv_pct,
+        base_sl_pct=base_sl_pct,
+        base_risk_pct=base_risk_pct,
+        market_features_json=market_features_json,
+        gpt_max_risk_pct=gpt_max_risk_pct,
+    )
 
-    # 지연 시간 가드 (하드 타임아웃; soft 기준은 CSV에서 is_slow 플래그로만 사용)
-    if elapsed > max_latency:
-        try:
-            _log_gpt_latency_csv(
-                kind="ENTRY",
-                model=model,
-                symbol=symbol,
-                source=signal_source,
-                direction=chosen_signal,
-                latency_sec=elapsed,
-                soft_limit_sec=soft_latency,
-                hard_limit_sec=max_latency,
-                success=False,
-                error_message=f"latency>{max_latency:.2f}s",
-            )
-        except Exception:
-            pass
-        _fatal_log_and_raise(
-            "[GPT_ENTRY] 응답 지연",
-            RuntimeError(f"GPT 응답 지연: {elapsed:.2f}s > {max_latency:.2f}s"),
+    client = _get_client()
+
+    latency = 0.0
+    error_type = ""
+    error_msg = ""
+    success = False
+
+    start_ts = time.monotonic()
+    try:
+        max_tokens = OPENAI_TRADER_MAX_TOKENS
+        max_latency = OPENAI_TRADER_MAX_LATENCY
+
+        _safe_log(
+            "DEBUG",
+            f"[ENTRY_CALL] model={model} symbol={symbol} source={source} "
+            f"base_tv={base_tv_pct} base_sl={base_sl_pct} base_risk={base_risk_pct}",
         )
 
-    # 정상 응답도 CSV 로 남김
-    try:
+        gpt_entry_call_count += 1
+        gpt_call_id = gpt_entry_call_count
+
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            max_output_tokens=max_tokens,
+            timeout=max_latency,
+            response_format={"type": "json_object"},
+        )
+        latency = time.monotonic() - start_ts
+        success = True
+
+        text = _extract_text_from_response(resp)
+
+        try:
+            raw_dict = json.loads(text)
+        except Exception:
+            raw_dict = _parse_json(text)
+
+        if not isinstance(raw_dict, dict):
+            raise ValueError(
+                f"ENTRY GPT 응답 JSON 최상위 타입이 dict가 아님: {type(raw_dict).__name__}"
+            )
+
+        normalized = _normalize_and_validate_entry_response(
+            raw_dict,
+            base_tv_pct=base_tv_pct,
+            base_sl_pct=base_sl_pct,
+            base_risk_pct=base_risk_pct,
+            symbol=symbol,
+            source=source,
+            gpt_max_risk_pct=gpt_max_risk_pct,
+        )
+        normalized["raw_response"] = text
+
+        _safe_log(
+            "INFO",
+            f"[ENTRY_OK] model={model} symbol={symbol} source={source} "
+            f"dir={normalized['direction']} conf={normalized['confidence']:.3f} "
+            f"tv={normalized['tv_pct']:.4f} sl={normalized['sl_pct']:.4f} "
+            f"risk={normalized['effective_risk_pct']:.4f} latency={latency:.3f}s "
+            f"call_id={gpt_call_id}",
+        )
+
         _log_gpt_latency_csv(
             kind="ENTRY",
             model=model,
             symbol=symbol,
-            source=signal_source,
-            direction=chosen_signal,
-            latency_sec=elapsed,
-            soft_limit_sec=soft_latency,
-            hard_limit_sec=max_latency,
+            source=source,
+            direction=normalized["direction"],
+            latency=latency,
             success=True,
-            error_message=None,
         )
-    except Exception:
-        pass
 
-    try:
-        text = _extract_text_from_response(resp).strip()
+        return normalized
+
     except Exception as e:
-        _fatal_log_and_raise("[GPT_ENTRY] 응답 텍스트 추출 실패", RuntimeError(str(e)))
+        latency = time.monotonic() - start_ts
+        error_type = type(e).__name__
+        error_msg = str(e)
 
-    if not text:
-        _fatal_log_and_raise(
-            "[GPT_ENTRY] 응답 없음", RuntimeError("GPT 응답이 비어 있습니다."),
+        _safe_log(
+            "ERROR",
+            f"[ENTRY_FAIL] model={model} symbol={symbol} source={source} "
+            f"latency={latency:.3f}s err={error_type}: {error_msg}",
+        )
+        _safe_tg(
+            f"[ENTRY_FAIL] model={model} symbol={symbol} source={source} "
+            f"latency={latency:.3f}s err={error_type}: {error_msg}"
         )
 
-    # JSON 파싱 (필요 시 중괄호 부분만 잘라서 재시도)
-    def _parse_json(s: str) -> Dict[str, Any]:
-        try:
-            obj = json.loads(s)
-            if not isinstance(obj, Dict):
-                raise ValueError("JSON 루트 타입이 dict 가 아닙니다.")
-            return obj
-        except Exception:
-            start = s.find("{")
-            end = s.rfind("}")
-            if start != -1 and end != -1 and start < end:
-                sub = s[start : end + 1]
-                obj = json.loads(sub)
-                if not isinstance(obj, Dict):
-                    raise ValueError("잘라낸 JSON 루트 타입이 dict 가 아닙니다.")
-                return obj
-            raise
-
-    try:
-        data = _parse_json(text)
-    except Exception as e:
-        preview = text[:200]
-        _fatal_log_and_raise(
-            "[GPT_ENTRY] JSON 파싱 실패",
-            RuntimeError(f"GPT 응답 JSON 파싱 실패: {preview!r} / {e}"),
-        )
-
-    # JSON 스키마/값 검증
-    try:
-        data = _normalize_and_validate_entry_response(
-            data,
-            base_tp_pct=tp_pct,
-            base_sl_pct=sl_pct,
-            base_risk_pct=effective_risk_pct,
-        )
-    except Exception as e:
-        _fatal_log_and_raise(
-            "[GPT_ENTRY] JSON 검증 실패",
-            RuntimeError(f"GPT 진입 응답 검증 실패: {e}"),
-        )
-
-    # 메타 정보(지연 시간)를 붙여서 상위에서 참고할 수 있게 한다.
-    try:
-        meta = data.get("_meta")
-        if not isinstance(meta, Dict):
-            meta = {}
-        meta["latency_sec"] = round(elapsed, 3)
-        data["_meta"] = meta
-    except Exception:
-        # 메타 추가는 필수가 아니므로 실패해도 무시
-        pass
-
-    return data
-
-
-def ask_entry_decision_safe(
-    *,
-    symbol: str,
-    signal_source: str,
-    chosen_signal: str,
-    last_price: float,
-    entry_score: Optional[float],
-    effective_risk_pct: float,
-    leverage: float,
-    tp_pct: float,
-    sl_pct: float,
-    extra: Optional[Dict[str, Any]],
-    market_features: Optional[Dict[str, Any]],
-) -> Tuple[str, Dict[str, Any]]:
-    """진입 의사결정용 래퍼.
-
-    - ask_entry_decision 과 동일하되, 실패 시 Render 로그/Telegram 알림을 남기고 예외를 그대로 전파한다.
-    - 폴백 진입(ENTER/CLOSE 자동 선택)을 하지 않는다.
-    """
-    try:
-        data = ask_entry_decision(
+        _log_gpt_latency_csv(
+            kind="ENTRY",
+            model=model,
             symbol=symbol,
-            signal_source=signal_source,
-            chosen_signal=chosen_signal,
-            last_price=last_price,
-            entry_score=entry_score,
-            effective_risk_pct=effective_risk_pct,
-            leverage=leverage,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            extra=extra,
-            market_features=market_features,
+            source=source,
+            direction=None,
+            latency=latency,
+            success=False,
+            error_type=error_type,
+            error_msg=error_msg,
         )
-        action = str(data.get("action", "")).upper()
-        # 여기까지 오면 _normalize_and_validate_entry_response 에서 이미 검증됨
-        if action not in {"ENTER", "SKIP", "ADJUST"}:
-            raise RuntimeError(f"검증 이후에도 action 값이 비정상입니다: {action!r}")
 
-        # 성공 시 Render 로그에 요약 남김
-        try:
-            new_tp = data.get("tp_pct", tp_pct)
-            new_sl = data.get("sl_pct", sl_pct)
-            new_risk = data.get("effective_risk_pct", effective_risk_pct)
-            latency = None
-            meta = data.get("_meta")
-            if isinstance(meta, Dict):
-                latency = meta.get("latency_sec")
-            _safe_log(
-                f"[GPT_ENTRY] action={action} tp={new_tp} sl={new_sl} "
-                f"risk={new_risk} lat={latency} symbol={symbol} "
-                f"src={signal_source} dir={chosen_signal}"
-            )
-        except Exception:
-            pass
-
-        return action, data
-    except Exception as e:  # pragma: no cover - GPT 오류
-        try:
-            from telelog import log  # 순환 import 방지용 지연 import
-
-            log(f"[GPT_ENTRY][ERROR] GPT 진입 판단 호출 실패: {e}")
-            _safe_tg(
-                "⚠️ GPT 진입 판단 호출에 실패했습니다. "
-                "자동매매 상태와 로그를 확인해 주세요.\n"
-                f"에러: {e}"
-            )
-        except Exception:
-            pass
-        # 폴백 없이 예외를 그대로 전파
-        raise
+        raise RuntimeError(
+            f"ENTRY GPT 호출 실패: {error_type}: {error_msg}"
+        ) from e
 
 
-# ─────────────────────────────────────────
-# 2) 청산(포지션 종료) 의사결정
-# ─────────────────────────────────────────
+# =============================================================================
+# EXIT 쪽 프롬프트 / 호출
+# =============================================================================
+
+_EXIT_SYSTEM_PROMPT = """
+You are an expert trading exit advisor for intraday crypto futures trading.
+
+[역할]
+- 이미 진입한 포지션에 대해, 지금 청산(전부 또는 일부)해야 할지, 또는 유지해야 할지에 대해 조언합니다.
+- 손절/익절 레벨에 근접했는지, 시장 구조가 바뀌었는지 등을 고려해 결정을 돕습니다.
+
+[입력으로 제공되는 정보]
+- symbol, side(LONG/SHORT), entry_price, current_price, entry_time, holding_minutes
+- unrealized_pnl_pct (실현되지 않은 손익률, %, 예: 0.03 = +3%)
+- max_favorable_excursion_pct (MFE), max_adverse_excursion_pct (MAE)
+- regime, volatility, trend 관련 피처 등
+
+[출력 JSON 스키마]
+
+필수 필드:
+- action: "CLOSE_ALL" | "CLOSE_PARTIAL" | "HOLD"
+- close_ratio: 0.0 ~ 1.0 (CLOSE_PARTIAL일 때 청산 비율, 예: 0.5 = 50%)
+- new_sl_pct: 0.0 ~ 0.5 (새로운 손절 라인(진입가 기준), 필요 없으면 기존 유지 의미에서 0.0 사용 가능)
+- new_tp_pct: 0.0 ~ 0.5 (새로운 익절 라인(진입가 기준), 필요 없으면 0.0)
+- note: string (결정 이유 설명)
+- raw_response: string (추가 메모 등)
+
+제약:
+- "CLOSE_ALL"인 경우 close_ratio는 1.0
+- "HOLD"인 경우 close_ratio는 0.0
+- NaN / Infinity / null / "NaN" / "Infinity" / "None" 등은 절대 사용하지 않는다.
+
+JSON 예시:
+```json
+{
+  "action": "CLOSE_PARTIAL",
+  "close_ratio": 0.5,
+  "new_sl_pct": 0.01,
+  "new_tp_pct": 0.04,
+  "note": "이미 상당 부분 이익 구간에 진입했으므로 절반 청산 후 나머지는 추세를 따라가도록 설정.",
+  "raw_response": "간단한 요약 또는 내부용 메모"
+}
+"""
+_EXIT_USER_PROMPT_TEMPLATE = """
+[포지션 정보]
+
+Symbol: {symbol}
+Side: {side}
+Entry Price: {entry_price}
+Current Price: {current_price}
+Entry Time (UTC): {entry_time}
+Holding Minutes: {holding_minutes}
+
+[포지션 성과]
+
+Unrealized PnL %: {pnl_pct}
+Max Favorable Excursion % (MFE): {mfe_pct}
+Max Adverse Excursion % (MAE): {mae_pct}
+
+[시장 상태 요약 (JSON 직렬화)]
+
+{extra_json}
+
+[요구사항]
+
+위 정보를 바탕으로, 현재 포지션을 어떻게 처리할지 JSON 형식으로만 응답해 주세요.
+
+- action: "CLOSE_ALL" | "CLOSE_PARTIAL" | "HOLD"
+- close_ratio: 0.0 ~ 1.0
+- new_sl_pct: 0.0 ~ 0.5
+- new_tp_pct: 0.0 ~ 0.5
+- note: string
+- raw_response: string
+
+주의:
+- "CLOSE_ALL"이면 close_ratio=1.0.
+- "HOLD"이면 close_ratio=0.0.
+- NaN / Infinity / null / "NaN" / "Infinity" / "None" 등의 값은 절대 사용하지 않습니다.
+- 반드시 JSON만, 추가 설명 텍스트 없이 응답합니다.
+"""
 
 
 def _make_exit_prompt(payload: Dict[str, Any]) -> str:
-    """EXIT(청산) 전용 프롬프트를 구성한다.
-
-    payload 예시:
-    {
-      "symbol": "BTC-USDT",
-      "regime": "MARKET" 등 단순 태그,
-      "side": "BUY"/"SELL"/"LONG"/"SHORT",
-      "scenario": "RUNTIME_EXIT_CHECK" / "OPPOSITE_SIGNAL" / "SMALL_PROFIT_PROTECT" 등,
-      "last_price": 95000.0,
-      "entry_price": 94000.0,
-      "leverage": 10,
-      "pnl_pct": 0.0105,
-      "extra": {
-        "market_features": {...},   # unified_features_builder 가 만든 시장/패턴/지표 피처
-        "thresholds": {...},       # 조기 익절/손절 임계값, 시간 경과 정보 등
-        "guards": {...}            # 추가 리스크 플래그 등
-      }
-    }
     """
-    return (
-        "당신은 BTC-USDT 선물 자동매매 봇의 '포지션 종료 전담 리스크 컨트롤러'입니다.\n"
-        "아래 JSON 상태를 보고, 지금 포지션을 청산할지(CLOSE) 보유할지(HOLD) 결정하세요.\n\n"
-        "입력 JSON에는 대략 다음 정보가 포함됩니다.\n"
-        "- symbol: 거래 종목\n"
-        "- regime: 단순 태그 (예: 'MARKET')\n"
-        "- side: LONG/SHORT (BUY/SELL 포함)\n"
-        "- scenario: 호출 의도 (예: 'RUNTIME_EXIT_CHECK', 'OPPOSITE_SIGNAL', 'SMALL_PROFIT_PROTECT', 'VOLATILITY_DROP', 'TIME_STOP' 등)\n"
-        "- entry_price, last_price, leverage\n"
-        "- pnl_pct: 롱 기준 수익률 (양수=이익, 음수=손실)\n"
-        "- extra.market_features: 모멘텀/변동성/패턴 점수, wick 구조, 유동성 이벤트 등\n"
-        "- extra.thresholds: 조기익절/조기손절 기준, 목표 TP/SL, 경과 시간, small_profit 범위 등\n"
-        "- extra.guards 및 기타 플래그: 급등락, 변동성 급증/급락, 지지·저항 이탈 여부 등\n\n"
-        "청산 의사결정 기본 가이드:\n"
-        "1) 충분한 이익 구간 (pnl_pct 가 thresholds.small_tp_max 이상 또는 목표 TP 근처)에서는 다음을 고려합니다.\n"
-        "   - pattern_features 와 market_features 가 '되돌림 위험'(반전 패턴, 강한 윗꼬리/아랫꼬리, 유동성 스윕) 을 강하게 보여주면 → 이익을 확정하기 위해 'CLOSE' 를 선호합니다.\n"
-        "   - 모멘텀/추세 점수가 여전히 포지션 방향을 강하게 지지하고, 변동성이 살아 있으며, thresholds 가 허용하는 경우 → 'HOLD' 를 허용할 수 있습니다.\n\n"
-        "2) 소량 이익 구간 (0 < pnl_pct < thresholds.small_tp_max 근처)에서는:\n"
-        "   - scenario 가 'SMALL_PROFIT_PROTECT' 이거나, 변동성이 죽고(boxiness 증가, momentum 약화) 방향성이 애매해진 경우 → 작은 이익이라도 지키기 위해 'CLOSE' 쪽으로 기울어야 합니다.\n"
-        "   - 모멘텀/유동성이 여전히 포지션 방향을 지지하고, reversal 신호가 약하다면 → 'HOLD' 를 잠시 더 허용할 수 있습니다.\n\n"
-        "3) 손실 구간 (pnl_pct < 0)에서는:\n"
-        "   - thresholds.max_loss 또는 조기손절 기준에 도달했거나 가까운 경우 → 과감히 'CLOSE' 를 선택합니다.\n"
-        "   - market_features 가 모멘텀/패턴/유동성 측면에서 일관되게 포지션 반대 방향을 지지하는 경우 → 손실이 작더라도 'CLOSE' 를 우선합니다.\n"
-        "   - 아직 명확한 방향 전환 없이 노이즈 수준이고, thresholds 가 더 허용한다면 → 'HOLD' 도 고려할 수 있습니다.\n\n"
-        "4) scenario 별 우선 규칙:\n"
-        "   - 'OPPOSITE_SIGNAL': 상위/동일 타임프레임에서 강한 반대 방향 신호가 감지된 상황이면 기본 선택은 'CLOSE' 입니다.\n"
-        "   - 'VOLATILITY_DROP' 또는 유사 태그: 급등/급락 이후 변동성이 죽고(박스화), 방향성 에지가 약해졌다면 소량 이익이라도 'CLOSE' 를 선호합니다.\n"
-        "   - 'RUNTIME_EXIT_CHECK': 주기적(예: 10초) 점검용이며, 위 1~3번 규칙을 그대로 적용해 합리적인 리스크 관점에서 CLOSE/HOLD 를 선택합니다.\n"
-        "   - 'TIME_STOP' / 만기/강제정리 관련 태그: 시간이 충분히 경과했고 더 이상 가져갈 이유가 없으면 손익이 작아도 'CLOSE' 를 고려합니다.\n\n"
-        "5) TP/SL 과의 관계:\n"
-        "   - 기존 TP/SL 은 '참고 값'일 뿐, 시장 구조와 현재 리스크를 보고 필요하면 그 전에 'CLOSE' 를 선택해야 합니다.\n"
-        "   - 손절가(SL)에 도달하기 전이라도 구조가 명확히 깨졌다면 과감히 'CLOSE' 합니다.\n"
-        "   - TP 에 근접했지만 되돌림 위험이 크다면 TP 까지 기다리지 말고 'CLOSE' 로 이익을 확정합니다.\n\n"
-        "반드시 JSON 하나만 출력합니다.\n"
-        "출력 스키마는 다음과 같습니다.\n\n"
-        "{\n"
-        "  \"action\": \"CLOSE\" 또는 \"HOLD\",\n"
-        "  \"reason\": \"여기에 한국어 한 줄 요약\",\n"
-        "  \"comment\": \"사람이 이해하기 쉬운 짧은 설명 (선택 사항)\"\n"
-        "}\n\n"
-        "규칙(아주 중요):\n"
-        "- action 은 오직 \"CLOSE\" 또는 \"HOLD\" 중 하나만 사용하십시오.\n"
-        "- \"KEEP\" 이라고 표현하고 싶다면 대신 \"HOLD\" 를 사용하십시오.\n"
-        "- JSON 바깥에 다른 텍스트를 절대 쓰지 마십시오.\n"
-        "- 코드블록 마크다운(예: ```json) 과 주석(//, # 등), NaN/Infinity 는 절대 사용하지 마십시오.\n\n"
-        "현재 포지션 상태 JSON:\n"
-        + json.dumps(
-            _sanitize_for_gpt(payload),
-            ensure_ascii=False,
-            indent=2,
-        )
+    EXIT 결정용 user 프롬프트 문자열을 만든다.
+    이 때 payload는 GPT 직전 _sanitize_for_gpt를 거쳐 NaN/Inf/None이 제거된 상태여야 한다.
+    """
+    extra_json = json.dumps(
+        _sanitize_for_gpt(payload),
+        ensure_ascii=False,
+        indent=2,
     )
 
-
-def _normalize_and_validate_exit_response(data: Dict[str, Any]) -> Dict[str, Any]:
-    """GPT 청산 응답 JSON 을 정규화/검증한다.
-
-    - action: 'CLOSE' 또는 'HOLD' 만 허용. 'KEEP' 은 내부적으로 'HOLD' 로 변환.
-    - reason/comment: 존재할 경우 문자열 여부만 확인.
-    """
-    action = data.get("action")
-    if not isinstance(action, str):
-        raise ValueError("GPT exit response 에 'action' 문자열 필드가 없습니다.")
-    action_u = action.strip().upper()
-    if action_u == "KEEP":
-        action_u = "HOLD"
-    if action_u not in {"CLOSE", "HOLD"}:
-        raise ValueError(f"GPT exit response 의 action 값이 잘못되었습니다: {action_u!r}")
-    data["action"] = action_u
-
-    if "reason" in data and data["reason"] is not None and not isinstance(
-        data["reason"], str
-    ):
-        raise ValueError("GPT exit response 의 reason 은 문자열이어야 합니다.")
-
-    if "comment" in data and data["comment"] is not None and not isinstance(
-        data["comment"], str
-    ):
-        raise ValueError("GPT exit response 의 comment 는 문자열이어야 합니다.")
-
-    return data
+    prompt = _EXIT_USER_PROMPT_TEMPLATE.format(
+        symbol=payload.get("symbol"),
+        side=payload.get("side"),
+        entry_price=payload.get("entry_price"),
+        current_price=payload.get("current_price"),
+        entry_time=payload.get("entry_time"),
+        holding_minutes=payload.get("holding_minutes"),
+        pnl_pct=payload.get("pnl_pct"),
+        mfe_pct=payload.get("mfe_pct"),
+        mae_pct=payload.get("mae_pct"),
+        extra_json=extra_json,
+    )
+    return prompt
 
 
 def ask_exit_decision(
     *,
     symbol: str,
-    side: str,  # "BUY" / "SELL" / "LONG" / "SHORT"
-    scenario: str,  # "EARLY_TP" / "EARLY_EXIT" / "OPPOSITE_SIGNAL" 등
-    last_price: float,
+    side: Literal["LONG", "SHORT"],
     entry_price: float,
-    leverage: Optional[float],
-    extra: Optional[Dict[str, Any]],
-    regime: Optional[str] = None,
-    source: Optional[str] = None,
+    current_price: float,
+    entry_time: dt.datetime,
+    holding_minutes: float,
+    mfe_pct: float,
+    mae_pct: float,
+    extra: Dict[str, Any],
+    model: str = GPT_MODEL_DEFAULT,
 ) -> Dict[str, Any]:
-    """GPT-5.1 에게 '이 포지션을 지금 청산할지 말지'를 묻는다.
-
-    - regime/source: 전략 종류 태그. 둘 중 하나만 넘겨도 됨.
-    - side:   포지션 방향
-    - scenario: 호출 위치/의도 구분용 태그 (ex: "EARLY_TP")
-    - extra:  캔들/거래량/임계값/시장 피처 등 추가 컨텍스트
     """
-    model = os.getenv("GPT_EXIT_MODEL", "gpt-5.1-mini")
-
-    # unified_features 기반 market_features 는 EXIT 에서도 필수 (백필 금지)
-    if extra is None or not isinstance(extra, dict):
-        raise RuntimeError(
-            "ask_exit_decision 호출 시 extra 가 None 이거나 dict 가 아닙니다. "
-            "position_watch_ws → unified_features_builder 파이프라인을 확인하세요."
-        )
-    mf = extra.get("market_features")
-    if not isinstance(mf, dict) or not mf:
-        raise RuntimeError(
-            "ask_exit_decision.extra.market_features 가 비어 있습니다. "
-            "EXIT 호출 시 unified_features_builder 에서 만든 market_features 를 반드시 포함해야 합니다."
-        )
-
-    # side 정규화
-    s = side.upper()
-    if s == "BUY":
-        norm_side = "LONG"
-    elif s == "SELL":
-        norm_side = "SHORT"
-    else:
-        norm_side = s
-
-    # regime/source 정규화 (둘 중 하나만 넘어와도 됨)
-    regime_val = (source or regime or "").upper() if (source or regime) else ""
+    EXIT 결정을 위해 GPT에게 질의하고, 응답을 dict로 반환한다.
+    NaN / Inf / None은 GPT 직전 _sanitize_for_gpt에 의해 제거된다.
+    """
+    now = dt.datetime.utcnow()
+    entry_time_utc = entry_time.astimezone(dt.timezone.utc).replace(tzinfo=None)
 
     # PnL %
-    pnl_pct: Optional[float]
     try:
-        if entry_price > 0 and last_price > 0:
-            raw = (last_price - entry_price) / entry_price
-            if norm_side == "SHORT":
-                raw = -raw
-            pnl_pct = raw
+        if entry_price > 0:
+            pnl_pct = (current_price - entry_price) / entry_price
+            if side == "SHORT":
+                pnl_pct *= -1.0
         else:
             pnl_pct = None
     except Exception:
@@ -1148,108 +1002,145 @@ def ask_exit_decision(
 
     payload: Dict[str, Any] = {
         "symbol": symbol,
-        "regime": regime_val,
-        "side": norm_side,
-        "scenario": scenario,
+        "side": side,
         "entry_price": entry_price,
-        "last_price": last_price,
-        "leverage": leverage,
+        "current_price": current_price,
+        "entry_time": entry_time_utc.isoformat(),
+        "now": now.isoformat(),
+        "holding_minutes": holding_minutes,
         "pnl_pct": pnl_pct,
-        "extra": extra or {},
+        "mfe_pct": mfe_pct,
+        "mae_pct": mae_pct,
+        "extra_context": extra or {},
     }
 
     prompt = _make_exit_prompt(payload)
+    system = _EXIT_SYSTEM_PROMPT
+
+    latency = 0.0
+    start_ts = time.monotonic()
+
     try:
+        _safe_log(
+            "DEBUG",
+            f"[EXIT_CALL] model={model} symbol={symbol} side={side} "
+            f"entry={entry_price} cur={current_price} pnl={pnl_pct}",
+        )
+
         data = _call_gpt_json(
-            model=model, prompt=prompt, purpose="EXIT_DECISION"
+            model=model,
+            prompt=system + "\n\n" + prompt,
+            purpose="EXIT",  # CSV kind="EXIT" 으로 기록
         )
-    except Exception as e:
-        _fatal_log_and_raise("[GPT_EXIT] 호출/JSON 파싱 실패", RuntimeError(str(e)))
+        latency = time.monotonic() - start_ts
 
-    # JSON 스키마/값 검증
-    try:
-        data = _normalize_and_validate_exit_response(data)
-    except Exception as e:
-        _fatal_log_and_raise(
-            "[GPT_EXIT] JSON 검증 실패", RuntimeError(f"GPT 청산 응답 검증 실패: {e}"),
+        action = str(data.get("action", "HOLD")).upper().strip()
+        if action not in ("CLOSE_ALL", "CLOSE_PARTIAL", "HOLD"):
+            action = "HOLD"
+
+        def _flt(key: str, default: float = 0.0, *, min_val: float, max_val: float) -> float:
+            v = data.get(key, default)
+            try:
+                if v is None:
+                    return default
+                v = float(v)
+            except Exception:
+                return default
+            if math.isnan(v) or math.isinf(v):
+                return default
+            return max(min_val, min(max_val, v))
+
+        close_ratio = _flt("close_ratio", 0.0, min_val=0.0, max_val=1.0)
+        new_sl_pct = _flt("new_sl_pct", 0.0, min_val=0.0, max_val=0.5)
+        new_tp_pct = _flt("new_tp_pct", 0.0, min_val=0.0, max_val=0.5)
+
+        if action == "CLOSE_ALL":
+            close_ratio = 1.0
+        elif action == "HOLD":
+            close_ratio = 0.0
+
+        note = str(data.get("note", "") or "").strip()
+        raw_response = str(data.get("raw_response", "") or "").strip()
+
+        result = {
+            "action": action,
+            "close_ratio": close_ratio,
+            "new_sl_pct": new_sl_pct,
+            "new_tp_pct": new_tp_pct,
+            "note": note,
+            "raw_response": raw_response,
+        }
+
+        _safe_log(
+            "INFO",
+            f"[EXIT_OK] model={model} symbol={symbol} side={side} "
+            f"action={action} close_ratio={close_ratio:.3f} "
+            f"new_sl={new_sl_pct:.4f} new_tp={new_tp_pct:.4f} "
+            f"latency={latency:.3f}s",
         )
 
-    return data
+        return result
+
+    except Exception as e:
+        latency = time.monotonic() - start_ts
+        _safe_log(
+            "ERROR",
+            f"[EXIT_FAIL] model={model} symbol={symbol} side={side} "
+            f"latency={latency:.3f}s err={type(e).__name__}: {e}",
+        )
+        _safe_tg(
+            f"[EXIT_FAIL] model={model} symbol={symbol} side={side} "
+            f"latency={latency:.3f}s err={type(e).__name__}: {e}"
+        )
+        raise RuntimeError(f"EXIT GPT 호출 실패: {type(e).__name__}: {e}") from e
 
 
 def ask_exit_decision_safe(
     *,
     symbol: str,
-    side: str,
-    scenario: str,
-    last_price: float,
+    side: Literal["LONG", "SHORT"],
     entry_price: float,
-    leverage: Optional[float],
-    extra: Optional[Dict[str, Any]],
-    fallback_action: str = "CLOSE",
-    regime: Optional[str] = None,
-    source: Optional[str] = None,
-) -> Tuple[str, Dict[str, Any]]:
-    """청산(포지션 종료) 의사결정용 래퍼.
-
-    - 정상 응답: (action, json) 을 돌려준다.
-      * action 은 항상 "CLOSE" 또는 "HOLD" 로 정규화된다.
-    - 비정상 상황(GPT 오류/타임아웃/JSON 형식 오류 등):
-      * Render 로그 + Telegram 알림을 남기고 예외를 그대로 전파한다.
-    - fallback_action 인자는 더 이상 사용되지 않으며, 향후 제거될 수 있다.
+    current_price: float,
+    entry_time: dt.datetime,
+    holding_minutes: float,
+    mfe_pct: float,
+    mae_pct: float,
+    extra: Dict[str, Any],
+    model: str = GPT_MODEL_DEFAULT,
+    fallback_action: Literal["HOLD", "CLOSE_ALL"] = "HOLD",
+) -> Dict[str, Any]:
     """
-    # 기존 시그니처 유지를 위해 fallback_action 인자를 받지만, 실제 폴백에는 사용하지 않는다.
-    _ = fallback_action
+    ask_exit_decision을 감싸서, GPT 호출 실패 시에도 예외를 바깥으로 전파하지 않고
+    안전한 폴백 액션(HOLD 또는 CLOSE_ALL)을 반환한다.
 
-    try:
-        data = ask_exit_decision(
-            symbol=symbol,
-            side=side,
-            scenario=scenario,
-            last_price=last_price,
-            entry_price=entry_price,
-            leverage=leverage,
-            extra=extra,
-            regime=regime,
-            source=source,
-        )
-        raw_action = str(data.get("action", "")).upper()
+    Parameters
+    ----------
+    fallback_action : {"HOLD", "CLOSE_ALL"}
+        GPT 호출 실패 시 사용할 기본 액션. 기본값은 "HOLD".
 
-        if raw_action not in {"CLOSE", "HOLD"}:
-            raise RuntimeError(f"검증 이후에도 action 값이 비정상입니다: {raw_action!r}")
-        action = raw_action
+    Returns
+    -------
+    Dict[str, Any]
+        (가능하면) GPT 기반 EXIT 결정 결과, 실패 시 fallback_action 기반 결과.
+    """
+    _ = fallback_action  # 현재는 항상 예외를 외부로 전파하므로 사용하지 않음
 
-        # 성공 시 Render 로그에 요약 남김
-        try:
-            _safe_log(
-                f"[GPT_EXIT] scenario={scenario} action={action} "
-                f"symbol={symbol} side={side} reason={data.get('reason')}"
-            )
-        except Exception:
-            pass
-
-        return action, data
-    except Exception as e:  # pragma: no cover - GPT 오류
-        try:
-            from telelog import log  # 순환 import 방지용 지연 import
-
-            msg = f"[GPT_EXIT][ERROR] GPT 청산 판단 호출 실패: {e}"
-            log(msg)
-            _safe_tg(
-                "⚠️ GPT 청산 판단 호출에 실패했습니다. "
-                "자동매매 상태와 로그를 확인해 주세요.\n"
-                f"에러: {e}"
-            )
-        except Exception:
-            pass
-
-        # 폴백 없이 예외를 그대로 전파
-        raise
+    return ask_exit_decision(
+        symbol=symbol,
+        side=side,
+        entry_price=entry_price,
+        current_price=current_price,
+        entry_time=entry_time,
+        holding_minutes=holding_minutes,
+        mfe_pct=mfe_pct,
+        mae_pct=mae_pct,
+        extra=extra,
+        model=model,
+    )
 
 
 __all__ = [
     "ask_entry_decision",
-    "ask_entry_decision_safe",
     "ask_exit_decision",
     "ask_exit_decision_safe",
 ]

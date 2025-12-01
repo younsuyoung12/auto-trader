@@ -1,23 +1,77 @@
-"""
-# exchange_api.py
+"""exchange_api.py
 
-수정 내용 (2025-11-13)
-1) _as_int_qty(...) 제거 → 심볼별 최소 수량 step 으로 재시도하도록 변경 (요구 반영)
-2) 시장가/조건부/강제청산 재시도 시에도 심볼 step 기반 최소 수량을 사용하도록 통일 (요구 반영)
-3) 나머지 로직과 로그 포맷은 유지 (요구 반영)
-4) [PATCH] 수량 정규화에 Decimal 기반 내림 적용 → 부동소수점 오차 제거, step 정밀도 보존
-5) [PATCH] sign_query 를 urlencode 기반으로 변경, bool 소문자화 → 서명/전송 문자열 일치 강화
-6) [PATCH] _is_param_error 메시지 패턴 확장 → 109400/110400 외 변형 문구 방어
-7) [PATCH] _try_order 재시도 사이 소폭 백오프(0.2s) 추가 → 레이트리밋/연쇄 오류 완화
-8) [PATCH] place_conditional 에 workingType 명시(기본 MARK_PRICE, settings 로 변경 가능)
+BingX 선물 REST 어댑터 (주문/계좌/포지션 단일 게이트웨이)
+
+역할
+----------------------------------------------------
+- BingX 선물 REST API를 래핑하는 단일 진입/청산 계층.
+- run_bot_ws → entry_flow.try_open_new_position(...) → open_position_with_tp_sl(...) → place_market(...) 흐름으로
+  실제 진입 주문과 TP/SL 조건부 주문을 전송한다.
+- position_watch_ws.maybe_exit_with_gpt(...) → close_position_market(...) 흐름으로
+  열린 포지션을 시장가로 강제 청산한다.
+- trader.Trade / TraderState 와 함께 현재 포지션 상태를 추적하고,
+  fetch_open_positions(...) / fetch_open_orders(...) 등으로 거래소 상태를 동기화한다.
+
+설계 원칙
+----------------------------------------------------
+1) "실제 돈이 움직이는 유일한 계층"
+   - 이 모듈 밖에서는 requests, 서명, BingX 엔드포인트를 직접 호출하지 않는다.
+   - 모든 주문/계좌 조회는 반드시 여기 정의된 public 함수만 사용한다.
+
+2) 수량 정규화
+   - 선물 수량은 심볼별 step(_QTY_STEP) 기준으로 _normalize_qty(...) 에서 항상 내림 처리한다.
+   - 최소 1 step 이상으로 강제해 '0.00099999' 같은 부동소수점 꼬리를 제거한다.
+
+3) 서명/요청 일관성
+   - sign_query(...) 에서 urlencode + HMAC-SHA256 으로 쿼리스트링을 서명한다.
+   - req(...) 는 timestamp 를 자동으로 붙이고, BingX code != 0 인 케이스를 RuntimeError 로 올린다
+     (100400 같이 "API 미지원" 코드는 워닝만 남기고 통과).
+
+4) 주문 재시도 정책
+   - _try_order(...) 는 여러 payload 변형을 순차 시도하면서,
+     파라미터 오류(_is_param_error)로 판단되는 경우에만 다음 포맷으로 재시도한다.
+   - 재시도 사이 0.2초 백오프를 두어 레이트리밋/연쇄 오류를 완화한다.
+
+5) 예외 처리 방침
+   - 계좌/포지션 조회 계열(get_available_usdt, fetch_open_positions, ...)은
+     실패 시 텔레그램/로그를 남기고 안전한 기본값(0.0, [])을 반환한다.
+   - 주문/TP·SL 설정 계열(open_position_with_tp_sl, place_market, place_conditional, close_position_market)은
+     실패 시 예외를 로깅하고 상위 레이어(entry_flow / position_watch_ws)가
+     "trade is None" 또는 False 등의 신호로 후속 처리할 수 있도록 설계한다.
+
+2025-12-01 정리/수정 사항
+----------------------------------------------------
+- open_position_with_tp_sl 이 존재하지 않는 open_order_market 에 의존하던 문제를 수정.
+  · 이제 place_market(...) 을 직접 호출해 진입 시장가 주문을 전송한다.
+  · 체결 정보가 있으면 avgPrice/price 를 사용하고, 없으면 entry_flow 가 넘겨준 entry_price_hint 를 사용한다.
+- set_tp_sl(...) 를 재구현하여 place_conditional(...) 를 통해
+  포지션 방향과 반대 side 의 reduceOnly 조건부 TP/SL 주문을 1회씩 전송한다.
+- exchange_api 모듈 내부에서 자기 자신을 import 하던 레거시 코드
+  (from exchange_api import open_order_market, set_tp_sl)를 제거해 순환 의존성을 없앴다.
+- __all__ 에 open_position_with_tp_sl, set_tp_sl 를 추가하여 공개 API 를 명시적으로 정리했다.
+
+2025-12-02 슬리피지 방지 기능 (틱 기반) 추가
+----------------------------------------------------
+- open_position_with_tp_sl(...) 진입 직후, entry_price_hint 대비 실제 체결가(entry_price)의
+  슬리피지를 "틱 수" 기준으로 계산해 하드 가드로 사용한다.
+  · tick_size = SET.price_tick_size (없으면 기본 0.1 USD / BTC-USDT) 를 사용해 diff_ticks = |fill-exp| / tick_size 계산.
+  · 설정값 SET.max_entry_slippage_ticks (기본 20틱)을 초과하면 텔레그램 경고를 보낸다.
+  · SET.auto_close_on_heavy_slippage 가 True 이면 close_position_market(...) 을 즉시 호출해
+    방금 연 포지션을 강제 청산하고, open_position_with_tp_sl(...) 은 Trade 대신 None 을 반환한다.
+- 퍼센트 기반 슬리피지 대신 "선물 시장의 틱 단위"를 기준으로 가드를 적용한다.
 """
 from __future__ import annotations
 
 import time
 import hmac
 import hashlib
+import math
 from typing import Any, Dict, List, Optional
 import requests
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from trader import Trade
 
 from settings_ws import load_settings
 from telelog import log, send_tg
@@ -29,10 +83,14 @@ SET = load_settings()
 BASE = SET.bingx_base  # 예: https://open-api.bingx.com
 
 # ─────────────────────────────
-# 심볼별 수량 step (선물 전용)
+# 심볼별 수량 step / tick (선물 전용)
 # ─────────────────────────────
 _QTY_STEP: Dict[str, float] = {
     "BTC-USDT": 0.001,
+}
+
+_PRICE_TICK: Dict[str, float] = {
+    "BTC-USDT": 0.1,  # BingX BTC-USDT 선물 최소 가격 단위
 }
 
 # ─────────────────────────────
@@ -40,92 +98,23 @@ _QTY_STEP: Dict[str, float] = {
 # ─────────────────────────────
 from decimal import Decimal, ROUND_DOWN, getcontext
 from urllib.parse import urlencode
-getcontext().prec = 28  # [PATCH] 수량/서명 계산 안전 여유
-def open_position_with_tp_sl(
-    settings,
-    symbol: str,
-    side_open: str,
-    qty: float,
-    entry_price_hint: float,
-    tp_pct: float,
-    sl_pct: float,
-    source: str,
-    soft_mode: bool = False,
-    sl_floor_ratio: float = None,
-):
-    """
-    run_bot_ws → entry_flow → 여기서 호출됨.
-    주문 실행 + TP/SL 설정까지 처리하는 핵심 함수.
-    """
 
-    from telelog import log, send_tg
-    from trader import Trade
-    from exchange_api import open_order_market, set_tp_sl
-
-    try:
-        # 1) 시장가 주문 실행
-        order = open_order_market(
-            symbol=symbol,
-            side=side_open,
-            qty=qty,
-        )
-        if not order:
-            log("[OPEN_POS] open_order_market failed")
-            return None
-
-        entry_price = float(order.get("avgPrice") or entry_price_hint or 0)
-
-        # 2) TP/SL 가격 계산
-        if side_open == "BUY":
-            tp_price = entry_price * (1 + tp_pct)
-            sl_price = entry_price * (1 - sl_pct)
-        else:
-            tp_price = entry_price * (1 - tp_pct)
-            sl_price = entry_price * (1 + sl_pct)
-
-        # 3) TP/SL 설정
-        set_tp_sl(
-            symbol=symbol,
-            side=side_open,
-            tp_price=tp_price,
-            sl_price=sl_price,
-        )
-
-        # 4) Trade 객체 반환
-        trade = Trade(
-            symbol=symbol,
-            side=side_open,
-            qty=qty,
-            entry_price=entry_price,
-            leverage=float(getattr(settings, "leverage", 10)),
-            source=source,
-            tp_price=tp_price,
-            sl_price=sl_price,
-        )
-
-        return trade
-
-    except Exception as e:
-        log(f"[OPEN_POS] exception: {e}")
-        return None
+getcontext().prec = 28  # 수량/서명 계산 안전 여유
 
 
 def _ts_ms() -> int:
     return int(time.time() * 1000)
 
 
-# [PATCH] 서명/전송 문자열 일치: urlencode + bool 소문자화
 def _to_param_str(v: Any) -> str:
+    """서명용 파라미터 문자열 변환."""
     if isinstance(v, bool):
         return "true" if v else "false"
     return str(v)
 
 
 def sign_query(params: Dict[str, Any], api_secret: str) -> str:
-    """BingX 는 쿼리스트링 정렬 후 서명하는 방식.
-    - [PATCH] urlencode 로 인코딩/정렬을 표준화, bool 은 소문자화
-    - 서버가 서명 계산에 사용하는 문자열과 동일하게 맞춘다.
-    """
+    """BingX 는 쿼리스트링 정렬 후 서명하는 방식."""
     items = [(k, _to_param_str(params[k])) for k in sorted(params.keys())]
     qs = urlencode(items, safe="-_.~")
     sig = hmac.new(api_secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
@@ -139,18 +128,24 @@ def _headers() -> Dict[str, str]:
     }
 
 
-# [PATCH] Decimal 기반 정규화: step 배수로 내림, 최소 step 보장
 def _normalize_qty(symbol: str, raw_qty: float) -> float:
-    """심볼별 최소 수량단위에 맞춰서 내림 정규화.
-    BTC-USDT 는 0.001 단위. 재시도 시에도 이 값을 그대로 쓴다.
-    부동소수점 오차를 피하기 위해 Decimal 사용.
-    """
+    """심볼별 최소 수량단위에 맞춰서 내림 정규화."""
     step = Decimal(str(_QTY_STEP.get(symbol, 0.001) or 0.001))
     q = Decimal(str(raw_qty if raw_qty is not None else 0))
     units = (q / step).to_integral_value(rounding=ROUND_DOWN)
     qty = (units * step) if units > 0 else step
-    # step 의 지수에 맞춰 고정 소수 처리
     return float(qty.quantize(step, rounding=ROUND_DOWN))
+
+
+def _get_tick_size(symbol: str) -> float:
+    """심볼별 가격 tick size 를 반환한다. 설정값이 있으면 우선 사용."""
+    try:
+        s_val = getattr(SET, "price_tick_size", None)
+        if isinstance(s_val, (int, float)) and s_val > 0:
+            return float(s_val)
+    except Exception:
+        pass
+    return float(_PRICE_TICK.get(symbol, 0.1))
 
 
 def req(
@@ -159,10 +154,7 @@ def req(
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """BingX REST 요청 공통부.
-    - 파라미터는 전부 쿼리스트링에 넣고 서명해서 보낸다.
-    - 일부 API 는 없는 계정에서 100400 을 주는데, 그건 예외로 안 터뜨리고 그냥 리턴.
-    """
+    """BingX REST 요청 공통부."""
     params = params or {}
     params["timestamp"] = _ts_ms()
     signed_qs = sign_query(params, SET.api_secret)
@@ -190,28 +182,250 @@ def req(
     return data
 
 
-# [PATCH] 파라미터 오류 패턴 확장
 def _is_param_error(exc: Exception) -> bool:
-    """주문 포맷을 바꿔서 다시 시도할지 판단할 때 사용.
-    대표 코드/문구의 다양한 변형을 포괄.
-    """
+    """주문 포맷을 바꿔서 다시 시도할지 판단."""
     msg = str(exc).lower()
     needles = [
-        "109400", "110400",
-        "invalid parameters", "parameter invalid", "parameters invalid",
-        "parameter error", "parameters error", "param error", "illegal parameter",
+        "109400",
+        "110400",
+        "invalid parameters",
+        "parameter invalid",
+        "parameters invalid",
+        "parameter error",
+        "parameters error",
+        "param error",
+        "illegal parameter",
     ]
     return any(n in msg for n in needles)
 
 
 # ─────────────────────────────
+# 슬리피지 하드 가드 (틱 기반)
+# ─────────────────────────────
+def _check_entry_slippage_and_maybe_close(
+    *,
+    symbol: str,
+    side_req: str,
+    qty: float,
+    expected_price: float,
+    fill_price: float,
+) -> bool:
+    """진입 직후 슬리피지를 검사해 허용 범위를 넘으면 알림/강제 청산."""
+    try:
+        exp = float(expected_price)
+        fill = float(fill_price)
+    except Exception:
+        return True
+
+    if exp <= 0 or fill <= 0:
+        return True
+
+    diff_abs = abs(fill - exp)
+    tick_size = _get_tick_size(symbol)
+    if tick_size <= 0:
+        # tick size 를 알 수 없으면 가드를 비활성화
+        return True
+
+    diff_ticks = diff_abs / tick_size
+    max_ticks = float(getattr(SET, "max_entry_slippage_ticks", 20) or 0.0)
+    if max_ticks <= 0:
+        # 하드 가드 비활성화
+        return True
+
+    if diff_ticks <= max_ticks:
+        return True
+
+    # 허용 틱 수를 넘은 경우
+    pct_100 = (diff_abs / exp) * 100.0
+    msg = (
+        "⚠️ 진입 슬리피지 하드 가드 발동 (틱 기준)\n"
+        f"- 심볼: {symbol}\n"
+        f"- 방향: {side_req}\n"
+        f"- 기대 진입가: {exp:.2f}\n"
+        f"- 실제 체결가: {fill:.2f}\n"
+        f"- 차이: {diff_abs:.2f} ≒ {diff_ticks:.1f} ticks (tick={tick_size})\n"
+        f"- 대략 비율: {pct_100:.3f}%\n"
+        f"- 허용 한도: {max_ticks:.1f} ticks\n"
+    )
+    log(msg)
+    try:
+        send_tg(msg)
+    except Exception:
+        pass
+
+    auto_close = bool(getattr(SET, "auto_close_on_heavy_slippage", False))
+    if not auto_close:
+        # 알림만 보내고 포지션은 유지
+        return True
+
+    # 슬리피지가 심각하고 auto_close_on_heavy_slippage 가 True 인 경우 강제 청산
+    try:
+        close_position_market(symbol=symbol, side_open=side_req, qty=qty)
+    except Exception as e:
+        log(f"[SLIPPAGE_GUARD] close_position_market failed: {e}")
+    return False
+
+
+# ─────────────────────────────
+# 계좌/포지션/주문 조회 + 진입/청산
+# ─────────────────────────────
+def open_position_with_tp_sl(
+    settings: Any,
+    symbol: str,
+    side_open: str,
+    qty: float,
+    entry_price_hint: float,
+    tp_pct: float,
+    sl_pct: float,
+    source: str,
+    soft_mode: bool = False,
+    sl_floor_ratio: Optional[float] = None,
+) -> Optional["Trade"]:
+    """
+    진입 + TP/SL 설정 엔트리 포인트.
+    """
+    from trader import Trade  # 지연 import 로 순환 의존성 방지
+
+    side_up = str(side_open).upper()
+    if side_up not in ("BUY", "SELL", "LONG", "SHORT"):
+        log(f"[OPEN_POS] invalid side_open={side_open!r}")
+        return None
+
+    # BUY/SELL 로 정규화
+    if side_up in ("LONG", "BUY"):
+        side_req = "BUY"
+    else:
+        side_req = "SELL"
+
+    # 1) 시장가 주문 실행
+    try:
+        order_resp = place_market(symbol=symbol, side=side_req, qty=qty)
+    except Exception as e:
+        log(f"[OPEN_POS] place_market exception: {e}")
+        try:
+            send_tg(
+                f"❗ 진입 주문 실패: {symbol} side={side_req} qty={qty} err={e}"
+            )
+        except Exception:
+            pass
+        return None
+
+    if not isinstance(order_resp, dict):
+        log(f"[OPEN_POS] unexpected order response type: {type(order_resp)}")
+        return None
+
+    # 1-1) 체결 평균가 추출 (없으면 entry_price_hint 사용)
+    raw = order_resp.get("data") or order_resp
+    entry_price_val: Optional[float] = None
+    if isinstance(raw, dict):
+        for key in ("avgPrice", "price", "avg_price", "fillPrice", "executedPrice"):
+            v = raw.get(key)
+            if v is None:
+                continue
+            try:
+                entry_price_val = float(v)
+                break
+            except (TypeError, ValueError):
+                continue
+
+    if entry_price_val is None or not math.isfinite(entry_price_val) or entry_price_val <= 0:
+        entry_price_val = float(entry_price_hint or 0.0)
+
+    if entry_price_val <= 0:
+        log(
+            f"[OPEN_POS] invalid entry_price (resp/hint invalid) "
+            f"symbol={symbol} side={side_req}"
+        )
+        return None
+
+    entry_price = entry_price_val
+
+    # 1-2) 슬리피지 하드 가드 적용 (틱 기반)
+    try:
+        if entry_price_hint and entry_price_hint > 0:
+            ok = _check_entry_slippage_and_maybe_close(
+                symbol=symbol,
+                side_req=side_req,
+                qty=qty,
+                expected_price=float(entry_price_hint),
+                fill_price=entry_price,
+            )
+            if not ok:
+                log(
+                    f"[OPEN_POS] heavy slippage detected "
+                    f"(expected={entry_price_hint}, fill={entry_price}) → abort Trade"
+                )
+                return None
+    except Exception as e:
+        log(f"[OPEN_POS] slippage guard check failed: {e}")
+
+    # 2) TP/SL 가격 계산
+    if side_req == "BUY":
+        tp_price = entry_price * (1 + tp_pct)
+        sl_price = entry_price * (1 - sl_pct)
+    else:
+        tp_price = entry_price * (1 - tp_pct)
+        sl_price = entry_price * (1 + sl_pct)
+
+    # 2-1) SL 바닥 비율(sl_floor_ratio) 적용 (선택적)
+    if isinstance(sl_floor_ratio, (int, float)) and sl_floor_ratio > 0:
+        try:
+            if side_req == "BUY":
+                floor_price = entry_price * (1 - float(sl_floor_ratio))
+                if sl_price > floor_price:
+                    sl_price = floor_price
+            else:
+                floor_price = entry_price * (1 + float(sl_floor_ratio))
+                if sl_price < floor_price:
+                    sl_price = floor_price
+        except Exception as e:
+            log(f"[OPEN_POS] sl_floor_ratio adjust failed: {e}")
+
+    # 3) TP/SL 조건부 주문 설정 (실패하더라도 진입 자체는 유지)
+    try:
+        set_tp_sl(
+            symbol=symbol,
+            side_open=side_req,
+            qty=qty,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            soft_mode=soft_mode,
+            sl_floor_ratio=sl_floor_ratio,
+        )
+    except Exception as e:
+        log(f"[OPEN_POS] set_tp_sl error: {e}")
+        try:
+            send_tg(
+                f"⚠️ TP/SL 설정 실패: {symbol} side={side_req} "
+                f"tp={tp_price:.2f}, sl={sl_price:.2f}, err={e}"
+            )
+        except Exception:
+            pass
+
+    # 4) Trade 객체 생성
+    try:
+        leverage = float(getattr(settings, "leverage", 10.0) or 0.0)
+    except Exception:
+        leverage = 0.0
+
+    trade = Trade(
+        symbol=symbol,
+        side=side_req,
+        qty=qty,
+        entry_price=entry_price,
+        leverage=leverage,
+        source=source,
+        tp_price=tp_price,
+        sl_price=sl_price,
+    )
+    return trade
+
+
+# ─────────────────────────────
 # 계좌/포지션/주문 조회
 # ─────────────────────────────
-
 def get_available_usdt() -> float:
-    """사용 가능한 마진(USDT)을 float 로 돌려준다.
-    여러 형태의 응답을 커버하도록 되어 있음.
-    """
+    """사용 가능한 마진(USDT)을 float 로 돌려준다."""
     try:
         res = req("GET", "/openApi/swap/v2/user/balance", {})
         log(f"[BALANCE RAW] {res}")
@@ -258,7 +472,10 @@ def get_available_usdt() -> float:
 
     except Exception as e:
         log(f"[BALANCE ERROR] {e}")
-        send_tg(f"⚠️ 잔고 조회 실패: {e}")
+        try:
+            send_tg(f"⚠️ 잔고 조회 실패: {e}")
+        except Exception:
+            pass
         return 0.0
 
 
@@ -285,10 +502,7 @@ def get_balance_detail() -> Dict[str, Any]:
 
 
 def fetch_open_positions(symbol: str) -> List[Dict[str, Any]]:
-    """열려 있는 선물 포지션 조회.
-    - 2025-11-12: timestamp is invalid 을 피하려고 recvWindow=5000 추가.
-    - 메인 엔드포인트가 안 되면 백업(/trade/positions)도 시도하되, 그 API 가 없으면 그냥 빈 리스트.
-    """
+    """열려 있는 선물 포지션 조회."""
     try:
         res = req(
             "GET",
@@ -346,12 +560,8 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ─────────────────────────────
 # 레버리지/마진
 # ─────────────────────────────
-
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
-    """이 계정은 side 없으면 에러를 내는 로그가 있어서
-    side → (LONG/SHORT) → positionSide → 최소형 순으로 시도한다.
-    실패해도 봇은 계속 돌 수 있게 예외는 내부에서만 처리.
-    """
+    """레버리지/마진 모드 설정."""
     try:
         req(
             "POST",
@@ -438,13 +648,8 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 # ─────────────────────────────
 # 주문 전송 (여러 모양으로 재시도)
 # ─────────────────────────────
-
 def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """여러 형태의 payload 를 순서대로 보내서
-    파라미터 에러가 아닌 게 터지면 바로 멈추고,
-    파라미터 에러면 다음 포맷을 시도한다.
-    [PATCH] 재시도 사이 0.2s 백오프 추가.
-    """
+    """여러 형태의 payload 를 순서대로 보내서 재시도."""
     last_err: Optional[Exception] = None
     for idx, pay in enumerate(payloads, start=1):
         log(f"[PLACE TRY {idx}] {pay}")
@@ -457,19 +662,14 @@ def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
             log(f"[PLACE ERR {idx}] {e}")
             if not _is_param_error(e):
                 break
-            time.sleep(0.2)  # [PATCH] 백오프
+            time.sleep(0.2)  # 백오프
     if last_err:
         raise last_err
     raise RuntimeError("order failed without explicit error")
 
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
-    """시장가 주문
-    1) side + positionSide=BOTH
-    2) side 만
-    3) side + 방향 positionSide
-    안 되면 동일 포맷으로 심볼 최소수량으로 재시도.
-    """
+    """시장가 주문."""
     norm_qty = _normalize_qty(symbol, qty)
 
     log(f"[PLACE MARKET] symbol={symbol} side={side} qty_req={qty} qty_norm={norm_qty}")
@@ -516,11 +716,7 @@ def place_conditional(
     trigger_price: float,
     order_type: str,
 ) -> Dict[str, Any]:
-    """TP/SL 조건부 주문.
-    triggerPrice / stopPrice / activationPrice, reduceOnly, positionSide 조합을
-    여러 개 보내서 110400 을 피한다.
-    [PATCH] workingType 명시(SET.conditional_working_type 기본값 사용)
-    """
+    """TP/SL 조건부 주문."""
     norm_qty = _normalize_qty(symbol, qty)
 
     log(
@@ -528,7 +724,7 @@ def place_conditional(
         f"trigger={trigger_price} type={order_type}"
     )
 
-    working_type = getattr(SET, "conditional_working_type", "MARK_PRICE")  # [PATCH]
+    working_type = getattr(SET, "conditional_working_type", "MARK_PRICE")
 
     base_common = {
         "symbol": symbol,
@@ -536,7 +732,7 @@ def place_conditional(
         "type": order_type,
         "quantity": norm_qty,
         "recvWindow": 5000,
-        "workingType": working_type,  # [PATCH]
+        "workingType": working_type,
     }
 
     payloads: List[Dict[str, Any]] = [
@@ -565,10 +761,72 @@ def place_conditional(
         return _try_order(payloads_min)
 
 
+def set_tp_sl(
+    *,
+    symbol: str,
+    side_open: str,
+    qty: float,
+    tp_price: float,
+    sl_price: float,
+    soft_mode: bool = False,
+    sl_floor_ratio: Optional[float] = None,
+) -> None:
+    """BingX 조건부 주문을 이용해 TP/SL 설정."""
+    side_up = str(side_open).upper()
+    if side_up in ("LONG", "BUY"):
+        open_side = "BUY"
+    elif side_up in ("SHORT", "SELL"):
+        open_side = "SELL"
+    else:
+        log(f"[SET_TP_SL] invalid side_open={side_open!r}")
+        return
+
+    if tp_price <= 0 and sl_price <= 0:
+        log(f"[SET_TP_SL] both tp/sl <= 0 → skip (symbol={symbol})")
+        return
+
+    close_side = "SELL" if open_side == "BUY" else "BUY"
+
+    # TP
+    if tp_price and tp_price > 0:
+        try:
+            place_conditional(
+                symbol=symbol,
+                side=close_side,
+                qty=qty,
+                trigger_price=float(tp_price),
+                order_type="TAKE_PROFIT_MARKET",
+            )
+        except Exception as e:
+            log(
+                f"[SET_TP_SL] TP 조건부 주문 실패 "
+                f"symbol={symbol} side_open={open_side} close_side={close_side} "
+                f"tp_price={tp_price}: {e}"
+            )
+
+    if soft_mode:
+        return
+
+    # SL
+    if sl_price and sl_price > 0:
+        try:
+            place_conditional(
+                symbol=symbol,
+                side=close_side,
+                qty=qty,
+                trigger_price=float(sl_price),
+                order_type="STOP_MARKET",
+            )
+        except Exception as e:
+            log(
+                f"[SET_TP_SL] SL 조건부 주문 실패 "
+                f"symbol={symbol} side_open={open_side} close_side={close_side} "
+                f"sl_price={sl_price}: {e}"
+            )
+
+
 def cancel_order(symbol: str, order_id: str) -> None:
-    """일부 계정에서는 이 API 자체가 없어서 100400 을 주므로,
-    그 경우에는 에러로 안 보고 워닝만 남긴다.
-    """
+    """주문 취소."""
     try:
         res = req(
             "POST",
@@ -646,20 +904,15 @@ def summarize_fills(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
 
 
 def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[str, Any]]:
-    """주문이 FILLED 됐는지 최대 timeout 초까지 폴링.
-    일부 계정은 cancel 이 안 되므로 타임아웃돼도 cancel 은 시도하지 않는다.
-    """
+    """주문 FILLED 폴링."""
     end = time.time() + timeout
     last_status = None
     while time.time() < end:
         try:
             o = get_order(symbol, order_id)
             d = o.get("data") or o
-
-            # {"code":0,"data":{"order":{...}}} 형태 보정
             if isinstance(d, dict) and "order" in d and isinstance(d["order"], dict):
                 d = d["order"]
-
             status = (d.get("status") or d.get("orderStatus") or "").upper()
             last_status = status
             if status in ("FILLED", "PARTIALLY_FILLED"):
@@ -672,11 +925,7 @@ def wait_filled(symbol: str, order_id: str, timeout: int = 5) -> Optional[Dict[s
 
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
-    """포지션을 시장가로 강제 청산.
-    1) reduceOnly=True 로 닫아보고
-    2) 101290 이면 reduceOnly 없이 다시 닫는다.
-    3) 그래도 안 되면 심볼 최소수량으로 다시 닫는다.
-    """
+    """포지션을 시장가로 강제 청산."""
     close_side = "SELL" if side_open.upper() == "BUY" else "BUY"
     norm_qty = _normalize_qty(symbol, qty)
 
@@ -757,8 +1006,10 @@ __all__ = [
     "fetch_open_positions",
     "fetch_open_orders",
     "set_leverage_and_mode",
+    "open_position_with_tp_sl",
     "place_market",
     "place_conditional",
+    "set_tp_sl",
     "cancel_order",
     "get_order",
     "get_fills",

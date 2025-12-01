@@ -171,8 +171,7 @@ class BotSettings:
     # ── 기본 TP/SL (GPT가 없을 때/기본값) ───────────────────
     # 익절/손절 기본 비율 (가격 기준)
     tp_pct: float = 0.005  # 기본 익절 0.5%
-    sl_pct: float = 0.015  # 기본 손절 1.5%
-
+    sl_pct: float = 0.01    # 기본 손절 1.0%
     # ATR/변동성 보정
     use_atr: bool = True
     atr_len: int = 20
@@ -227,6 +226,11 @@ class BotSettings:
     max_spread_pct: float =  0.0012
     max_entry_slippage_pct: float = 0.0005
     use_orderbook_entry_hint: bool = True
+
+    # ── 선물 틱 기반 슬리피지 가드 ────────────────────────
+    price_tick_size: float = 0.1
+    max_entry_slippage_ticks: int = 5
+    auto_close_on_heavy_slippage: bool = True
 
     # 호가 한쪽 쏠림(depth imbalance) 가드
     depth_imbalance_enabled: bool = True
