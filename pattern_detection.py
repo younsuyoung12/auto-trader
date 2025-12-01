@@ -1,131 +1,56 @@
 from __future__ import annotations
 
-"""pattern_detection.py (Ultra Version)
+# 2025-12-01 변경 사항 요약
+# -----------------------------------------------------
+# 1) 패턴 강도(base_strength) 하드코딩 제거
+#    - DEFAULT_PATTERN_STRENGTHS / PATTERN_STRENGTHS 딕셔너리로 중앙 관리.
+#    - add_pattern(...) 에서 _strength("패턴키", 기본값) 헬퍼를 통해 사용.
+#    - 향후 settings_ws.PatternStrengthSettings 로 확장 가능하도록 훅 추가.
+# 2) 패턴 합성 스코어에서 삼각형 플래그 키 불일치 버그 수정
+#    - "bullish_triangle_*" / "bearish_triangle_*" 처럼 존재하지 않는 키 대신
+#      실제 플래그 이름("triangle_sym", "triangle_asc", "triangle_desc")을 사용하도록 수정.
+# 3) 상단 모듈 설명 정리
+#    - 현재 구현에 맞도록 설명을 축약하고, 오래된 예시/표현 일부를 제거.
+
+
+"""
+pattern_detection.py (Ultra Version, tuned)
 =====================================================
 BingX Auto Trader에서 GPT-5.1이 사용할 수 있는
 "차트 패턴 전용 피처 엔진" 모듈.
 
 역할
 -----------------------------------------------------
-- WS 로우데이터(raw_ohlcv_last20 등)를 기반으로
+- WS raw_ohlcv_last20을 기반으로
   캔들 패턴 · 구조 패턴 · 지표 결합 패턴 · 볼륨/유동성 패턴을 정량화한다.
-- unified_features_builder.py / market_features_ws.py 가 이 모듈을 호출해
-  GPT 입력(market_features["pattern_features"])에 그대로 포함시킨다.
-- gpt_decider.py 는 이 결과를 이용해, 사람 트레이더처럼
-  "지금은 박스 브레이크아웃인가, 유동성 스윕인가, 역추세 리버설인가" 를 판단한다.
+- build_pattern_features(...) 결과를 unified_features_builder / gpt_decider 에서
+  그대로 사용하여, GPT가 사람 트레이더 수준의 패턴 맥락을 이해할 수 있게 한다.
+- WS 데이터가 부족/손상된 경우 PatternError를 발생시켜, REST 백필이나
+  임의 추정 없이 그대로 실패시키는 "백필 금지" 정책을 따른다.
 
-왜 필요한가
+출력 개요
 -----------------------------------------------------
-- 기존 피처(EMA/RSI/ATR/볼륨 등)만으로는
-  "헤드앤숄더", "엔골핑", "플래그", "삼각수렴" 같은
-  고전 패턴을 정량적으로 표현하기 어렵다.
-- GPT가 차트를 이해하려면
-  *원시 OHLCV + 패턴 요약 + 강도/신뢰도*가 함께 필요하다.
-- 이 모듈은 사람이 차트를 보며 느끼는 직관을
-  GPT가 읽을 수 있는 숫자/JSON 형식으로 변환한다.
+build_pattern_features(...) 반환 dict 의 주요 필드:
 
-GPT와 연결 구조
------------------------------------------------------
-1) market_features_ws.build_entry_features_ws(...) 가
-   각 타임프레임(1m/5m/15m 등)에 대해 raw_ohlcv_last20 을 만든다.
-2) unified_features_builder.py (또는 그에 준하는 호출부)에서
-   build_pattern_features(...) 를 호출하고, 반환된 dict 을
-   market_features["pattern_features"] 같은 키로 붙인다.
-3) gpt_decider.ask_entry_decision_safe(..., market_features=features) 에서
-   이 패턴 피처를 함께 GPT-5.1에게 전달한다.
-4) GPT는
-   - patterns: [...]
-   - best_pattern: "bullish_engulfing" 등
-   - reversal_score / momentum_score / liquidity_event_score
-   를 참고해 진입/청산/리스크 조정을 결정한다.
-
-패턴 감지 실패 시 하드 에러 전략 (백필 금지)
------------------------------------------------------
-- WS 버퍼가 비어 있거나, raw_ohlcv_last20 에서 OHLCV 필드가 하나라도
-  None/결측/파싱 실패이면 PatternError 를 발생시킨다.
-- PatternError 발생 시 텔레그램으로 사유를 전송하고, 예외를 그대로 올려
-  Render 서비스 로그에 ERROR 로 남긴다.
-- 이 모듈에서는 어떤 경우에도 REST 백필/임의 보정/추론을 하지 않는다.
-  (WS 데이터가 부족하면 그냥 실패 → 사람이 원인을 보고 고친다.)
-
-백필 금지 처리 기준
------------------------------------------------------
-- raw_ohlcv_last20 이 None 또는 길이 < 5 인 경우 → 즉시 PatternError.
-- 각 캔들의 open/high/low/close 가 float 로 캐스팅 불가 또는
-  NaN/무한대인 경우 → 즉시 PatternError.
-- volume 이 None/결측이면 → PatternError (0.0 은 허용).
-- 보조 지표/오더북 피처는 옵션이다. 없어도 전체 패턴 엔진은 동작하지만,
-  주어진 경우에는 최소 길이를 확인하고 이상치 발생 시 로그를 남긴다.
-
-주요 기능
------------------------------------------------------
-1) 데이터 유효성 검사 (백필 금지)
-   - 1m/5m/15m 캔들 raw_ohlcv_last20 (필수)
-   - 고가/저가/종가/거래량 (필수)
-   - 지표/오더북 입력이 있는 경우 최소 길이 및 NaN 검사
-
-2) 유명 트레이더들이 실제로 사용하는 패턴
-   - Engulfing (Bull/Bear)
-   - Hammer / Inverted Hammer / Shooting Star
-   - Morning Star / Evening Star
-   - Doji (Long-Legged, Dragonfly, Gravestone)
-   - Pin Bar
-   - Triangle (Ascending / Descending / Symmetrical)
-   - Flag / Pennant
-   - Head & Shoulders / Inverted H&S (단순형)
-   - Breakout / Fakeout (최근 박스 상·하단 기준)
-   - Volume Climax
-   - Orderbook Imbalance Pattern (bid/ask 깊이 비대칭)
-   - Liquidity Grab Pattern (꼬리 과도 + 반전)
-   - Trendline Break Pattern (단순 SMA 추세선 돌파)
-
-3) 머신러닝/AI Friendly 패턴 JSON
-   - GPT가 바로 사용할 수 있는 형태의 patterns 리스트 생성:
-       {
-         "pattern": "bullish_engulfing",
-         "direction": "BULLISH",
-         "kind": "candle",
-         "strength": 0.82,
-         "confidence": "high",   # "low" / "medium" / "high"
-         "explanation": "강한 매수 전환 신호로 많이 쓰이는 상승 엔골핑 캔들이 마지막 봉에 출현했습니다."
-       }
-
-4) GPT-Trader 전용 패턴 점수
-   - pattern_score: 전체 패턴 강도 종합 점수 (0.0~1.0)
-   - reversal_probability: 추세 전환 가능성 (0.0~1.0)
-   - continuation_probability: 추세 지속 가능성 (0.0~1.0)
-   - momentum_score: 방향성 모멘텀 강도 (0.0~1.0)
-   - volume_confirmation: 볼륨이 패턴을 얼마나 뒷받침하는지 (0.0~1.0)
-   - wick_strength: 꼬리(위/아래) 강조 패턴 강도 (0.0~1.0)
-   - liquidity_event_score: 유동성 스윕/그랩 관련 이벤트 강도 (0.0~1.0)
-
-5) unified_features_builder 에서 사용할 output 형태
-   - build_pattern_features(...) 반환 예시:
-       {
-         # 단순 플래그/스칼라 피처
-         "has_bullish_engulfing": 1,
-         "has_bearish_engulfing": 0,
-         "has_bullish_pinbar": 0,
-         "has_bearish_pinbar": 1,
-         ...,
-
-         # 합성 스코어
-         "pattern_score": 0.74,
-         "reversal_probability": 0.68,
-         "continuation_probability": 0.32,
-         "momentum_score": 0.55,
-         "volume_confirmation": 0.80,
-         "wick_strength": 0.71,
-         "liquidity_event_score": 0.60,
-
-         # 요약
-         "patterns": [...],        # GPT 친화적인 패턴 JSON 리스트
-         "best_pattern": "bearish_liquidity_grab",
-         "best_pattern_direction": "BEARISH",
-         "best_pattern_confidence": "high",
-         "has_bullish_pattern": 1,
-         "has_bearish_pattern": 1,
-       }
+- 개별 패턴 플래그 (0/1)
+  · "bullish_engulfing", "bearish_engulfing",
+    "bullish_pinbar", "bearish_pinbar",
+    "doji", "head_and_shoulders", "triangle_sym", ...
+- 합성 스코어 (0.0 ~ 1.0)
+  · "pattern_score"
+  · "reversal_probability"
+  · "continuation_probability"
+  · "momentum_score"
+  · "volume_confirmation"
+  · "wick_strength"
+  · "liquidity_event_score"
+- 요약 정보
+  · "patterns" : GPT 친화적인 패턴 JSON 리스트
+  · "best_pattern"
+  · "best_pattern_direction"
+  · "best_pattern_confidence"
+  · "has_bullish_pattern"
+  · "has_bearish_pattern"
 """
 
 import math
@@ -140,6 +65,93 @@ except Exception:  # 로컬 테스트/단일 모듈 실행 시 대비
 
     def send_tg(msg: str) -> None:  # type: ignore[override]
         print(f"[TG-STUB] {msg}")
+
+
+# ─────────────────────────────────────────────────────
+# 패턴 강도 설정 (휴리스틱 값 중앙 관리)
+# ─────────────────────────────────────────────────────
+
+# 각 패턴별 기본 base_strength 값.
+# - 여기 값들은 "전략 휴리스틱"이므로, 한 곳에서만 관리되도록 모았다.
+# - 향후 settings_ws.PatternStrengthSettings 를 도입하면,
+#   PATTERN_STRENGTHS 위에 덮어쓰는 형태로 튜닝할 수 있다.
+DEFAULT_PATTERN_STRENGTHS: Dict[str, float] = {
+    # 캔들 패턴
+    "bullish_engulfing": 0.8,
+    "bearish_engulfing": 0.8,
+    "bullish_pinbar": 0.7,
+    "bearish_pinbar": 0.7,
+    "doji": 0.4,
+    "doji_long_legged": 0.5,
+    "doji_dragonfly": 0.6,
+    "doji_gravestone": 0.6,
+    "morning_star": 0.9,
+    "evening_star": 0.9,
+    # 구조 패턴
+    "head_and_shoulders": 0.85,
+    "inverse_head_and_shoulders": 0.85,
+    "triangle_sym": 0.6,
+    "triangle_asc": 0.6,
+    "triangle_desc": 0.6,
+    "bullish_flag": 0.65,
+    "bearish_flag": 0.65,
+    "pennant": 0.6,
+    "bullish_breakout": 0.7,
+    "bearish_breakout": 0.7,
+    "bullish_fakeout": 0.6,
+    "bearish_fakeout": 0.6,
+    # 볼륨/유동성/오더북
+    "volume_climax": 0.6,
+    "bullish_liquidity_grab": 0.7,
+    "bearish_liquidity_grab": 0.7,
+    "orderbook_bullish_imbalance": 0.6,
+    "orderbook_bearish_imbalance": 0.6,
+    # 추세선/지표
+    "bullish_trendline_break": 0.6,
+    "bearish_trendline_break": 0.6,
+    "rsi_bullish_divergence": 0.65,
+    "rsi_bearish_divergence": 0.65,
+}
+
+# 선택적으로 settings_ws.PatternStrengthSettings 를 통해
+# DEFAULT_PATTERN_STRENGTHS 위에 사용자 튜닝 값을 덮어쓴다.
+try:  # pragma: no cover - 선택적 연동
+    from settings_ws import PatternStrengthSettings  # type: ignore
+except Exception:  # settings_ws 가 없거나 PatternStrengthSettings 미정의인 환경
+    PatternStrengthSettings = None  # type: ignore[assignment]
+
+
+def _load_pattern_strengths() -> Dict[str, float]:
+    """PatternStrengthSettings 가 있으면 기본값 위에 덮어쓴 딕셔너리를 생성한다."""
+    strengths: Dict[str, float] = dict(DEFAULT_PATTERN_STRENGTHS)
+    if PatternStrengthSettings is not None:
+        try:
+            user_settings = PatternStrengthSettings()  # type: ignore[call-arg]
+            user_map = getattr(user_settings, "pattern_strengths", None)
+            if isinstance(user_map, dict):
+                for k, v in user_map.items():
+                    try:
+                        strengths[str(k)] = float(v)
+                    except Exception:
+                        continue
+        except Exception as e:
+            log(f"[PATTERN] PatternStrengthSettings 로드 실패: {e}")
+    return strengths
+
+
+PATTERN_STRENGTHS: Dict[str, float] = _load_pattern_strengths()
+
+
+def _strength(key: str, default: float) -> float:
+    """패턴 키에 대응하는 base_strength 를 반환한다.
+
+    - PATTERN_STRENGTHS 에 키가 없으면 default 를 사용.
+    - 잘못된 값/타입이 들어오더라도 기본값으로 폴백.
+    """
+    try:
+        return float(PATTERN_STRENGTHS.get(key, default))
+    except Exception:
+        return default
 
 
 # ─────────────────────────────────────────────────────
@@ -164,14 +176,21 @@ def _is_nan(x: Any) -> bool:
     return isinstance(x, float) and math.isnan(x)
 
 
-def _require_ohlcv(raw_ohlcv_last20: List[Dict[str, Any]], name: str = "raw_ohlcv_last20", min_len: int = 5) -> None:
+def _require_ohlcv(
+    raw_ohlcv_last20: List[Dict[str, Any]],
+    name: str = "raw_ohlcv_last20",
+    min_len: int = 5,
+) -> None:
     """필수 OHLCV 데이터 검사 (백필 금지).
 
     - 길이 부족, 필드 누락, NaN/inf, 타입 오류 발생 시 PatternError.
     """
 
     if raw_ohlcv_last20 is None or len(raw_ohlcv_last20) < min_len:
-        msg = f"[패턴오류] {name} 데이터 부족: 필요 {min_len}, 실제 {0 if raw_ohlcv_last20 is None else len(raw_ohlcv_last20)}"
+        msg = (
+            f"[패턴오류] {name} 데이터 부족: 필요 {min_len}, "
+            f"실제 {0 if raw_ohlcv_last20 is None else len(raw_ohlcv_last20)}"
+        )
         log(msg)
         _safe_tg(msg)
         raise PatternError(msg)
@@ -197,13 +216,21 @@ def _require_ohlcv(raw_ohlcv_last20: List[Dict[str, Any]], name: str = "raw_ohlc
 
         # 가격이 0 이하인 경우는 비정상 데이터로 간주 (볼륨 0은 허용)
         if h <= 0 or l <= 0 or cl <= 0 or o <= 0:
-            msg = f"[패턴오류] {name}[{idx}] 가격이 0 이하입니다 (o={o}, h={h}, l={l}, c={cl})"
+            msg = (
+                f"[패턴오류] {name}[{idx}] 가격이 0 이하입니다 "
+                f"(o={o}, h={h}, l={l}, c={cl})"
+            )
             log(msg)
             _safe_tg(msg)
             raise PatternError(msg)
 
 
-def _require_series(series: Optional[List[float]], name: str, min_len: int = 5, strict: bool = False) -> bool:
+def _require_series(
+    series: Optional[List[float]],
+    name: str,
+    min_len: int = 5,
+    strict: bool = False,
+) -> bool:
     """지표 시리즈 유효성 검사.
 
     strict=True 인 경우 길이 부족/NaN 발생 시 PatternError.
@@ -212,7 +239,10 @@ def _require_series(series: Optional[List[float]], name: str, min_len: int = 5, 
 
     if series is None or len(series) < min_len:
         if strict:
-            msg = f"[패턴오류] {name} 시리즈 길이 부족: 필요 {min_len}, 실제 {0 if series is None else len(series)}"
+            msg = (
+                f"[패턴오류] {name} 시리즈 길이 부족: 필요 {min_len}, "
+                f"실제 {0 if series is None else len(series)}"
+            )
             log(msg)
             _safe_tg(msg)
             raise PatternError(msg)
@@ -230,7 +260,9 @@ def _require_series(series: Optional[List[float]], name: str, min_len: int = 5, 
     return True
 
 
-def _ohlc_lists(raw_ohlcv_last20: List[Dict[str, Any]]) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
+def _ohlc_lists(
+    raw_ohlcv_last20: List[Dict[str, Any]]
+) -> Tuple[List[float], List[float], List[float], List[float], List[float]]:
     """raw_ohlcv_last20 → (opens, highs, lows, closes, volumes) 리스트로 변환."""
 
     opens: List[float] = []
@@ -288,7 +320,12 @@ def _detect_engulfing(opens: List[float], closes: List[float]) -> Tuple[int, int
     return bull, bear
 
 
-def _detect_pinbar(opens: List[float], highs: List[float], lows: List[float], closes: List[float]) -> Tuple[int, int, float]:
+def _detect_pinbar(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+) -> Tuple[int, int, float]:
     """마지막 봉 기준 핀바/롱테일 패턴 감지.
 
     반환: (bullish_pinbar, bearish_pinbar, wick_strength)
@@ -318,7 +355,12 @@ def _detect_pinbar(opens: List[float], highs: List[float], lows: List[float], cl
     return bull, bear, max(0.0, min(1.0, wick_strength))
 
 
-def _detect_doji(opens: List[float], highs: List[float], lows: List[float], closes: List[float]) -> Dict[str, int]:
+def _detect_doji(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+) -> Dict[str, int]:
     """마지막 봉 기준 도지 유형 감지."""
 
     out = {
@@ -365,7 +407,12 @@ def _detect_doji(opens: List[float], highs: List[float], lows: List[float], clos
     return out
 
 
-def _detect_morning_evening_star(opens: List[float], closes: List[float], highs: List[float], lows: List[float]) -> Tuple[int, int]:
+def _detect_morning_evening_star(
+    opens: List[float],
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+) -> Tuple[int, int]:
     """마지막 3개 봉 기준 모닝/이브닝 스타 패턴 감지."""
 
     if len(opens) < 3:
@@ -399,7 +446,10 @@ def _detect_morning_evening_star(opens: List[float], closes: List[float], highs:
     return int(cond_morning), int(cond_evening)
 
 
-def _detect_head_and_shoulders(highs: List[float], lows: List[float]) -> Tuple[int, int]:
+def _detect_head_and_shoulders(
+    highs: List[float],
+    lows: List[float],
+) -> Tuple[int, int]:
     """단순 헤드앤숄더 / 역헤드앤숄더 패턴 감지.
 
     - 정확한 교과서형 패턴이 아니라, 최근 7~11봉을 이용한 근사형이다.
@@ -465,7 +515,11 @@ def _detect_triangle(highs: List[float], lows: List[float]) -> Tuple[int, int, i
     return sym, asc, desc
 
 
-def _detect_flag_pennant(closes: List[float], highs: List[float], lows: List[float]) -> Tuple[int, int, int, int]:
+def _detect_flag_pennant(
+    closes: List[float],
+    highs: List[float],
+    lows: List[float],
+) -> Tuple[int, int, int, int]:
     """플래그/페넌트/채널형 플래그 근사 감지.
 
     - 직전 N봉 급등락 후, 최근 M봉이 좁은 범위에서 횡보하는지 확인.
@@ -509,7 +563,11 @@ def _detect_flag_pennant(closes: List[float], highs: List[float], lows: List[flo
     return bullish_flag, bearish_flag, pennant, channel_flag
 
 
-def _detect_breakout_fakeout(highs: List[float], lows: List[float], closes: List[float]) -> Tuple[int, int, int, int]:
+def _detect_breakout_fakeout(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+) -> Tuple[int, int, int, int]:
     """최근 박스 기준 브레이크아웃/페이크아웃 감지."""
 
     n = len(closes)
@@ -579,7 +637,12 @@ def _detect_volume_climax(vols: List[float]) -> Tuple[int, float]:
     return has_climax, min(ratio / 5.0, 1.0)  # ratio>=5 이상은 1.0 로 캡
 
 
-def _detect_liquidity_grab(opens: List[float], highs: List[float], lows: List[float], closes: List[float]) -> Tuple[int, int]:
+def _detect_liquidity_grab(
+    opens: List[float],
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+) -> Tuple[int, int]:
     """단일 봉 기준 유동성 스윕/그랩 패턴 감지.
 
     - 긴 꼬리 + 반대 방향 마감.
@@ -607,7 +670,9 @@ def _detect_liquidity_grab(opens: List[float], highs: List[float], lows: List[fl
     return bull, bear
 
 
-def _detect_orderbook_imbalance(orderbook_features: Optional[Dict[str, Any]]) -> Tuple[int, int, float]:
+def _detect_orderbook_imbalance(
+    orderbook_features: Optional[Dict[str, Any]]
+) -> Tuple[int, int, float]:
     """오더북 depth_imbalance 기반 비대칭 패턴 감지.
 
     - market_features_ws._compute_orderbook_features(...) 결과를 그대로 받는 것을 가정.
@@ -642,7 +707,10 @@ def _detect_orderbook_imbalance(orderbook_features: Optional[Dict[str, Any]]) ->
 # ─────────────────────────────────────────────────────
 
 
-def _detect_rsi_divergence(closes: List[float], rsi_series: Optional[List[float]]) -> Tuple[int, int]:
+def _detect_rsi_divergence(
+    closes: List[float],
+    rsi_series: Optional[List[float]],
+) -> Tuple[int, int]:
     """RSI 간단 다이버전스 패턴.
 
     - 가격 저점 하락 + RSI 저점 상승 → bullish_div
@@ -666,10 +734,15 @@ def _detect_rsi_divergence(closes: List[float], rsi_series: Optional[List[float]
 # ─────────────────────────────────────────────────────
 
 
-def _aggregate_scores(flags: Dict[str, int], volume_ratio: float, wick_strength: float, liquidity_strength: float) -> Dict[str, float]:
+def _aggregate_scores(
+    flags: Dict[str, int],
+    volume_ratio: float,
+    wick_strength: float,
+    liquidity_strength: float,
+) -> Dict[str, float]:
     """각 패턴 플래그를 이용해 합성 스코어를 계산."""
 
-    # 기본 카운트
+    # 기본 카운트 (삼각형 키는 실제 플래그 이름과 일치하도록 수정)
     bull_rev_keys = [
         "bullish_engulfing",
         "bullish_pinbar",
@@ -686,14 +759,14 @@ def _aggregate_scores(flags: Dict[str, int], volume_ratio: float, wick_strength:
     ]
     bull_cont_keys = [
         "bullish_flag",
-        "bullish_triangle_sym",
-        "bullish_triangle_asc",
+        "triangle_sym",
+        "triangle_asc",
         "bullish_trendline_break",
     ]
     bear_cont_keys = [
         "bearish_flag",
-        "bearish_triangle_sym",
-        "bearish_triangle_desc",
+        "triangle_sym",
+        "triangle_desc",
         "bearish_trendline_break",
     ]
 
@@ -771,19 +844,42 @@ def build_pattern_features(
     rsi_series: Optional[List[float]] = None
     if indicators is not None:
         cand = indicators.get("rsi_series") or indicators.get("rsi")
-        if isinstance(cand, list) and _require_series(cand, "rsi_series", min_len=5, strict=False):
+        if isinstance(cand, list) and _require_series(
+            cand,
+            "rsi_series",
+            min_len=5,
+            strict=False,
+        ):
             rsi_series = [float(v) for v in cand]
 
     # 3) 개별 패턴 감지
     bullish_engulfing, bearish_engulfing = _detect_engulfing(opens, closes)
-    bullish_pinbar, bearish_pinbar, wick_strength = _detect_pinbar(opens, highs, lows, closes)
+    bullish_pinbar, bearish_pinbar, wick_strength = _detect_pinbar(
+        opens,
+        highs,
+        lows,
+        closes,
+    )
     doji_flags = _detect_doji(opens, highs, lows, closes)
-    morning_star, evening_star = _detect_morning_evening_star(opens, closes, highs, lows)
+    morning_star, evening_star = _detect_morning_evening_star(
+        opens,
+        closes,
+        highs,
+        lows,
+    )
     hs, inv_hs = _detect_head_and_shoulders(highs, lows)
 
     tri_sym, tri_asc, tri_desc = _detect_triangle(highs, lows)
-    bullish_flag, bearish_flag, pennant, channel_flag = _detect_flag_pennant(closes, highs, lows)
-    bull_break, bear_break, bull_fake, bear_fake = _detect_breakout_fakeout(highs, lows, closes)
+    bullish_flag, bearish_flag, pennant, channel_flag = _detect_flag_pennant(
+        closes,
+        highs,
+        lows,
+    )
+    bull_break, bear_break, bull_fake, bear_fake = _detect_breakout_fakeout(
+        highs,
+        lows,
+        closes,
+    )
     bull_tlb, bear_tlb = _detect_trendline_break(closes)
 
     vol_climax, vol_ratio = _detect_volume_climax(vols)
@@ -829,7 +925,15 @@ def build_pattern_features(
     }
 
     # 5) 합성 스코어 계산
-    scores = _aggregate_scores(flags, volume_ratio=vol_ratio, wick_strength=wick_strength, liquidity_strength=max(ob_strength, float(bull_liq or bear_liq)))
+    scores = _aggregate_scores(
+        flags,
+        volume_ratio=vol_ratio,
+        wick_strength=wick_strength,
+        liquidity_strength=max(
+            ob_strength,
+            float(bull_liq or bear_liq),
+        ),
+    )
 
     # 6) GPT 친화적인 patterns 리스트 생성
     patterns: List[Dict[str, Any]] = []
@@ -844,6 +948,12 @@ def build_pattern_features(
         extra_boost: float = 0.0,
         explanation: str,
     ) -> None:
+        """개별 패턴을 patterns 리스트에 추가하는 헬퍼.
+
+        - enabled == 0 이면 무시.
+        - base_strength + extra_boost 를 [0, 1] 범위로 클램핑.
+        - strength 에 따라 confidence("low"/"medium"/"high") 결정.
+        """
         if not enabled:
             return
         strength = max(0.0, min(1.0, base_strength + extra_boost))
@@ -869,36 +979,48 @@ def build_pattern_features(
         enabled=bullish_engulfing,
         direction="BULLISH",
         kind="candle",
-        base_strength=0.8,
+        base_strength=_strength("bullish_engulfing", 0.8),
         extra_boost=vol_ratio * 0.1,
-        explanation=f"최근 2개 봉 기준 상승 엔골핑 패턴이 감지되었습니다{iv_txt}. 강한 매수 전환 신호로 해석될 수 있습니다.",
+        explanation=(
+            f"최근 2개 봉 기준 상승 엔골핑 패턴이 감지되었습니다{iv_txt}. "
+            f"강한 매수 전환 신호로 해석될 수 있습니다."
+        ),
     )
     add_pattern(
         key="bearish_engulfing",
         enabled=bearish_engulfing,
         direction="BEARISH",
         kind="candle",
-        base_strength=0.8,
+        base_strength=_strength("bearish_engulfing", 0.8),
         extra_boost=vol_ratio * 0.1,
-        explanation=f"최근 2개 봉 기준 하락 엔골핑 패턴이 감지되었습니다{iv_txt}. 강한 매도 전환 신호로 해석될 수 있습니다.",
+        explanation=(
+            f"최근 2개 봉 기준 하락 엔골핑 패턴이 감지되었습니다{iv_txt}. "
+            f"강한 매도 전환 신호로 해석될 수 있습니다."
+        ),
     )
     add_pattern(
         key="bullish_pinbar",
         enabled=bullish_pinbar,
         direction="BULLISH",
         kind="candle",
-        base_strength=0.7,
+        base_strength=_strength("bullish_pinbar", 0.7),
         extra_boost=wick_strength * 0.2,
-        explanation=f"아래 꼬리가 긴 강세 핀바 패턴이 감지되었습니다{iv_txt}. 아래 구간에서 강한 매수 응답이 있었다는 신호입니다.",
+        explanation=(
+            f"아래 꼬리가 긴 강세 핀바 패턴이 감지되었습니다{iv_txt}. "
+            f"아래 구간에서 강한 매수 응답이 있었다는 신호입니다."
+        ),
     )
     add_pattern(
         key="bearish_pinbar",
         enabled=bearish_pinbar,
         direction="BEARISH",
         kind="candle",
-        base_strength=0.7,
+        base_strength=_strength("bearish_pinbar", 0.7),
         extra_boost=wick_strength * 0.2,
-        explanation=f"위 꼬리가 긴 약세 핀바 패턴이 감지되었습니다{iv_txt}. 위 구간에서 강한 매도 응답이 있었다는 신호입니다.",
+        explanation=(
+            f"위 꼬리가 긴 약세 핀바 패턴이 감지되었습니다{iv_txt}. "
+            f"위 구간에서 강한 매도 응답이 있었다는 신호입니다."
+        ),
     )
 
     # 도지 계열
@@ -908,8 +1030,11 @@ def build_pattern_features(
             enabled=1,
             direction=None,
             kind="candle",
-            base_strength=0.4,
-            explanation=f"몸통이 매우 작은 도지 캔들이 감지되었습니다{iv_txt}. 방향성 모멘텀이 약하거나, 추세 전환 구간일 가능성이 있습니다.",
+            base_strength=_strength("doji", 0.4),
+            explanation=(
+                f"몸통이 매우 작은 도지 캔들이 감지되었습니다{iv_txt}. "
+                f"방향성 모멘텀이 약하거나, 추세 전환 구간일 가능성이 있습니다."
+            ),
         )
     if doji_flags.get("doji_long_legged"):
         add_pattern(
@@ -917,8 +1042,11 @@ def build_pattern_features(
             enabled=1,
             direction=None,
             kind="candle",
-            base_strength=0.5,
-            explanation=f"양쪽 꼬리가 긴 롱레그드 도지 패턴이 감지되었습니다{iv_txt}. 매수·매도 세력이 강하게 충돌한 구간일 수 있습니다.",
+            base_strength=_strength("doji_long_legged", 0.5),
+            explanation=(
+                f"양쪽 꼬리가 긴 롱레그드 도지 패턴이 감지되었습니다{iv_txt}. "
+                f"매수·매도 세력이 강하게 충돌한 구간일 수 있습니다."
+            ),
         )
     if doji_flags.get("doji_dragonfly"):
         add_pattern(
@@ -926,8 +1054,11 @@ def build_pattern_features(
             enabled=1,
             direction="BULLISH",
             kind="candle",
-            base_strength=0.6,
-            explanation=f"아래 꼬리가 긴 드래곤플라이 도지 패턴이 감지되었습니다{iv_txt}. 하단 유동성 스윕 후 강한 반등 신호로 해석될 수 있습니다.",
+            base_strength=_strength("doji_dragonfly", 0.6),
+            explanation=(
+                f"아래 꼬리가 긴 드래곤플라이 도지 패턴이 감지되었습니다{iv_txt}. "
+                f"하단 유동성 스윕 후 강한 반등 신호로 해석될 수 있습니다."
+            ),
         )
     if doji_flags.get("doji_gravestone"):
         add_pattern(
@@ -935,8 +1066,11 @@ def build_pattern_features(
             enabled=1,
             direction="BEARISH",
             kind="candle",
-            base_strength=0.6,
-            explanation=f"위 꼬리가 긴 그래브스톤 도지 패턴이 감지되었습니다{iv_txt}. 상단 유동성 스윕 후 강한 매도 압력 신호로 해석될 수 있습니다.",
+            base_strength=_strength("doji_gravestone", 0.6),
+            explanation=(
+                f"위 꼬리가 긴 그래브스톤 도지 패턴이 감지되었습니다{iv_txt}. "
+                f"상단 유동성 스윕 후 강한 매도 압력 신호로 해석될 수 있습니다."
+            ),
         )
 
     # 모닝/이브닝 스타
@@ -945,16 +1079,22 @@ def build_pattern_features(
         enabled=morning_star,
         direction="BULLISH",
         kind="candle",
-        base_strength=0.9,
-        explanation=f"3개 봉 기준 모닝 스타(강세 반전) 패턴이 감지되었습니다{iv_txt}. 하락 추세의 바닥 부근에서 자주 관찰되는 패턴입니다.",
+        base_strength=_strength("morning_star", 0.9),
+        explanation=(
+            f"3개 봉 기준 모닝 스타(강세 반전) 패턴이 감지되었습니다{iv_txt}. "
+            f"하락 추세의 바닥 부근에서 자주 관찰되는 패턴입니다."
+        ),
     )
     add_pattern(
         key="evening_star",
         enabled=evening_star,
         direction="BEARISH",
         kind="candle",
-        base_strength=0.9,
-        explanation=f"3개 봉 기준 이브닝 스타(약세 반전) 패턴이 감지되었습니다{iv_txt}. 상승 추세의 상단 부근에서 자주 관찰되는 패턴입니다.",
+        base_strength=_strength("evening_star", 0.9),
+        explanation=(
+            f"3개 봉 기준 이브닝 스타(약세 반전) 패턴이 감지되었습니다{iv_txt}. "
+            f"상승 추세의 상단 부근에서 자주 관찰되는 패턴입니다."
+        ),
     )
 
     # 헤드앤숄더
@@ -963,16 +1103,20 @@ def build_pattern_features(
         enabled=hs,
         direction="BEARISH",
         kind="structure",
-        base_strength=0.85,
-        explanation=f"최근 고점 구조에서 헤드앤숄더(상승 추세 피로) 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("head_and_shoulders", 0.85),
+        explanation=(
+            f"최근 고점 구조에서 헤드앤숄더(상승 추세 피로) 패턴이 감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="inverse_head_and_shoulders",
         enabled=inv_hs,
         direction="BULLISH",
         kind="structure",
-        base_strength=0.85,
-        explanation=f"최근 저점 구조에서 역헤드앤숄더(하락 추세 피로) 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("inverse_head_and_shoulders", 0.85),
+        explanation=(
+            f"최근 저점 구조에서 역헤드앤숄더(하락 추세 피로) 패턴이 감지되었습니다{iv_txt}."
+        ),
     )
 
     # 삼각형
@@ -981,24 +1125,33 @@ def build_pattern_features(
         enabled=tri_sym,
         direction=None,
         kind="structure",
-        base_strength=0.6,
-        explanation=f"상단은 내려오고 하단은 올라가는 대칭 삼각수렴 패턴이 감지되었습니다{iv_txt}. 돌파 방향에 따라 강한 추세가 이어질 수 있습니다.",
+        base_strength=_strength("triangle_sym", 0.6),
+        explanation=(
+            f"상단은 내려오고 하단은 올라가는 대칭 삼각수렴 패턴이 감지되었습니다{iv_txt}. "
+            f"돌파 방향에 따라 강한 추세가 이어질 수 있습니다."
+        ),
     )
     add_pattern(
         key="triangle_asc",
         enabled=tri_asc,
         direction="BULLISH",
         kind="structure",
-        base_strength=0.6,
-        explanation=f"하단이 점차 상승하는 상승 삼각형 패턴이 감지되었습니다{iv_txt}. 상단 돌파 시 강한 상승 추세가 이어질 수 있습니다.",
+        base_strength=_strength("triangle_asc", 0.6),
+        explanation=(
+            f"하단이 점차 상승하는 상승 삼각형 패턴이 감지되었습니다{iv_txt}. "
+            f"상단 돌파 시 강한 상승 추세가 이어질 수 있습니다."
+        ),
     )
     add_pattern(
         key="triangle_desc",
         enabled=tri_desc,
         direction="BEARISH",
         kind="structure",
-        base_strength=0.6,
-        explanation=f"상단이 점차 하락하는 하락 삼각형 패턴이 감지되었습니다{iv_txt}. 하단 이탈 시 강한 하락 추세가 이어질 수 있습니다.",
+        base_strength=_strength("triangle_desc", 0.6),
+        explanation=(
+            f"상단이 점차 하락하는 하락 삼각형 패턴이 감지되었습니다{iv_txt}. "
+            f"하단 이탈 시 강한 하락 추세가 이어질 수 있습니다."
+        ),
     )
 
     # 플래그/페넌트
@@ -1007,24 +1160,32 @@ def build_pattern_features(
         enabled=bullish_flag,
         direction="BULLISH",
         kind="structure",
-        base_strength=0.65,
-        explanation=f"급등 후 좁은 범위에서 조정이 이어지는 강세 플래그 패턴이 감지되었습니다{iv_txt}. 추세 지속 가능성이 있습니다.",
+        base_strength=_strength("bullish_flag", 0.65),
+        explanation=(
+            f"급등 후 좁은 범위에서 조정이 이어지는 강세 플래그 패턴이 감지되었습니다{iv_txt}. "
+            f"추세 지속 가능성이 있습니다."
+        ),
     )
     add_pattern(
         key="bearish_flag",
         enabled=bearish_flag,
         direction="BEARISH",
         kind="structure",
-        base_strength=0.65,
-        explanation=f"급락 후 좁은 범위에서 조정이 이어지는 약세 플래그 패턴이 감지되었습니다{iv_txt}. 추세 지속 가능성이 있습니다.",
+        base_strength=_strength("bearish_flag", 0.65),
+        explanation=(
+            f"급락 후 좁은 범위에서 조정이 이어지는 약세 플래그 패턴이 감지되었습니다{iv_txt}. "
+            f"추세 지속 가능성이 있습니다."
+        ),
     )
     add_pattern(
         key="pennant",
         enabled=pennant,
         direction=None,
         kind="structure",
-        base_strength=0.6,
-        explanation=f"급격한 추세 이후 짧은 삼각형 수렴 형태의 페넌트 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("pennant", 0.6),
+        explanation=(
+            f"급격한 추세 이후 짧은 삼각형 수렴 형태의 페넌트 패턴이 감지되었습니다{iv_txt}."
+        ),
     )
 
     # 브레이크아웃/페이크아웃
@@ -1033,32 +1194,42 @@ def build_pattern_features(
         enabled=bull_break,
         direction="BULLISH",
         kind="structure",
-        base_strength=0.7,
-        explanation=f"최근 박스 상단을 상향 돌파하는 강세 브레이크아웃 신호가 감지되었습니다{iv_txt}.",
+        base_strength=_strength("bullish_breakout", 0.7),
+        explanation=(
+            f"최근 박스 상단을 상향 돌파하는 강세 브레이크아웃 신호가 감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="bearish_breakout",
         enabled=bear_break,
         direction="BEARISH",
         kind="structure",
-        base_strength=0.7,
-        explanation=f"최근 박스 하단을 하향 돌파하는 약세 브레이크아웃 신호가 감지되었습니다{iv_txt}.",
+        base_strength=_strength("bearish_breakout", 0.7),
+        explanation=(
+            f"최근 박스 하단을 하향 돌파하는 약세 브레이크아웃 신호가 감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="bullish_fakeout",
         enabled=bull_fake,
         direction="BEARISH",
         kind="structure",
-        base_strength=0.6,
-        explanation=f"상단 돌파 시도로 보였다가 다시 박스 안으로 되돌아온 강세 페이크아웃 패턴이 감지되었습니다{iv_txt}. 상방 유동성 회수 후 하락 전환 가능성을 시사합니다.",
+        base_strength=_strength("bullish_fakeout", 0.6),
+        explanation=(
+            f"상단 돌파 시도로 보였다가 다시 박스 안으로 되돌아온 강세 페이크아웃 패턴이 "
+            f"감지되었습니다{iv_txt}. 상방 유동성 회수 후 하락 전환 가능성을 시사합니다."
+        ),
     )
     add_pattern(
         key="bearish_fakeout",
         enabled=bear_fake,
         direction="BULLISH",
         kind="structure",
-        base_strength=0.6,
-        explanation=f"하단 이탈 시도로 보였다가 다시 박스 안으로 되돌아온 약세 페이크아웃 패턴이 감지되었습니다{iv_txt}. 하방 유동성 회수 후 상승 전환 가능성을 시사합니다.",
+        base_strength=_strength("bearish_fakeout", 0.6),
+        explanation=(
+            f"하단 이탈 시도로 보였다가 다시 박스 안으로 되돌아온 약세 페이크아웃 패턴이 "
+            f"감지되었습니다{iv_txt}. 하방 유동성 회수 후 상승 전환 가능성을 시사합니다."
+        ),
     )
 
     # 볼륨/유동성/오더북
@@ -1067,43 +1238,58 @@ def build_pattern_features(
         enabled=vol_climax,
         direction=None,
         kind="volume",
-        base_strength=0.6,
+        base_strength=_strength("volume_climax", 0.6),
         extra_boost=vol_ratio * 0.2,
-        explanation=f"최근 봉 거래량이 과거 평균 대비 매우 크게 증가한 볼륨 클라이맥스 패턴이 감지되었습니다{iv_txt}.",
+        explanation=(
+            f"최근 봉 거래량이 과거 평균 대비 매우 크게 증가한 볼륨 클라이맥스 패턴이 "
+            f"감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="bullish_liquidity_grab",
         enabled=bull_liq,
         direction="BULLISH",
         kind="liquidity",
-        base_strength=0.7,
-        explanation=f"하단 꼬리가 긴 강세 유동성 그랩 패턴이 감지되었습니다{iv_txt}. 아래 구간의 손절/유동성을 회수한 뒤 반등하는 구간일 수 있습니다.",
+        base_strength=_strength("bullish_liquidity_grab", 0.7),
+        explanation=(
+            f"하단 꼬리가 긴 강세 유동성 그랩 패턴이 감지되었습니다{iv_txt}. "
+            f"아래 구간의 손절/유동성을 회수한 뒤 반등하는 구간일 수 있습니다."
+        ),
     )
     add_pattern(
         key="bearish_liquidity_grab",
         enabled=bear_liq,
         direction="BEARISH",
         kind="liquidity",
-        base_strength=0.7,
-        explanation=f"상단 꼬리가 긴 약세 유동성 그랩 패턴이 감지되었습니다{iv_txt}. 위 구간의 손절/유동성을 회수한 뒤 되밀리는 구간일 수 있습니다.",
+        base_strength=_strength("bearish_liquidity_grab", 0.7),
+        explanation=(
+            f"상단 꼬리가 긴 약세 유동성 그랩 패턴이 감지되었습니다{iv_txt}. "
+            f"위 구간의 손절/유동성을 회수한 뒤 되밀리는 구간일 수 있습니다."
+        ),
     )
     add_pattern(
         key="orderbook_bullish_imbalance",
         enabled=ob_bull,
         direction="BULLISH",
         kind="orderbook",
-        base_strength=0.6,
+        base_strength=_strength("orderbook_bullish_imbalance", 0.6),
         extra_boost=ob_strength * 0.3,
-        explanation=f"depth5 오더북에서 매수 호가가 매도 호가보다 뚜렷하게 많은 강세 호가 비대칭 패턴이 감지되었습니다{iv_txt}.",
+        explanation=(
+            f"depth5 오더북에서 매수 호가가 매도 호가보다 뚜렷하게 많은 강세 호가 비대칭 "
+            f"패턴이 감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="orderbook_bearish_imbalance",
         enabled=ob_bear,
         direction="BEARISH",
         kind="orderbook",
-        base_strength=0.6,
+        base_strength=_strength("orderbook_bearish_imbalance", 0.6),
         extra_boost=ob_strength * 0.3,
-        explanation=f"depth5 오더북에서 매도 호가가 매수 호가보다 뚜렷하게 많은 약세 호가 비대칭 패턴이 감지되었습니다{iv_txt}.",
+        explanation=(
+            f"depth5 오더북에서 매도 호가가 매수 호가보다 뚜렷하게 많은 약세 호가 비대칭 "
+            f"패턴이 감지되었습니다{iv_txt}."
+        ),
     )
 
     # 트렌드라인 브레이크
@@ -1112,16 +1298,22 @@ def build_pattern_features(
         enabled=bull_tlb,
         direction="BULLISH",
         kind="trendline",
-        base_strength=0.6,
-        explanation=f"단순 SMA 기준으로 가격이 상향 돌파하는 추세선 브레이크(강세) 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("bullish_trendline_break", 0.6),
+        explanation=(
+            f"단순 SMA 기준으로 가격이 상향 돌파하는 추세선 브레이크(강세) 패턴이 "
+            f"감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="bearish_trendline_break",
         enabled=bear_tlb,
         direction="BEARISH",
         kind="trendline",
-        base_strength=0.6,
-        explanation=f"단순 SMA 기준으로 가격이 하향 이탈하는 추세선 브레이크(약세) 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("bearish_trendline_break", 0.6),
+        explanation=(
+            f"단순 SMA 기준으로 가격이 하향 이탈하는 추세선 브레이크(약세) 패턴이 "
+            f"감지되었습니다{iv_txt}."
+        ),
     )
 
     # RSI 다이버전스
@@ -1130,16 +1322,22 @@ def build_pattern_features(
         enabled=rsi_bull_div,
         direction="BULLISH",
         kind="indicator",
-        base_strength=0.65,
-        explanation=f"가격 저점은 낮아지는데 RSI 저점은 높아지는 강세 다이버전스 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("rsi_bullish_divergence", 0.65),
+        explanation=(
+            f"가격 저점은 낮아지는데 RSI 저점은 높아지는 강세 다이버전스 패턴이 "
+            f"감지되었습니다{iv_txt}."
+        ),
     )
     add_pattern(
         key="rsi_bearish_divergence",
         enabled=rsi_bear_div,
         direction="BEARISH",
         kind="indicator",
-        base_strength=0.65,
-        explanation=f"가격 고점은 높아지는데 RSI 고점은 낮아지는 약세 다이버전스 패턴이 감지되었습니다{iv_txt}.",
+        base_strength=_strength("rsi_bearish_divergence", 0.65),
+        explanation=(
+            f"가격 고점은 높아지는데 RSI 고점은 낮아지는 약세 다이버전스 패턴이 "
+            f"감지되었습니다{iv_txt}."
+        ),
     )
 
     # 7) best_pattern 선택
@@ -1162,8 +1360,12 @@ def build_pattern_features(
     # 요약 정보 추가
     out["patterns"] = patterns
     out["best_pattern"] = best_pattern.get("pattern") if best_pattern else None
-    out["best_pattern_direction"] = best_pattern.get("direction") if best_pattern else None
-    out["best_pattern_confidence"] = best_pattern.get("confidence") if best_pattern else None
+    out["best_pattern_direction"] = (
+        best_pattern.get("direction") if best_pattern else None
+    )
+    out["best_pattern_confidence"] = (
+        best_pattern.get("confidence") if best_pattern else None
+    )
     out["has_bullish_pattern"] = has_bullish_pattern
     out["has_bearish_pattern"] = has_bearish_pattern
 

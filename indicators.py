@@ -1,27 +1,64 @@
+from __future__ import annotations
+
 """indicators.py
 ====================================================
-기술적 지표 및 레짐 피처 계산 모듈.
+기술적 지표 및 레짐 피처 계산 모듈 (TA-Lib 백엔드 버전).
 
 역할
 ----------------------------------------------------
 - WebSocket / DB 에서 얻은 캔들(1m/5m/15m ...)에 대해
-  EMA, RSI, ATR, MACD, 스토캐스틱, 볼린저 밴드, ADX 등을 계산한다.
-- 신호 판단/전략/GPT 레이어는 이 모듈의 함수만 호출해서
-  순수 수치 지표를 얻고, I/O 나 텔레그램 로깅은 전혀 수행하지 않는다.
+  EMA, RSI, ATR, MACD, 스토캐스틱, 볼린저 밴드, ADX, OBV 등을 계산한다.
+- 이 모듈은 **순수 수치 계산 전용 레이어**로, I/O 나 텔레그램 로깅을 전혀 수행하지 않는다.
+- GPT 레이어는 이 모듈이 돌려주는 지표 값만 사용하며, 지표 계산을 직접 수행하지 않는다.
 
-2025-11-19 변경 요약
+2025-12-01 변경 요약 (TA-Lib 마이그레이션 및 레짐 휴리스틱 파라미터화)
 ----------------------------------------------------
-1) MACD, 스토캐스틱(Stoch), 볼린저 밴드(BBands), ADX, OBV 지표를 추가했다.
-2) build_regime_features_from_candles(...) 를 확장해
-   - EMA20/50/100/200, ATR, RSI, BBands 폭, ADX, Stoch, MACD 를 한 번에 계산해
-   - GPT 컨텍스트에 바로 실어 보낼 수 있는 피처 dict 를 돌려준다.
-3) 기존 함수 시그니처는 유지해 이전 호출부와 완전히 호환된다.
+1) EMA / SMA / RSI / ATR / MACD / Bollinger Bands / OBV / ADX / Stochastic
+   계산을 모두 TA-Lib 기반으로 교체했다.
+   - talib 이 import 되지 않으면 RuntimeError 를 바로 발생시켜
+     잘못된 환경에서 지표를 "대충" 계산하는 일을 원천 차단한다.
+2) build_regime_features_from_candles(...) 는 TA-Lib 결과를 사용하도록 변경했지만,
+   기존 시그니처와 반환 키/형식은 완전히 동일하게 유지해 상위 모듈과 100% 호환된다.
+3) 과거 순수 파이썬 지표 구현 코드는 모두 제거하고,
+   이 모듈을 "지표 계산 전용 · 무 사이드이펙트" 레이어로 단순화했다.
+4) build_regime_features_from_candles(...) 내부 레짐 판별용 휴리스틱 임계값
+   (EMA 괴리도, ATR %, Range 폭, ADX 기준치 등)을 RegimeThresholds 데이터클래스로
+   파라미터화해, 자산/타임프레임별 튜닝이 가능하도록 했다.
 """
 
-from __future__ import annotations
-
 import math
+from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Iterable
+
+import numpy as np
+
+# TA-Lib 로 백엔드를 통일한다.
+try:  # pragma: no cover - 환경별 talib 설치 유무 차이 방어
+    import talib  # type: ignore[import]
+except Exception as e:  # pragma: no cover
+    talib = None  # type: ignore[assignment]
+    _talib_import_error: Optional[Exception] = e
+else:
+    _talib_import_error = None
+
+
+def _require_talib() -> None:
+    """TA-Lib 이 필수인 함수 호출 전에 환경을 강제 체크한다."""
+    if talib is None:
+        raise RuntimeError(
+            "TA-Lib(talib) import 에 실패했습니다.\n"
+            "indicators.py 는 TA-Lib 기반으로 리팩터링된 상태이며, "
+            "지표를 정확하게 계산하려면 TA-Lib 이 반드시 설치되어 있어야 합니다.\n"
+            "· pip install ta-lib (및 시스템 라이브러리 설치)를 확인해 주세요."
+        ) from _talib_import_error
+
+
+def _to_np(values: List[float]) -> "np.ndarray":
+    """Python 리스트를 float64 numpy 배열로 변환 (지표 계산용)."""
+    if not values:
+        return np.empty(0, dtype="float64")
+    return np.asarray(values, dtype="float64")
+
 
 # WebSocket / DB 공용 캔들 타입
 # ts_ms: epoch milliseconds (int)
@@ -29,122 +66,100 @@ from typing import Dict, List, Tuple, Optional, Iterable
 Candle = Tuple[int, float, float, float, float]  # (ts_ms, open, high, low, close)
 
 
+# 레짐 판별 휴리스틱 임계값 묶음
+@dataclass(frozen=True)
+class RegimeThresholds:
+    """build_regime_features_from_candles 에서 사용하는 레짐 판별용 임계값 모음.
+
+    - 기본값은 BTC/고변동성 코인 1m~15m 기준으로 튜닝한 휴리스틱에 해당한다.
+    - 자산/타임프레임별로 다른 기준이 필요할 때 인스턴스를 만들어 인자로 넘긴다.
+    """
+    # 추세 레짐 판정
+    trend_ema_dist_min: float = 0.003      # EMA 괴리도 최소 비율
+    trend_atr_pct_min: float = 0.003      # ATR / price 최소 비율
+    trend_strength_min: float = 1.2       # |ema_dist_pct| / atr_pct 최소 비율
+    trend_adx_min: float = 25.0           # ADX 최소 기준값
+
+    # 박스(횡보) 레짐 판정
+    range_width_max: float = 0.004        # (최근 고가-저가) / price 최대 비율
+    range_ema_dist_max: float = 0.002     # EMA 괴리도 최대 비율
+    range_adx_max: float = 20.0           # ADX 최대 기준값
+
+
 # ─────────────────────────────
-# SMA (단순 이동평균)
+# SMA (단순 이동평균) - TA-Lib
 # ─────────────────────────────
 
 def sma(values: List[float], length: int) -> List[float]:
-    """단순 이동평균(SMA) 계산.
+    """단순 이동평균(SMA) 계산 (TA-Lib 백엔드).
 
-    - 반환 리스트 길이는 입력 values 와 동일하게 맞춘다.
+    - 반환 리스트 길이는 입력 values 와 동일하다.
     - length 이전 구간은 NaN 으로 채워 인덱스 정합을 유지한다.
-    - length <= 0 이면 방어적으로 원본 값을 그대로 복사해 반환한다.
+    - length <= 0 인 경우, 방어적으로 원본 값을 그대로 복사해 반환한다.
     """
     n = len(values)
     if n == 0:
         return []
     if length <= 0:
         return list(values)
-    if n < length:
-        return [math.nan] * n
 
-    out: List[float] = [math.nan] * (length - 1)
-    window_sum = sum(values[:length])
-    out.append(window_sum / length)
-
-    for i in range(length, n):
-        window_sum += values[i] - values[i - length]
-        out.append(window_sum / length)
-
-    return out
+    _require_talib()
+    arr = _to_np(values)
+    out = talib.SMA(arr, timeperiod=length)
+    return out.tolist()
 
 
 # ─────────────────────────────
-# EMA
+# EMA - TA-Lib
 # ─────────────────────────────
 
 def ema(values: List[float], length: int) -> List[float]:
-    """EMA(지수이동평균) 계산.
+    """EMA(지수이동평균) 계산 (TA-Lib 백엔드).
 
-    반환값은 입력 values 와 같은 길이의 리스트이며,
-    초기 구간(length 이전)은 NaN 으로 채워서 인덱스 정합을 맞춘다.
+    - 반환 값 길이는 입력과 동일하며, 초기 구간은 NaN 으로 채워진다.
+    - length <= 0 인 경우, 방어적으로 원본 값을 그대로 복사해 반환한다.
     """
     n = len(values)
     if n == 0:
         return []
     if length <= 0:
-        # 방어적으로 length <= 0 이면 단순 복사만 반환
         return list(values)
-    if n < length:
-        # 길이가 부족하면 전부 NaN 으로 리턴
-        return [math.nan] * n
 
-    k = 2 / (length + 1)  # EMA 계수
-    out: List[float] = [math.nan] * (length - 1)
-
-    # 첫 EMA 는 단순이동평균(SMA)으로 시작
-    ema_prev = sum(values[:length]) / length
-    out.append(ema_prev)
-
-    # 그 다음부터는 EMA 공식 적용
-    for v in values[length:]:
-        ema_prev = v * k + ema_prev * (1 - k)
-        out.append(ema_prev)
-
-    return out
+    _require_talib()
+    arr = _to_np(values)
+    out = talib.EMA(arr, timeperiod=length)
+    return out.tolist()
 
 
 # ─────────────────────────────
-# RSI
+# RSI - TA-Lib
 # ─────────────────────────────
 
 def rsi(closes: List[float], length: int = 14) -> List[float]:
-    """표준 RSI 계산.
+    """표준 RSI 계산 (TA-Lib 백엔드).
 
     - 입력: 종가 리스트(closes)
     - 반환: 원본 길이에 맞춘 RSI 리스트
-    - 길이가 length+1 미만이면 전부 NaN 으로 채운다.
+    - length <= 0 인 경우 전체 NaN 리스트 반환.
     """
     n = len(closes)
     if n == 0:
         return []
     if length <= 0:
-        # 방어적으로 length <= 0 이면 전부 NaN
-        return [math.nan] * n
-    if n < length + 1:
         return [math.nan] * n
 
-    gains: List[float] = []
-    losses: List[float] = []
-    for i in range(1, n):
-        change = closes[i] - closes[i - 1]
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-
-    # 초기 평균값
-    avg_gain = sum(gains[:length]) / length
-    avg_loss = sum(losses[:length]) / length
-
-    rsis: List[float] = [math.nan] * length
-    rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
-    rsis.append(100 - 100 / (1 + rs))
-
-    # 이후 값들 (Wilders smoothing)
-    for i in range(length, len(gains)):
-        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
-        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
-        rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
-        rsis.append(100 - 100 / (1 + rs))
-
-    return rsis
+    _require_talib()
+    arr = _to_np(closes)
+    out = talib.RSI(arr, timeperiod=length)
+    return out.tolist()
 
 
 # ─────────────────────────────
-# ATR
+# ATR - TA-Lib
 # ─────────────────────────────
 
 def calc_atr(candles: List[Candle], length: int = 14) -> Optional[float]:
-    """기본 ATR 계산.
+    """기본 ATR 계산 (TA-Lib 백엔드).
 
     candles 는 (ts_ms, open, high, low, close) 튜플 리스트여야 한다.
     length+1 개 미만이면 None 을 리턴한다.
@@ -156,27 +171,22 @@ def calc_atr(candles: List[Candle], length: int = 14) -> Optional[float]:
     if len(candles) < length + 1:
         return None
 
-    trs: List[float] = []
-    for i in range(1, len(candles)):
-        _, _, high, low, close = candles[i]
-        _, _, _, _, prev_close = candles[i - 1]
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
-        )
-        trs.append(tr)
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    closes = [c[4] for c in candles]
 
-    if len(trs) < length:
+    _require_talib()
+    h_arr = _to_np(highs)
+    l_arr = _to_np(lows)
+    c_arr = _to_np(closes)
+    atr_series = talib.ATR(h_arr, l_arr, c_arr, timeperiod=length)
+    if atr_series.size == 0 or math.isnan(float(atr_series[-1])):
         return None
-
-    # 단순 평균 ATR (필요시 Wilder 방식으로 변경 가능)
-    atr = sum(trs[-length:]) / length
-    return atr
+    return float(atr_series[-1])
 
 
 # ─────────────────────────────
-# MACD
+# MACD - TA-Lib
 # ─────────────────────────────
 
 def macd(
@@ -185,48 +195,29 @@ def macd(
     slow_len: int = 26,
     signal_len: int = 9,
 ) -> Tuple[List[float], List[float], List[float]]:
-    """MACD(12·26·9 기본값) 계산.
+    """MACD(12·26·9 기본값) 계산 (TA-Lib 백엔드).
 
     반환:
         macd_line, signal_line, hist 리스트 (길이는 values 와 동일)
-    초반부 데이터가 부족하면 NaN 으로 채운다.
+    TA-Lib 의 결과를 그대로 사용하므로, 선두 구간은 NaN 으로 채워진다.
     """
     n = len(values)
     if n == 0:
         return [], [], []
 
-    ema_fast = ema(values, fast_len)
-    ema_slow = ema(values, slow_len)
-
-    macd_line: List[float] = []
-    for f, s in zip(ema_fast, ema_slow):
-        if math.isnan(f) or math.isnan(s):
-            macd_line.append(math.nan)
-        else:
-            macd_line.append(f - s)
-
-    # signal 은 macd_line 에 대해 EMA 를 적용하되, 앞쪽 NaN 은 그대로 둔다.
-    signal_line: List[float] = [math.nan] * n
-    # 유효 구간만 잘라서 EMA 계산
-    first_valid = next((i for i, v in enumerate(macd_line) if not math.isnan(v)), None)
-    if first_valid is not None:
-        segment = macd_line[first_valid:]
-        ema_seg = ema(segment, signal_len)
-        for idx, v in enumerate(ema_seg):
-            signal_line[first_valid + idx] = v
-
-    hist: List[float] = []
-    for m, s in zip(macd_line, signal_line):
-        if math.isnan(m) or math.isnan(s):
-            hist.append(math.nan)
-        else:
-            hist.append(m - s)
-
-    return macd_line, signal_line, hist
+    _require_talib()
+    arr = _to_np(values)
+    macd_line, signal_line, hist = talib.MACD(
+        arr,
+        fastperiod=fast_len,
+        slowperiod=slow_len,
+        signalperiod=signal_len,
+    )
+    return macd_line.tolist(), signal_line.tolist(), hist.tolist()
 
 
 # ─────────────────────────────
-# 볼린저 밴드
+# 볼린저 밴드 - TA-Lib
 # ─────────────────────────────
 
 def bollinger_bands(
@@ -234,7 +225,7 @@ def bollinger_bands(
     length: int = 20,
     num_std: float = 2.0,
 ) -> Tuple[List[float], List[float], List[float]]:
-    """볼린저 밴드 (중심선, 상단, 하단) 계산.
+    """볼린저 밴드 (중심선, 상단, 하단) 계산 (TA-Lib 백엔드).
 
     - 길이가 length 미만인 구간은 NaN.
     """
@@ -244,127 +235,61 @@ def bollinger_bands(
     if length <= 0:
         return [math.nan] * n, [math.nan] * n, [math.nan] * n
 
-    mid: List[float] = [math.nan] * n
-    upper: List[float] = [math.nan] * n
-    lower: List[float] = [math.nan] * n
-
-    for i in range(length - 1, n):
-        window = values[i - length + 1 : i + 1]
-        if len(window) < length:
-            continue
-        mean = sum(window) / length
-        var = sum((x - mean) ** 2 for x in window) / length
-        std = math.sqrt(var)
-
-        mid[i] = mean
-        upper[i] = mean + num_std * std
-        lower[i] = mean - num_std * std
-
-    return mid, upper, lower
+    _require_talib()
+    arr = _to_np(values)
+    upper, mid, lower = talib.BBANDS(
+        arr,
+        timeperiod=length,
+        nbdevup=num_std,
+        nbdevdn=num_std,
+        matype=0,
+    )
+    return mid.tolist(), upper.tolist(), lower.tolist()
 
 
 # ─────────────────────────────
-# OBV (On-Balance Volume)
+# OBV (On-Balance Volume) - TA-Lib
 # ─────────────────────────────
 
 def obv(closes: List[float], volumes: List[float]) -> List[float]:
-    """OBV 계산. 길이가 맞지 않으면 공통 구간까지만 사용한다."""
+    """OBV 계산 (TA-Lib 백엔드). 길이가 맞지 않으면 공통 구간까지만 사용한다."""
     n = min(len(closes), len(volumes))
     if n == 0:
         return []
 
-    closes = closes[:n]
-    volumes = volumes[:n]
-
-    out: List[float] = [0.0] * n
-    for i in range(1, n):
-        if closes[i] > closes[i - 1]:
-            out[i] = out[i - 1] + volumes[i]
-        elif closes[i] < closes[i - 1]:
-            out[i] = out[i - 1] - volumes[i]
-        else:
-            out[i] = out[i - 1]
-    return out
+    _require_talib()
+    c_arr = _to_np(closes[:n])
+    v_arr = _to_np(volumes[:n])
+    out = talib.OBV(c_arr, v_arr)
+    return out.tolist()
 
 
 # ─────────────────────────────
-# ADX
+# ADX - TA-Lib
 # ─────────────────────────────
 
 def adx(candles: List[Candle], length: int = 14) -> Optional[float]:
-    """ADX(평균 방향성 지수) 마지막 값 1개를 계산한다.
+    """ADX(평균 방향성 지수) 마지막 값 1개 계산 (TA-Lib 백엔드).
 
     - candles 가 2 * length 개 미만이면 None.
-    - Wilder 방식으로 +DM, -DM, TR, DX, ADX 를 계산한다.
+    - TA-Lib ADX 의 마지막 유효 값을 그대로 사용한다.
     """
     n = len(candles)
     if length <= 0 or n < 2 * length:
         return None
 
-    plus_dm: List[float] = []
-    minus_dm: List[float] = []
-    trs: List[float] = []
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    closes = [c[4] for c in candles]
 
-    for i in range(1, n):
-        _, _, high, low, close = candles[i]
-        _, _, prev_high, prev_low, prev_close = candles[i - 1]
-
-        up_move = high - prev_high
-        down_move = prev_low - low
-
-        plus = up_move if (up_move > down_move and up_move > 0) else 0.0
-        minus = down_move if (down_move > up_move and down_move > 0) else 0.0
-
-        tr = max(
-            high - low,
-            abs(high - prev_close),
-            abs(low - prev_close),
-        )
-
-        plus_dm.append(plus)
-        minus_dm.append(minus)
-        trs.append(tr)
-
-    if len(trs) < length:
+    _require_talib()
+    h_arr = _to_np(highs)
+    l_arr = _to_np(lows)
+    c_arr = _to_np(closes)
+    adx_series = talib.ADX(h_arr, l_arr, c_arr, timeperiod=length)
+    if adx_series.size == 0 or math.isnan(float(adx_series[-1])):
         return None
-
-    # 초기 smoothed 값
-    tr_n = sum(trs[:length])
-    plus_dm_n = sum(plus_dm[:length])
-    minus_dm_n = sum(minus_dm[:length])
-
-    def _calc_di(tr_val: float, plus_val: float, minus_val: float) -> Tuple[float, float, float]:
-        if tr_val <= 0:
-            return 0.0, 0.0, 0.0
-        plus_di = 100.0 * plus_val / tr_val
-        minus_di = 100.0 * minus_val / tr_val
-        denom = plus_di + minus_di
-        if denom <= 0:
-            return plus_di, minus_di, 0.0
-        dx = 100.0 * abs(plus_di - minus_di) / denom
-        return plus_di, minus_di, dx
-
-    _, _, first_dx = _calc_di(tr_n, plus_dm_n, minus_dm_n)
-    dx_values: List[float] = [first_dx]
-
-    # 이후 smoothed 값
-    for i in range(length, len(trs)):
-        tr_n = tr_n - (tr_n / length) + trs[i]
-        plus_dm_n = plus_dm_n - (plus_dm_n / length) + plus_dm[i]
-        minus_dm_n = minus_dm_n - (minus_dm_n / length) + minus_dm[i]
-        _, _, dx_val = _calc_di(tr_n, plus_dm_n, minus_dm_n)
-        dx_values.append(dx_val)
-
-    if len(dx_values) < length:
-        # 샘플이 부족하면 마지막 DX 를 그대로 ADX 로 사용
-        return dx_values[-1]
-
-    # 첫 ADX 는 앞 length 개 DX 의 평균
-    adx_val = sum(dx_values[:length]) / length
-    for dx_val in dx_values[length:]:
-        adx_val = ((adx_val * (length - 1)) + dx_val) / length
-
-    return adx_val
+    return float(adx_series[-1])
 
 
 # ─────────────────────────────
@@ -379,6 +304,7 @@ def build_regime_features_from_candles(
     atr_len: int = 14,
     rsi_len: int = 14,
     range_window: int = 50,
+    regime_thresholds: Optional["RegimeThresholds"] = None,
 ) -> Optional[Dict[str, float]]:
     """캔들 배열에서 추세/변동성/박스 여부를 가늠하는 피처 묶음을 생성한다.
 
@@ -389,12 +315,15 @@ def build_regime_features_from_candles(
           "ema_slow": 94300.0,
           "ema_dist_pct": 0.0019,
           "ema_fast_slope_pct": 0.0003,
+          "ema_100": ...,
+          "ema_200": ...,
           "atr": 350.0,
           "atr_pct": 0.0037,
           "range_pct": 0.0052,
           "rsi_last": 57.3,
           "adx_last": 27.1,
           "bb_width_pct": 0.004,
+          "bb_pos": 0.6,
           "stoch_k": 65.0,
           "stoch_d": 60.0,
           "macd": ...,
@@ -407,9 +336,9 @@ def build_regime_features_from_candles(
         }
 
     - DB 를 직접 보지 않고, 넘겨받은 candles 리스트만 사용한다.
-    - signal_analysis_worker, signal_flow_ws, position_watch_ws 에서
-      이 함수를 호출해 extra["regime_features"] 에 그대로 실어 보내면
-      GPT / 대시보드 양쪽에서 재사용 가능하다.
+    - position_watch_ws, market_features_ws 등에서 extra["regime_features"] 용으로 사용된다.
+    - regime_thresholds 를 넘기면 레짐 판별 기준(EMA 괴리도, ATR %, ADX 등)을
+      자산/타임프레임별로 커스터마이즈할 수 있다.
     """
     n = len(candles)
     need = max(fast_ema_len, slow_ema_len, atr_len + 1, rsi_len + 1, range_window)
@@ -422,6 +351,10 @@ def build_regime_features_from_candles(
     last_close = closes[-1]
     if last_close <= 0:
         return None
+
+    # 레짐 휴리스틱 임계값 (None 이면 기본값 사용)
+    if regime_thresholds is None:
+        regime_thresholds = RegimeThresholds()
 
     # EMA 기반 추세 강도 (20/50 기본)
     ema_fast_list = ema(closes, fast_ema_len)
@@ -455,13 +388,13 @@ def build_regime_features_from_candles(
         ema_fast_slope_pct = (ema_fast_last - ema_fast_prev) / last_close
 
     # EMA200 대비 종가 위치
-    if ema_200_list and not math.isnan(ema_200_val):
+    if not math.isnan(ema_200_val):
         ema_200_dist_pct = (last_close - ema_200_val) / last_close
     else:
         ema_200_dist_pct = math.nan
 
     # ATR 및 가격 밴드 폭
-    atr_val = calc_atr(candles[-(atr_len + 1) :], length=atr_len)
+    atr_val = calc_atr(candles[-(atr_len + 1):], length=atr_len)
     atr_pct = (atr_val / last_close) if (atr_val is not None and last_close > 0) else math.nan
 
     high_recent = max(highs[-range_window:])
@@ -513,15 +446,19 @@ def build_regime_features_from_candles(
         range_strength = range_pct / atr_pct if atr_pct > 0 else range_pct
 
         # 매우 단순한 휴리스틱 레이블링 (+ ADX 반영)
+        t = regime_thresholds
         strong_trend = (
-            abs(ema_dist_pct) >= 0.003
-            and atr_pct >= 0.003
-            and (trend_strength >= 1.2 or (adx_val is not None and adx_val >= 25))
+            abs(ema_dist_pct) >= t.trend_ema_dist_min
+            and atr_pct >= t.trend_atr_pct_min
+            and (
+                trend_strength >= t.trend_strength_min
+                or (adx_val is not None and adx_val >= t.trend_adx_min)
+            )
         )
         strong_range = (
-            range_pct <= 0.004
-            and abs(ema_dist_pct) <= 0.002
-            and (adx_val is None or adx_val < 20)
+            range_pct <= t.range_width_max
+            and abs(ema_dist_pct) <= t.range_ema_dist_max
+            and (adx_val is None or adx_val < t.range_adx_max)
         )
 
         if strong_trend:
@@ -576,7 +513,7 @@ def build_regime_features_from_candles(
 
 
 # ─────────────────────────────
-# 다이버전스 보조 피벗 찾기
+# 다이버전스 보조 피벗 찾기 (순수 파이썬 유지)
 # ─────────────────────────────
 
 def _find_last_two_pivot_highs(candles: List[Candle]) -> List[int]:
@@ -624,7 +561,7 @@ def _find_last_two_pivot_lows(candles: List[Candle]) -> List[int]:
 
 
 # ─────────────────────────────
-# RSI 다이버전스
+# RSI 다이버전스 (순수 파이썬 유지)
 # ─────────────────────────────
 
 def has_bearish_rsi_divergence(candles: List[Candle], rsi_vals: List[float]) -> bool:
@@ -670,7 +607,7 @@ def has_bullish_rsi_divergence(candles: List[Candle], rsi_vals: List[float]) -> 
 
 
 # ─────────────────────────────
-# 스토캐스틱 (보조지표로도 직접 사용 가능)
+# 스토캐스틱 (Stochastic Oscillator) - TA-Lib
 # ─────────────────────────────
 
 def stochastic_oscillator(
@@ -680,40 +617,31 @@ def stochastic_oscillator(
     k_len: int = 14,
     d_len: int = 3,
 ) -> Tuple[List[float], List[float]]:
-    """스토캐스틱 오실레이터 (%K, %D) 계산."""
+    """스토캐스틱 오실레이터 (%K, %D) 계산 (TA-Lib STOCH 기반).
+
+    - fastK 기간은 k_len, slowK 기간은 3, slowD 기간은 d_len 으로 설정한다.
+    - 반환값은 (slowK, slowD) ≒ (표준 %K, %D) 로 사용한다.
+    """
     n = min(len(highs), len(lows), len(closes))
     if n == 0:
         return [], []
 
-    highs = highs[:n]
-    lows = lows[:n]
-    closes = closes[:n]
+    _require_talib()
+    h_arr = _to_np(highs[:n])
+    l_arr = _to_np(lows[:n])
+    c_arr = _to_np(closes[:n])
 
-    k_vals: List[float] = [math.nan] * n
-    for i in range(n):
-        if i + 1 < k_len:
-            continue
-        start = i + 1 - k_len
-        window_high = max(highs[start : i + 1])
-        window_low = min(lows[start : i + 1])
-        denom = window_high - window_low
-        if denom <= 0:
-            k_vals[i] = 50.0  # 변동성 거의 없으면 중립값
-        else:
-            k_vals[i] = 100.0 * (closes[i] - window_low) / denom
-
-    # %D = %K 의 이동평균 (NaN 은 제외한 윈도우 평균)
-    d_vals: List[float] = [math.nan] * n
-    for i in range(n):
-        if i + 1 < d_len:
-            continue
-        window = k_vals[i + 1 - d_len : i + 1]
-        valid = [v for v in window if not math.isnan(v)]
-        if len(valid) < d_len:
-            continue
-        d_vals[i] = sum(valid) / len(valid)
-
-    return k_vals, d_vals
+    slowk, slowd = talib.STOCH(
+        h_arr,
+        l_arr,
+        c_arr,
+        fastk_period=k_len,
+        slowk_period=3,
+        slowk_matype=0,
+        slowd_period=d_len,
+        slowd_matype=0,
+    )
+    return slowk.tolist(), slowd.tolist()
 
 
 __all__ = [
@@ -732,4 +660,5 @@ __all__ = [
     "_find_last_two_pivot_highs",
     "_find_last_two_pivot_lows",
     "Candle",
+    "RegimeThresholds",
 ]

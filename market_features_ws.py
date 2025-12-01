@@ -3,6 +3,19 @@
 BingX WebSocket 로우데이터(멀티 타임프레임 캔들 + depth5 오더북)를
 GPT-5.1 트레이더용 피처로 가공하는 모듈.
 
+2025-12-02 변경 사항 (RSI/macd 시리즈 + 패턴 엔진 연동)
+----------------------------------------------------
+1) _build_timeframe_features(...)에서 rsi(...) 결과 전체를 rsi_series로
+   timeframes[iv]["indicators"]["rsi_series"]에 추가했다.
+2) 동일하게 MACD 히스토그램 시리즈를 macd_hist_series로
+   timeframes[iv]["indicators"]["macd_hist_series"]에 포함했다.
+3) NaN/None/비수치 값은 필터링한 뒤 저장해
+   pattern_detection.build_pattern_features(...)에서 _require_series(...)
+   가 안정적으로 동작하도록 했다.
+4) unified_features_builder.build_unified_features(...)
+   → pattern_detection.build_pattern_features(...) 호출 시
+   indicators 인자를 통해 RSI 다이버전스 패턴이 활성화되도록 했다.
+
 2025-11-20 변경 사항 (엔트리 시그널 빌더 통합 + 저변동성 필터 + 피처 문서화/강화)
 ----------------------------------------------------
 1) get_trading_signal(...) 추가
@@ -164,8 +177,6 @@ Key Overview
 - volume_zscore_5m: float | None
 - strong_trend_flag_5m: int | None
 """
-
-from __future__ import annotations
 
 import math
 import time
@@ -417,6 +428,57 @@ def _volume_stats(values: List[float], ma_len: int) -> Tuple[float, float, float
     return last, mean, ratio, z
 
 
+def _normalize_regime_keys(regime: Dict[str, Any]) -> Dict[str, Any]:
+    """TA-Lib indicators.py 정합 체크용: 핵심 키들을 보정/보완한다.
+
+    - atr_pct / range_pct / macd_hist / rsi_last 필드가 누락되어 있으면
+      가능한 값에서 alias 를 만들어 준다.
+    - 현재 indicators.py 는 이미 위 키들을 생성하지만,
+      과거 버전과의 호환을 위한 안전장치로 둔다.
+    """
+    normalized = dict(regime)
+
+    # rsi_last 가 없고 rsi 만 있다면 alias 생성
+    if "rsi_last" not in normalized and "rsi" in normalized:
+        v = normalized.get("rsi")
+        if isinstance(v, (int, float)):
+            normalized["rsi_last"] = float(v)
+
+    # macd_hist 가 없고 macd_hist_last 가 있는 경우 alias
+    if "macd_hist" not in normalized and "macd_hist_last" in normalized:
+        v = normalized.get("macd_hist_last")
+        if isinstance(v, (int, float)):
+            normalized["macd_hist"] = float(v)
+
+    # atr_pct 가 없고 atr / last_close 로 계산 가능한 경우 보완
+    if "atr_pct" not in normalized:
+        atr_val = normalized.get("atr")
+        last_close = normalized.get("last_close")
+        if (
+            isinstance(atr_val, (int, float))
+            and isinstance(last_close, (int, float))
+            and last_close > 0
+        ):
+            normalized["atr_pct"] = float(atr_val) / float(last_close)
+
+    # range_pct 가 없고 high_recent/low_recent 로 계산 가능한 경우 보완
+    if "range_pct" not in normalized:
+        high_recent = normalized.get("high_recent")
+        low_recent = normalized.get("low_recent")
+        last_close = normalized.get("last_close")
+        if (
+            isinstance(high_recent, (int, float))
+            and isinstance(low_recent, (int, float))
+            and isinstance(last_close, (int, float))
+            and last_close > 0
+        ):
+            normalized["range_pct"] = (float(high_recent) - float(low_recent)) / float(
+                last_close
+            )
+
+    return normalized
+
+
 def _build_timeframe_features(
     symbol: str,
     interval: str,
@@ -653,6 +715,34 @@ def _build_timeframe_features(
         "is_low_volatility": is_low_volatility,
     }
 
+    # 패턴 엔진용 지표 시리즈 (RSI / MACD 히스토그램 등)
+    indicators: Dict[str, Any] = {}
+    try:
+        if rsi_vals:
+            rsi_clean = [
+                float(v)
+                for v in rsi_vals
+                if isinstance(v, (int, float)) and not math.isnan(float(v))
+            ]
+            if rsi_clean:
+                indicators["rsi_series"] = rsi_clean
+    except Exception as e:
+        log(f"[MKT-FEAT] rsi_series 빌드 중 예외 interval={interval}: {e}")
+    try:
+        if macd_hist:
+            macd_hist_clean = [
+                float(v)
+                for v in macd_hist
+                if isinstance(v, (int, float)) and not math.isnan(float(v))
+            ]
+            if macd_hist_clean:
+                indicators["macd_hist_series"] = macd_hist_clean
+    except Exception as e:
+        log(f"[MKT-FEAT] macd_hist_series 빌드 중 예외 interval={interval}: {e}")
+
+    if indicators:
+        tf_features["indicators"] = indicators
+
     # GPT 프롬프트에서 직접 차트 패턴을 해석할 수 있게,
     # 1m/5m/15m 에 대해서만 최근 20개 원시 OHLCV 를 함께 실어 보낸다.
     if interval in ("1m", "5m", "15m"):
@@ -670,7 +760,8 @@ def _build_timeframe_features(
                 range_window=range_len,
             )
             if regime is not None:
-                tf_features["regime"] = regime
+                # TA-Lib indicators.py 에서 생성된 regime 키 정합을 한 번 더 보정
+                tf_features["regime"] = _normalize_regime_keys(regime)
         except Exception as e:
             log(f"[MKT-FEAT] regime feature 계산 중 예외 interval={interval}: {e}")
 
@@ -1036,10 +1127,21 @@ def get_trading_signal(
         low_vol_tfs = int(mtf.get("low_vol_tfs") or 0)
 
         if (is_low_range and is_low_atr) or (is_low_vol_5 and low_vol_tfs >= 2):
+            # TA-Lib 기반 range_pct / atr_pct 가 정상 계산되었는지 로그로도 함께 체크
+            range_str = (
+                f"{range_pct_5:.4f}"
+                if isinstance(range_pct_5, (int, float)) and not math.isnan(range_pct_5)
+                else "nan"
+            )
+            atr_str = (
+                f"{atr_pct_5:.4f}"
+                if isinstance(atr_pct_5, (int, float)) and not math.isnan(atr_pct_5)
+                else "nan"
+            )
             log(
                 "[MKT-FEAT] get_trading_signal: 저변동성 구간 스킵 "
-                f"(5m range_pct={range_pct_5:.4f if isinstance(range_pct_5, (int, float)) else float('nan')}, "
-                f"atr_pct={atr_pct_5:.4f if isinstance(atr_pct_5, (int, float)) else float('nan')}, "
+                f"(5m range_pct={range_str}, "
+                f"atr_pct={atr_str}, "
                 f"th=({low_range_th:.4f}, {low_atr_th:.4f}), low_vol_tfs={low_vol_tfs})"
             )
             return None

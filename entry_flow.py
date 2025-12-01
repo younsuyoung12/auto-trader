@@ -5,6 +5,18 @@
 - run_bot.py / run_bot_ws.py 에서 호출하는 진입 실행 레이어.
 - WS 시세 + market_features_ws 시그널 → gpt_trader 판단 → 가드 → 주문 → 로그/DB 기록.
 
+2025-12-01 변경 요약 (TA-Lib EntryScore 정합 + NaN 가드)
+-----------------------------------------------------
+- market_features_ws.get_trading_signal(...) 이 내려주는 extra["atr_fast"], extra["atr_slow"] 를
+  EntryScore 계산의 기준으로 사용하되, 둘 중 하나라도 NaN/None/비유효 값이면
+  이번 캔들은 전체 엔트리 플로우를 SKIP 처리하도록 가드 추가.
+- _compute_entry_score_components(...) 의 0~10 → 0~100 클램프/정규화 로직을 유지하면서
+  preview_entry_score / DB EntryScore 저장 경로에서 NaN 이 저장되지 않도록
+  ValueError 기반 가드 흐름을 명확히 정리.
+- GPT 호출 이전에 ATR 정합 가드가 먼저 적용되도록 해서,
+  TA-Lib 지표가 아직 안정되지 않은 초기 구간에서는 진입 자체를 막고
+  로그/skip_event 만 남기도록 변경.
+
 2025-11-20 변경 요약
 -----------------------------------------------------
 - 레거시 레짐 전용 의사결정 로직 제거.
@@ -637,6 +649,37 @@ def try_open_new_position(
         regime_label: str = str(signal_source)
     else:
         regime_label = "GENERIC"
+
+    # ✅ 2025-12-01: TA-Lib ATR 기반 EntryScore NaN 가드
+    # - atr_fast / atr_slow 가 NaN/None/비유효 값이면,
+    #   지표가 준비되지 않은 상태로 보고 이번 캔들 엔트리 전체를 SKIP 처리.
+    atr_fast_val = extra.get("atr_fast") if isinstance(extra, dict) else None
+    atr_slow_val = extra.get("atr_slow") if isinstance(extra, dict) else None
+    if (
+        not isinstance(atr_fast_val, (int, float))
+        or not math.isfinite(float(atr_fast_val))
+        or not isinstance(atr_slow_val, (int, float))
+        or not math.isfinite(float(atr_slow_val))
+    ):
+        msg = (
+            "[SKIP] entry_score_atr_invalid: atr_fast/atr_slow invalid "
+            f"(atr_fast={atr_fast_val}, atr_slow={atr_slow_val})"
+        )
+        log(msg)
+        try:
+            send_skip_tg(msg)
+        except Exception as te:
+            log(f"[ENTRY_SCORE] send_skip_tg failed on atr_invalid: {te}")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.entry_score_atr",
+            side=chosen_signal,
+            reason="atr_invalid_for_entry_score",
+            extra={"atr_fast": atr_fast_val, "atr_slow": atr_slow_val},
+        )
+        # ATR 이 안정될 때까지 짧게 대기 후 다음 루프에서 다시 시도
+        return None, 1.0
 
     # (1-1) 웹소켓에서 1m 캔들을 한 번 땡겨본다. 없으면 None.
     ws_candles_1m: Optional[List[tuple]] = None
@@ -1339,3 +1382,8 @@ def try_open_new_position(
 
     # 진입 후에는 짧은 쿨다운
     return trade, float(getattr(settings, "post_entry_sleep_sec", 5.0))
+
+
+__all__ = [
+    "try_open_new_position",
+]

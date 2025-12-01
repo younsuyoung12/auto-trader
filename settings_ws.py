@@ -162,16 +162,16 @@ class BotSettings:
     enable_1m_confirm: bool = True
 
     # 레버리지/리스크
-    leverage: int = 10
+    leverage: int = 1
     isolated: bool = True
-    risk_pct: float = 0.3
+    risk_pct: float = 0.1
     min_notional_usdt: float = 5.0
     max_notional_usdt: float = 999999.0
 
     # ── 기본 TP/SL (GPT가 없을 때/기본값) ───────────────────
     # 익절/손절 기본 비율 (가격 기준)
-    tp_pct: float = 0.01  # 기본 익절 1%
-    sl_pct: float = 0.02  # 기본 손절 2%
+    tp_pct: float = 0.005  # 기본 익절 0.5%
+    sl_pct: float = 0.015  # 기본 손절 1.5%
 
     # ATR/변동성 보정
     use_atr: bool = True
@@ -193,7 +193,7 @@ class BotSettings:
     gpt_error_sleep_sec: float = 5.0      # GPT 오류 시 루프 대기(sec)
     gpt_skip_sleep_sec: float = 3.0       # GPT SKIP/비정상 응답 후 대기(sec)
     gpt_max_risk_pct: float = 0.03        # GPT 제안 리스크 상한 (3%)
-    gpt_entry_cooldown_sec: int = 120     # GPT ENTRY 호출 쿨다운(sec) — ENV: GPT_ENTRY_COOLDOWN_SEC
+    gpt_entry_cooldown_sec: int = 20     # GPT ENTRY 호출 쿨다운(sec) — ENV: GPT_ENTRY_COOLDOWN_SEC
 
     # GPT가 제안하는 TP/SL 범위 (가격 기준)
     gpt_min_tp_pct: float = 0.01          # TP 하한 (기본 1%)
@@ -224,7 +224,7 @@ class BotSettings:
 
     # ── 슬리피지/호가 관련 ─────────────────────────────────
     max_price_jump_pct: float = 0.003
-    max_spread_pct: float = 0.0008
+    max_spread_pct: float =  0.0012
     max_entry_slippage_pct: float = 0.0005
     use_orderbook_entry_hint: bool = True
 
@@ -446,7 +446,7 @@ def load_settings() -> BotSettings:
         ),
         # 진입 거래량 가드
         min_entry_volume_ratio=_as_float(
-            os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.3"),
+            os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.15"),
             0.3,
         ),
         # 쿨다운/폴링
@@ -462,7 +462,7 @@ def load_settings() -> BotSettings:
         ),
         poll_fills_sec=_as_int(os.getenv("POLL_FILLS_SEC", "2"), 2),
         # 가드
-        max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.003"), 0.003),
+        max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.006"), 0.003),
         max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
         max_entry_slippage_pct=_as_float(
             os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"),

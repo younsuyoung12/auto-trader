@@ -8,6 +8,17 @@ gpt_decider.py
 - BingX Auto Trader에서 진입/청산 의사결정을 GPT-5.1에 위임하는 브레인 모듈.
 - gpt_trader / position_watch_ws 등에서 이 모듈만 import 해서 사용한다.
 
+2025-12-01 변경 사항 (WS market_features + NaN/None 직렬화 보정)
+----------------------------------------------------
+1) market_features 및 extra 안의 숫자 필드에서 None/NaN/Infinity 값을 GPT 프롬프트 직전에 0으로 단순 치환해,
+   "None"/"NaN" 문자열이 프롬프트에 그대로 노출되지 않도록 했다.
+2) pattern_score, trend_strength, range_strength, volatility_score, multi_timeframe signals, risk_flags,
+   liquidity_event_score 등 주요 지표가 모두 유한한 숫자로만 GPT 입력에 포함되도록 정규화했다.
+3) 지표 계산 단계(indicators.py / market_features_ws.py / entry_flow.py)에서의 '폴백 금지' 정책은 그대로 유지하고,
+   gpt_decider.py는 오직 직렬화 포맷 안정화만 담당하도록 분리했다.
+4) EXIT(청산) 프롬프트에 포함되는 market_features/extra payload 에도 동일한 NaN/None 보정을 적용해,
+   청산 판단 시에도 이상값이 들어가지 않도록 했다.
+
 2025-11-21 변경 사항 (Unified Features + 백필 금지 + 레짐 제거)
 ----------------------------------------------------
 1) unified_features_builder.build_unified_features(...) 가 만든 market_features dict 를
@@ -189,6 +200,49 @@ def _log_gpt_latency_csv(
         _safe_log(f"[GPT_LATENCY][ERROR] {e}")
 
 
+def _sanitize_for_gpt(obj: Any, *, _depth: int = 0, _max_depth: int = 8) -> Any:
+    """GPT 프롬프트에 들어가는 payload 에서 None/NaN/Infinity 를 정규화한다.
+
+    - 지표 계산 단계의 값을 '추정해서 보정'하지 않고,
+      GPT 가 읽는 JSON 직렬화 포맷을 안정화하는 용도만 담당한다.
+    - 규칙:
+      * None → 0
+      * float 가 NaN/Infinity → 0.0
+      * dict/list/tuple 는 재귀적으로 동일 규칙 적용
+      * 그 외(str/bool 등)는 그대로 둔다.
+    """
+    if _depth > _max_depth:
+        # 너무 깊은 중첩은 그대로 두되, 상위에서 이미 주요 지표는 정규화된 상태라고 가정한다.
+        return obj
+
+    if obj is None:
+        return 0
+
+    # float 인 경우 유한 실수만 허용
+    if isinstance(obj, float):
+        return float(obj) if math.isfinite(obj) else 0.0
+
+    # int/bool 은 그대로 사용
+    if isinstance(obj, (int, bool)):
+        return obj
+
+    # dict 는 각 값에 재귀 적용
+    if isinstance(obj, dict):
+        return {
+            k: _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
+            for k, v in obj.items()
+        }
+
+    # list/tuple 등 시퀀스는 요소별 재귀 적용
+    if isinstance(obj, (list, tuple)):
+        return [
+            _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth) for v in obj
+        ]
+
+    # 문자열/그 외 타입은 그대로 둔다.
+    return obj
+
+
 # ─────────────────────────────────────────
 # GPT 시스템 프롬프트 (진입용)
 # ─────────────────────────────────────────
@@ -209,10 +263,10 @@ _SYSTEM_PROMPT_ENTRY = """
 - recent_pnl_pct, skip_streak: 최근 손익과 연속 손실/스킵 횟수 등 리스크 컨텍스트
 - market_features: unified_features_builder 가 만든 시장 상태·패턴 요약 dict
   * timeframes: 1m/5m/15m 가격·거래량·변동성 피처(숫자 위주)
-  * pattern_features: pattern_score, reversal_probability, continuation_probability,
+  * pattern_features: pattern_score, trend_strength, range_strength(또는 boxiness_score), volatility_score, reversal_probability, continuation_probability,
     momentum_score, volume_confirmation, wick_strength, liquidity_event_score 등
   * pattern_summary: 사람이 읽기 쉬운 한 줄 설명
-  * risk_flags / liquidity 정보: 갑작스러운 변동성, 유동성 스윕 등
+  * risk_flags / liquidity 정보: 멀티타임프레임 신호, 갑작스러운 변동성, 유동성 스윕 등
 
 당신의 목표는:
 - "지금 이 방향으로 진입하는 것이 합리적인지"를,
@@ -688,8 +742,11 @@ def ask_entry_decision(
         market_features=market_features,
     )
 
+    # NaN/None/Infinity 방지용으로 payload 를 한 번 정규화해서 GPT 에 전달한다.
+    sanitized_payload = _sanitize_for_gpt(payload)
+
     user_content = json.dumps(
-        payload,
+        sanitized_payload,
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -993,7 +1050,11 @@ def _make_exit_prompt(payload: Dict[str, Any]) -> str:
         "- JSON 바깥에 다른 텍스트를 절대 쓰지 마십시오.\n"
         "- 코드블록 마크다운(예: ```json) 과 주석(//, # 등), NaN/Infinity 는 절대 사용하지 마십시오.\n\n"
         "현재 포지션 상태 JSON:\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
+        + json.dumps(
+            _sanitize_for_gpt(payload),
+            ensure_ascii=False,
+            indent=2,
+        )
     )
 
 

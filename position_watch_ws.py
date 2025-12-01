@@ -1,40 +1,56 @@
-# position_watch_ws.py
-# ====================================================
-# 역할
-# ----------------------------------------------------
-# - 웹소켓 캔들/호가에서 현재 시장 상태 요약 피처를 만들고,
-#   열린 포지션(Trade)에 대해 GPT-5.1(gpt_decider)을 통해
-#   EXIT 여부(HOLD/CLOSE)만 판단한 뒤, 실제 청산/로그/DB 업데이트만 수행하는 얇은 레이어.
-#
-# 2025-11-21 변경 사항 (1m 캔들 종가 기반 run_bot_ws 연동)
-# ----------------------------------------------------
-# - run_bot_ws.py 가 1m WS 캔들이 새로 생성되는 시점(직전 1분봉 종가 확정 시점)에
-#   maybe_exit_with_gpt(...) 를 호출하도록 변경되었으며,
-#   이 모듈은 "한 번 호출 시의 EXIT 판단" 로직에만 집중한다.
-# - EXIT_CHECK_INTERVAL_SEC 는 여전히 이 모듈을 별도 워커에서 재사용할 때 참고용으로
-#   권장 최소 호출 주기(현재 60초)를 의미하지만, run_bot_ws 메인 루프에서는 사용하지 않는다.
-#
-# 2025-11-22 변경 사항 (EXIT 실시간 분석 텔레그램 요약)
-# ----------------------------------------------------
-# - maybe_exit_with_gpt(...) 에서 GPT EXIT 판단 직후, 진입 때와 유사한 형태의
-#   상세 분석 요약을 텔레그램으로 전송하는 옵션(exit_debug_notify)을 추가했다.
-#   · BotSettings.exit_debug_notify 가 True 인 경우에만 전송(기본값 False).
-#   · 심볼/방향/시나리오/PnL%/1m 캔들/레짐 요약/GPT 코멘트가 포함된다.
-# - 기존 EXIT/HOLD 로직, DB 업데이트, CSV 로깅 동작에는 영향을 주지 않는다.
-#
-# 사용 방식
-# ----------------------------------------------------
-# - run_bot_ws 메인 루프:
-#     · 1m WS 캔들이 새로 생성된 타이밍에 열린 포지션마다
-#       maybe_exit_with_gpt(trade, settings, scenario="RUNTIME_EXIT_CHECK") 호출.
-# - 별도 워커/스크립트에서 이 모듈을 직접 사용할 때는
-#     maybe_exit_with_gpt(trade, settings, scenario="GENERIC_EXIT_CHECK")
-#   를 **약 1분(60초)** 간격(EXIT_CHECK_INTERVAL_SEC)으로 호출하는 패턴을 권장한다.
-
 from __future__ import annotations
+
+"""
+position_watch_ws.py
+====================================================
+역할
+----------------------------------------------------
+- 웹소켓 캔들/호가에서 현재 시장 상태 요약 피처를 만들고,
+  열린 포지션(Trade)에 대해 GPT-5.1(gpt_decider)을 통해
+  EXIT 여부(HOLD/CLOSE)만 판단한 뒤, 실제 청산/로그/DB 업데이트만 수행하는 얇은 레이어.
+
+2025-12-01 변경 사항 (TA-Lib EXIT 지표 정합 + market_features 브리지)
+----------------------------------------------------
+- indicators.py 의 TA-Lib 기반 build_regime_features_from_candles(...) 출력에 맞춰
+  trend_strength, atr_pct, stoch_k, rsi_last, macd_hist, vol_zscore, wick_strength,
+  liquidity_event_score 등의 key 를 EXIT 컨텍스트에 안정적으로 포함하도록 정합을 점검했다.
+- _build_runtime_regime_features_for_gpt(...) 에서 regime_features 를 정규화하고,
+  position_watch_ws → gpt_decider.ask_exit_decision(...) 로 전달되는
+  extra["market_features"] 구조를 새로 추가했다.
+- None/NaN/Infinity 값은 pattern_features 에 싣지 않도록 필터링해서
+  GPT 프롬프트에 "nan"/"None" 문자열이 직접 노출되지 않게 했다
+  (지표 계산 단계의 폴백/추정은 여전히 하지 않음).
+- 사용되지 않던 _norm_dir(...) 헬퍼 함수를 제거하고, EXIT 어댑터 역할만 남겼다.
+
+2025-11-22 변경 사항 (EXIT 실시간 분석 텔레그램 요약)
+----------------------------------------------------
+- maybe_exit_with_gpt(...) 에서 GPT EXIT 판단 직후, 진입 때와 유사한 형태의
+  상세 분석 요약을 텔레그램으로 전송하는 옵션(exit_debug_notify)을 추가했다.
+  · BotSettings.exit_debug_notify 가 True 인 경우에만 전송(기본값 False).
+  · 심볼/방향/시나리오/PnL%/1m 캔들/레짐 요약/GPT 코멘트가 포함된다.
+- 기존 EXIT/HOLD 로직, DB 업데이트, CSV 로깅 동작에는 영향을 주지 않는다.
+
+2025-11-21 변경 사항 (1m 캔들 종가 기반 run_bot_ws 연동)
+----------------------------------------------------
+- run_bot_ws.py 가 1m WS 캔들이 새로 생성되는 시점(직전 1분봉 종가 확정 시점)에
+  maybe_exit_with_gpt(...) 를 호출하도록 변경되었으며,
+  이 모듈은 "한 번 호출 시의 EXIT 판단" 로직에만 집중한다.
+- EXIT_CHECK_INTERVAL_SEC 는 여전히 이 모듈을 별도 워커에서 재사용할 때 참고용으로
+  권장 최소 호출 주기(현재 60초)를 의미하지만, run_bot_ws 메인 루프에서는 사용하지 않는다.
+
+2025-12-01 커스텀 RUNTIME EXIT 규칙 (수익/손실/추세 기반)
+----------------------------------------------------
+- 15m 방향이 포지션과 반대이고, PnL ≥ +0.2% 이면 즉시 전체 청산.
+- 15m 방향이 포지션과 반대이고, PnL ≤ -0.5% 이면 즉시 전체 청산.
+- PnL ≥ +0.5% 이고 partial_tp_done 이 아니면 포지션의 30% 부분 익절 후
+  남은 70%는 그대로 유지.
+- trend_strength > 0.75, atr_pct > 0.004, PnL > 0 이고 15m 방향이 포지션과 같으면
+  GPT 가 CLOSE 라고 해도 HOLD 로 오버라이드하여 추세를 더 길게 탄다.
+"""
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
+import math
 
 from telelog import log, send_tg
 from market_data_ws import (
@@ -65,22 +81,142 @@ except Exception:  # pragma: no cover - DB 미준비 환경 방어
 
 
 # ─────────────────────────────────────────
-# 내부 헬퍼: 방향/레짐/DB 등
+# 내부 헬퍼: 레짐/지표 정합 + DB 등
 # ─────────────────────────────────────────
 
 
-def _norm_dir(d: str) -> str:
-    """BUY/SELL/LONG/SHORT 혼용을 LONG/SHORT 로 정규화."""
-    if not d:
-        return ""
-    d = d.upper()
-    if d == "BUY":
-        return "LONG"
-    if d == "SELL":
-        return "SHORT"
-    if d in {"LONG", "SHORT"}:
-        return d
-    return ""
+def _normalize_regime_keys(regime: Dict[str, Any]) -> Dict[str, Any]:
+    """TA-Lib 기반 regime dict 의 핵심 키를 정규화한다.
+
+    - atr_pct / range_pct / macd_hist / rsi_last 필드가 누락되어 있으면
+      사용 가능한 값에서 alias 를 만들어 준다.
+    - indicators.py 의 build_regime_features_from_candles(...) 와
+      market_features_ws.py 에서 사용하는 정합 규칙과 동일한 방향을 따른다.
+    """
+    normalized = dict(regime)
+
+    # rsi_last 가 없고 rsi 만 있다면 alias 생성
+    if "rsi_last" not in normalized and "rsi" in normalized:
+        v = normalized.get("rsi")
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            normalized["rsi_last"] = float(v)
+
+    # macd_hist 가 없고 macd_hist_last 가 있는 경우 alias
+    if "macd_hist" not in normalized and "macd_hist_last" in normalized:
+        v = normalized.get("macd_hist_last")
+        if isinstance(v, (int, float)) and math.isfinite(float(v)):
+            normalized["macd_hist"] = float(v)
+
+    # atr_pct 가 없고 atr / last_close 로 계산 가능한 경우 보완
+    if "atr_pct" not in normalized:
+        atr_val = normalized.get("atr")
+        last_close = normalized.get("last_close")
+        if (
+            isinstance(atr_val, (int, float))
+            and math.isfinite(float(atr_val))
+            and isinstance(last_close, (int, float))
+            and math.isfinite(float(last_close))
+            and float(last_close) > 0
+        ):
+            normalized["atr_pct"] = float(atr_val) / float(last_close)
+
+    # range_pct 가 없고 high_recent/low_recent 로 계산 가능한 경우 보완
+    if "range_pct" not in normalized:
+        high_recent = normalized.get("high_recent")
+        low_recent = normalized.get("low_recent")
+        last_close = normalized.get("last_close")
+        if (
+            isinstance(high_recent, (int, float))
+            and math.isfinite(float(high_recent))
+            and isinstance(low_recent, (int, float))
+            and math.isfinite(float(low_recent))
+            and isinstance(last_close, (int, float))
+            and math.isfinite(float(last_close))
+            and float(last_close) > 0
+        ):
+            normalized["range_pct"] = (
+                float(high_recent) - float(low_recent)
+            ) / float(last_close)
+
+    return normalized
+
+
+def _safe_num_or_none(v: Any) -> Optional[float]:
+    """유한 실수이면 float 로, 아니면 None 으로 반환."""
+    if isinstance(v, (int, float)):
+        f = float(v)
+        if math.isfinite(f):
+            return f
+    return None
+
+
+def _build_market_features_from_regime(regime_features: Dict[str, Any]) -> Dict[str, Any]:
+    """EXIT 용 market_features dict 를 regime_features 기반으로 구성한다.
+
+    - trend_strength, atr_pct, stoch_k, rsi_last, macd_hist, vol_zscore,
+      wick_strength, liquidity_event_score 등을 pattern_features 로 모은다.
+    - build_regime_features_from_candles(...) 가 반환한 원본 dict 는
+      raw_regime_5m 로 그대로 포함시켜 GPT 가 세부 값을 참고할 수 있게 한다.
+    """
+    if not isinstance(regime_features, dict) or not regime_features:
+        return {}
+
+    reg = _normalize_regime_keys(regime_features)
+
+    pattern: Dict[str, Any] = {}
+
+    def _copy_num(src_key: str, dst_key: Optional[str] = None) -> None:
+        val = _safe_num_or_none(reg.get(src_key))
+        if val is not None:
+            pattern[dst_key or src_key] = val
+
+    # 핵심 패턴/지표
+    _copy_num("pattern_score")
+    _copy_num("trend_strength")
+    _copy_num("range_strength")
+    _copy_num("boxiness")
+    _copy_num("volatility_score")
+    _copy_num("reversal_probability")
+    _copy_num("continuation_probability")
+
+    # EXIT 에서 직접 보는 지표들
+    _copy_num("atr_pct")
+    _copy_num("stoch_k")
+    if "stoch_k" not in pattern:
+        _copy_num("stoch_rsi_k", "stoch_k")
+
+    _copy_num("rsi_last")
+    if "rsi_last" not in pattern:
+        _copy_num("rsi", "rsi_last")
+
+    _copy_num("macd_hist")
+    if "macd_hist" not in pattern:
+        _copy_num("macd_hist_last", "macd_hist")
+
+    _copy_num("vol_zscore")
+    if "vol_zscore" not in pattern:
+        _copy_num("volume_zscore", "vol_zscore")
+
+    _copy_num("wick_strength")
+    _copy_num("liquidity_event_score")
+
+    # 요약 문구 (있으면)
+    summary = None
+    for key in ("pattern_summary", "regime_comment", "regime_label"):
+        val = reg.get(key)
+        if isinstance(val, str) and val.strip():
+            summary = val.strip()
+            break
+
+    mf: Dict[str, Any] = {
+        "timeframe": reg.get("timeframe", "5m"),
+        "raw_regime_5m": reg,
+        "pattern_features": pattern,
+    }
+    if summary:
+        mf["pattern_summary"] = summary
+
+    return mf
 
 
 def _get_15m_trend_dir(symbol: str) -> str:
@@ -117,6 +253,8 @@ def _build_runtime_regime_features_for_gpt(symbol: str) -> Dict[str, Any]:
 
     - indicators.build_regime_features_from_candles(...) 를 재사용해서
       entry_flow.py 와 동일한 포맷의 regime_features_5m 을 만든다.
+    - TA-Lib 기반 키들(atr_pct, rsi_last, macd_hist 등)은 _normalize_regime_keys 로
+      한 번 더 정규화해서 사용한다.
     - 실패 시에는 빈 dict 반환 (GPT 컨텍스트에서 무시 가능).
     """
     try:
@@ -155,7 +293,7 @@ def _build_runtime_regime_features_for_gpt(symbol: str) -> Dict[str, Any]:
     if not isinstance(base_features, dict) or not base_features:
         return {}
 
-    features: Dict[str, Any] = dict(base_features)
+    features: Dict[str, Any] = _normalize_regime_keys(base_features)
 
     # 메타 필드 보강
     features.setdefault("version", "ws_runtime_v2")
@@ -215,7 +353,8 @@ def _build_exit_context(
 
     - trade, settings 에서 필요한 최소 정보만 요약해서 보낸다.
     - extra 로 시나리오별 세부 정보를 합친다.
-    - 5m/websocket 기반 레짐/지표 스냅샷(regime_features)도 함께 포함.
+    - 5m/websocket 기반 레짐/지표 스냅샷(regime_features)과
+      EXIT 전용 market_features 를 함께 포함한다.
     """
     ctx: Dict[str, Any] = {
         "scenario": scenario,
@@ -233,18 +372,21 @@ def _build_exit_context(
         pnl_pct = (last_price - entry) / entry
         if trade.side == "SELL":
             pnl_pct = -pnl_pct
-        ctx["pnl_pct"] = pnl_pct
+        ctx["pnl_pct"] = float(pnl_pct)
     else:
         ctx["pnl_pct"] = None
 
     if extra:
         ctx.update(extra)
 
-    # 레짐/지표 스냅샷 추가 (실패해도 기존 동작에는 영향 없음)
+    # 레짐/지표 스냅샷 및 market_features 추가 (실패해도 기존 동작에는 영향 없음)
     try:
         regime_features = _build_runtime_regime_features_for_gpt(symbol=trade.symbol)
         if regime_features:
             ctx["regime_features"] = regime_features
+            mf = _build_market_features_from_regime(regime_features)
+            if mf:
+                ctx["market_features"] = mf
     except Exception as e:  # pragma: no cover - 방어적 로그
         log(f"[PW][REGIME_FEAT] context build error symbol={trade.symbol}: {e}")
 
@@ -361,6 +503,93 @@ def _update_trade_close_in_db(
         log(f"[TRADE_DB] update 실패 trade_id={trade_db_id}: {e}")
     finally:
         session.close()
+
+
+# ─────────────────────────────────────────
+# RUNTIME EXIT용 추가 헬퍼
+# ─────────────────────────────────────────
+
+
+def _is_opposite_side(trade_side: str, trend_dir: str) -> bool:
+    """포지션 방향과 15m 추세 방향이 반대인지 판별."""
+    side = (trade_side or "").upper()
+    trend = (trend_dir or "").upper()
+    if side in ("BUY", "LONG") and trend == "SHORT":
+        return True
+    if side in ("SELL", "SHORT") and trend == "LONG":
+        return True
+    return False
+
+
+def _runtime_force_close(
+    *,
+    trade: Trade,
+    last_price: float,
+    qty: float,
+    regime_label: str,
+    scenario: str,
+    candle_ts: int,
+    reason_suffix: str,
+    extra_ctx: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """규칙 기반(RUNTIME) 강제 청산 공통 처리."""
+    try:
+        close_position_market(trade.symbol, trade.side, qty)
+        entry = float(getattr(trade, "entry", 0.0) or 0.0)
+        if trade.side == "BUY":
+            pnl = (last_price - entry) * qty
+        else:
+            pnl = (entry - last_price) * qty
+
+        base_notional = entry * qty if entry > 0 and qty > 0 else 0.0
+        pnl_pct_signed = (pnl / base_notional) if base_notional > 0 else None
+
+        reason = f"runtime_{reason_suffix}"
+        send_tg(
+            f"⚠️ (WS) RUNTIME EXIT 실행: {trade.symbol} {trade.side} "
+            f"scenario={scenario} reason={reason} 진입={entry:.2f} 현재={last_price:.2f} "
+            f"pnl={pnl:.4f}USDT ({(pnl_pct_signed or 0.0)*100:.2f}%)"
+        )
+        log_signal(
+            event="CLOSE",
+            symbol=trade.symbol,
+            strategy_type=regime_label,
+            direction=trade.side,
+            price=last_price,
+            qty=qty,
+            reason=reason,
+            pnl=pnl,
+        )
+
+        try:
+            log_gpt_exit_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                side=trade.side,
+                scenario=scenario,
+                action="CLOSE",
+                pnl_pct=pnl_pct_signed,
+                extra={
+                    "runtime_reason": reason,
+                    "exit_ctx": extra_ctx or {},
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_LOG][RUNTIME_CLOSE] failed: {e}")
+
+        _update_trade_close_in_db(
+            trade=trade,
+            close_price=float(last_price),
+            close_reason=reason,
+            event_ts_ms=int(candle_ts),
+            pnl=float(pnl),
+            cooldown_tag=None,
+        )
+
+        return True
+    except Exception as e:
+        log(f"[PW][RUNTIME_EXIT] close failed symbol={trade.symbol}: {e}")
+        return False
 
 
 # ─────────────────────────────────────────
@@ -592,6 +821,72 @@ def maybe_exit_with_gpt(
         extra=ctx_extra,
     )
 
+    # ── RUNTIME 규칙 1: 반대 방향 + 수익 ≥ 0.2% 이면 즉시 전체 청산 ──────────────
+    pnl_pct = gpt_ctx.get("pnl_pct")
+    regime_features = gpt_ctx.get("regime_features") or {}
+    trend15_dir = regime_features.get("trend15_dir") or ""
+
+    opposite = _is_opposite_side(trade.side, trend15_dir) if trend15_dir else False
+
+    if isinstance(pnl_pct, (int, float)):
+        # 1-1) 반대 방향 + 수익 0.2% 이상 → 무조건 이익 확정
+        if opposite and pnl_pct >= 0.002:
+            log(
+                f"[PW][RUNTIME_EXIT] opposite dir & pnl>=0.2% → force close "
+                f"(symbol={trade.symbol}, pnl={pnl_pct*100:.3f}%)"
+            )
+            return _runtime_force_close(
+                trade=trade,
+                last_price=c,
+                qty=qty,
+                regime_label=regime_label,
+                scenario=scenario,
+                candle_ts=int(candle_ts),
+                reason_suffix="opposite_profit_take",
+                extra_ctx=gpt_ctx,
+            )
+
+        # 1-2) 반대 방향 + 손실 -0.5% 이하 → 손실 확대 방지 위해 즉시 손절
+        if opposite and pnl_pct <= -0.005:
+            log(
+                f"[PW][RUNTIME_EXIT] opposite dir & pnl<=-0.5% → force close "
+                f"(symbol={trade.symbol}, pnl={pnl_pct*100:.3f}%)"
+            )
+            return _runtime_force_close(
+                trade=trade,
+                last_price=c,
+                qty=qty,
+                regime_label=regime_label,
+                scenario=scenario,
+                candle_ts=int(candle_ts),
+                reason_suffix="opposite_loss_cut",
+                extra_ctx=gpt_ctx,
+            )
+
+        # 1-3) 수익 0.5% 이상 → 1회성 30% 부분 익절 (나머지 70%는 계속 유지)
+        partial_done = getattr(trade, "partial_tp_done", False)
+        if not partial_done and pnl_pct >= 0.005 and qty > 0:
+            partial_qty = qty * 0.3
+            try:
+                close_position_market(trade.symbol, trade.side, partial_qty)
+                new_qty = qty - partial_qty
+                setattr(trade, "qty", new_qty)
+                setattr(trade, "partial_tp_done", True)
+                send_tg(
+                    f"[PARTIAL TAKE PROFIT] {trade.symbol} {trade.side} "
+                    f"+0.5% 이상 구간에서 30% 부분익절 실행 "
+                    f"(old_qty={qty:.6f}, new_qty={new_qty:.6f})"
+                )
+                log(
+                    f"[PW][PARTIAL_TP] symbol={trade.symbol} side={trade.side} "
+                    f"partial_qty={partial_qty:.6f} remaining={new_qty:.6f} "
+                    f"pnl≈{pnl_pct*100:.3f}%"
+                )
+                qty = new_qty
+                gpt_ctx["qty"] = new_qty
+            except Exception as e:
+                log(f"[PW][PARTIAL_TP] partial close failed symbol={trade.symbol}: {e}")
+
     # GPT 에 EXIT 여부 질의
     action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
@@ -604,6 +899,35 @@ def maybe_exit_with_gpt(
         extra=gpt_ctx,
         fallback_action="HOLD",  # GPT 오류/타임아웃 시 추가 EXIT 레이어만 비활성화
     )
+
+    # ── RUNTIME 규칙 2: 강한 추세 + PnL>0 이고 방향 동일이면 CLOSE를 HOLD로 오버라이드 ──
+    try:
+        regime_features = gpt_ctx.get("regime_features") or {}
+        trend_strength = regime_features.get("trend_strength")
+        atr_pct = regime_features.get("atr_pct")
+        pnl_for_override = gpt_ctx.get("pnl_pct")
+
+        same_dir = False
+        if trend15_dir:
+            same_dir = not _is_opposite_side(trade.side, trend15_dir)
+
+        if (
+            action == "CLOSE"
+            and isinstance(trend_strength, (int, float))
+            and isinstance(atr_pct, (int, float))
+            and isinstance(pnl_for_override, (int, float))
+            and trend_strength > 0.75
+            and atr_pct > 0.004
+            and pnl_for_override > 0.0
+            and same_dir
+        ):
+            log(
+                f"[PW][TREND_HOLD_OVERRIDE] strong trend & pnl>0 & same dir "
+                f"→ override CLOSE→HOLD (symbol={trade.symbol}, pnl={pnl_for_override*100:.3f}%)"
+            )
+            action = "HOLD"
+    except Exception as e:
+        log(f"[PW][TREND_HOLD_OVERRIDE] failed: {e}")
 
     # 옵션 B: 진입처럼 상세 EXIT 분석 요약을 텔레그램으로 전송 (settings.exit_debug_notify=True 인 경우)
     if getattr(settings, "exit_debug_notify", False):
