@@ -1,5 +1,3 @@
-# gpt_decider_entry.py
-
 from __future__ import annotations
 
 import csv
@@ -148,33 +146,45 @@ def _log_gpt_latency_csv(
 
 def _extract_text_from_response(resp: Any) -> str:
     """
-    OpenAI Responses API 응답 객체에서 텍스트 부분을 최대한 안전하게 추출한다.
+    OpenAI Chat Completions / (구) Responses 스타일 응답 객체에서
+    텍스트 부분을 최대한 안전하게 추출한다.
 
-    - 우선 resp.output_text 같은 direct 속성이 있으면 그것을 사용
-    - 없으면 resp.output[0].content[0].text.value 루트를 시도
-    - 그래도 안 되면 repr(resp) 일부를 잘라서라도 반환 (완전 실패보다는 낫다)
+    우선순위:
+    1) chat.completions 응답: resp.choices[0].message.content
+    2) (구) Responses 스타일: resp.output_text
+    3) (구) Responses 스타일: resp.output[0].content[0].text.value
+    4) 최후: repr(resp) 일부
     """
-    # 1) direct text 속성
+    # 0) Chat Completions 스타일 (새 API)
+    choices = getattr(resp, "choices", None)
+    if choices and isinstance(choices, (list, tuple)) and len(choices) > 0:
+        first = choices[0]
+        message = getattr(first, "message", None)
+        content = None
+        if isinstance(message, dict):
+            content = message.get("content")
+        else:
+            content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content
+
+    # 1) direct text 속성 (구 Responses API)
     text_attr = getattr(resp, "output_text", None)
     if isinstance(text_attr, str) and text_attr.strip():
         return text_attr
 
-    # 2) output -> content -> text.value 경로
+    # 2) output -> content -> text.value 경로 (구 Responses API)
     output = getattr(resp, "output", None)
     if output and isinstance(output, (list, tuple)):
         try:
-            # 첫 번째 블록
             block = output[0]
-            content = getattr(block, "content", None)
-            if content and isinstance(content, (list, tuple)) and content:
-                first = content[0]
+            content_list = getattr(block, "content", None)
+            if content_list and isinstance(content_list, (list, tuple)) and content_list:
+                first = content_list[0]
                 txt_obj = getattr(first, "text", None)
-                # text.value
                 value = getattr(txt_obj, "value", None)
                 if isinstance(value, str) and value.strip():
                     return value
-
-                # 혹시 모를 직접 문자열
                 if isinstance(txt_obj, str) and txt_obj.strip():
                     return txt_obj
         except Exception:
@@ -197,7 +207,7 @@ def _call_gpt_json(
     timeout_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Responses API를 사용해 JSON 응답을 기대하는 GPT 호출을 공통 처리.
+    Chat Completions API를 사용해 JSON 응답을 기대하는 GPT 호출을 공통 처리.
 
     - response_format={"type": "json_object"} 사용
     - 레이턴시 측정 및 CSV 로깅
@@ -210,10 +220,16 @@ def _call_gpt_json(
 
     start = time.monotonic()
     try:
-        resp = client.responses.create(
+        resp = client.chat.completions.create(
             model=model,
-            input=prompt,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
             response_format={"type": "json_object"},
+            max_tokens=OPENAI_TRADER_MAX_TOKENS,
             timeout=timeout_sec,
         )
         latency = time.monotonic() - start
@@ -281,24 +297,6 @@ def _normalize_and_validate_entry_response(
 ) -> Dict[str, Any]:
     """
     ENTRY GPT의 JSON 응답을 정규화하고, 위험/타겟/손절 관련 필드를 검증한다.
-
-    기대 JSON 스키마(요약):
-    {
-      "direction": "LONG" | "SHORT" | "PASS",
-      "confidence": 0.0~1.0 실수,
-      "tv_pct": 0.0~0.5 실수,  # 타겟 수익률
-      "sl_pct": 0.0~0.5 실수,  # 손절 수익률
-      "effective_risk_pct": 0.0~gpt_max_risk_pct 실수,
-      "note": "string",
-      "raw_response": "원본 문자열(JSON을 파싱하기 전의 텍스트)"
-    }
-
-    설계 변경 사항 (2025-12-02):
-    - tv_pct / sl_pct / effective_risk_pct 는 규격 범위를 벗어나도 예외를 발생시키지 않고,
-      [min, max] 범위로 클램핑하며 WARNING 로그만 남긴다.
-    - base_tv_pct / base_sl_pct 대비 비율이 비정상적이어도 예외를 발생시키지 않고 WARNING 로그만 남긴다.
-    - direction이 PASS가 아닌데 effective_risk_pct가 0 이하인 경우, 그대로 0으로 둔다
-      (실제 포지션 크기 계산 레이어에서 추가 필터링하는 것을 전제).
     """
     direction = str(resp.get("direction", "PASS")).upper().strip()
     if direction not in ("LONG", "SHORT", "PASS"):
@@ -465,40 +463,26 @@ def _sanitize_for_gpt(
     """
     GPT 호출 직전에 JSON으로 직렬화할 payload에 들어 있는
     NaN / Infinity / None 값을 비교적 단순하게 정규화한다.
-
-    - 숫자:
-        - NaN, ±Inf      -> 0.0
-        - 그 외 실수/정수 -> 그대로
-    - None: 0
-    - dict / list / tuple: 재귀 처리 (최대 _max_depth)
-    - 그 외 타입: 그대로 둔다 (문자열 등)
-
-    지표 계산 단계에서 '폴백'을 넣지 않고,
-    오직 GPT API가 요구하는 직렬화 포맷만 안정화한다는 취지다.
     """
     if _depth > _max_depth:
-        return obj  # 너무 깊으면 더 이상 파고들지 않는다
+        return obj
 
-    # 숫자 계열
-    if isinstance(obj, (int, bool)):  # bool은 int의 서브클래스지만 그대로 둠
+    if isinstance(obj, (int, bool)):
         return obj
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return 0.0
         return obj
 
-    # None -> 0
     if obj is None:
         return 0
 
-    # dict 재귀
     if isinstance(obj, dict):
         return {
             str(k): _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
             for k, v in obj.items()
         }
 
-    # list/tuple 재귀
     if isinstance(obj, (list, tuple)):
         return [
             _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
@@ -637,10 +621,6 @@ def _get_client() -> OpenAI:
 def _parse_json(text: str) -> Dict[str, Any]:
     """
     GPT가 반환한 텍스트에서 JSON을 파싱.
-
-    - 전체를 json.loads 시도
-    - 실패하면 ``` 코드블록(예: ```json ... ```)을 제거한 뒤 재시도
-    - 그래도 실패하면 첫 '{'와 마지막 '}' 사이만 잘라내 재시도
     """
     text = (text or "").strip()
     if not text:
@@ -653,7 +633,6 @@ def _parse_json(text: str) -> Dict[str, Any]:
             first = lines[0].strip()
             if first.startswith("```"):
                 lines = lines[1:]
-        # 마지막 줄이 ``` 인 경우 제거
         while lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
@@ -753,47 +732,6 @@ def ask_entry_decision(
 ) -> Dict[str, Any]:
     """
     ENTRY 결정을 위해 GPT에게 질의하고, 응답을 정규화/검증하여 반환한다.
-
-    Parameters
-    ----------
-    symbol : str
-        종목 심볼 (예: "BTCUSDT").
-    source : str
-        시그널/전략 이름 또는 출처 태그.
-    current_price : float
-        현재 가격.
-    base_tv_pct : float
-        기본 타겟 수익률 비율 (예: 0.03 = 3%).
-    base_sl_pct : float
-        기본 손절 비율 (예: 0.01 = 1%).
-    base_risk_pct : float
-        기본 1회 진입 시 계좌 대비 위험 비율.
-    market_features : Dict[str, Any]
-        마켓 상태를 요약한 피처 딕셔너리.
-    model : str, optional
-        사용할 GPT 모델 이름. 기본값은 환경변수 OPENAI_TRADER_MODEL 또는 "gpt-5.1-mini".
-    gpt_max_risk_pct : float, optional
-        GPT가 설정할 수 있는 최대 effective_risk_pct. 기본값은 GPT_MAX_RISK_PCT.
-
-    Returns
-    -------
-    Dict[str, Any]
-        정규화/검증된 ENTRY 결정 정보:
-        {
-          "direction": "LONG" | "SHORT" | "PASS",
-          "confidence": float,
-          "tv_pct": float,
-          "sl_pct": float,
-          "effective_risk_pct": float,
-          "note": str,
-          "raw_response": str
-        }
-
-    Raises
-    ------
-    RuntimeError
-        - OpenAI API 오류 / 네트워크 오류 / JSON 파싱 오류 / 응답 지연 초과 / JSON 스키마 검증 실패 / market_features 이상 시
-          치명적 오류로 간주하고 RuntimeError를 발생시킨다.
     """
     global gpt_entry_call_count
 
@@ -850,22 +788,17 @@ def ask_entry_decision(
         gpt_entry_call_count += 1
         gpt_call_id = gpt_entry_call_count
 
-        resp = client.responses.create(
+        resp = client.chat.completions.create(
             model=model,
-            input=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": user_prompt,
-                },
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
-            max_output_tokens=max_tokens,
-            timeout=max_latency,
             response_format={"type": "json_object"},
+            max_tokens=max_tokens,
+            timeout=max_latency,
         )
+
         latency = time.monotonic() - start_ts
 
         text = _extract_text_from_response(resp)
@@ -1195,16 +1128,6 @@ def ask_exit_decision_safe(
     """
     ask_exit_decision을 감싸서, GPT 호출 실패 시에도 예외를 바깥으로 전파하지 않고
     안전한 폴백 액션(HOLD 또는 CLOSE_ALL)을 반환한다.
-
-    Parameters
-    ----------
-    fallback_action : {"HOLD", "CLOSE_ALL"}
-        GPT 호출 실패 시 사용할 기본 액션. 기본값은 "HOLD".
-
-    Returns
-    -------
-    Dict[str, Any]
-        (가능하면) GPT 기반 EXIT 결정 결과, 실패 시 fallback_action 기반 결과.
     """
     _ = fallback_action  # 현재는 항상 예외를 외부로 전파하므로 사용하지 않음
 
