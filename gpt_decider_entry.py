@@ -574,15 +574,15 @@ You are an expert trading decision assistant for intraday crypto futures trading
 JSON 예시 (단, 실제 응답에서는 한국어 note 사용 가능):
 
 ```json
-{
+{{
   "direction": "LONG",
   "confidence": 0.74,
   "tv_pct": 0.032,
   "sl_pct": 0.012,
   "effective_risk_pct": 0.018,
-  "note": "상승 추세가 이어질 가능성이 크지만, 변동성도 있으므로 손절은 다소 타이트하게 설정.",
-  "raw_response": "간단한 요약 또는 내부용 메모"
-}
+  "note": "상승 추세...",
+  "raw_response": "..."
+}}
 """
 
 
