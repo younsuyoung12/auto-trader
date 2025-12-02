@@ -245,6 +245,7 @@ def send_skip_tg(reason: str) -> None:
     2025-11-14: 템플릿 빌더를 사용해 쿨타임 정보를 함께 표시하도록 변경.
     2025-11-20: 쿨타임/사유 문구를 한국어로 표시하도록 변경.
     """
+    SET = load_settings()   # ★ 이렇게 해야 최신 settings 반영됨
     now = time.time()
 
     # 1) 잔고 관련 스킵은 무조건 길게
