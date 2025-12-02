@@ -685,7 +685,15 @@ def main() -> None:
     global OPEN_TRADES, LAST_CLOSE_TS
     global CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS, LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS
-
+   
+    # ---- STOP_FLAG 자동 삭제 ----
+    try:
+       if os.path.exists("STOP_FLAG"):
+           os.remove("STOP_FLAG")
+    except:
+        pass
+    # -----------------------------
+    
     # 시작 시 STOP_FLAG 있으면 바로 종료
     if os.path.exists("STOP_FLAG"):
         log("STOP_FLAG detected on startup. exiting without start.")

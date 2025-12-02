@@ -965,8 +965,8 @@ def ask_entry_decision(
             es_val = None
 
         # 1) 추세/변동성 모두 약한 구간 → 로컬 SKIP
-        #    - trend_strength < 0.05 AND volatility < 0.02 인 경우
-        if trend_strength < 0.05 and vol_score < 0.02:
+        #    - trend_strength < 0.03 AND volatility < 0.01 인 경우
+        if trend_strength < 0.03 and vol_score < 0.01:
             reason = (
                 "장세 추세와 변동성이 모두 약해 이번 캔들은 진입 후보에서 제외합니다 "
                 "(GPT 호출 생략)."
