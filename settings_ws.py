@@ -214,8 +214,8 @@ class BotSettings:
     min_entry_volume_ratio: float = 0.3   # 기본 0.30
 
     # ── 쿨다운/폴링 ────────────────────────────────────────
-    cooldown_sec: int = 15
-    cooldown_after_close: int = 30
+    cooldown_sec: int = 1
+    cooldown_after_close: int = 1
     # 연속 손실 기준 쿨타임 (예: 2번 연속 손절 나면 3시간 잠시 쉼)
     max_consecutive_losses: int = 2
     cooldown_after_consec_loss_sec: int = 10800  # 3시간
@@ -455,8 +455,8 @@ def load_settings() -> BotSettings:
             0.3,
         ),
         # 쿨다운/폴링
-        cooldown_sec=_as_int(os.getenv("COOLDOWN_SEC", "15"), 15),
-        cooldown_after_close=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE", "30"), 30),
+        cooldown_sec=_as_int(os.getenv("COOLDOWN_SEC", "15"), 1),
+        cooldown_after_close=_as_int(os.getenv("COOLDOWN_AFTER_CLOSE", "1"), 1),
         max_consecutive_losses=_as_int(
             os.getenv("MAX_CONSECUTIVE_LOSSES", "2"),
             2,
