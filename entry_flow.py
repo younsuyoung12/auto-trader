@@ -1001,15 +1001,16 @@ def try_open_new_position(
     # (4-8) GPT 판단에 따른 일반 SKIP
     #     (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
     if final_action != "ENTER":
-        msg = (
-            f"[GPT_ENTRY][SKIP] action={gpt_action or 'NONE'} "
-            f"reason={gpt_reason or 'no_reason'}"
-        )
+        # GPT reason만 텔레그램에 명확히 전달
+        clean_reason = gpt_reason or "no_reason"
+        msg = f"[GPT_ENTRY][SKIP] {clean_reason}"
+
         log(msg)
         try:
-            send_skip_tg(msg)
+            send_skip_tg(msg)   # → reason을 그대로 텔레그램으로 전달
         except Exception as te:
             log(f"[GPT_ENTRY] send_skip_tg failed on general-skip: {te}")
+
         log_skip_event(
             symbol=symbol,
             regime=regime_label,
@@ -1018,6 +1019,7 @@ def try_open_new_position(
             reason=f"gpt_action_{gpt_action or 'NONE'}",
             extra={"gpt_result": gpt_result},
         )
+
         sleep_sec = float(
             gpt_result.get(
                 "sleep_after_sec", getattr(settings, "gpt_skip_sleep_sec", 3.0)

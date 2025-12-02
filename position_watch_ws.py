@@ -929,8 +929,7 @@ def maybe_exit_with_gpt(
     except Exception as e:
         log(f"[PW][TREND_HOLD_OVERRIDE] failed: {e}")
 
-    # 옵션 B: 진입처럼 상세 EXIT 분석 요약을 텔레그램으로 전송 (settings.exit_debug_notify=True 인 경우)
-    if getattr(settings, "exit_debug_notify", False):
+    # 옵션 B: 진입처럼 상세 EXIT 분석 요약을 텔레그램으로 전송
         _send_exit_debug_summary(
             trade=trade,
             scenario=scenario,
