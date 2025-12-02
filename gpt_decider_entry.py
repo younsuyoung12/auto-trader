@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
 # 설정 / 상수
 # =============================================================================
 
-GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-5.1")
+GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-4o-mini")
 
 OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "4.0"))
 OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "512"))
