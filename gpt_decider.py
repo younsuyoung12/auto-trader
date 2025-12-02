@@ -17,6 +17,15 @@ except Exception:  # pragma: no cover
     telelog = None  # type: ignore
 
 
+"""
+2025-12-02 ENTRY 안정화 개편
+
+- ENTRY 쪽 fatal validator 제거 (검증 실패로 엔진 전체가 중단되지 않도록 수정)
+- tv_pct / sl_pct / effective_risk_pct 검증 로직을 예외 발생 대신 클램핑 + 경고 로그 방식으로 변경
+- ENTRY JSON 파서(_parse_json)를 강화하여 ```json 코드블록 및 여분 텍스트가 포함된 응답도 최대한 파싱
+- 부동소수점 오차 허용 및 비정상적인 비율(tv/sl/risk vs base)에는 경고만 남기고 값은 정규화
+"""
+
 # =============================================================================
 # 설정 / 상수
 # =============================================================================
@@ -79,7 +88,9 @@ def _safe_tg(msg: str) -> None:
 def _fatal_log_and_raise(msg: str, *, exc: Optional[Exception] = None) -> None:
     """
     치명적 오류 상황에서 로그를 남기고 RuntimeError로 감싼 뒤 raise.
-    트레이딩 엔진 쪽에서는 이 예외를 잡아서 정상적인 폴백 로직을 수행하면 된다.
+
+    ※ ENTRY 경로에서는 더 이상 사용하지 않는다. (ENTRY는 검증 실패로 엔진 전체가 멈추지 않도록 수정됨)
+    EXIT 등에서 치명적인 설정 오류를 잡아야 할 때만 필요시 사용할 수 있다.
     """
     full_msg = f"[gpt_decider:FATAL] {msg}"
     if exc is not None:
@@ -280,12 +291,20 @@ def _normalize_and_validate_entry_response(
       "raw_response": "원본 문자열(JSON을 파싱하기 전의 텍스트)"
     }
 
-    - direction이 PASS인 경우 tv/sl/effective_risk_pct는 모두 0으로 강제
-    - tv_pct/sl_pct는 base_*와의 비율 제한(0.02 ~ 4.0배) 및 절대값 제한(0~0.5) 적용
-    - effective_risk_pct는 0 < v <= gpt_max_risk_pct
+    설계 변경 사항 (2025-12-02):
+    - tv_pct / sl_pct / effective_risk_pct 는 규격 범위를 벗어나도 예외를 발생시키지 않고,
+      [min, max] 범위로 클램핑하며 WARNING 로그만 남긴다.
+    - base_tv_pct / base_sl_pct 대비 비율이 비정상적이어도 예외를 발생시키지 않고 WARNING 로그만 남긴다.
+    - direction이 PASS가 아닌데 effective_risk_pct가 0 이하인 경우, 그대로 0으로 둔다
+      (실제 포지션 크기 계산 레이어에서 추가 필터링하는 것을 전제).
     """
     direction = str(resp.get("direction", "PASS")).upper().strip()
     if direction not in ("LONG", "SHORT", "PASS"):
+        _safe_log(
+            "WARNING",
+            f"[ENTRY_VALIDATE] invalid direction={direction!r} -> FORCE PASS | "
+            f"symbol={symbol} source={source}",
+        )
         direction = "PASS"
 
     def _as_float(key: str, default: float = 0.0) -> float:
@@ -294,39 +313,58 @@ def _normalize_and_validate_entry_response(
             if v is None:
                 return default
             if isinstance(v, (int, float)):
-                if math.isnan(float(v)) or math.isinf(float(v)):
+                f = float(v)
+                if math.isnan(f) or math.isinf(f):
                     return default
-                return float(v)
-            return float(str(v))
+                return f
+            f = float(str(v))
+            if math.isnan(f) or math.isinf(f):
+                return default
+            return f
         except Exception:
+            _safe_log(
+                "WARNING",
+                f"[ENTRY_VALIDATE] {key} parse failed, use default={default} | "
+                f"symbol={symbol} source={source} raw={v!r}",
+            )
             return default
 
-    def _check_float(
+    def _clamp_float(
         key: str,
         v: float,
         min_val: float,
         max_val: float,
         *,
-        allow_zero: bool = False,
+        allow_zero: bool = False,  # 기존 시그니처 유지용
     ) -> float:
-        # NaN/Inf 보호
+        """
+        숫자 범위를 벗어나더라도 예외를 발생시키지 않고,
+        [min_val, max_val] 구간으로 클램핑하며 WARNING 로그만 남긴다.
+        """
         if math.isnan(v) or math.isinf(v):
-            _fatal_log_and_raise(
-                f"[ENTRY_VALIDATE] {key} is NaN/Inf: {v} | symbol={symbol} source={source}"
+            _safe_log(
+                "WARNING",
+                f"[ENTRY_VALIDATE] {key} is NaN/Inf -> set to {min_val} | "
+                f"symbol={symbol} source={source}",
             )
-        # 범위 체크
-        if allow_zero:
-            if not (min_val <= v <= max_val):
-                _fatal_log_and_raise(
-                    f"[ENTRY_VALIDATE] {key} out of range {min_val}~{max_val}: {v} | "
-                    f"symbol={symbol} source={source}"
-                )
-        else:
-            if not (min_val < v < max_val):
-                _fatal_log_and_raise(
-                    f"[ENTRY_VALIDATE] {key} out of range ({min_val},{max_val}): {v} | "
-                    f"symbol={symbol} source={source}"
-                )
+            return min_val
+
+        if v < min_val:
+            _safe_log(
+                "WARNING",
+                f"[ENTRY_VALIDATE] {key} below min ({v} < {min_val}) -> clamp | "
+                f"symbol={symbol} source={source}",
+            )
+            return min_val
+
+        if v > max_val:
+            _safe_log(
+                "WARNING",
+                f"[ENTRY_VALIDATE] {key} above max ({v} > {max_val}) -> clamp | "
+                f"symbol={symbol} source={source}",
+            )
+            return max_val
+
         return v
 
     # direction PASS면 나머지는 0으로
@@ -339,42 +377,62 @@ def _normalize_and_validate_entry_response(
         sl_pct = _as_float("sl_pct", base_sl_pct)
         effective_risk_pct = _as_float("effective_risk_pct", base_risk_pct)
 
-        tv_pct = _check_float("tv_pct", tv_pct, 0.0, 0.5)
-        sl_pct = _check_float("sl_pct", sl_pct, 0.0, 0.5)
+        # 절대 범위 클램핑
+        tv_pct = _clamp_float("tv_pct", tv_pct, 0.0, 0.5, allow_zero=True)
+        sl_pct = _clamp_float("sl_pct", sl_pct, 0.0, 0.5, allow_zero=True)
 
-        if base_tv_pct > 0:
+        # base_* 대비 비율 체크 (경고만)
+        if base_tv_pct > 0 and tv_pct > 0:
             ratio_tv = tv_pct / base_tv_pct
             if ratio_tv < 0.02 or ratio_tv > 4.0:
-                _fatal_log_and_raise(
+                _safe_log(
+                    "WARNING",
                     "[ENTRY_VALIDATE] tv_pct/base_tv_pct ratio out of range 0.02~4.0: "
                     f"{ratio_tv:.4f} (tv={tv_pct}, base={base_tv_pct}) | "
-                    f"symbol={symbol} source={source}"
+                    f"symbol={symbol} source={source}",
                 )
 
-        if base_sl_pct > 0:
+        if base_sl_pct > 0 and sl_pct > 0:
             ratio_sl = sl_pct / base_sl_pct
             if ratio_sl < 0.02 or ratio_sl > 4.0:
-                _fatal_log_and_raise(
+                _safe_log(
+                    "WARNING",
                     "[ENTRY_VALIDATE] sl_pct/base_sl_pct ratio out of range 0.02~4.0: "
                     f"{ratio_sl:.4f} (sl={sl_pct}, base={base_sl_pct}) | "
-                    f"symbol={symbol} source={source}"
+                    f"symbol={symbol} source={source}",
                 )
 
+        # effective_risk_pct 클램핑 (부동소수점 오차 허용)
         if base_risk_pct > 0:
-            effective_risk_pct = _check_float(
-                "effective_risk_pct", effective_risk_pct, 0.0, gpt_max_risk_pct
+            tol = max(1e-6, gpt_max_risk_pct * 1e-4)
+            max_allowed = gpt_max_risk_pct + tol
+            min_allowed = 0.0
+            effective_risk_pct = _clamp_float(
+                "effective_risk_pct",
+                effective_risk_pct,
+                min_allowed,
+                max_allowed,
+                allow_zero=True,
             )
-            if effective_risk_pct > gpt_max_risk_pct + 1e-9:
-                _fatal_log_and_raise(
-                    "[ENTRY_VALIDATE] effective_risk_pct exceeds GPT max risk limit: "
-                    f"{effective_risk_pct} > {gpt_max_risk_pct} | "
-                    f"symbol={symbol} source={source}"
+            if effective_risk_pct > gpt_max_risk_pct:
+                _safe_log(
+                    "WARNING",
+                    "[ENTRY_VALIDATE] effective_risk_pct slightly above max, "
+                    f"clamp to {gpt_max_risk_pct} | "
+                    f"symbol={symbol} source={source} raw={effective_risk_pct}",
                 )
+                effective_risk_pct = gpt_max_risk_pct
         else:
             effective_risk_pct = 0.0
 
     confidence = _as_float("confidence", 0.5)
-    confidence = max(0.0, min(1.0, confidence))
+    if confidence < 0.0 or confidence > 1.0:
+        _safe_log(
+            "WARNING",
+            f"[ENTRY_VALIDATE] confidence out of 0~1 range: {confidence} -> clamp | "
+            f"symbol={symbol} source={source}",
+        )
+        confidence = max(0.0, min(1.0, confidence))
 
     note = str(resp.get("note", "") or "").strip()
     raw_response = str(resp.get("raw_response", "") or "").strip()
@@ -525,6 +583,7 @@ JSON 예시 (단, 실제 응답에서는 한국어 note 사용 가능):
 }
 """
 
+
 _USER_PROMPT_TEMPLATE_ENTRY = """
 [거래 정보]
 
@@ -576,13 +635,28 @@ def _get_client() -> OpenAI:
 def _parse_json(text: str) -> Dict[str, Any]:
     """
     GPT가 반환한 텍스트에서 JSON을 파싱.
-    - 일단 전체를 json.loads 시도
-    - 실패하면 '{'와 '}' 사이만 잘라내 재시도
+
+    - 전체를 json.loads 시도
+    - 실패하면 ``` 코드블록(예: ```json ... ```)을 제거한 뒤 재시도
+    - 그래도 실패하면 첫 '{'와 마지막 '}' 사이만 잘라내 재시도
     """
     text = (text or "").strip()
     if not text:
         raise ValueError("GPT 응답이 비어 있습니다.")
 
+    # 1) 코드블록( ``` / ```json ) 제거
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            first = lines[0].strip()
+            if first.startswith("```"):
+                lines = lines[1:]
+        # 마지막 줄이 ``` 인 경우 제거
+        while lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # 2) 전체 파싱 시도
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -591,6 +665,7 @@ def _parse_json(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # 3) 중괄호 블록만 추출해서 재시도
     try:
         first = text.index("{")
         last = text.rindex("}")
@@ -750,7 +825,6 @@ def ask_entry_decision(
     latency = 0.0
     error_type = ""
     error_msg = ""
-    success = False
 
     start_ts = time.monotonic()
     try:
@@ -783,7 +857,6 @@ def ask_entry_decision(
             response_format={"type": "json_object"},
         )
         latency = time.monotonic() - start_ts
-        success = True
 
         text = _extract_text_from_response(resp)
 
@@ -938,7 +1011,7 @@ Max Adverse Excursion % (MAE): {mae_pct}
 주의:
 - "CLOSE_ALL"이면 close_ratio=1.0.
 - "HOLD"이면 close_ratio=0.0.
-- NaN / Infinity / null / "NaN" / "Infinity" / "None" 등의 값은 절대 사용하지 않습니다.
+- NaN / Infinity / null / "NaN" / "Infinity" / "None" 등은 절대 사용하지 않습니다.
 - 반드시 JSON만, 추가 설명 텍스트 없이 응답합니다.
 """
 
