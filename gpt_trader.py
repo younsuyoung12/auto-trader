@@ -620,17 +620,18 @@ def decide_entry_with_gpt_trader(
         _gpt_entry_last_call_ts = _now_ts()
 
         gpt_json = ask_entry_decision(
-            symbol=symbol,
-            signal_source=signal_source,
-            chosen_signal=direction,
-            last_price=last_price,
-            entry_score=entry_score,
-            effective_risk_pct=base_risk_pct,
-            leverage=float(settings.leverage),
-            tp_pct=base_tp_pct,
-            sl_pct=base_sl_pct,
-            extra=extra_for_gpt,
-            market_features=market_features,
+             symbol=symbol,
+             signal_source=signal_source,
+             chosen_signal=direction,
+             last_price=last_price,
+             entry_score=entry_score,
+             effective_risk_pct=base_risk_pct,
+             market_features=market_features,
+             source=signal_source,
+             current_price=last_price,
+             base_tv_pct=base_tp_pct,
+             base_sl_pct=base_sl_pct,
+             base_risk_pct=base_risk_pct,
         )
         result["raw"] = gpt_json
 
