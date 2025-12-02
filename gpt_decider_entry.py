@@ -500,7 +500,21 @@ def _sanitize_for_gpt(
 _SYSTEM_PROMPT_ENTRY = """
 You are an expert trading decision assistant for intraday crypto futures trading.
 
+[응답 JSON 스키마]
+필수 필드:
+
 [중요 규칙 요약]
+- direction: "LONG" | "SHORT" | "PASS"
+- confidence: …
+- tv_pct: …
+- sl_pct: …
+- effective_risk_pct: …
+- note: …
+- raw_response: …
+추가 규칙:
+- direction이 PASS 또는 SKIP일 경우, 반드시 한국어(Korean)로 상세한 이유(reason)를 1~2문장으로 포함하라.
+
+
 
 1) Direction 결정
    - LONG: 상승 기대 시
@@ -543,6 +557,9 @@ You are an expert trading decision assistant for intraday crypto futures trading
 - effective_risk_pct: 0.0 ~ {gpt_max_risk_pct} 사이의 숫자 (계좌 대비 위험 비율)
 - note: 문자열 (간단한 설명)
 - raw_response: 문자열 (필요시 시스템이 사용할 수 있도록, 핵심 요약 등 자유롭게 기입)
+
+추가 규칙:
+- SKIP 또는 PASS일 경우 반드시 "reason" 필드를 포함하여, 최소 1개의 근거를 간단히 설명한다. (예: entry_score_low, trend_weak, volatility_low, guard_not_passed 등)
 
 제약 조건:
 - direction이 "PASS"일 경우:
@@ -912,6 +929,8 @@ You are an expert trading exit advisor for intraday crypto futures trading.
 - "CLOSE_ALL"인 경우 close_ratio는 1.0
 - "HOLD"인 경우 close_ratio는 0.0
 - NaN / Infinity / null / "NaN" / "Infinity" / "None" 등은 절대 사용하지 않는다.
+
+- action이 "HOLD"일 경우, 반드시 한국어(Korean)로 현재 홀딩 이유(note)를 1~2문장으로 상세히 포함한다.
 
 JSON 예시:
 ```json
