@@ -747,6 +747,7 @@ def ask_entry_decision(
     chosen_signal: Optional[str] = None,  # ← 반드시 추가
     last_price: Optional[float] = None,  # ← 반드시 추가
     entry_score: Optional[float] = None,     # ← 반드시 추가 (새 오류)
+    effective_risk_pct: Optional[float] = None,  # ← 지금 이게 문제
 ) -> Dict[str, Any]:
     """
     ENTRY 결정을 위해 GPT에게 질의하고, 응답을 정규화/검증하여 반환한다.
