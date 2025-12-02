@@ -74,7 +74,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from settings_ws import BotSettings
-from gpt_decider import ask_entry_decision
+from gpt_decider_entry import ask_entry_decision
 from unified_features_builder import (
     build_unified_features,
     UnifiedFeaturesError as UnifiedFeatureError,   # 이름 통일

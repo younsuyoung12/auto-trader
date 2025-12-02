@@ -65,7 +65,7 @@ from signals_logger import (
     log_skip_event,
 )
 from trader import Trade
-from gpt_decider import ask_exit_decision_safe
+from gpt_decider_entry import ask_exit_decision_safe
 from indicators import build_regime_features_from_candles
 
 # 이 모듈에서 권장하는 EXIT 체크 주기 (초 단위, 현재 60초)

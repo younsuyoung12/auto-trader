@@ -98,6 +98,8 @@ from market_data_store import (
 )
 from market_data_rest import fetch_klines_rest, KlineRestError  # BingX REST /kline 헬퍼
 
+from gpt_decider_entry import ask_entry_decision
+
 
 # ─────────────────────────────
 # 전역 상태 초기화

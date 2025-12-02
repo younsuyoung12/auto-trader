@@ -59,6 +59,9 @@ from signals_logger import (
 )
 from gpt_trader import decide_entry_with_gpt_trader
 
+from gpt_decider_entry import ask_entry_decision
+
+
 # ✅ 시그널/피처 공급자
 # - market_features_ws.get_trading_signal 이 아직 없더라도 ImportError 로
 #   프로세스가 바로 죽지 않도록 방어.
