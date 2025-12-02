@@ -9,6 +9,16 @@ position_watch_ws.py
   열린 포지션(Trade)에 대해 GPT-5.1(gpt_decider)을 통해
   EXIT 여부(HOLD/CLOSE)만 판단한 뒤, 실제 청산/로그/DB 업데이트만 수행하는 얇은 레이어.
 
+2025-12-02 변경 사항 (EXIT GPT 호출 쿨다운 + 저비용 모드)
+----------------------------------------------------
+- maybe_exit_with_gpt 에 포지션별 EXIT GPT 쿨다운을 추가했다.
+  · BotSettings.exit_gpt_cooldown_sec(초) 가 설정되어 있으면 그 값을 사용.
+  · 미설정 시 EXIT_CHECK_INTERVAL_SEC(60초)를 기본 쿨다운으로 사용.
+- 동일 포지션에 대해 쿨다운 시간 이내에는 ask_exit_decision_safe 를 호출하지 않고,
+  RUNTIME 규칙만 적용한 뒤 HOLD 로 처리한다.
+- log_skip_event(reason="gpt_exit_cooldown") 으로 스킵 이벤트를 남겨
+  나중에 GPT EXIT 비용 절감 구간을 분석할 수 있다.
+
 2025-12-01 변경 사항 (TA-Lib EXIT 지표 정합 + market_features 브리지)
 ----------------------------------------------------
 - indicators.py 의 TA-Lib 기반 build_regime_features_from_candles(...) 출력에 맞춰
@@ -51,6 +61,7 @@ position_watch_ws.py
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
 import math
+import time
 
 from telelog import log, send_tg
 from market_data_ws import (
@@ -70,6 +81,9 @@ from indicators import build_regime_features_from_candles
 
 # 이 모듈에서 권장하는 EXIT 체크 주기 (초 단위, 현재 60초)
 EXIT_CHECK_INTERVAL_SEC: float = 60
+
+# EXIT GPT 호출 쿨다운 관리용 (포지션별 마지막 호출 시각)
+_EXIT_GPT_LAST_CALL_TS: Dict[str, float] = {}
 
 # DB 연동 (bt_trades)
 try:
@@ -506,6 +520,50 @@ def _update_trade_close_in_db(
 
 
 # ─────────────────────────────────────────
+# EXIT GPT 쿨다운 헬퍼
+# ─────────────────────────────────────────
+
+
+def _get_exit_gpt_cooldown_sec(settings: Any) -> float:
+    """EXIT GPT 최소 호출 간격(초)을 설정에서 가져온다.
+
+    - settings.exit_gpt_cooldown_sec 가 양수면 그 값을 사용.
+    - 없으면 EXIT_CHECK_INTERVAL_SEC(기본 60초)를 사용.
+    """
+    try:
+        v = getattr(settings, "exit_gpt_cooldown_sec", None)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    except Exception:
+        pass
+    return float(EXIT_CHECK_INTERVAL_SEC)
+
+
+def _get_exit_gpt_trade_key(trade: Trade) -> str:
+    """EXIT GPT 쿨다운용 포지션 키.
+
+    - db_id/id/trade_id 가 있으면 해당 값을 우선 사용.
+    - 없으면 심볼/방향/진입가/수량 조합으로 키를 만든다.
+    """
+    trade_db_id = _get_trade_db_id(trade)
+    if trade_db_id is not None:
+        return f"db:{trade_db_id}"
+
+    try:
+        symbol = getattr(trade, "symbol", "UNKNOWN")
+        side = getattr(trade, "side", "UNKNOWN")
+        entry = float(getattr(trade, "entry", 0.0) or 0.0)
+        qty = float(getattr(trade, "qty", 0.0) or 0.0)
+    except Exception:
+        symbol = getattr(trade, "symbol", "UNKNOWN")
+        side = getattr(trade, "side", "UNKNOWN")
+        entry = 0.0
+        qty = 0.0
+
+    return f"{symbol}:{side}:{entry:.8f}:{qty:.8f}"
+
+
+# ─────────────────────────────────────────
 # RUNTIME EXIT용 추가 헬퍼
 # ─────────────────────────────────────────
 
@@ -887,6 +945,37 @@ def maybe_exit_with_gpt(
             except Exception as e:
                 log(f"[PW][PARTIAL_TP] partial close failed symbol={trade.symbol}: {e}")
 
+    # EXIT GPT 호출 쿨다운 체크 (동일 포지션에 대해 너무 자주 부르지 않도록 제한)
+    trade_key = _get_exit_gpt_trade_key(trade)
+    cooldown_sec = _get_exit_gpt_cooldown_sec(settings)
+    now_ts = time.time()
+    last_call_ts = _EXIT_GPT_LAST_CALL_TS.get(trade_key)
+
+    if last_call_ts is not None and (now_ts - last_call_ts) < cooldown_sec:
+        remaining = cooldown_sec - (now_ts - last_call_ts)
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="position_watch_ws.maybe_exit_with_gpt",
+                side=trade.side,
+                reason="gpt_exit_cooldown",
+                extra={
+                    "scenario": scenario,
+                    "cooldown_sec": cooldown_sec,
+                    "remaining_sec": remaining,
+                    "exit_ctx": gpt_ctx,
+                },
+            )
+        except Exception as e:
+            log(f"[GPT_EXIT_COOLDOWN][SKIP_LOG] failed: {e}")
+
+        log(
+            f"[PW][EXIT_GPT_COOLDOWN] skip GPT EXIT call for trade_key={trade_key} "
+            f"(remaining={remaining:.1f}s)"
+        )
+        return False
+
     # GPT 에 EXIT 여부 질의
     action, gpt_data = ask_exit_decision_safe(
         symbol=trade.symbol,
@@ -899,6 +988,7 @@ def maybe_exit_with_gpt(
         extra=gpt_ctx,
         fallback_action="HOLD",  # GPT 오류/타임아웃 시 추가 EXIT 레이어만 비활성화
     )
+    _EXIT_GPT_LAST_CALL_TS[trade_key] = now_ts
 
     # ── RUNTIME 규칙 2: 강한 추세 + PnL>0 이고 방향 동일이면 CLOSE를 HOLD로 오버라이드 ──
     try:
@@ -930,14 +1020,16 @@ def maybe_exit_with_gpt(
         log(f"[PW][TREND_HOLD_OVERRIDE] failed: {e}")
 
     # 옵션 B: 진입처럼 상세 EXIT 분석 요약을 텔레그램으로 전송
-    _send_exit_debug_summary(
-        trade=trade,
-        scenario=scenario,
-        action=action,
-        gpt_ctx=gpt_ctx,
-        gpt_data=gpt_data,
-    )
-   
+    # BotSettings.exit_debug_notify 가 True 인 경우에만 전송
+    if getattr(settings, "exit_debug_notify", False):
+        _send_exit_debug_summary(
+            trade=trade,
+            scenario=scenario,
+            action=action,
+            gpt_ctx=gpt_ctx,
+            gpt_data=gpt_data,
+        )
+
     if action != "CLOSE":
         # HOLD or 기타 → 청산하지 않음
         try:
