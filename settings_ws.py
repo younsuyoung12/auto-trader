@@ -192,7 +192,7 @@ class BotSettings:
     gpt_error_sleep_sec: float = 5.0      # GPT 오류 시 루프 대기(sec)
     gpt_skip_sleep_sec: float = 3.0       # GPT SKIP/비정상 응답 후 대기(sec)
     gpt_max_risk_pct: float = 0.03        # GPT 제안 리스크 상한 (3%)
-    gpt_entry_cooldown_sec: int = 20     # GPT ENTRY 호출 쿨다운(sec) — ENV: GPT_ENTRY_COOLDOWN_SEC
+    gpt_entry_cooldown_sec: int = 3     # GPT ENTRY 호출 쿨다운(sec) — ENV: GPT_ENTRY_COOLDOWN_SEC
 
     # GPT가 제안하는 TP/SL 범위 (가격 기준)
     gpt_min_tp_pct: float = 0.01          # TP 하한 (기본 1%)
