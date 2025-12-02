@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover
 GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-5.1")
 
 OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "4.0"))
-OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "192"))
+OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "512"))
 
 GPT_LATENCY_CSV = os.getenv("GPT_LATENCY_CSV", "gpt_latency.csv")
 
@@ -705,9 +705,13 @@ def _build_entry_payload(
         "market_features": extra_filtered,
     }
 
-    if isinstance(market_features, dict):
-        for k, v in market_features.items():
-            if k not in extra_filtered and k not in payload:
+    # ⭐⭐⭐ 여기 아래에 넣어야 함 — 함수 내부! ⭐⭐⭐
+
+    important_keys = ["trend_strength", "volatility", "regime"]
+
+    if isinstance(extra_filtered, dict):   # ← 수정됨
+          for k, v in extra_filtered.items():   # ← 수정됨
+            if k in important_keys:
                 payload[k] = v
 
     return payload
@@ -795,7 +799,7 @@ def ask_entry_decision(
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            max_completion_tokens=max_tokens,
+            max_tokens=max_tokens,  # ← 정식 파라미터
             timeout=max_latency,
         )
 
