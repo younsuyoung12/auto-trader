@@ -99,7 +99,7 @@ except Exception:  # pragma: no cover - DB가 아직 준비되지 않은 환경 
 DEFAULT_GPT_ENTRY_MODEL = "gpt-5.1"
 
 # GPT 엔트리 쿨다운 (PREVIEW + GPT 호출 공통)
-_DEFAULT_GPT_ENTRY_COOLDOWN_SEC = 3.0
+_DEFAULT_GPT_ENTRY_COOLDOWN_SEC = 1.0
 _LAST_GPT_ENTRY_TS: float = 0.0
 
 
@@ -809,7 +809,7 @@ def try_open_new_position(
             )
             # 남은 쿨다운 시간과 GPT_SKIP_SLEEP_SEC 중 큰 값으로 슬립
             sleep_sec = float(
-                max(remain, getattr(settings, "gpt_skip_sleep_sec", 3.0))
+                max(remain, getattr(settings, "gpt_skip_sleep_sec", 1.0))
             )
             return None, sleep_sec
 
@@ -879,7 +879,7 @@ def try_open_new_position(
             reason="gpt_trader_exception",
             extra={"error": str(e)},
         )
-        sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
+        sleep_sec = float(getattr(settings, "gpt_error_sleep_sec", 1.0))
         return None, sleep_sec
 
     gpt_action = str(gpt_result.get("gpt_action", "")).upper()

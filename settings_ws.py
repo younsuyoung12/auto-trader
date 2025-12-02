@@ -8,7 +8,8 @@ settings_ws.py
 - WS/REST 엔드포인트, 기본 심볼·주기, 구독 타임프레임 관리
 - 레버리지/리스크, TP·SL 기본값, ATR 파라미터
 - GPT 진입/청산 게이트(쿨다운, 리스크·TP·SL 상/하한, soft TP 재판단)
-- 각종 가드(스프레드, 가격 점프, depth 쏠림, mark/last 괴리, 캔들 지연 등)
+- 각종 가드(스프레드, 가격 점프, depth 쏠림, mark/
+ast 괴리, 캔들 지연 등)
 - 텔레그램 알림, 로그/헬스 포트 설정
 
 2025-11-19 패치 (GPT MARKET 단일 전략 전환)
@@ -190,7 +191,7 @@ class BotSettings:
 
     # ── GPT 진입 게이트/TP·SL 제약 ────────────────────────
     gpt_error_sleep_sec: float = 5.0      # GPT 오류 시 루프 대기(sec)
-    gpt_skip_sleep_sec: float = 3.0       # GPT SKIP/비정상 응답 후 대기(sec)
+    gpt_skip_sleep_sec: float = 1.0      # GPT SKIP/비정상 응답 후 대기(sec)
     gpt_max_risk_pct: float = 0.03        # GPT 제안 리스크 상한 (3%)
     gpt_entry_cooldown_sec: int = 3     # GPT ENTRY 호출 쿨다운(sec) — ENV: GPT_ENTRY_COOLDOWN_SEC
 
@@ -430,7 +431,7 @@ def load_settings() -> BotSettings:
         gpt_max_risk_pct=_as_float(os.getenv("GPT_MAX_RISK_PCT", "0.03"), 0.03),
         gpt_entry_cooldown_sec=_as_int(
             os.getenv("GPT_ENTRY_COOLDOWN_SEC", "1"),
-            120,
+            1,
         ),
         # GPT TP/SL 범위
         gpt_min_tp_pct=_as_float(os.getenv("GPT_MIN_TP_PCT", "0.01"), 0.01),
