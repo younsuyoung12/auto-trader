@@ -534,7 +534,7 @@ You are an expert trading decision assistant for intraday crypto futures trading
        - sl_pct가 tv_pct보다 지나치게 크면 비대칭 리스크가 되므로 지양
    - effective_risk_pct (실제 계좌 기준 1회 진입 시 허용 위험 비율):
        - 0 < effective_risk_pct <= {gpt_max_risk_pct} (기본 3%)
-       - 단일 포지션에서 계좌의 {gpt_max_risk_pct*100:.1f}%를 초과해서는 안 됨
+       - 단일 포지션에서 계좌의 {gpt_max_risk_pct_pct:.1f}%를 초과해서는 안 됨
        - 방향성이 애매하거나, 근거가 약하다고 느껴지면 더 낮은 값(예: 0.005~0.01)으로 보수적으로 잡는다.
 
 3) 리스크 관리
@@ -745,11 +745,11 @@ def ask_entry_decision(
     market_features: Dict[str, Any],
     model: str = GPT_MODEL_DEFAULT,
     gpt_max_risk_pct: Optional[float] = None,
-    signal_source: Optional[str] = None,   # ← 반드시 추가 (핵심)
-    chosen_signal: Optional[str] = None,  # ← 반드시 추가
-    last_price: Optional[float] = None,  # ← 반드시 추가
-    entry_score: Optional[float] = None,     # ← 반드시 추가 (새 오류)
-    effective_risk_pct: Optional[float] = None,  # ← 지금 이게 문제
+    signal_source: Optional[str] = None,   # 추가 메타 필드 (현재 프롬프트에는 미사용)
+    chosen_signal: Optional[str] = None,   # 추가 메타 필드
+    last_price: Optional[float] = None,    # 추가 메타 필드
+    entry_score: Optional[float] = None,   # 추가 메타 필드
+    effective_risk_pct: Optional[float] = None,  # 추가 메타 필드
 ) -> Dict[str, Any]:
     """
     ENTRY 결정을 위해 GPT에게 질의하고, 응답을 정규화/검증하여 반환한다.
@@ -815,7 +815,10 @@ def ask_entry_decision(
         sanitized_payload, ensure_ascii=False, separators=(",", ":")
     )
 
-    system_prompt = _SYSTEM_PROMPT_ENTRY.format(gpt_max_risk_pct=gpt_max_risk_pct)
+    system_prompt = _SYSTEM_PROMPT_ENTRY.format(
+        gpt_max_risk_pct=gpt_max_risk_pct,
+        gpt_max_risk_pct_pct=gpt_max_risk_pct * 100.0,
+    )
     user_prompt = _USER_PROMPT_TEMPLATE_ENTRY.format(
         symbol=symbol,
         source=source,
