@@ -799,7 +799,7 @@ def ask_entry_decision(
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            max_tokens=max_tokens,  # ← 정식 파라미터
+            mmax_completion_tokens=max_tokens,    # ← 이렇게 변경
             timeout=max_latency,
         )
 
