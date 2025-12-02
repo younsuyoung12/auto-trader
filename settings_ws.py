@@ -275,7 +275,7 @@ class BotSettings:
     health_port: int = 0
 
     # 텔레그램 스팸 억제
-    skip_tg_cooldown: int = 30
+    skip_tg_cooldown: int = 5
     balance_skip_cooldown: int = 3600
 
     # 캔들 지연 허용치 (신호 레벨)
