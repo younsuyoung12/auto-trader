@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover
 - ENTRY 쪽 fatal validator 제거 (검증 실패로 엔진 전체가 중단되지 않도록 수정)
 - tv_pct / sl_pct / effective_risk_pct 검증 로직을 예외 발생 대신 클램핑 + 경고 로그 방식으로 변경
 - ENTRY JSON 파서(_parse_json)를 강화하여 ```json 코드블록 및 여분 텍스트가 포함된 응답도 최대한 파싱
-- 부동소수점 오차 허용 및 비정상적인 비율(tv/sl/risk vs base)에는 경고만 남기고 값은 정규화
+- 부동소수점 오차 허용 및 비정상적인 비율(tv/sl/risk vs base)에는 경고만 남기고 값은 정규화!
 """
 
 # =============================================================================
