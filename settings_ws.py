@@ -429,7 +429,7 @@ def load_settings() -> BotSettings:
         gpt_skip_sleep_sec=_as_float(os.getenv("GPT_SKIP_SLEEP_SEC", "3.0"), 3.0),
         gpt_max_risk_pct=_as_float(os.getenv("GPT_MAX_RISK_PCT", "0.03"), 0.03),
         gpt_entry_cooldown_sec=_as_int(
-            os.getenv("GPT_ENTRY_COOLDOWN_SEC", "120"),
+            os.getenv("GPT_ENTRY_COOLDOWN_SEC", "1"),
             120,
         ),
         # GPT TP/SL 범위

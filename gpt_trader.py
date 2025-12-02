@@ -552,7 +552,7 @@ def decide_entry_with_gpt_trader(
         _safe_log("[GPT_TRADER] HARD_STOP window ended → GPT entry gate reopened")
 
     # 0-0) GPT ENTRY 호출 쿨다운
-    cooldown_sec = int(getattr(settings, "gpt_entry_cooldown_sec", 120))
+    cooldown_sec = int(getattr(settings, "gpt_entry_cooldown_sec", 1))
     if _gpt_entry_last_call_ts > 0:
         elapsed = now_ts - _gpt_entry_last_call_ts
         if elapsed < cooldown_sec:
