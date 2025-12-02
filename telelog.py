@@ -251,36 +251,20 @@ def send_skip_tg(reason: str) -> None:
     # 1) 잔고 관련 스킵은 무조건 길게
     if reason.startswith("[BALANCE_SKIP]"):
         cooldown = SET.balance_skip_cooldown  # 기본 3600초
-        title = "스킵 / 잔고"
     # 2) 박스장 막힘 관련 스킵도 길게
     elif "range_blocked_today" in reason:
         cooldown = 3600
-        title = "스킵 / 박스장 차단"
     else:
         # 3) 나머지는 짧게 (기본 30초)
         cooldown = SET.skip_tg_cooldown
-        title = "스킵"
 
     last_ts = LAST_SKIP_TG.get(reason, 0.0)
     if now - last_ts >= cooldown:
-        # 사용자에게 보여 줄 설명은 한국어로 변환
-        localized_reason = _localize_skip_reason(reason)
-
-        # 쿨다운이 지났으면 실제로 텔레그램 전송
-        text = build_tg_template(
-            title=title,
-            indicators=None,
-            scores=None,
-            cooldown_sec=float(cooldown),
-            cooldown_reason=localized_reason,
-            error=None,
-            note=None,
-        )
-        send_tg(text)
+        # 쿨다운이 지났으면, reason 원문을 그대로 텔레그램으로 전송
+        send_tg(reason)
         LAST_SKIP_TG[reason] = now
     else:
         # 아직 쿨다운 중이면 콘솔에만 남겨둔다.
-        # 이렇게 하면 왜 텔레그램이 안 나갔는지 로그로 확인 가능하다.
         log(f"[SKIP_TG_SUPPRESS] {reason}")
 
 

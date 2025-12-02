@@ -930,14 +930,14 @@ def maybe_exit_with_gpt(
         log(f"[PW][TREND_HOLD_OVERRIDE] failed: {e}")
 
     # 옵션 B: 진입처럼 상세 EXIT 분석 요약을 텔레그램으로 전송
-        _send_exit_debug_summary(
-            trade=trade,
-            scenario=scenario,
-            action=action,
-            gpt_ctx=gpt_ctx,
-            gpt_data=gpt_data,
-        )
-
+    _send_exit_debug_summary(
+        trade=trade,
+        scenario=scenario,
+        action=action,
+        gpt_ctx=gpt_ctx,
+        gpt_data=gpt_data,
+    )
+   
     if action != "CLOSE":
         # HOLD or 기타 → 청산하지 않음
         try:
