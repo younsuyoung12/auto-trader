@@ -743,6 +743,7 @@ def ask_entry_decision(
     market_features: Dict[str, Any],
     model: str = GPT_MODEL_DEFAULT,
     gpt_max_risk_pct: Optional[float] = None,
+    signal_source: Optional[str] = None,   # ← 반드시 추가 (핵심)
 ) -> Dict[str, Any]:
     """
     ENTRY 결정을 위해 GPT에게 질의하고, 응답을 정규화/검증하여 반환한다.

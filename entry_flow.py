@@ -96,7 +96,7 @@ except Exception:  # pragma: no cover - DB가 아직 준비되지 않은 환경 
 DEFAULT_GPT_ENTRY_MODEL = "gpt-5.1"
 
 # GPT 엔트리 쿨다운 (PREVIEW + GPT 호출 공통)
-_DEFAULT_GPT_ENTRY_COOLDOWN_SEC = 30.0
+_DEFAULT_GPT_ENTRY_COOLDOWN_SEC = 3.0
 _LAST_GPT_ENTRY_TS: float = 0.0
 
 
