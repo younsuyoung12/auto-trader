@@ -229,7 +229,7 @@ def _call_gpt_json(
                 }
             ],
             response_format={"type": "json_object"},
-            max_tokens=OPENAI_TRADER_MAX_TOKENS,
+            max_completion_tokens=OPENAI_TRADER_MAX_TOKENS,
             timeout=timeout_sec,
         )
         latency = time.monotonic() - start
@@ -795,7 +795,7 @@ def ask_entry_decision(
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             timeout=max_latency,
         )
 
