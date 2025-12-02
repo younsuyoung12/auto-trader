@@ -970,7 +970,8 @@ def try_open_new_position(
         sleep_sec = float(
             gpt_result.get(
                 "sleep_after_sec",
-                getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0),
+                getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 5.0
+                        ),
             )
         )
         return None, sleep_sec
