@@ -951,7 +951,7 @@ def main() -> None:
                 OPEN_TRADES.append(trade)
                 LAST_STATUS_TG_TS = time.time()
 
-            time.sleep(sleep_sec)
+            time.sleep(1)
 
         except Exception as e:
             log(f"ERROR: {e}")
