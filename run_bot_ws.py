@@ -376,7 +376,7 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
 def _on_safe_stop() -> None:
     """텔레그램 명령으로 안전 종료를 요청받았을 때 플래그만 세팅한다."""
     global SAFE_STOP_REQUESTED
-    SAFE_STOP_REQUESTED = False
+    SAFE_STOP_REQUESTED = True
     send_tg("🛑 텔레그램에서 '종료' 버튼을 눌렀습니다. 현재 포지션을 모두 정리한 뒤 자동매매를 멈춥니다.")
 
 
@@ -889,18 +889,19 @@ def main() -> None:
 
                 # TP/SL 재설정이 계속 실패하면 봇 중단 → idle
                 if TRADER_STATE.should_stop_bot():
-                    send_tg(
-                        "🛑 손절/익절 주문을 여러 번 다시 걸었는데 계속 실패합니다. "
-                        "안전을 위해 자동매매를 중단합니다."
-                    )
-                    _write_stop_flag()
-                    _enter_idle_forever()
+                    send_tg("🚫 TP/SL 재설정 실패 발생 (자동중지 기능 비활성화됨). 계속 진행합니다.")
+                    pass   
+                    
+                    
 
                 # 안전 종료 요청이 왔고, 이미 포지션이 모두 정리된 상태라면 종료
                 if SAFE_STOP_REQUESTED and not OPEN_TRADES:
                     send_tg("🛑 요청하신 대로 포지션을 모두 정리했고, 자동매매를 종료합니다.")
-                    _write_stop_flag()
-                    _enter_idle_forever()
+                    # STOP_FLAG 생성 막음
+                    #write_stop_flag()
+                    # idle 모드 진입 제거
+                    # _enter_idle_forever()
+                    return  # 종료 후 메인 루프 빠져나감
 
             # (e) 열린 포지션에 대한 실시간 대응 (1m 캔들 종가 기준 GPT EXIT 레이어)
             if OPEN_TRADES:
