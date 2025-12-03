@@ -604,9 +604,14 @@ You are an expert intraday crypto futures trading decision assistant.
 - "지표 근거 부족 → SKIP."
 
 이 문체 규칙을 reason 과 note 에 반드시 적용한다.
+
+추가 진입 규칙(중요):
+
+- 시장 변동성이 낮거나 entry_score가 중간 수준(40~60)이어도
+  지나치게 보수적으로 SKIP하지 않는다.
+- 약하지만 유의미한 추세/유동성/패턴이 보이면 ENTER 또는 ADJUST를 우선 고려한다.
+- RANGE 장세에서는 롱/숏 모두 진입 가능성을 적극적으로 평가한다.
 """
-
-
 
 _USER_PROMPT_TEMPLATE_ENTRY = """
 [거래 정보]
@@ -820,18 +825,12 @@ def ask_entry_decision(
 
     sanitized_payload = _sanitize_for_gpt(payload)
 
-    # 🔥 GPT에게 꼭 필요한 핵심 정보만 전달 (나머지는 제거)
-
-    minimal_payload = {
-        "multi_timeframe": sanitized_payload.get("multi_timeframe", {}),
-        "orderbook": sanitized_payload.get("orderbook", {}),
-        "entry_meta": sanitized_payload.get("entry_meta", {}),
-    }    
+    # GPT가 시장을 충분히 이해하도록 full payload 전달
 
     market_features_json = json.dumps(
-        minimal_payload, ensure_ascii=False, separators=(",", ":")
+        sanitized_payload, ensure_ascii=False, separators=(",", ":")
 
-    )
+    )  
 
     # -------------------------------------------------------------------------
     # [ENTRY 비용 최적화 레이어]
