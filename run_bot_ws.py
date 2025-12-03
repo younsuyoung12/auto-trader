@@ -995,7 +995,8 @@ def main() -> None:
             time.sleep(2)
 
     # RUNNING 이 False 로 바뀌어 루프가 끝나면 idle 로 가서 멈춘다
-    _enter_idle_forever()
+    # _enter_idle_forever()   # 자동 중지 제거
+    return
 
 
 if __name__ == "__main__":
