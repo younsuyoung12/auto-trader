@@ -114,6 +114,9 @@ class BotSettings:
     api_key: str
     api_secret: str
 
+    # GPT 비용 보호 기능 — 하루 GPT 호출 상한
+    gpt_daily_call_limit: int = 500  # 500회 ≈ $0.50
+
     # 기본 심볼/주기
     symbol: str = "BTC-USDT"
     interval: str = "5m"  # 웹소켓에서 기본으로 보는 주기

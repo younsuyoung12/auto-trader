@@ -803,6 +803,25 @@ def ask_entry_decision(
     """
     global gpt_entry_call_count
 
+    # === GPT 일일 호출 상한 체크 ===
+    from settings_ws import load_settings
+    SET = load_settings()
+    if gpt_entry_call_count >= SET.gpt_daily_call_limit:
+        return {
+            "action": "SKIP",
+            "direction": "PASS",
+            "confidence": 0.0,
+            "tp_pct": 0.0,
+            "tv_pct": 0.0,
+            "sl_pct": 0.0,
+            "effective_risk_pct": 0.0,
+            "guard_adjustments": {},
+            "reason": "GPT 일일 호출 상한 초과로 자동 중지됨.",
+            "note": "daily_gpt_limit_exceeded",
+            "raw_response": "daily_gpt_limit_exceeded",
+        }
+
+
     if gpt_max_risk_pct is None:
         gpt_max_risk_pct = GPT_MAX_RISK_PCT
 
@@ -968,10 +987,8 @@ def ask_entry_decision(
             f"[ENTRY_CALL] model={model} symbol={symbol} source={source} "
             f"base_tv={base_tv_pct} base_sl={base_sl_pct} base_risk={base_risk_pct}",
         )
-
-        gpt_entry_call_count += 1
-        gpt_call_id = gpt_entry_call_count
-
+           
+        # GPT 호출
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -983,6 +1000,11 @@ def ask_entry_decision(
             timeout=OPENAI_TRADER_MAX_LATENCY,
             temperature=0.0,
         )
+        
+        # ✅ GPT 호출이 실제로 성공적으로 나간 경우에만 카운트 증가
+
+        gpt_entry_call_count += 1
+        gpt_call_id = gpt_entry_call_count
 
         latency = time.monotonic() - start_ts
 

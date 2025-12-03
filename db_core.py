@@ -15,6 +15,9 @@ PATCH NOTES — 2025-11-15
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()   # ★ .env 파일 로딩 — 이거 없으면 절대 인식 안 됨
+
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine
