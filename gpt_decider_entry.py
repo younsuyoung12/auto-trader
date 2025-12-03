@@ -822,8 +822,18 @@ def ask_entry_decision(
     )
 
     sanitized_payload = _sanitize_for_gpt(payload)
+
+    # 🔥 GPT에게 꼭 필요한 핵심 정보만 전달 (나머지는 제거)
+
+    minimal_payload = {
+        "multi_timeframe": sanitized_payload.get("multi_timeframe", {}),
+        "orderbook": sanitized_payload.get("orderbook", {}),
+        "entry_meta": sanitized_payload.get("entry_meta", {}),
+    }    
+
     market_features_json = json.dumps(
-        sanitized_payload, ensure_ascii=False, separators=(",", ":")
+        minimal_payload, ensure_ascii=False, separators=(",", ":")
+
     )
 
     # -------------------------------------------------------------------------
