@@ -376,7 +376,7 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
 def _on_safe_stop() -> None:
     """텔레그램 명령으로 안전 종료를 요청받았을 때 플래그만 세팅한다."""
     global SAFE_STOP_REQUESTED
-    SAFE_STOP_REQUESTED = True
+    SAFE_STOP_REQUESTED = False
     send_tg("🛑 텔레그램에서 '종료' 버튼을 눌렀습니다. 현재 포지션을 모두 정리한 뒤 자동매매를 멈춥니다.")
 
 
