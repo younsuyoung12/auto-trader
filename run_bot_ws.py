@@ -9,6 +9,15 @@ BingX WebSocket + REST 히스토리 기반 비트코인 선물 자동매매 메�
 - 이 파일은 "메인 오케스트레이터" 역할만 수행하고,
   매수/매도·손절/익절·포지션 변경에 대한 실제 판단 로직은 gpt_decider.py 에서 관리한다.
 
+2025-12-03 변경 사항 (자동 종료/idle 제거 및 수동 종료만 허용)
+----------------------------------------------------
+1) STOP_FLAG 기반 자동 종료 및 idle 진입 경로를 모두 제거했다.
+2) 텔레그램 '종료' 버튼 동작을 다음과 같이 단순화했다.
+   - 열린 포지션이 있으면: 기존 TP/SL·EXIT 로직만 계속 수행하고 새로운 진입은 막는다.
+   - 열린 포지션이 더 이상 없으면: 메인 루프를 정상 종료(return)한다.
+3) TRADER_STATE.should_stop_bot() 는 더 이상 봇을 중단하지 않고,
+   TP/SL 재설정 실패를 텔레그램으로 알려주는 용도로만 사용한다.
+
 2025-12-02 변경 사항 (ENTRY GPT 호출 쿨다운 추가)
 ----------------------------------------------------
 1) 메인 루프에서 try_open_new_position 호출에 entry_cooldown_sec 적용.
@@ -165,23 +174,20 @@ LAST_ENTRY_GPT_CALL_TS: float = 0.0
 # GPT Latency Reporter (내장형)
 # ─────────────────────────────────────────────
 
-import threading
-import os
 import csv
-import datetime
-from telelog import send_tg, log
+from telelog import send_tg as _send_tg_for_latency, log as _log_for_latency  # 이름 충돌 방지
 
 LATENCY_DIR = os.path.join("logs", "gpt_latency")
 REPORT_INTERVAL_SEC = 1800  # 30분
 
 
-def _read_recent_latency(minutes=30):
+def _read_recent_latency(minutes: int = 30) -> list[dict[str, str]]:
     if not os.path.isdir(LATENCY_DIR):
         return []
 
     now = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
     cutoff = now - datetime.timedelta(minutes=minutes)
-    rec = []
+    rec: list[dict[str, str]] = []
 
     for fname in os.listdir(LATENCY_DIR):
         if not fname.startswith("gpt-latency") and not fname.startswith("gpt_latency"):
@@ -201,30 +207,32 @@ def _read_recent_latency(minutes=30):
                     if ts >= cutoff:
                         rec.append(row)
         except Exception as e:
-            log(f"[GPT_REPORTER] CSV read error: {e}")
+            _log_for_latency(f"[GPT_REPORTER] CSV read error: {e}")
 
     return rec
 
 
-def _build_summary(records):
+def _build_summary(records: list[dict[str, str]]) -> str:
     if not records:
         return "📉 최근 30분 동안 GPT 호출 기록이 없습니다."
 
-    latencies, slow_count, err_count = [], 0, 0
+    latencies: list[float] = []
+    slow_count, err_count = 0, 0
 
     for r in records:
-        if r["latency_sec"]:
+        if r.get("latency_sec"):
             try:
                 latencies.append(float(r["latency_sec"]))
-            except:
+            except Exception:
                 pass
         if r.get("is_slow") == "1":
             slow_count += 1
         if r.get("is_timeout_or_error") == "1":
             err_count += 1
 
-    avg_latency = sum(latencies) / len(latencies) if latencies else 0
-    max_latency = max(latencies) if latencies else 0
+    avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    max_latency = max(latencies) if latencies else 0.0
+    success_rate = ((len(records) - err_count) / len(records)) * 100 if records else 0.0
 
     summary = (
         "📊 *GPT Latency Report — 최근 30분*\n"
@@ -233,56 +241,29 @@ def _build_summary(records):
         f"• 최대 응답 시간: {max_latency:.2f}초\n"
         f"• 느린 응답: {slow_count}건\n"
         f"• 오류/타임아웃: {err_count}건\n"
-        f"• 성공률: {((len(records)-err_count)/len(records))*100:.1f}%\n"
+        f"• 성공률: {success_rate:.1f}%\n"
     )
     return summary
 
 
-def start_gpt_latency_reporter():
-    def _worker():
+def start_gpt_latency_reporter() -> None:
+    def _worker() -> None:
         log("[GPT_REPORTER] started")
         while True:
             try:
                 rec = _read_recent_latency(30)
                 summary = _build_summary(rec)
-                send_tg(summary)
+                _send_tg_for_latency(summary)
             except Exception as e:
-                log(f"[GPT_REPORTER ERROR] {e}")
-                send_tg(f"[GPT_REPORTER ERROR] {e}")
+                _log_for_latency(f"[GPT_REPORTER ERROR] {e}")
+                try:
+                    _send_tg_for_latency(f"[GPT_REPORTER ERROR] {e}")
+                except Exception:
+                    pass
             time.sleep(REPORT_INTERVAL_SEC)
 
     t = threading.Thread(target=_worker, daemon=True, name="gpt-latency-reporter")
     t.start()
-
-
-# ─────────────────────────────
-# 유틸: STOP_FLAG 파일
-# ─────────────────────────────
-
-
-def _write_stop_flag() -> None:
-    """프로세스 재시작 시 즉시 종료시키기 위한 플래그 파일 작성."""
-    try:
-        with open("STOP_FLAG", "w", encoding="utf-8") as f:
-            f.write("stop\n")
-    except OSError as e:
-        log(f"[STOP_FLAG] write failed: {e}")
-
-
-# ─────────────────────────────
-# idle 모드
-# ─────────────────────────────
-
-
-def _enter_idle_forever() -> None:
-    """메인 로직만 멈추고 프로세스는 살아 있게 하는 무한 슬립."""
-    log("[IDLE] 봇이 중지 상태(idle 모드)로 들어갑니다.")
-    try:
-        send_tg("🟡 자동매매를 멈추고 대기 상태로 유지합니다. 다시 돌리려면 서버에서 봇을 재시작해 주세요.")
-    except Exception:
-        pass
-    while True:
-        time.sleep(60)
 
 
 # ─────────────────────────────
@@ -685,23 +666,6 @@ def main() -> None:
     global OPEN_TRADES, LAST_CLOSE_TS
     global CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS, LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS
-   
-    # ---- STOP_FLAG 자동 삭제 ----
-    try:
-       if os.path.exists("STOP_FLAG"):
-           os.remove("STOP_FLAG")
-    except:
-        pass
-    # -----------------------------
-    
-    # 시작 시 STOP_FLAG 있으면 바로 종료
-    if os.path.exists("STOP_FLAG"):
-        log("STOP_FLAG detected on startup. exiting without start.")
-        send_tg(
-            "⛔ 이전에 '종료' 명령을 받아 STOP_FLAG 파일이 남아 있습니다. "
-            "파일을 삭제한 뒤 다시 실행해 주세요."
-        )
-        return
 
     # WS 설정 로그로 남기기 (Render 확인용)
     log(
@@ -887,21 +851,9 @@ def main() -> None:
 
                 last_fill_check = now
 
-                # TP/SL 재설정이 계속 실패하면 봇 중단 → idle
-                if TRADER_STATE.should_stop_bot():
-                    send_tg("🚫 TP/SL 재설정 실패 발생 (자동중지 기능 비활성화됨). 계속 진행합니다.")
-                    pass   
-                    
-                    
-
-                # 안전 종료 요청이 왔고, 이미 포지션이 모두 정리된 상태라면 종료
-                if SAFE_STOP_REQUESTED and not OPEN_TRADES:
-                    send_tg("🛑 요청하신 대로 포지션을 모두 정리했고, 자동매매를 종료합니다.")
-                    # STOP_FLAG 생성 막음
-                    #write_stop_flag()
-                    # idle 모드 진입 제거
-                    # _enter_idle_forever()
-                    return  # 종료 후 메인 루프 빠져나감
+            # TP/SL 재설정 실패 알림 (자동 중지 기능 비활성화 상태)
+            if TRADER_STATE.should_stop_bot():
+                send_tg("🚫 TP/SL 재설정 실패 발생 (자동중지 기능 비활성화됨). 계속 진행합니다.")
 
             # (e) 열린 포지션에 대한 실시간 대응 (1m 캔들 종가 기준 GPT EXIT 레이어)
             if OPEN_TRADES:
@@ -938,11 +890,10 @@ def main() -> None:
                     time.sleep(1)
                     continue
 
-            # (f) 포지션이 없는 상태에서 안전 종료 요청이 들어온 경우 → 즉시 idle
-            if SAFE_STOP_REQUESTED:
-                send_tg("🛑 요청하신 대로 새로운 진입 없이 자동매매를 종료합니다.")
-                _write_stop_flag()
-                _enter_idle_forever()
+            # (f) 포지션이 없는 상태에서 안전 종료 요청이 들어온 경우 → 메인 루프 종료
+            if SAFE_STOP_REQUESTED and not OPEN_TRADES:
+                send_tg("🛑 요청하신 대로 포지션을 모두 정리했고, 자동매매를 종료합니다.")
+                return
 
             # (g) 연속 손실 방어 로직
             if CONSEC_LOSSES >= 3:
@@ -959,10 +910,15 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
+            # (h-1) 안전 종료 요청 상태에서는 EXIT 만 진행하고 새 진입은 막는다
+            if SAFE_STOP_REQUESTED:
+                time.sleep(1)
+                continue
+
             # (i) 새 포지션 진입 시도 (GPT 전담 엔트리)
             #     - ENTRY 쿨다운: GPT 비용 절감을 위해 최소 entry_cooldown_sec 간격으로만 진입 판단 수행
             entry_cooldown_sec = getattr(SET, "entry_cooldown_sec", 20)
-            trade = None
+            trade: Optional[Trade] = None
             if now - LAST_ENTRY_GPT_CALL_TS >= entry_cooldown_sec:
                 trade, sleep_sec = try_open_new_position(
                     SET,
@@ -994,8 +950,8 @@ def main() -> None:
             )
             time.sleep(2)
 
-    # RUNNING 이 False 로 바뀌어 루프가 끝나면 idle 로 가서 멈춘다
-    # _enter_idle_forever()   # 자동 중지 제거
+    # RUNNING 이 False 로 바뀌어 루프가 끝나면 여기로 빠져나온다.
+    # 자동 idle 진입은 제거하고, 메인 함수만 종료한다.
     return
 
 
