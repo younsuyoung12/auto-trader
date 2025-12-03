@@ -965,8 +965,8 @@ def ask_entry_decision(
             es_val = None
 
         # 1) 추세/변동성 모두 약한 구간 → 로컬 SKIP
-        #    - trend_strength < 0.03 AND volatility < 0.01 인 경우
-        if trend_strength < 0.03 and vol_score < 0.01:
+        #    - trend_strength < 0.02 AND volatility < 0.006 인 경우
+        if trend_strength < 0.02 and vol_score < 0.006:
             reason = (
                 "장세 추세와 변동성이 모두 약해 이번 캔들은 진입 후보에서 제외합니다 "
                 "(GPT 호출 생략)."
@@ -999,8 +999,8 @@ def ask_entry_decision(
             return local_result
 
         # 2) entry_score 가 너무 낮은 구간 → 로컬 SKIP
-        #    - entry_score < 28 기준 (0~100 스케일 가정)
-        if es_val is not None and es_val < 28.0:
+        #    - entry_score < 20.0 기준 (0~100 스케일 가정)
+        if es_val is not None and es_val < 20.0:
             reason = (
                 "entry_score가 충분히 높지 않아 이번 캔들은 진입을 시도하지 않습니다 "
                 "(GPT 호출 생략)."
