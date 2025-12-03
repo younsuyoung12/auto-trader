@@ -1144,7 +1144,7 @@ def get_trading_signal(
                 f"atr_pct={atr_str}, "
                 f"th=({low_range_th:.4f}, {low_atr_th:.4f}), low_vol_tfs={low_vol_tfs})"
             )
-            return None
+            
     except Exception as e:
         log(f"[MKT-FEAT] low-volatility filter 계산 중 예외 발생: {e}")
 
@@ -1297,7 +1297,7 @@ def get_trading_signal(
 
     # 최종 범위 확장
     signal_score = max(0.5, min(signal_score, 6.0))
-    
+
     # 7) extra 메타 구성 (GPT/gpt_trader + EntryScore 공용)
     extra: Dict[str, Any] = {
         "signal_score": float(signal_score),
