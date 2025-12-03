@@ -112,7 +112,7 @@ _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
 
 MAX_KLINES = 500
-RECONNECT_WAIT = 5
+RECONNECT_WAIT = 15
 
 
 def _now_ms() -> int:
