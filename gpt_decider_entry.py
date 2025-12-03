@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover
 
 
 """
-2025-12-03 ENTRY/EXIT 안정화 + GPT-5.1 일반 최적화 버전
+2025-12-03 ENTRY/EXIT 안정화 + GPT-4o-mini 최적화 버전
 ======================================================
 
 이 파일은 진입(ENTRY) / 청산(EXIT)에 대한 GPT 판단 레이어를 담당한다.
@@ -27,64 +27,38 @@ except Exception:  # pragma: no cover
 ---------
 
 1) 공통 사항
-   - 기본 모델: GPT-5.1 (일반, pro 아님)
+   - 기본 모델: GPT-4o-mini (저비용·고속·안정적)
    - OpenAI Chat Completions API 사용
-   - response_format={"type": "json_object"} 고정
-   - temperature=0.0 (결정적·재현 가능한 결과)
+   - response_format={"type": "json_object"} 강제
+   - temperature=0.0 (결정적 결과)
    - NaN/Infinity/None 은 GPT 입력 전에 _sanitize_for_gpt 로 제거
    - ENTRY / EXIT 레이턴시는 CSV(gpt_latency.csv)에 기록
 
 2) ENTRY (ask_entry_decision)
-   - gpt_trader.decide_entry_with_gpt_trader 와 스키마 정합
-   - GPT 응답 필드:
-       action: "ENTER" | "SKIP" | "ADJUST"
-       direction: "LONG" | "SHORT" | "PASS"
-       tp_pct: float (0.0~0.5)
-       sl_pct: float (0.0~0.5)
-       effective_risk_pct: float (0.0~GPT_MAX_RISK_PCT)
-       guard_adjustments: dict (없으면 {})
-       confidence: float (0~1)
-       reason: str (한국어, 왜 ENTER/SKIP/ADJUST 했는지 1~2문장)
-       note: str (추가 설명)
-       raw_response: str (원문 또는 요약)
-   - 정규화/검증:
-       · action/direction 이상값은 안전한 기본값으로 보정
-       · tp_pct/sl_pct/effective_risk_pct 는 절대 범위 + base_* 대비 비율 체크
-       · tv_pct 는 tp_pct 의 alias 로 유지
-       · guard_adjustments 가 dict 가 아니면 빈 dict 로 교체
-       · ENTRY 실패가 엔진 전체 중단으로 이어지지 않도록 예외 대신 보정 위주
-
-   - 로컬 SKIP 레이어 (비용/잡신호 필터):
-       · trend_strength / volatility 가 매우 약한 구간은 GPT 호출 없이 SKIP
-       · entry_score 가 너무 낮은 구간도 GPT 호출 없이 SKIP
-       · 이 레이어는 비용 절감용이며, 이유(reason)는 한국어로 명시
+   - 시스템 기준 신호(entry_score, trend_strength, volatility)를 기반으로
+     로컬 필터를 먼저 적용해 불필요한 GPT 호출을 차단한다.
+   - 요구 필드(action/direction/tp_pct/sl_pct/risk_pct/reason 등)를
+     GPT JSON 응답에서 정규화해 안전하게 반환한다.
+   - 로컬 SKIP 레이어를 통해 비용 폭증을 방지한다.
 
 3) EXIT (ask_exit_decision / ask_exit_decision_safe)
-   - position_watch_ws.maybe_exit_with_gpt(...) 와 인터페이스 정합
-   - GPT 응답 필드:
-       action: "CLOSE" | "HOLD"
-       close_ratio: 0.0~1.0 (생략 시 기본 1.0, HOLD 시 0.0 간주)
-       new_sl_pct: 0.0~0.5 (옵션)
-       new_tp_pct: 0.0~0.5 (옵션)
-       reason: str (한국어 1~2문장, EXIT/HOLD 이유)
-       note: str (추가 설명)
-       raw_response: str
-   - ask_exit_decision_safe:
-       · GPT 호출/파싱 실패 시에도 예외를 위로 올리지 않고
-         fallback_action("HOLD"/"CLOSE") 으로 복구
-       · 호출 측은 (action, gpt_data) 튜플을 받아 처리
+   - 포지션 유지(HOLD) / 청산(CLOSE) 여부를 GPT에 묻는다.
+   - GPT 실패 시 fallback_action(HOLD/CLOSE)으로 자동 복구한다.
+   - new_sl_pct/new_tp_pct 등은 선택적이며 누락 가능하다.
 
 4) 프롬프트 최적화
-   - 시스템/유저 프롬프트에서 장문 예시·중복 설명을 제거해 토큰 사용량을 줄이되,
-     필수 필드 정의, 제약 조건, reason 한국어 설명 규칙은 그대로 유지
+   - 장문 예시와 잡음 제거.
+   - 반드시 1개의 JSON만 출력하도록 강제.
+   - reason/note는 전문적이고 간결한 한국어 문장 규칙 적용.
 """
+
 
 # =============================================================================
 # 설정 / 상수
 # =============================================================================
 
 # 기본 모델: GPT-5.1 (일반, pro 아님)
-GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-5.1")
+GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-4o-mini")
 
 OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "12"))
 OPENAI_TRADER_MAX_TOKENS = int(os.getenv("OPENAI_TRADER_MAX_TOKENS", "512"))
@@ -589,45 +563,49 @@ def _sanitize_for_gpt(
 # =============================================================================
 # GPT 프롬프트 정의 (ENTRY)
 # =============================================================================
-
-
-_SYSTEM_PROMPT_ENTRY = """
+SYSTEM_PROMPT_ENTRY = """
 You are an expert intraday crypto futures trading decision assistant.
 
 역할:
-- 단기(인트라데이) 비트코인 선물 자동매매 시스템의 "진입 판단 레이어"를 담당한다.
-- 주어진 JSON 컨텍스트를 바탕으로 이번 캔들에서 진입(ENTER) / 조정(ADJUST) / 스킵(SKIP)을 결정한다.
+- 단기(인트라데이) 비트코인 선물 자동매매 시스템의 '진입 판단 레이어'를 담당한다.
+- JSON 컨텍스트를 기반으로 이번 캔들에서 ENTER / ADJUST / SKIP 중 하나를 결정한다.
+- 반드시 하나의 JSON 객체만 출력한다.
 
-출력 형식(반드시 지켜야 함):
-- 항상 **하나의 JSON 객체만** 출력한다. 마크다운, 설명 텍스트, 코드블록은 절대 포함하지 않는다.
-- 필수 필드:
-    - "action": "ENTER" | "SKIP" | "ADJUST"
-    - "direction": "LONG" | "SHORT" | "PASS"
-    - "confidence": 0.0 ~ 1.0
-    - "tp_pct": 0.0 ~ 0.5          (목표 수익률 비율)
-    - "sl_pct": 0.0 ~ 0.5          (손절 비율)
-    - "effective_risk_pct": 0.0 ~ {gpt_max_risk_pct}
-    - "guard_adjustments": JSON 객체 (없으면 {{}} )
-    - "reason": 한국어 문자열 1~2문장 (왜 이 action/direction 을 선택했는지)
-    - "note": 한국어 추가 설명 (선택적이지만 비워두지 않는 것을 권장)
-    - "raw_response": 내부용 메모/요약 등 자유 형식 문자열
 
-제약 조건:
-- action 이 "ENTER" 또는 "ADJUST" 인 경우:
-    - tp_pct > 0, sl_pct > 0, effective_risk_pct > 0 이어야 한다.
-    - effective_risk_pct 는 절대 {gpt_max_risk_pct} 를 넘지 않는다.
-- action 이 "SKIP" 인 경우:
-    - 실제 진입은 하지 않는다.
-    - reason 에 이번 캔들을 왜 진입 후보에서 제외했는지 한국어로 구체적으로 적는다.
-- NaN / Infinity / null / "NaN" / "Infinity" / "None" 과 같은 값/문자열은 절대 사용하지 않는다.
-- 모든 수치는 실수(float)로 응답한다.
+출력 JSON 스키마:
+- 필수:
+    - action: "ENTER" | "SKIP" | "ADJUST"
+    - direction: "LONG" | "SHORT" | "PASS"
+    - confidence: 0.0 ~ 1.0
+    - tp_pct: 0.0 ~ 0.5
+    - sl_pct: 0.0 ~ 0.5
+    - effective_risk_pct: 0.0 ~ {gpt_max_risk_pct}
+    - guard_adjustments: 객체 (없으면 빈 객체)
+    - reason: 한국어 1~2문장 (왜 ENTER/ADJUST/SKIP 했는지)
+    - note: string
+    - raw_response: string
 
-판단 가이드(간단 버전):
-- 추세가 뚜렷하고 거래량/변동성이 뒷받침되면 ENTER/ADJUST 를 우선적으로 검토하되,
-  리스크가 과도하면 effective_risk_pct 를 줄이거나 SKIP 을 선택한다.
-- 변동성이 거의 없거나 방향성이 애매하면 보수적으로 SKIP 을 선택하고,
-  reason 에 "횡보/저변동성/패턴 불명확" 등의 이유를 써준다.
+규칙:
+- action 이 "ENTER" 또는 "ADJUST"면 tp_pct/sl_pct/effective_risk_pct 모두 0보다 커야 한다.
+- action 이 "SKIP"이면 왜 스킵했는지 reason에 반드시 지표 기반 근거를 포함한다.
+- NaN/Infinity/null/None 과 같은 값은 절대 사용하지 않는다.
+- 반드시 순수 JSON 형식으로만 출력한다.
+
+문체 규칙(중요):
+- 말투는 전문적이고 간결하며 감정을 넣지 않는다.
+- 돌려 말하지 않고 있는 그대로 말한다.
+- 이유(reason)는 지표·가격·리스크 근거만 명확하게 제시한다.
+- 불필요한 형용사, 감탄사, 스토리형 설명 금지.
+- 다음과 같은 형식을 우선한다:
+
+예시:
+- "entry_score 36. 추세 불명확. 변동성 약함 → SKIP."
+- "단기·중기 추세 상방. 유동성 우위 → ENTER LONG."
+- "지표 근거 부족 → SKIP."
+
+이 문체 규칙을 reason 과 note 에 반드시 적용한다.
 """
+
 
 
 _USER_PROMPT_TEMPLATE_ENTRY = """
@@ -959,7 +937,7 @@ def ask_entry_decision(
     # 위 두 조건을 통과한 경우에만 GPT 호출을 수행한다.
     # -------------------------------------------------------------------------
 
-    system_prompt = _SYSTEM_PROMPT_ENTRY.format(
+    system_prompt = SYSTEM_PROMPT_ENTRY.format(
         gpt_max_risk_pct=gpt_max_risk_pct,
         gpt_max_risk_pct_pct=gpt_max_risk_pct * 100.0,
     )

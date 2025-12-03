@@ -419,39 +419,36 @@ def _on_close(ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
 
 
 def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
-    """WS 연결 직후 구독 메시지를 전송한다."""
+    """WS 연결 직후 구독 메시지를 안정적으로 재전송하도록 강화된 버전."""
+
     msgs = _build_sub_msgs(symbol)
+
     for m in msgs:
-        try:
-            ws.send(json.dumps(m))
-        except Exception as e:
-            log(f"[MD-WS] subscribe send error: {e}")
-    log(f"[MD-WS] subscribed: {msgs}")
+        payload = json.dumps(m)
+        sent = False
 
-
-def start_ws_loop(symbol: str) -> None:
-    """백그라운드 스레드에서 무한 재접속 루프로 WS를 유지한다."""
-    url = WS_URL
-
-    def _runner() -> None:
-        while True:
+        # 최대 5회까지 재전송 시도 (폴백 아님, 보장성 강화)
+        for attempt in range(5):
             try:
-                ws = websocket.WebSocketApp(
-                    url,
-                    on_open=lambda w: _on_open(symbol, w),
-                    on_message=lambda w, m: _on_message(symbol, w, m),
-                    on_error=_on_error,
-                    on_close=_on_close,
-                )
-                ws.run_forever(ping_interval=25, ping_timeout=10)
+                ws.send(payload)
+                sent = True
+                break
             except Exception as e:
-                log(f"[MD-WS] run_forever error: {e}")
-            log(f"[MD-WS] reconnect in {RECONNECT_WAIT}s ...")
-            time.sleep(RECONNECT_WAIT)
+                log(f"[MD-WS] subscribe send error (attempt {attempt+1}/5): {e}")
+                time.sleep(0.3)  # 아주 짧은 backoff
 
-    th = threading.Thread(target=_runner, name=f"md-ws-{symbol}", daemon=True)
-    th.start()
-    log(f"[MD-WS] background ws started for {symbol}")
+        if not sent:
+            # 구독 실패는 '데이터 없음 → health_snapshot fail'로 이어지므로
+            # 폴백 없이 즉시 치명적 로그만 남기고 재접속 루프로 넘긴다.
+            log(f"[MD-WS] FATAL: subscribe failed permanently → reconnect required")
+            # ws.close() 강제 종료 → _runner() 재접속 실행
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
+
+    log(f"[MD-WS] subscribed (stable): {msgs}")
 
 
 def preload_klines(
@@ -761,6 +758,38 @@ def is_data_healthy(symbol: str) -> bool:
     """심볼 기준 WS 데이터 헬스가 양호한지 여부만 간단히 반환한다."""
     snap = get_health_snapshot(symbol)
     return bool(snap.get("overall_ok", False))
+
+# -------------------------------------
+# (기존 코드 끝부분)
+# -------------------------------------
+
+def start_ws_loop(symbol: str) -> None:
+    # ★ 내가 준 최적화 버전 그대로 복붙
+    url = WS_URL
+
+    def _runner() -> None:
+        retry_wait = 3
+        while True:
+            try:
+                log(f"[MD-WS] connecting to {url} ...")
+                ws = websocket.WebSocketApp(
+                    url,
+                    on_open=lambda ws: _on_open(symbol, ws),
+                    on_message=lambda ws, message: _on_message(symbol, ws, message),
+                    on_error=lambda ws, error: _on_error(ws, error),
+                    on_close=lambda ws, code, msg: _on_close(ws, code, msg),
+                )
+                ws.run_forever(ping_interval=20, ping_timeout=8)
+                log("[MD-WS] WS disconnected → retrying ...")
+            except Exception as e:
+                log(f"[MD-WS] run_forever exception: {e}")
+            time.sleep(retry_wait)
+            retry_wait = min(retry_wait + 2, 10)
+
+    th = threading.Thread(target=_runner, name=f"md-ws-{symbol}", daemon=True)
+    th.start()
+    log(f"[MD-WS] background ws started for {symbol}")
+
 
 
 __all__ = [

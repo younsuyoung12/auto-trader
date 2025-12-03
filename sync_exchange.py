@@ -309,6 +309,8 @@ def sync_open_trades_from_exchange(
                 symbol=symbol,
                 side=side_open,
                 qty=qty,
+                entry_price=entry_price,        # ★ 추가됨
+                leverage=float(pos.get("leverage") or 0.0),   # ★ 추가됨
                 entry=entry_price,
                 entry_order_id=None,
                 tp_order_id=tp_id,

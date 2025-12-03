@@ -1031,10 +1031,16 @@ def maybe_exit_with_gpt(
         )
 
     if action != "CLOSE":
-        # 🔥 HOLD 이유 텔레그램 즉시 전송 (추가된 코드)
-        exit_reason = gpt_data.get("reason", "no_reason")
-        send_tg(f"[GPT_EXIT][HOLD] {exit_reason}")
+        # GPT reason 가져오기
+        exit_reason = gpt_data.get("reason", "").strip()
 
+        # 🚨 GPT가 빈 문자열이거나 누락된 경우 → 수영님 스타일 기본 reason 적용
+        if not exit_reason:
+            exit_reason = "추세 유지. 지표 근거 변화 없음 → HOLD."
+
+        # 🔥 HOLD 이유 텔레그램 전송
+        send_tg(f"[GPT_EXIT][HOLD] {exit_reason}")
+                                
         # HOLD or 기타 → 청산하지 않음
         try:
             log_skip_event(

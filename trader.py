@@ -99,6 +99,11 @@ class Trade:
     # - GPT EXIT/DB 로깅 코드: trade.entry 를 사용.
     # - __post_init__ 에서 entry 와 entry_price 를 서로 동기화한다.
     entry: float = 0.0
+    entry_order_id: Optional[str] = None
+    # ★ sync_exchange가 요구하는 필드 2개 추가
+    tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
+
 
     # 최초 진입 주문 ID (자동/수동 공통).
     # - 수동 진입 시 open_position_with_tp_sl(..., entry_order_id=...) 에서 채워질 수 있다.
