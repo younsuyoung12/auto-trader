@@ -439,4 +439,9 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     result["pattern_features"] = pattern_features
     result["pattern_summary"] = pattern_summary
 
+    # 🔧 (추가) GPT ENTRY 필터가 필요로 하는 핵심 값 전달
+    tf5 = base.get("timeframes", {}).get("5m", {})
+    reg = tf5.get("regime", {})
+    result["trend_strength"] = reg.get("trend_strength")
+    result["volatility"] = tf5.get("atr_pct")
     return result

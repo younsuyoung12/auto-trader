@@ -3,58 +3,54 @@
 # 역할
 # ----------------------------------------------------
 # - BingX Auto Trader에서 "GPT 판단"과 "하드 리스크/가드" 사이의 중간 레이어.
-# - market_features_ws.build_entry_features_ws(...) 로 만든 WS 피처를
-#   gpt_decider.ask_entry_decision(...) 에 전달하고,
+# - unified_features_builder.build_unified_features(...) 가 만든
+#   WS 마켓 피처 + 차트 패턴 피처(unified_features)를
+#   gpt_decider_entry.ask_entry_decision(...) 에 전달하고,
 #   settings_ws.BotSettings 기반 상·하한 가드를 적용한다.
-# - 지나치게 보수적인 조건 때문에 항상 SKIP 나는 상황에서는 GPT가 부드럽게 조정할 수 있게 하고,
-#   반대로 너무 위험한 완화/레버리지 제안은 settings_ws.BotSettings 상한/하한으로 완전히 차단한다.
-# - 장 흐름(최근 PnL/스킵 패턴 등)과 데이터/모델 헬스에 따라, 
+# - 지나치게 보수적인 조건 때문에 항상 SKIP 나는 상황에서는
+#   GPT가 부드럽게 조정할 수 있게 하고,
+#   반대로 너무 위험한 완화/레버리지 제안은
+#   settings_ws.BotSettings 상한/하한으로 완전히 차단한다.
+# - 장 흐름(최근 PnL/스킵 패턴 등)과 데이터/모델 헬스에 따라,
 #   가드·리스크 파라미터를 동적으로 조정하는 AI 게이트웨이.
 #
-# 2025-11-21 변경 사항 (GPT ENTRY 호출 쿨다운 추가)
+# 2025-11-21 변경 사항 (GPT ENTRY 호출 쿨다운 + unified_features 연동 안정화)
 # ----------------------------------------------------
 # 1) settings.gpt_entry_cooldown_sec 기반 GPT ENTRY 호출 쿨다운 추가.
-#    - 마지막 GPT ENTRY 호출 이후 gpt_entry_cooldown_sec(기본 120초) 이내에는
-#      ask_entry_decision 를 호출하지 않고 즉시 SKIP 처리.
+#    - 마지막 GPT ENTRY 호출 이후 gpt_entry_cooldown_sec 이내에는
+#      ask_entry_decision 을 호출하지 않고 즉시 SKIP 처리.
 #    - rate limit/비용 폭주 및 중복 판단 호출 방지.
+# 2) unified_features_builder.build_unified_features(...) 를 사용해
+#    WS 마켓 피처 + 패턴 피처를 한 번에 생성한 뒤 GPT에 전달.
 #
 # 2025-11-19 변경 사항 (WS 피처 연동 + 데이터 오류 처리 강화 + GPT 지연/장애 하드 스톱 정리)
 # ----------------------------------------------------
-# 1) market_features_ws.build_entry_features_ws(...) 연동
-#    - decide_entry_with_gpt_trader(...)에 market_features 파라미터 추가.
-#    - 호출측에서 피처를 이미 계산한 경우 그대로 사용하고,
-#      없으면 이 모듈에서 build_entry_features_ws(...)를 호출해 GPT에 전달.
-# 2) FeatureBuildError 처리
-#    - WS 캔들/오더북이 부족하거나 지연된 경우 GPT를 호출하지 않고
+# 1) decide_entry_with_gpt_trader(...) 에 market_features 파라미터 추가.
+#    - 호출 측에서 unified_features 를 이미 계산한 경우 그대로 사용하고,
+#      없으면 이 모듈에서 build_unified_features(...) 를 호출해 GPT에 전달.
+# 2) FeatureBuildError / UnifiedFeaturesError 처리
+#    - WS 캔들/오더북 부족·지연, 패턴 피처 빌드 실패 등 unified_features 계층에서
+#      나는 예외는 GPT를 호출하지 않고
 #      final_action="SKIP", gpt_action="SKIP", gpt_status="DATA_ERROR" 로 반환.
 #    - 기존 GPT 에러 카운터/하드 스톱 로직과는 별개로 취급해,
 #      데이터가 애매한 구간에서 불필요한 HARD_STOP 이 걸리지 않도록 함.
 # 3) GPT 지연/장애 하드 스톱 로직 정리
 #    - 연속 에러 수(gpt_entry_hard_stop_min_errors 이상) 발생 시
 #      gpt_entry_hard_stop_cooldown_sec 동안 신규 진입 HARD_STOP.
-#    - HARD_STOP 윈도우 내에서는 GPT 호출과 WS 피처 계산을 모두 생략하여
-#      서버 자원을 아끼고 상태를 명확하게 유지.
+#    - HARD_STOP 윈도우 내에서는 GPT 호출과 WS 피처 계산을 모두 생략.
 #
 # 2025-11-18 변경 사항 (GPT 프롬프트 경량화 + 토큰 가드)
 # ----------------------------------------------------
-# 1) _sanitize_extra_for_gpt(...) 에서 extra dict 전체를 그대로 넘기지 않고,
-#    - 숫자/문자/불리언 스칼라 값만 기본 허용,
-#    - 리스트/딥한 dict 는 길이/키 개수가 작은 경우만 요약 허용,
+# 1) _sanitize_extra_for_gpt(...) 를 통해 extra payload 를 경량화.
+#    - 숫자/문자/불리언 스칼라 값만 기본 허용.
+#    - 리스트/딥한 dict 는 길이/키 개수가 작은 경우만 요약 허용.
 #    - guard_snapshot 는 핵심 키만 유지하여 프롬프트 JSON 크기를 축소.
-# 2) extra 필드에 regime/direction/recent_pnl_pct/skip_streak 를 포함하는 규칙은 유지하되
-#    heavy payload 가 들어가지 않도록 필터링 로직 추가.
-# 3) 리스크/가드 클램핑 로직은 그대로 사용하되, GPT가 리스크를 0%로 만드는
-#    응답은 동일하게 강제 SKIP 처리.
 #
 # 2025-11-17 변경 사항 (GPT 프롬프트 컨텍스트 강화)
 # ----------------------------------------------------
-# 1) ask_entry_decision 호출 전에 _build_extra_for_gpt(...) 로 extra 를 재구성.
-#    - signal_source / direction 을 regime, direction 필드로 전달.
-#    - guard_snapshot 의 핵심 가드 값(min_entry_volume_ratio, max_spread_pct 등)을
-#      guard_snapshot 필드로 요약해 GPT 프롬프트에 포함.
-#    - settings.recent_pnl_pct / settings.skip_streak 가 있으면 함께 전달해
-#      최근 성과/스킵 패턴을 참고할 수 있게 함.
-# 2) decide_entry_with_gpt_trader(...) docstring 에 프롬프트 연동 규칙을 보강.
+# 1) _build_extra_for_gpt(...) 로 regime/direction/guard_snapshot/
+#    recent_pnl_pct/skip_streak 등을 하나의 extra dict 로 통합하고,
+#    unified_features 와 병합해 ask_entry_decision(...) 의 market_features 로 전달.
 #
 # 사용 대상
 # ----------------------------------------------------
@@ -77,8 +73,9 @@ from settings_ws import BotSettings
 from gpt_decider_entry import ask_entry_decision
 from unified_features_builder import (
     build_unified_features,
-    UnifiedFeaturesError as UnifiedFeatureError,   # 이름 통일
+    UnifiedFeaturesError as UnifiedFeatureError,  # 이름 통일
 )
+from market_features_ws import FeatureBuildError
 
 # ─────────────────────────────────────────
 # 내부 유틸 (텔레그램/로그)
@@ -92,7 +89,7 @@ def _safe_log(msg: str) -> None:
 
         log(msg)
     except Exception:
-        pass      
+        pass
 
 
 def _safe_tg(msg: str) -> None:
@@ -103,7 +100,6 @@ def _safe_tg(msg: str) -> None:
         send_tg(msg)
     except Exception:
         pass
-        
 
 
 # ─────────────────────────────────────────
@@ -495,9 +491,9 @@ def decide_entry_with_gpt_trader(
       → final_action="SKIP" 으로 통일 (폴백 진입 금지).
     - 리스크/TP/SL 은 항상 settings.gpt_max_* 으로 상한이 걸린 값만 사용.
     - extra / guard_snapshot 는 _build_extra_for_gpt(...) 에서 통합되어
-      gpt_decider.ask_entry_decision 의 프롬프트에 들어간다.
-    - market_features 는 market_features_ws.build_entry_features_ws(...) 가 만든
-      WS 기반 피처 dict 로, GPT 가 차트/지표/오더북 상태를 한 번에 이해하기 위한 데이터.
+      gpt_decider_entry.ask_entry_decision 의 프롬프트에 들어간다.
+    - market_features 는 unified_features_builder.build_unified_features(...) 로 만든
+      WS 마켓 피처 + 차트 패턴 피처(unified_features) dict 로, GPT 가 차트/지표/오더북/패턴 상태를 한 번에 이해하기 위한 데이터.
     - GPT 진입 장애(연속 에러/타임아웃)가 일정 횟수 이상 누적되면
       → 일정 시간 동안 하드 스톱(HARD_STOP) 상태로 전환하여 신규 진입을 전부 막는다.
     - settings.gpt_entry_cooldown_sec 에 따라 GPT ENTRY 호출 간 최소 간격을 두어
@@ -579,13 +575,13 @@ def decide_entry_with_gpt_trader(
     try:
         if market_features is None:
             market_features = build_unified_features(symbol=symbol)
-    except UnifiedFeatureError as e:
-        # WS 데이터 부족/지연 → GPT 를 부르지 않고 안전하게 SKIP
+    except (UnifiedFeatureError, FeatureBuildError) as e:
+        # unified_features 계층의 데이터 부족/지연/패턴 실패 → GPT 를 부르지 않고 안전하게 SKIP
         result["final_action"] = "SKIP"
         result["gpt_action"] = "SKIP"
         result["gpt_status"] = "DATA_ERROR"
         result["reason"] = (
-            "WS 시세 피처를 만들지 못해 이번 루프는 진입 없이 건너뜁니다. "
+            "WS 시세/패턴 피처를 만들지 못해 이번 루프는 진입 없이 건너뜁니다. "
             f"({type(e).__name__}: {e})"
         )
         result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
@@ -615,23 +611,30 @@ def decide_entry_with_gpt_trader(
         guard_snapshot=guard_snapshot,
     )
 
+    # unified_features + extra_for_gpt 를 병합해 GPT 에 전달할 피처 구성
+    features_for_gpt: Dict[str, Any] = {}
+    if isinstance(market_features, dict):
+        features_for_gpt.update(market_features)
+    if extra_for_gpt:
+        features_for_gpt.update(extra_for_gpt)
+
     try:
         # ENTRY 호출 시각 기록 (쿨다운용)
         _gpt_entry_last_call_ts = _now_ts()
 
         gpt_json = ask_entry_decision(
-             symbol=symbol,
-             signal_source=signal_source,
-             chosen_signal=direction,
-             last_price=last_price,
-             entry_score=entry_score,
-             effective_risk_pct=base_risk_pct,
-             market_features=market_features,
-             source=signal_source,
-             current_price=last_price,
-             base_tv_pct=base_tp_pct,
-             base_sl_pct=base_sl_pct,
-             base_risk_pct=base_risk_pct,
+            symbol=symbol,
+            signal_source=signal_source,
+            chosen_signal=direction,
+            last_price=last_price,
+            entry_score=entry_score,
+            effective_risk_pct=base_risk_pct,
+            market_features=features_for_gpt,
+            source=signal_source,
+            current_price=last_price,
+            base_tv_pct=base_tp_pct,
+            base_sl_pct=base_sl_pct,
+            base_risk_pct=base_risk_pct,
         )
         result["raw"] = gpt_json
 
