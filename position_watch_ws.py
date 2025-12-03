@@ -1031,6 +1031,10 @@ def maybe_exit_with_gpt(
         )
 
     if action != "CLOSE":
+        # 🔥 HOLD 이유 텔레그램 즉시 전송 (추가된 코드)
+        exit_reason = gpt_data.get("reason", "no_reason")
+        send_tg(f"[GPT_EXIT][HOLD] {exit_reason}")
+
         # HOLD or 기타 → 청산하지 않음
         try:
             log_skip_event(
@@ -1059,6 +1063,11 @@ def maybe_exit_with_gpt(
 
     # action == "CLOSE" → 실제 청산 실행
     try:
+        # 🔥 추가된 코드 (CLOSE 이유 텔레그램 전송)
+        exit_reason = gpt_data.get("reason", "no_reason")
+        send_tg(f"[GPT_EXIT][CLOSE] {exit_reason}")
+
+
         close_position_market(trade.symbol, trade.side, qty)
         if trade.side == "BUY":
             pnl = (c - entry) * qty

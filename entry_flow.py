@@ -1004,7 +1004,8 @@ def try_open_new_position(
         # GPT reason만 텔레그램에 명확히 전달
         clean_reason = gpt_reason or "no_reason"
         msg = f"[GPT_ENTRY][SKIP] {clean_reason}"
-
+        
+        send_tg(msg)        # ✅ reason 즉시 전송 (쿨다운 없음)
         log(msg)
         try:
             send_skip_tg(msg)   # → reason을 그대로 텔레그램으로 전달
@@ -1043,7 +1044,11 @@ def try_open_new_position(
             guard_adjustments = {}
 
     # GPT 승인/보정 결과 텔레그램 알림 (정보용)
+
     try:
+        # 🔥 먼저 진입 이유(reason)만 깔끔하게 전송 (추가한 코드)
+        send_tg(f"[GPT_ENTRY][ENTER] {gpt_reason or 'no_reason'}")
+        
         side_up = (chosen_signal or "").upper()
         if side_up == "LONG":
             side_ko = "롱"

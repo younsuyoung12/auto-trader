@@ -1219,8 +1219,8 @@ def get_trading_signal(
     elif majority_trend == "SHORT":
         trend_bias = -1
     else:
-        # MTF가 애매하면 오더북 쏠림을 참고
-        if isinstance(depth_imbalance, (int, float)) and abs(depth_imbalance) >= 0.05:
+         # 오더북 쏠림이 강할 때만 방향 반영 (과도한 방향 흔들림 방지)
+        if isinstance(depth_imbalance, (int, float)) and abs(depth_imbalance) >= 0.20:
             trend_bias = 1 if depth_imbalance > 0 else -1
 
     # 여전히 0이면 5m EMA 정렬로 최소 방향은 정해준다.
@@ -1282,24 +1282,22 @@ def get_trading_signal(
     else:
         atr_slow_val = float("nan")
 
-    # 간단한 시그널 강도 점수 (0~3 근사)
-    signal_score = 1.0
+    # ▶ 확장된 시그널 강도 점수 (0.5 ~ 6.0)
+    signal_score = 0.5
     try:
         vol_z = tf5.get("volume_zscore")
         if signal_source == "TREND":
-            signal_score += 0.5
+            signal_score += 1.5
         if majority_trend in ("LONG", "SHORT"):
-            signal_score += 0.3
-        if isinstance(vol_z, (int, float)) and abs(vol_z) >= 2.0:
-            signal_score += 0.4
+            signal_score += 1.0
+        if isinstance(vol_z, (int, float)):
+            signal_score += min(abs(vol_z) * 0.5, 2.0)
     except Exception:
         pass
 
-    if signal_score < 0.1:
-        signal_score = 0.1
-    if signal_score > 3.0:
-        signal_score = 3.0
-
+    # 최종 범위 확장
+    signal_score = max(0.5, min(signal_score, 6.0))
+    
     # 7) extra 메타 구성 (GPT/gpt_trader + EntryScore 공용)
     extra: Dict[str, Any] = {
         "signal_score": float(signal_score),
