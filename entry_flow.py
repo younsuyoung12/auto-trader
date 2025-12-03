@@ -96,7 +96,7 @@ except Exception:  # pragma: no cover - DB가 아직 준비되지 않은 환경 
     sa_text = None  # type: ignore
 
 # GPT-5 메타 정보 (entry_flow 에서는 로깅/메타 정보용으로만 사용)
-DEFAULT_GPT_ENTRY_MODEL = "gpt-5.1"
+DEFAULT_GPT_ENTRY_MODEL = "gpt-4o-mini"
 
 # GPT 엔트리 쿨다운 (PREVIEW + GPT 호출 공통)
 _DEFAULT_GPT_ENTRY_COOLDOWN_SEC = 1.0

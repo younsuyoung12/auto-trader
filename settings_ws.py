@@ -215,7 +215,7 @@ class BotSettings:
     gpt_soft_tp_recheck_sec: int = 60     # soft TP 존에 있을 때 재판단 주기(sec)
 
     # 진입 거래량 가드 (ENV 훅)
-    min_entry_volume_ratio: float = 0.3   # 기본 0.30
+    min_entry_volume_ratio: float = 0.15   # 기본 0.15
 
     # ── 쿨다운/폴링 ────────────────────────────────────────
     cooldown_sec: int = 1
@@ -228,7 +228,7 @@ class BotSettings:
 
     # ── 슬리피지/호가 관련 ─────────────────────────────────
     max_price_jump_pct: float = 0.003
-    max_spread_pct: float =  0.0012
+    max_spread_pct: float =  0.002
     max_entry_slippage_pct: float = 0.0005
     use_orderbook_entry_hint: bool = True
 
@@ -239,8 +239,8 @@ class BotSettings:
 
     # 호가 한쪽 쏠림(depth imbalance) 가드
     depth_imbalance_enabled: bool = True
-    depth_imbalance_min_notional: float = 50.0
-    depth_imbalance_min_ratio: float = 2.0
+    depth_imbalance_min_notional: float = 10.0
+    depth_imbalance_min_ratio: float = 1.1
 
     # mark/last 괴리 가드
     price_deviation_guard_enabled: bool = True
@@ -455,7 +455,7 @@ def load_settings() -> BotSettings:
         ),
         # 진입 거래량 가드
         min_entry_volume_ratio=_as_float(
-            os.getenv("MIN_ENTRY_VOLUME_RATIO", "0.15"),
+            os.getenv("MIN_ENTRY_VOLUME_RATIO", "15"),
             0.3,
         ),
         # 쿨다운/폴링
@@ -472,7 +472,7 @@ def load_settings() -> BotSettings:
         poll_fills_sec=_as_int(os.getenv("POLL_FILLS_SEC", "2"), 2),
         # 가드
         max_price_jump_pct=_as_float(os.getenv("MAX_PRICE_JUMP_PCT", "0.006"), 0.003),
-        max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.0008"), 0.0008),
+        max_spread_pct=_as_float(os.getenv("MAX_SPREAD_PCT", "0.002"), 0.002),
         max_entry_slippage_pct=_as_float(
             os.getenv("MAX_ENTRY_SLIPPAGE_PCT", "0.0005"),
             0.0005,
