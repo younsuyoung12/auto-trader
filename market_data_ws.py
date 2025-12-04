@@ -11,7 +11,7 @@ getter / 데이터 헬스 체크 유틸을 제공하는 모듈.
 - 심볼별 depth5 오더북(bids/asks, bestBid/bestAsk, spreadPct) 버퍼링
 - REST 히스토리 백필(preload_klines/backfill_klines_from_rest) 지원
   · run_bot_ws 부트스트랩(시작 시 초기 히스토리 채우기)에서만 사용
-  · 라이브 운영 중에는 WS 데이터만 사용(인위적인 캔들 생성/보정 없음)
+  · 라이브 운영 중에는 WS 데이터만 사용(인위적인 캔들 생성/보정 없음, 폴백 금지)
 - 버퍼 길이/지연/오더북 최신 여부 기반 데이터 헬스 스냅샷
   · get_health_snapshot(symbol), is_data_healthy(symbol)
 
@@ -38,13 +38,22 @@ getter / 데이터 헬스 체크 유틸을 제공하는 모듈.
    get_health_snapshot / is_data_healthy 헬퍼를 추가했다.
    - settings_ws.ws_required_tfs: 필수 타임프레임 목록
      (미지정 시 ws_subscribe_tfs 또는 기본 타임프레임 사용)
-   - settings_ws.ws_min_kline_buffer: TF 공통 최소 버퍼 길이 (기본 120)
-   - settings_ws.ws_max_kline_delay_sec: TF 공통 최대 허용 지연(sec, 기본 600)
+   - settings_ws.ws_min_kline_buffer: TF 공통 최소 버퍼 길이
+     (기본 60, 과도한 120에서 현실적인 값으로 조정)
+   - settings_ws.ws_max_kline_delay_sec: TF 공통 최대 허용 지연(sec)
+     (기본 120, 기존 600초(10분)에서 2분 수준으로 현실화)
    - settings_ws.ws_orderbook_max_delay_sec: 오더북 최대 허용 지연(sec, 기본 10)
 2) 오더북 버퍼에 bestBid / bestAsk / spreadPct(%) 를 함께 저장해
    유동성 상태를 상위 레이어에서 바로 확인할 수 있게 했다.
 3) 상단 설명에서 1m/5m/15m 언급을 제거하고, BingX가 지원하는
    멀티 타임프레임 구조로 정리했다.
+
+STRICT 원칙
+-----------------------------------------------------
+- WS/REST에서 받은 원본 데이터는 어떤 경우에도 보정·추론·폴백하지 않는다.
+- 캔들/오더북 데이터가 비정상(0/NaN/누락)인 경우 상위 레이어에서 그대로 FAIL 처리한다.
+- 이 파일에서 하는 일은 "순수 데이터 스트림을 안정적으로 수신/버퍼링" 까지이며,
+  데이터 자체를 꾸미거나 보정하지 않는다.
 """
 
 from __future__ import annotations
@@ -94,9 +103,17 @@ WS_INTERVALS: List[str] = getattr(SET, "ws_subscribe_tfs", None) or DEFAULT_INTE
 
 # 데이터 헬스 체크용 필수 타임프레임 / 지연/버퍼 기준값
 REQUIRED_INTERVALS: List[str] = ["1m", "5m", "15m"]
-KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 120))
-KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 600.0))  # 기본 10분
-ORDERBOOK_MAX_DELAY_SEC: float = float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0))
+
+# ✔ 1) KLINE_MIN_BUFFER 120 → 60 으로 현실적인 값으로 조정
+KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 60))
+
+# ✔ 7) KLINE_MAX_DELAY_SEC 기본값 600 → 120초로 축소 (실전용 지연 한계)
+KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 120.0))
+
+# 오더북은 기본 10초 지연 허용 (settings 에서 오버라이드 가능)
+ORDERBOOK_MAX_DELAY_SEC: float = float(
+    getattr(SET, "ws_orderbook_max_delay_sec", 10.0)
+)
 
 # { (symbol, interval): [(ts, o, h, l, c, v), ...] }
 _kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float, float]]] = {}
@@ -111,8 +128,8 @@ _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
 
+# 각 버퍼에 최대 500개까지 유지 (과거 히스토리용)
 MAX_KLINES = 500
-RECONNECT_WAIT = 15
 
 
 def _now_ms() -> int:
@@ -160,7 +177,11 @@ def _build_sub_msgs(symbol: str) -> List[Dict[str, Any]]:
 
 
 def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
-    """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다."""
+    """WS 로부터 받은 kline 데이터를 내부 버퍼에 반영한다.
+
+    - STRICT 원칙: ts <= 0 인 비정상 데이터는 버퍼에 넣지 않고 경고만 남긴다.
+    - o/h/l/c/v 는 그대로 float 캐스팅만 하고 보정/추론하지 않는다.
+    """
     key = (symbol, interval)
     ts = int(item.get("t") or item.get("T") or 0)
     if ts <= 0:
@@ -185,6 +206,7 @@ def _push_kline(symbol: str, interval: str, item: Dict[str, Any]) -> None:
         buf = _kline_buffers.setdefault(key, [])
         before_len = len(buf)
         if buf and buf[-1][0] == ts:
+            # 같은 ts 는 업데이트(대체)
             buf[-1] = (ts, o, h, l, c, v)
         else:
             buf.append((ts, o, h, l, c, v))
@@ -220,7 +242,12 @@ def _normalize_depth_side(side_val: Any) -> List[List[float]]:
         elif isinstance(row, dict):
             try:
                 price = float(row.get("price"))
-                qty = float(row.get("qty") or row.get("quantity") or row.get("size") or 0.0)
+                qty = float(
+                    row.get("qty")
+                    or row.get("quantity")
+                    or row.get("size")
+                    or 0.0
+                )
                 out.append([price, qty])
             except Exception:
                 continue
@@ -243,9 +270,16 @@ def _compute_spread_pct(bids: List[List[float]], asks: List[List[float]]) -> Opt
 
 
 def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
-    """depth payload 를 내부 버퍼에 저장한다."""
-    normalized_bids = _normalize_depth_side(payload.get("bids") or payload.get("buys") or [])
-    normalized_asks = _normalize_depth_side(payload.get("asks") or payload.get("sells") or [])
+    """depth payload 를 내부 버퍼에 저장한다.
+
+    - STRICT 원칙: bids/asks 를 그대로 float 변환만 하고 보정하지 않는다.
+    """
+    normalized_bids = _normalize_depth_side(
+        payload.get("bids") or payload.get("buys") or []
+    )
+    normalized_asks = _normalize_depth_side(
+        payload.get("asks") or payload.get("sells") or []
+    )
 
     now_ms = _now_ms()
     spread_pct = _compute_spread_pct(normalized_bids, normalized_asks)
@@ -419,8 +453,11 @@ def _on_close(ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
 
 
 def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
-    """WS 연결 직후 구독 메시지를 안정적으로 재전송하도록 강화된 버전."""
+    """WS 연결 직후 구독 메시지를 안정적으로 전송한다.
 
+    - 최대 5회까지 재전송 시도.
+    - 실패 시 ws.close()로 종료해 상위 루프에서 재연결을 유도한다.
+    """
     msgs = _build_sub_msgs(symbol)
 
     for m in msgs:
@@ -441,7 +478,6 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
             # 구독 실패는 '데이터 없음 → health_snapshot fail'로 이어지므로
             # 폴백 없이 즉시 치명적 로그만 남기고 재접속 루프로 넘긴다.
             log(f"[MD-WS] FATAL: subscribe failed permanently → reconnect required")
-            # ws.close() 강제 종료 → _runner() 재접속 실행
             try:
                 ws.close()
             except Exception:
@@ -467,6 +503,8 @@ def preload_klines(
         _kline_buffers[key] = trimmed
         buf_len = len(trimmed)
         if trimmed:
+            # REST 백필 시점에도 last_recv_ts 를 현재 시각으로 초기화하여
+            # health 체크가 즉시 delay_sec>로 FAIL 나지 않도록 한다.
             _kline_last_recv_ts[key] = _now_ms()
 
     if getattr(SET, "ws_log_enabled", True):
@@ -558,7 +596,7 @@ def backfill_klines_from_rest(
 
 
 def get_klines(symbol: str, interval: str, limit: int = 120):
-    """(ts, o, h, l, c) 튜플 리스트를 반환한다 (기존 포맷)."""
+    """(ts, o, h, l, c) 튜플 리스트를 반환한다 (기존 포맷 호환)."""
     key = (symbol, interval)
     with _kline_lock:
         buf = _kline_buffers.get(key, [])
@@ -718,6 +756,8 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
     {
         "symbol": "BTC-USDT",
         "overall_ok": True/False,
+        "overall_kline_ok": True/False,
+        "overall_orderbook_ok": True/False,
         "klines": {
             "1m": {...},
             "5m": {...},
@@ -726,16 +766,24 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
         "orderbook": {...},
         "checked_at_ms": 1234567890,
     }
+
+    - STRICT 유지: 여기서도 어떤 데이터도 조작/보정하지 않고,
+      상태만 판단해서 상위 레이어에 전달한다.
     """
     snapshot: Dict[str, Any] = {
         "symbol": symbol,
         "overall_ok": True,
+        "overall_kline_ok": True,
+        "overall_orderbook_ok": True,
         "klines": {},
         "orderbook": {},
         "checked_at_ms": _now_ms(),
     }
 
     overall_ok = True
+    overall_kline_ok = True
+    overall_orderbook_ok = True
+
     kline_map: Dict[str, Any] = {}
 
     for iv in REQUIRED_INTERVALS:
@@ -743,14 +791,18 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
         kline_map[iv] = k_status
         if not k_status.get("ok", False):
             overall_ok = False
+            overall_kline_ok = False
 
     ob_status = _compute_orderbook_health(symbol)
     if not ob_status.get("ok", False):
         overall_ok = False
+        overall_orderbook_ok = False
 
     snapshot["klines"] = kline_map
     snapshot["orderbook"] = ob_status
     snapshot["overall_ok"] = overall_ok
+    snapshot["overall_kline_ok"] = overall_kline_ok
+    snapshot["overall_orderbook_ok"] = overall_orderbook_ok
     return snapshot
 
 
@@ -759,37 +811,137 @@ def is_data_healthy(symbol: str) -> bool:
     snap = get_health_snapshot(symbol)
     return bool(snap.get("overall_ok", False))
 
+
 # -------------------------------------
-# (기존 코드 끝부분)
+# WS 루프 및 자동 재연결 로직
 # -------------------------------------
 
 def start_ws_loop(symbol: str) -> None:
-    # ★ 내가 준 최적화 버전 그대로 복붙
+    """지정 심볼에 대한 WS 루프를 백그라운드로 시작한다.
+
+    적용된 핵심 정책:
+    - ✔ 2) ping_interval=3 / ping_timeout=2 로 dead-connection 을 빠르게 감지
+    - ✔ 3) 캔들/오더북 지연 및 헬스 FAIL 시 watchdog 이 ws.close() 호출
+    - ✔ 4) health FAIL → WS 재연결 자동화 (watchdog + _runner 루프)
+    - ✔ 5) 재연결 알고리즘 강화 (짧게 시작 → 점진적 backoff, 장기간 연결 시 backoff 리셋)
+    """
+
     url = WS_URL
 
     def _runner() -> None:
-        retry_wait = 3
+        retry_wait = 1.0  # 첫 재연결 대기 시간(초)
         while True:
+            session_dur = 0.0
             try:
                 log(f"[MD-WS] connecting to {url} ...")
                 ws = websocket.WebSocketApp(
                     url,
-                    on_open=lambda ws: _on_open(symbol, ws),
-                    on_message=lambda ws, message: _on_message(symbol, ws, message),
-                    on_error=lambda ws, error: _on_error(ws, error),
-                    on_close=lambda ws, code, msg: _on_close(ws, code, msg),
+                    on_open=lambda ws_: _on_open(symbol, ws_),
+                    on_message=lambda ws_, message: _on_message(symbol, ws_, message),
+                    on_error=lambda ws_, error: _on_error(ws_, error),
+                    on_close=lambda ws_, code, msg: _on_close(ws_, code, msg),
                 )
-                ws.run_forever(ping_interval=20, ping_timeout=8)
+
+                start_ts = time.time()
+
+                def _watchdog() -> None:
+                    """WS 연결 상태와 데이터 헬스를 모니터링하여 필요 시 강제 재연결한다.
+
+                    STRICT 원칙:
+                    - 데이터가 이상하면 보정하지 않고, 단순히 WS를 재연결해서
+                      "새로운 순수 데이터 스트림"만 다시 받는다.
+                    """
+                    # 워밍업 시간: 처음 연결 직후 일정 시간은 헬스 체크를 건너뛴다.
+                    WARMUP_SEC = 15.0
+                    while True:
+                        time.sleep(5.0)
+                        try:
+                            # 연결이 이미 끊겼으면 워치독 종료
+                            if ws.sock is None or not ws.sock.connected:
+                                break
+
+                            # 워밍업 구간 동안은 체크하지 않음
+                            if time.time() - start_ts < WARMUP_SEC:
+                                continue
+
+                            snap = get_health_snapshot(symbol)
+                            need_close = False
+
+                            # ✔ 3) 캔들(1m/5m/15m) 지연/헬스 문제 감시
+                            for iv, st in snap.get("klines", {}).items():
+                                reasons = st.get("reasons", []) or []
+                                for r in reasons:
+                                    # buffer_len 부족만으로는 재연결 대상 아님.
+                                    if r.startswith("delay_sec>"):
+                                        log(
+                                            f"[MD-WS WATCHDOG] {symbol} {iv} unhealthy (reason={r}) → ws.close()"
+                                        )
+                                        need_close = True
+                                        break
+                                if need_close:
+                                    break
+
+                            # ✔ 3) 오더북 지연/부재/ts 문제 감시
+                            if not need_close:
+                                ob_status = snap.get("orderbook") or {}
+                                for r in ob_status.get("reasons", []) or []:
+                                    if (
+                                        r.startswith("delay_sec>")
+                                        or r in ("no_orderbook", "no_ts")
+                                    ):
+                                        log(
+                                            f"[MD-WS WATCHDOG] {symbol} orderbook unhealthy (reason={r}) → ws.close()"
+                                        )
+                                        need_close = True
+                                        break
+
+                            # ✔ 4) health FAIL → WS 재연결 자동화 (ws.close() → run_forever 반환 → _runner 재시도)
+                            if need_close:
+                                try:
+                                    ws.close()
+                                except Exception:
+                                    pass
+                                break
+
+                        except Exception as e:
+                            # 워치독 오류는 WS 동작에 영향을 주지 않도록 로그만 남김
+                            try:
+                                log(f"[MD-WS WATCHDOG] exception: {e}")
+                            except Exception:
+                                pass
+                            continue
+
+                # 워치독 쓰레드 시작
+                threading.Thread(
+                    target=_watchdog,
+                    name=f"md-ws-watchdog-{symbol}",
+                    daemon=True,
+                ).start()
+
+                # ✔ 2) ping_interval=3 / ping_timeout=2 적용
+                ws.run_forever(ping_interval=3, ping_timeout=2)
+                session_dur = time.time() - start_ts
                 log("[MD-WS] WS disconnected → retrying ...")
             except Exception as e:
                 log(f"[MD-WS] run_forever exception: {e}")
+
+            # ✔ 5) 재연결 알고리즘 강화
+            # - 60초 이상 안정적으로 유지된 세션이면 backoff 리셋
+            # - 그보다 짧게 끊기면 backoff 를 2배씩 증가 (최대 10초)
+            if session_dur > 60.0:
+                retry_wait = 1.0
+            else:
+                retry_wait = min(retry_wait * 2.0, 10.0)
+
+            try:
+                log(f"[MD-WS] reconnecting after {retry_wait:.1f}s ...")
+            except Exception:
+                pass
             time.sleep(retry_wait)
-            retry_wait = min(retry_wait + 2, 10)
 
     th = threading.Thread(target=_runner, name=f"md-ws-{symbol}", daemon=True)
     th.start()
     log(f"[MD-WS] background ws started for {symbol}")
-
 
 
 __all__ = [
