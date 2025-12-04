@@ -660,44 +660,67 @@ def _try_order(payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def place_market(symbol: str, side: str, qty: float) -> Dict[str, Any]:
-    """시장가 주문."""
+    """
+    Market-Limit Hybrid 주문 (시장가처럼 빠르지만 슬리피지는 절대 안 나는 방식)
+    """
     norm_qty = _normalize_qty(symbol, qty)
 
-    log(f"[PLACE MARKET] symbol={symbol} side={side} qty_req={qty} qty_norm={norm_qty}")
+    # WS 실제 가격 읽기
+    try:
+        from market_data_ws import get_orderbook
+        ob = get_orderbook(symbol, limit=5)
+        ws_price = float(ob.get("markPrice") or ob.get("lastPrice") or 0)
+    except:
+        ws_price = 0.0
 
-    payloads = [
-        {
+    if ws_price <= 0:
+        # WS 가격 실패 → 안전하게 일반 MARKET 사용
+        log(f"[PLACE HYBRID] WS price invalid → fallback MARKET")
+        payload = {
             "symbol": symbol,
             "side": side,
             "positionSide": "BOTH",
             "type": "MARKET",
             "quantity": norm_qty,
             "recvWindow": 5000,
-        },
-        {
-            "symbol": symbol,
-            "side": side,
-            "type": "MARKET",
-            "quantity": norm_qty,
-            "recvWindow": 5000,
-        },
-        {
-            "symbol": symbol,
-            "side": side,
-            "positionSide": "LONG" if side.upper() == "BUY" else "SHORT",
-            "type": "MARKET",
-            "quantity": norm_qty,
-            "recvWindow": 5000,
-        },
-    ]
+        }
+        return _try_order([payload])
+
+    # 🔥 허용 슬리피지 0.05% (원하면 0.03~0.08 조절) 
+    limit_price = ws_price * 1.0005
+    limit_price = round(limit_price, 2)
+
+    log(
+        f"[PLACE HYBRID] symbol={symbol} side={side} qty={norm_qty} "
+        f"ws_price={ws_price} limit_price={limit_price}"
+    )
+
+    # LIMIT + IOC → 즉시체결 or 취소 (슬리피지 차단)
+    payload = {
+        "symbol": symbol,
+        "side": side,
+        "positionSide": "BOTH",
+        "type": "LIMIT",
+        "price": limit_price,
+        "quantity": norm_qty,
+        "timeInForce": "IOC",
+        "recvWindow": 5000,
+    }
 
     try:
-        return _try_order(payloads)
-    except Exception:
-        min_qty = _normalize_qty(symbol, 0)
-        log(f"[PLACE MARKET] norm qty fail -> retry with min step qty: {min_qty}")
-        payloads_min = [{**p, "quantity": min_qty} for p in payloads]
-        return _try_order(payloads_min)
+        return _try_order([payload])
+    except Exception as e:
+        # LIMIT 실패 → fallback MARKET
+        log(f"[PLACE HYBRID] limit fail → fallback MARKET: {e}")
+        payload_mkt = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "BOTH",
+            "type": "MARKET",
+            "quantity": norm_qty,
+            "recvWindow": 5000,
+        }
+        return _try_order([payload_mkt])
 
 
 def place_conditional(

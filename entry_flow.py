@@ -999,18 +999,62 @@ def try_open_new_position(
         return None, sleep_sec
 
     # (4-8) GPT 판단에 따른 일반 SKIP
-    #     (ENTER/ADJUST 가 아닌 경우, 또는 final_action=SKIP)
     if final_action != "ENTER":
-        # GPT reason만 텔레그램에 명확히 전달
-        clean_reason = gpt_reason or "no_reason"
-        msg = f"[GPT_ENTRY][SKIP] {clean_reason}"
-        
-        send_tg(msg)        # ✅ reason 즉시 전송 (쿨다운 없음)
+
+        # 지능형 SKIP 리포트 생성 (GPT 호출 없음)
+        # available: extra, preview_score, guard_snapshot, chosen_signal, regime_features 등
+        skip_parts = []
+
+        # 1) 추세 강도
+        ts = extra.get("trend_strength") if isinstance(extra, dict) else None
+        if isinstance(ts, (int, float)):
+            skip_parts.append(f"추세약함(ts={ts:.3f})" if ts < 0.1 else f"추세중립(ts={ts:.3f})")
+
+        # 2) 변동성
+        vol = extra.get("volatility") if isinstance(extra, dict) else None
+        if isinstance(vol, (int, float)):
+            skip_parts.append(f"변동성부족(vol={vol:.4f})" if vol < 0.003 else f"변동성중간(vol={vol:.4f})")
+
+        # 3) 거래량
+        vz = extra.get("volume_zscore") if isinstance(extra, dict) else None
+        if isinstance(vz, (int, float)):
+            if vz < -1:
+               skip_parts.append(f"거래량부족(z={vz:.2f})")
+            elif vz > 1:
+               skip_parts.append(f"거래량증가(z={vz:.2f})")
+
+        # 4) 오더북
+        ob_imb = extra.get("depth_imbalance") if isinstance(extra, dict) else None
+        if isinstance(ob_imb, (int, float)):
+            if abs(ob_imb) < 0.1:
+               skip_parts.append("호가균형")
+            elif ob_imb > 0:
+               skip_parts.append("매수우위(ob)")
+            else:
+               skip_parts.append("매도우위(ob)")
+
+        # 5) MTF 방향
+        mtf = extra.get("majority_trend") if isinstance(extra, dict) else None
+        if isinstance(mtf, str) and mtf:
+            skip_parts.append(f"MTF={mtf}")
+
+        # 6) preview entry_score
+        if isinstance(preview_score, (int, float)):
+            if preview_score < 30:
+                skip_parts.append(f"entry_score낮음({preview_score:.1f})")
+
+        # SKIP 리포트 문장 구성
+        skip_report = " / ".join(skip_parts) if skip_parts else "신뢰도 낮음"
+
+        # 최종 메시지 생성
+        msg = f"[GPT_ENTRY][SKIP] {skip_report} → 진입 보류"
+
+        send_tg(msg)
         log(msg)
         try:
-            send_skip_tg(msg)   # → reason을 그대로 텔레그램으로 전달
+           send_skip_tg(msg)
         except Exception as te:
-            log(f"[GPT_ENTRY] send_skip_tg failed on general-skip: {te}")
+           log(f"[GPT_ENTRY] send_skip_tg failed on general-skip: {te}")
 
         log_skip_event(
             symbol=symbol,
@@ -1018,15 +1062,16 @@ def try_open_new_position(
             source="entry_flow.gpt_decision",
             side=chosen_signal,
             reason=f"gpt_action_{gpt_action or 'NONE'}",
-            extra={"gpt_result": gpt_result},
+            extra={"gpt_result": gpt_result, "skip_report": skip_report},
         )
 
         sleep_sec = float(
             gpt_result.get(
-                "sleep_after_sec", getattr(settings, "gpt_skip_sleep_sec", 3.0)
+                 "sleep_after_sec", getattr(settings, "gpt_skip_sleep_sec", 3.0)
             )
         )
         return None, sleep_sec
+
 
     # (4-9) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
     effective_risk_pct = float(
