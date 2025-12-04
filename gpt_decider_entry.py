@@ -714,22 +714,11 @@ def _build_entry_payload(
     base_effective_risk_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    ENTRY 결정에 사용할 payload dict를 구성한다.
+    ENTRY에서 사용할 payload를 FULL FEATURE 버전으로 구성.
+    (요약 필터링 제거 → market_features 전체 전달)
     """
-    extra = dict(market_features) if market_features else {}
-    meaningful_keys = [
-        "trend_strength",
-        "volatility",
-        "volume_score",
-        "pattern_summary",
-        "regime",
-        "time_features",
-    ]
-    extra_filtered: Dict[str, Any] = {}
-    for k in meaningful_keys:
-        if k in extra:
-            extra_filtered[k] = extra[k]
 
+    # 🔥 EXIT처럼 FULL FEATURE 전체를 GPT ENTRY에 전달
     payload: Dict[str, Any] = {
         "symbol": symbol,
         "source": source,
@@ -737,9 +726,10 @@ def _build_entry_payload(
         "base_tv_pct": base_tv_pct,
         "base_sl_pct": base_sl_pct,
         "base_risk_pct": base_risk_pct,
-        "market_features": extra_filtered,
+        "market_features": market_features,  # ← 핵심 변경점
     }
 
+    # 원래 코드의 entry_meta 유지
     entry_meta: Dict[str, Any] = {}
     if signal_source:
         entry_meta["signal_source"] = signal_source
@@ -754,12 +744,6 @@ def _build_entry_payload(
 
     if entry_meta:
         payload["entry_meta"] = entry_meta
-
-    important_keys = ["trend_strength", "volatility", "regime"]
-    if isinstance(extra_filtered, dict):
-        for k, v in extra_filtered.items():
-            if k in important_keys:
-                payload[k] = v
 
     return payload
 
