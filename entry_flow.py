@@ -5,6 +5,16 @@
 - run_bot.py / run_bot_ws.py 에서 호출하는 진입 실행 레이어.
 - WS 시세 + market_features_ws 시그널 → gpt_trader 판단 → 가드 → 주문 → 로그/DB 기록.
 
+2025-12-04 변경 요약 (GPT SKIP 상세 로그 + 자연어 해석)
+-----------------------------------------------------
+- GPT 진입 결과가 SKIP 일 때, 단순 레이블이 아니라
+  주요 지표(trend_strength / volatility / volume_zscore / depth_imbalance /
+  majority_trend / entry_score)를 사람 기준으로 해석한 문장을 함께 텔레그램 전송.
+  · 예: "추세 거의 없음", "변동성 매우 낮음", "강한 매도 우위", "MTF 방향 불일치" 등.
+- gpt_result["reason"] 을 항상 메시지에 포함해 GPT가 판단을 내린 핵심 코멘트를
+  바로 확인할 수 있도록 개선.
+- 기존 [ENTRY_PREVIEW] 점수/리스크/TP·SL 알림과 EntryScore 저장 흐름은 유지.
+
 2025-12-01 변경 요약 (TA-Lib EntryScore 정합 + NaN 가드)
 -----------------------------------------------------
 - market_features_ws.get_trading_signal(...) 이 내려주는 extra["atr_fast"], extra["atr_slow"] 를
@@ -17,15 +27,10 @@
   TA-Lib 지표가 아직 안정되지 않은 초기 구간에서는 진입 자체를 막고
   로그/skip_event 만 남기도록 변경.
 
-2025-11-20 변경 요약
------------------------------------------------------
-- 레거시 레짐 전용 의사결정 로직 제거.
-- GPT 전담 엔트리 구조로 단순화.
-
 2025-11-21 변경 요약 (GPT 엔트리 쿨다운 + PREVIEW 스팸 제어)
 -----------------------------------------------------
 - GPT 엔트리 쿨다운을 entry_flow 레벨에서 추가.
-  · settings.gpt_entry_cooldown_sec / ENV GPT_ENTRY_COOLDOWN_SEC 로 설정 (기본 30초).
+  · settings.gpt_entry_cooldown_sec / ENV GPT_ENTRY_COOLDOWN_SEC 로 설정 (기본 1초).
   · 쿨다운 중에는 PREVIEW/GPT 호출 모두 SKIP, gpt_entry_cooldown 이벤트만 기록.
 - GPT 쿨다운 구간에서는 Entry PREVIEW 텔레그램도 발생하지 않도록 차단.
 """
@@ -58,9 +63,6 @@ from signals_logger import (
     log_skip_event,
 )
 from gpt_trader import decide_entry_with_gpt_trader
-
-from gpt_decider_entry import ask_entry_decision
-
 
 # ✅ 시그널/피처 공급자
 # - market_features_ws.get_trading_signal 이 아직 없더라도 ImportError 로
@@ -109,7 +111,7 @@ def _get_gpt_entry_cooldown_sec(settings: Any) -> float:
     우선순위:
     1) settings.gpt_entry_cooldown_sec (숫자형) 이 있으면 사용
     2) ENV GPT_ENTRY_COOLDOWN_SEC 이 있으면 float 로 파싱해서 사용
-    3) 둘 다 없으면 _DEFAULT_GPT_ENTRY_COOLDOWN_SEC (기본 30초)
+    3) 둘 다 없으면 _DEFAULT_GPT_ENTRY_COOLDOWN_SEC (현재 기본 1초)
     """
     val = getattr(settings, "gpt_entry_cooldown_sec", None)
     if isinstance(val, (int, float)):
@@ -970,8 +972,7 @@ def try_open_new_position(
         sleep_sec = float(
             gpt_result.get(
                 "sleep_after_sec",
-                getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 5.0
-                        ),
+                getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 5.0),
             )
         )
         return None, sleep_sec
@@ -1003,35 +1004,39 @@ def try_open_new_position(
 
         # 지능형 SKIP 리포트 생성 (GPT 호출 없음)
         # available: extra, preview_score, guard_snapshot, chosen_signal, regime_features 등
-        skip_parts = []
+        skip_parts: List[str] = []
 
         # 1) 추세 강도
         ts = extra.get("trend_strength") if isinstance(extra, dict) else None
         if isinstance(ts, (int, float)):
-            skip_parts.append(f"추세약함(ts={ts:.3f})" if ts < 0.1 else f"추세중립(ts={ts:.3f})")
+            skip_parts.append(
+                f"추세약함(ts={ts:.3f})" if ts < 0.1 else f"추세중립(ts={ts:.3f})"
+            )
 
         # 2) 변동성
         vol = extra.get("volatility") if isinstance(extra, dict) else None
         if isinstance(vol, (int, float)):
-            skip_parts.append(f"변동성부족(vol={vol:.4f})" if vol < 0.003 else f"변동성중간(vol={vol:.4f})")
+            skip_parts.append(
+                f"변동성부족(vol={vol:.4f})" if vol < 0.003 else f"변동성중간(vol={vol:.4f})"
+            )
 
         # 3) 거래량
         vz = extra.get("volume_zscore") if isinstance(extra, dict) else None
         if isinstance(vz, (int, float)):
             if vz < -1:
-               skip_parts.append(f"거래량부족(z={vz:.2f})")
+                skip_parts.append(f"거래량부족(z={vz:.2f})")
             elif vz > 1:
-               skip_parts.append(f"거래량증가(z={vz:.2f})")
+                skip_parts.append(f"거래량증가(z={vz:.2f})")
 
         # 4) 오더북
         ob_imb = extra.get("depth_imbalance") if isinstance(extra, dict) else None
         if isinstance(ob_imb, (int, float)):
             if abs(ob_imb) < 0.1:
-               skip_parts.append("호가균형")
+                skip_parts.append("호가균형")
             elif ob_imb > 0:
-               skip_parts.append("매수우위(ob)")
+                skip_parts.append("매수우위(ob)")
             else:
-               skip_parts.append("매도우위(ob)")
+                skip_parts.append("매도우위(ob)")
 
         # 5) MTF 방향
         mtf = extra.get("majority_trend") if isinstance(extra, dict) else None
@@ -1043,18 +1048,105 @@ def try_open_new_position(
             if preview_score < 30:
                 skip_parts.append(f"entry_score낮음({preview_score:.1f})")
 
-        # SKIP 리포트 문장 구성
+        # SKIP 리포트 문장 구성 (요약 레이블)
         skip_report = " / ".join(skip_parts) if skip_parts else "신뢰도 낮음"
 
-        # 최종 메시지 생성
-        msg = f"[GPT_ENTRY][SKIP] {skip_report} → 진입 보류"
+        # ─────────────────────────────────────
+        # 사람이 바로 이해할 수 있는 해석 문자열 구성
+        # ─────────────────────────────────────
+        interpret_parts: List[str] = []
 
-        send_tg(msg)
-        log(msg)
+        # 추세 강도 해석
+        if isinstance(ts, (int, float)):
+            if ts < 0.02:
+                interpret_parts.append(f"추세 거의 없음(trend_strength={ts:.4f})")
+            elif ts < 0.05:
+                interpret_parts.append(f"약한 추세(trend_strength={ts:.4f})")
+            else:
+                interpret_parts.append(f"뚜렷한 추세(trend_strength={ts:.4f})")
+
+        # 변동성 해석
+        if isinstance(vol, (int, float)):
+            if vol < 0.003:
+                interpret_parts.append(f"변동성 매우 낮음(vol={vol:.4f})")
+            elif vol < 0.008:
+                interpret_parts.append(f"변동성 보통(vol={vol:.4f})")
+            else:
+                interpret_parts.append(f"변동성 높음(vol={vol:.4f})")
+
+        # 거래량 해석
+        if isinstance(vz, (int, float)):
+            if vz < -1:
+                interpret_parts.append(f"거래량 부족(vz={vz:.2f})")
+            elif vz > 1:
+                interpret_parts.append(f"거래량 증가(vz={vz:.2f})")
+            else:
+                interpret_parts.append(f"거래량 평범(vz={vz:.2f})")
+
+        # 오더북 해석
+        if isinstance(ob_imb, (int, float)):
+            if ob_imb < -0.2:
+                interpret_parts.append(f"강한 매도 우위(imbalance={ob_imb:.2f})")
+            elif ob_imb > 0.2:
+                interpret_parts.append(f"강한 매수 우위(imbalance={ob_imb:.2f})")
+            else:
+                interpret_parts.append(f"호가 균형(imbalance={ob_imb:.2f})")
+
+        # MTF 방향 해석
+        if isinstance(mtf, str):
+            if mtf == "MIXED":
+                interpret_parts.append("MTF 방향 불일치(majority_trend=MIXED)")
+            elif mtf == "LONG":
+                interpret_parts.append("MTF 상방 정렬")
+            elif mtf == "SHORT":
+                interpret_parts.append("MTF 하방 정렬")
+
+        # EntryScore 해석
+        if isinstance(preview_score, (int, float)):
+            if preview_score < 30:
+                interpret_parts.append(
+                    f"엔트리 점수 낮음(entry_score={preview_score:.1f}) → 보수적 스킵 구간"
+                )
+            elif preview_score > 70:
+                interpret_parts.append(
+                    f"엔트리 점수는 높지만 다른 지표가 스킵을 유도(entry_score={preview_score:.1f})"
+                )
+
+        interpret_msg = "\n  · ".join(interpret_parts) if interpret_parts else ""
+
+        # 🔥 GPT가 준 reason 가져오기
+        gpt_reason = gpt_result.get("reason")
+        if not isinstance(gpt_reason, str):
+            gpt_reason = ""
+
+        # 🔥 세밀한 SKIP 상세 메시지 구성
+        lines: List[str] = [
+            "[GPT_ENTRY][SKIP]",
+            f"- 요약: {skip_report}",
+            f"- GPT 이유: {gpt_reason or '사유 미제공'}",
+        ]
+        if interpret_msg:
+            lines.append("- 해석:")
+            lines.append(f"  · {interpret_msg}")
+
+        # raw 지표도 하단에 별도로 붙여서, 필요하면 숫자 레벨까지 확인 가능
+        lines.append("- raw 지표:")
+        lines.append(f"  · trend_strength={ts}")
+        lines.append(f"  · volatility={vol}")
+        lines.append(f"  · volume_zscore={vz}")
+        lines.append(f"  · depth_imbalance={ob_imb}")
+        lines.append(f"  · majority_trend={mtf}")
+        lines.append(f"  · entry_score_preview={preview_score}")
+
+        detailed_msg = "\n".join(lines)
+
+        send_tg(detailed_msg)
+        log(detailed_msg)
+
         try:
-           send_skip_tg(msg)
+            send_skip_tg(detailed_msg)
         except Exception as te:
-           log(f"[GPT_ENTRY] send_skip_tg failed on general-skip: {te}")
+            log(f"[GPT_ENTRY] send_skip_tg failed on general-skip: {te}")
 
         log_skip_event(
             symbol=symbol,
@@ -1067,11 +1159,10 @@ def try_open_new_position(
 
         sleep_sec = float(
             gpt_result.get(
-                 "sleep_after_sec", getattr(settings, "gpt_skip_sleep_sec", 3.0)
+                "sleep_after_sec", getattr(settings, "gpt_skip_sleep_sec", 3.0)
             )
         )
         return None, sleep_sec
-
 
     # (4-9) GPT 가 승인한 리스크/TP/SL 및 가드 조정값 적용
     effective_risk_pct = float(
@@ -1089,11 +1180,10 @@ def try_open_new_position(
             guard_adjustments = {}
 
     # GPT 승인/보정 결과 텔레그램 알림 (정보용)
-
     try:
-        # 🔥 먼저 진입 이유(reason)만 깔끔하게 전송 (추가한 코드)
-        send_tg(f"[GPT_ENTRY][ENTER] {gpt_reason or 'no_reason'}")
-        
+        # 🔥 먼저 진입 이유(reason)만 깔끔하게 전송
+        send_tg(f"[GPT_ENTRY][ENTER] {gpt_reason or '진입 사유 미제공'}")
+
         side_up = (chosen_signal or "").upper()
         if side_up == "LONG":
             side_ko = "롱"
@@ -1232,7 +1322,7 @@ def try_open_new_position(
                 setattr(settings, key, val)
             except Exception:
                 pass
-  
+
     # (5-6) 진입에 사용할 기준 가격 계산 (markPrice 우선)
     price_for_qty = float(last_price) if last_price else 0.0
     price_for_hint = price_for_qty
@@ -1241,11 +1331,12 @@ def try_open_new_position(
 
     # 1) markPrice 가져오기
     try:
-       from market_data_ws import get_orderbook
-       ob = get_orderbook(symbol, limit=5)
-       mark = ob.get("markPrice")
-       if mark:
-          mark = float(mark)
+        from market_data_ws import get_orderbook
+
+        ob = get_orderbook(symbol, limit=5)
+        mark = ob.get("markPrice")
+        if mark:
+            mark = float(mark)
     except Exception:
         mark = None
 
@@ -1268,7 +1359,7 @@ def try_open_new_position(
                 price_for_hint = float(best_ask)
             else:
                 price_for_hint = float(best_bid)
-    
+
     # (6) 실제 주문 수량 계산 (여기서 qty가 처음 정의됨 → 절대 위로 올라가면 안 됨)
     notional = avail * effective_risk_pct * leverage
     qty = notional / max(float(price_for_qty), 1.0)
@@ -1278,27 +1369,27 @@ def try_open_new_position(
     min_qty = float(getattr(settings, "min_qty", qty_step))
 
     def _round_step(x: float, step: float) -> float:
-         if step <= 0:
-             return x
-         return math.floor(x / step) * step
+        if step <= 0:
+            return x
+        return math.floor(x / step) * step
 
     qty = _round_step(qty, qty_step)
     if qty < min_qty:
-       try:
-           send_skip_tg(
-               f"[SKIP] qty_too_small: qty={qty:.8f} < min_qty={min_qty:.8f}"
-           )
-       except Exception as te:
-           log(f"[ENTRY_QTY] send_skip_tg failed on qty_too_small: {te}")
-       log_skip_event(
-           symbol=symbol,
-           regime=regime_label,
-           source="entry_flow.qty",
-           side=chosen_signal,
-           reason="qty_too_small",
-           extra={"qty": qty, "min_qty": min_qty, "notional": notional},
-       )
-       return None, 5.0
+        try:
+            send_skip_tg(
+                f"[SKIP] qty_too_small: qty={qty:.8f} < min_qty={min_qty:.8f}"
+            )
+        except Exception as te:
+            log(f"[ENTRY_QTY] send_skip_tg failed on qty_too_small: {te}")
+        log_skip_event(
+            symbol=symbol,
+            regime=regime_label,
+            source="entry_flow.qty",
+            side=chosen_signal,
+            reason="qty_too_small",
+            extra={"qty": qty, "min_qty": min_qty, "notional": notional},
+        )
+        return None, 5.0
 
     # (7) 실제 주문 실행
     side = "BUY" if chosen_signal == "LONG" else "SELL"
@@ -1310,9 +1401,7 @@ def try_open_new_position(
     sl_floor_ratio = None
     if isinstance(extra, dict):
         soft_mode = bool(
-            extra.get("soft_mode")
-            or extra.get("soft")
-            or False
+            extra.get("soft_mode") or extra.get("soft") or False
         )
         _sl_floor = extra.get("sl_floor_ratio")
         if isinstance(_sl_floor, (int, float)):
