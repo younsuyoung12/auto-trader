@@ -199,7 +199,6 @@ def _is_param_error(exc: Exception) -> bool:
     return any(n in msg for n in needles)
 
 
-# ─────────────────────────────
 # 슬리피지 하드 가드 (틱 기반)
 # ─────────────────────────────
 def _check_entry_slippage_and_maybe_close(
@@ -210,12 +209,21 @@ def _check_entry_slippage_and_maybe_close(
     expected_price: float,
     fill_price: float,
 ) -> bool:
-    """진입 직후 슬리피지를 검사해 허용 범위를 넘으면 알림/강제 청산."""
+    """진입 직후 슬리피지를 검사하고 경고만 보내며 절대 자동 청산하지 않는다."""
+
+    # markPrice 기반 기대가격 계산
     try:
-        exp = float(expected_price)
+        from market_data_ws import get_orderbook
+        ob = get_orderbook(symbol, limit=5)
+        mark = ob.get("markPrice")
+        if mark:
+            exp = float(mark)   # markPrice 사용
+        else:
+            exp = float(expected_price)
         fill = float(fill_price)
     except Exception:
-        return True
+        exp = float(expected_price)
+        fill = float(fill_price)
 
     if exp <= 0 or fill <= 0:
         return True
@@ -223,49 +231,32 @@ def _check_entry_slippage_and_maybe_close(
     diff_abs = abs(fill - exp)
     tick_size = _get_tick_size(symbol)
     if tick_size <= 0:
-        # tick size 를 알 수 없으면 가드를 비활성화
         return True
 
     diff_ticks = diff_abs / tick_size
     max_ticks = float(getattr(SET, "max_entry_slippage_ticks", 20) or 0.0)
-    if max_ticks <= 0:
-        # 하드 가드 비활성화
-        return True
 
-    if diff_ticks <= max_ticks:
-        return True
+    # 슬리피지 초과 시 경고만 보내고 절대 자동청산하지 않음
+    if diff_ticks > max_ticks:
+        pct_100 = (diff_abs / exp) * 100.0
+        msg = (
+            "⚠️ 진입 슬리피지 경고 (자동청산 없음)\n"
+            f"- 심볼: {symbol}\n"
+            f"- 방향: {side_req}\n"
+            f"- markPrice 기준 기대가: {exp:.2f}\n"
+            f"- 실제 체결가: {fill:.2f}\n"
+            f"- 차이: {diff_abs:.2f} ≒ {diff_ticks:.1f} ticks (tick={tick_size})\n"
+            f"- 비율: {pct_100:.3f}%\n"
+            f"- 허용 한도: {max_ticks:.1f} ticks\n"
+        )
+        log(msg)
+        try:
+            send_tg(msg)
+        except:
+            pass
 
-    # 허용 틱 수를 넘은 경우
-    pct_100 = (diff_abs / exp) * 100.0
-    msg = (
-        "⚠️ 진입 슬리피지 하드 가드 발동 (틱 기준)\n"
-        f"- 심볼: {symbol}\n"
-        f"- 방향: {side_req}\n"
-        f"- 기대 진입가: {exp:.2f}\n"
-        f"- 실제 체결가: {fill:.2f}\n"
-        f"- 차이: {diff_abs:.2f} ≒ {diff_ticks:.1f} ticks (tick={tick_size})\n"
-        f"- 대략 비율: {pct_100:.3f}%\n"
-        f"- 허용 한도: {max_ticks:.1f} ticks\n"
-    )
-    log(msg)
-    try:
-        send_tg(msg)
-    except Exception:
-        pass
-
-    auto_close = bool(getattr(SET, "auto_close_on_heavy_slippage", False))
-    if not auto_close:
-        # 알림만 보내고 포지션은 유지
-        return True
-
-    # 슬리피지가 심각하고 auto_close_on_heavy_slippage 가 True 인 경우 강제 청산
-    try:
-        close_position_market(symbol=symbol, side_open=side_req, qty=qty)
-    except Exception as e:
-        log(f"[SLIPPAGE_GUARD] close_position_market failed: {e}")
-    return False
-
-
+    # 자동 청산 절대 없음 → 항상 True
+    return True
 # ─────────────────────────────
 # 계좌/포지션/주문 조회 + 진입/청산
 # ─────────────────────────────

@@ -404,6 +404,63 @@ def _build_exit_context(
     except Exception as e:  # pragma: no cover - 방어적 로그
         log(f"[PW][REGIME_FEAT] context build error symbol={trade.symbol}: {e}")
 
+    # ============================================================
+    # 🔥 [추가] EXIT도 ENTRY처럼 전체 WS 시장 정보를 GPT에게 전달
+    # ============================================================
+    # ENTRY에서는 build_entry_features_ws()를 통해 1m~15m + 오더북 + 패턴 + MTF
+    # 전체 시장 구조를 GPT가 본다.
+    #
+    # 그래서 EXIT도 동일하게 전체 피처를 GPT에게 전달하도록 확장함.
+    # 이렇게 해야 reason이 풍부해지고,
+    # 진입 때와 같은 수준의 시장 판단 정확도를 확보할 수 있음.
+    # ============================================================
+
+    try:
+        from market_features_ws import build_entry_features_ws
+        full_features = build_entry_features_ws(trade.symbol)
+        ctx["full_market_features"] = full_features
+    except Exception as e:
+        log(f"[PW][EXIT_FULL_FEATURES] failed: {e}")
+
+    # ============================================================
+    # 🔥 ENTRY처럼 패턴엔진 시리즈도 EXIT에 평탄화해서 넣는 부분 (여기에 붙임)
+    # ============================================================
+
+    try:
+        fm = full_features  # ENTRY 전체 WS features
+
+        # timeframes(1m/5m/15m) 패턴 시리즈 추출
+        tf_map = fm.get("timeframes", {})
+
+        for iv in ("1m", "5m", "15m"):
+            t = tf_map.get(iv)
+            if not t:
+                continue
+
+            # raw OHLCV 20개
+            if "raw_ohlcv_last20" in t:
+                ctx[f"{iv}_raw_ohlcv_last20"] = t["raw_ohlcv_last20"]
+
+            # indicators → rsi_series, macd_hist_series
+            indicators = t.get("indicators", {})
+            if "rsi_series" in indicators:
+                ctx[f"{iv}_rsi_series"] = indicators["rsi_series"]
+            if "macd_hist_series" in indicators:
+                ctx[f"{iv}_macd_hist_series"] = indicators["macd_hist_series"]
+
+        # multi timeframe summary
+        if "multi_timeframe" in fm:
+            ctx["multi_timeframe_summary"] = fm["multi_timeframe"]
+
+        # orderbook 전체
+        if "orderbook" in fm:
+            ctx["orderbook_full"] = fm["orderbook"]
+
+    except Exception as e:
+        log(f"[PW][EXIT_PATTERN_SERIES] failed: {e}")
+
+    # ============================================================
+
     return ctx
 
 
@@ -921,30 +978,6 @@ def maybe_exit_with_gpt(
                 extra_ctx=gpt_ctx,
             )
 
-        # 1-3) 수익 0.5% 이상 → 1회성 30% 부분 익절 (나머지 70%는 계속 유지)
-        partial_done = getattr(trade, "partial_tp_done", False)
-        if not partial_done and pnl_pct >= 0.005 and qty > 0:
-            partial_qty = qty * 0.3
-            try:
-                close_position_market(trade.symbol, trade.side, partial_qty)
-                new_qty = qty - partial_qty
-                setattr(trade, "qty", new_qty)
-                setattr(trade, "partial_tp_done", True)
-                send_tg(
-                    f"[PARTIAL TAKE PROFIT] {trade.symbol} {trade.side} "
-                    f"+0.5% 이상 구간에서 30% 부분익절 실행 "
-                    f"(old_qty={qty:.6f}, new_qty={new_qty:.6f})"
-                )
-                log(
-                    f"[PW][PARTIAL_TP] symbol={trade.symbol} side={trade.side} "
-                    f"partial_qty={partial_qty:.6f} remaining={new_qty:.6f} "
-                    f"pnl≈{pnl_pct*100:.3f}%"
-                )
-                qty = new_qty
-                gpt_ctx["qty"] = new_qty
-            except Exception as e:
-                log(f"[PW][PARTIAL_TP] partial close failed symbol={trade.symbol}: {e}")
-
     # EXIT GPT 호출 쿨다운 체크 (동일 포지션에 대해 너무 자주 부르지 않도록 제한)
     trade_key = _get_exit_gpt_trade_key(trade)
     cooldown_sec = _get_exit_gpt_cooldown_sec(settings)
@@ -989,6 +1022,50 @@ def maybe_exit_with_gpt(
         fallback_action="HOLD",  # GPT 오류/타임아웃 시 추가 EXIT 레이어만 비활성화
     )
     _EXIT_GPT_LAST_CALL_TS[trade_key] = now_ts
+
+    # ============================================================
+    # 🔥 GPT 기반 부분 청산 로직 (올바른 위치)
+    # ============================================================
+    close_ratio = None
+    try:
+        cr = gpt_data.get("close_ratio")
+        if isinstance(cr, (int, float)):
+            close_ratio = max(0.0, min(float(cr), 1.0))  # 0~1 범위
+    except Exception:
+        close_ratio = None
+
+    # GPT가 부분 청산을 지시한 경우 (0 < close_ratio < 1)
+    if action == "CLOSE" and close_ratio is not None and 0 < close_ratio < 1:
+        partial_qty = qty * close_ratio
+
+        try:
+            close_position_market(trade.symbol, trade.side, partial_qty)
+
+            remaining_qty = qty - partial_qty
+            setattr(trade, "qty", remaining_qty)
+
+            send_tg(
+                f"[GPT_EXIT][PARTIAL] {close_ratio*100:.1f}% 부분 청산 실행 "
+                f"(old_qty={qty:.6f}, new_qty={remaining_qty:.6f})"
+            )
+
+            log_signal(
+                event="CLOSE",
+                symbol=trade.symbol,
+                strategy_type=regime_label,
+                direction=trade.side,
+                price=c,
+                qty=partial_qty,
+                reason="gpt_partial_close",
+                pnl=None,
+            )
+
+            # 부분청산 후 EXIT 종료 (전체청산과 구분)
+            return False
+
+        except Exception as e:
+            log(f"[PW][GPT_PARTIAL_CLOSE] failed: {e}")
+
 
     # ── RUNTIME 규칙 2: 강한 추세 + PnL>0 이고 방향 동일이면 CLOSE를 HOLD로 오버라이드 ──
     try:

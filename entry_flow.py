@@ -1187,69 +1187,73 @@ def try_open_new_position(
                 setattr(settings, key, val)
             except Exception:
                 pass
-
-    # (5-6) 진입에 사용할 기준 가격 계산 (호가/캔들 기반)
-    # - 수량 계산: mid price((best_bid + best_ask) / 2)
-    # - 슬리피지 기준: LONG→best_ask, SHORT→best_bid
+  
+    # (5-6) 진입에 사용할 기준 가격 계산 (markPrice 우선)
     price_for_qty = float(last_price) if last_price else 0.0
     price_for_hint = price_for_qty
 
-    if (
-        best_bid is not None
-        and best_ask is not None
-        and best_bid > 0
-        and best_ask > 0
-    ):
-        mid = (best_bid + best_ask) / 2.0
-        price_for_qty = mid
-        if chosen_signal == "LONG":
-            price_for_hint = float(best_ask)
-        else:
-            price_for_hint = float(best_bid)
+    mark = None
 
-    # 기준 가격 로그 (엔트리 가격·슬리피지 분석용)
+    # 1) markPrice 가져오기
     try:
-        log(
-            f"[ENTRY PRICE_REF] symbol={symbol} dir={chosen_signal} "
-            f"last_price={last_price} best_bid={best_bid} best_ask={best_ask} "
-            f"price_for_qty={price_for_qty} price_for_hint={price_for_hint}"
-        )
+       from market_data_ws import get_orderbook
+       ob = get_orderbook(symbol, limit=5)
+       mark = ob.get("markPrice")
+       if mark:
+          mark = float(mark)
     except Exception:
-        pass
+        mark = None
 
-    # (6) 실제 주문 수량 계산
-    # - available USDT * effective_risk_pct * leverage / price_for_qty
-    # - 최소/단위는 settings 에 따라 맞춘다.
+    # markPrice가 정상일 경우
+    if isinstance(mark, (int, float)) and mark > 0:
+        price_for_hint = mark
+        price_for_qty = mark
+
+    # markPrice를 못 구했을 경우에만 WS depth5 사용
+    else:
+        if (
+            best_bid is not None
+            and best_ask is not None
+            and best_bid > 0
+            and best_ask > 0
+        ):
+            mid = (best_bid + best_ask) / 2.0
+            price_for_qty = mid
+            if chosen_signal == "LONG":
+                price_for_hint = float(best_ask)
+            else:
+                price_for_hint = float(best_bid)
+    
+    # (6) 실제 주문 수량 계산 (여기서 qty가 처음 정의됨 → 절대 위로 올라가면 안 됨)
     notional = avail * effective_risk_pct * leverage
     qty = notional / max(float(price_for_qty), 1.0)
 
-    # 수량 단위 및 최소 수량 적용
+    # 수량 정규화
     qty_step = float(getattr(settings, "qty_step", 0.0001))
     min_qty = float(getattr(settings, "min_qty", qty_step))
 
     def _round_step(x: float, step: float) -> float:
-        if step <= 0:
-            return x
-        return math.floor(x / step) * step
+         if step <= 0:
+             return x
+         return math.floor(x / step) * step
 
     qty = _round_step(qty, qty_step)
     if qty < min_qty:
-        try:
-            send_skip_tg(
-                f"[SKIP] qty_too_small: qty={qty:.8f} < "
-                f"min_qty={min_qty:.8f} (notional={notional:.4f}USDT)"
-            )
-        except Exception as te:
-            log(f"[ENTRY_QTY] send_skip_tg failed on qty_too_small: {te}")
-        log_skip_event(
-            symbol=symbol,
-            regime=regime_label,
-            source="entry_flow.qty",
-            side=chosen_signal,
-            reason="qty_too_small",
-            extra={"qty": qty, "min_qty": min_qty, "notional": notional},
-        )
-        return None, 5.0
+       try:
+           send_skip_tg(
+               f"[SKIP] qty_too_small: qty={qty:.8f} < min_qty={min_qty:.8f}"
+           )
+       except Exception as te:
+           log(f"[ENTRY_QTY] send_skip_tg failed on qty_too_small: {te}")
+       log_skip_event(
+           symbol=symbol,
+           regime=regime_label,
+           source="entry_flow.qty",
+           side=chosen_signal,
+           reason="qty_too_small",
+           extra={"qty": qty, "min_qty": min_qty, "notional": notional},
+       )
+       return None, 5.0
 
     # (7) 실제 주문 실행
     side = "BUY" if chosen_signal == "LONG" else "SELL"
