@@ -76,7 +76,7 @@ from market_data_ws import (
     get_klines as ws_get_klines,
     get_klines_with_volume as ws_get_klines_with_vol,
 )
-from exchange_api import close_position_market
+from order_executor import close_position_market
 from signals_logger import (
     log_signal,
     log_candle_snapshot,

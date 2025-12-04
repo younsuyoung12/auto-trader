@@ -1,76 +1,25 @@
-"""run_bot_ws.py
+"""run_bot_ws.py – BingX WebSocket 비트코인 선물 메인 루프
 ======================================================
-BingX WebSocket + REST 히스토리 기반 비트코인 선물 자동매매 메인 루프.
 
-- WS: 멀티 타임프레임 K라인 + depth5 오더북 수신
-- REST: 부팅 시 K라인 히스토리 백필 전용
-- 진입 의사결정: entry_flow + gpt_decider (GPT-4o-mini 진입 게이트)
-- 청산 의사결정: position_watch_ws.maybe_exit_with_gpt + gpt_decider (GPT-4o-mini EXIT 레이어)
-- 이 파일은 "메인 오케스트레이터" 역할만 수행하고,
-  매수/매도·손절/익절·포지션 변경에 대한 실제 판단 로직은 gpt_decider.py 에서 관리한다.
+역할
+-----------------------------------------------------
+- WS: 멀티 타임프레임 K라인 + depth5 오더북 수신.
+- REST: 부팅 시 K라인 히스토리 백필 전용(런타임 의사결정에는 사용하지 않음).
+- 진입: entry_flow.try_open_new_position → GPT 엔트리 레이어.
+- 청산: position_watch_ws.maybe_exit_with_gpt → GPT EXIT 레이어.
+- 이 파일은 포지션/쿨다운/헬스체크를 오케스트레이션할 뿐,
+  매수·매도·손절·익절 결정 로직은 하위 GPT 모듈에서 관리한다.
 
-2025-12-03 변경 사항 (자동 종료/idle 제거 및 수동 종료만 허용)
-----------------------------------------------------
-1) STOP_FLAG 기반 자동 종료 및 idle 진입 경로를 모두 제거했다.
-2) 텔레그램 '종료' 버튼 동작을 다음과 같이 단순화했다.
-   - 열린 포지션이 있으면: 기존 TP/SL·EXIT 로직만 계속 수행하고 새로운 진입은 막는다.
-   - 열린 포지션이 더 이상 없으면: 메인 루프를 정상 종료(return)한다.
-3) TRADER_STATE.should_stop_bot() 는 더 이상 봇을 중단하지 않고,
-   TP/SL 재설정 실패를 텔레그램으로 알려주는 용도로만 사용한다.
-
-2025-12-02 변경 사항 (ENTRY GPT 호출 쿨다운 추가)
-----------------------------------------------------
-1) 메인 루프에서 try_open_new_position 호출에 entry_cooldown_sec 적용.
-   - 기본값: 20초 (SET.entry_cooldown_sec 으로 조정 가능)
-2) 포지션이 없더라도 초당 GPT ENTRY 호출이 발생하지 않도록 제한하여,
-   GPT-4o-mini 사용 시 비용 폭발을 크게 줄인다.
-
-2025-11-21 변경 사항 (EXIT 1m 캔들 종가 기준 체크)
-----------------------------------------------------
-1) 열린 포지션에 대한 GPT EXIT 체크를 단순 시간 간격(EXIT_CHECK_INTERVAL_SEC) 기준이 아니라,
-   1m WS 캔들이 새로 생성되는 시점(직전 1m 캔들 종가가 확정되는 순간)에만 수행하도록 변경했다.
-   - market_data_ws.get_klines_with_volume(symbol, "1m", limit=1)의 마지막 ts_ms를 추적하여,
-     이전에 처리한 ts보다 커졌을 때만 maybe_exit_with_gpt(...)를 호출한다.
-2) 이로써 항상 "완성된 1분봉"을 기준으로 EXIT 의사결정을 수행하며,
-   부분적으로 형성 중인 캔들 데이터로 EXIT를 판단하지 않는다.
-3) EXIT_CHECK_INTERVAL_SEC 기반 시간 간격 로직은 run_bot_ws 에서 사용하지 않으며,
-   포지션이 없거나 WS 1m 캔들이 존재하지 않는 경우에는 EXIT 호출을 건너뛰도록 안전하게 처리한다.
-
-2025-11-20 변경 사항 (MARKET 단일 전략 + 사용 안 하는 코드 정리 + 1m REST 백필 기본 추가)
-----------------------------------------------------
-1) settings_ws.BotSettings 의 enable_trend / enable_range 제거에 맞춰
-   - run_bot_ws 에서 해당 필드를 전부 제거하고 ENABLE_MARKET만 로깅하도록 수정.
-2) 이 파일은 MARKET 단일 전략 오케스트레이터로 동작하며,
-   TREND/RANGE on/off 플래그는 더 이상 사용하지 않는다.
-3) 사용되지 않는 import (send_skip_tg, get_balance_detail) 삭제.
-4) entry_flow.try_open_new_position 시그니처(2개 인자)에 맞게 호출부 인자 개수 수정.
-5) WS 시세 초기 REST 백필 기본 타임프레임에 1m 을 포함하도록 변경.
-   - ws_backfill_tfs 환경변수가 없을 때 기본값을 ["1m", "5m", "15m"] 로 사용.
-
-2025-11-19 변경 사항 (EXIT GPT 레이어 단순화 + 데이터 헬스 모니터링)
-----------------------------------------------------
-1) position_watch_ws.py 의 GPT 기반 EXIT 어댑터(maybe_exit_with_gpt)와 완전 연동.
-   - 박스/추세/업그레이드/다운그레이드/반대 시그널 등의 개별 Python EXIT 규칙을 전부 제거했다.
-   - 런타임 EXIT 는
-       · run_bot_ws → 열린 Trade 에 대해 maybe_exit_with_gpt(trade, settings) 호출
-       · position_watch_ws → WS 캔들·레짐 피처 생성 + gpt_decider.ask_exit_decision_safe(...)
-       · gpt_decider → GPT-5.1 프롬프트로 HOLD/CLOSE 결정
-     구조로 단순화되었다.
-2) REST /kline 히스토리 백필 상태와 WS 버퍼 길이/지연을 METRICS 에 기록하고,
-   백필 실패(KlineRestError 등) 시 사유를 텔레그램으로 즉시 전송한다.
-3) market_data_ws.get_health_snapshot(...) 를 사용해 WS/오더북 데이터 헬스를
-   주기적으로 점검하고, 결과를 텔레그램으로 요약 전송한다.
-
-이전 변경 요약 (압축)
-----------------------------------------------------
-- 2025-11-17: 텔레그램 안내 한글화, 청산 사유/포지션 상태 메시지 정리.
-- 2025-11-15: REST 히스토리 백필 및 WS 버퍼 상태 디버그 로그 강화.
-- 2025-11-14: WS 캔들/오더북 DB 저장 + signal_analysis_worker 기반 레짐/지표 기록.
-- 2025-11-13: 3m 캔들 제거, position_watch_ws/market_data_ws 도입, WS 설정 로깅.
+핵심 원칙
+-----------------------------------------------------
+- 실시간 판단은 WS 버퍼 데이터만 사용하고, REST 는 초기 백필에만 사용한다.
+- STOP_FLAG 기반 자동 종료/idle 없음. 텔레그램 '종료' 요청 + 포지션 0 일 때만 종료한다.
+- 엔트리: entry_cooldown_sec 으로 GPT 엔트리 호출 간격을 제한한다.
+- 익절/손절: 완성된 1m WS 캔들 종가가 확정될 때만 GPT EXIT 를 호출한다.
+- WS/REST 데이터 헬스·GPT 레이턴시 상태를 주기적으로 텔레그램으로 보고한다.
 """
 
 from __future__ import annotations
-
 import os
 import time
 import datetime
@@ -96,7 +45,7 @@ from signal_analysis_worker import start_signal_analysis_thread
 
 # 동기화/진입/포지션 감시 모듈
 from sync_exchange import sync_open_trades_from_exchange
-from entry_flow import try_open_new_position  # 진입 쪽 GPT 결정은 entry_flow/gpt_decider 에서 처리
+from entry_flow import try_open_new_position  # 진입 쪽 GPT 결정은 entry_flow/gpt_trader 에서 처리
 from position_watch_ws import (  # WS 버전 GPT EXIT 어댑터
     maybe_exit_with_gpt,
 )
@@ -114,16 +63,12 @@ from market_data_store import (
 )
 from market_data_rest import fetch_klines_rest, KlineRestError  # BingX REST /kline 헬퍼
 
-from gpt_decider_entry import ask_entry_decision
-
-
 # ─────────────────────────────
 # 전역 상태 초기화
 # ─────────────────────────────
 SET = load_settings()
 START_TS: float = time.time()
 RUNNING: bool = True
-TERMINATED_BY_SIGNAL: bool = False
 
 # KRW 환산용 환율 (텔레그램 표시용)
 KRW_RATE: float = getattr(SET, "krw_per_usdt", 1400.0)
@@ -273,8 +218,7 @@ def start_gpt_latency_reporter() -> None:
 
 def _sigterm(*_: Any) -> None:
     """컨테이너 SIGTERM 시 자연스럽게 메인 루프를 빠져나오도록 한다."""
-    global RUNNING, TERMINATED_BY_SIGNAL
-    TERMINATED_BY_SIGNAL = True
+    global RUNNING
     RUNNING = False
 
 
@@ -369,9 +313,8 @@ def _on_safe_stop() -> None:
 def _backfill_ws_kline_history(symbol: str) -> None:
     """BingX REST /kline 으로 히스토리 캔들을 받아 WS 버퍼에 미리 채운다.
 
-    - run_bot_ws.main() 시작 시점에 한 번만 호출.
-    - market_data_ws.backfill_klines_from_rest(...) 를 사용해
-      각 타임프레임 버퍼가 최소 수십 개 이상 채워진 상태에서 신호 계산이 시작되도록 한다.
+    - main() 시작 시점에 한 번만 호출.
+    - 각 타임프레임 버퍼가 충분히 채워진 상태에서 WS 기반 신호 계산이 시작되도록 한다.
     """
     global LAST_REST_BACKFILL_AT
 
@@ -667,20 +610,25 @@ def main() -> None:
     global CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS, LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS
 
-    # WS 설정 로그로 남기기 (Render 확인용)
+    # WS 설정 로그로 남기기
     log(
         f"[BOOT] WS_ENABLED={getattr(SET, 'ws_enabled', True)} "
         f"WS_TF={getattr(SET, 'ws_subscribe_tfs', ['1m','5m','15m'])} "
         f"INTERVAL={SET.interval}"
     )
 
-    # ★ REST 히스토리 백필 + 웹소켓 시세 수신 시작
+    # REST 히스토리 백필 + 웹소켓 시세 수신 시작
     if getattr(SET, "ws_enabled", True):
         _backfill_ws_kline_history(SET.symbol)
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
+        
+        # 🔥 바로 여기!
+        from data_health_monitor import start_health_monitor
+        start_health_monitor()
 
-        # 부팅 직후 WS 버퍼 상태 진단 (REST 백필 + WS 스트림 확인용)
+
+        # 부팅 직후 WS 버퍼 상태 진단
         try:
             time.sleep(2)
             for iv in ("1m", "5m", "15m"):
@@ -692,8 +640,7 @@ def main() -> None:
         except Exception as e:
             log(f"[BOOT] WS buffer status check error: {e}")
 
-        # EXIT 1m 캔들 기준 초기화: 현재 버퍼의 마지막 1m ts 를 기록해 두고,
-        # 그 이후 새로 생기는 캔들에 대해서만 GPT EXIT 를 수행한다.
+        # EXIT 1m 캔들 기준 초기화
         try:
             last_1m = ws_get_klines_with_volume(SET.symbol, "1m", limit=1)
             if last_1m:
@@ -731,12 +678,12 @@ def main() -> None:
     except Exception as e:
         log(f"[WARN] 레버리지/마진 설정 실패: {e}")
 
-    # 보조 스레드들 시작 (헬스 서버, 드라이브 동기화, 텔레그램 명령, 레짐/지표 워커)
+    # 보조 스레드들 시작 (헬스 서버, 드라이브 동기화, 텔레그램 명령, 레짐/지표 워커, GPT 레이턴시)
     start_health_server()
     start_drive_sync_thread()
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
-    start_gpt_latency_reporter()   # ★ GPT 레이턴시 30분 리포트 스레드
+    start_gpt_latency_reporter()   # GPT 레이턴시 30분 리포트 스레드
 
     # 최초 거래소 포지션 동기화
     OPEN_TRADES, _ = sync_open_trades_from_exchange(
@@ -837,7 +784,6 @@ def main() -> None:
                             f"- 실현 손익: {pnl:.2f} USDT (약 {pnl_krw:,.0f}원)"
                         )
 
-                    # ✅ 여기 log_signal 호출이 정답 형태
                     log_signal(
                         event="CLOSE",
                         symbol=t.symbol,
@@ -857,8 +803,7 @@ def main() -> None:
 
             # (e) 열린 포지션에 대한 실시간 대응 (1m 캔들 종가 기준 GPT EXIT 레이어)
             if OPEN_TRADES:
-                # ★ WS 1m 캔들 버퍼에서 마지막 ts_ms 를 읽어와,
-                #    이전에 처리한 ts 보다 커졌을 때만 EXIT 판별을 수행한다.
+                # WS 1m 캔들의 마지막 ts_ms 를 기준으로, 새 캔들이 생겼을 때만 EXIT 판단 수행
                 try:
                     last_1m = ws_get_klines_with_volume(SET.symbol, "1m", limit=1)
                 except Exception as e:
@@ -873,7 +818,7 @@ def main() -> None:
                     elif last_ts_ms > LAST_EXIT_CANDLE_TS_1M:
                         # 직전 캔들 종가가 확정된 뒤 새 1m 캔들이 시작된 것으로 보고 EXIT 판단 수행
                         for t in list(OPEN_TRADES):
-                            # GPT-5.1 이 EXIT 여부(HOLD/CLOSE)를 전적으로 결정
+                            # GPT 레이어가 EXIT 여부(HOLD/CLOSE)를 전적으로 결정
                             if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
                                 OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
                                 LAST_CLOSE_TS = now
@@ -929,7 +874,7 @@ def main() -> None:
                     OPEN_TRADES.append(trade)
                     LAST_STATUS_TG_TS = time.time()
 
-            # 루프 주기는 기존과 동일하게 1초 유지
+            # 루프 주기는 1초
             time.sleep(1)
 
         except Exception as e:
@@ -951,7 +896,6 @@ def main() -> None:
             time.sleep(2)
 
     # RUNNING 이 False 로 바뀌어 루프가 끝나면 여기로 빠져나온다.
-    # 자동 idle 진입은 제거하고, 메인 함수만 종료한다.
     return
 
 

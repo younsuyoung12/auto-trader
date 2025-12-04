@@ -1,181 +1,32 @@
 """market_features_ws.py
 =====================================================
-BingX WebSocket 로우데이터(멀티 타임프레임 캔들 + depth5 오더북)를
-GPT-5.1 트레이더용 피처로 가공하는 모듈.
+BingX WebSocket 캔들(1m/5m/15m/...)과 depth5 오더북을
+GPT-5.1 트레이더용 엔트리 피처로 변환하는 모듈.
 
-2025-12-02 변경 사항 (RSI/macd 시리즈 + 패턴 엔진 연동)
-----------------------------------------------------
-1) _build_timeframe_features(...)에서 rsi(...) 결과 전체를 rsi_series로
-   timeframes[iv]["indicators"]["rsi_series"]에 추가했다.
-2) 동일하게 MACD 히스토그램 시리즈를 macd_hist_series로
-   timeframes[iv]["indicators"]["macd_hist_series"]에 포함했다.
-3) NaN/None/비수치 값은 필터링한 뒤 저장해
-   pattern_detection.build_pattern_features(...)에서 _require_series(...)
-   가 안정적으로 동작하도록 했다.
-4) unified_features_builder.build_unified_features(...)
-   → pattern_detection.build_pattern_features(...) 호출 시
-   indicators 인자를 통해 RSI 다이버전스 패턴이 활성화되도록 했다.
+핵심 원칙
+-----------------------------------------------------
+- WS 순수 데이터만 사용 (REST 백필 · 임의 보정 · 추론 · 폴백 전부 금지)
+- 헬스 체크나 지표 계산 중 하나라도 비정상 / NaN / None 이 발견되면
+  FeatureBuildError 를 발생시키고 피처 생성을 즉시 중단
+- GPT 는 항상 "완전한 피처 셋"만 전달받고, 애매한 데이터로는 절대 진입하지 않음
 
-2025-11-20 변경 사항 (엔트리 시그널 빌더 통합 + 저변동성 필터 + 피처 문서화/강화)
-----------------------------------------------------
-1) get_trading_signal(...) 추가
-   - build_entry_features_ws(...) 결과 + WS 5m 캔들 버퍼를 이용해
-     엔트리 후보 방향/시그널 메타/캔들 세트를 entry_flow.py 가
-     바로 사용할 수 있는 형태로 제공한다.
-   - 반환 포맷:
-       (chosen_signal, signal_source, latest_ts,
-        candles_5m, candles_5m_raw, last_price, extra)
-2) EntryScore / GPT 트레이더 연동용 extra 필드 구성
-   - extra["signal_score"]      : 0~3 근사 시그널 강도 점수
-   - extra["atr_fast"]          : 5m ATR
-   - extra["atr_slow"]          : 15m ATR (없으면 5m ATR로 대체)
-   - extra["direction_raw"]     : LONG=+1, SHORT=-1
-   - extra["direction_norm"]    : 위와 동일
-   - extra["regime_level"]      : TREND=1.0, RANGE=2.0, GENERIC=1.5
-   - extra["market_features"]   : build_entry_features_ws(...) 전체 dict
-3) 시장 레이블 단순화
-   - signal_source 는 로그/분석용 레이블로만 사용:
-       · 강한 추세 + ADX 다수 → "TREND"
-       · 과열/과매도 MTF 다수 → "RANGE"
-       · 그 외 → "GENERIC"
-4) 저변동성(좁은 박스장) 필터 추가
-   - settings.low_vol_range_pct_threshold / low_vol_atr_pct_threshold 기준으로
-     5m range_pct, atr_pct 가 모두 너무 작으면 엔트리 자체를 SKIP 처리.
-5) indicators.py 에서 계산된 고급 지표/상태 플래그를 정리해
-   GPT 프롬프트에서 바로 활용할 수 있도록 key 목록을 문서화.
-6) 저변동성/가격 정지 구간에 대한 방어 로직 강화
-   - 타임프레임별 is_low_volatility 플래그 추가.
-   - 멀티 타임프레임 요약에 low_vol_tfs(저변동성 타임프레임 수) 추가.
-   - 극단적으로 가격/거래량이 정지된 구간은 FeatureBuildError 로 취급.
+주요 공개 함수
+-----------------------------------------------------
+- build_entry_features_ws(symbol) -> Dict[str, Any]
+    · timeframes / orderbook / multi_timeframe 를 포함한 전체 WS 피처
+- get_trading_signal(settings, last_close_ts, symbol) -> EntrySignal
+    · entry_flow 가 바로 사용할 수 있는
+      (chosen_signal, signal_source, latest_ts,
+       candles_5m, candles_5m_raw, last_price, extra) 튜플
 
-2025-11-19 변경 사항 (2차 - 지표 확장 + GPT 피드 최적화)
-----------------------------------------------------
-1) indicators.py 에 새로 추가된 고급 지표들을 통합했다.
-   - MACD (12/26/9), Bollinger Bands(20, 2σ), ADX(추세 강도), OBV, Stochastic(14,3)
-   - 각 타임프레임별로 대표 값과 단순 상태 플래그(과열/과매도, 강한 추세 여부 등)를
-     숫자 피처로 만들어 GPT 에 그대로 넘길 수 있게 했다.
-2) 멀티 타임프레임 요약(_build_multi_timeframe_summary)을 보강했다.
-   - EMA 기반 다수결 추세(majority_trend) 외에,
-     ADX 기준 "트렌드가 강한 타임프레임 수", RSI/스토캐스틱 과열·과매도 타임프레임 수를
-     한 번에 파악할 수 있는 집계 피처를 추가했다.
-3) _fetch_candles_strict(...) 에서 ADX 계산에 필요한 최소 캔들 수(2 * length)를
-   need_len 에 포함해, WS 버퍼가 부족하면 바로 FeatureBuildError 를 던지도록 했다.
-4) 이 모듈에서는 어떤 경우에도 REST 백필을 호출하지 않으며,
-   필수 WS 데이터가 부족/지연되면 FeatureBuildError + 텔레그램 알림만 발생한다.
-   (데이터가 애매한 상태에서 임의 보정/추론을 하지 않는다.)
-5) 1m/5m/15m 타임프레임에 대해 최근 20개 OHLCV 스냅샷을
-   "raw_ohlcv_last20" 키로 함께 내보내, GPT 프롬프트에서
-   쐐기, 플래그, 헤드앤숄더 등 차트 패턴을 직접 해석할 수 있도록 했다.
-6) 원시 OHLCV 스냅샷 파싱 중 하나라도 예외가 발생하면
-   해당 타임프레임 피처 생성을 즉시 중단하고 FeatureBuildError 를 발생시키며,
-   텔레그램으로 상세 원인을 전송하도록 변경했다.
-
-2025-11-19 변경 사항 (WS 피처 빌더 1차 도입)
-----------------------------------------------------
-1) build_entry_features_ws(...) 추가
-   - 1m/5m/15m/1h/4h/1d 캔들과 depth5 오더북을 사용해
-     추세·모멘텀·변동성·거래량·오더북 관련 핵심 지표를 계산하고
-     GPT 컨텍스트로 바로 넘길 수 있는 dict 를 생성한다.
-2) 데이터 헬스 검증 강화
-   - 필수 타임프레임(기본 1m/5m/15m)에 대해 버퍼 개수/지연을 엄격하게 검사하고,
-     하나라도 부족하거나 지연 기준(KLINE_MAX_DELAY_SEC)을 초과하면
-     FeatureBuildError 를 발생시키고 텔레그램으로 상세 원인을 알린다.
-   - 오더북(depth5)이 비어 있거나 ORDERBOOK_MAX_DELAY_SEC 을 넘게 지연된 경우도
-     동일하게 오류로 처리한다.
-3) 고전 트레이더들이 많이 참고하는 신호를 포괄하는 피처 세트 제공
-   - EMA 추세(20/50 조합), 최근 수익률, RSI(14), ATR(14) 기반 변동성,
-     최근 박스 폭(range_pct), 거래량 급증 여부(volume_ratio/z-score),
-     골든/데드 크로스, 멀티 타임프레임 추세 정렬(trend alignment) 등을 포함한다.
-
-역할
-----------------------------------------------------
-- market_data_ws 가 메모리에 보관 중인 WS 캔들/오더북을 읽어
-  "지금 시장이 어떤 상태인지"를 GPT-5.1 이 한 번에 이해하기 쉽도록
-  구조화된 피처 dict 로 변환한다.
-- EMA/RSI/ATR/MACD/볼린저/ADX/OBV/스토캐스틱 등
-  유명 트레이더들이 자주 사용하는 지표를 멀티 타임프레임으로 정리하고,
-  1m/5m/15m 에 대해서는 최근 20개 OHLCV 원시 캔들 스냅샷도 함께 제공해
-  LLM 이 차트 패턴까지 직접 해석할 수 있게 돕는다.
-- 이 모듈은 **계산/검증 전용 레이어**로, 매매 판단은 gpt_decider/gpt_trader 쪽에 맡긴다.
-- 데이터가 불완전한 상태에서 잘못된 판단을 내리지 않도록,
-  필수 데이터가 비정상일 때는 백필/추론 없이 바로 예외를 던지고
-  텔레그램 알림으로 사람에게 원인을 명확히 전달하는 것을 최우선으로 한다.
-
-
-Key Overview
-----------------------------------------------------
-[표 1] build_entry_features_ws(...) 최상위 키
-
-- symbol: str
-- checked_at_ms: int (ms 단위 헬스 체크 시각)
-- timeframes: Dict[str, Dict[str, Any]]  # "1m" / "5m" / "15m" / "1h" / "4h" / "1d"
-- orderbook: Dict[str, Any]
-- multi_timeframe: Dict[str, Any]
-
-[표 2] timeframes[iv] 공통 키 (단일 타임프레임 피처)
-
-- interval: str ("1m"/"5m"/...)
-- buffer_len: int (WS 버퍼에 사용한 캔들 개수)
-- last_close: float
-- prev_close: float
-- return_1 / return_3 / return_5: float (최근 1/3/5봉 수익률)
-- ema_fast / ema_slow: float
-- ema_fast_len / ema_slow_len: int
-- ema_dist_pct: float (fast-slow 간격 / 가격)
-- ema_fast_slope_pct: float (fast EMA 기울기 / 가격)
-- atr: float
-- atr_pct: float (ATR / 가격)
-- range_pct: float (최근 range_window 고가-저가 / 가격)
-- rsi / rsi_len: float/int
-- rsi_overbought / rsi_oversold: int (0/1 플래그)
-- macd / macd_signal / macd_hist: float
-- macd_bias: int (-1/0/1, MACD 방향)
-- bb_width_pct / bb_pos: float (볼린저 폭/위치)
-- stoch_k / stoch_d: float
-- stoch_overbought / stoch_oversold: int
-- adx: float | None
-- strong_trend_flag: int (ADX 25 이상이면 1)
-- volume_last / volume_ma / volume_ratio / volume_zscore: float
-- obv: float
-- cross_type: str ("GOLDEN"/"DEAD"/"NONE")
-- cross_bars_ago: Optional[int]
-- is_low_volatility: int (0/1, 저변동성 플래그)
-- raw_ohlcv_last20: List[Dict[str, float]]  # interval 이 1m/5m/15m 인 경우에만 존재
-- regime: Dict[str, Any]  # interval 이 5m/15m/1h 인 경우에만 존재
-
-[표 3] orderbook 피처 키
-
-- ts_ms: int (오더북 기준 시각)
-- age_sec: float (스냅샷 지연 시간)
-- best_bid / best_ask / mid_price: float
-- spread_abs / spread_pct: float
-- bid_notional / ask_notional: float
-- depth_imbalance: float in [-1, 1] or None
-- mark_price / last_price: float | None
-
-[표 4] multi_timeframe 요약 키
-
-- trend_votes: Dict[str, int]  # 각 TF 의 LONG(+1)/SHORT(-1)/중립(0) 편향
-- long_votes / short_votes: int
-- trend_align_long / trend_align_short: bool
-- majority_trend: str ("LONG"/"SHORT"/"NEUTRAL"/"MIXED")
-- adx_trend_tfs: int  # ADX >= 25 인 타임프레임 개수
-- overbought_tfs / oversold_tfs: int  # 과열/과매도 TF 수
-- low_vol_tfs: int  # is_low_volatility == 1 인 타임프레임 수
-
-[표 5] get_trading_signal(...) extra 키
-
-- signal_score: float (0~3 근사 시그널 강도)
-- atr_fast / atr_slow: float
-- direction_raw / direction_norm: float (+1 LONG / -1 SHORT)
-- regime_level: float (TREND=1.0 / RANGE=2.0 / GENERIC=1.5)
-- market_features: Dict[str, Any]  # build_entry_features_ws(...) 전체 반환값
-- last_close_ts: float (최근 청산 시각)
-- majority_trend: str
-- depth_imbalance: float | None
-- spread_pct: float | None
-- volume_zscore_5m: float | None
-- strong_trend_flag_5m: int | None
+extra 주요 필드
+-----------------------------------------------------
+- signal_score   : 0.5 ~ 6.0 엔트리 강도 점수
+- trend_strength : 5m regime 의 추세 강도 (필수, 없으면 시그널 생성 중단)
+- volatility     : 5m ATR pct (필수)
+- volume_zscore  : 5m 거래량 z-score (필수)
+- majority_trend / depth_imbalance / spread_pct 등은
+  GPT 자연어 해석 및 리스크 로그용 메타로 함께 제공된다.
 """
 
 import math
@@ -429,54 +280,61 @@ def _volume_stats(values: List[float], ma_len: int) -> Tuple[float, float, float
 
 
 def _normalize_regime_keys(regime: Dict[str, Any]) -> Dict[str, Any]:
-    """TA-Lib indicators.py 정합 체크용: 핵심 키들을 보정/보완한다.
+    """TA-Lib indicators.py 에서 생성된 regime 딕셔너리를 그대로 복사해 반환한다.
 
-    - atr_pct / range_pct / macd_hist / rsi_last 필드가 누락되어 있으면
-      가능한 값에서 alias 를 만들어 준다.
-    - 현재 indicators.py 는 이미 위 키들을 생성하지만,
-      과거 버전과의 호환을 위한 안전장치로 둔다.
+    과거 버전 호환을 위한 alias 보정(atr_pct, range_pct, rsi_last 등)은
+    더 이상 수행하지 않는다. 값이 없다면 상위 레이어에서
+    FeatureBuildError 또는 시그널 SKIP 으로 처리하게 두어,
+    폴백/추론 없이 "있는 그대로"만 사용한다.
     """
-    normalized = dict(regime)
+    return dict(regime)
 
-    # rsi_last 가 없고 rsi 만 있다면 alias 생성
-    if "rsi_last" not in normalized and "rsi" in normalized:
-        v = normalized.get("rsi")
-        if isinstance(v, (int, float)):
-            normalized["rsi_last"] = float(v)
 
-    # macd_hist 가 없고 macd_hist_last 가 있는 경우 alias
-    if "macd_hist" not in normalized and "macd_hist_last" in normalized:
-        v = normalized.get("macd_hist_last")
-        if isinstance(v, (int, float)):
-            normalized["macd_hist"] = float(v)
+def _validate_core_features(
+    symbol: str,
+    interval: str,
+    feats: Dict[str, Any],
+) -> None:
+    """필수 타임프레임의 핵심 피처들이 모두 유효한 숫자인지 검사한다.
 
-    # atr_pct 가 없고 atr / last_close 로 계산 가능한 경우 보완
-    if "atr_pct" not in normalized:
-        atr_val = normalized.get("atr")
-        last_close = normalized.get("last_close")
-        if (
-            isinstance(atr_val, (int, float))
-            and isinstance(last_close, (int, float))
-            and last_close > 0
-        ):
-            normalized["atr_pct"] = float(atr_val) / float(last_close)
-
-    # range_pct 가 없고 high_recent/low_recent 로 계산 가능한 경우 보완
-    if "range_pct" not in normalized:
-        high_recent = normalized.get("high_recent")
-        low_recent = normalized.get("low_recent")
-        last_close = normalized.get("last_close")
-        if (
-            isinstance(high_recent, (int, float))
-            and isinstance(low_recent, (int, float))
-            and isinstance(last_close, (int, float))
-            and last_close > 0
-        ):
-            normalized["range_pct"] = (float(high_recent) - float(low_recent)) / float(
-                last_close
+    하나라도 NaN/None/비수치이면 FeatureBuildError 로 전체 빌드를 중단한다.
+    """
+    core_keys = [
+        "last_close",
+        "ema_fast",
+        "ema_slow",
+        "atr",
+        "atr_pct",
+        "range_pct",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "stoch_k",
+        "stoch_d",
+        "volume_last",
+        "volume_ma",
+        "volume_zscore",
+    ]
+    for key in core_keys:
+        v = feats.get(key)
+        if not isinstance(v, (int, float)) or math.isnan(float(v)):
+            _fail(
+                symbol,
+                f"features_{interval}",
+                f"{interval} 핵심 피처 '{key}' 가 NaN/None 입니다.",
             )
 
-    return normalized
+    # ADX 는 필수 값으로 취급한다. 계산 실패(None) 인 경우도 오류 처리.
+    adx_val = feats.get("adx")
+    if adx_val is None or (
+        isinstance(adx_val, (int, float)) and math.isnan(float(adx_val))
+    ):
+        _fail(
+            symbol,
+            f"features_{interval}",
+            f"{interval} 핵심 피처 'adx' 가 NaN/None 입니다.",
+        )
 
 
 def _build_timeframe_features(
@@ -997,6 +855,8 @@ def build_entry_features_ws(
 
         try:
             tf_features = _build_timeframe_features(symbol, iv, buf, cfg)
+            if is_required:
+                _validate_core_features(symbol, iv, tf_features)
             timeframes[iv] = tf_features
         except FeatureBuildError:
             raise
@@ -1056,7 +916,7 @@ def get_trading_signal(
         · direction_raw : LONG=+1, SHORT=-1
         · direction_norm: 위와 동일
         · regime_level  : TREND=1.0, RANGE=2.0, GENERIC=1.5
-        · market_features: build_entry_features_ws(...) 전체 dict
+        · market_features: build_entry_features_ws(...) 전체 반환값
         · last_close_ts : 최근 청산 시각(단일 전략 기준)
     """
     # 심볼 결정: 우선 settings.symbol, 없으면 글로벌 SET.symbol
@@ -1298,6 +1158,24 @@ def get_trading_signal(
     # 최종 범위 확장
     signal_score = max(0.5, min(signal_score, 6.0))
 
+    # 6.5) ENTRY 핵심 피처 (trend_strength / volatility / volume_zscore) 추출
+    reg5 = tf5.get("regime") or {}
+    trend_strength = reg5.get("trend_strength")
+    volatility = tf5.get("atr_pct")
+    volume_zscore = tf5.get("volume_zscore")
+
+    for name, value in (
+        ("trend_strength", trend_strength),
+        ("volatility", volatility),
+        ("volume_zscore", volume_zscore),
+    ):
+        if not isinstance(value, (int, float)) or math.isnan(float(value)):
+            log(
+                f"[MKT-FEAT] get_trading_signal: 핵심 피처 {name} 가 NaN/None 입니다. "
+                "엔트리 시그널 생성을 중단합니다."
+            )
+            return None
+
     # 7) extra 메타 구성 (GPT/gpt_trader + EntryScore 공용)
     extra: Dict[str, Any] = {
         "signal_score": float(signal_score),
@@ -1306,9 +1184,13 @@ def get_trading_signal(
         "direction_raw": direction_num,
         "direction_norm": direction_num,
         "regime_level": regime_level,
+        "trend_strength": float(trend_strength),
+        "volatility": float(volatility),
+        "volume_zscore": float(volume_zscore),
         "market_features": features,
         "last_close_ts": float(last_close_ts),
     }
+
 
     # 참고용으로 일부 핵심 값도 함께 넣어 준다.
     try:

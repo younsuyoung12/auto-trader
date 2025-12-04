@@ -1,41 +1,32 @@
-"""entry_flow.py (WS + GPT 트레이더 오케스트레이터)
+"""entry_flow.py – WS + GPT 트레이더 진입 오케스트레이터
 =====================================================
+
 역할
 -----------------------------------------------------
-- run_bot.py / run_bot_ws.py 에서 호출하는 진입 실행 레이어.
-- WS 시세 + market_features_ws 시그널 → gpt_trader 판단 → 가드 → 주문 → 로그/DB 기록.
+- run_bot.py / run_bot_ws.py 에서 호출하는 단일 진입 실행 레이어.
+- WS 시세 피처(market_features_ws.get_trading_signal) → 사전 가드 →
+  GPT 엔트리 판단 → 주문 실행 → 텔레그램/CSV/DB 기록까지 한 번에 처리한다.
 
-2025-12-04 변경 요약 (GPT SKIP 상세 로그 + 자연어 해석)
+핵심 원칙
 -----------------------------------------------------
-- GPT 진입 결과가 SKIP 일 때, 단순 레이블이 아니라
-  주요 지표(trend_strength / volatility / volume_zscore / depth_imbalance /
-  majority_trend / entry_score)를 사람 기준으로 해석한 문장을 함께 텔레그램 전송.
-  · 예: "추세 거의 없음", "변동성 매우 낮음", "강한 매도 우위", "MTF 방향 불일치" 등.
-- gpt_result["reason"] 을 항상 메시지에 포함해 GPT가 판단을 내린 핵심 코멘트를
-  바로 확인할 수 있도록 개선.
-- 기존 [ENTRY_PREVIEW] 점수/리스크/TP·SL 알림과 EntryScore 저장 흐름은 유지.
+- WS 시세/피처가 비정상이면 어떤 진입·점수도 계산하지 않고 즉시 SKIP 한다
+  (FeatureBuildError / get_trading_signal None).
+- REST 백필, 임의 보정, 더미 점수 생성 등 **폴백 로직은 사용하지 않는다**.
+- 모든 SKIP/진입/점수 이벤트는 텔레그램 + 로그/DB에 그대로 남긴다.
 
-2025-12-01 변경 요약 (TA-Lib EntryScore 정합 + NaN 가드)
+최근 변경 요약
 -----------------------------------------------------
-- market_features_ws.get_trading_signal(...) 이 내려주는 extra["atr_fast"], extra["atr_slow"] 를
-  EntryScore 계산의 기준으로 사용하되, 둘 중 하나라도 NaN/None/비유효 값이면
-  이번 캔들은 전체 엔트리 플로우를 SKIP 처리하도록 가드 추가.
-- _compute_entry_score_components(...) 의 0~10 → 0~100 클램프/정규화 로직을 유지하면서
-  preview_entry_score / DB EntryScore 저장 경로에서 NaN 이 저장되지 않도록
-  ValueError 기반 가드 흐름을 명확히 정리.
-- GPT 호출 이전에 ATR 정합 가드가 먼저 적용되도록 해서,
-  TA-Lib 지표가 아직 안정되지 않은 초기 구간에서는 진입 자체를 막고
-  로그/skip_event 만 남기도록 변경.
-
-2025-11-21 변경 요약 (GPT 엔트리 쿨다운 + PREVIEW 스팸 제어)
------------------------------------------------------
-- GPT 엔트리 쿨다운을 entry_flow 레벨에서 추가.
-  · settings.gpt_entry_cooldown_sec / ENV GPT_ENTRY_COOLDOWN_SEC 로 설정 (기본 1초).
-  · 쿨다운 중에는 PREVIEW/GPT 호출 모두 SKIP, gpt_entry_cooldown 이벤트만 기록.
-- GPT 쿨다운 구간에서는 Entry PREVIEW 텔레그램도 발생하지 않도록 차단.
+- GPT SKIP 시 추세/변동성/거래량/오더북/MTF/entry_score 를 자연어로 해석해 전송.
+- atr_fast/atr_slow 가 NaN/None/비정상이면 엔트리 전체를 SKIP 하고
+  EntryScore 계산·저장도 막는 NaN 가드를 추가.
+- GPT 엔트리 쿨다운 도입:
+  settings.gpt_entry_cooldown_sec / ENV GPT_ENTRY_COOLDOWN_SEC 기준으로
+  PREVIEW + GPT 호출 간 최소 간격을 강제한다.
 """
 
 from __future__ import annotations
+
+from data_health_monitor import HEALTH_OK, LAST_FAIL_REASON
 
 import os
 import time
@@ -55,7 +46,7 @@ from exchange_api import (
     get_balance_detail,
 )
 from trader import Trade
-from exchange_api import open_position_with_tp_sl
+from order_executor import open_position_with_tp_sl
 from signals_logger import (
     log_signal,
     log_candle_snapshot,
@@ -66,7 +57,7 @@ from gpt_trader import decide_entry_with_gpt_trader
 
 # ✅ 시그널/피처 공급자
 # - market_features_ws.get_trading_signal 이 아직 없더라도 ImportError 로
-#   프로세스가 바로 죽지 않도록 방어.
+#   프로세스가 바로 죽지 않도록 방어. (이 경우 모든 진입은 SKIP)
 try:
     from market_features_ws import get_trading_signal  # type: ignore[attr-defined]
 except ImportError:
@@ -77,8 +68,6 @@ except ImportError:
         - 항상 None 을 반환하여 entry_flow.try_open_new_position(...) 쪽에서
           "시그널 없음"으로 처리되게 한다.
         - 봇은 죽지 않고 동작하지만, 신규 진입은 발생하지 않는다.
-        - 실제 매매를 위해서는 market_features_ws.py 에
-          호환되는 get_trading_signal(...) 구현이 필요하다.
         """
         log(
             "[ENTRY_FLOW] WARNING: market_features_ws.get_trading_signal 미구현 → "
@@ -97,7 +86,7 @@ except Exception:  # pragma: no cover - DB가 아직 준비되지 않은 환경 
     EntryScoreORM = None  # type: ignore
     sa_text = None  # type: ignore
 
-# GPT-5 메타 정보 (entry_flow 에서는 로깅/메타 정보용으로만 사용)
+# GPT 메타 정보 (entry_flow 에서는 로깅/메타 정보용으로만 사용)
 DEFAULT_GPT_ENTRY_MODEL = "gpt-4o-mini"
 
 # GPT 엔트리 쿨다운 (PREVIEW + GPT 호출 공통)
@@ -111,7 +100,7 @@ def _get_gpt_entry_cooldown_sec(settings: Any) -> float:
     우선순위:
     1) settings.gpt_entry_cooldown_sec (숫자형) 이 있으면 사용
     2) ENV GPT_ENTRY_COOLDOWN_SEC 이 있으면 float 로 파싱해서 사용
-    3) 둘 다 없으면 _DEFAULT_GPT_ENTRY_COOLDOWN_SEC (현재 기본 1초)
+    3) 둘 다 없으면 _DEFAULT_GPT_ENTRY_COOLDOWN_SEC
     """
     val = getattr(settings, "gpt_entry_cooldown_sec", None)
     if isinstance(val, (int, float)):
@@ -148,10 +137,10 @@ def _pick_latest_candle(
     """캔들 스냅샷에 쓸 (ts, o, h, l, c, v) 하나를 고른다.
 
     우선순위:
-    1) 웹소켓 1m 캔들(ws_candles)이 있고 (ts, o, h, l, c, v) 형태면 그대로 사용.
-    2) get_trading_signal 이 내려준 raw 캔들(candles_5m_raw)에 거래량이 있으면 그걸 사용.
-    3) 기본 5m 캔들(candles_5m)만 있으면 v=0.0 을 붙여서 사용.
-    4) 진짜 아무 것도 없으면 현재 시각 기준 dummy 캔들을 만든다.
+    1) 웹소켓 1m 캔들(ws_candles)
+    2) get_trading_signal 이 내려준 raw 5m 캔들(candles_5m_raw)
+    3) 기본 5m 캔들(candles_5m) + v=0.0
+    4) 전부 없으면 현재 시각 기준 dummy 캔들
     """
     # 1) 웹소켓 캔들(1m) 우선
     if ws_candles:
@@ -210,18 +199,6 @@ def _compute_entry_score_components(
     ⚠ 폴백/추정 없음.
     - 필수 값이 하나라도 없거나, NaN/inf/0 등으로 비정상이면 ValueError 를 발생시킨다.
     - 호출부에서 이 예외를 잡아서 EntryScore 저장을 SKIP 하고 로그만 남긴다.
-
-    필수 입력:
-    - extra: dict 여야 하고, 다음 키가 필수
-      · signal_score 또는 candidate_score (float)
-      · atr_fast, atr_slow (float, atr_slow > 0)
-    - effective_risk_pct > 0
-    - leverage > 0
-    - tp_pct > 0, sl_pct > 0
-
-    반환:
-    - entry_score: float (0~100 범위 점수)
-    - components: {"base": ..., "signal_strength": ..., "risk": ..., "volatility": ..., "entry_score": ...}
     """
     missing: List[str] = []
 
@@ -305,7 +282,7 @@ def _compute_entry_score_components(
     components["leverage"] = float(leverage)
     components["risk_score"] = risk_score
 
-    # 4) ATR 기반 변동성 점수 (필수 값, 위에서 검증 완료)
+    # 4) ATR 기반 변동성 점수
     atr_fast_f = float(atr_fast)  # type: ignore[arg-type]
     atr_slow_f = float(atr_slow)  # type: ignore[arg-type]
     atr_ratio = atr_fast_f / atr_slow_f
@@ -317,14 +294,14 @@ def _compute_entry_score_components(
     components["atr_ratio"] = atr_ratio
     components["volatility_score"] = vol_score
 
-    # 5) TP/SL 비율 자체도 참고용으로 남긴다.
+    # 5) TP/SL 비율도 참고용으로 저장
     tp_pct_f = float(tp_pct)
     sl_pct_f = float(sl_pct)
     components["tp_pct"] = tp_pct_f
     components["sl_pct"] = sl_pct_f
     components["tp_sl_ratio"] = tp_pct_f / sl_pct_f
 
-    # 6) 최종 entry_score 합성 (내부적으로 0~10 근사 스코어 만든 뒤 0~100 으로 스케일링)
+    # 6) 최종 entry_score 합성 (내부 0~10 → 0~100)
     entry_score_raw = (
         base_score
         + 0.7 * float(signal_strength)
@@ -333,7 +310,6 @@ def _compute_entry_score_components(
     )
     components["entry_score_raw"] = entry_score_raw
 
-    # 0 이하 / 10 이상은 클램프 후 0~100 으로 변환
     entry_score_clamped = min(max(entry_score_raw, 0.0), 10.0)
     entry_score = entry_score_clamped * 10.0
     components["entry_score"] = entry_score
@@ -354,12 +330,7 @@ def _preview_entry_score_and_notify(
 ) -> Tuple[Optional[float], Dict[str, Any]]:
     """진입 직전 EntryScore 를 계산해서 텔레그램으로 프리뷰 전송.
 
-    - _compute_entry_score_components(...) 를 호출해서 0~100 점수/컴포넌트 계산.
-    - 계산에 필요한 값이 부족하면 ValueError 를 잡고 로그만 남기고 조용히 패스.
-
-    반환:
-    - (entry_score or None, components_dict)
-      · entry_score 가 None 이면 점수 계산이 스킵된 것.
+    - 계산에 필요한 값이 부족하면 ValueError 를 잡고 로그만 남기고 패스.
     """
     try:
         entry_score, components = _compute_entry_score_components(
@@ -413,9 +384,8 @@ def _save_entry_score_to_db(
 ) -> None:
     """bt_entry_scores 테이블에 EntryScore 레코드를 저장.
 
-    - DB 세션/모델이 준비되지 않은 환경에서는 조용히 패스하고 로그만 남긴다.
+    - DB 세션/모델이 준비되지 않은 환경에서는 기록을 생략한다.
     - DB 에러 발생 시 rollback 후 에러 로그를 남긴다.
-    - 저장에 성공하면 텔레그램으로도 점수 요약을 전송한다.
     """
     if SessionLocal is None or EntryScoreORM is None:
         log("[ENTRY_SCORE] SessionLocal / EntryScoreORM 없음 → 기록 생략")
@@ -423,7 +393,7 @@ def _save_entry_score_to_db(
 
     try:
         session = SessionLocal()
-    except Exception as e:  # pragma: no cover - DB 초기화 실패 방어
+    except Exception as e:  # pragma: no cover
         log(f"[ENTRY_SCORE] Session 생성 실패: {e}")
         return
 
@@ -451,7 +421,7 @@ def _save_entry_score_to_db(
         session.commit()
         log(f"[ENTRY_SCORE] saved: symbol={symbol} ts={ts_dt} score={entry_score:.3f}")
 
-        # ✅ 저장 성공 시 텔레그램으로도 점수 알림 전송
+        # 텔레그램 점수 알림
         try:
             side_up = (side or "").upper()
             if side_up == "LONG":
@@ -472,7 +442,7 @@ def _save_entry_score_to_db(
         except Exception as e:
             log(f"[ENTRY_SCORE] telegram send failed: {e}")
 
-    except Exception as e:  # pragma: no cover - DB 에러 방어
+    except Exception as e:  # pragma: no cover
         session.rollback()
         log(f"[ENTRY_SCORE] insert failed: {e}")
     finally:
@@ -495,7 +465,6 @@ def _create_trade_row_on_entry(
 
     - INSERT 시 RETURNING id 를 사용해 pk 를 받아 trade.db_id 로 심어 둔다.
     - SessionLocal / sa_text 가 없으면 조용히 패스하고 로그만 남긴다.
-    - DB 에러 발생 시 rollback 후 에러 로그를 남긴다.
     """
     if SessionLocal is None or sa_text is None:
         log("[BT_TRADES] SessionLocal / sa_text 없음 → INSERT 생략")
@@ -609,10 +578,18 @@ def try_open_new_position(
     """시그널을 받아서 조건이 되면 실제로 포지션을 연다.
 
     아무 것도 못 열면 (None, sleep_sec)을 돌려준다.
-
-    - settings   : BotSettings (settings_ws.load_settings 결과)
-    - last_close_ts: 최근 청산 시각(쿨다운/컨텍스트용, 현재는 단일 전략 기준)
     """
+
+    # 🔥 데이터 헬스 FAIL 시 엔트리 차단
+    if not HEALTH_OK:
+        msg = f"[SKIP][DATA_HEALTH_FAIL] 진입 차단됨: {LAST_FAIL_REASON}"
+        try:
+            send_skip_tg(msg)
+        except Exception as e:
+            log(f"[ENTRY_HEALTH] send_skip_tg failed: {e}")
+        log(msg)
+        return None, 1.0
+
     symbol = settings.symbol
 
     # GPT 메타 정보 (로그/EntryScore components 에 기록용)
@@ -627,14 +604,15 @@ def try_open_new_position(
         last_close_ts=last_close_ts,
     )
     if signal_ctx is None:
-        # 시그널이 없거나 모든 후보가 필터링 단계에서 탈락
-        send_skip_tg(f"[SKIP] no_signal_or_arbitration_rejected: symbol={symbol}")
+        # WS 피처 빌더 단계에서 이미 FeatureBuildError / 예외가 처리된 상태.
+        msg = f"[SKIP] no_signal_from_ws_features: symbol={symbol}"
+        send_skip_tg(msg)
         log_skip_event(
             symbol=symbol,
             regime="NO_TRADE",
             source="entry_flow.signal",
             side=None,
-            reason="no_signal_or_arbitration_rejected",
+            reason="no_signal_from_ws_features",
             extra=None,
         )
         return None, 1.0
@@ -655,9 +633,7 @@ def try_open_new_position(
     else:
         regime_label = "GENERIC"
 
-    # ✅ 2025-12-01: TA-Lib ATR 기반 EntryScore NaN 가드
-    # - atr_fast / atr_slow 가 NaN/None/비유효 값이면,
-    #   지표가 준비되지 않은 상태로 보고 이번 캔들 엔트리 전체를 SKIP 처리.
+    # ✅ ATR NaN 가드: atr_fast/atr_slow 이상 시 엔트리 전체 SKIP
     atr_fast_val = extra.get("atr_fast") if isinstance(extra, dict) else None
     atr_slow_val = extra.get("atr_slow") if isinstance(extra, dict) else None
     if (
@@ -691,7 +667,7 @@ def try_open_new_position(
     if ws_get_klines_with_volume is not None:
         try:
             ws_candles_1m = ws_get_klines_with_volume(symbol, "1m", 40)
-        except Exception as e:  # pragma: no cover - 방어적 로깅
+        except Exception as e:  # pragma: no cover
             log(f"[ENTRY][WS] get 1m candles failed: {e}")
             ws_candles_1m = None
 
@@ -715,7 +691,7 @@ def try_open_new_position(
             direction="LONG" if chosen_signal == "LONG" else "SHORT",
             extra="signal_eval=1",
         )
-    except Exception as e:  # pragma: no cover - 스냅샷 실패는 무시
+    except Exception as e:  # pragma: no cover
         log(f"[SIGNAL_SNAPSHOT] log failed: {e}")
 
     # (2) 진입 전 가드: 수동/외부 가드 (GPT 이전에 항상 체크)
@@ -759,7 +735,6 @@ def try_open_new_position(
         return None, 5.0
 
     # (4) 주문 관련 파라미터 계산 (리스크/레버리지/TP·SL 기본값)
-    # settings 에 값이 없으면 안전한 기본값으로.
     leverage = float(getattr(settings, "leverage", 10.0))
     risk_pct = float(getattr(settings, "risk_pct", 0.01))  # 1% 기본
 
@@ -781,7 +756,6 @@ def try_open_new_position(
     )
 
     # (4-0) GPT 엔트리 쿨다운 (PREVIEW/GPT 모두 포함)
-    # - 너무 잦은 WS 시그널로 인해 PREVIEW + GPT SKIP 이 몇 초 간격으로 반복되는 현상 방지.
     global _LAST_GPT_ENTRY_TS
     cooldown_sec = _get_gpt_entry_cooldown_sec(settings)
     now_ts = time.time()
@@ -809,7 +783,6 @@ def try_open_new_position(
                     "cooldown_sec": float(cooldown_sec),
                 },
             )
-            # 남은 쿨다운 시간과 GPT_SKIP_SLEEP_SEC 중 큰 값으로 슬립
             sleep_sec = float(
                 max(remain, getattr(settings, "gpt_skip_sleep_sec", 1.0))
             )
@@ -818,7 +791,7 @@ def try_open_new_position(
     # 이 캔들을 GPT 후보로 평가하기로 했으므로 타임스탬프 갱신
     _LAST_GPT_ENTRY_TS = now_ts
 
-    # (4-1) 진입 전 점수 프리뷰 (GPT 프롬프트에도 같이 들어갈 요약 정보)
+    # (4-1) 진입 전 점수 프리뷰
     preview_score, _ = _preview_entry_score_and_notify(
         symbol=symbol,
         signal_source=signal_source,
@@ -830,7 +803,7 @@ def try_open_new_position(
         extra=extra,
     )
 
-    # (4-2) 현재 가드 스냅샷 구성 (GPT 프롬프트 + guard_adjustments 에 사용)
+    # (4-2) 현재 가드 스냅샷 (GPT 프롬프트 + guard_adjustments 용)
     guard_snapshot: Dict[str, float] = {}
     for key in [
         "min_entry_volume_ratio",
@@ -849,7 +822,7 @@ def try_open_new_position(
     else:
         extra_for_gpt = None
 
-    # (4-4) GPT-5 진입 의사결정 (gpt_trader 사용, 폴백 없음)
+    # (4-4) GPT 진입 의사결정 (폴백 없음)
     try:
         gpt_result = decide_entry_with_gpt_trader(
             settings,
@@ -865,8 +838,6 @@ def try_open_new_position(
             guard_snapshot=guard_snapshot or None,
         )
     except Exception as e:
-        # gpt_trader 내부에서도 예외를 처리하지만, 혹시 모를 오류는
-        # 해당 루프만 SKIP 처리하고, 나머지 하드 스톱/쿨타임 관리는 gpt_trader 에 맡긴다.
         msg = f"[GPT_ENTRY][ERROR] gpt_trader unexpected exception → skip: {e}"
         log(msg)
         try:
@@ -890,7 +861,7 @@ def try_open_new_position(
     reason_val = gpt_result.get("reason")
     gpt_reason = str(reason_val) if isinstance(reason_val, str) else None
 
-    # gpt_trader 가 반환하는 상태코드(gpt_status) 우선 사용, 없으면 legacy status 사용
+    # gpt_status / legacy status
     status_val = gpt_result.get("gpt_status")
     if not isinstance(status_val, str):
         status_val = gpt_result.get("status")
@@ -912,7 +883,7 @@ def try_open_new_position(
     except (TypeError, ValueError):
         preview_score = None
 
-    # (4-5) GPT 타임아웃(응답 지연) → 이 캔들만 SKIP (하드 스톱 금지)
+    # (4-5) GPT 타임아웃 → 이 캔들만 SKIP
     is_timeout = False
     if gpt_status == "TIMEOUT":
         is_timeout = True
@@ -950,7 +921,7 @@ def try_open_new_position(
         )
         return None, sleep_sec
 
-    # (4-6) gpt_trader 하드 스톱 상태 → 쿨타임 동안 신규 진입 전면 스킵
+    # (4-6) GPT 하드 스톱 → 쿨타임 동안 신규 진입 전면 스킵
     if gpt_status == "HARD_STOP" or hard_stop_flag:
         msg = (
             "[GPT_ENTRY][HARD_STOP] GPT 장애 상태 → 신규 진입 스킵"
@@ -977,7 +948,7 @@ def try_open_new_position(
         )
         return None, sleep_sec
 
-    # (4-7) GPT 내부 오류/예외에 의한 ERROR + raw 비어 있음 → 이 캔들만 에러 SKIP
+    # (4-7) GPT ERROR + raw 없음 → 이 캔들만 에러 SKIP
     if gpt_action == "ERROR" and not raw_decision:
         msg = (
             "[GPT_ENTRY][ERROR] GPT_TRADER returned ERROR with empty raw → "
@@ -1002,8 +973,7 @@ def try_open_new_position(
     # (4-8) GPT 판단에 따른 일반 SKIP
     if final_action != "ENTER":
 
-        # 지능형 SKIP 리포트 생성 (GPT 호출 없음)
-        # available: extra, preview_score, guard_snapshot, chosen_signal, regime_features 등
+        # 지능형 SKIP 리포트 생성 (extra / preview_score 기반)
         skip_parts: List[str] = []
 
         # 1) 추세 강도
@@ -1044,16 +1014,12 @@ def try_open_new_position(
             skip_parts.append(f"MTF={mtf}")
 
         # 6) preview entry_score
-        if isinstance(preview_score, (int, float)):
-            if preview_score < 30:
-                skip_parts.append(f"entry_score낮음({preview_score:.1f})")
+        if isinstance(preview_score, (int, float)) and preview_score < 30:
+            skip_parts.append(f"entry_score낮음({preview_score:.1f})")
 
-        # SKIP 리포트 문장 구성 (요약 레이블)
         skip_report = " / ".join(skip_parts) if skip_parts else "신뢰도 낮음"
 
-        # ─────────────────────────────────────
-        # 사람이 바로 이해할 수 있는 해석 문자열 구성
-        # ─────────────────────────────────────
+        # 사람이 바로 이해할 수 있는 해석 문자열
         interpret_parts: List[str] = []
 
         # 추세 강도 해석
@@ -1114,12 +1080,12 @@ def try_open_new_position(
 
         interpret_msg = "\n  · ".join(interpret_parts) if interpret_parts else ""
 
-        # 🔥 GPT가 준 reason 가져오기
+        # GPT가 준 reason
         gpt_reason = gpt_result.get("reason")
         if not isinstance(gpt_reason, str):
             gpt_reason = ""
 
-        # 🔥 세밀한 SKIP 상세 메시지 구성
+        # SKIP 상세 메시지 구성
         lines: List[str] = [
             "[GPT_ENTRY][SKIP]",
             f"- 요약: {skip_report}",
@@ -1129,7 +1095,7 @@ def try_open_new_position(
             lines.append("- 해석:")
             lines.append(f"  · {interpret_msg}")
 
-        # raw 지표도 하단에 별도로 붙여서, 필요하면 숫자 레벨까지 확인 가능
+        # raw 지표도 숫자 그대로 노출
         lines.append("- raw 지표:")
         lines.append(f"  · trend_strength={ts}")
         lines.append(f"  · volatility={vol}")
@@ -1179,9 +1145,8 @@ def try_open_new_position(
         except Exception:
             guard_adjustments = {}
 
-    # GPT 승인/보정 결과 텔레그램 알림 (정보용)
+    # GPT 승인/보정 결과 텔레그램 알림
     try:
-        # 🔥 먼저 진입 이유(reason)만 깔끔하게 전송
         send_tg(f"[GPT_ENTRY][ENTER] {gpt_reason or '진입 사유 미제공'}")
 
         side_up = (chosen_signal or "").upper()
@@ -1225,7 +1190,6 @@ def try_open_new_position(
     )
 
     # (5) 거래량/가격 점프/스프레드 가드
-    # - gpt_trader 가 내려준 guard_adjustments 를 settings 에 1회성으로 반영한 뒤 체크
     original_guard_values: Dict[str, Any] = {}
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
@@ -1344,9 +1308,8 @@ def try_open_new_position(
     if isinstance(mark, (int, float)) and mark > 0:
         price_for_hint = mark
         price_for_qty = mark
-
-    # markPrice를 못 구했을 경우에만 WS depth5 사용
     else:
+        # markPrice를 못 구했을 경우에만 WS depth5 사용
         if (
             best_bid is not None
             and best_ask is not None
@@ -1360,7 +1323,7 @@ def try_open_new_position(
             else:
                 price_for_hint = float(best_bid)
 
-    # (6) 실제 주문 수량 계산 (여기서 qty가 처음 정의됨 → 절대 위로 올라가면 안 됨)
+    # (6) 실제 주문 수량 계산
     notional = avail * effective_risk_pct * leverage
     qty = notional / max(float(price_for_qty), 1.0)
 
@@ -1400,9 +1363,7 @@ def try_open_new_position(
     soft_mode = False
     sl_floor_ratio = None
     if isinstance(extra, dict):
-        soft_mode = bool(
-            extra.get("soft_mode") or extra.get("soft") or False
-        )
+        soft_mode = bool(extra.get("soft_mode") or extra.get("soft") or False)
         _sl_floor = extra.get("sl_floor_ratio")
         if isinstance(_sl_floor, (int, float)):
             sl_floor_ratio = float(_sl_floor)
@@ -1479,7 +1440,6 @@ def try_open_new_position(
                 "reason": gpt_reason,
                 "decision": gpt_decision,
             }
-            # market_features_ws 가 내려준 방향/레짐 정보도 함께 기록
             if isinstance(extra, dict):
                 gpt_info["signal"] = {
                     "direction_raw": extra.get("direction_raw"),
