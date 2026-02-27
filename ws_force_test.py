@@ -16,12 +16,12 @@ WS 강제 테스트 + REST 백필(60개) 포함 스크립트
 import time
 
 # 🔥 MUST BE FIRST — settings must load BEFORE market_data_ws
-from settings_ws import load_settings
+from settings import load_settings
 SET = load_settings()   # ← 이게 먼저 실행되어야 KLINE_MIN_BUFFER=60 적용됨
 
 # 이제서야 market_data_ws import (SET 적용됨)
-from market_data_rest import fetch_klines_rest
-from market_data_ws import (
+from infra.market_data_rest import fetch_klines_rest
+from infra.market_data_ws import (
     backfill_klines_from_rest,
     start_ws_loop,
     get_health_snapshot,

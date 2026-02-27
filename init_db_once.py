@@ -20,8 +20,8 @@ Render Background Worker 에서는 TRADER_DB_URL 을 Internal Database URL 로
 맞춰둔 뒤, 필요한 경우에만 이 스크립트를 실행하면 된다.
 """
 
-from db_core import Base, engine  # TRADER_DB_URL 로 연결된 engine 사용
-import db_models  # noqa: F401  # 모델들을 Base에 등록하기 위해 import 만 해둔다.
+from state.db_core import Base, engine  # TRADER_DB_URL 로 연결된 engine 사용
+import state.db_models as db_models  # noqa: F401  # 모델들을 Base에 등록하기 위해 import 만 해둔다.
 
 
 def init_db() -> None:

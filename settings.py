@@ -1,0 +1,601 @@
+# settings.py
+# =============================================================================
+# Design principles (Production Settings for Binance USDT-M Futures Engine)
+# -----------------------------------------------------------------------------
+# - This project must use **settings.py** as the single source of truth.
+# - Environment variables (os.environ) have priority (Render-friendly).
+# - Optional local .env is supported (no external deps) and never overwrites
+#   existing environment variables.
+# - Invalid configuration must fail fast (ValueError/RuntimeError).
+# - Sensitive values (API key/secret) must never be logged.
+# - Python 3.11+
+# =============================================================================
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+from dataclasses import dataclass, field
+from datetime import timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Korea Standard Time (UTC+9)
+KST = timezone(timedelta(hours=9))
+
+
+# -----------------------------------------------------------------------------
+# Dataclasses
+# -----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class Settings:
+    """Runtime settings for the trading engine (Binance USDT-M Futures)."""
+
+    # Binance credentials (exchange_api.py expects these names)
+    api_key: str = ""
+    api_secret: str = ""
+
+    # Core trading
+    symbol: str = "BTCUSDT"
+    interval: str = "5m"
+
+    # Futures config
+    leverage: int = 10
+    # Legacy flag used across the repo (True -> ISOLATED, False -> CROSSED)
+    isolated: bool = True
+    # Normalized margin mode string ("ISOLATED" or "CROSSED")
+    margin_mode: str = "ISOLATED"
+    # Position mode ("ONEWAY" or "HEDGE")
+    futures_position_mode: str = "ONEWAY"
+
+    # HTTP / signing
+    recv_window_ms: int = 5000
+    request_timeout_sec: int = 10
+
+    # Symbol filters (conservative placeholders; final precision is applied in order_executor)
+    qty_step: float = 0.001
+    min_qty: float = 0.001
+    price_tick: float = 0.1
+
+    # Strategy / sizing (legacy)
+    risk_pct: float = 0.3
+    tp_pct: float = 0.006
+    sl_pct: float = 0.003
+    max_sl_pct: float = 0.015
+    max_trade_qty: float = 1.0
+
+    # Entry/exit cadence
+    entry_cooldown_sec: float = 1.0
+    cooldown_after_close: float = 3.0
+    min_entry_score_for_gpt: float = 40.0
+    gpt_entry_cooldown_sec: float = 1.0
+
+    # GPT safety
+    gpt_daily_call_limit: int = 2000
+    gpt_max_risk_pct: float = 0.02
+    gpt_min_confidence: float = 0.6
+    gpt_reject_if_over_pnl_pct: float = 0.02
+
+    # Notifications
+    unrealized_notify_sec: int = 1800
+
+    # EXIT engine
+    enable_exit_gpt: bool = True
+
+    # Polling / order limits
+    poll_fills_sec: float = 3.0
+    max_open_orders: int = 5
+
+    # Daily entry cap
+    max_entry_per_day: int = 999
+    max_entry_per_day_reset_hour_kst: int = 9
+
+    # Logging
+    log_to_file: bool = False
+    log_file: str = "logs/bot.log"
+
+    # Telegram
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    # WebSocket buffering
+    ws_enabled: bool = True
+    ws_base: str = "wss://fstream.binance.com/ws"
+    ws_combined_base: str = "wss://fstream.binance.com/stream?streams="
+    ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
+    ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
+    ws_min_kline_buffer: int = 60
+    ws_max_kline_delay_sec: float = 120.0
+    ws_orderbook_max_delay_sec: float = 10.0
+    ws_log_enabled: bool = False
+    ws_log_interval_sec: int = 60
+    ws_stale_reset_sec: float = 600.0
+
+    # Guards (entry_guards_ws)
+    max_spread_pct: float = 0.0008
+    max_spread_abs: float = 0.0
+    min_entry_volume_ratio: float = 0.3
+    max_price_jump_pct: float = 0.003
+    max_5m_delay_ms: int = 10 * 60 * 1000
+    max_orderbook_age_ms: int = 3000
+    min_bbo_notional_usdt: float = 0.0
+
+    depth_imbalance_enabled: bool = True
+    depth_imbalance_min_notional: float = 10.0
+    depth_imbalance_min_ratio: float = 2.0
+
+    price_deviation_guard_enabled: bool = True
+    price_deviation_max_pct: float = 0.0015
+
+    session_spread_mult_asia: float = 1.0
+    session_spread_mult_eu: float = 1.1
+    session_spread_mult_us: float = 1.2
+    session_jump_mult_asia: float = 1.0
+    session_jump_mult_eu: float = 1.1
+    session_jump_mult_us: float = 1.2
+
+    # Monitoring
+    data_health_notify_sec: int = 900
+    signal_analysis_interval_sec: int = 60
+    krw_per_usdt: float = 1400.0
+
+    # Exchange endpoints
+    binance_futures_base: str = "https://fapi.binance.com"
+
+    # Legacy aliases (used by some modules)
+    binance_recv_window: int = 5000
+    binance_http_timeout_sec: int = 10
+
+    # Hard risk guards (document requirements)
+    hard_daily_loss_limit_usdt: float = 0.0
+    hard_consecutive_losses_limit: int = 0
+    hard_position_value_pct_cap: float = 100.0
+    hard_liquidation_distance_pct_min: float = 0.0
+
+    # Slippage / protection
+    slippage_block_pct: float = 0.3
+    slippage_stop_engine: bool = False
+    protection_mode_enabled: bool = True
+
+
+# Backward-compatible alias for legacy type hints
+BotSettings = Settings
+
+
+@dataclass(slots=True)
+class PatternStrengthSettings:
+    """Optional pattern-strength overrides used by pattern_detection."""
+
+    pattern_strengths: Dict[str, float] = field(default_factory=dict)
+
+
+# -----------------------------------------------------------------------------
+# Optional .env loader (no external deps)
+# -----------------------------------------------------------------------------
+
+
+def _strip_inline_comment(s: str) -> str:
+    """Strip inline comments (#...) when not inside quotes."""
+    out: list[str] = []
+    in_single = False
+    in_double = False
+
+    for ch in s:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+            continue
+        if ch == "#" and not in_single and not in_double:
+            break
+        out.append(ch)
+
+    return "".join(out).strip()
+
+
+def _unquote(v: str) -> str:
+    """Remove surrounding single/double quotes if present."""
+    v = v.strip()
+    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+        return v[1:-1]
+    return v
+
+
+def _load_env_file_into_environ(dotenv_path: Path) -> None:
+    """Load .env into os.environ without overwriting existing keys."""
+    try:
+        text = dotenv_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        raise RuntimeError(f"failed to read .env: {e.__class__.__name__}") from None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        line = _strip_inline_comment(line)
+        if not line:
+            continue
+
+        if "=" not in line:
+            raise ValueError(f"invalid .env line (missing '='): {raw_line}")
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = _unquote(value.strip())
+
+        if not key:
+            raise ValueError(f"invalid .env line (empty key): {raw_line}")
+
+        if key in os.environ:
+            continue
+
+        os.environ[key] = value
+
+
+def _try_load_local_dotenv() -> None:
+    """Optionally load a .env file from common project roots."""
+    candidates: list[Path] = [Path.cwd() / ".env"]
+
+    try:
+        here = Path(__file__).resolve()
+        base = here.parent
+        for _ in range(6):
+            candidates.append(base / ".env")
+            if base.parent == base:
+                break
+            base = base.parent
+    except Exception:
+        pass
+
+    for p in candidates:
+        if p.is_file():
+            _load_env_file_into_environ(p)
+            logger.info(".env loaded (path=%s)", str(p))
+            return
+
+
+# -----------------------------------------------------------------------------
+# Type conversion helpers
+# -----------------------------------------------------------------------------
+
+
+def _get_env(key: str) -> Optional[str]:
+    v = os.environ.get(key)
+    if v is None:
+        return None
+    vv = str(v).strip()
+    return vv if vv != "" else None
+
+
+def _as_str(key: str, default: str) -> str:
+    v = _get_env(key)
+    return v if v is not None else default
+
+
+def _as_int(key: str, default: int) -> int:
+    v = _get_env(key)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        raise ValueError(f"invalid int for {key}") from None
+
+
+def _as_float(key: str, default: float) -> float:
+    v = _get_env(key)
+    if v is None:
+        return default
+    try:
+        x = float(v)
+    except Exception:
+        raise ValueError(f"invalid float for {key}") from None
+
+    if not math.isfinite(x):
+        raise RuntimeError(f"non-finite float for {key}")
+
+    return x
+
+
+def _as_bool(key: str, default: bool) -> bool:
+    v = _get_env(key)
+    if v is None:
+        return default
+
+    vv = v.strip().lower()
+    if vv in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if vv in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"invalid bool for {key}")
+
+
+def _as_csv_list(key: str, default: List[str]) -> List[str]:
+    v = _get_env(key)
+    if v is None:
+        return list(default)
+
+    parts = [p.strip() for p in v.split(",")]
+    out = [p for p in parts if p]
+    return out if out else list(default)
+
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+
+
+def _validate_settings(s: Settings) -> None:
+    if not s.api_key or not s.api_secret:
+        raise RuntimeError("missing Binance credentials (BINANCE_API_KEY / BINANCE_API_SECRET)")
+
+    sym = str(s.symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol is empty")
+    if any(ch.isspace() for ch in sym):
+        raise ValueError("symbol contains whitespace")
+
+    interval = str(s.interval or "").strip()
+    if not interval:
+        raise ValueError("interval is empty")
+
+    if s.leverage < 1:
+        raise ValueError("leverage must be >= 1")
+
+    if s.recv_window_ms < 1:
+        raise ValueError("recv_window_ms must be >= 1")
+    if s.request_timeout_sec < 1:
+        raise ValueError("request_timeout_sec must be >= 1")
+
+    if s.qty_step <= 0:
+        raise ValueError("qty_step must be > 0")
+    if s.min_qty <= 0:
+        raise ValueError("min_qty must be > 0")
+    if s.price_tick <= 0:
+        raise ValueError("price_tick must be > 0")
+
+    mm = str(s.margin_mode or "").strip().upper()
+    if mm in {"CROSS", "CROSSED"}:
+        mm = "CROSSED"
+    if mm not in {"ISOLATED", "CROSSED"}:
+        raise ValueError("margin_mode must be ISOLATED or CROSSED")
+
+    if s.hard_daily_loss_limit_usdt < 0:
+        raise ValueError("hard_daily_loss_limit_usdt must be >= 0")
+    if s.hard_consecutive_losses_limit < 0:
+        raise ValueError("hard_consecutive_losses_limit must be >= 0")
+    if not (0.0 <= s.hard_position_value_pct_cap <= 100.0):
+        raise ValueError("hard_position_value_pct_cap must be within 0..100")
+    if not (0.0 <= s.hard_liquidation_distance_pct_min <= 100.0):
+        raise ValueError("hard_liquidation_distance_pct_min must be within 0..100")
+
+    if s.slippage_block_pct < 0:
+        raise ValueError("slippage_block_pct must be >= 0")
+
+
+# -----------------------------------------------------------------------------
+# Public loader
+# -----------------------------------------------------------------------------
+
+
+def load_settings() -> Settings:
+    """Load and validate Settings (env-first, optional .env, then defaults)."""
+    _try_load_local_dotenv()
+
+    # Core env mappings
+    api_key = _as_str("BINANCE_API_KEY", "")
+    api_secret = _as_str("BINANCE_API_SECRET", "")
+
+    symbol = _as_str("SYMBOL", "BTCUSDT").upper().replace("-", "")
+    interval = _as_str("INTERVAL", "5m")
+
+    leverage = _as_int("LEVERAGE", 10)
+
+    margin_mode = _as_str("MARGIN_MODE", "ISOLATED").upper()
+    if margin_mode in {"CROSS", "CROSSED"}:
+        margin_mode = "CROSSED"
+    if margin_mode not in {"ISOLATED", "CROSSED"}:
+        raise ValueError("MARGIN_MODE must be ISOLATED or CROSSED")
+
+    isolated = margin_mode == "ISOLATED"
+
+    futures_position_mode = _as_str("FUTURES_POSITION_MODE", "ONEWAY").upper()
+
+    recv_window_ms = _as_int("RECV_WINDOW_MS", 5000)
+    request_timeout_sec = _as_int("REQUEST_TIMEOUT_SEC", 10)
+
+    qty_step = _as_float("QTY_STEP", 0.001)
+    min_qty = _as_float("MIN_QTY", 0.001)
+    price_tick = _as_float("PRICE_TICK", 0.1)
+
+    # Legacy / strategy env mappings (optional)
+    risk_pct = _as_float("RISK_PCT", 0.3)
+    tp_pct = _as_float("TP_PCT", 0.006)
+    sl_pct = _as_float("SL_PCT", 0.003)
+
+    max_sl_pct = _as_float("MAX_SL_PCT", 0.015)
+    max_trade_qty = _as_float("MAX_TRADE_QTY", 1.0)
+
+    entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 1.0)
+    cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
+
+    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 40.0)
+    gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 1.0)
+
+    gpt_daily_call_limit = _as_int("GPT_DAILY_CALL_LIMIT", 2000)
+    gpt_max_risk_pct = _as_float("GPT_MAX_RISK_PCT", 0.02)
+    gpt_min_confidence = _as_float("GPT_MIN_CONFIDENCE", 0.6)
+    gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
+
+    unrealized_notify_sec = _as_int("UNREALIZED_NOTIFY_SEC", 1800)
+    enable_exit_gpt = _as_bool("ENABLE_EXIT_GPT", True)
+
+    poll_fills_sec = _as_float("POLL_FILLS_SEC", 3.0)
+    max_open_orders = _as_int("MAX_OPEN_ORDERS", 5)
+
+    max_entry_per_day = _as_int("MAX_ENTRY_PER_DAY", 999)
+    max_entry_per_day_reset_hour_kst = _as_int("MAX_ENTRY_PER_DAY_RESET_HOUR_KST", 9)
+
+    log_to_file = _as_bool("LOG_TO_FILE", False)
+    log_file = _as_str("LOG_FILE", "logs/bot.log")
+
+    telegram_bot_token = _as_str("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id = _as_str("TELEGRAM_CHAT_ID", "")
+
+    ws_enabled = _as_bool("WS_ENABLED", True)
+    ws_base = _as_str("BINANCE_FUTURES_WS_BASE", "wss://fstream.binance.com/ws")
+    ws_combined_base = _as_str(
+        "BINANCE_FUTURES_WS_COMBINED_BASE",
+        "wss://fstream.binance.com/stream?streams=",
+    )
+
+    ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m"])
+    ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m"])
+
+    ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 60)
+    ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
+    ws_orderbook_max_delay_sec = _as_float("WS_ORDERBOOK_MAX_DELAY_SEC", 10.0)
+
+    ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)
+    ws_log_interval_sec = _as_int("WS_LOG_INTERVAL_SEC", 60)
+    ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
+
+    # Guards (optional)
+    max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0008)
+    max_spread_abs = _as_float("MAX_SPREAD_ABS", 0.0)
+    min_entry_volume_ratio = _as_float("MIN_ENTRY_VOLUME_RATIO", 0.3)
+    max_price_jump_pct = _as_float("MAX_PRICE_JUMP_PCT", 0.003)
+
+    max_5m_delay_ms = _as_int("MAX_5M_DELAY_MS", 10 * 60 * 1000)
+    max_orderbook_age_ms = _as_int("MAX_ORDERBOOK_AGE_MS", 3000)
+    min_bbo_notional_usdt = _as_float("MIN_BBO_NOTIONAL_USDT", 0.0)
+
+    depth_imbalance_enabled = _as_bool("DEPTH_IMBALANCE_ENABLED", True)
+    depth_imbalance_min_notional = _as_float("DEPTH_IMBALANCE_MIN_NOTIONAL", 10.0)
+    depth_imbalance_min_ratio = _as_float("DEPTH_IMBALANCE_MIN_RATIO", 2.0)
+
+    price_deviation_guard_enabled = _as_bool("PRICE_DEVIATION_GUARD_ENABLED", True)
+    price_deviation_max_pct = _as_float("PRICE_DEVIATION_MAX_PCT", 0.0015)
+
+    session_spread_mult_asia = _as_float("SESSION_SPREAD_MULT_ASIA", 1.0)
+    session_spread_mult_eu = _as_float("SESSION_SPREAD_MULT_EU", 1.1)
+    session_spread_mult_us = _as_float("SESSION_SPREAD_MULT_US", 1.2)
+
+    session_jump_mult_asia = _as_float("SESSION_JUMP_MULT_ASIA", 1.0)
+    session_jump_mult_eu = _as_float("SESSION_JUMP_MULT_EU", 1.1)
+    session_jump_mult_us = _as_float("SESSION_JUMP_MULT_US", 1.2)
+
+    data_health_notify_sec = _as_int("DATA_HEALTH_NOTIFY_SEC", 900)
+    signal_analysis_interval_sec = _as_int("SIGNAL_ANALYSIS_INTERVAL_SEC", 60)
+    krw_per_usdt = _as_float("KRW_PER_USDT", 1400.0)
+
+    binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
+    binance_recv_window = recv_window_ms
+    binance_http_timeout_sec = request_timeout_sec
+
+    # Hard risk guards
+    hard_daily_loss_limit_usdt = _as_float("HARD_DAILY_LOSS_LIMIT_USDT", 0.0)
+    hard_consecutive_losses_limit = _as_int("HARD_CONSECUTIVE_LOSSES_LIMIT", 0)
+    hard_position_value_pct_cap = _as_float("HARD_POSITION_VALUE_PCT_CAP", 100.0)
+    hard_liquidation_distance_pct_min = _as_float("HARD_LIQUIDATION_DISTANCE_PCT_MIN", 0.0)
+
+    # Slippage / protection
+    slippage_block_pct = _as_float("SLIPPAGE_BLOCK_PCT", 0.3)
+    slippage_stop_engine = _as_bool("SLIPPAGE_STOP_ENGINE", False)
+    protection_mode_enabled = _as_bool("PROTECTION_MODE_ENABLED", True)
+
+    s = Settings(
+        api_key=api_key,
+        api_secret=api_secret,
+        symbol=symbol,
+        interval=interval,
+        leverage=leverage,
+        isolated=isolated,
+        margin_mode=margin_mode,
+        futures_position_mode=futures_position_mode,
+        recv_window_ms=recv_window_ms,
+        request_timeout_sec=request_timeout_sec,
+        qty_step=qty_step,
+        min_qty=min_qty,
+        price_tick=price_tick,
+        risk_pct=risk_pct,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        max_sl_pct=max_sl_pct,
+        max_trade_qty=max_trade_qty,
+        entry_cooldown_sec=entry_cooldown_sec,
+        cooldown_after_close=cooldown_after_close,
+        min_entry_score_for_gpt=min_entry_score_for_gpt,
+        gpt_entry_cooldown_sec=gpt_entry_cooldown_sec,
+        gpt_daily_call_limit=gpt_daily_call_limit,
+        gpt_max_risk_pct=gpt_max_risk_pct,
+        gpt_min_confidence=gpt_min_confidence,
+        gpt_reject_if_over_pnl_pct=gpt_reject_if_over_pnl_pct,
+        unrealized_notify_sec=unrealized_notify_sec,
+        enable_exit_gpt=enable_exit_gpt,
+        poll_fills_sec=poll_fills_sec,
+        max_open_orders=max_open_orders,
+        max_entry_per_day=max_entry_per_day,
+        max_entry_per_day_reset_hour_kst=max_entry_per_day_reset_hour_kst,
+        log_to_file=log_to_file,
+        log_file=log_file,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        ws_enabled=ws_enabled,
+        ws_base=ws_base,
+        ws_combined_base=ws_combined_base,
+        ws_subscribe_tfs=ws_subscribe_tfs,
+        ws_required_tfs=ws_required_tfs,
+        ws_min_kline_buffer=ws_min_kline_buffer,
+        ws_max_kline_delay_sec=ws_max_kline_delay_sec,
+        ws_orderbook_max_delay_sec=ws_orderbook_max_delay_sec,
+        ws_log_enabled=ws_log_enabled,
+        ws_log_interval_sec=ws_log_interval_sec,
+        ws_stale_reset_sec=ws_stale_reset_sec,
+        max_spread_pct=max_spread_pct,
+        max_spread_abs=max_spread_abs,
+        min_entry_volume_ratio=min_entry_volume_ratio,
+        max_price_jump_pct=max_price_jump_pct,
+        max_5m_delay_ms=max_5m_delay_ms,
+        max_orderbook_age_ms=max_orderbook_age_ms,
+        min_bbo_notional_usdt=min_bbo_notional_usdt,
+        depth_imbalance_enabled=depth_imbalance_enabled,
+        depth_imbalance_min_notional=depth_imbalance_min_notional,
+        depth_imbalance_min_ratio=depth_imbalance_min_ratio,
+        price_deviation_guard_enabled=price_deviation_guard_enabled,
+        price_deviation_max_pct=price_deviation_max_pct,
+        session_spread_mult_asia=session_spread_mult_asia,
+        session_spread_mult_eu=session_spread_mult_eu,
+        session_spread_mult_us=session_spread_mult_us,
+        session_jump_mult_asia=session_jump_mult_asia,
+        session_jump_mult_eu=session_jump_mult_eu,
+        session_jump_mult_us=session_jump_mult_us,
+        data_health_notify_sec=data_health_notify_sec,
+        signal_analysis_interval_sec=signal_analysis_interval_sec,
+        krw_per_usdt=krw_per_usdt,
+        binance_futures_base=binance_futures_base,
+        binance_recv_window=binance_recv_window,
+        binance_http_timeout_sec=binance_http_timeout_sec,
+        hard_daily_loss_limit_usdt=hard_daily_loss_limit_usdt,
+        hard_consecutive_losses_limit=hard_consecutive_losses_limit,
+        hard_position_value_pct_cap=hard_position_value_pct_cap,
+        hard_liquidation_distance_pct_min=hard_liquidation_distance_pct_min,
+        slippage_block_pct=slippage_block_pct,
+        slippage_stop_engine=slippage_stop_engine,
+        protection_mode_enabled=protection_mode_enabled,
+    )
+
+    _validate_settings(s)
+
+    return s

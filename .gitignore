@@ -21,9 +21,13 @@ env/
 # ───── 환경변수/민감정보 ─────
 .env
 *.env
+.env.*
+*.pem
+*.key
+*.crt
 
 # 구글 서비스 계정 키 (절대 올리지 말 것)
-bingx-bot-*.json
+*-bot-*.json
 *.serviceaccount.json
 *.gserviceaccount.json
 *.key.json
