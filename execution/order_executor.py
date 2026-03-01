@@ -1,4 +1,4 @@
-# order_executor.py
+# execution/order_executor.py
 # =============================================================================
 # Binance USDT-M Futures - Order Execution Layer (Production)
 # =============================================================================
@@ -10,15 +10,24 @@
 # =============================================================================
 #
 # =============================================================================
-# 2026-XX-XX 변경 사항
+# 변경 이력
 # -----------------------------------------------------------------------------
-# 1) 실제 주문 실행/청산 시 이벤트 발행 추가
-#    - ENTRY
-#    - EXIT
-#    - ORDER_SUBMITTED
-#    - ORDER_ERROR
-# 2) signals_logger.log_event()를 통해 EventBus 자동 연결
-# 3) 거래 로직은 변경하지 않음
+# 2026-XX-XX
+# 1) 패키지 구조 정합성 수정
+#    - from exchange_api import ...  →  from execution.exchange_api import ...
+#    - 내부 get_position import도 동일하게 execution.exchange_api로 통일
+# 2) 기존 로직(주문/청산 흐름) 변경 없음
+#
+# 2026-03-01
+# 1) Trade import 경로 정합
+#    - open_position_with_tp_sl 내부의 `from trader import Trade` 제거
+#    - 상단 `from state.trader_state import Trade` 단일 사용 (No module named 'trader' 해결)
+# 2) EventBus strict validation 정합
+#    - publish payload.side는 LONG/SHORT/CLOSE만 허용
+#    - order_executor 내부 log_event side를 LONG/SHORT/CLOSE로 정규화
+#      (close 관련은 CLOSE, entry 관련은 LONG/SHORT)
+# 3) Trade dataclass 정합
+#    - Trade(tp_price/sl_price)는 float이므로 None 금지 → 0.0으로 저장
 # =============================================================================
 
 from __future__ import annotations
@@ -32,7 +41,8 @@ from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, Optional, Tuple
 
-from exchange_api import (
+from execution.exchange_api import (
+    fetch_open_positions,
     get_exchange_info,
     get_open_orders,
     req,
@@ -57,16 +67,30 @@ _FILTER_CACHE_TTL_SEC: int = 1800  # 30 minutes
 _IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
 _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
 
-# -----------------------------------------------------------------------------
-# Retry hook (placeholder)
-# -----------------------------------------------------------------------------
-try:  # pragma: no cover - optional module
-    from retry_policy import execute_with_retry  # type: ignore
-except ImportError:  # pragma: no cover
 
-    def execute_with_retry(fn):  # type: ignore
-        """Fallback retry wrapper when retry_policy is not available."""
-        return fn()
+# -----------------------------------------------------------------------------
+# Retry policy (STRICT)
+# -----------------------------------------------------------------------------
+# NOTE:
+# - retry_policy 모듈을 사용하는 구조라면, 패키지 기준으로 import 되어야 한다.
+# - 폴백(없으면 조용히 통과) 금지. 없으면 ImportError로 즉시 실패.
+from execution.retry_policy import execute_with_retry  # type: ignore
+
+
+# -----------------------------------------------------------------------------
+# Event side normalization (EventBus strict: LONG/SHORT/CLOSE)
+# -----------------------------------------------------------------------------
+def _event_side_from_open_side(open_side: str) -> str:
+    s = str(open_side).upper().strip()
+    if s == "BUY":
+        return "LONG"
+    if s == "SELL":
+        return "SHORT"
+    return "CLOSE"
+
+
+def _event_side_close() -> str:
+    return "CLOSE"
 
 
 # -----------------------------------------------------------------------------
@@ -313,14 +337,12 @@ def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolF
     if tick is None or tick <= 0:
         raise RuntimeError(f"missing/invalid PRICE_FILTER.tickSize for symbol={symbol}")
 
-    # At least one of LOT_SIZE / MARKET_LOT_SIZE must exist
     if lot_step is None or lot_min is None:
         if mkt_step is None or mkt_min is None:
             raise RuntimeError(f"missing LOT_SIZE and MARKET_LOT_SIZE for symbol={symbol}")
         lot_step = mkt_step
         lot_min = mkt_min
 
-    # If MARKET_LOT_SIZE is missing, reuse LOT_SIZE (exchange-defined)
     if mkt_step is None or mkt_min is None:
         mkt_step = lot_step
         mkt_min = lot_min
@@ -364,7 +386,6 @@ def get_symbol_filters(symbol: str) -> SymbolFilters:
 # Trading settings enforcement (margin mode / leverage)
 # -----------------------------------------------------------------------------
 def _require_margin_mode(settings: Any) -> str:
-    """Read and validate settings.margin_mode (ISOLATED/CROSSED)."""
     mm = getattr(settings, "margin_mode", None)
     if not isinstance(mm, str) or not mm.strip():
         raise ValueError("settings.margin_mode is required")
@@ -377,7 +398,6 @@ def _require_margin_mode(settings: Any) -> str:
 
 
 def _require_leverage(settings: Any) -> int:
-    """Read and validate settings.leverage (>=1)."""
     lev = getattr(settings, "leverage", None)
     if lev is None:
         raise ValueError("settings.leverage is required")
@@ -391,7 +411,6 @@ def _require_leverage(settings: Any) -> int:
 
 
 def _require_timeout_sec(settings: Any) -> int:
-    """Read and validate settings.request_timeout_sec (>=1)."""
     v = getattr(settings, "request_timeout_sec", None)
     if v is None:
         raise ValueError("settings.request_timeout_sec is required")
@@ -405,7 +424,6 @@ def _require_timeout_sec(settings: Any) -> int:
 
 
 def _require_recv_window_ms(settings: Any) -> int:
-    """Read and validate settings.recv_window_ms (>=1)."""
     v = getattr(settings, "recv_window_ms", None)
     if v is None:
         raise ValueError("settings.recv_window_ms is required")
@@ -419,12 +437,6 @@ def _require_recv_window_ms(settings: Any) -> int:
 
 
 def ensure_trading_settings(symbol: str, settings: Optional[Any] = None) -> None:
-    """Ensure margin mode and leverage are applied once per symbol.
-
-    Raises:
-        ValueError: if settings are invalid.
-        RuntimeError: if exchange calls fail.
-    """
     sym = _normalize_symbol(symbol)
     st = settings if settings is not None else SET
     margin_mode = _require_margin_mode(st)
@@ -456,7 +468,6 @@ def ensure_trading_settings(symbol: str, settings: Optional[Any] = None) -> None
 # Idempotency helpers
 # -----------------------------------------------------------------------------
 def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
-    """Search open orders for matching clientOrderId."""
     orders = get_open_orders(symbol)
     if not isinstance(orders, list):
         raise RuntimeError("get_open_orders returned non-list")
@@ -469,7 +480,6 @@ def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional
 
 
 def _get_order_by_client_id(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
-    """Query an order by origClientOrderId. Returns None if not found."""
     params = {"symbol": symbol, "origClientOrderId": client_order_id}
     try:
         data = _call_with_time_sync_retry(
@@ -484,10 +494,7 @@ def _get_order_by_client_id(symbol: str, client_order_id: str, timeout_sec: int)
     return data
 
 
-def _wait_for_inflight_or_existing(
-    symbol: str, client_order_id: str, timeout_sec: int
-) -> Optional[Dict[str, Any]]:
-    """If another thread is placing this clientOrderId, wait briefly and return existing order if found."""
+def _wait_for_inflight_or_existing(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
     deadline = time.time() + _IDEMPOTENCY_INFLIGHT_WAIT_SEC
     while True:
         with _CLIENT_ID_LOCK:
@@ -520,11 +527,6 @@ def _round_qty_and_price(
     raw_price: Optional[Any],
     raw_stop_price: Optional[Any],
 ) -> Tuple[Decimal, Optional[Decimal], Optional[Decimal]]:
-    """Round quantity/price/stopPrice according to exchange filters.
-
-    Quantity is floored to stepSize. If result is 0 or < minQty, raises ValueError.
-    Price/stopPrice are floored to tickSize when provided.
-    """
     type_u = order_type.upper().strip()
     is_market_like = type_u == "MARKET" or type_u.endswith("_MARKET")
 
@@ -577,11 +579,6 @@ def _place_order(
     close_position: Optional[bool] = None,
     client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Place an order on Binance Futures with strict validation + idempotency.
-
-    All new orders use newClientOrderId. If an order with the same clientOrderId
-    already exists, it is returned instead of submitting a duplicate.
-    """
     st = settings if settings is not None else SET
 
     sym = _normalize_symbol(symbol)
@@ -599,7 +596,6 @@ def _place_order(
     timeout_sec = _require_timeout_sec(st)
     recv_window_ms = _require_recv_window_ms(st)
 
-    # Idempotency: client order id
     cid = _validate_client_order_id(client_order_id) if client_order_id else _make_client_order_id()
 
     acquired = False
@@ -642,7 +638,6 @@ def _place_order(
             raw_stop_price=stop_price,
         )
 
-        # Exchange-level idempotency checks
         existing = _find_open_order_by_client_id(sym, cid)
         if existing is not None:
             logger.info(
@@ -688,17 +683,14 @@ def _place_order(
         if stop_n is not None:
             params["stopPrice"] = _d_to_str(stop_n)
 
-        # LIMIT-like orders require timeInForce and price
         if type_u in {"LIMIT", "STOP", "TAKE_PROFIT"}:
             params["timeInForce"] = tif_u or "GTC"
             if "price" not in params:
                 raise ValueError(f"price is required for order_type={type_u}")
 
-        # Stop / take-profit (limit) orders require stopPrice too
         if type_u in {"STOP", "TAKE_PROFIT"} and "stopPrice" not in params:
             raise ValueError(f"stopPrice is required for order_type={type_u}")
 
-        # Stop-market orders require stopPrice
         if type_u in {"STOP_MARKET", "TAKE_PROFIT_MARKET"} and "stopPrice" not in params:
             raise ValueError(f"stopPrice is required for order_type={type_u}")
 
@@ -735,9 +727,6 @@ def _place_order(
             _CLIENT_ID_INFLIGHT.discard(cid)
 
 
-# -----------------------------------------------------------------------------
-# Public API (keep backward compatibility where possible)
-# -----------------------------------------------------------------------------
 def place_market(
     symbol: str,
     side: str,
@@ -748,7 +737,6 @@ def place_market(
     position_side: Optional[str] = "BOTH",
     client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Place a MARKET order (entry or reduce-only close)."""
     return _place_order(
         settings=settings,
         symbol=symbol,
@@ -773,7 +761,6 @@ def place_limit(
     position_side: Optional[str] = "BOTH",
     client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Place a LIMIT order."""
     return _place_order(
         settings=settings,
         symbol=symbol,
@@ -800,7 +787,6 @@ def place_conditional(
     position_side: Optional[str] = "BOTH",
     client_order_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Place a conditional stop/take-profit order (STOP_MARKET / TAKE_PROFIT_MARKET, etc.)."""
     type_u = str(order_type).upper().strip()
     return _place_order(
         settings=settings,
@@ -821,7 +807,6 @@ def cancel_order_safe(
     *,
     settings: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Cancel an order with timestamp-error recovery (-1021)."""
     st = settings if settings is not None else SET
     sym = _normalize_symbol(symbol)
     timeout_sec = _require_timeout_sec(st)
@@ -845,14 +830,9 @@ def set_tp_sl(
     tp_price: float,
     sl_price: float,
     soft_mode: bool = False,
-    sl_floor_ratio: Optional[float] = None,  # kept for backward compatibility (handled upstream)
+    sl_floor_ratio: Optional[float] = None,
     settings: Optional[Any] = None,
 ) -> None:
-    """Set TP/SL as reduce-only conditional orders.
-
-    - TP: TAKE_PROFIT_MARKET
-    - SL: STOP_MARKET (skipped when soft_mode=True)
-    """
     _ = sl_floor_ratio
 
     open_side = _normalize_side(side_open)
@@ -898,14 +878,7 @@ def open_position_with_tp_sl(
     soft_mode: bool = False,
     sl_floor_ratio: Optional[float] = None,
 ) -> Optional["Trade"]:
-    """Open a position with MARKET entry, then set TP/SL as conditional orders.
-
-    Keeps the legacy signature used by entry_flow.py.
-    """
-    try:
-        from trader import Trade  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"Trade import failed: {e}") from None
+    # ✅ Trade는 파일 상단에서 `from state.trader_state import Trade` 로 이미 import됨
 
     sym = _normalize_symbol(symbol)
     try:
@@ -919,7 +892,6 @@ def open_position_with_tp_sl(
     except Exception:
         lev = float(getattr(SET, "leverage", 1) or 1)
 
-    # Stable across internal retries
     cid = _make_client_order_id(prefix="ent")
 
     try:
@@ -941,16 +913,17 @@ def open_position_with_tp_sl(
             source,
             str(e),
         )
+        # ✅ EventBus strict side
         log_event(
             event_type="ERROR",
             symbol=sym,
             regime=source,
-            side=open_side,
-            reason=str(e),
+            side=_event_side_from_open_side(open_side),
+            reason=str(e) or "entry_order_failed",
+            extra_json={"open_side": open_side, "qty": float(qty)},
         )
         return None
 
-    # Extract entry price (do not use hint for execution-critical values)
     entry_price: float = 0.0
     try:
         v = entry_resp.get("avgPrice")
@@ -980,7 +953,7 @@ def open_position_with_tp_sl(
 
     if entry_price <= 0:
         try:
-            from exchange_api import get_position  # type: ignore
+            from execution.exchange_api import get_position  # ✅ FIXED
 
             for _ in range(3):
                 pos = get_position(sym)
@@ -997,11 +970,12 @@ def open_position_with_tp_sl(
         logger.error("entry price unavailable (symbol=%s) hint=%s", sym, entry_price_hint)
         return None
 
+    # ✅ EventBus strict side
     log_event(
         event_type="ENTRY",
         symbol=sym,
         regime=source,
-        side=open_side,
+        side=_event_side_from_open_side(open_side),  # LONG/SHORT
         price=entry_price,
         qty=qty,
         leverage=lev,
@@ -1009,6 +983,7 @@ def open_position_with_tp_sl(
         sl_pct=sl_pct,
         risk_pct=getattr(settings, "risk_pct", None),
         reason="MARKET_ENTRY_FILLED",
+        extra_json={"open_side": open_side},
     )
 
     try:
@@ -1027,7 +1002,6 @@ def open_position_with_tp_sl(
         tp_price = entry_price * (1.0 - tp_pct_f)
         sl_price = entry_price * (1.0 + sl_pct_f)
 
-    # Optional SL floor adjustment (legacy behavior)
     if isinstance(sl_floor_ratio, (int, float)) and float(sl_floor_ratio) > 0:
         floor_r = float(sl_floor_ratio)
         if open_side == "BUY":
@@ -1056,11 +1030,12 @@ def open_position_with_tp_sl(
         logger.error("set_tp_sl failed (symbol=%s err=%s)", sym, str(e))
 
     if tp_sl_set_ok:
+        # ✅ EventBus strict side
         log_event(
             event_type="TP_SL_SET",
             symbol=sym,
             regime=source,
-            side=open_side,
+            side=_event_side_from_open_side(open_side),  # LONG/SHORT
             price=entry_price,
             qty=qty,
             leverage=lev,
@@ -1068,6 +1043,7 @@ def open_position_with_tp_sl(
             sl_pct=sl_pct,
             risk_pct=getattr(settings, "risk_pct", None),
             reason="TP_SL_CONFIGURED",
+            extra_json={"soft_mode": bool(soft_mode)},
         )
 
     entry_order_id: Optional[str]
@@ -1077,21 +1053,21 @@ def open_position_with_tp_sl(
     except Exception:
         entry_order_id = None
 
+    # ✅ Trade dataclass(tp_price/sl_price) float → None 금지
     return Trade(
-        symbol=symbol,  # keep original for upstream consistency
+        symbol=symbol,
         side=open_side,
         qty=float(qty),
         entry_price=float(entry_price),
-        leverage=float(lev),
+        leverage=int(float(lev)),
         source=str(source or "MARKET"),
-        tp_price=float(tp_price) if tp_price > 0 else None,
-        sl_price=float(sl_price) if sl_price > 0 else None,
+        tp_price=float(tp_price) if tp_price > 0 else 0.0,
+        sl_price=float(sl_price) if sl_price > 0 else 0.0,
         entry_order_id=entry_order_id,
     )
 
 
 def close_position_market(symbol: str, side_open: str, qty: float) -> None:
-    """Close a position using reduce-only MARKET order."""
     sym = _normalize_symbol(symbol)
     open_side = _normalize_side(side_open)
     close_side = "SELL" if open_side == "BUY" else "BUY"
@@ -1107,15 +1083,17 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         client_order_id=cid,
     )
 
+    # ✅ EventBus strict side: CLOSE
     log_event(
         event_type="EXIT",
         symbol=sym,
         regime="MANUAL_CLOSE",
-        side=close_side,
-        price=resp.get("avgPrice") or "",
+        side=_event_side_close(),  # CLOSE
+        price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
         qty=qty,
         leverage=getattr(SET, "leverage", None),
         reason="MARKET_CLOSE_EXECUTED",
+        extra_json={"close_side": close_side, "clientOrderId": cid},
     )
 
     logger.info(
@@ -1128,6 +1106,92 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     )
 
 
+def close_all_positions_market(symbol: str) -> int:
+    """Reduce-Only 시장가로 해당 심볼의 모든 포지션을 정리한다.
+
+    STRICT:
+    - 시장데이터(캔들/오더북) 사용 금지.
+    - 포지션/주문 상태(REST)는 허용.
+
+    반환:
+    - 제출한 청산 주문 개수
+    """
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise ValueError("symbol is required")
+
+    positions = fetch_open_positions(sym)
+    if not isinstance(positions, list):
+        raise RuntimeError("fetch_open_positions returned non-list")
+    if not positions:
+        return 0
+
+    submitted = 0
+
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("symbol") or "").upper() != sym:
+            continue
+
+        amt_raw = p.get("positionAmt")
+        try:
+            amt = float(amt_raw)
+        except Exception as e:
+            raise RuntimeError(f"positionAmt parse failed: {e}") from e
+
+        if abs(amt) < 1e-12:
+            continue
+
+        pos_side = str(p.get("positionSide") or "BOTH").upper()
+        if pos_side not in ("BOTH", "LONG", "SHORT"):
+            pos_side = "BOTH"
+
+        # 포지션 방향 판정
+        if pos_side in ("LONG", "SHORT"):
+            direction = pos_side
+        else:
+            direction = "LONG" if amt > 0 else "SHORT"
+
+        close_side = "SELL" if direction == "LONG" else "BUY"
+        qty = abs(amt)
+
+        client_id = _make_client_order_id(prefix="sigterm")
+        logger.warning(
+            "[FORCE_CLOSE] submit reduce-only market close: symbol=%s direction=%s qty=%s positionSide=%s",
+            sym,
+            direction,
+            qty,
+            pos_side,
+        )
+
+        resp = place_market(
+            symbol=sym,
+            side=close_side,
+            qty=float(qty),
+            settings=SET,
+            reduce_only=True,
+            position_side=pos_side,
+            client_order_id=client_id,
+        )
+
+        # ✅ EventBus strict side: CLOSE
+        log_event(
+            event_type="EXIT",
+            symbol=sym,
+            regime="SIGTERM_FORCE_CLOSE",
+            side=_event_side_close(),  # CLOSE
+            price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
+            qty=qty,
+            leverage=getattr(SET, "leverage", None),
+            reason="SIGTERM_DEADLINE_FORCE_CLOSE",
+            extra_json={"direction": direction, "close_side": close_side, "positionSide": pos_side},
+        )
+        submitted += 1
+
+    return submitted
+
+
 __all__ = [
     "open_position_with_tp_sl",
     "place_market",
@@ -1138,4 +1202,5 @@ __all__ = [
     "close_position_market",
     "get_symbol_filters",
     "ensure_trading_settings",
+    "close_all_positions_market",
 ]

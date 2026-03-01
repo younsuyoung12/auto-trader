@@ -1,3 +1,13 @@
+# =============================================================================
+# PATCH NOTES — 2026-03-01
+# -----------------------------------------------------------------------------
+# - set_leverage_and_mode()를 상태 검증 기반 구조로 전면 수정.
+# - 기존: 무조건 set 시도 → 이미 설정된 경우(-4046 등)도 실패 처리.
+# - 변경: 현재 leverage/marginType 조회 후 다른 경우에만 set 호출.
+# - "이미 설정됨"은 정상 상태로 간주.
+# - req()의 STRICT 예외 정책은 유지 (HTTP 코드 완화하지 않음).
+# =============================================================================
+
 # exchange_api.py
 # =============================================================================
 # Design principles (Binance USDT-M Futures REST Adapter)
@@ -79,6 +89,21 @@ def _normalize_symbol(symbol: str) -> str:
     if not s:
         raise ValueError("symbol is empty")
     return s
+
+
+def _normalize_margin_type(value: Any) -> str:
+    """Normalize marginType from Binance positionRisk to 'ISOLATED' or 'CROSSED'."""
+    v = str(value or "").strip().upper()
+    if not v:
+        raise RuntimeError("positionRisk.marginType is missing/empty")
+
+    # Binance positionRisk marginType commonly: 'isolated' or 'cross'
+    if v in {"ISOLATED"}:
+        return "ISOLATED"
+    if v in {"CROSS", "CROSSED"}:
+        return "CROSSED"
+
+    raise RuntimeError(f"positionRisk.marginType unexpected value: {value!r}")
 
 
 def _local_ts_ms() -> int:
@@ -298,9 +323,7 @@ def assert_one_way_mode() -> None:
         raise RuntimeError("positionSide/dual unexpected response")
 
     if data.get("dualSidePosition") is True:
-        raise RuntimeError(
-            "Account is in HEDGE mode. Switch Binance Futures to ONE-WAY mode."
-        )
+        raise RuntimeError("Account is in HEDGE mode. Switch Binance Futures to ONE-WAY mode.")
 
 
 # -----------------------------------------------------------------------------
@@ -491,9 +514,42 @@ def set_margin_mode(symbol: str, mode: str) -> Dict[str, Any]:
 
 
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
-    """Backward-compatible helper to set leverage and margin mode."""
-    set_leverage(symbol, leverage)
-    set_margin_mode(symbol, "ISOLATED" if isolated else "CROSSED")
+    """Backward-compatible helper to set leverage and margin mode (state-verified).
+
+    STRICT:
+    - Current leverage/marginType are fetched from /fapi/v2/positionRisk.
+    - set_* calls are made only when current state differs from target.
+    - If current state fields are missing/invalid, raises RuntimeError.
+    """
+    if not isinstance(leverage, int):
+        raise ValueError("leverage must be int")
+    if leverage <= 0:
+        raise ValueError("leverage must be positive")
+
+    s = _normalize_symbol(symbol)
+    current = get_position(s)
+
+    if "leverage" not in current:
+        raise RuntimeError("positionRisk.leverage is missing")
+    try:
+        current_leverage = int(current["leverage"])
+    except (TypeError, ValueError):
+        raise RuntimeError(f"positionRisk.leverage parse failed: {current.get('leverage')!r}")
+
+    current_margin = _normalize_margin_type(current.get("marginType"))
+
+    target_leverage = leverage
+    target_margin = "ISOLATED" if isolated else "CROSSED"
+
+    if current_leverage != target_leverage:
+        set_leverage(s, target_leverage)
+    else:
+        logger.info("leverage already set: %s", target_leverage)
+
+    if current_margin != target_margin:
+        set_margin_mode(s, target_margin)
+    else:
+        logger.info("marginType already set: %s", target_margin)
 
 
 __all__ = [

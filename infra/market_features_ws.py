@@ -27,6 +27,11 @@ extra 주요 필드
 - volume_zscore  : 5m 거래량 z-score (필수)
 - majority_trend / depth_imbalance / spread_pct 등은
   GPT 자연어 해석 및 리스크 로그용 메타로 함께 제공된다.
+
+변경 이력
+-----------------------------------------------------
+- 2026-03-01: raw_ohlcv_last20 포맷을 dict -> (ts_ms, o, h, l, c, v) tuple 로 변경 (STRICT 호환)
+- 2026-03-01: indicators dict 에 scalar 지표(rsi/ema/atr/macd...) 포함 (unified_features_builder 호환)
 """
 
 import math
@@ -74,9 +79,9 @@ EntrySignal = Tuple[
 # - REQUIRED_TFS: 이 목록의 타임프레임은 부족/지연 시 곧바로 오류로 본다.
 # - EXTRA_TFS: 있으면 피처에 포함하지만, 없어도 오류로 보지 않는다.
 REQUIRED_TFS: List[str] = list(
-    getattr(SET, "features_required_tfs", ["1m", "5m", "15m"])
+    getattr(SET, "features_required_tfs", ["1m", "5m", "15m", "1h", "4h"])
 )
-EXTRA_TFS: List[str] = ["1h", "4h", "1d"]
+EXTRA_TFS: List[str] = []
 
 # 각 타임프레임별 기본 파라미터 (EMA 길이, RSI/ATR 길이 등)
 TF_CONFIG: Dict[str, Dict[str, int]] = {
@@ -365,26 +370,25 @@ def _build_timeframe_features(
 
     # GPT 프롬프트용 원시 OHLCV 스냅샷(최대 20개)
     # - 1m/5m/15m 에 대해서만 raw_ohlcv_last20 키로 내보낸다.
-    raw_ohlcv_last20: List[Dict[str, float]] = []
+    # raw_ohlcv_last20: STRICT 포맷 (ts_ms, open, high, low, close, volume)
+    # - unified_features_builder / pattern_detection 과 입력 포맷을 맞춘다.
+    raw_ohlcv_last20: List[Tuple[int, float, float, float, float, float]] = []
     raw_slice = buf[-20:] if len(buf) >= 20 else buf
     for ts, o, h, l, c, v in raw_slice:
         try:
             raw_ohlcv_last20.append(
-                {
-                    "ts_ms": int(ts),
-                    "open": float(o),
-                    "high": float(h),
-                    "low": float(l),
-                    "close": float(c),
-                    "volume": float(v),
-                }
+                (
+                    int(ts),
+                    float(o),
+                    float(h),
+                    float(l),
+                    float(c),
+                    float(v),
+                )
             )
         except Exception as e:
-            reason = (
-                f"{interval} raw OHLCV 스냅샷 파싱 중 예외가 발생했습니다: {e}. "
-                "WS 원시 캔들 데이터 형식을 확인해 주세요."
-            )
-            _fail(symbol, f"raw_ohlcv_{interval}", reason)
+            _fail(symbol, f"raw_ohlcv_{interval}", f"raw_ohlcv_last20 build failed: {e}")
+
 
     # EMA(추세), 최근 기울기
     ema_fast_vals = ema(closes, ema_fast_len)
@@ -403,6 +407,13 @@ def _build_timeframe_features(
         ema_fast_slope_pct = math.nan
     else:
         ema_fast_slope_pct = (ema_fast_last - ema_fast_prev) / last_close
+
+    # EMA slow slope (pct) for unified_features_builder compatibility
+    ema_slow_prev, ema_slow_last = _last_two_valid(ema_slow_vals)
+    if ema_slow_prev is None or ema_slow_last is None or last_close <= 0:
+        ema_slow_slope_pct = math.nan
+    else:
+        ema_slow_slope_pct = (ema_slow_last - ema_slow_prev) / last_close
 
     # 수익률 (최근 1, 3, 5 봉 기준)
     def _ret(n_bars: int) -> float:
@@ -574,32 +585,55 @@ def _build_timeframe_features(
     }
 
     # 패턴 엔진용 지표 시리즈 (RSI / MACD 히스토그램 등)
-    indicators: Dict[str, Any] = {}
+    # indicators: unified_features_builder 가 참조하는 scalar 지표는 indicators dict 에도 포함한다.
+    # - top-level 값은 유지(기존 호환)
+    indicators: Dict[str, Any] = {
+        # Scalars (unified_features_builder expects these under timeframes[tf]["indicators"])
+        "ema_fast": float(ema_fast_val) if isinstance(ema_fast_val, (int, float)) else math.nan,
+        "ema_slow": float(ema_slow_val) if isinstance(ema_slow_val, (int, float)) else math.nan,
+        "ema_fast_slope_pct": float(ema_fast_slope_pct) if isinstance(ema_fast_slope_pct, (int, float)) else math.nan,
+        "ema_slow_slope_pct": float(ema_slow_slope_pct) if isinstance(ema_slow_slope_pct, (int, float)) else math.nan,
+        "rsi": float(rsi_last) if isinstance(rsi_last, (int, float)) else math.nan,
+        "atr": float(atr_val) if isinstance(atr_val, (int, float)) else math.nan,
+        "atr_pct": float(atr_pct) if isinstance(atr_pct, (int, float)) else math.nan,
+        "macd": float(macd_last) if isinstance(macd_last, (int, float)) else math.nan,
+        "macd_signal": float(macd_signal_last) if isinstance(macd_signal_last, (int, float)) else math.nan,
+        "macd_hist": float(macd_hist_last) if isinstance(macd_hist_last, (int, float)) else math.nan,
+        "adx": float(adx_val) if isinstance(adx_val, (int, float)) else math.nan,
+        "bb_width_pct": float(bb_width_pct) if isinstance(bb_width_pct, (int, float)) else math.nan,
+        "bb_pos": float(bb_pos) if isinstance(bb_pos, (int, float)) else math.nan,
+        "stoch_k": float(stoch_k_last) if isinstance(stoch_k_last, (int, float)) else math.nan,
+        "stoch_d": float(stoch_d_last) if isinstance(stoch_d_last, (int, float)) else math.nan,
+        "volume_ratio": float(vol_ratio) if isinstance(vol_ratio, (int, float)) else math.nan,
+        "volume_zscore": float(vol_z) if isinstance(vol_z, (int, float)) else math.nan,
+    }
+
+    # Optional series (pattern_detection uses these when present)
     try:
         if rsi_vals:
             rsi_clean = [
                 float(v)
                 for v in rsi_vals
-                if isinstance(v, (int, float)) and not math.isnan(float(v))
+                if isinstance(v, (int, float)) and math.isfinite(float(v))
             ]
             if rsi_clean:
                 indicators["rsi_series"] = rsi_clean
-    except Exception as e:
-        log(f"[MKT-FEAT] rsi_series 빌드 중 예외 interval={interval}: {e}")
+    except Exception:
+        pass
     try:
         if macd_hist:
             macd_hist_clean = [
                 float(v)
                 for v in macd_hist
-                if isinstance(v, (int, float)) and not math.isnan(float(v))
+                if isinstance(v, (int, float)) and math.isfinite(float(v))
             ]
             if macd_hist_clean:
                 indicators["macd_hist_series"] = macd_hist_clean
-    except Exception as e:
-        log(f"[MKT-FEAT] macd_hist_series 빌드 중 예외 interval={interval}: {e}")
+    except Exception:
+        pass
 
-    if indicators:
-        tf_features["indicators"] = indicators
+    tf_features["indicators"] = indicators
+
 
     # GPT 프롬프트에서 직접 차트 패턴을 해석할 수 있게,
     # 1m/5m/15m 에 대해서만 최근 20개 원시 OHLCV 를 함께 실어 보낸다.
@@ -607,7 +641,7 @@ def _build_timeframe_features(
         tf_features["raw_ohlcv_last20"] = raw_ohlcv_last20
 
     # 5m / 15m / 1h 등의 타임프레임는 regime 피처도 같이 계산
-    if interval in ("5m", "15m", "1h"):
+    if interval in ("5m", "15m", "1h", "4h"):
         try:
             regime = build_regime_features_from_candles(
                 candles_for_calc,
@@ -623,6 +657,15 @@ def _build_timeframe_features(
         except Exception as e:
             log(f"[MKT-FEAT] regime feature 계산 중 예외 interval={interval}: {e}")
 
+
+    # UNIFIED FEATURE COMPATIBILITY
+    # - unified_features_builder expects timeframes[tf]['candles_raw'] to be a list of (ts,o,h,l,c,v).
+    # - We expose WS buffer data directly without REST backfill or inference.
+    tf_features['candles_raw'] = [
+        (int(ts), float(o), float(h), float(l), float(c), float(v))
+        for (ts, o, h, l, c, v) in buf
+    ]
+    tf_features['candles'] = list(tf_features['candles_raw'])
     return tf_features
 
 

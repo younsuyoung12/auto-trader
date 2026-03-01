@@ -1,9 +1,16 @@
-# dashboard_server.py
+# broadcast/dashboard_server.py
 # ====================================================
-# BingX Auto Trader - Dashboard Web App + API
+# Dashboard Server (Trades + Events)
+# ====================================================
+# 변경 이력
 # ----------------------------------------------------
-# - FastAPI 기반 읽기 전용 대시보드 서버
-# - JSON API + 반응형 HTML 대시보드 페이지 제공
+# - 2026-03-01:
+#   1) recent trades 라벨 매핑을 is_auto/strategy 기준으로 수정
+#   2) EntryScore API에 include_test 옵션 추가
+#   3) bt_events 기반 이벤트 분석 API 추가:
+#      - /api/events/skip-reasons
+#      - /api/events/skip-hourly
+#      - /api/events/recent
 # ====================================================
 
 from __future__ import annotations
@@ -24,14 +31,14 @@ from broadcast.dashboard_metrics import (
     get_recent_trades,
     get_recent_entry_scores,
     build_entry_score_hist,
+    events_skip_reason_top,
+    events_skip_hourly,
+    events_recent,
 )
 
-app = FastAPI(title="BingX Auto Trader Dashboard")
-
-# 템플릿 설정 (프로젝트 루트에 templates/ 디렉토리)
+app = FastAPI(title="Binance Auto Trader Dashboard")
 templates = Jinja2Templates(directory="templates")
 
-# CORS: 추후 외부 프론트엔드에서 API만 따로 쓸 수도 있으니 열어 둠
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,73 +48,36 @@ app.add_middleware(
 )
 
 
-# ─────────────────────────────────────────────
-# HTML 대시보드 페이지
-# ─────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard_page(request: Request) -> HTMLResponse:
-    """
-    메인 대시보드 페이지 (반응형, 요약 카드 + 그래프 + 거래 테이블).
-    실제 데이터는 JS에서 /api/... 를 호출해서 채운다.
-    """
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
-# ─────────────────────────────────────────────
-# 헬스 체크
-# ─────────────────────────────────────────────
 @app.get("/healthz")
 def health_check(db: Session = Depends(get_db)) -> Dict[str, Any]:
     db.execute(text("SELECT 1"))
     return {"status": "ok"}
 
 
-# ─────────────────────────────────────────────
-# 요약 카드용 API
-# ─────────────────────────────────────────────
 @app.get("/api/summary")
 def api_summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """
-    상단 요약 카드용:
-    - 총 거래 횟수
-    - 이긴 거래 / 진 거래 / 본전
-    - 총 수익(USDT)
-    - 승률(%)
-    - 거래당 평균 수익(USDT)
-    """
-    summary = get_summary(db)
-    return summary
+    return get_summary(db)
 
 
-# ─────────────────────────────────────────────
-# 일별 손익 그래프용 API
-# ─────────────────────────────────────────────
 @app.get("/api/daily-pnl")
 def api_daily_pnl(days: int = 30, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    items = get_daily_pnl(db, days=days)
-    return {
-        "days": days,
-        "items": items,
-    }
+    return {"days": days, "items": get_daily_pnl(db, days=days)}
 
 
-# ─────────────────────────────────────────────
-# 최근 트레이드 리스트
-# ─────────────────────────────────────────────
-def _map_source_label(source: str | None) -> str:
-    if not source:
-        return "알 수 없음"
-    s = source.upper()
-    if "MANUAL" in s:
-        return "수동"
-    return "자동"
+def _map_trade_type(is_auto: bool) -> str:
+    return "자동" if is_auto else "수동"
 
 
-def _map_regime_label(source: str | None) -> str:
-    if not source:
+def _map_regime_label(strategy: str | None) -> str:
+    if not strategy:
         return "기타"
-    s = source.upper()
+    s = strategy.upper()
     if "RANGE" in s:
         return "박스장"
     if "TREND" in s:
@@ -121,9 +91,9 @@ def _map_side_label(side: str | None) -> str:
     if not side:
         return ""
     s = side.upper()
-    if s == "LONG":
+    if s in ("LONG", "BUY"):
         return "롱"
-    if s == "SHORT":
+    if s in ("SHORT", "SELL"):
         return "숏"
     return s
 
@@ -131,50 +101,34 @@ def _map_side_label(side: str | None) -> str:
 def _map_close_reason_label(reason: str | None) -> str:
     if not reason:
         return "기타"
-
     r = reason.lower()
-
     if "tp" in r and "early" not in r:
         return "익절"
     if "sl" in r and "early" not in r:
         return "손절"
-    if "early" in r and "tp" in r:
-        return "조기 익절"
-    if "early" in r and "sl" in r:
-        return "조기 손절"
-    if "reverse" in r or "signal" in r:
-        return "반대 신호 청산"
     if "manual" in r:
         return "수동 청산"
-
     return reason
 
 
 @app.get("/api/trades/recent")
-def api_recent_trades(
-    limit: int = 50,
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """
-    최근 트레이드 리스트.
-    - 한 행 = 한 거래
-    - 프런트에서 테이블로 보여주기 좋게 한글 레이블을 추가해서 반환.
-    """
+def api_recent_trades(limit: int = 50, db: Session = Depends(get_db)) -> Dict[str, Any]:
     trades: List[Dict[str, Any]] = get_recent_trades(db, limit=limit)
 
     enriched: List[Dict[str, Any]] = []
     for t in trades:
         pnl = float(t.get("pnl_usdt") or 0.0)
-        source = t.get("source")
+        is_auto = bool(t.get("is_auto"))
+        strategy = t.get("strategy")
         side = t.get("side")
         close_reason = t.get("close_reason")
 
         item = dict(t)
         item.update(
             {
-                "trade_type": _map_source_label(source),        # 자동 / 수동
-                "regime_label": _map_regime_label(source),     # 박스장 / 추세장 / 혼합 / 기타
-                "side_label": _map_side_label(side),           # 롱 / 숏
+                "trade_type": _map_trade_type(is_auto),
+                "regime_label": _map_regime_label(strategy),
+                "side_label": _map_side_label(side),
                 "close_reason_label": _map_close_reason_label(close_reason),
                 "is_profit": pnl > 0,
                 "is_loss": pnl < 0,
@@ -183,26 +137,29 @@ def api_recent_trades(
         )
         enriched.append(item)
 
-    return {
-        "limit": limit,
-        "items": enriched,
-    }
+    return {"limit": limit, "items": enriched}
 
 
-# ─────────────────────────────────────────────
-# 최근 EntryScore + 히스토그램
-# ─────────────────────────────────────────────
 @app.get("/api/entry-scores/recent")
-def api_recent_entry_scores(
-    limit: int = 300,
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    scores = get_recent_entry_scores(db, limit=limit)
+def api_recent_entry_scores(limit: int = 300, include_test: bool = False, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    scores = get_recent_entry_scores(db, limit=limit, include_test=include_test)
     labels, counts = build_entry_score_hist(scores)
+    return {"limit": limit, "include_test": include_test, "items": scores, "hist_labels": labels, "hist_counts": counts}
 
-    return {
-        "limit": limit,
-        "items": scores,
-        "hist_labels": labels,
-        "hist_counts": counts,
-    }
+
+# -----------------------------
+# bt_events 분석 API
+# -----------------------------
+@app.get("/api/events/skip-reasons")
+def api_skip_reasons(days: int = 7, limit: int = 15, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"days": days, "limit": limit, "items": events_skip_reason_top(db, days=days, limit=limit)}
+
+
+@app.get("/api/events/skip-hourly")
+def api_skip_hourly(days: int = 7, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"days": days, "items": events_skip_hourly(db, days=days)}
+
+
+@app.get("/api/events/recent")
+def api_events_recent(limit: int = 200, event_type: str | None = None, db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return {"limit": limit, "event_type": event_type, "items": events_recent(db, limit=limit, event_type=event_type)}

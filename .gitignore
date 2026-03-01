@@ -1,47 +1,87 @@
-# ───── 파이썬 기본 ─────
+# =========================
+# Python
+# =========================
 __pycache__/
 *.py[cod]
-*.pyo
 *.pyd
 *.so
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
 
-# ───── 가상환경 ─────
+# =========================
+# Virtualenv
+# =========================
 .venv/
 venv/
 env/
 
-# ───── IDE / OS ─────
-.vscode/
-.idea/
-.DS_Store
-
-# ───── 환경변수/민감정보 ─────
+# =========================
+# Environment / Secrets
+# =========================
 .env
 *.env
 .env.*
 *.pem
 *.key
 *.crt
+*.p12
+*.pfx
 
-# 구글 서비스 계정 키 (절대 올리지 말 것)
+# OAuth / tokens
+credentials.json
+token.json
+
+# Google service account keys (never commit)
 *-bot-*.json
 *.serviceaccount.json
 *.gserviceaccount.json
 *.key.json
-credentials.json
 
-# ───── 로그 / 임시파일 ─────
+# Recommended secret folders (use these and keep them untracked)
+secrets/
+private/
+
+# =========================
+# Logs / Temp
+# =========================
 logs/
 *.log
 *.tmp
 *.bak
+*.swp
 
-# ───── Jupyter ─────
-.ipynb_checkpoints/
-
-# ───── 프로젝트 개별 ─────
+# =========================
+# DB / Local runtime files
+# =========================
+*.db
+*.sqlite
+*.sqlite3
 /*.sqlite3
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Project-specific
+# =========================
 /.python-version
+
+# If you have a frontend in the same repo, keep package.json tracked.
+!package.json

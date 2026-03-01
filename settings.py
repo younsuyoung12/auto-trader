@@ -21,6 +21,9 @@ from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 # Korea Standard Time (UTC+9)
@@ -39,13 +42,12 @@ class Settings:
     # Binance credentials (exchange_api.py expects these names)
     api_key: str = ""
     api_secret: str = ""
-
     # Core trading
     symbol: str = "BTCUSDT"
     interval: str = "5m"
 
     # Futures config
-    leverage: int = 10
+    leverage: int = 1
     # Legacy flag used across the repo (True -> ISOLATED, False -> CROSSED)
     isolated: bool = True
     # Normalized margin mode string ("ISOLATED" or "CROSSED")
@@ -72,8 +74,8 @@ class Settings:
     # Entry/exit cadence
     entry_cooldown_sec: float = 1.0
     cooldown_after_close: float = 3.0
-    min_entry_score_for_gpt: float = 40.0
-    gpt_entry_cooldown_sec: float = 1.0
+    min_entry_score_for_gpt: float = 10
+    gpt_entry_cooldown_sec: float = 10.0
 
     # GPT safety
     gpt_daily_call_limit: int = 2000
@@ -107,8 +109,8 @@ class Settings:
     ws_enabled: bool = True
     ws_base: str = "wss://fstream.binance.com/ws"
     ws_combined_base: str = "wss://fstream.binance.com/stream?streams="
-    ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
-    ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
+    ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
+    ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     ws_min_kline_buffer: int = 60
     ws_max_kline_delay_sec: float = 120.0
     ws_orderbook_max_delay_sec: float = 10.0
@@ -143,6 +145,12 @@ class Settings:
     data_health_notify_sec: int = 900
     signal_analysis_interval_sec: int = 60
     krw_per_usdt: float = 1400.0
+
+    # Operations / runtime safety
+    # SIGTERM 수신 시 포지션 정리(Exit 루틴) 대기 시간. 데드라인 초과 시 강제 청산 시도 후 종료.
+    sigterm_grace_sec: int = 30
+    # 레버리지/마진모드 설정 실패 시 기본은 "즉시 중단". True일 때만 경고 후 계속.
+    allow_start_without_leverage_setup: bool = False
 
     # Exchange endpoints
     binance_futures_base: str = "https://fapi.binance.com"
@@ -383,6 +391,9 @@ def _validate_settings(s: Settings) -> None:
     if s.slippage_block_pct < 0:
         raise ValueError("slippage_block_pct must be >= 0")
 
+    if s.sigterm_grace_sec <= 0:
+        raise ValueError("sigterm_grace_sec must be > 0")
+
 
 # -----------------------------------------------------------------------------
 # Public loader
@@ -430,7 +441,7 @@ def load_settings() -> Settings:
     entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 1.0)
     cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
 
-    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 40.0)
+    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 10)
     gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 1.0)
 
     gpt_daily_call_limit = _as_int("GPT_DAILY_CALL_LIMIT", 2000)
@@ -460,8 +471,8 @@ def load_settings() -> Settings:
         "wss://fstream.binance.com/stream?streams=",
     )
 
-    ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m"])
-    ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m"])
+    ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
+    ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
 
     ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 60)
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
@@ -499,6 +510,12 @@ def load_settings() -> Settings:
     data_health_notify_sec = _as_int("DATA_HEALTH_NOTIFY_SEC", 900)
     signal_analysis_interval_sec = _as_int("SIGNAL_ANALYSIS_INTERVAL_SEC", 60)
     krw_per_usdt = _as_float("KRW_PER_USDT", 1400.0)
+
+    # Operations / runtime safety
+    sigterm_grace_sec = _as_int("SIGTERM_GRACE_SEC", 30)
+    allow_start_without_leverage_setup = _as_bool(
+        "ALLOW_START_WITHOUT_LEVERAGE_SETUP", False
+    )
 
     binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
     binance_recv_window = recv_window_ms
@@ -584,6 +601,9 @@ def load_settings() -> Settings:
         data_health_notify_sec=data_health_notify_sec,
         signal_analysis_interval_sec=signal_analysis_interval_sec,
         krw_per_usdt=krw_per_usdt,
+
+        sigterm_grace_sec=sigterm_grace_sec,
+        allow_start_without_leverage_setup=allow_start_without_leverage_setup,
         binance_futures_base=binance_futures_base,
         binance_recv_window=binance_recv_window,
         binance_http_timeout_sec=binance_http_timeout_sec,

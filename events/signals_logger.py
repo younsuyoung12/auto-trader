@@ -1,92 +1,37 @@
 # events/signals_logger.py
-# =============================================================================
-# AUTO-TRADER - Event Logger (STRICT / NO-FALLBACK)
-# -----------------------------------------------------------------------------
-# 이 파일은 자동매매 엔진의 모든 이벤트를 기록하고
-# 동시에 EventBus로 publish하는 중앙 허브이다.
-#
-# 정책:
-# - 이벤트 기록 실패 시 즉시 예외 발생
-# - 필수 필드 누락 시 예외 발생
-# - JSON 직렬화 실패 시 예외 발생
-# - 폴백 금지
-# =============================================================================
+"""
+========================================================
+events/signals_logger.py
+STRICT · NO-FALLBACK · PRODUCTION MODE
+========================================================
+역할:
+- 모든 이벤트를 bt_events(DB)에 저장하고, EventBus로 publish한다.
+
+정책(STRICT):
+- DB 기록 실패 시 예외 전파
+- EventBus validate 실패 시 예외 전파
+- side는 LONG/SHORT/CLOSE만 허용
+- extra_json은 dict로 정규화하여 JSONB 저장
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-01:
+  1) CSV 기록 제거 → bt_events DB 저장으로 전환
+  2) legacy wrapper(log_candle_snapshot/log_gpt_entry_event/log_gpt_exit_event/_ensure_today_csv) 유지
+========================================================
+"""
 
 from __future__ import annotations
 
-import csv
 import datetime
-import json
-import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
+
+from events.event_bus import publish_event
+from events.event_store import record_event_db
 
 
-# -----------------------------------------------------------------------------
-# Paths
-# -----------------------------------------------------------------------------
-EVENTS_DIR = os.path.join("logs", "events")
-
-
-# -----------------------------------------------------------------------------
-# Time helpers (KST = UTC+9)
-# -----------------------------------------------------------------------------
-def _now_kst() -> datetime.datetime:
-    now_utc = datetime.datetime.utcnow()
-    return now_utc + datetime.timedelta(hours=9)
-
-
-def _today_kst_str() -> str:
-    return _now_kst().strftime("%Y-%m-%d")
-
-
-def _ensure_dir(path: str) -> None:
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
-
-
-# -----------------------------------------------------------------------------
-# CSV helpers
-# -----------------------------------------------------------------------------
-def _events_csv_path_for(day_str: str) -> str:
-    _ensure_dir(EVENTS_DIR)
-    return os.path.join(EVENTS_DIR, f"events-{day_str}.csv")
-
-
-def _event_fieldnames() -> List[str]:
-    return [
-        "ts",
-        "ts_iso",
-        "event_type",
-        "symbol",
-        "regime",
-        "source",
-        "side",
-        "price",
-        "qty",
-        "leverage",
-        "tp_pct",
-        "sl_pct",
-        "risk_pct",
-        "pnl_pct",
-        "reason",
-        "extra_json",
-    ]
-
-
-def _ensure_today_events_csv() -> str:
-    day = _today_kst_str()
-    path = _events_csv_path_for(day)
-    fields = _event_fieldnames()
-    if not os.path.exists(path):
-        _ensure_dir(EVENTS_DIR)
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fields)
-            writer.writeheader()
-    return path
-
-
-# Create today's events CSV on import (STRICT: any failure should surface)
-_ensure_today_events_csv()
+def _now_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def _require_nonempty_str(v: Any, name: str) -> str:
@@ -96,101 +41,184 @@ def _require_nonempty_str(v: Any, name: str) -> str:
     return s
 
 
-def _json_stringify_extra(extra_val: Any) -> str:
-    """Return a JSON string. STRICT: if string is provided, it must be valid JSON."""
-    if extra_val is None:
-        return "{}"
-
-    if isinstance(extra_val, (dict, list)):
-        return json.dumps(extra_val, ensure_ascii=False)
-
-    if isinstance(extra_val, str):
-        # STRICT: must be valid JSON string
-        _ = json.loads(extra_val)  # raises if invalid
-        return extra_val
-
-    raise RuntimeError("extra_json must be dict/list/valid-json-string")
+def _normalize_side(side: Any) -> str:
+    s = str(side or "").upper().strip()
+    if s in ("LONG", "SHORT", "CLOSE"):
+        return s
+    raise RuntimeError("payload.side must be LONG/SHORT/CLOSE")
 
 
 def log_event(event_type: str, **kwargs: Any) -> None:
-    """
-    1) 필수 필드 검증 (event_type, symbol, reason)
-    2) row 구성
-    3) CSV 기록
-    4) publish_event(event_type, **payload)
-    """
     et = _require_nonempty_str(event_type, "event_type")
     symbol = _require_nonempty_str(kwargs.get("symbol"), "symbol")
     reason = _require_nonempty_str(kwargs.get("reason"), "reason")
 
-    now = _now_kst()
-    row: Dict[str, Any] = {
-        "ts": now.timestamp(),
-        "ts_iso": now.isoformat(),
-        "event_type": et,
-        "symbol": symbol,
-        "regime": "",
-        "source": "",
-        "side": "",
-        "price": "",
-        "qty": "",
-        "leverage": "",
-        "tp_pct": "",
-        "sl_pct": "",
-        "risk_pct": "",
-        "pnl_pct": "",
-        "reason": reason,
-        "extra_json": "{}",
-    }
+    side = _normalize_side(kwargs.get("side"))
 
-    # Allowed keys mapping (ignore unknown keys)
-    allowed = set(_event_fieldnames())
-    for key, val in kwargs.items():
-        if key in allowed and key not in {"event_type", "extra_json", "reason"}:
-            row[key] = val
-
-    # extra / extra_json -> JSON string (STRICT)
-    extra_val: Any = None
-    if "extra_json" in kwargs:
-        extra_val = kwargs["extra_json"]
-    elif "extra" in kwargs:
-        extra_val = kwargs["extra"]
-
-    row["extra_json"] = _json_stringify_extra(extra_val)
-
-    # Write CSV (STRICT: no swallow)
-    path = _ensure_today_events_csv()
-    file_exists = os.path.exists(path)
-    fieldnames = _event_fieldnames()
-
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({k: row.get(k, "") for k in fieldnames})
-
-    # Publish to EventBus (STRICT: no swallow)
-    from events.event_bus import publish_event
+    ts_utc = _now_utc()
 
     payload: Dict[str, Any] = {
         "symbol": symbol,
-        "regime": str(row.get("regime") or ""),
-        "source": str(row.get("source") or ""),
-        "side": str(row.get("side") or ""),
-        "price": row.get("price"),
-        "qty": row.get("qty"),
-        "leverage": row.get("leverage"),
-        "tp_pct": row.get("tp_pct"),
-        "sl_pct": row.get("sl_pct"),
-        "risk_pct": row.get("risk_pct"),
-        "pnl_pct": row.get("pnl_pct"),
+        "regime": str(kwargs.get("regime") or ""),
+        "source": str(kwargs.get("source") or ""),
+        "side": side,
+        "price": kwargs.get("price"),
+        "qty": kwargs.get("qty"),
+        "leverage": kwargs.get("leverage"),
+        "tp_pct": kwargs.get("tp_pct"),
+        "sl_pct": kwargs.get("sl_pct"),
+        "risk_pct": kwargs.get("risk_pct"),
+        "pnl_pct": kwargs.get("pnl_pct"),
         "reason": reason,
-        "extra_json": row.get("extra_json"),
-        "ts_kst_epoch": row.get("ts"),
-        "ts_iso": row.get("ts_iso"),
+        "extra_json": kwargs.get("extra_json", kwargs.get("extra")),
+        "ts_kst_epoch": ts_utc.timestamp(),  # legacy key
+        "ts_iso": ts_utc.isoformat(),
     }
 
+    # 1) DB 저장
+    record_event_db(
+        ts_utc=ts_utc,
+        event_type=et,
+        symbol=symbol,
+        regime=payload["regime"],
+        source=payload["source"],
+        side=side,
+        price=payload["price"],
+        qty=payload["qty"],
+        leverage=payload["leverage"],
+        tp_pct=payload["tp_pct"],
+        sl_pct=payload["sl_pct"],
+        risk_pct=payload["risk_pct"],
+        pnl_pct=payload["pnl_pct"],
+        reason=reason,
+        extra_json=payload["extra_json"],
+        is_test=bool(kwargs.get("is_test", False)),
+    )
+
+    # 2) EventBus publish (strict validation 포함)
     publish_event(et, **payload)
 
 
-__all__ = ["log_event"]
+def log_signal(**kwargs: Any) -> None:
+    event = kwargs.pop("event", None)
+    et = _require_nonempty_str(event, "event")
+    log_event(et, **kwargs)
+
+
+def log_skip_event(**kwargs: Any) -> None:
+    log_event("SKIP", **kwargs)
+
+
+def log_candle_snapshot(
+    *,
+    symbol: str,
+    tf: str,
+    candle_ts: int,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+    strategy_type: str,
+    direction: str,
+    extra: str,
+) -> None:
+    sym = _require_nonempty_str(symbol, "symbol")
+    tf_s = _require_nonempty_str(tf, "tf")
+    strat = _require_nonempty_str(strategy_type, "strategy_type")
+    dir_s = _require_nonempty_str(direction, "direction").upper()
+
+    if dir_s not in ("LONG", "SHORT"):
+        raise RuntimeError("direction must be LONG/SHORT")
+
+    if not isinstance(candle_ts, int) or candle_ts <= 0:
+        raise RuntimeError("candle_ts must be int > 0")
+
+    log_event(
+        "CANDLE_SNAPSHOT",
+        symbol=sym,
+        regime=str(strat),
+        source="candle_snapshot",
+        side=dir_s,
+        price=float(close),
+        qty=float(volume),
+        reason="candle_snapshot",
+        extra_json={
+            "tf": tf_s,
+            "candle_ts": int(candle_ts),
+            "open": float(open_),
+            "high": float(high),
+            "low": float(low),
+            "close": float(close),
+            "volume": float(volume),
+            "strategy_type": strat,
+            "direction": dir_s,
+            "extra": str(extra or ""),
+        },
+    )
+
+
+def log_gpt_entry_event(**kwargs: Any) -> None:
+    symbol = _require_nonempty_str(kwargs.get("symbol"), "symbol")
+    reason = _require_nonempty_str(kwargs.get("reason"), "reason")
+
+    regime = str(kwargs.get("regime") or "")
+    side = _normalize_side(kwargs.get("side") or "CLOSE")
+    action = str(kwargs.get("action") or kwargs.get("gpt_action") or "")
+
+    log_event(
+        "GPT_ENTRY",
+        symbol=symbol,
+        regime=regime,
+        source=str(kwargs.get("source") or "gpt_entry"),
+        side=side,
+        tp_pct=kwargs.get("tp_pct"),
+        sl_pct=kwargs.get("sl_pct"),
+        risk_pct=kwargs.get("risk_pct"),
+        reason=reason,
+        extra_json={
+            "action": action,
+            "gpt_json": kwargs.get("gpt_json") if kwargs.get("gpt_json") is not None else {},
+        },
+    )
+
+
+def log_gpt_exit_event(**kwargs: Any) -> None:
+    symbol = _require_nonempty_str(kwargs.get("symbol"), "symbol")
+    reason = _require_nonempty_str(kwargs.get("reason"), "reason")
+
+    regime = str(kwargs.get("regime") or "")
+    side = _normalize_side(kwargs.get("side") or "CLOSE")
+    action = str(kwargs.get("action") or kwargs.get("gpt_action") or "")
+
+    log_event(
+        "GPT_EXIT",
+        symbol=symbol,
+        regime=regime,
+        source=str(kwargs.get("source") or "gpt_exit"),
+        side=side,
+        reason=reason,
+        extra_json={
+            "action": action,
+            "close_ratio": kwargs.get("close_ratio"),
+            "new_tp_pct": kwargs.get("new_tp_pct"),
+            "new_sl_pct": kwargs.get("new_sl_pct"),
+            "gpt_json": kwargs.get("gpt_json") if kwargs.get("gpt_json") is not None else {},
+        },
+    )
+
+
+def _ensure_today_csv() -> None:
+    # legacy wrapper: CSV 제거됨. 호출되더라도 동작에 영향 없도록 no-op 유지.
+    return None
+
+
+__all__ = [
+    "log_event",
+    "log_signal",
+    "log_skip_event",
+    "log_candle_snapshot",
+    "log_gpt_entry_event",
+    "log_gpt_exit_event",
+    "_ensure_today_csv",
+]

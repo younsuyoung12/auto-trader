@@ -1,10 +1,11 @@
-# dashboard_db.py
+# broadcast/dashboard_db.py
 # ====================================================
-# BingX Auto Trader - Dashboard DB 세션 유틸
+# Binance Auto Trader - Dashboard DB 세션 유틸
+# ====================================================
+# 변경 이력
 # ----------------------------------------------------
-# - TRADER_DB_URL 환경변수로 연결
-# - 실패/오타/권한 문제 발생 시 폴백 없이 바로 예외 발생
-#   → 대시보드 전체가 500을 내고, Render 로그에 에러가 남도록 설계
+# - 2026-03-01:
+#   1) Render 안정성: pool_size/max_overflow/pool_recycle 옵션 추가
 # ====================================================
 
 from __future__ import annotations
@@ -15,21 +16,20 @@ from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
-
 TRADER_DB_URL = os.getenv("TRADER_DB_URL")
-
 if not TRADER_DB_URL:
-    # 폴백 금지: DB URL 이 없으면 아예 서비스 시작을 막는다.
-    raise RuntimeError(
-        "TRADER_DB_URL 환경변수가 설정되어 있지 않습니다. "
-        "대시보드 서버를 실행하기 전에 Render Web Service 환경설정에 "
-        "Internal Database URL(TRADER_DB_URL)을 등록하세요."
-    )
+    raise RuntimeError("TRADER_DB_URL 환경변수가 설정되어 있지 않습니다.")
 
-# 읽기 전용이지만, SQLAlchemy 쪽에는 일반 엔진으로 붙는다.
+pool_size = int(os.getenv("DB_POOL_SIZE", "5"))
+max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+pool_recycle = int(os.getenv("DB_POOL_RECYCLE_SEC", "1800"))
+
 engine = create_engine(
     TRADER_DB_URL,
     pool_pre_ping=True,
+    pool_size=pool_size,
+    max_overflow=max_overflow,
+    pool_recycle=pool_recycle,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
