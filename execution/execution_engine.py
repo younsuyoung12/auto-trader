@@ -16,6 +16,14 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 민감정보(키/토큰/시크릿)는 로그/출력 금지.
 - settings 객체를 런타임에 mutate 하지 않는다(가드 조정은 read-only view로 적용).
 
+전액 배분형(Allocation Mode)
+--------------------------------------------------------
+- signal.risk_pct 는 이제 "리스크%"가 아니라 "계좌 투입 비율"로 해석한다.
+  - 1.0 = 전액
+  - 0.7 = 70%
+  - 0.4 = 40%
+- 따라서 0 < risk_pct <= 1.0 을 강제한다.
+
 PATCH NOTES — 2026-03-01
 - bt_trades 실제 DB 스키마 정합:
   - open 기록: entry_ts/entry_price/qty/is_auto/regime_at_entry/strategy/risk_pct/tp_pct/sl_pct/leverage 등 저장
@@ -28,10 +36,13 @@ PATCH NOTES — 2026-03-01
   - TEST_FAKE_AVAILABLE_USDT=1000 : 잔고를 강제로 설정
   - TEST_BYPASS_GUARDS=1 : volume/price_jump/spread/risk_guard 실패 시에도 계속 진행
   - TEST_DRY_RUN=1 : 실주문 금지. DB에 (open+snapshot) 기록 후 즉시 TEST_DRY_RUN으로 닫고 exit snapshot까지 저장
-
-추가 안전장치 — 2026-03-01
 - TEST_BYPASS_GUARDS는 TEST_DRY_RUN=1일 때만 허용(운영 사고 방지)
-- TEST 모드 활성화 시 시작 로그에 강제 경고 출력
+
+PATCH NOTES — 2026-03-02
+- dynamic_risk_pct 메타가 존재하면 signal.risk_pct와 일치 강제(불일치 시 예외).
+- ENTER 시 risk_pct/tp_pct/sl_pct는 반드시 > 0 강제(0 허용 금지).
+- 전액 배분형 안전장치:
+  - leverage > 1 상태에서 risk_pct(투입 비율)가 큰 경우(>=0.8) 즉시 예외로 차단.
 ========================================================
 """
 
@@ -98,7 +109,7 @@ if any([TEST_FORCE_ENTER, TEST_BYPASS_GUARDS, TEST_DRY_RUN, TEST_FAKE_AVAILABLE_
     )
 
 
-def _as_float(value: Any, name: str, *, min_value: Optional[float] = None) -> float:
+def _as_float(value: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
     try:
         if isinstance(value, bool):
             raise TypeError("bool is not allowed")
@@ -111,6 +122,8 @@ def _as_float(value: Any, name: str, *, min_value: Optional[float] = None) -> fl
 
     if min_value is not None and v < min_value:
         raise ValueError(f"{name} must be >= {min_value}")
+    if max_value is not None and v > max_value:
+        raise ValueError(f"{name} must be <= {max_value}")
 
     return v
 
@@ -127,15 +140,6 @@ def _opt_float(value: Any) -> Optional[float]:
     if not math.isfinite(v):
         return None
     return v
-
-
-def _dig(d: Any, path: list[str]) -> Any:
-    cur = d
-    for k in path:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(k)
-    return cur
 
 
 class _SettingsView:
@@ -234,12 +238,22 @@ class ExecutionEngine:
             return None
 
         last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
+        if last_price <= 0:
+            raise RuntimeError("meta.last_price must be > 0")
 
         candles_5m = meta.get("candles_5m")
         candles_5m_raw = meta.get("candles_5m_raw")
         extra = meta.get("extra")
         if extra is not None and not isinstance(extra, dict):
             raise RuntimeError("meta.extra must be dict or None")
+
+        # 0) dynamic_risk_pct 일치 강제(있으면)
+        dyn = meta.get("dynamic_risk_pct")
+        if dyn is not None:
+            dyn_f = _as_float(dyn, "meta.dynamic_risk_pct", min_value=0.0, max_value=1.0)
+            sig_r = _as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0, max_value=1.0)
+            if abs(dyn_f - sig_r) > 1e-12:
+                raise RuntimeError(f"dynamic_risk_pct mismatch: meta={dyn_f} != signal.risk_pct={sig_r}")
 
         # 1) 수동 포지션 가드
         manual_ok = check_manual_position_guard(
@@ -372,6 +386,9 @@ class ExecutionEngine:
                     price_for_qty = mid
                 entry_price_hint = ba if direction == "LONG" else bb
 
+        if price_for_qty <= 0:
+            raise RuntimeError("price_for_qty must be > 0")
+
         spread_pct_snapshot: Optional[float] = None
         if best_bid is not None and best_ask is not None:
             bb = float(best_bid)
@@ -405,12 +422,31 @@ class ExecutionEngine:
 
         leverage = _as_float(getattr(self.settings, "leverage"), "settings.leverage", min_value=1.0)
 
-        risk_pct = _as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0)
+        # ENTER에서 0 금지 (STRICT) + 전액 배분형: 0<risk_pct<=1 강제
+        risk_pct = _as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0, max_value=1.0)
         tp_pct = _as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0)
         sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0)
 
+        if risk_pct <= 0:
+            raise RuntimeError("ENTER requires signal.risk_pct > 0")
+        if tp_pct <= 0:
+            raise RuntimeError("ENTER requires signal.tp_pct > 0")
+        if sl_pct <= 0:
+            raise RuntimeError("ENTER requires signal.sl_pct > 0")
+
+        # 전액 배분형 안전장치: 큰 투입 비율 + 레버리지>1은 사고 가능성이 매우 큼
+        if leverage > 1.0 and risk_pct >= 0.8:
+            raise RuntimeError(
+                f"allocation_mode violation: leverage({leverage})>1 with large allocation(risk_pct={risk_pct})"
+            )
+
         notional = avail_usdt * risk_pct * leverage
+        if notional <= 0:
+            raise RuntimeError("notional must be > 0")
+
         qty_raw = notional / price_for_qty
+        if qty_raw <= 0:
+            raise RuntimeError("qty_raw must be > 0")
 
         ok, guard_reason, guard_extra = hard_risk_guard_check(
             self.settings,
@@ -473,7 +509,18 @@ class ExecutionEngine:
             sl_pct=float(sl_pct),
             risk_pct=float(risk_pct),
             reason=str(signal.reason) or "enter",
-            extra_json={"candle_ts": int(signal_ts_ms), "available_usdt": float(avail_usdt), "notional": float(notional)},
+            extra_json={
+                "candle_ts": int(signal_ts_ms),
+                "available_usdt": float(avail_usdt),
+                "notional": float(notional),
+                "regime_score": meta.get("regime_score"),
+                "regime_band": meta.get("regime_band"),
+                "regime_allocation": meta.get("regime_allocation"),
+                "dd_pct": meta.get("dd_pct"),
+                "consecutive_losses": meta.get("consecutive_losses"),
+                "risk_physics_reason": meta.get("risk_physics_reason"),
+                "dynamic_risk_pct": meta.get("dynamic_risk_pct"),
+            },
         )
 
         if TEST_DRY_RUN:
@@ -654,7 +701,7 @@ class ExecutionEngine:
 
         send_tg(
             f"[ENTRY][FILLED] {symbol} {direction} "
-            f"risk={risk_pct*100:.2f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
+            f"alloc={risk_pct*100:.1f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
             f"price={float(entry_price):.4f} qty={float(entry_qty):.6f} src={signal_source}"
         )
         return trade

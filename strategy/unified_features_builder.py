@@ -13,6 +13,7 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 오더북은 WS depth5 스냅샷(bids/asks)을 포함하며, 비어 있으면 즉시 실패한다.
 - pattern_features/summary 는 화이트리스트 기반 compact 형태로 축소(토큰 최적화).
 - engine_scores(0~100)는 엔진 1차 정량 점수이며, 최종 해석/결정은 GPT가 수행한다.
+
 ========================================================
 입력 계약(중요)
 - market_features_ws.timeframes[1m|5m|15m].raw_ohlcv_last20:
@@ -20,6 +21,25 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - market_features_ws.timeframes[*].indicators:
   engine_scores 계산에 필요한 scalar(rsi/ema_fast/ema_slow/atr_pct/macd_hist 등)를 포함해야 한다.
 
+========================================================
+PATCH NOTES — 2026-03-02
+- FIX(STRICT): atr_pct / range_pct 스케일 정규화 규칙 추가
+  - 일부 upstream이 atr_pct, range_pct를 "비율(0~1)"로 제공함을 확인.
+  - 본 파일의 점수식은 "%(0~100)" 전제를 사용하므로,
+    아래 규칙으로 STRICT 정규화한다(폴백/추정 아님, 명시 규칙):
+    * 0.0 <= v <= 1.0  → v * 100.0 (ratio → percent)
+    * 1.0 < v <= 100.0 → 그대로 사용 (already percent)
+    * 그 외 범위       → 즉시 실패
+- 적용 대상:
+  - _score_momentum_1h: indicators.atr_pct
+  - _score_timing_5m:   indicators.atr_pct
+  - _score_structure_15m: tf15m.range_pct
+
+- TUNING(TRADE-GRADE): engine_scores.total 가중치 재조정
+  - 문제: trend_4h 가중치가 높으면(0.30) 대부분 구간에서 total이 NO_TRADE로 고정됨
+  - 해결: orderbook_micro 비중을 올리고(0.25), trend_4h 비중을 낮춤(0.15)
+  - 의도: 4h 추세가 약해도 5m/15m/오더북 기반 기회 포착을 허용
+========================================================
 """
 
 import math
@@ -30,7 +50,6 @@ from settings import load_settings
 try:
     from infra.telelog import log, send_tg
 except Exception as e:  # pragma: no cover
-    # STRICT: 로컬 stub 폴백 금지. 운영 환경에서는 반드시 telelog 가 있어야 한다.
     raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · PRODUCTION MODE)") from e
 
 from infra.market_data_ws import get_orderbook
@@ -39,17 +58,12 @@ from strategy.pattern_detection import PatternError, build_pattern_features
 
 SET = load_settings()
 
-# REQUIRED: GPT/엔진 1차 점수 산출을 위해 반드시 필요
 REQUIRED_TFS: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
-
-# PATTERN: Ultra 정책 유지
 PATTERN_TFS: Tuple[str, ...] = ("1m", "5m", "15m")
 
-# 토큰 절감: 패턴 리스트 상한
 MAX_PATTERNS_PER_TF: int = 4
 MAX_SUMMARY_PATTERNS: int = 10
 
-# 패턴 item compact 화이트리스트
 _PATTERN_ITEM_KEYS: Tuple[str, ...] = (
     "pattern",
     "direction",
@@ -64,16 +78,15 @@ _PATTERN_ITEM_KEYS: Tuple[str, ...] = (
     "target_price",
 )
 
-# engine_scores.total 가중치(고정)
+# engine_scores.total 가중치 (합=1.0)
 _TOTAL_WEIGHTS: Dict[str, float] = {
-    "trend_4h": 0.30,
+    "trend_4h": 0.15,
     "momentum_1h": 0.20,
     "structure_15m": 0.20,
     "timing_5m": 0.20,
-    "orderbook_micro": 0.10,
+    "orderbook_micro": 0.25,
 }
 
-# 출력(토큰 최적화)용으로 indicators 에서 유지할 필드
 _INDICATOR_KEEP_KEYS: Tuple[str, ...] = (
     "rsi",
     "ema_fast",
@@ -91,7 +104,6 @@ class UnifiedFeaturesError(RuntimeError):
 
 
 def _safe_tg(msg: str) -> None:
-    """텔레그램 전송 실패만 제한적으로 무시한다(유틸 보호)."""
     try:
         send_tg(msg)
     except Exception:
@@ -163,6 +175,15 @@ def _require_prob_0_1(symbol: str, stage: str, v: Any, name: str) -> float:
     return fv
 
 
+def _require_pct_0_100(symbol: str, stage: str, v: Any, name: str) -> float:
+    fv = _require_float(symbol, stage, v, name)
+    if 0.0 <= fv <= 1.0:
+        fv = fv * 100.0
+    if fv < 0.0 or fv > 100.0:
+        _fail_unified(symbol, stage, f"{name} out of range after normalization (got={fv})")
+    return fv
+
+
 def _parse_ohlcv_rows(
     symbol: str,
     stage: str,
@@ -174,7 +195,6 @@ def _parse_ohlcv_rows(
     raw = _require_list(symbol, stage, rows, name, min_len=min_len)
     out: List[Tuple[int, float, float, float, float, float]] = []
 
-    # min_len 개만 사용(토큰/연산 최적화 + 요건 충족)
     sliced = raw[-min_len:]
 
     for i, row in enumerate(sliced):
@@ -205,13 +225,6 @@ def _parse_ohlcv_rows(
 
 
 def _ensure_timeframe_payloads_strict(symbol: str, timeframes: Dict[str, Any]) -> None:
-    """
-    STRICT 요구사항(A):
-    - REQUIRED_TFS 존재
-    - 1m/5m/15m: raw_ohlcv_last20 >= 20
-    - 1h/4h: raw_ohlcv_last60 >= 60 (없으면 candles 에서 생성)
-    - 모든 REQUIRED_TFS: indicators dict 필수
-    """
     for tf in REQUIRED_TFS:
         stage = f"timeframes[{tf}]"
         tf_data = timeframes.get(tf)
@@ -237,18 +250,12 @@ def _ensure_timeframe_payloads_strict(symbol: str, timeframes: Dict[str, Any]) -
             if raw60 is None:
                 candles = tf_data.get("candles")
                 parsed = _parse_ohlcv_rows(symbol, stage, candles, min_len=60, name=f"{tf}.candles")
-                # 생성은 "더미"가 아니라 WS 캔들 데이터의 형식 변환이다.
                 tf_data["raw_ohlcv_last60"] = [[ts, o, h, l, c, v] for (ts, o, h, l, c, v) in parsed]
             else:
                 _parse_ohlcv_rows(symbol, stage, raw60, min_len=60, name=f"{tf}.raw_ohlcv_last60")
 
 
 def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
-    """
-    STRICT 요구사항(A):
-    - orderbook dict 존재 필수
-    - bids/asks 비어있거나 누락이면 즉시 실패
-    """
     stage = "orderbook"
     ob = get_orderbook(symbol, limit=limit)
     if not isinstance(ob, dict) or not ob:
@@ -261,7 +268,6 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if not isinstance(asks, list) or not asks:
         _fail_unified(symbol, stage, "orderbook asks missing/empty")
 
-    # Normalize rows to [price, qty]
     nbids: List[List[float]] = []
     nasks: List[List[float]] = []
 
@@ -313,7 +319,7 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if notional_total <= 0:
         _fail_unified(symbol, stage, "invalid notional_total (<=0) for depth_imbalance")
 
-    depth_imbalance = (bid_notional - ask_notional) / notional_total  # [-1, +1]
+    depth_imbalance = (bid_notional - ask_notional) / notional_total
     if not math.isfinite(depth_imbalance):
         _fail_unified(symbol, stage, f"invalid depth_imbalance: {depth_imbalance}")
 
@@ -321,7 +327,7 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if checked_at_ms <= 0:
         _fail_unified(symbol, stage, f"invalid checked_at_ms(ts): {checked_at_ms}")
 
-    out: Dict[str, Any] = {
+    return {
         "checked_at_ms": checked_at_ms,
         "best_bid": best_bid,
         "best_ask": best_ask,
@@ -335,20 +341,15 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
         "asks": nasks,
     }
 
-    return out
-
 
 def _compact_pattern_item(symbol: str, stage: str, p: Dict[str, Any], timeframe: str) -> Dict[str, Any]:
     item: Dict[str, Any] = {}
     for key in _PATTERN_ITEM_KEYS:
         if key in p:
             item[key] = p[key]
-
     item["timeframe"] = timeframe
-
     if "strength" not in item:
         _fail_unified(symbol, stage, f"pattern item missing strength (timeframe={timeframe})")
-
     item["strength"] = _require_float(symbol, stage, item["strength"], "pattern.strength")
     return item
 
@@ -358,13 +359,6 @@ def _build_pattern_bundle_strict(
     timeframes: Dict[str, Any],
     orderbook_features: Dict[str, Any],
 ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
-    """
-    STRICT 요구사항(B):
-    - PATTERN_TFS 고정
-    - score 키 누락/비정상 -> 즉시 실패 (0으로 방어 금지)
-    - build_pattern_features 예외 -> UnifiedFeaturesError 로 래핑
-    - patterns compact + 상위 N개 유지
-    """
     pattern_features: Dict[str, Dict[str, Any]] = {}
 
     all_patterns: List[Dict[str, Any]] = []
@@ -374,7 +368,6 @@ def _build_pattern_bundle_strict(
     best_pattern_confidence = "none"
     best_pattern_timeframe = "None"
 
-    # 전역 요약 스코어: max 기준
     global_pattern_score = 0.0
     global_reversal = 0.0
     global_continuation = 0.0
@@ -391,7 +384,6 @@ def _build_pattern_bundle_strict(
         tf_data = _require_dict(symbol, stage, timeframes.get(tf), f"timeframes['{tf}']")
 
         raw_ohlcv_last20 = tf_data.get("raw_ohlcv_last20")
-        # parse/validate only. pattern_detection 입력은 원본(list of list) 사용 가능하지만, 여기서 최소 요건 검증은 필수.
         _parse_ohlcv_rows(symbol, stage, raw_ohlcv_last20, min_len=20, name=f"{tf}.raw_ohlcv_last20")
 
         indicators = tf_data.get("indicators")
@@ -412,12 +404,9 @@ def _build_pattern_bundle_strict(
         if not isinstance(pf_raw, dict) or not pf_raw:
             _fail_unified(symbol, stage, "pattern_detection returned non-dict or empty")
 
-        # ── STRICT: 핵심 스코어 키 검증 ────────────────────────────────────────
         pattern_score = _require_prob_0_1(symbol, stage, pf_raw.get("pattern_score"), "pattern_score")
         reversal_prob = _require_prob_0_1(symbol, stage, pf_raw.get("reversal_probability"), "reversal_probability")
-        continuation_prob = _require_prob_0_1(
-            symbol, stage, pf_raw.get("continuation_probability"), "continuation_probability"
-        )
+        continuation_prob = _require_prob_0_1(symbol, stage, pf_raw.get("continuation_probability"), "continuation_probability")
         momentum_score = _require_prob_0_1(symbol, stage, pf_raw.get("momentum_score"), "momentum_score")
         volume_conf = _require_prob_0_1(symbol, stage, pf_raw.get("volume_confirmation"), "volume_confirmation")
         wick_strength = _require_prob_0_1(symbol, stage, pf_raw.get("wick_strength"), "wick_strength")
@@ -426,11 +415,7 @@ def _build_pattern_bundle_strict(
         has_bull = _require_int(symbol, stage, pf_raw.get("has_bullish_pattern"), "has_bullish_pattern")
         has_bear = _require_int(symbol, stage, pf_raw.get("has_bearish_pattern"), "has_bearish_pattern")
         if has_bull not in (0, 1) or has_bear not in (0, 1):
-            _fail_unified(
-                symbol,
-                stage,
-                f"has_bullish_pattern/has_bearish_pattern must be 0/1 (got={has_bull}/{has_bear})",
-            )
+            _fail_unified(symbol, stage, f"has_bullish_pattern/has_bearish_pattern must be 0/1 (got={has_bull}/{has_bear})")
 
         raw_patterns = pf_raw.get("patterns")
         if raw_patterns is None:
@@ -438,7 +423,6 @@ def _build_pattern_bundle_strict(
         if not isinstance(raw_patterns, list):
             _fail_unified(symbol, stage, f"patterns must be list (got={type(raw_patterns)})")
 
-        # ── compact patterns (화이트리스트 + timeframe + strength float) ───────
         compact_patterns: List[Dict[str, Any]] = []
         for i, p in enumerate(raw_patterns):
             if not isinstance(p, dict):
@@ -454,14 +438,12 @@ def _build_pattern_bundle_strict(
                 best_pattern_confidence = str(item.get("confidence") or "none")
                 best_pattern_timeframe = tf
 
-        # 타임프레임별 상위 N개
         compact_patterns.sort(key=lambda x: float(x.get("strength", 0.0)), reverse=True)
         if MAX_PATTERNS_PER_TF > 0:
             compact_patterns = compact_patterns[:MAX_PATTERNS_PER_TF]
 
         all_patterns.extend(compact_patterns)
 
-        # 타임프레임별 score 저장
         pattern_features[tf] = {
             "interval": tf,
             "pattern_score": pattern_score,
@@ -475,7 +457,6 @@ def _build_pattern_bundle_strict(
             "has_bearish_pattern": has_bear,
         }
 
-        # 전역 max 갱신
         global_pattern_score = max(global_pattern_score, pattern_score)
         global_reversal = max(global_reversal, reversal_prob)
         global_continuation = max(global_continuation, continuation_prob)
@@ -486,7 +467,6 @@ def _build_pattern_bundle_strict(
         has_bullish_pattern = max(has_bullish_pattern, has_bull)
         has_bearish_pattern = max(has_bearish_pattern, has_bear)
 
-    # 전역 상위 N개
     all_patterns.sort(key=lambda x: float(x.get("strength", 0.0)), reverse=True)
     if MAX_SUMMARY_PATTERNS > 0:
         all_patterns = all_patterns[:MAX_SUMMARY_PATTERNS]
@@ -517,10 +497,6 @@ def _atr_pct_change_from_ohlcv(
     ohlcv: List[Tuple[int, float, float, float, float, float]],
     period: int = 14,
 ) -> float:
-    """
-    ATR% 변화(단순 SMA 기반).
-    - 최근 ATR% vs 직전 ATR% 비교 (percent 단위)
-    """
     if len(ohlcv) < (period * 2 + 1):
         _fail_unified(symbol, stage, f"need >= {period*2+1} candles for ATR change (got={len(ohlcv)})")
 
@@ -560,11 +536,7 @@ def _atr_pct_change_from_ohlcv(
     return change_pct
 
 
-def _score_trend_4h(
-    symbol: str,
-    tf4h: Dict[str, Any],
-    ohlcv60: List[Tuple[int, float, float, float, float, float]],
-) -> Dict[str, Any]:
+def _score_trend_4h(symbol: str, tf4h: Dict[str, Any], ohlcv60: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
     stage = "engine_scores.trend_4h"
 
     indicators = _require_dict(symbol, stage, tf4h.get("indicators"), "4h.indicators")
@@ -585,7 +557,6 @@ def _score_trend_4h(
 
     slope_pct_60 = ((closes[-1] - closes[0]) / closes[0]) * 100.0
 
-    # HH/HL vs LL/LH 구조 (최근 20봉 vs 직전 20봉)
     last20_high = max(highs[-20:])
     prev20_high = max(highs[-40:-20])
     last20_low = min(lows[-20:])
@@ -600,25 +571,22 @@ def _score_trend_4h(
         structure_bias = -1
         structure_state = "LL_LH"
 
-    # direction 결정(EMA200 + 구조)
     direction = "NEUTRAL"
     if price > ema_slow and ema_fast > ema_slow and structure_bias >= 0:
         direction = "LONG"
     elif price < ema_slow and ema_fast < ema_slow and structure_bias <= 0:
         direction = "SHORT"
 
-    # trend_strength 는 market_features_ws.regime.trend_strength 를 우선 사용(있으면)
     regime = tf4h.get("regime")
     if not isinstance(regime, dict):
         _fail_unified(symbol, stage, "4h.regime missing/invalid")
     trend_strength_val = _require_float(symbol, stage, regime.get("trend_strength"), "4h.regime.trend_strength")
 
-    # 점수(0~100): 방향과 무관하게 '추세 선명도'를 수치화
-    comp_price_dist = _clamp(abs(price_vs_ema_pct) * 8.0, 0.0, 30.0)  # 3.75% → 30
-    comp_ema_spread = _clamp(abs(ema_spread_pct) * 10.0, 0.0, 20.0)  # 2% → 20
-    comp_slope = _clamp(abs(slope_pct_60) * 5.0, 0.0, 20.0)  # 4% → 20
+    comp_price_dist = _clamp(abs(price_vs_ema_pct) * 8.0, 0.0, 30.0)
+    comp_ema_spread = _clamp(abs(ema_spread_pct) * 10.0, 0.0, 20.0)
+    comp_slope = _clamp(abs(slope_pct_60) * 5.0, 0.0, 20.0)
     comp_structure = 10.0 if structure_bias != 0 else 0.0
-    comp_regime = _clamp(trend_strength_val * 20.0, 0.0, 20.0)  # 스케일 불명 → 상한 클램프
+    comp_regime = _clamp(trend_strength_val * 20.0, 0.0, 20.0)
 
     score = _clamp(comp_price_dist + comp_ema_spread + comp_slope + comp_structure + comp_regime, 0.0, 100.0)
 
@@ -640,45 +608,34 @@ def _score_trend_4h(
     }
 
 
-def _score_momentum_1h(
-    symbol: str,
-    tf1h: Dict[str, Any],
-    ohlcv60: List[Tuple[int, float, float, float, float, float]],
-) -> Dict[str, Any]:
+def _score_momentum_1h(symbol: str, tf1h: Dict[str, Any], ohlcv60: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
     stage = "engine_scores.momentum_1h"
-
     indicators = _require_dict(symbol, stage, tf1h.get("indicators"), "1h.indicators")
 
     price = _require_float(symbol, stage, tf1h.get("last_close"), "1h.last_close")
     rsi = _require_float(symbol, stage, indicators.get("rsi"), "1h.indicators.rsi")
     macd_hist = _require_float(symbol, stage, indicators.get("macd_hist"), "1h.indicators.macd_hist")
-    atr_pct = _require_float(symbol, stage, indicators.get("atr_pct"), "1h.indicators.atr_pct")
+    atr_pct = _require_pct_0_100(symbol, stage, indicators.get("atr_pct"), "1h.indicators.atr_pct")
 
     if price <= 0:
         _fail_unified(symbol, stage, f"invalid price (<=0): {price}")
 
-    # RSI 편차(50 기준) → 모멘텀 강도
-    rsi_dev = abs(rsi - 50.0)  # 0~50
-    comp_rsi = _clamp(rsi_dev * 1.6, 0.0, 40.0)  # 25 → 40
+    rsi_dev = abs(rsi - 50.0)
+    comp_rsi = _clamp(rsi_dev * 1.6, 0.0, 40.0)
 
-    # MACD hist 크기(가격 대비) → 모멘텀
     macd_hist_pct = (abs(macd_hist) / price) * 100.0
-    comp_macd = _clamp(macd_hist_pct * 300.0, 0.0, 30.0)  # 0.1% → 30
+    comp_macd = _clamp(macd_hist_pct * 300.0, 0.0, 30.0)
 
     closes = [x[4] for x in ohlcv60]
-    # 최근 10봉 모멘텀(절대값)
     if len(closes) < 10:
         _fail_unified(symbol, stage, f"need >=10 closes for momentum (got={len(closes)})")
 
     mom_pct_10 = abs((closes[-1] - closes[-10]) / closes[-10]) * 100.0
-    comp_price_mom = _clamp(mom_pct_10 * 10.0, 0.0, 20.0)  # 2% → 20
+    comp_price_mom = _clamp(mom_pct_10 * 10.0, 0.0, 20.0)
 
-    # ATR% 자체는 환경(움직임 여지)로 사용 (변화는 별도 산출)
-    comp_atr_env = _clamp(atr_pct * 50.0, 0.0, 10.0)  # 0.2% → 10
-
-    # ATR% 변화(최근 vs 직전)
+    comp_atr_env = _clamp(atr_pct * 50.0, 0.0, 10.0)
     atr_chg_pct = _atr_pct_change_from_ohlcv(symbol, stage, ohlcv60, period=14)
-    comp_atr_chg = _clamp(abs(atr_chg_pct) * 0.4, 0.0, 10.0)  # 25% 변화 → 10
+    comp_atr_chg = _clamp(abs(atr_chg_pct) * 0.4, 0.0, 10.0)
 
     score = _clamp(comp_rsi + comp_macd + comp_price_mom + comp_atr_env + comp_atr_chg, 0.0, 100.0)
 
@@ -701,15 +658,11 @@ def _score_momentum_1h(
     }
 
 
-def _score_structure_15m(
-    symbol: str,
-    tf15m: Dict[str, Any],
-    ohlcv20: List[Tuple[int, float, float, float, float, float]],
-) -> Dict[str, Any]:
+def _score_structure_15m(symbol: str, tf15m: Dict[str, Any], ohlcv20: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
     stage = "engine_scores.structure_15m"
 
     price = _require_float(symbol, stage, tf15m.get("last_close"), "15m.last_close")
-    range_pct = _require_float(symbol, stage, tf15m.get("range_pct"), "15m.range_pct")
+    range_pct = _require_pct_0_100(symbol, stage, tf15m.get("range_pct"), "15m.range_pct")
 
     closes = [x[4] for x in ohlcv20]
     highs = [x[2] for x in ohlcv20]
@@ -730,7 +683,6 @@ def _score_structure_15m(
     elif breakout_down:
         state = "BREAKOUT_DOWN"
     else:
-        # range_pct 로 박스/추세 단순 분류
         if range_pct >= 1.2 and slope_abs >= 0.6:
             state = "TRENDING"
         elif range_pct >= 1.2:
@@ -739,8 +691,8 @@ def _score_structure_15m(
             state = "TIGHT_RANGE"
 
     comp_breakout = 40.0 if (breakout_up or breakout_down) else 0.0
-    comp_slope = _clamp(slope_abs * 12.0, 0.0, 30.0)  # 2.5% → 30
-    comp_range = _clamp(range_pct * 10.0, 0.0, 30.0)  # 3% → 30
+    comp_slope = _clamp(slope_abs * 12.0, 0.0, 30.0)
+    comp_range = _clamp(range_pct * 10.0, 0.0, 30.0)
 
     score = _clamp(comp_breakout + comp_slope + comp_range, 0.0, 100.0)
 
@@ -771,7 +723,7 @@ def _score_timing_5m(
     stage = "engine_scores.timing_5m"
 
     indicators = _require_dict(symbol, stage, tf5m.get("indicators"), "5m.indicators")
-    atr_pct = _require_float(symbol, stage, indicators.get("atr_pct"), "5m.indicators.atr_pct")
+    atr_pct = _require_pct_0_100(symbol, stage, indicators.get("atr_pct"), "5m.indicators.atr_pct")
 
     closes = [x[4] for x in ohlcv20]
     highs = [x[2] for x in ohlcv20]
@@ -782,7 +734,6 @@ def _score_timing_5m(
 
     mom_pct_5 = abs((closes[-1] - closes[-6]) / closes[-6]) * 100.0
 
-    # 변동성 확장/수축: 최근 5봉 평균 range vs 이전 5봉 평균 range
     def _avg_range_pct(seg_high: List[float], seg_low: List[float], seg_close: List[float]) -> float:
         if len(seg_high) != len(seg_low) or len(seg_low) != len(seg_close) or not seg_close:
             _fail_unified(symbol, stage, "invalid segment lengths for range_pct")
@@ -800,17 +751,13 @@ def _score_timing_5m(
 
     range_ratio = recent_range / prev_range
 
-    # 패턴 스코어(5m + 전역)
     p5_score = _require_prob_0_1(symbol, stage, pattern_features_5m.get("pattern_score"), "5m.pattern_score")
-    global_pattern_score = _require_prob_0_1(
-        symbol, stage, pattern_summary.get("pattern_score"), "pattern_summary.pattern_score"
-    )
+    global_pattern_score = _require_prob_0_1(symbol, stage, pattern_summary.get("pattern_score"), "pattern_summary.pattern_score")
 
     comp_pattern = _clamp(max(p5_score, global_pattern_score) * 40.0, 0.0, 40.0)
-    comp_momentum = _clamp(mom_pct_5 * 12.0, 0.0, 25.0)  # 2.1% → 25
-    comp_atr_env = _clamp(atr_pct * 80.0, 0.0, 15.0)  # 0.1875% → 15
+    comp_momentum = _clamp(mom_pct_5 * 12.0, 0.0, 25.0)
+    comp_atr_env = _clamp(atr_pct * 80.0, 0.0, 15.0)
 
-    # range_ratio 가 1보다 크면 확장(진입 타이밍에 유리한 경우가 많음)
     comp_expansion = 0.0
     if range_ratio >= 1.20:
         comp_expansion = 15.0
@@ -844,7 +791,6 @@ def _score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, 
     imbalance_qty_pct = _require_float(symbol, stage, orderbook.get("imbalance_qty_pct"), "orderbook.imbalance_qty_pct")
     depth_imbalance = _require_float(symbol, stage, orderbook.get("depth_imbalance"), "orderbook.depth_imbalance")
 
-    # spreadPct 낮을수록 좋다.
     spread_score = 0.0
     if spread_pct <= 0.02:
         spread_score = 40.0
@@ -857,11 +803,8 @@ def _score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, 
     else:
         spread_score = 0.0
 
-    # imbalance(절대값) 클수록 한쪽 우세. 과도하면 불안정할 수 있으나, 상한 클램프.
-    imbalance_score = _clamp(abs(imbalance_qty_pct) * 0.6, 0.0, 30.0)  # 50% → 30
-    depth_score = _clamp(abs(depth_imbalance) * 30.0, 0.0, 30.0)  # 1.0 → 30
-
-    # 정상 오더북(이미 strict 검증 통과) → 품질 보너스
+    imbalance_score = _clamp(abs(imbalance_qty_pct) * 0.6, 0.0, 30.0)
+    depth_score = _clamp(abs(depth_imbalance) * 30.0, 0.0, 30.0)
     quality_score = 10.0
 
     score = _clamp(spread_score + imbalance_score + depth_score + quality_score, 0.0, 100.0)
@@ -887,44 +830,25 @@ def _build_engine_scores_strict(
     pattern_summary: Dict[str, Any],
     orderbook: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    STRICT 요구사항(C):
-    - 멀티TF 엔진 점수(0~100) 산출
-    - total 은 고정 weights 로 합산
-    """
-    # 4h (trend)
     tf4h = _require_dict(symbol, "engine_scores", timeframes.get("4h"), "timeframes['4h']")
-    ohlcv4h = _parse_ohlcv_rows(
-        symbol, "engine_scores", tf4h.get("raw_ohlcv_last60"), min_len=60, name="4h.raw_ohlcv_last60"
-    )
+    ohlcv4h = _parse_ohlcv_rows(symbol, "engine_scores", tf4h.get("raw_ohlcv_last60"), min_len=60, name="4h.raw_ohlcv_last60")
     trend_4h = _score_trend_4h(symbol, tf4h, ohlcv4h)
 
-    # 1h (momentum)
     tf1h = _require_dict(symbol, "engine_scores", timeframes.get("1h"), "timeframes['1h']")
-    ohlcv1h = _parse_ohlcv_rows(
-        symbol, "engine_scores", tf1h.get("raw_ohlcv_last60"), min_len=60, name="1h.raw_ohlcv_last60"
-    )
+    ohlcv1h = _parse_ohlcv_rows(symbol, "engine_scores", tf1h.get("raw_ohlcv_last60"), min_len=60, name="1h.raw_ohlcv_last60")
     momentum_1h = _score_momentum_1h(symbol, tf1h, ohlcv1h)
 
-    # 15m (structure)
     tf15 = _require_dict(symbol, "engine_scores", timeframes.get("15m"), "timeframes['15m']")
-    ohlcv15 = _parse_ohlcv_rows(
-        symbol, "engine_scores", tf15.get("raw_ohlcv_last20"), min_len=20, name="15m.raw_ohlcv_last20"
-    )
+    ohlcv15 = _parse_ohlcv_rows(symbol, "engine_scores", tf15.get("raw_ohlcv_last20"), min_len=20, name="15m.raw_ohlcv_last20")
     structure_15m = _score_structure_15m(symbol, tf15, ohlcv15)
 
-    # 5m (timing)
     tf5 = _require_dict(symbol, "engine_scores", timeframes.get("5m"), "timeframes['5m']")
-    ohlcv5 = _parse_ohlcv_rows(
-        symbol, "engine_scores", tf5.get("raw_ohlcv_last20"), min_len=20, name="5m.raw_ohlcv_last20"
-    )
+    ohlcv5 = _parse_ohlcv_rows(symbol, "engine_scores", tf5.get("raw_ohlcv_last20"), min_len=20, name="5m.raw_ohlcv_last20")
     pf5 = _require_dict(symbol, "engine_scores", pattern_features.get("5m"), "pattern_features['5m']")
     timing_5m = _score_timing_5m(symbol, tf5, ohlcv5, pattern_summary, pf5)
 
-    # orderbook micro
     orderbook_micro = _score_orderbook_micro(symbol, orderbook)
 
-    # total weighted
     w = _TOTAL_WEIGHTS
     total_score = (
         float(trend_4h["score"]) * w["trend_4h"]
@@ -946,11 +870,6 @@ def _build_engine_scores_strict(
 
 
 def _compact_indicators_strict(symbol: str, tf: str, indicators: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    STRICT:
-    - indicators dict 필수 키를 포함해야 한다(없으면 실패)
-    - series(대형 리스트)는 출력에서 제거(토큰 최적화)
-    """
     stage = f"timeframes[{tf}].indicators"
     out: Dict[str, Any] = {}
 
@@ -963,12 +882,6 @@ def _compact_indicators_strict(symbol: str, tf: str, indicators: Dict[str, Any])
 
 
 def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    STRICT 요구사항(D):
-    - raw_ohlcv_last20/60 유지
-    - 불필요한 대형 배열/디버그 시리즈 제거
-    - 출력은 REQUIRED_TFS 중심으로 축소(토큰 최적화)
-    """
     out: Dict[str, Any] = {}
 
     for tf in REQUIRED_TFS:
@@ -977,36 +890,30 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
 
         tf_out: Dict[str, Any] = {}
 
-        # 최소 필요 키는 그대로 유지(스칼라/작은 dict)
         for k, v in tf_data.items():
             if k in ("candles",):
-                continue  # 중복/대형
+                continue
             if k.startswith("debug") or k.endswith("_series"):
                 continue
             if k == "indicators":
-                continue  # 아래에서 별도 compact
+                continue
 
-            # raw series는 필수만 유지
             if k == "raw_ohlcv_last20" and tf not in ("1m", "5m", "15m"):
                 continue
             if k == "raw_ohlcv_last60" and tf not in ("1h", "4h"):
                 continue
 
-            # 기타 list/tuple 가 과도하게 크면 제거 (필수 raw 제외)
             if isinstance(v, list) and len(v) > 200 and k not in ("raw_ohlcv_last20", "raw_ohlcv_last60"):
                 continue
 
-            # None 값은 출력에서 제거(토큰+해석 안정성)
             if v is None:
                 continue
 
             tf_out[k] = v
 
-        # indicators compact
         indicators = _require_dict(symbol, stage, tf_data.get("indicators"), f"{tf}.indicators")
         tf_out["indicators"] = _compact_indicators_strict(symbol, tf, indicators)
 
-        # raw_ohlcv 필수 유지/정규화(리스트 of list)
         if tf in ("1m", "5m", "15m"):
             raw20 = tf_data.get("raw_ohlcv_last20")
             parsed20 = _parse_ohlcv_rows(symbol, stage, raw20, min_len=20, name=f"{tf}.raw_ohlcv_last20")
@@ -1022,16 +929,10 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
 
 
 def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
-    """
-    STRICT · NO-FALLBACK:
-    - base(market_features_ws) + pattern_detection + engine_scores 를 통합한다.
-    - 필수 데이터 누락/손상 시 즉시 UnifiedFeaturesError.
-    """
     sym = str(symbol or getattr(SET, "symbol", "")).strip()
     if not sym:
         _fail_unified("UNKNOWN", "symbol", "symbol is empty (provide symbol or set settings.symbol)")
 
-    # 1) WS 기반 기본 마켓 피처 생성
     try:
         base = build_entry_features_ws(sym)
     except FeatureBuildError as e:
@@ -1046,33 +947,22 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(timeframes, dict) or not timeframes:
         _fail_unified(sym, "timeframes", "timeframes missing/invalid")
 
-    # 2) 필수 타임프레임/데이터 STRICT 검증 + (1h/4h raw_ohlcv_last60 생성)
     _ensure_timeframe_payloads_strict(sym, timeframes)
 
-    # 3) 오더북 STRICT 확보 (bids/asks 포함) — base["orderbook"] 대신 WS snapshot 기반으로 재구성
     orderbook = _get_orderbook_strict(sym, limit=5)
 
-    # 4) 패턴 번들 생성 (STRICT)
     pattern_features, pattern_summary = _build_pattern_bundle_strict(sym, timeframes, orderbook)
 
-    # 5) 엔진 1차 멀티TF 점수 (STRICT)
     engine_scores = _build_engine_scores_strict(sym, timeframes, pattern_features, pattern_summary, orderbook)
 
-    # 6) 토큰 최적화: timeframes 축소/정리 (필수 raw + scalar indicators 유지)
     compact_timeframes = _compact_timeframes_for_output(sym, timeframes)
 
-    # 7) 최종 dict 구성
     result: Dict[str, Any] = dict(base)
     result["timeframes"] = compact_timeframes
     result["orderbook"] = orderbook
     result["pattern_features"] = pattern_features
     result["pattern_summary"] = pattern_summary
     result["engine_scores"] = engine_scores
-
-    # (운영 권고) settings/ws_subscribe_tfs 에 반드시 포함:
-    #   WS_SUBSCRIBE_TFS="1m,5m,15m,1h,4h"
-    # (운영 권고) 부팅 안정화용 WS 백필에도 포함:
-    #   ws_backfill_tfs=["1m","5m","15m","1h","4h"]
 
     return result
 

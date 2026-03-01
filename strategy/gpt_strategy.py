@@ -9,6 +9,12 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - unified_features + engine_scores는 필수 입력.
 - 데이터 누락/오류는 즉시 예외.
 - 폴백(REST 백필/더미 값/임의 보정) 절대 금지.
+
+PATCH NOTES — 2026-03-02
+- market_data.account_state 필수 입력으로 강제(STRICT).
+  - dd_pct / consecutive_losses / recent_win_rate / recent_trades_count 필수.
+- account_state를 GPT 입력(extra_to_gpt)에 포함하여 의사결정 컨텍스트 강화.
+  (I/O 없음, 추정 없음, caller가 제공한 실제 데이터만 전달)
 ========================================================
 """
 
@@ -41,6 +47,13 @@ _REQUIRED_MARKET_FEATURE_KEYS: Tuple[str, ...] = (
     "pattern_summary",
     "pattern_features",
     "engine_scores",
+)
+
+_REQUIRED_ACCOUNT_STATE_KEYS: Tuple[str, ...] = (
+    "dd_pct",
+    "consecutive_losses",
+    "recent_win_rate",
+    "recent_trades_count",
 )
 
 
@@ -93,6 +106,43 @@ def _require_dict(value: Any, name: str) -> Dict[str, Any]:
     if not isinstance(value, dict) or not value:
         raise RuntimeError(f"{name} is required and must be non-empty dict")
     return value
+
+
+def _require_account_state(value: Any) -> Dict[str, Any]:
+    """
+    STRICT:
+    - account_state는 반드시 dict
+    - 필수 키 존재
+    - 각 값의 타입/범위 강제
+    """
+    st = _require_dict(value, "market_data.account_state")
+
+    for k in _REQUIRED_ACCOUNT_STATE_KEYS:
+        if k not in st:
+            raise RuntimeError(f"account_state missing required key: {k}")
+
+    dd_pct = _as_float(st.get("dd_pct"), "account_state.dd_pct", min_value=0.0, max_value=100.0)
+    consecutive_losses = _as_int(st.get("consecutive_losses"), "account_state.consecutive_losses", min_value=0)
+    recent_win_rate = _as_float(st.get("recent_win_rate"), "account_state.recent_win_rate", min_value=0.0, max_value=1.0)
+    recent_trades_count = _as_int(st.get("recent_trades_count"), "account_state.recent_trades_count", min_value=0)
+
+    # STRICT: 값 저장(정규화/클램프 금지, 단 타입 확정/유효성 검증은 수행)
+    st2: Dict[str, Any] = dict(st)
+    st2["dd_pct"] = float(dd_pct)
+    st2["consecutive_losses"] = int(consecutive_losses)
+    st2["recent_win_rate"] = float(recent_win_rate)
+    st2["recent_trades_count"] = int(recent_trades_count)
+
+    # optional fields (있으면 검증)
+    if "equity_current_usdt" in st2 and st2["equity_current_usdt"] is not None:
+        st2["equity_current_usdt"] = _as_float(st2["equity_current_usdt"], "account_state.equity_current_usdt", min_value=0.0)
+    if "equity_peak_usdt" in st2 and st2["equity_peak_usdt"] is not None:
+        st2["equity_peak_usdt"] = _as_float(st2["equity_peak_usdt"], "account_state.equity_peak_usdt", min_value=0.0)
+
+    if "recent_planned_rr_avg" in st2 and st2["recent_planned_rr_avg"] is not None:
+        st2["recent_planned_rr_avg"] = _as_float(st2["recent_planned_rr_avg"], "account_state.recent_planned_rr_avg", min_value=0.0)
+
+    return st2
 
 
 def _compute_pre_entry_score(extra: Any) -> Optional[float]:
@@ -232,6 +282,9 @@ class GPTStrategy(BaseStrategy):
         if last_price <= 0:
             raise ValueError("market_data.last_price must be > 0")
 
+        # account_state (필수)
+        account_state = _require_account_state(market_data.get("account_state"))
+
         # unified_features (필수)
         market_features = market_data.get("market_features")
         if not isinstance(market_features, dict) or not market_features:
@@ -303,6 +356,7 @@ class GPTStrategy(BaseStrategy):
                     "candles_5m_raw": candles_5m_raw,
                     "extra": extra,
                     "entry_score": entry_score,
+                    "account_state": account_state,
                     "market_features": market_features,
                     "engine_total_score": float(engine_total_score),
                     "engine_scores": engine_scores,
@@ -329,6 +383,11 @@ class GPTStrategy(BaseStrategy):
         # guard snapshot
         guard_snapshot = _build_guard_snapshot(self.settings)
 
+        # GPT 입력 extra 구성 (account_state 포함)
+        extra_to_gpt: Dict[str, Any] = dict(extra) if isinstance(extra, dict) else {}
+        extra_to_gpt["account_state"] = account_state
+        extra_to_gpt["engine_total_score"] = float(engine_total_score)
+
         # GPT 판단
         try:
             gpt_result = decide_entry_with_gpt_trader(
@@ -341,7 +400,7 @@ class GPTStrategy(BaseStrategy):
                 base_risk_pct=float(effective_risk_pct),
                 base_tp_pct=float(tp_pct),
                 base_sl_pct=float(sl_pct),
-                extra=extra,
+                extra=extra_to_gpt,
                 guard_snapshot=guard_snapshot,
                 market_features=market_features,
             )
@@ -412,8 +471,9 @@ class GPTStrategy(BaseStrategy):
             "last_price": float(last_price),
             "candles_5m": candles_5m,
             "candles_5m_raw": candles_5m_raw,
-            "extra": extra,
+            "extra": extra,  # 원본 extra 보존
             "entry_score": entry_score,
+            "account_state": account_state,
             "market_features": market_features,
             "engine_total_score": float(engine_total_score),
             "engine_scores": engine_scores,

@@ -1,4 +1,4 @@
-# run_bot_ws.py
+# core/run_bot_ws.py
 """
 run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 ============================================================
@@ -10,8 +10,10 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
   - 시장데이터(캔들/오더북) 런타임 의사결정에는 사용하지 않음(WS only).
   - 단, 계정/주문 상태(포지션/체결/잔고) 조회에는 사용 가능.
   - 부팅 시 WS 버퍼 백필(/fapi/v1/klines) 용도로도 사용.
-- 진입(ENTRY): (STRICT) get_trading_signal → build_unified_features → GPTStrategy.decide → ExecutionEngine.execute
-- 청산(EXIT): position_watch_ws.maybe_exit_with_gpt → GPT EXIT 레이어.
+- 진입(ENTRY): (STRICT)
+  get_trading_signal → build_unified_features → Regime/Account Gate → GPTStrategy.decide
+  → RiskPhysics(decide) → ExecutionEngine.execute
+- 청산(EXIT): maybe_exit_with_gpt → GPT EXIT 레이어.
 - 이 파일은 포지션/쿨다운/헬스체크를 오케스트레이션할 뿐,
   매수·매도·손절·익절 “실행” 로직은 execution 레이어에서만 수행한다.
 
@@ -32,12 +34,13 @@ PATCH NOTES — 2026-02-28
 - ENTRY 게이트: WS 캔들/오더북 미준비 시 SKIP (unified_features/GPT 호출 금지).
 - 헬스 리포트: get_kline_buffer_status로 1h/4h/1d 표시, md-store TF 옵션화.
 
-참고 (설명용)
------------------------------------------------------
-- Binance Futures WS base: wss://fstream.binance.com/ws
-- kline stream: <symbol>@kline_<interval>
-- depth stream: <symbol>@depth5
-- 실제 스트림 연결/파싱은 market_data_ws 모듈이 담당한다.
+PATCH NOTES — 2026-03-02 (Trade-grade upgrade)
+- RegimeEngine(절대 점수 65/75/85) 기반 allocation 도입: regime_score<65이면 GPT 호출 금지.
+- AccountStateBuilder 도입: DD/연속손실/승률 기반으로 GPT 호출 전 차단 가능.
+- RiskPhysicsEngine 도입: DD/연속손실/최소RR 기반으로 최종 투입 비율(=risk_pct) 결정.
+- 전액 배분형: risk_pct는 "계좌 투입 비율"로 해석(1.0=전액).
+- 흐름: Python(Regime/Account) → GPT(전략) → Python(RiskPhysics) → Execution
+============================================================
 """
 
 from __future__ import annotations
@@ -50,6 +53,7 @@ import signal
 import threading
 import time
 import traceback
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 from settings import KST, load_settings  # WS 버전 설정
@@ -62,16 +66,12 @@ from execution.order_executor import close_all_positions_market
 from state.trader_state import Trade, TraderState, check_closes, build_close_summary_strict
 from events.signals_logger import log_signal
 
-from infra.bot_workers import (
-    start_telegram_command_thread,
-)
+from infra.bot_workers import start_telegram_command_thread
 from strategy.signal_analysis_worker import start_signal_analysis_thread
 
 # 동기화/포지션 감시 모듈
 from execution.sync_exchange import sync_open_trades_from_exchange
-from state.exit_engine import (  # WS 버전 GPT EXIT 어댑터
-    maybe_exit_with_gpt,
-)
+from state.exit_engine import maybe_exit_with_gpt  # WS 버전 GPT EXIT 어댑터
 
 # WS 시세 버퍼
 from infra.market_data_ws import (
@@ -96,6 +96,14 @@ from infra.market_features_ws import get_trading_signal, FeatureBuildError
 from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
 from strategy.gpt_strategy import GPTStrategy
 from execution.execution_engine import ExecutionEngine
+
+# ─────────────────────────────────────────────
+# Trade-grade engines (STRICT · NO-FALLBACK)
+# ─────────────────────────────────────────────
+from strategy.regime_engine import RegimeEngine
+from strategy.account_state_builder import AccountStateBuilder, AccountStateNotReadyError
+from execution.risk_physics_engine import RiskPhysicsEngine, RiskPhysicsPolicy
+from strategy.signal import Signal
 
 
 # ─────────────────────────────
@@ -204,10 +212,7 @@ def _verify_required_tfs_or_die(name: str, configured_tfs: List[str], required_t
     norm = {str(x).strip().lower() for x in configured_tfs if str(x).strip()}
     missing = [tf for tf in required_tfs if tf.lower() not in norm]
     if missing:
-        msg = (
-            f"⛔ 설정 오류: {name} 에 필수 TF 누락: {missing}. "
-            f"필수={list(required_tfs)}"
-        )
+        msg = f"⛔ 설정 오류: {name} 에 필수 TF 누락: {missing}. 필수={list(required_tfs)}"
         log(msg)
         _safe_send_tg(msg)
         raise RuntimeError(msg)
@@ -220,7 +225,6 @@ def _verify_ws_boot_configuration_or_die() -> None:
 
     ws_backfill_tfs = _parse_tfs(getattr(SET, "ws_backfill_tfs", None))
     if not ws_backfill_tfs:
-        # 설정이 아예 없으면 기본값(필수 TF)로 운영하도록 유도 (실제 값 변경은 하지 않음)
         ws_backfill_tfs = list(ENTRY_REQUIRED_TFS)
     _verify_required_tfs_or_die("ws_backfill_tfs", ws_backfill_tfs, ENTRY_REQUIRED_TFS)
 
@@ -250,12 +254,7 @@ def _maybe_send_error_tg(key: str, msg: str, cooldown_sec: int = 60) -> None:
 
 
 def interruptible_sleep(total_sec: float, tick: float = 1.0) -> None:
-    """인터럽트 가능한 슬립.
-
-    요구사항:
-    - tick 단위로 RUNNING/SAFE_STOP_REQUESTED/SIGTERM 데드라인을 확인하고 즉시 반환.
-    - time.sleep(수시간) 같은 블로킹 슬립을 제거한다.
-    """
+    """인터럽트 가능한 슬립."""
     if total_sec is None:
         return
     try:
@@ -303,18 +302,12 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
     best_ask = ob.get("bestAsk")
 
     try:
-        if best_bid is None:
-            best_bid = float(bids[0][0])
-        else:
-            best_bid = float(best_bid)
+        best_bid = float(bids[0][0]) if best_bid is None else float(best_bid)
     except Exception:
         return "orderbook bestBid invalid"
 
     try:
-        if best_ask is None:
-            best_ask = float(asks[0][0])
-        else:
-            best_ask = float(best_ask)
+        best_ask = float(asks[0][0]) if best_ask is None else float(best_ask)
     except Exception:
         return "orderbook bestAsk invalid"
 
@@ -328,8 +321,7 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
 
 def _validate_klines_for_entry(symbol: str) -> Optional[str]:
     for iv, min_len in ENTRY_REQUIRED_KLINES_MIN.items():
-        limit = min_len
-        buf = ws_get_klines_with_volume(symbol, iv, limit=limit)
+        buf = ws_get_klines_with_volume(symbol, iv, limit=min_len)
         if not isinstance(buf, list):
             return f"kline buffer invalid type for {iv}"
         if len(buf) < min_len:
@@ -348,9 +340,69 @@ def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────
+# AccountState bootstrap (DB read, STRICT)
+# ─────────────────────────────────────────────
+def _load_closed_trades_bootstrap(symbol: str, limit: int = 50) -> list[dict[str, Any]]:
+    """
+    STRICT:
+    - DATABASE_URL 환경변수 기반으로 bt_trades에서 최근 청산 트레이드 로드.
+    - 실패 시 예외(폴백 금지). 단, caller가 예외를 받아 '명시적 SKIP' 처리 가능.
+    """
+    dsn = os.getenv("DATABASE_URL")
+    if not dsn or not str(dsn).strip():
+        raise RuntimeError("DATABASE_URL is required for account_state bootstrap")
+
+    try:
+        import psycopg2
+    except Exception as e:
+        raise RuntimeError("psycopg2 is required for account_state bootstrap") from e
+
+    q = """
+        SELECT id, exit_ts, pnl_usdt, tp_pct, sl_pct
+        FROM bt_trades
+        WHERE symbol = %s
+          AND exit_ts IS NOT NULL
+          AND pnl_usdt IS NOT NULL
+        ORDER BY exit_ts DESC
+        LIMIT %s
+    """
+
+    rows: list[dict[str, Any]] = []
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(dsn)
+        cur = conn.cursor()
+        cur.execute(q, (symbol, int(limit)))
+        for (trade_id, exit_ts, pnl_usdt, tp_pct, sl_pct) in cur.fetchall():
+            if exit_ts is None:
+                raise RuntimeError("bt_trades.exit_ts is NULL (unexpected)")
+            rows.append(
+                {
+                    "id": int(trade_id),
+                    "exit_ts": exit_ts,
+                    "pnl_usdt": float(pnl_usdt),
+                    "tp_pct": None if tp_pct is None else float(tp_pct),
+                    "sl_pct": None if sl_pct is None else float(sl_pct),
+                }
+            )
+        return rows
+    finally:
+        try:
+            if cur is not None:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────
 # GPT Latency Reporter (내장형)
 # ─────────────────────────────────────────────
-
 from infra.telelog import send_tg as _send_tg_for_latency, log as _log_for_latency  # 이름 충돌 방지
 
 LATENCY_DIR = os.path.join("logs", "gpt_latency")
@@ -410,7 +462,7 @@ def _build_summary(records: list[dict[str, str]]) -> str:
     max_latency = max(latencies) if latencies else 0.0
     success_rate = ((len(records) - err_count) / len(records)) * 100 if records else 0.0
 
-    summary = (
+    return (
         "📊 *GPT Latency Report — 최근 30분*\n"
         f"• 호출 수: {len(records)}\n"
         f"• 평균 응답 시간: {avg_latency:.2f}초\n"
@@ -419,7 +471,6 @@ def _build_summary(records: list[dict[str, str]]) -> str:
         f"• 오류/타임아웃: {err_count}건\n"
         f"• 성공률: {success_rate:.1f}%\n"
     )
-    return summary
 
 
 def start_gpt_latency_reporter() -> None:
@@ -445,17 +496,8 @@ def start_gpt_latency_reporter() -> None:
 # ─────────────────────────────
 # SIGTERM 핸들러 등록
 # ─────────────────────────────
-
-
 def _sigterm(*_: Any) -> None:
-    """SIGTERM 수신 시 안전 종료를 요청한다.
-
-    요구사항 (STRICT · NO-FALLBACK):
-    - 즉시 신규 진입 금지 상태로 전환(SAFE_STOP_REQUESTED=True)
-    - RUNNING=False 로 즉시 루프를 끝내지 않는다(포지션 정리 루틴이 돌 수 있게).
-    - 데드라인(sigterm_grace_sec) 내에 포지션이 0이 되지 않으면 강제 청산 시도 후 종료.
-    - 텔레그램 알림은 1회만.
-    """
+    """SIGTERM 수신 시 안전 종료를 요청한다."""
     global SAFE_STOP_REQUESTED, SIGTERM_REQUESTED_AT, SIGTERM_DEADLINE_TS, _SIGTERM_NOTICE_SENT
 
     SAFE_STOP_REQUESTED = True
@@ -481,11 +523,6 @@ def _sigterm(*_: Any) -> None:
 signal.signal(signal.SIGTERM, _sigterm)
 
 
-# ─────────────────────────────
-# 유틸: 청산 사유(reason) 한글 변환
-# ─────────────────────────────
-
-
 def _translate_close_reason(reason: str) -> str:
     """check_closes 에서 넘어오는 청산 사유를 사람이 보기 쉬운 짧은 문장으로 변환."""
     if not reason:
@@ -503,11 +540,6 @@ def _translate_close_reason(reason: str) -> str:
     if "opposite" in r:
         return "반대 방향 신호로 종료"
     return reason
-
-
-# ─────────────────────────────
-# 포지션 상태 텔레그램 알림 (WS 버전)
-# ─────────────────────────────
 
 
 def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
@@ -545,11 +577,6 @@ def _send_open_positions_status(symbol: str, interval_sec: int) -> None:
     _safe_send_tg("\n".join(lines))
 
 
-# ─────────────────────────────
-# 텔레그램 종료 콜백
-# ─────────────────────────────
-
-
 def _on_safe_stop() -> None:
     """텔레그램 명령으로 안전 종료를 요청받았을 때 플래그만 세팅한다."""
     global SAFE_STOP_REQUESTED
@@ -557,16 +584,11 @@ def _on_safe_stop() -> None:
     _safe_send_tg("🛑 텔레그램에서 '종료' 버튼을 눌렀습니다. 현재 포지션을 모두 정리한 뒤 자동매매를 멈춥니다.")
 
 
-# ─────────────────────────────
-# NEW: ENTRY용 market_data 구성 (STRICT · NO-FALLBACK)
-# ─────────────────────────────
-
-
 def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Dict[str, Any]]:
     """
     STRICT:
-    - get_trading_signal이 None이면 "신호 없음"으로 None 반환(정상).
-    - 신호가 있는데 WS 필수 데이터가 미준비면 SKIP 처리(로그+텔레그램), GPT 호출 금지.
+    - get_trading_signal이 None이면 None 반환(정상).
+    - 신호가 있는데 WS 필수 데이터가 미준비면 SKIP 처리, GPT 호출 금지.
     - unified_features는 build_unified_features로만 생성한다(실패 시 SKIP).
     - 런타임 REST 폴백은 절대 하지 않는다.
     """
@@ -595,7 +617,6 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     if ts_ms <= 0:
         raise RuntimeError(f"invalid latest_ts: {latest_ts!r}")
 
-    # ENTRY 게이트: WS 캔들(1m/5m/15m/1h/4h) + depth5 오더북 필수
     prereq_reason = _validate_ws_entry_prereqs(symbol)
     if prereq_reason:
         msg = f"[SKIP][WS_NOT_READY] entry blocked: {symbol} ({prereq_reason})"
@@ -603,7 +624,6 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         _maybe_send_entry_block_tg(f"WS_NOT_READY:{symbol}:{prereq_reason}", msg, cooldown_sec=60)
         return None
 
-    # unified_features는 WS 기반으로만 생성(실패 시 SKIP)
     try:
         market_features = build_unified_features(symbol)
     except (UnifiedFeaturesError, FeatureBuildError) as e:
@@ -618,7 +638,7 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
 
-    md: Dict[str, Any] = {
+    return {
         "symbol": symbol,
         "direction": direction,
         "signal_source": signal_source_s,
@@ -630,21 +650,12 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         "extra": extra,
         "market_features": market_features,
     }
-    return md
-
-
-# ─────────────────────────────
-# WS 시세 초기 REST 백필 (부팅 전용)
-# ─────────────────────────────
 
 
 def _backfill_ws_kline_history(symbol: str) -> None:
     """
     Binance Futures REST /fapi/v1/klines 로 히스토리 캔들을 받아 WS 버퍼에 미리 채운다.
-
-    STRICT:
-    - 런타임 판단에는 사용하지 않는다(부팅 전용).
-    - 필수 TF(1m/5m/15m/1h/4h) 백필 실패/부족 시 부팅을 즉시 중단한다.
+    STRICT: 부팅 전용. 필수 TF 백필 실패/부족 시 부팅 중단.
     """
     global LAST_REST_BACKFILL_AT
 
@@ -695,22 +706,14 @@ def _backfill_ws_kline_history(symbol: str) -> None:
             _safe_send_tg(msg)
             raise RuntimeError(msg)
 
-        log(
-            f"[BOOT] REST backfill fetched: symbol={symbol} interval={iv} rows={len(rest_rows)}"
-        )
-
-        # WS 버퍼에 적재
+        log(f"[BOOT] REST backfill fetched: symbol={symbol} interval={iv} rows={len(rest_rows)}")
         backfill_klines_from_rest(symbol, iv, rest_rows)
 
-        # WS 버퍼 적재 검증 (ENTRY 요구 최소 개수 충족 필수)
         verify_limit = max(60, min_needed)
         buf = ws_get_klines_with_volume(symbol, iv, limit=verify_limit)
         buf_len = len(buf) if isinstance(buf, list) else 0
 
-        log(
-            f"[BOOT] REST backfill verify: symbol={symbol} interval={iv} "
-            f"ws_buf_len={buf_len} (need>={min_needed})"
-        )
+        log(f"[BOOT] REST backfill verify: symbol={symbol} interval={iv} ws_buf_len={buf_len} (need>={min_needed})")
 
         if buf_len < min_needed:
             msg = (
@@ -728,11 +731,6 @@ def _backfill_ws_kline_history(symbol: str) -> None:
         LAST_REST_BACKFILL_AT = time.time()
 
 
-# ─────────────────────────────
-# WS 시세 → DB 저장 스레드
-# ─────────────────────────────
-
-
 def _start_market_data_store_thread() -> None:
     """WS 버퍼에서 캔들/호가를 읽어 주기적으로 Postgres 에 저장하는 백그라운드 스레드."""
     symbol = SET.symbol
@@ -747,14 +745,10 @@ def _start_market_data_store_thread() -> None:
 
     def _loop() -> None:
         nonlocal last_ob_ts
-        log(
-            f"[MD-STORE] loop started: flush_sec={flush_sec}, "
-            f"ob_interval_sec={ob_interval_sec}, store_tfs={store_tfs}"
-        )
+        log(f"[MD-STORE] loop started: flush_sec={flush_sec}, ob_interval_sec={ob_interval_sec}, store_tfs={store_tfs}")
         while RUNNING:
             try:
                 now = time.time()
-
                 candles_to_save: List[Dict[str, Any]] = []
 
                 for iv in store_tfs:
@@ -782,7 +776,6 @@ def _start_market_data_store_thread() -> None:
                                 "source": "ws",
                             }
                         )
-
                     last_candle_ts[iv] = int(new_rows[-1][0])
 
                 if candles_to_save:
@@ -802,12 +795,7 @@ def _start_market_data_store_thread() -> None:
                         if ts_ms is None:
                             ts_ms = int(now * 1000)
 
-                        save_orderbook_from_ws(
-                            symbol=symbol,
-                            ts_ms=ts_ms,
-                            bids=ob["bids"],
-                            asks=ob["asks"],
-                        )
+                        save_orderbook_from_ws(symbol=symbol, ts_ms=ts_ms, bids=ob["bids"], asks=ob["asks"])
                         last_ob_ts = now
 
             except Exception as e:
@@ -820,27 +808,18 @@ def _start_market_data_store_thread() -> None:
     log("[MD-STORE] background store thread started")
 
 
-# ─────────────────────────────
-# 데이터 헬스 텔레그램 리포트
-# ─────────────────────────────
-
-
 def _send_data_health_report(symbol: str) -> None:
     """REST 백필 및 WS/오더북 데이터 상태를 1회 텔레그램으로 전송한다."""
     try:
         snap = get_health_snapshot(symbol)
     except Exception as e:
         log(f"[DATA-HEALTH] snapshot error: {e}")
-        _safe_send_tg(
-            "⚠ 데이터 헬스 스냅샷 조회 중 오류가 발생했습니다.\n"
-            f"- 내용: {e}"
-        )
+        _safe_send_tg("⚠ 데이터 헬스 스냅샷 조회 중 오류가 발생했습니다.\n" f"- 내용: {e}")
         return
 
     overall_ok = bool(snap.get("overall_ok", False))
     ob_status = snap.get("orderbook", {}) or {}
 
-    # 리포트는 REQUIRED_INTERVALS에 종속되지 않도록 모든 TF를 직접 조회
     key_intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
 
     kline_failures = int(METRICS.get("kline_failures", 0))
@@ -850,7 +829,6 @@ def _send_data_health_report(symbol: str) -> None:
     else:
         last_rest_str = "한 번도 성공한 적 없음"
 
-    # ENTRY 준비 상태도 함께 표시
     entry_prereq_reason = _validate_ws_entry_prereqs(symbol)
     entry_ready = entry_prereq_reason is None
 
@@ -860,21 +838,18 @@ def _send_data_health_report(symbol: str) -> None:
         f"- 심볼: {symbol}",
         f"- 마지막 REST 백필 시각: {last_rest_str}",
         f"- REST 백필 실패 누적: {kline_failures}회",
-        f"- ENTRY WS 준비: {'O' if entry_ready else 'X'}"
-        + ("" if entry_ready else f" ({entry_prereq_reason})"),
+        f"- ENTRY WS 준비: {'O' if entry_ready else 'X'}" + ("" if entry_ready else f" ({entry_prereq_reason})"),
+        "",
+        "📈 K라인 버퍼 상태:",
     ]
 
-    # K라인 상태
     min_buf = int(getattr(SET, "ws_min_kline_buffer", 60))
     max_delay_sec = float(getattr(SET, "ws_max_kline_delay_sec", 120.0))
 
-    lines.append("")
-    lines.append("📈 K라인 버퍼 상태:")
     for iv in key_intervals:
         st = ws_get_kline_buffer_status(symbol, iv)
         buffer_len = int(st.get("buffer_len") or 0)
         delay_ms = st.get("delay_ms")
-
         if delay_ms is None:
             delay_str = "N/A"
             ok = False
@@ -882,34 +857,23 @@ def _send_data_health_report(symbol: str) -> None:
             delay_sec = float(delay_ms) / 1000.0
             delay_str = f"{delay_sec:.1f}s"
             ok = buffer_len >= min_buf and delay_sec <= max_delay_sec
-
         ok_mark = "O" if ok else "X"
         lines.append(f"· {iv}: len={buffer_len}, delay={delay_str}, ok={ok_mark}")
 
-    # 오더북 상태
     if ob_status:
         ob_ok = bool(ob_status.get("ok", False))
         ob_delay_ms = ob_status.get("delay_ms")
-        if ob_delay_ms is None:
-            ob_delay_str = "N/A"
-        else:
-            ob_delay_str = f"{float(ob_delay_ms) / 1000.0:.1f}s"
+        ob_delay_str = "N/A" if ob_delay_ms is None else f"{float(ob_delay_ms) / 1000.0:.1f}s"
         lines.append("")
         lines.append(f"📊 오더북(depth5) 상태: ok={'O' if ob_ok else 'X'}, delay={ob_delay_str}")
 
+    lines.append("")
     if overall_ok and entry_ready and LAST_REST_BACKFILL_AT > 0:
-        lines.append("")
         lines.append("→ GPT 트레이더가 사용할 WS 로우데이터는 현재 ENTRY 기준으로 준비되어 있습니다.")
     else:
-        lines.append("")
         lines.append("→ 데이터 이상/부족으로 GPT 판단에 사용할 로우데이터가 부족할 수 있습니다. 로그를 확인해 주세요.")
 
     _safe_send_tg("\n".join(lines))
-
-
-# ─────────────────────────────
-# 메인 루프 (WS)
-# ─────────────────────────────
 
 
 def main() -> None:
@@ -919,57 +883,46 @@ def main() -> None:
     global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS, LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS
     global SIGTERM_DEADLINE_TS, _SIGTERM_DEADLINE_HANDLED, _SIGTERM_FORCE_CLOSE_ATTEMPTED
 
-    # 부팅 시 WS 설정 강제 검증
     _verify_ws_boot_configuration_or_die()
 
-    # WS 설정 로그로 남기기
     log(
         f"[BOOT] WS_ENABLED={getattr(SET, 'ws_enabled', True)} "
         f"WS_TF={getattr(SET, 'ws_subscribe_tfs', ['1m','5m','15m'])} "
         f"INTERVAL={SET.interval}"
     )
 
-    # REST 히스토리 백필 + 웹소켓 시세 수신 시작
     if getattr(SET, "ws_enabled", True):
         _backfill_ws_kline_history(SET.symbol)
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
 
-        # 데이터 헬스 모니터 시작
         from infra.data_health_monitor import start_health_monitor
         start_health_monitor()
 
-        # 부팅 직후 WS 버퍼 상태 진단(필수 TF 전부 확인)
         interruptible_sleep(2)
         for iv in ENTRY_REQUIRED_TFS:
             buf = ws_get_klines_with_volume(SET.symbol, iv, limit=5)
             buf_len = len(buf) if isinstance(buf, list) else 0
             log(f"[BOOT] WS buffer status: symbol={SET.symbol} interval={iv} len={buf_len}")
 
-        # EXIT 1m 캔들 기준 초기화
         last_1m = ws_get_klines_with_volume(SET.symbol, "1m", limit=1)
         if last_1m:
             LAST_EXIT_CANDLE_TS_1M = int(last_1m[0][0])
-            log(
-                f"[EXIT] INIT last 1m candle ts_ms={LAST_EXIT_CANDLE_TS_1M} "
-                "for candle-close based EXIT checks"
-            )
+            log(f"[EXIT] INIT last 1m candle ts_ms={LAST_EXIT_CANDLE_TS_1M} for candle-close based EXIT checks")
 
-    # 필수 자격정보 체크 (민감정보 자체는 로그/텔레그램에 출력하지 않음)
     if not SET.api_key or not SET.api_secret:
         msg = "❗ API 자격정보가 설정되어 있지 않습니다. 설정 후 재시작해 주세요."
         log(msg)
         _safe_send_tg(msg)
         return
 
-    # 시작 알림 및 주요 설정 로깅
     log(
         f"CONFIG: ENABLE_MARKET={getattr(SET, 'enable_market', True)}, "
         f"ENABLE_1M_CONFIRM={getattr(SET, 'enable_1m_confirm', False)}, "
         f"SYMBOL={SET.symbol}, INTERVAL={SET.interval}, "
-        f"LEVERAGE={SET.leverage}, RISK_PCT={SET.risk_pct}"
+        f"LEVERAGE={SET.leverage}, RISK_PCT={getattr(SET, 'risk_pct', None)}"
     )
-    # 레버리지/마진 모드 세팅 (실패 시 기본은 즉시 중단)
+
     try:
         set_leverage_and_mode(SET.symbol, SET.leverage, SET.isolated)
     except Exception as e:
@@ -984,22 +937,31 @@ def main() -> None:
 
     _safe_send_tg("✅ Binance USDT-M Futures 자동매매(WS 버전)를 시작합니다.")
 
-    # 보조 스레드들 시작 (Drive sync 제거: DB-only 운영)
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
     start_gpt_latency_reporter()
 
-    # 최초 거래소 포지션 동기화
-    OPEN_TRADES, _ = sync_open_trades_from_exchange(
-        SET.symbol,
-        replace=True,
-        current_trades=OPEN_TRADES,
-    )
+    OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     LAST_EXCHANGE_SYNC_TS = time.time()
 
-    # NEW: ENTRY 전략/엔진 초기화 (한 번만 생성)
     entry_strategy = GPTStrategy(SET)
     entry_exec_engine = ExecutionEngine(SET)
+
+    regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
+    account_builder = AccountStateBuilder(win_rate_window=20, min_trades_for_win_rate=5)
+
+    # 전액 배분형 정책: 상한은 1.0(전액)
+    risk_policy = RiskPhysicsPolicy(max_allocation=1.0)
+    risk_physics = RiskPhysicsEngine(policy=risk_policy)
+
+    CLOSED_TRADES_CACHE = deque(maxlen=50)
+    try:
+        boot_rows = _load_closed_trades_bootstrap(SET.symbol, limit=50)
+        for r in boot_rows:
+            CLOSED_TRADES_CACHE.append(r)
+    except Exception as e:
+        log(f"[WARN] account_state bootstrap failed: {type(e).__name__}: {e}")
+        CLOSED_TRADES_CACHE.clear()
 
     now_kst = datetime.datetime.now(KST)
     last_report_date_kst = now_kst.strftime("%Y-%m-%d")
@@ -1009,7 +971,6 @@ def main() -> None:
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
 
-    # 메인 루프 시작
     while RUNNING:
         try:
             METRICS["last_loop_ts"] = time.time()
@@ -1018,15 +979,10 @@ def main() -> None:
 
             now = time.time()
 
-            # ─────────────────────────────────────────────────────────────
-            # SIGTERM grace deadline 처리
-            # ─────────────────────────────────────────────────────────────
             if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS:
                 if not _SIGTERM_DEADLINE_HANDLED:
                     _SIGTERM_DEADLINE_HANDLED = True
-                    log(
-                        f"[SIGTERM] grace deadline reached (deadline_ts={SIGTERM_DEADLINE_TS}, now={now})"
-                    )
+                    log(f"[SIGTERM] grace deadline reached (deadline_ts={SIGTERM_DEADLINE_TS}, now={now})")
 
                     if OPEN_TRADES and not _SIGTERM_FORCE_CLOSE_ATTEMPTED:
                         _SIGTERM_FORCE_CLOSE_ATTEMPTED = True
@@ -1040,7 +996,6 @@ def main() -> None:
                             log(f"[SIGTERM][ERROR] force close failed: {e}")
                             log(traceback.format_exc())
 
-                    # 강제청산 시도 후(또는 포지션 없으면) 1회만 재동기화
                     try:
                         OPEN_TRADES, _ = sync_open_trades_from_exchange(
                             symbol=SET.symbol,
@@ -1060,7 +1015,6 @@ def main() -> None:
                 RUNNING = False
                 continue
 
-            # (a) 거래소 포지션 주기 동기화
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 OPEN_TRADES, _ = sync_open_trades_from_exchange(
                     SET.symbol,
@@ -1069,12 +1023,10 @@ def main() -> None:
                 )
                 LAST_EXCHANGE_SYNC_TS = now
 
-            # (b) 잔고 주기 로그
             if now - last_balance_log >= 60:
                 get_available_usdt()
                 last_balance_log = now
 
-            # (c) 자정(KST)마다 일일 정산 알림
             now_kst = datetime.datetime.now(KST)
             today_kst = now_kst.strftime("%Y-%m-%d")
             if now_kst.hour == 0 and now_kst.minute < 1 and last_report_date_kst != today_kst:
@@ -1088,15 +1040,10 @@ def main() -> None:
                 CONSEC_LOSSES = 0
                 last_report_date_kst = today_kst
 
-            # (c.5) 데이터 헬스 텔레그램 리포트
-            if (
-                DATA_HEALTH_TG_INTERVAL_SEC > 0
-                and now - LAST_DATA_HEALTH_TG_TS >= DATA_HEALTH_TG_INTERVAL_SEC
-            ):
+            if DATA_HEALTH_TG_INTERVAL_SEC > 0 and now - LAST_DATA_HEALTH_TG_TS >= DATA_HEALTH_TG_INTERVAL_SEC:
                 _send_data_health_report(SET.symbol)
                 LAST_DATA_HEALTH_TG_TS = now
 
-            # (d) 거래소 TP/SL 체결 확인 및 내부 포지션 리스트 정리
             if now - last_fill_check >= SET.poll_fills_sec:
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
                 for closed in closed_list:
@@ -1104,11 +1051,8 @@ def main() -> None:
                     reason: str = closed["reason"]
                     summary: Any = closed.get("summary")
 
-                    # STRICT: summary 누락 시 임의 폴백 금지.
                     if not isinstance(summary, dict) or not summary:
-                        log(
-                            f"[WARN] close summary missing/invalid -> requery once (symbol={t.symbol} reason={reason})"
-                        )
+                        log(f"[WARN] close summary missing/invalid -> requery once (symbol={t.symbol} reason={reason})")
                         reason2, summary2 = build_close_summary_strict(t)
                         if not isinstance(summary2, dict) or not summary2:
                             raise RuntimeError("close summary requery returned invalid")
@@ -1137,8 +1081,26 @@ def main() -> None:
                     else:
                         CONSEC_LOSSES = 0
 
-                    pnl_krw = pnl * KRW_RATE
+                    trade_id = getattr(t, "id", None)
+                    if not isinstance(trade_id, int) or trade_id <= 0:
+                        raise RuntimeError("closed trade missing valid trade.id (DB record mismatch)")
 
+                    exit_ts_dt = datetime.datetime.fromtimestamp(float(now), tz=datetime.timezone.utc)
+
+                    tp_pct_v = getattr(t, "tp_pct", None)
+                    sl_pct_v = getattr(t, "sl_pct", None)
+
+                    CLOSED_TRADES_CACHE.append(
+                        {
+                            "id": int(trade_id),
+                            "exit_ts": exit_ts_dt,
+                            "pnl_usdt": float(pnl),
+                            "tp_pct": None if tp_pct_v is None else float(tp_pct_v),
+                            "sl_pct": None if sl_pct_v is None else float(sl_pct_v),
+                        }
+                    )
+
+                    pnl_krw = pnl * KRW_RATE
                     if getattr(SET, "notify_on_close", True):
                         reason_ko = _translate_close_reason(reason)
                         side_ko = "롱" if str(t.side).upper() in ("BUY", "LONG") else "숏"
@@ -1168,10 +1130,8 @@ def main() -> None:
             if TRADER_STATE.should_stop_bot():
                 _safe_send_tg("🚫 TP/SL 재설정 실패 발생 (자동중지 기능 비활성화됨). 계속 진행합니다.")
 
-            # (e) 열린 포지션에 대한 실시간 대응 (1m 캔들 종가 기준 GPT EXIT)
             if OPEN_TRADES:
                 last_1m = ws_get_klines_with_volume(SET.symbol, "1m", limit=1)
-
                 if last_1m:
                     last_ts_ms = int(last_1m[0][0])
                     if LAST_EXIT_CANDLE_TS_1M is None:
@@ -1198,16 +1158,12 @@ def main() -> None:
                                 log(traceback.format_exc())
 
                 if OPEN_TRADES:
-                    if (
-                        getattr(SET, "unrealized_notify_enabled", False)
-                        and now - LAST_STATUS_TG_TS >= STATUS_TG_INTERVAL_SEC
-                    ):
+                    if getattr(SET, "unrealized_notify_enabled", False) and now - LAST_STATUS_TG_TS >= STATUS_TG_INTERVAL_SEC:
                         _send_open_positions_status(SET.symbol, STATUS_TG_INTERVAL_SEC)
                         LAST_STATUS_TG_TS = now
                     interruptible_sleep(1)
                     continue
 
-            # (f) 포지션이 없는 상태에서 안전 종료 요청이 들어온 경우
             if SAFE_STOP_REQUESTED and not OPEN_TRADES:
                 if SIGTERM_REQUESTED_AT is None:
                     _safe_send_tg("🛑 요청하신 대로 포지션을 모두 정리했고, 자동매매를 종료합니다.")
@@ -1215,34 +1171,23 @@ def main() -> None:
                     log("[SIGTERM] all positions are cleared; exiting")
                 return
 
-            # (g) 연속 손실 방어 로직
             if CONSEC_LOSSES >= 3:
                 _safe_send_tg(
-                    "⛔ 연속으로 3번 손실이 발생했습니다. "
-                    "설정된 휴식 시간 동안 새로 진입하지 않고 쉬었다가 다시 시작합니다."
+                    "⛔ 연속으로 3번 손실이 발생했습니다. 설정된 휴식 시간 동안 새로 진입하지 않고 쉬었다가 다시 시작합니다."
                 )
-                loss_cooldown_sec = int(
-                    getattr(
-                        SET,
-                        "cooldown_after_3loss",
-                        getattr(SET, "cooldown_after_consec_loss_sec", 10800),
-                    )
-                )
+                loss_cooldown_sec = int(getattr(SET, "cooldown_after_3loss", getattr(SET, "cooldown_after_consec_loss_sec", 10800)))
                 interruptible_sleep(loss_cooldown_sec)
                 CONSEC_LOSSES = 0
                 continue
 
-            # (h) 방금 닫은 직후라면 쿨다운
             if LAST_CLOSE_TS > 0 and (time.time() - LAST_CLOSE_TS) < SET.cooldown_after_close:
                 interruptible_sleep(1)
                 continue
 
-            # (h-1) 안전 종료 요청 상태에서는 EXIT 만 진행하고 새 진입은 막는다
             if SAFE_STOP_REQUESTED:
                 interruptible_sleep(1)
                 continue
 
-            # (i) NEW: 새 포지션 진입 시도 (STRICT 분리 구조)
             entry_cooldown_sec = getattr(SET, "entry_cooldown_sec", 20)
 
             if now - LAST_ENTRY_GPT_CALL_TS >= entry_cooldown_sec:
@@ -1255,10 +1200,113 @@ def main() -> None:
 
                 market_data = _build_entry_market_data(SET, LAST_CLOSE_TS)
                 if market_data is not None:
+                    mf = market_data.get("market_features")
+                    if not isinstance(mf, dict) or not mf:
+                        raise RuntimeError("market_features missing (STRICT)")
+
+                    eng = mf.get("engine_scores")
+                    if not isinstance(eng, dict) or not eng:
+                        raise RuntimeError("engine_scores missing (STRICT)")
+
+                    total = eng.get("total")
+                    if not isinstance(total, dict) or not total:
+                        raise RuntimeError("engine_scores.total missing (STRICT)")
+                    if "score" not in total:
+                        raise RuntimeError("engine_scores.total.score missing (STRICT)")
+
+                    regime_score = total["score"]
+                    regime_engine.update(regime_score)
+                    regime_decision = regime_engine.decide(regime_score)
+
+                    if regime_decision.allocation <= 0.0:
+                        msg = f"[SKIP][REGIME_NO_TRADE] score={regime_decision.score:.1f} band={regime_decision.band}"
+                        log(msg)
+                        _maybe_send_entry_block_tg("REGIME_NO_TRADE", msg, cooldown_sec=60)
+                        interruptible_sleep(1)
+                        continue
+
+                    equity_current_usdt = float(get_available_usdt())
+                    try:
+                        account_state = account_builder.build(
+                            symbol=market_data["symbol"],
+                            current_equity_usdt=equity_current_usdt,
+                            closed_trades=list(CLOSED_TRADES_CACHE),
+                        )
+                    except AccountStateNotReadyError as e:
+                        msg = f"[SKIP][ACCOUNT_NOT_READY] {e}"
+                        log(msg)
+                        _maybe_send_entry_block_tg("ACCOUNT_NOT_READY", msg, cooldown_sec=60)
+                        interruptible_sleep(1)
+                        continue
+
+                    if account_state.dd_pct >= 15.0:
+                        msg = f"[SKIP][DD_BLOCK] dd_pct={account_state.dd_pct:.2f}>=15"
+                        log(msg)
+                        _maybe_send_entry_block_tg("DD_BLOCK", msg, cooldown_sec=60)
+                        interruptible_sleep(1)
+                        continue
+
+                    if account_state.consecutive_losses >= 3:
+                        msg = f"[SKIP][CONSEC_BLOCK] consecutive_losses={account_state.consecutive_losses}>=3"
+                        log(msg)
+                        _maybe_send_entry_block_tg("CONSEC_BLOCK", msg, cooldown_sec=60)
+                        interruptible_sleep(1)
+                        continue
+
                     signal_obj = entry_strategy.decide(market_data)
                     LAST_ENTRY_GPT_CALL_TS = now
 
-                    trade = entry_exec_engine.execute(signal_obj)
+                    # 전액 배분형 RiskPhysics 호출( base_risk_pct 제거 )
+                    rp = risk_physics.decide(
+                        regime_allocation=float(regime_decision.allocation),
+                        dd_pct=float(account_state.dd_pct),
+                        consecutive_losses=int(account_state.consecutive_losses),
+                        tp_pct=float(signal_obj.tp_pct),
+                        sl_pct=float(signal_obj.sl_pct),
+                    )
+
+                    if rp.action_override == "STOP":
+                        SAFE_STOP_REQUESTED = True
+                        _safe_send_tg(
+                            "⛔ RiskPhysics STOP: DD 임계치 초과로 신규 진입을 중단합니다.\n"
+                            f"- dd_pct={account_state.dd_pct:.2f}\n"
+                            "포지션이 남아 있으면 정리 후 종료합니다."
+                        )
+                        interruptible_sleep(1)
+                        continue
+
+                    if rp.action_override == "SKIP":
+                        msg = f"[SKIP][RISK_PHYSICS] {rp.reason}"
+                        log(msg)
+                        _maybe_send_entry_block_tg("RISK_PHYSICS_SKIP", msg, cooldown_sec=60)
+                        interruptible_sleep(1)
+                        continue
+
+                    meta2 = dict(signal_obj.meta or {})
+                    meta2.update(
+                        {
+                            "regime_score": float(regime_decision.score),
+                            "regime_band": str(regime_decision.band),
+                            "regime_allocation": float(regime_decision.allocation),
+                            "dd_pct": float(account_state.dd_pct),
+                            "consecutive_losses": int(account_state.consecutive_losses),
+                            "risk_physics_reason": str(rp.reason),
+                            "dynamic_risk_pct": float(rp.effective_risk_pct),
+                        }
+                    )
+
+                    signal_final = Signal(
+                        action="ENTER",
+                        direction=signal_obj.direction,
+                        tp_pct=float(signal_obj.tp_pct),
+                        sl_pct=float(signal_obj.sl_pct),
+                        risk_pct=float(rp.effective_risk_pct),  # 전액 배분형: 1.0=전액
+                        reason=str(signal_obj.reason),
+                        guard_adjustments=dict(signal_obj.guard_adjustments or {}),
+                        meta=meta2,
+                    )
+
+                    trade = entry_exec_engine.execute(signal_final)
                     if trade:
                         OPEN_TRADES.append(trade)
                         LAST_STATUS_TG_TS = time.time()

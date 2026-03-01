@@ -9,6 +9,12 @@
 # - Invalid configuration must fail fast (ValueError/RuntimeError).
 # - Sensitive values (API key/secret) must never be logged.
 # - Python 3.11+
+#
+# PATCH NOTES — 2026-03-02
+# - Allocation Mode(전액 배분형) 도입:
+#   - 포지션 사이즈는 RiskPhysicsEngine(=allocation)에서 결정한다.
+#   - Settings.risk_pct는 "호환/참고용"으로만 남긴다(기본 1.0 권장).
+# - LEVERAGE 기본값을 1로 변경(전액 배분형 안전 전제).
 # =============================================================================
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -33,8 +40,6 @@ KST = timezone(timedelta(hours=9))
 # -----------------------------------------------------------------------------
 # Dataclasses
 # -----------------------------------------------------------------------------
-
-
 @dataclass(slots=True)
 class Settings:
     """Runtime settings for the trading engine (Binance USDT-M Futures)."""
@@ -42,30 +47,31 @@ class Settings:
     # Binance credentials (exchange_api.py expects these names)
     api_key: str = ""
     api_secret: str = ""
+
     # Core trading
     symbol: str = "BTCUSDT"
     interval: str = "5m"
 
     # Futures config
-    leverage: int = 1
-    # Legacy flag used across the repo (True -> ISOLATED, False -> CROSSED)
+    leverage: int = 1  # ✅ 전액 배분형 전제: 기본 1
     isolated: bool = True
-    # Normalized margin mode string ("ISOLATED" or "CROSSED")
     margin_mode: str = "ISOLATED"
-    # Position mode ("ONEWAY" or "HEDGE")
     futures_position_mode: str = "ONEWAY"
 
     # HTTP / signing
     recv_window_ms: int = 5000
     request_timeout_sec: int = 10
 
-    # Symbol filters (conservative placeholders; final precision is applied in order_executor)
+    # Symbol filters
     qty_step: float = 0.001
     min_qty: float = 0.001
     price_tick: float = 0.1
 
-    # Strategy / sizing (legacy)
-    risk_pct: float = 0.3
+    # Strategy / sizing
+    # ✅ 전액 배분형에서는 포지션 사이즈는 risk_physics_engine의 allocation이 결정한다.
+    #    risk_pct는 호환/참고용으로만 남긴다. (기본 1.0 권장)
+    risk_pct: float = 1.0
+
     tp_pct: float = 0.006
     sl_pct: float = 0.003
     max_sl_pct: float = 0.015
@@ -74,10 +80,10 @@ class Settings:
     # Entry/exit cadence
     entry_cooldown_sec: float = 1.0
     cooldown_after_close: float = 3.0
-    min_entry_score_for_gpt: float = 10
+    min_entry_score_for_gpt: float = 28
     gpt_entry_cooldown_sec: float = 10.0
 
-    # GPT safety
+    # GPT safety (legacy fields kept)
     gpt_daily_call_limit: int = 2000
     gpt_max_risk_pct: float = 0.02
     gpt_min_confidence: float = 0.6
@@ -147,19 +153,17 @@ class Settings:
     krw_per_usdt: float = 1400.0
 
     # Operations / runtime safety
-    # SIGTERM 수신 시 포지션 정리(Exit 루틴) 대기 시간. 데드라인 초과 시 강제 청산 시도 후 종료.
     sigterm_grace_sec: int = 30
-    # 레버리지/마진모드 설정 실패 시 기본은 "즉시 중단". True일 때만 경고 후 계속.
     allow_start_without_leverage_setup: bool = False
 
     # Exchange endpoints
     binance_futures_base: str = "https://fapi.binance.com"
 
-    # Legacy aliases (used by some modules)
+    # Legacy aliases
     binance_recv_window: int = 5000
     binance_http_timeout_sec: int = 10
 
-    # Hard risk guards (document requirements)
+    # Hard risk guards
     hard_daily_loss_limit_usdt: float = 0.0
     hard_consecutive_losses_limit: int = 0
     hard_position_value_pct_cap: float = 100.0
@@ -178,17 +182,13 @@ BotSettings = Settings
 @dataclass(slots=True)
 class PatternStrengthSettings:
     """Optional pattern-strength overrides used by pattern_detection."""
-
     pattern_strengths: Dict[str, float] = field(default_factory=dict)
 
 
 # -----------------------------------------------------------------------------
 # Optional .env loader (no external deps)
 # -----------------------------------------------------------------------------
-
-
 def _strip_inline_comment(s: str) -> str:
-    """Strip inline comments (#...) when not inside quotes."""
     out: list[str] = []
     in_single = False
     in_double = False
@@ -210,7 +210,6 @@ def _strip_inline_comment(s: str) -> str:
 
 
 def _unquote(v: str) -> str:
-    """Remove surrounding single/double quotes if present."""
     v = v.strip()
     if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
         return v[1:-1]
@@ -218,7 +217,6 @@ def _unquote(v: str) -> str:
 
 
 def _load_env_file_into_environ(dotenv_path: Path) -> None:
-    """Load .env into os.environ without overwriting existing keys."""
     try:
         text = dotenv_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -252,7 +250,6 @@ def _load_env_file_into_environ(dotenv_path: Path) -> None:
 
 
 def _try_load_local_dotenv() -> None:
-    """Optionally load a .env file from common project roots."""
     candidates: list[Path] = [Path.cwd() / ".env"]
 
     try:
@@ -276,8 +273,6 @@ def _try_load_local_dotenv() -> None:
 # -----------------------------------------------------------------------------
 # Type conversion helpers
 # -----------------------------------------------------------------------------
-
-
 def _get_env(key: str) -> Optional[str]:
     v = os.environ.get(key)
     if v is None:
@@ -342,8 +337,6 @@ def _as_csv_list(key: str, default: List[str]) -> List[str]:
 # -----------------------------------------------------------------------------
 # Validation
 # -----------------------------------------------------------------------------
-
-
 def _validate_settings(s: Settings) -> None:
     if not s.api_key or not s.api_secret:
         raise RuntimeError("missing Binance credentials (BINANCE_API_KEY / BINANCE_API_SECRET)")
@@ -379,6 +372,10 @@ def _validate_settings(s: Settings) -> None:
     if mm not in {"ISOLATED", "CROSSED"}:
         raise ValueError("margin_mode must be ISOLATED or CROSSED")
 
+    # 전액 배분형: risk_pct는 호환/참고용이므로 0~1 범위만 강제
+    if not (0.0 < float(s.risk_pct) <= 1.0):
+        raise ValueError("risk_pct must be within (0,1]")
+
     if s.hard_daily_loss_limit_usdt < 0:
         raise ValueError("hard_daily_loss_limit_usdt must be >= 0")
     if s.hard_consecutive_losses_limit < 0:
@@ -398,20 +395,18 @@ def _validate_settings(s: Settings) -> None:
 # -----------------------------------------------------------------------------
 # Public loader
 # -----------------------------------------------------------------------------
-
-
 def load_settings() -> Settings:
     """Load and validate Settings (env-first, optional .env, then defaults)."""
     _try_load_local_dotenv()
 
-    # Core env mappings
     api_key = _as_str("BINANCE_API_KEY", "")
     api_secret = _as_str("BINANCE_API_SECRET", "")
 
     symbol = _as_str("SYMBOL", "BTCUSDT").upper().replace("-", "")
     interval = _as_str("INTERVAL", "5m")
 
-    leverage = _as_int("LEVERAGE", 10)
+    # ✅ 전액 배분형: LEVERAGE 기본값 1
+    leverage = _as_int("LEVERAGE", 1)
 
     margin_mode = _as_str("MARGIN_MODE", "ISOLATED").upper()
     if margin_mode in {"CROSS", "CROSSED"}:
@@ -420,7 +415,6 @@ def load_settings() -> Settings:
         raise ValueError("MARGIN_MODE must be ISOLATED or CROSSED")
 
     isolated = margin_mode == "ISOLATED"
-
     futures_position_mode = _as_str("FUTURES_POSITION_MODE", "ONEWAY").upper()
 
     recv_window_ms = _as_int("RECV_WINDOW_MS", 5000)
@@ -430,8 +424,9 @@ def load_settings() -> Settings:
     min_qty = _as_float("MIN_QTY", 0.001)
     price_tick = _as_float("PRICE_TICK", 0.1)
 
-    # Legacy / strategy env mappings (optional)
-    risk_pct = _as_float("RISK_PCT", 0.3)
+    # ✅ 전액 배분형: RISK_PCT는 호환/참고용 (기본 1.0)
+    risk_pct = _as_float("RISK_PCT", 1.0)
+
     tp_pct = _as_float("TP_PCT", 0.006)
     sl_pct = _as_float("SL_PCT", 0.003)
 
@@ -441,8 +436,8 @@ def load_settings() -> Settings:
     entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 1.0)
     cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
 
-    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 10)
-    gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 1.0)
+    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 28)
+    gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 10.0)
 
     gpt_daily_call_limit = _as_int("GPT_DAILY_CALL_LIMIT", 2000)
     gpt_max_risk_pct = _as_float("GPT_MAX_RISK_PCT", 0.02)
@@ -466,10 +461,7 @@ def load_settings() -> Settings:
 
     ws_enabled = _as_bool("WS_ENABLED", True)
     ws_base = _as_str("BINANCE_FUTURES_WS_BASE", "wss://fstream.binance.com/ws")
-    ws_combined_base = _as_str(
-        "BINANCE_FUTURES_WS_COMBINED_BASE",
-        "wss://fstream.binance.com/stream?streams=",
-    )
+    ws_combined_base = _as_str("BINANCE_FUTURES_WS_COMBINED_BASE", "wss://fstream.binance.com/stream?streams=")
 
     ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
@@ -482,7 +474,6 @@ def load_settings() -> Settings:
     ws_log_interval_sec = _as_int("WS_LOG_INTERVAL_SEC", 60)
     ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
 
-    # Guards (optional)
     max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0008)
     max_spread_abs = _as_float("MAX_SPREAD_ABS", 0.0)
     min_entry_volume_ratio = _as_float("MIN_ENTRY_VOLUME_RATIO", 0.3)
@@ -511,23 +502,18 @@ def load_settings() -> Settings:
     signal_analysis_interval_sec = _as_int("SIGNAL_ANALYSIS_INTERVAL_SEC", 60)
     krw_per_usdt = _as_float("KRW_PER_USDT", 1400.0)
 
-    # Operations / runtime safety
     sigterm_grace_sec = _as_int("SIGTERM_GRACE_SEC", 30)
-    allow_start_without_leverage_setup = _as_bool(
-        "ALLOW_START_WITHOUT_LEVERAGE_SETUP", False
-    )
+    allow_start_without_leverage_setup = _as_bool("ALLOW_START_WITHOUT_LEVERAGE_SETUP", False)
 
     binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
     binance_recv_window = recv_window_ms
     binance_http_timeout_sec = request_timeout_sec
 
-    # Hard risk guards
     hard_daily_loss_limit_usdt = _as_float("HARD_DAILY_LOSS_LIMIT_USDT", 0.0)
     hard_consecutive_losses_limit = _as_int("HARD_CONSECUTIVE_LOSSES_LIMIT", 0)
     hard_position_value_pct_cap = _as_float("HARD_POSITION_VALUE_PCT_CAP", 100.0)
     hard_liquidation_distance_pct_min = _as_float("HARD_LIQUIDATION_DISTANCE_PCT_MIN", 0.0)
 
-    # Slippage / protection
     slippage_block_pct = _as_float("SLIPPAGE_BLOCK_PCT", 0.3)
     slippage_stop_engine = _as_bool("SLIPPAGE_STOP_ENGINE", False)
     protection_mode_enabled = _as_bool("PROTECTION_MODE_ENABLED", True)
@@ -601,7 +587,6 @@ def load_settings() -> Settings:
         data_health_notify_sec=data_health_notify_sec,
         signal_analysis_interval_sec=signal_analysis_interval_sec,
         krw_per_usdt=krw_per_usdt,
-
         sigterm_grace_sec=sigterm_grace_sec,
         allow_start_without_leverage_setup=allow_start_without_leverage_setup,
         binance_futures_base=binance_futures_base,
@@ -617,5 +602,4 @@ def load_settings() -> Settings:
     )
 
     _validate_settings(s)
-
     return s
