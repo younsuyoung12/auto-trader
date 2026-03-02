@@ -3,99 +3,102 @@
 FILE: state/trader_state.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
-설계 원칙:
-- in-memory 트레이드 상태(Trade)와 거래소 포지션 상태를 동기화한다.
-- 예외를 삼키지 않는다. 데이터/거래소 응답 이상은 즉시 예외로 전파한다.
-- 폴백 금지: WS 가격/포지션 정보가 없으면 임의 추정/조용한 return을 하지 않는다.
-- 민감정보(API키/토큰/DB비번 등)는 출력/로그에 포함하지 않는다.
 
-PATCH NOTES — 2026-03-02
---------------------------------------------------------
-- (9점대 핵심) 청산 요약을 orderId 기반으로 확정(STRICT)
-  - TP/SL orderId가 있으면: /fapi/v1/order status=FILLED + userTrades(orderId)로 요약
-  - TP/SL이 없거나 비정상 케이스(수동/강제청산)인 경우:
-    * userTrades를 orderId 단위로 그룹핑하여 "유일하게" trade.qty를 만족하는 orderId만 허용
-    * 후보가 0개/2개 이상이면 즉시 예외 (추정/폴백 금지)
-- (9점대 기반) 부분청산(partial close) 감지 및 in-memory 상태 업데이트(STRICT)
-  - positionAmt 감소(delta_qty)를 userTrades(시간창)로 검증하여
-    delta_qty 정합 시에만 remaining_qty / realized_pnl_usdt 업데이트
-  - 정합 실패 시 즉시 예외 (폴백 금지)
-- Trade dataclass에 운영형 실행/복구 필드 확장(레거시 호환 유지)
-  - tp/sl/entry order ids, exchange_position_side, remaining_qty, realized_pnl_usdt,
-    reconciliation_status, last_synced_at, close_order_id
+역할
+- in-memory Trade 상태와 거래소 포지션 상태를 동기화한다.
+- “청산/부분청산”을 거래소 확정 데이터로만 판정하고, DB에 영속화한다.
+
+핵심 원칙 (STRICT)
+- 예외를 삼키지 않는다.
+- 폴백 금지:
+  - 누락/모호/정합 실패 시 즉시 예외
+  - “첫 번째 row 선택”, “0이면 qty로 대체”, “시간 없으면 임의로 보정” 같은 추정 금지
+- 민감정보(API키/토큰/DB비번 등) 로그/출력 금지
+
+PATCH NOTES — 2026-03-02 (PATCH)
+- (상태머신 연동) Trade.lifecycle_state 추가 및 check_closes에서 상태 검증/전이 적용
+  - ENTERED 상태만 close-check 허용
+  - 완전 청산 감지 시 SYNC_SET_CLOSED 전이
+- (NO-FALLBACK 강화)
+  - Trade.remaining_qty / last_synced_at / exchange_position_side 필수화(0/None 자동 보정 제거)
+  - positionRisk row 선택 시 “첫 row 폴백” 제거(유효 후보 없으면 즉시 예외)
+  - partial close reconciliation window 생성 시 start_ms 폴백 제거(유효하지 않으면 즉시 예외)
+- (9점대 핵심) 청산 요약 orderId 확정(STRICT)
+  - TP/SL orderId가 있으면 FILLED + userTrades(orderId)로 요약
+  - 그 외 케이스는 userTrades를 orderId로 그룹핑하여 “유일” 후보만 허용
 ========================================================
 """
 
 from __future__ import annotations
 
-import os
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution.exchange_api import fetch_open_positions, req
-from infra.market_data_ws import get_klines_with_volume
+from execution.exceptions import OrderFailed, StateViolation, SyncMismatch
+from execution.state_machine import TradeEvent, TradeLifecycleState, apply_event, get_state
 from infra.telelog import log, send_tg
 from settings import load_settings
-
-# ✅ DB close + exit snapshot (DB 스키마: exit_ts/exit_price/pnl_usdt)
-from state.db_writer import (
-    close_latest_open_trade_returning_id,
-    record_trade_exit_snapshot,
-)
+from state.db_writer import close_latest_open_trade_returning_id, record_trade_exit_snapshot
 
 SET = load_settings()
 
+
 # ─────────────────────────────────────────────────────────────
-# Basic strict helpers
+# Strict helpers
 # ─────────────────────────────────────────────────────────────
 def _require_nonempty_str(v: Any, name: str) -> str:
     s = str(v or "").strip()
     if not s:
-        raise RuntimeError(f"{name} is required")
+        raise OrderFailed(f"{name} is required (STRICT)")
     return s
 
 
 def _require_float(v: Any, name: str) -> float:
     if v is None:
-        raise RuntimeError(f"{name} is required")
+        raise OrderFailed(f"{name} is required (STRICT)")
     if isinstance(v, bool):
-        raise RuntimeError(f"{name} must be numeric (bool not allowed)")
+        raise OrderFailed(f"{name} must be numeric (bool not allowed) (STRICT)")
     try:
         f = float(v)
     except Exception as e:
-        raise RuntimeError(f"{name} must be numeric: {e}") from e
+        raise OrderFailed(f"{name} must be numeric: {e} (STRICT)") from e
     if not math.isfinite(f):
-        raise RuntimeError(f"{name} must be finite")
-    return f
+        raise OrderFailed(f"{name} must be finite (STRICT)")
+    return float(f)
 
 
 def _get_env_required_float(name: str) -> float:
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
-        raise RuntimeError(f"required env var missing: {name}")
+        raise OrderFailed(f"required env var missing: {name} (STRICT)")
     try:
-        return float(raw)
+        v = float(raw)
     except Exception as e:
-        raise RuntimeError(f"invalid env var {name}: {e}") from e
+        raise OrderFailed(f"invalid env var {name}: {e} (STRICT)") from e
+    if not math.isfinite(v):
+        raise OrderFailed(f"invalid env var {name}: not finite (STRICT)")
+    return float(v)
 
 
 def _epoch_ms_to_dt_utc(ms: int) -> datetime:
     if not isinstance(ms, int) or ms <= 0:
-        raise RuntimeError("epoch ms must be int > 0")
+        raise OrderFailed("epoch ms must be int > 0 (STRICT)")
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
 
 
 def _dt_to_epoch_ms_utc(dt: datetime) -> int:
     if not isinstance(dt, datetime):
-        raise RuntimeError("dt must be datetime")
+        raise OrderFailed("dt must be datetime (STRICT)")
     if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-        raise RuntimeError("dt must be timezone-aware")
+        raise OrderFailed("dt must be timezone-aware (STRICT)")
     ms = int(dt.timestamp() * 1000)
     if ms <= 0:
-        raise RuntimeError("dt timestamp invalid")
+        raise OrderFailed("dt timestamp invalid (STRICT)")
     return ms
 
 
@@ -103,22 +106,8 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _get_last_ws_price_strict(symbol: str) -> float:
-    sym = _require_nonempty_str(symbol, "symbol")
-    kl = get_klines_with_volume(sym, "1m", limit=1)
-    if not kl:
-        raise RuntimeError(f"no 1m candle in WS buffer: symbol={sym}")
-    try:
-        close_price = float(kl[0][4])  # [ts, o, h, l, c, v]
-    except Exception as e:
-        raise RuntimeError(f"invalid 1m candle format: {e}") from e
-    if close_price <= 0:
-        raise RuntimeError(f"invalid 1m close price: {close_price}")
-    return close_price
-
-
 # ─────────────────────────────────────────────────────────────
-# Trade dataclass (in-memory)
+# Trade (in-memory)
 # ─────────────────────────────────────────────────────────────
 @dataclass
 class Trade:
@@ -133,82 +122,96 @@ class Trade:
     sl_price: float = 0.0
     ts: float = 0.0
 
-    # 주문 ID (운영형: DB에도 저장됨)
     entry_order_id: Optional[str] = None
     tp_order_id: Optional[str] = None
     sl_order_id: Optional[str] = None
-
-    # 수동/강제 청산의 close order 추적용(있으면 사용)
     close_order_id: Optional[str] = None
 
-    # 클라이언트 ID (선택)
     client_entry_id: Optional[str] = None
-
-    # DB trade_id (있으면 사용 가능)
     id: int = 0
 
     # legacy alias
     entry: float = 0.0
 
-    # 상태 (in-memory)
+    # lifecycle (상태머신)
+    lifecycle_state: TradeLifecycleState = TradeLifecycleState.ENTERED
+    last_state_change_reason: str = ""
+    last_state_change_at: Optional[datetime] = None
+
+    # close state
     is_open: bool = True
     close_reason: str = ""
     close_ts: float = 0.0
 
-    # 운영형 실행/복구 필드(부분청산/재시작 정합용)
-    exchange_position_side: str = "BOTH"
-    remaining_qty: float = 0.0
-    realized_pnl_usdt: float = 0.0
+    # 운영형 실행/복구 필드 (STRICT: 기본값 자동 보정 금지)
+    exchange_position_side: str = ""  # BOTH / LONG / SHORT (필수)
+    remaining_qty: float = 0.0        # 필수(>0)
+    realized_pnl_usdt: float = 0.0    # 필수(초기 0 가능, 음수 가능)
     reconciliation_status: str = "INIT"
-    last_synced_at: Optional[datetime] = None
+    last_synced_at: Optional[datetime] = None  # 필수(tz-aware)
 
     def __post_init__(self) -> None:
-        if self.entry_price > 0 and self.entry == 0:
-            self.entry = self.entry_price
-        if self.entry > 0 and self.entry_price == 0:
-            self.entry_price = self.entry
+        self.symbol = _require_nonempty_str(self.symbol, "trade.symbol").upper()
 
-        if self.qty <= 0:
-            raise RuntimeError("trade.qty must be > 0 (STRICT)")
-        if self.entry_price <= 0:
-            raise RuntimeError("trade.entry_price must be > 0 (STRICT)")
+        if self.qty <= 0 or not math.isfinite(float(self.qty)):
+            raise OrderFailed("trade.qty must be finite > 0 (STRICT)")
+        if self.entry_price <= 0 or not math.isfinite(float(self.entry_price)):
+            raise OrderFailed("trade.entry_price must be finite > 0 (STRICT)")
         if int(self.leverage) < 1:
-            raise RuntimeError("trade.leverage must be >= 1 (STRICT)")
+            raise OrderFailed("trade.leverage must be >= 1 (STRICT)")
 
-        # remaining_qty는 기본적으로 qty로 초기화
-        if self.remaining_qty == 0.0:
-            self.remaining_qty = float(self.qty)
+        # legacy alias sync (허용)
+        if self.entry_price > 0 and self.entry == 0:
+            self.entry = float(self.entry_price)
+        if self.entry > 0 and self.entry_price == 0:
+            self.entry_price = float(self.entry)
 
-        if self.last_synced_at is None:
-            self.last_synced_at = _utc_now()
-
-        ps = str(self.exchange_position_side or "").upper().strip() or "BOTH"
+        ps = str(self.exchange_position_side or "").upper().strip()
         if ps not in ("BOTH", "LONG", "SHORT"):
-            raise RuntimeError(f"invalid exchange_position_side: {ps!r}")
+            raise OrderFailed(f"trade.exchange_position_side must be BOTH/LONG/SHORT (STRICT), got={ps!r}")
         self.exchange_position_side = ps
 
+        if self.remaining_qty <= 0 or not math.isfinite(float(self.remaining_qty)):
+            raise OrderFailed("trade.remaining_qty must be finite > 0 (STRICT)")
+        if float(self.remaining_qty) - float(self.qty) > 1e-12:
+            raise OrderFailed("trade.remaining_qty must be <= trade.qty (STRICT)")
+
+        if not math.isfinite(float(self.realized_pnl_usdt)):
+            raise OrderFailed("trade.realized_pnl_usdt must be finite (STRICT)")
+
+        if self.last_synced_at is None:
+            raise OrderFailed("trade.last_synced_at is required (STRICT)")
+        if self.last_synced_at.tzinfo is None or self.last_synced_at.tzinfo.utcoffset(self.last_synced_at) is None:
+            raise OrderFailed("trade.last_synced_at must be timezone-aware (STRICT)")
+
+        # 상태머신: 열린 트레이드는 ENTERED여야 한다.
+        st = get_state(self)
+        if self.is_open and st != TradeLifecycleState.ENTERED:
+            raise StateViolation(f"open Trade must be ENTERED, got {st.value}")
+
     def calculate_pnl(self, current_price: float) -> float:
-        cp = float(current_price)
-        if self.entry_price <= 0:
-            raise RuntimeError("entry_price must be > 0 to calculate pnl")
-        side_u = str(self.side).upper()
+        cp = _require_float(current_price, "current_price")
+        side_u = str(self.side).upper().strip()
         if side_u in ("BUY", "LONG"):
-            return (cp - self.entry_price) * float(self.qty)
-        return (self.entry_price - cp) * float(self.qty)
+            return (cp - float(self.entry_price)) * float(self.qty)
+        if side_u in ("SELL", "SHORT"):
+            return (float(self.entry_price) - cp) * float(self.qty)
+        raise OrderFailed(f"invalid trade.side: {side_u!r} (STRICT)")
 
     def calculate_pnl_pct(self, current_price: float) -> float:
-        cp = float(current_price)
-        if self.entry_price <= 0:
-            raise RuntimeError("entry_price must be > 0 to calculate pnl_pct")
-        side_u = str(self.side).upper()
+        cp = _require_float(current_price, "current_price")
+        ep = float(self.entry_price)
+        if ep <= 0:
+            raise OrderFailed("entry_price must be > 0 (STRICT)")
+        side_u = str(self.side).upper().strip()
         if side_u in ("BUY", "LONG"):
-            return (cp - self.entry_price) / self.entry_price * 100.0
-        return (self.entry_price - cp) / self.entry_price * 100.0
+            return (cp - ep) / ep * 100.0
+        if side_u in ("SELL", "SHORT"):
+            return (ep - cp) / ep * 100.0
+        raise OrderFailed(f"invalid trade.side: {side_u!r} (STRICT)")
 
 
 class TraderState:
-    """TP/SL 재설정 실패 횟수 등 런타임 상태 관리."""
-
     def __init__(self) -> None:
         self.tp_sl_reset_failures: int = 0
 
@@ -232,7 +235,7 @@ class TraderState:
 
 
 # ─────────────────────────────────────────────────────────────
-# Slippage checks (legacy 유지)
+# Slippage (legacy 유지)
 # ─────────────────────────────────────────────────────────────
 def evaluate_slippage(
     expected_entry: float,
@@ -241,15 +244,14 @@ def evaluate_slippage(
     max_ticks: Optional[int] = None,
     max_notional_pct: Optional[float] = None,
 ) -> Tuple[bool, str]:
-    """진입 슬리피지 평가."""
     exp = _require_float(expected_entry, "expected_entry")
     act = _require_float(actual_entry, "actual_entry")
 
     if tick_size is None:
-        raise RuntimeError("tick_size is required (symbol filter)")
+        raise OrderFailed("tick_size is required (symbol filter) (STRICT)")
     tick = _require_float(tick_size, "tick_size")
     if tick <= 0:
-        raise RuntimeError("tick_size must be > 0")
+        raise OrderFailed("tick_size must be > 0 (STRICT)")
 
     if max_ticks is None:
         mt = getattr(SET, "slippage_max_ticks", None)
@@ -260,15 +262,15 @@ def evaluate_slippage(
         max_notional_pct = float(mnp) if mnp is not None else float(_get_env_required_float("SLIPPAGE_MAX_NOTIONAL_PCT"))
 
     if max_ticks <= 0:
-        raise RuntimeError("max_ticks must be > 0")
+        raise OrderFailed("max_ticks must be > 0 (STRICT)")
     if max_notional_pct <= 0:
-        raise RuntimeError("max_notional_pct must be > 0")
+        raise OrderFailed("max_notional_pct must be > 0 (STRICT)")
 
     diff = abs(act - exp)
     ticks = int(diff / tick)
 
     if exp <= 0:
-        raise RuntimeError("expected_entry must be > 0")
+        raise OrderFailed("expected_entry must be > 0 (STRICT)")
 
     notional_pct = (diff / exp) * 100.0
 
@@ -283,10 +285,9 @@ def evaluate_slippage(
 
 
 def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
-    """진입 직후 1회 슬리피지 체크."""
     from execution.order_executor import close_position_market, get_symbol_filters
 
-    sym = _require_nonempty_str(trade.symbol, "trade.symbol")
+    sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
     expected_entry = _require_float(entry_price, "entry_price")
 
     filters = get_symbol_filters(sym)
@@ -295,43 +296,34 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
     if hasattr(filters, "tick_size"):
         tick_size_val = getattr(filters, "tick_size")
     elif isinstance(filters, dict):
-        tick_size_val = filters.get("tickSize")
-        if tick_size_val is None:
-            tick_size_val = filters.get("tick_size")
+        tick_size_val = filters.get("tickSize") or filters.get("tick_size")
 
     if tick_size_val is None:
-        raise RuntimeError(f"tick_size not found in symbol filters: symbol={sym}")
+        raise OrderFailed(f"tick_size not found in symbol filters: symbol={sym} (STRICT)")
 
     tick_size = _require_float(tick_size_val, "tick_size")
     if tick_size <= 0:
-        raise RuntimeError(f"tick_size must be > 0: symbol={sym}, value={tick_size}")
+        raise OrderFailed(f"tick_size must be > 0: symbol={sym}, value={tick_size} (STRICT)")
 
     max_ticks = getattr(SET, "slippage_max_ticks", None)
-    if max_ticks is None:
-        max_ticks = int(_get_env_required_float("SLIPPAGE_MAX_TICKS"))
-    else:
-        max_ticks = int(max_ticks)
+    max_ticks = int(max_ticks) if max_ticks is not None else int(_get_env_required_float("SLIPPAGE_MAX_TICKS"))
 
     max_notional_pct = getattr(SET, "slippage_max_notional_pct", None)
-    if max_notional_pct is None:
-        max_notional_pct = float(_get_env_required_float("SLIPPAGE_MAX_NOTIONAL_PCT"))
-    else:
-        max_notional_pct = float(max_notional_pct)
+    max_notional_pct = float(max_notional_pct) if max_notional_pct is not None else float(_get_env_required_float("SLIPPAGE_MAX_NOTIONAL_PCT"))
 
     stop_on_heavy = bool(int(os.getenv("STOP_ON_HEAVY_SLIPPAGE", "0")))
 
     positions = fetch_open_positions(sym)
     if not isinstance(positions, list):
-        raise RuntimeError("fetch_open_positions returned non-list")
+        raise OrderFailed("fetch_open_positions returned non-list (STRICT)")
 
     pos = None
     for p in positions:
         if str(p.get("symbol", "")).upper() == sym.upper():
             pos = p
             break
-
     if pos is None:
-        raise RuntimeError(f"open position not found for slippage check: symbol={sym}")
+        raise OrderFailed(f"open position not found for slippage check: symbol={sym} (STRICT)")
 
     actual_entry_raw = pos.get("entryPrice") or pos.get("avgEntryPrice") or pos.get("entry_price")
     actual_entry = _require_float(actual_entry_raw, "actual_entry_price")
@@ -343,7 +335,6 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
         max_ticks=max_ticks,
         max_notional_pct=max_notional_pct,
     )
-
     if ok:
         return True
 
@@ -363,7 +354,6 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
             side_u = "BUY"
         elif side_u == "SHORT":
             side_u = "SELL"
-
         send_tg("🛑 설정(STOP_ON_HEAVY_SLIPPAGE=1)에 따라 즉시 시장가로 포지션을 정리합니다.")
         close_position_market(symbol=sym, side=side_u, qty=float(trade.qty))
 
@@ -371,48 +361,45 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# Close summary (STRICT · NO-FALLBACK)
+# Close summary (STRICT)
 # ─────────────────────────────────────────────────────────────
-class CloseSummaryError(RuntimeError):
+class CloseSummaryError(SyncMismatch):
     """거래소 확정값으로 청산 요약을 만들 수 없을 때 발생."""
 
 
 def _float_strict(v: Any, name: str) -> float:
     if v is None:
-        raise CloseSummaryError(f"{name} is required")
+        raise CloseSummaryError(f"{name} is required (STRICT)")
     if isinstance(v, bool):
-        raise CloseSummaryError(f"{name} must be numeric (bool not allowed)")
+        raise CloseSummaryError(f"{name} must be numeric (bool not allowed) (STRICT)")
     try:
         f = float(v)
     except Exception as e:
-        raise CloseSummaryError(f"{name} must be numeric: {e}") from e
+        raise CloseSummaryError(f"{name} must be numeric: {e} (STRICT)") from e
     if not math.isfinite(f):
-        raise CloseSummaryError(f"{name} must be finite")
-    return f
+        raise CloseSummaryError(f"{name} must be finite (STRICT)")
+    return float(f)
 
 
 def _int_strict(v: Any, name: str) -> int:
     if v is None:
-        raise CloseSummaryError(f"{name} is required")
+        raise CloseSummaryError(f"{name} is required (STRICT)")
     if isinstance(v, bool):
-        raise CloseSummaryError(f"{name} must be int (bool not allowed)")
+        raise CloseSummaryError(f"{name} must be int (bool not allowed) (STRICT)")
     try:
         return int(v)
     except Exception as e:
-        raise CloseSummaryError(f"{name} must be int: {e}") from e
+        raise CloseSummaryError(f"{name} must be int: {e} (STRICT)") from e
 
 
 def _fetch_position_risk_rows_strict(symbol: str) -> List[Dict[str, Any]]:
     sym = _require_nonempty_str(symbol, "symbol").upper()
     data = req("GET", "/fapi/v2/positionRisk", params={"symbol": sym}, private=True)
     if not isinstance(data, list):
-        raise CloseSummaryError("positionRisk response must be list")
-    out: List[Dict[str, Any]] = []
-    for r in data:
-        if isinstance(r, dict) and str(r.get("symbol") or "").upper() == sym:
-            out.append(r)
+        raise CloseSummaryError("positionRisk response must be list (STRICT)")
+    out: List[Dict[str, Any]] = [r for r in data if isinstance(r, dict) and str(r.get("symbol") or "").upper() == sym]
     if not out:
-        raise CloseSummaryError("positionRisk returned empty")
+        raise CloseSummaryError("positionRisk returned empty (STRICT)")
     return out
 
 
@@ -422,11 +409,10 @@ def _trade_direction_strict(trade: Trade) -> str:
         return "LONG"
     if side in ("SELL", "SHORT"):
         return "SHORT"
-    raise CloseSummaryError(f"invalid trade.side: {side!r}")
+    raise CloseSummaryError(f"invalid trade.side: {side!r} (STRICT)")
 
 
 def _trade_entry_side_db(trade: Trade) -> str:
-    """bt_trades.side는 BUY/SELL로 저장."""
     side = str(trade.side or "").upper().strip()
     if side in ("BUY", "SELL"):
         return side
@@ -434,7 +420,7 @@ def _trade_entry_side_db(trade: Trade) -> str:
         return "BUY"
     if side == "SHORT":
         return "SELL"
-    raise CloseSummaryError(f"invalid trade.side: {side!r}")
+    raise CloseSummaryError(f"invalid trade.side: {side!r} (STRICT)")
 
 
 def _close_side_for_trade(trade: Trade) -> str:
@@ -443,22 +429,28 @@ def _close_side_for_trade(trade: Trade) -> str:
         return "SELL"
     if side_u in ("SELL", "SHORT"):
         return "BUY"
-    raise CloseSummaryError(f"invalid trade.side: {side_u!r}")
+    raise CloseSummaryError(f"invalid trade.side: {side_u!r} (STRICT)")
 
 
 def _pick_position_row_for_trade(rows: List[Dict[str, Any]], trade: Trade) -> Dict[str, Any]:
-    wanted = _trade_direction_strict(trade)
-    for r in rows:
-        ps = str(r.get("positionSide") or "").upper()
-        if ps == wanted:
-            return r
-    for r in rows:
-        ps = str(r.get("positionSide") or "").upper()
-        if ps in ("BOTH", ""):
-            return r
     if not rows:
-        raise CloseSummaryError("positionRisk rows empty")
-    return rows[0]
+        raise CloseSummaryError("positionRisk rows empty (STRICT)")
+
+    wanted = _trade_direction_strict(trade)
+
+    matches = [r for r in rows if str(r.get("positionSide") or "").upper() == wanted]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise CloseSummaryError("multiple positionRisk rows match positionSide (ambiguous) (STRICT)")
+
+    both = [r for r in rows if str(r.get("positionSide") or "").upper() in ("BOTH", "")]
+    if len(both) == 1:
+        return both[0]
+    if len(both) > 1:
+        raise CloseSummaryError("multiple positionRisk rows for BOTH (ambiguous) (STRICT)")
+
+    raise CloseSummaryError("cannot select positionRisk row for trade (STRICT)")
 
 
 def _fetch_order_strict(symbol: str, order_id: str) -> Dict[str, Any]:
@@ -466,16 +458,16 @@ def _fetch_order_strict(symbol: str, order_id: str) -> Dict[str, Any]:
     oid = _int_strict(order_id, "order_id")
     data = req("GET", "/fapi/v1/order", params={"symbol": sym, "orderId": oid}, private=True)
     if not isinstance(data, dict):
-        raise CloseSummaryError("order response must be dict")
+        raise CloseSummaryError("order response must be dict (STRICT)")
     return data
 
 
 def _fetch_user_trades_strict(symbol: str, *, start_ms: int, end_ms: int, limit: int = 1000) -> List[Dict[str, Any]]:
     sym = _require_nonempty_str(symbol, "symbol").upper()
     if start_ms <= 0 or end_ms <= 0 or end_ms < start_ms:
-        raise CloseSummaryError("invalid userTrades time range")
+        raise CloseSummaryError("invalid userTrades time range (STRICT)")
     if not isinstance(limit, int) or limit <= 0 or limit > 1000:
-        raise CloseSummaryError("userTrades limit must be int in [1, 1000]")
+        raise CloseSummaryError("userTrades limit must be int in [1, 1000] (STRICT)")
 
     data = req(
         "GET",
@@ -484,7 +476,7 @@ def _fetch_user_trades_strict(symbol: str, *, start_ms: int, end_ms: int, limit:
         private=True,
     )
     if not isinstance(data, list):
-        raise CloseSummaryError("userTrades response must be list")
+        raise CloseSummaryError("userTrades response must be list (STRICT)")
     return [r for r in data if isinstance(r, dict)]
 
 
@@ -499,10 +491,7 @@ def _summarize_user_trades_for_order(trades: List[Dict[str, Any]], *, order_id: 
         oid = r.get("orderId")
         if oid is None:
             continue
-        try:
-            if int(oid) != int(order_id):
-                continue
-        except Exception:
+        if int(oid) != int(order_id):
             continue
 
         qty = _float_strict(r.get("qty"), "userTrade.qty")
@@ -511,14 +500,11 @@ def _summarize_user_trades_for_order(trades: List[Dict[str, Any]], *, order_id: 
         commission = _float_strict(r.get("commission"), "userTrade.commission")
         commission_asset = str(r.get("commissionAsset") or "").upper()
 
-        t_ms = None
-        try:
-            t_ms = int(r.get("time")) if r.get("time") is not None else None
-        except Exception:
-            t_ms = None
+        t_ms = r.get("time")
+        t_ms_i = int(t_ms) if t_ms is not None else None
 
         if qty <= 0 or price <= 0:
-            raise CloseSummaryError("userTrade.qty/price must be > 0")
+            raise CloseSummaryError("userTrade.qty/price must be > 0 (STRICT)")
 
         qty_sum += qty
         px_qty_sum += price * qty
@@ -526,16 +512,16 @@ def _summarize_user_trades_for_order(trades: List[Dict[str, Any]], *, order_id: 
         if commission_asset == "USDT":
             fee_usdt_sum += commission
 
-        if t_ms is not None:
-            if last_time_ms is None or t_ms > last_time_ms:
-                last_time_ms = t_ms
+        if t_ms_i is not None:
+            if last_time_ms is None or t_ms_i > last_time_ms:
+                last_time_ms = t_ms_i
 
     if qty_sum <= 0:
-        raise CloseSummaryError("no fills for orderId")
+        raise CloseSummaryError("no fills for orderId (STRICT)")
 
     avg_price = px_qty_sum / qty_sum
     if avg_price <= 0 or not math.isfinite(avg_price):
-        raise CloseSummaryError("avg_price invalid")
+        raise CloseSummaryError("avg_price invalid (STRICT)")
 
     pnl_net = realized_sum - fee_usdt_sum
     out: Dict[str, Any] = {
@@ -559,11 +545,7 @@ def _group_user_trades_by_order_id(trades: List[Dict[str, Any]], *, side: str) -
         oid = r.get("orderId")
         if oid is None:
             continue
-        try:
-            oi = int(oid)
-        except Exception:
-            raise CloseSummaryError("userTrade.orderId must be int")
-        out.setdefault(oi, []).append(r)
+        out.setdefault(int(oid), []).append(r)
     return out
 
 
@@ -574,27 +556,21 @@ def _infer_unique_close_order_id_strict(
     expected_qty: float,
     tolerance_ratio: float,
 ) -> Tuple[int, Dict[str, Any]]:
-    """
-    STRICT:
-    - userTrades를 orderId 단위로 그룹핑한 뒤,
-      "expected_qty를 유일하게 만족하는" orderId만 허용한다.
-    - 후보 0개/2개 이상이면 즉시 예외 (추정/폴백 금지)
-    """
     close_side = _close_side_for_trade(trade)
     groups = _group_user_trades_by_order_id(trades_window, side=close_side)
 
     if expected_qty <= 0 or not math.isfinite(expected_qty):
-        raise CloseSummaryError("expected_qty invalid")
+        raise CloseSummaryError("expected_qty invalid (STRICT)")
+
+    if tolerance_ratio <= 0 or not math.isfinite(tolerance_ratio):
+        raise CloseSummaryError("tolerance_ratio must be finite > 0 (STRICT)")
 
     tol = abs(expected_qty) * float(tolerance_ratio)
     if tol <= 0:
-        tol = abs(expected_qty) * 0.01  # 최소 1% (단, ratio=0인 경우를 방지)
-    if tol <= 0:
-        raise CloseSummaryError("tolerance invalid")
+        raise CloseSummaryError("tolerance invalid (STRICT)")
 
     candidates: List[Tuple[int, Dict[str, Any]]] = []
-    for oid, rows in groups.items():
-        # orderId 단위 요약
+    for oid in groups.keys():
         summary = _summarize_user_trades_for_order(trades_window, order_id=int(oid))
         qty = _float_strict(summary.get("qty"), "summary.qty")
         if abs(qty - expected_qty) <= tol:
@@ -603,8 +579,8 @@ def _infer_unique_close_order_id_strict(
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) == 0:
-        raise CloseSummaryError("cannot infer close orderId uniquely (no candidates)")
-    raise CloseSummaryError("cannot infer close orderId uniquely (multiple candidates)")
+        raise CloseSummaryError("cannot infer close orderId uniquely (no candidates) (STRICT)")
+    raise CloseSummaryError("cannot infer close orderId uniquely (multiple candidates) (STRICT)")
 
 
 def build_close_summary_strict(
@@ -613,24 +589,18 @@ def build_close_summary_strict(
     now_ms: Optional[int] = None,
     lookback_sec: int = 6 * 3600,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    STRICT:
-    - TP/SL 또는 close_order_id 기반으로 청산을 확정한다.
-    - TP/SL이 없고 close_order_id도 없을 경우:
-      userTrades를 orderId 단위로 그룹핑하여 trade.qty를 유일하게 만족하는 orderId만 허용한다.
-    - 유일성/정합성 실패 시 즉시 예외 (폴백 금지)
-    """
     sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     if now_ms <= 0:
-        raise CloseSummaryError("now_ms invalid")
+        raise CloseSummaryError("now_ms invalid (STRICT)")
+    if lookback_sec <= 0:
+        raise CloseSummaryError("lookback_sec must be > 0 (STRICT)")
 
     tp_id = str(trade.tp_order_id or "").strip()
     sl_id = str(trade.sl_order_id or "").strip()
     close_id = str(trade.close_order_id or "").strip()
 
-    # 1) TP/SL FILLED 체크
     filled: List[Tuple[str, Dict[str, Any]]] = []
     for oid in (tp_id, sl_id):
         if not oid:
@@ -640,21 +610,17 @@ def build_close_summary_strict(
         if status == "FILLED":
             filled.append((oid, o))
 
-    close_oid: Optional[str] = None
-    close_order: Optional[Dict[str, Any]] = None
     if len(filled) == 1:
         close_oid, close_order = filled[0]
         reason = "TP" if close_oid == tp_id else "SL"
-        # order updateTime 근처로 userTrades(orderId) 집계
+
         close_time_ms = None
         for k in ("updateTime", "time", "transactTime"):
             if close_order.get(k) is not None:
-                try:
-                    close_time_ms = int(close_order.get(k))
-                    break
-                except Exception:
-                    close_time_ms = None
-        if close_time_ms is None:
+                close_time_ms = int(close_order.get(k))
+                break
+        if close_time_ms is None or close_time_ms <= 0:
+            # 거래소가 시간을 주지 않으면 “감지 시각(now_ms)”를 기록한다(추정값이 아니라 관측 시각).
             close_time_ms = now_ms
 
         win_ms = 2 * 3600 * 1000
@@ -665,24 +631,20 @@ def build_close_summary_strict(
         return reason, summary
 
     if len(filled) > 1:
-        raise CloseSummaryError("multiple close orders FILLED (ambiguous)")
+        raise CloseSummaryError("multiple close orders FILLED (ambiguous) (STRICT)")
 
-    # 2) close_order_id가 있으면 그것으로 확정
     if close_id:
         o = _fetch_order_strict(sym, close_id)
         status = str(o.get("status") or "").upper()
         if status != "FILLED":
-            raise CloseSummaryError(f"close_order_id present but not FILLED (status={status})")
+            raise CloseSummaryError(f"close_order_id present but not FILLED (status={status}) (STRICT)")
 
         close_time_ms = None
         for k in ("updateTime", "time", "transactTime"):
             if o.get(k) is not None:
-                try:
-                    close_time_ms = int(o.get(k))
-                    break
-                except Exception:
-                    close_time_ms = None
-        if close_time_ms is None:
+                close_time_ms = int(o.get(k))
+                break
+        if close_time_ms is None or close_time_ms <= 0:
             close_time_ms = now_ms
 
         win_ms = 2 * 3600 * 1000
@@ -692,11 +654,7 @@ def build_close_summary_strict(
         summary = _summarize_user_trades_for_order(user_trades, order_id=_int_strict(close_id, "close_order_id"))
         return "MANUAL", summary
 
-    # 3) 마지막 수단: userTrades를 orderId로 그룹핑하여 "유일" 후보만 허용
     expected_qty = _float_strict(trade.qty, "trade.qty")
-    if expected_qty <= 0:
-        raise CloseSummaryError("trade.qty must be > 0")
-
     start_ms = max(1, now_ms - int(lookback_sec * 1000))
     end_ms = now_ms
     user_trades = _fetch_user_trades_strict(sym, start_ms=start_ms, end_ms=end_ms)
@@ -705,41 +663,37 @@ def build_close_summary_strict(
         trade,
         user_trades,
         expected_qty=float(expected_qty),
-        tolerance_ratio=0.01,  # 1% 허용
+        tolerance_ratio=0.01,
     )
-    # close_order_id를 메모리에 기록(호출부에서 DB에 반영할지는 별도)
     trade.close_order_id = str(oid)
     return "MANUAL", summary
 
 
 def _calc_pnl_pct_futures(trade: Trade, pnl_usdt: float) -> Optional[float]:
-    try:
-        entry_price = float(trade.entry_price)
-        qty = float(trade.qty)
-        if entry_price <= 0 or qty <= 0:
-            return None
-        notional = abs(entry_price * qty)
-        if notional <= 0:
-            return None
-        return float(pnl_usdt) / notional * 100.0
-    except Exception:
+    entry_price = float(trade.entry_price)
+    qty = float(trade.qty)
+    if entry_price <= 0 or qty <= 0:
         return None
+    notional = abs(entry_price * qty)
+    if notional <= 0:
+        return None
+    return float(pnl_usdt) / notional * 100.0
 
 
 def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str, Any]) -> int:
     sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
-    entry_side_db = _trade_entry_side_db(trade)  # BUY/SELL
+    entry_side_db = _trade_entry_side_db(trade)
 
     if not isinstance(summary, dict):
-        raise CloseSummaryError("summary must be dict")
+        raise CloseSummaryError("summary must be dict (STRICT)")
     for k in ("avg_price", "pnl"):
         if k not in summary:
-            raise CloseSummaryError(f"summary missing required key: {k}")
+            raise CloseSummaryError(f"summary missing required key: {k} (STRICT)")
 
     exit_price = _float_strict(summary.get("avg_price"), "summary.avg_price")
     pnl_usdt = _float_strict(summary.get("pnl"), "summary.pnl")
     if exit_price <= 0:
-        raise CloseSummaryError("summary.avg_price must be > 0")
+        raise CloseSummaryError("summary.avg_price must be > 0 (STRICT)")
 
     close_time_ms = summary.get("close_time")
     if close_time_ms is not None:
@@ -750,7 +704,6 @@ def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str,
     close_reason = _require_nonempty_str(reason, "reason")[:32]
     pnl_pct_futures = _calc_pnl_pct_futures(trade, pnl_usdt)
 
-    # STRICT: 단일 심볼 단일 오픈 트레이드 전제에서만 안전
     trade_id = close_latest_open_trade_returning_id(
         symbol=sym,
         side=entry_side_db,
@@ -780,9 +733,6 @@ def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str,
     return int(trade_id)
 
 
-# ─────────────────────────────────────────────────────────────
-# Partial close reconciliation (STRICT)
-# ─────────────────────────────────────────────────────────────
 def _strict_reconcile_partial_close(
     trade: Trade,
     *,
@@ -791,14 +741,8 @@ def _strict_reconcile_partial_close(
     start_ms: int,
     end_ms: int,
 ) -> float:
-    """
-    STRICT:
-    - delta_qty(감소한 수량)와 userTrades(반대 사이드 체결)의 합이 1% 이내로 일치해야 한다.
-    - 일치하면 해당 구간의 realizedPnl - fee(USDT) 를 반환한다.
-    - 정합 실패 시 즉시 예외(폴백 금지)
-    """
     if delta_qty <= 0 or not math.isfinite(delta_qty):
-        raise CloseSummaryError("delta_qty invalid")
+        raise CloseSummaryError("delta_qty invalid (STRICT)")
 
     trades_window = _fetch_user_trades_strict(symbol, start_ms=start_ms, end_ms=end_ms)
     close_side = _close_side_for_trade(trade)
@@ -817,20 +761,20 @@ def _strict_reconcile_partial_close(
         commission_asset = str(r.get("commissionAsset") or "").upper()
 
         if qty <= 0:
-            raise CloseSummaryError("userTrade.qty must be > 0")
+            raise CloseSummaryError("userTrade.qty must be > 0 (STRICT)")
 
         qty_sum += qty
         realized_sum += realized
         if commission_asset == "USDT":
             fee_usdt_sum += commission
 
-    tol = max(delta_qty * 0.01, 1e-12)  # 1% 허용
+    tol = max(delta_qty * 0.01, 1e-12)
     if abs(qty_sum - delta_qty) > tol:
-        raise CloseSummaryError(f"partial close qty mismatch: expected_delta={delta_qty}, got={qty_sum}")
+        raise CloseSummaryError(f"partial close qty mismatch: expected_delta={delta_qty}, got={qty_sum} (STRICT)")
 
     pnl_delta = realized_sum - fee_usdt_sum
     if not math.isfinite(pnl_delta):
-        raise CloseSummaryError("partial pnl_delta not finite")
+        raise CloseSummaryError("partial pnl_delta not finite (STRICT)")
     return float(pnl_delta)
 
 
@@ -843,43 +787,40 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
     if not open_trades:
         return [], []
 
-    # STRICT: DB close_latest_open_trade_returning_id 사용 중이면,
-    # 다중 트레이드(같은 심볼)에서는 닫을 대상이 뒤섞일 수 있다 → 즉시 금지.
     if len(open_trades) != 1:
-        raise RuntimeError("STRICT: multiple open_trades is not supported (single-trade only)")
+        raise StateViolation("STRICT: multiple open_trades is not supported (single-trade only)")
 
     t = open_trades[0]
+
+    # 상태머신: ENTERED만 허용
+    if get_state(t) != TradeLifecycleState.ENTERED:
+        raise StateViolation(f"check_closes requires ENTERED state, got {get_state(t).value}")
+
     symbol = _require_nonempty_str(t.symbol, "open_trades[0].symbol").upper()
 
     pos_rows = _fetch_position_risk_rows_strict(symbol)
     row = _pick_position_row_for_trade(pos_rows, t)
+
     pos_qty = _float_strict(row.get("positionAmt"), "positionRisk.positionAmt")
-
     abs_qty = abs(pos_qty)
-    remaining: List[Trade] = []
-    closed: List[Dict[str, Any]] = []
 
-    # 부분청산 감지: remaining_qty 감소(포지션이 아직 남아있을 때)
+    eps = 1e-12
+
     prev_remaining = _require_float(t.remaining_qty, "trade.remaining_qty")
     if prev_remaining <= 0:
-        prev_remaining = float(t.qty)
+        raise CloseSummaryError("trade.remaining_qty must be > 0 (STRICT)")
 
-    # 포지션이 열려 있는데 수량이 감소한 경우(부분청산)
-    eps = 1e-12
+    # 부분청산: 포지션이 남아있는데 수량이 줄었다
     if abs_qty > eps and abs_qty < prev_remaining - eps:
         delta = prev_remaining - abs_qty
 
-        # STRICT: userTrades로 delta 정합 검증
-        now_dt = _utc_now()
-        now_ms = _dt_to_epoch_ms_utc(now_dt)
-
-        # last_synced_at 기준으로 구간 생성(±2초 완충). 완충은 폴백이 아니라 "관측 지연" 흡수용.
         if t.last_synced_at is None:
             raise CloseSummaryError("trade.last_synced_at is required for partial reconciliation (STRICT)")
         start_ms = _dt_to_epoch_ms_utc(t.last_synced_at) - 2000
-        end_ms = now_ms + 2000
+        now_dt = _utc_now()
+        end_ms = _dt_to_epoch_ms_utc(now_dt) + 2000
         if start_ms <= 0:
-            start_ms = max(1, now_ms - 10_000)
+            raise CloseSummaryError("partial reconciliation start_ms invalid (STRICT)")
 
         pnl_delta = _strict_reconcile_partial_close(
             t,
@@ -899,22 +840,18 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
             f"delta={delta:.6f} remaining={t.remaining_qty:.6f} pnl_delta={pnl_delta:.4f} pnl_total={t.realized_pnl_usdt:.4f}"
         )
 
-        remaining.append(t)
-        return remaining, closed
+        return [t], []
 
-    # 완전 청산 감지
+    # 완전 청산: positionAmt = 0
     if abs_qty < eps:
         reason, summary = build_close_summary_strict(t)
-
-        if not isinstance(summary, dict):
-            raise CloseSummaryError("summary must be dict")
-        for k in ("qty", "avg_price", "pnl"):
-            if k not in summary:
-                raise CloseSummaryError(f"summary missing required key: {k}")
 
         trade_id = _persist_close_to_db_strict(trade=t, reason=str(reason), summary=summary)
         if t.id <= 0:
             t.id = int(trade_id)
+
+        # 상태 전이 (SYNC 기반 확정)
+        apply_event(t, TradeEvent.SYNC_SET_CLOSED, reason="exchange_position_zero")
 
         t.is_open = False
         t.close_reason = str(reason)
@@ -923,12 +860,10 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
         t.reconciliation_status = "CLOSED_OK"
         t.last_synced_at = _utc_now()
 
-        closed.append({"trade": t, "reason": reason, "summary": summary})
-        return [], closed
+        return [], [{"trade": t, "reason": reason, "summary": summary}]
 
-    # 변화 없음(열려있음)
-    remaining.append(t)
-    return remaining, closed
+    # 변화 없음
+    return [t], []
 
 
 __all__ = [

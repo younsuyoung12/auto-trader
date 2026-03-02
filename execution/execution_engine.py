@@ -4,17 +4,28 @@ FILE: execution/execution_engine.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 
+역할
+- strategy.Signal을 받아 “실행”만 한다.
+- 가드(수동/볼륨/점프/스프레드/하드리스크) → 주문 실행 → DB 영속화 → 알림
+- 폴백 금지: 누락/불일치/모호성은 즉시 예외
+
+핵심 원칙
+- 예외 삼키기 금지(단, 상태 기록 목적의 catch 후 즉시 재-raise는 허용)
+- “SKIP”은 정상 흐름(리스크/가드에 의해 실행하지 않는 결정)으로 처리한다.
+- “ENTER”는 필요한 메타/필드가 1개라도 없으면 즉시 중단한다.
+
 PATCH NOTES — 2026-03-02 (PATCH)
 - bt_trade_snapshots에 DD 영속화 저장:
   - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 를 STRICT로 요구
   - record_trade_snapshot에 위 3개 값을 저장
-- (9점대 기반) deterministic entry_client_order_id 생성/주입:
+- deterministic entry_client_order_id 생성/주입:
   - 동일 signal 재시도 시 동일 newClientOrderId로 중복 진입 방지
-- (9점대 기반) bt_trades 실행/복구 필드 영속화(STRICT):
+- bt_trades 실행/복구 필드 영속화(STRICT):
   - entry_order_id / tp_order_id / sl_order_id
   - exchange_position_side / remaining_qty / realized_pnl_usdt
   - reconciliation_status / last_synced_at
   - 필수 값 누락 시 즉시 예외(폴백 금지)
+- (아키텍처) exceptions/state_machine 도입에 맞춰 예외 타입을 정리
 ========================================================
 """
 
@@ -45,6 +56,9 @@ from state.db_writer import (
     record_trade_snapshot,
 )
 
+# 표준 예외(운영 시 원인 분류용)
+from execution.exceptions import OrderFailed, RiskRejected  # SyncMismatch는 sync_exchange에서 주로 사용
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,10 +71,8 @@ TEST_FORCE_ENTER: bool = _env_bool("TEST_FORCE_ENTER", "0")
 TEST_BYPASS_GUARDS: bool = _env_bool("TEST_BYPASS_GUARDS", "0")
 TEST_DRY_RUN: bool = _env_bool("TEST_DRY_RUN", "0")
 
-try:
-    TEST_FAKE_AVAILABLE_USDT: float = float(os.getenv("TEST_FAKE_AVAILABLE_USDT", "0") or 0)
-except Exception:
-    TEST_FAKE_AVAILABLE_USDT = 0.0
+TEST_FAKE_AVAILABLE_USDT_RAW = os.getenv("TEST_FAKE_AVAILABLE_USDT", "0")
+TEST_FAKE_AVAILABLE_USDT: float = float(TEST_FAKE_AVAILABLE_USDT_RAW) if TEST_FAKE_AVAILABLE_USDT_RAW else 0.0
 
 if TEST_BYPASS_GUARDS and not TEST_DRY_RUN:
     raise RuntimeError("TEST_BYPASS_GUARDS is only allowed with TEST_DRY_RUN=1")
@@ -75,10 +87,16 @@ if any([TEST_FORCE_ENTER, TEST_BYPASS_GUARDS, TEST_DRY_RUN, TEST_FAKE_AVAILABLE_
     )
 
 
-def _as_float(value: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+def _as_float(
+    value: Any,
+    name: str,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number (bool not allowed)")
     try:
-        if isinstance(value, bool):
-            raise TypeError("bool is not allowed")
         v = float(value)
     except Exception as e:
         raise ValueError(f"{name} must be a number") from e
@@ -94,46 +112,44 @@ def _as_float(value: Any, name: str, *, min_value: Optional[float] = None, max_v
     return v
 
 
-def _opt_float(value: Any) -> Optional[float]:
+def _opt_float_strict(value: Any, name: str) -> Optional[float]:
+    """
+    STRICT optional:
+    - None이면 None
+    - 값이 있으면 반드시 float 변환 가능 + finite, 아니면 예외
+    """
     if value is None:
         return None
-    try:
-        if isinstance(value, bool):
-            return None
-        v = float(value)
-    except Exception:
-        return None
-    if not math.isfinite(v):
-        return None
-    return v
+    v = _as_float(value, name)
+    return float(v)
 
 
 def _require_meta_equity(meta: Dict[str, Any]) -> tuple[float, float, float]:
     """
     STRICT:
     - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 필수
-    - 값은 finite
+    - 값은 finite, >0, dd는 0~100
     """
     if "equity_current_usdt" not in meta:
-        raise RuntimeError("signal.meta['equity_current_usdt'] is required for snapshot")
+        raise OrderFailed("signal.meta['equity_current_usdt'] is required (STRICT)")
     if "equity_peak_usdt" not in meta:
-        raise RuntimeError("signal.meta['equity_peak_usdt'] is required for snapshot")
+        raise OrderFailed("signal.meta['equity_peak_usdt'] is required (STRICT)")
     if "dd_pct" not in meta:
-        raise RuntimeError("signal.meta['dd_pct'] is required for snapshot")
+        raise OrderFailed("signal.meta['dd_pct'] is required (STRICT)")
 
     eq_cur = _as_float(meta.get("equity_current_usdt"), "meta.equity_current_usdt", min_value=0.0)
     eq_peak = _as_float(meta.get("equity_peak_usdt"), "meta.equity_peak_usdt", min_value=0.0)
     dd = _as_float(meta.get("dd_pct"), "meta.dd_pct", min_value=0.0, max_value=100.0)
 
     if eq_cur <= 0 or eq_peak <= 0:
-        raise RuntimeError("meta equity values must be > 0 (STRICT)")
+        raise OrderFailed("meta equity values must be > 0 (STRICT)")
     return float(eq_cur), float(eq_peak), float(dd)
 
 
 def _deterministic_entry_client_order_id(symbol: str, direction: str, signal_ts_ms: int) -> str:
     """
     STRICT:
-    - 동일 signal(심볼/방향/ts) 재시도 시 동일 newClientOrderId가 생성되어 중복 진입을 차단한다.
+    - 동일 signal(심볼/방향/ts) 재시도 시 동일 newClientOrderId 생성 → 중복 진입 차단
     - ASCII, <=36 chars
     """
     sym = str(symbol).upper().strip()
@@ -146,25 +162,30 @@ def _deterministic_entry_client_order_id(symbol: str, direction: str, signal_ts_
         raise ValueError("signal_ts_ms must be int > 0")
 
     d = "L" if dir_u == "LONG" else "S"
-    # ent-<sym8>-<d>-<ts>  (<= 4 + 8 + 1 + 1 + 13 = 27)
     sym8 = sym[:8]
     cid = f"ent-{sym8}-{d}-{signal_ts_ms}"
     if len(cid) > 36:
         cid = cid[:36]
-    # ASCII 보장(심볼은 A-Z0-9 가정이지만 STRICT로 한번 더 체크)
+
     try:
         cid.encode("ascii")
-    except UnicodeEncodeError:
-        raise ValueError("generated client order id must be ASCII")
+    except UnicodeEncodeError as e:
+        raise ValueError("generated client order id must be ASCII") from e
+
     if not cid or len(cid) > 36:
         raise ValueError("generated client order id invalid")
+
     return cid
 
 
-def _require_trade_exec_fields(trade: Any, *, soft_mode: bool) -> Tuple[str, Optional[str], Optional[str], str, float, float]:
+def _require_trade_exec_fields(
+    trade: Any,
+    *,
+    soft_mode: bool,
+) -> Tuple[str, Optional[str], Optional[str], str, float, float]:
     """
     STRICT:
-    - 9점대 운영을 위해 bt_trades 실행/복구 필드가 반드시 존재해야 한다.
+    - bt_trades 실행/복구 필드가 trade 객체에 존재해야 한다.
     - 누락 시 즉시 예외(폴백 금지)
     """
     entry_order_id = getattr(trade, "entry_order_id", None)
@@ -172,40 +193,41 @@ def _require_trade_exec_fields(trade: Any, *, soft_mode: bool) -> Tuple[str, Opt
     sl_order_id = getattr(trade, "sl_order_id", None)
 
     if not isinstance(entry_order_id, str) or not entry_order_id.strip():
-        raise RuntimeError("trade.entry_order_id is required (STRICT)")
+        raise OrderFailed("trade.entry_order_id is required (STRICT)")
 
     if tp_order_id is not None and (not isinstance(tp_order_id, str) or not tp_order_id.strip()):
-        raise RuntimeError("trade.tp_order_id must be str or None (STRICT)")
-    if sl_order_id is not None and (not isinstance(sl_order_id, str) or not sl_order_id.strip()):
-        raise RuntimeError("trade.sl_order_id must be str or None (STRICT)")
+        raise OrderFailed("trade.tp_order_id must be str or None (STRICT)")
 
-    # soft_mode=False면 SL은 반드시 존재해야 한다(안전)
+    if sl_order_id is not None and (not isinstance(sl_order_id, str) or not sl_order_id.strip()):
+        raise OrderFailed("trade.sl_order_id must be str or None (STRICT)")
+
     if not bool(soft_mode):
         if not isinstance(sl_order_id, str) or not sl_order_id.strip():
-            raise RuntimeError("soft_mode=False but trade.sl_order_id is missing (STRICT)")
+            raise OrderFailed("soft_mode=False but trade.sl_order_id is missing (STRICT)")
 
     exchange_position_side = getattr(trade, "exchange_position_side", None)
-    if exchange_position_side is None:
-        exchange_position_side = "BOTH"
     if not isinstance(exchange_position_side, str) or not exchange_position_side.strip():
-        raise RuntimeError("trade.exchange_position_side must be non-empty str (STRICT)")
+        raise OrderFailed("trade.exchange_position_side is required (STRICT)")
     exchange_position_side = exchange_position_side.strip().upper()
 
     remaining_qty = getattr(trade, "remaining_qty", None)
     if remaining_qty is None:
-        # order_executor가 남겨줘야 한다. 없으면 구조 미완성.
-        raise RuntimeError("trade.remaining_qty is required (STRICT)")
+        raise OrderFailed("trade.remaining_qty is required (STRICT)")
     remaining_qty_f = _as_float(remaining_qty, "trade.remaining_qty", min_value=0.0)
 
     realized_pnl_usdt = getattr(trade, "realized_pnl_usdt", None)
     if realized_pnl_usdt is None:
-        # 초기값은 0이어야 한다.
-        raise RuntimeError("trade.realized_pnl_usdt is required (STRICT)")
-    realized_pnl_usdt_f = _as_float(realized_pnl_usdt, "trade.realized_pnl_usdt", min_value=0.0)
+        raise OrderFailed("trade.realized_pnl_usdt is required (STRICT)")
+    realized_pnl_usdt_f = _as_float(realized_pnl_usdt, "trade.realized_pnl_usdt")
 
-    return entry_order_id.strip(), (tp_order_id.strip() if isinstance(tp_order_id, str) else None), (
-        sl_order_id.strip() if isinstance(sl_order_id, str) else None
-    ), exchange_position_side, float(remaining_qty_f), float(realized_pnl_usdt_f)
+    return (
+        entry_order_id.strip(),
+        (tp_order_id.strip() if isinstance(tp_order_id, str) else None),
+        (sl_order_id.strip() if isinstance(sl_order_id, str) else None),
+        exchange_position_side,
+        float(remaining_qty_f),
+        float(realized_pnl_usdt_f),
+    )
 
 
 class _SettingsView:
@@ -228,16 +250,16 @@ class _SettingsView:
 
 def _build_guard_settings_view(settings: Any, guard_adjustments: Dict[str, float]) -> _SettingsView:
     if guard_adjustments is None:
-        raise RuntimeError("guard_adjustments must not be None")
+        raise OrderFailed("guard_adjustments must not be None (STRICT)")
     if not isinstance(guard_adjustments, dict):
-        raise RuntimeError("guard_adjustments must be dict")
+        raise OrderFailed("guard_adjustments must be dict (STRICT)")
 
     overrides: Dict[str, float] = {}
     for k, v in guard_adjustments.items():
         if not isinstance(k, str) or not k.strip():
             raise ValueError("guard_adjustments key must be non-empty str")
         if not hasattr(settings, k):
-            raise RuntimeError(f"guard_adjustments contains unknown settings key: {k}")
+            raise OrderFailed(f"guard_adjustments contains unknown settings key: {k}")
         overrides[k] = _as_float(v, f"guard_adjustments.{k}", min_value=0.0)
 
     return _SettingsView(settings, overrides)
@@ -248,7 +270,7 @@ def _resolve_guard_adjustments(signal: Signal) -> Dict[str, float]:
     if ga is None:
         return {}
     if not isinstance(ga, dict):
-        raise RuntimeError("signal.guard_adjustments must be dict or None")
+        raise OrderFailed("signal.guard_adjustments must be dict or None (STRICT)")
     return dict(ga)
 
 
@@ -282,26 +304,26 @@ class ExecutionEngine:
 
         meta = signal.meta
         if not isinstance(meta, dict):
-            raise RuntimeError("signal.meta must be dict")
+            raise OrderFailed("signal.meta must be dict (STRICT)")
 
         symbol = meta.get("symbol")
         if not isinstance(symbol, str) or not symbol.strip():
-            raise RuntimeError("signal.meta['symbol'] is required")
+            raise OrderFailed("signal.meta['symbol'] is required (STRICT)")
         symbol = symbol.strip().upper()
 
         regime = meta.get("regime")
         if not isinstance(regime, str) or not regime.strip():
-            raise RuntimeError("signal.meta['regime'] is required")
+            raise OrderFailed("signal.meta['regime'] is required (STRICT)")
         regime = regime.strip()
 
         signal_source = meta.get("signal_source")
         if not isinstance(signal_source, str) or not signal_source.strip():
-            raise RuntimeError("signal.meta['signal_source'] is required")
+            raise OrderFailed("signal.meta['signal_source'] is required (STRICT)")
         signal_source = signal_source.strip()
 
         signal_ts_ms = meta.get("signal_ts_ms")
         if not isinstance(signal_ts_ms, int) or signal_ts_ms <= 0:
-            raise RuntimeError("signal.meta['signal_ts_ms'] must be int > 0")
+            raise OrderFailed("signal.meta['signal_ts_ms'] must be int > 0 (STRICT)")
 
         direction = str(signal.direction).upper().strip()
         if direction not in ("LONG", "SHORT"):
@@ -323,19 +345,19 @@ class ExecutionEngine:
 
         last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
         if last_price <= 0:
-            raise RuntimeError("meta.last_price must be > 0")
+            raise OrderFailed("meta.last_price must be > 0 (STRICT)")
 
         candles_5m = meta.get("candles_5m")
         candles_5m_raw = meta.get("candles_5m_raw")
         extra = meta.get("extra")
         if extra is not None and not isinstance(extra, dict):
-            raise RuntimeError("meta.extra must be dict or None")
+            raise OrderFailed("meta.extra must be dict or None (STRICT)")
 
         dyn_alloc = _resolve_dynamic_allocation(meta)
         if dyn_alloc is not None:
             sig_alloc = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
             if abs(dyn_alloc - sig_alloc) > 1e-12:
-                raise RuntimeError(f"dynamic_allocation mismatch: meta={dyn_alloc} != signal={sig_alloc}")
+                raise OrderFailed(f"dynamic_allocation mismatch: meta={dyn_alloc} != signal={sig_alloc} (STRICT)")
 
         manual_ok = check_manual_position_guard(
             get_balance_detail_func=get_balance_detail,
@@ -370,7 +392,7 @@ class ExecutionEngine:
                 source="execution_engine.balance",
                 side=direction,
                 reason="balance_zero_or_invalid",
-                extra={"available_usdt": avail_usdt},
+                extra={"available_usdt": avail_usdt, "ts_ms": signal_ts_ms},
             )
             send_skip_tg(msg)
             return None
@@ -382,7 +404,7 @@ class ExecutionEngine:
         guard_settings = _build_guard_settings_view(self.settings, guard_adjustments)
 
         if candles_5m_raw is None:
-            raise RuntimeError("meta.candles_5m_raw is required for volume guard")
+            raise OrderFailed("meta.candles_5m_raw is required for volume guard (STRICT)")
 
         vol_ok = check_volume_guard(
             settings=guard_settings,
@@ -407,7 +429,7 @@ class ExecutionEngine:
                 return None
 
         if candles_5m is None:
-            raise RuntimeError("meta.candles_5m is required for price jump guard")
+            raise OrderFailed("meta.candles_5m is required for price jump guard (STRICT)")
 
         price_ok = check_price_jump_guard(
             settings=guard_settings,
@@ -466,7 +488,7 @@ class ExecutionEngine:
                 entry_price_hint = ba if direction == "LONG" else bb
 
         if price_for_qty <= 0:
-            raise RuntimeError("price_for_qty must be > 0")
+            raise OrderFailed("price_for_qty must be > 0 (STRICT)")
 
         spread_pct_snapshot: Optional[float] = None
         if best_bid is not None and best_ask is not None:
@@ -477,7 +499,11 @@ class ExecutionEngine:
                 if mid > 0:
                     spread_pct_snapshot = (ba - bb) / mid
 
-        slippage_block_pct = _as_float(getattr(self.settings, "slippage_block_pct"), "settings.slippage_block_pct", min_value=0.0)
+        slippage_block_pct = _as_float(
+            getattr(self.settings, "slippage_block_pct"),
+            "settings.slippage_block_pct",
+            min_value=0.0,
+        )
         slippage_stop_engine = bool(getattr(self.settings, "slippage_stop_engine"))
 
         if slippage_block_pct > 0:
@@ -491,11 +517,11 @@ class ExecutionEngine:
                     source="execution_engine.slippage",
                     side=direction,
                     reason="slippage_block",
-                    extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct},
+                    extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct, "ts_ms": signal_ts_ms},
                 )
                 send_skip_tg(msg)
                 if slippage_stop_engine:
-                    raise RuntimeError("slippage_block triggered and slippage_stop_engine=True")
+                    raise OrderFailed("slippage_block triggered and slippage_stop_engine=True (STRICT)")
                 if not TEST_BYPASS_GUARDS:
                     return None
 
@@ -506,22 +532,24 @@ class ExecutionEngine:
         sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0)
 
         if allocation_ratio <= 0:
-            raise RuntimeError("ENTER requires allocation_ratio(signal.risk_pct) > 0")
+            raise OrderFailed("ENTER requires allocation_ratio(signal.risk_pct) > 0 (STRICT)")
         if tp_pct <= 0:
-            raise RuntimeError("ENTER requires signal.tp_pct > 0")
+            raise OrderFailed("ENTER requires signal.tp_pct > 0 (STRICT)")
         if sl_pct <= 0:
-            raise RuntimeError("ENTER requires signal.sl_pct > 0")
+            raise OrderFailed("ENTER requires signal.sl_pct > 0 (STRICT)")
 
         if leverage > 1.0 and allocation_ratio >= 0.8:
-            raise RuntimeError(f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio})")
+            raise OrderFailed(
+                f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio}) (STRICT)"
+            )
 
         notional = avail_usdt * allocation_ratio * leverage
         if notional <= 0:
-            raise RuntimeError("notional must be > 0")
+            raise OrderFailed("notional must be > 0 (STRICT)")
 
         qty_raw = notional / price_for_qty
         if qty_raw <= 0:
-            raise RuntimeError("qty_raw must be > 0")
+            raise OrderFailed("qty_raw must be > 0 (STRICT)")
 
         ok, guard_reason, guard_extra = hard_risk_guard_check(
             self.settings,
@@ -598,10 +626,7 @@ class ExecutionEngine:
             },
         )
 
-        # ✅ DD 영속화: snapshot 저장에 필요한 값 STRICT 확보
         eq_cur_usdt, eq_peak_usdt, dd_pct_v = _require_meta_equity(meta)
-
-        # ✅ deterministic entry clientOrderId
         entry_client_order_id = _deterministic_entry_client_order_id(symbol=symbol, direction=direction, signal_ts_ms=signal_ts_ms)
 
         if TEST_DRY_RUN:
@@ -635,7 +660,7 @@ class ExecutionEngine:
                 is_auto=True,
                 regime_at_entry=str(regime),
                 strategy=str(signal_source),
-                entry_score=_opt_float(meta.get("entry_score") or meta.get("entryScore")),
+                entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
                 trend_score_at_entry=None,
                 range_score_at_entry=None,
                 leverage=float(leverage),
@@ -643,7 +668,6 @@ class ExecutionEngine:
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
                 note="TEST_DRY_RUN",
-                # 실행/복구 필드 (테스트에서는 None 허용)
                 entry_order_id=None,
                 tp_order_id=None,
                 sl_order_id=None,
@@ -661,8 +685,8 @@ class ExecutionEngine:
                 direction=str(direction),
                 signal_source=str(signal_source),
                 regime=str(regime),
-                entry_score=_opt_float(meta.get("entry_score") or meta.get("entryScore")),
-                engine_total=_opt_float(meta.get("engine_total") or meta.get("engine_total_score")),
+                entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
+                engine_total=_opt_float_strict(meta.get("engine_total") or meta.get("engine_total_score"), "meta.engine_total"),
                 trend_strength=None,
                 atr_pct=None,
                 volume_zscore=None,
@@ -722,20 +746,25 @@ class ExecutionEngine:
             entry_client_order_id=str(entry_client_order_id),
         )
         if trade is None:
-            raise RuntimeError("open_position_with_tp_sl returned None")
+            raise OrderFailed("open_position_with_tp_sl returned None (STRICT)")
 
-        # 실행/복구 필드 STRICT 확보
         entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(
             trade, soft_mode=bool(soft_mode)
         )
 
-        entry_price = getattr(trade, "entry", getattr(trade, "entry_price", entry_price_hint))
-        entry_qty = getattr(trade, "qty", qty_raw)
+        entry_price = getattr(trade, "entry", getattr(trade, "entry_price", None))
+        if entry_price is None:
+            raise OrderFailed("trade.entry/entry_price is required (STRICT)")
+        entry_price = _as_float(entry_price, "trade.entry_price", min_value=0.0)
+
+        entry_qty = getattr(trade, "qty", None)
+        if entry_qty is None:
+            raise OrderFailed("trade.qty is required (STRICT)")
+        entry_qty = _as_float(entry_qty, "trade.qty", min_value=0.0)
 
         entry_ts_dt = getattr(trade, "entry_ts", None)
         if not isinstance(entry_ts_dt, datetime) or entry_ts_dt.tzinfo is None or entry_ts_dt.tzinfo.utcoffset(entry_ts_dt) is None:
-            # STRICT: 실제 체결시각을 못 받는 경우, 신호시각을 사용(추정이 아니라 "관측된 이벤트 시각")
-            entry_ts_dt = datetime.fromtimestamp(float(signal_ts_ms) / 1000.0, tz=timezone.utc)
+            raise OrderFailed("trade.entry_ts (tz-aware datetime) is required (STRICT)")
 
         log_event(
             "on_entry_filled",
@@ -750,7 +779,11 @@ class ExecutionEngine:
             sl_pct=float(sl_pct),
             risk_pct=float(allocation_ratio),
             reason="entry_filled",
-            extra_json={"signal_source": signal_source, "entry_client_order_id": entry_client_order_id, "entry_order_id": entry_order_id},
+            extra_json={
+                "signal_source": signal_source,
+                "entry_client_order_id": entry_client_order_id,
+                "entry_order_id": entry_order_id,
+            },
         )
 
         now_sync = datetime.now(timezone.utc)
@@ -764,7 +797,7 @@ class ExecutionEngine:
             is_auto=True,
             regime_at_entry=str(regime),
             strategy=str(signal_source),
-            entry_score=_opt_float(meta.get("entry_score") or meta.get("entryScore")),
+            entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
             trend_score_at_entry=None,
             range_score_at_entry=None,
             leverage=float(leverage),
@@ -772,7 +805,6 @@ class ExecutionEngine:
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
             note=f"gpt_reason={str(signal.reason or '')[:180]}",
-            # ✅ 실행/복구 필드(운영형)
             entry_order_id=str(entry_order_id),
             tp_order_id=(str(tp_order_id) if tp_order_id is not None else None),
             sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
@@ -795,8 +827,8 @@ class ExecutionEngine:
             direction=str(direction),
             signal_source=str(signal_source),
             regime=str(regime),
-            entry_score=_opt_float(meta.get("entry_score") or meta.get("entryScore")),
-            engine_total=_opt_float(meta.get("engine_total") or meta.get("engine_total_score")),
+            entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
+            engine_total=_opt_float_strict(meta.get("engine_total") or meta.get("engine_total_score"), "meta.engine_total"),
             trend_strength=None,
             atr_pct=None,
             volume_zscore=None,
@@ -818,4 +850,5 @@ class ExecutionEngine:
             f"alloc={allocation_ratio*100:.1f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
             f"price={float(entry_price):.4f} qty={float(entry_qty):.6f} src={signal_source}"
         )
+
         return trade
