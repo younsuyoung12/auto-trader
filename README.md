@@ -1,344 +1,384 @@
-# Auto-Trader (Binance USDT-M Futures) — STRICT · NO-FALLBACK · Production
+# Auto-Trader (Binance USDT-M Futures)
+STRICT · NO-FALLBACK · PRODUCTION
 
-이 저장소는 **BTCUSDT 단일 심볼** 기준의 실전형(운영형) 자동매매 엔진이다.  
-핵심 목표는 “수익률 과장”이 아니라 **운영 안정성(무중단/무결성/Fail-Fast)** 이다.
+이 저장소는 BTCUSDT 단일 심볼 기준의 실전형(운영형) 자동매매 엔진이다.
+목표는 “수익률 과장”이 아니라 운영 안정성(무중단/무결성/Fail-Fast)이다.
 
 - WebSocket 기반 시세 수집(캔들/오더북)
 - 전략 판단(지표/피처 + GPT)
 - 실행(주문/TP·SL) + DB 영속화(거래/스냅샷/이벤트)
-- 대시보드/분석은 Render에서 **DB 조회 전용(read-only analytics)** 으로 분리
+- 대시보드/분석은 Render에서 DB 조회 전용(read-only analytics)
 
----
+---------------------------------------------------------------------------
+0) TL;DR
+---------------------------------------------------------------------------
 
-## 1. 설계 원칙 (절대 준수)
+- 주문 실행(거래소 키)은 AWS Worker에만 존재한다.
+- Render는 DB + Dashboard(조회 전용)만 담당한다. 주문 금지.
+- 런타임 의사결정에서 REST 폴백 금지. WS 데이터만 사용한다.
+- 데이터가 부족/불일치/모호하면:
+  - 추정/보정/대체값으로 계속 진행하지 않는다.
+  - 즉시 예외(raise) 또는 명시적 SKIP로 종료한다.
 
-### 1.1 STRICT · NO-FALLBACK
-- 데이터 누락/불일치/모호성 발생 시 **추정/보정/대체값**으로 계속 진행하지 않는다.
-- 즉시 예외(raise) 또는 **명시적 SKIP** 처리한다.
-- “조용히 넘어가기”는 금지.
+잔고가 없으면 실주문은 실패한다.
+잔고 없는 환경에서 파이프라인 검증은 TEST_DRY_RUN=1로 진행한다.
 
-### 1.2 보안
-- 거래소 API Key/Secret은 **AWS 실행 워커에만 존재**한다.
-- Render(대시보드/DB)에는 **거래소 실행 권한/키를 절대 저장하지 않는다.**
-- DB는 **TLS(SSL)** 로만 연결한다.
+---------------------------------------------------------------------------
+1) 설계 원칙(절대 준수)
+---------------------------------------------------------------------------
 
-### 1.3 운영 안정성 (기관급에 근접한 최소 변경)
-- 메인 루프에서 **외부 I/O(Telegram/DB 등)** 로 블로킹되지 않도록 비동기 위임
-- 내부 상태 ↔ 거래소 상태 **Reconcile(불일치 감지)** 도입
+1.1 STRICT · NO-FALLBACK
+- 데이터 누락/불일치/모호성 발생 시 추정/보정/대체값 금지
+- 즉시 예외(raise) 또는 명시적 SKIP 처리
+- “조용히 넘어가기” 금지
+- 예외를 삼키지 않는다(로그 남기고 재-raise는 허용)
+
+1.2 보안(Security Boundary)
+- 거래소 API Key/Secret은 AWS Worker에만 존재
+- Render(대시보드/DB)에 거래소 실행 권한/키 저장 금지
+- DB 연결은 TLS(SSL) 전제(sslmode=require 권장)
+- 민감정보(키/토큰/시크릿)는 로그/출력 금지
+
+1.3 운영 안정성(기관급 근접 최소 요건)
+- 메인 루프에서 외부 I/O(Telegram/DB)로 블로킹 금지 → 비동기 위임
+- 내부 상태 ↔ 거래소 상태 Reconcile(불일치 감지) 도입
 - 지연(latency) 예산 초과 시 신규 진입 차단(SAFE_STOP) 가능
+- 재시작 후 정합(sync_exchange) 및 불일치 감지(reconcile_engine) 필수
 
----
+---------------------------------------------------------------------------
+2) 배포 토폴로지(Production)
+---------------------------------------------------------------------------
 
-## 2. 배포 토폴로지 (Production)
-
-### 2.1 Execution (Auto-Trader Worker): AWS
+2.1 Execution (Auto-Trader Worker): AWS
 - 24/7 트레이딩 워커 실행
 - WebSocket ingest → strategy → execution
-- 거래소 API keys/secrets 보관 (**절대 Render 저장 금지**)
-- Render Postgres로 **TLS 연결**하여 trades/events/snapshots 기록
+- 거래소 키 보관(절대 Render 저장 금지)
+- Render Postgres External URL로 TLS 연결하여 DB 기록
 
-### 2.2 Database + Dashboard: Render
-- Render Managed Postgres에 모든 거래/스냅샷/이벤트 저장
-- Render에 Dashboard/API 서버 배포(분석/시각화)
-- Render에서는 **주문 실행 절대 없음** (read-only / analytics only)
+2.2 Database + Dashboard: Render
+- Render Managed Postgres에 trades/snapshots/events/market-data 저장
+- Render에 Dashboard/API(조회 전용) 배포
+- Render에서 주문 실행 로직/키/권한 존재 금지(READ ONLY)
 
----
+---------------------------------------------------------------------------
+3) 런타임 데이터 플로우
+---------------------------------------------------------------------------
 
-## 3. 보안 경계 (Security Boundary)
+부팅(BOOT)
+- REST 백필(boot only):
+  - 시장 데이터 초기 버퍼(candles/indicators) 채우기
+- WS 시작:
+  - 캔들/오더북 버퍼 유지
+- 워밍업:
+  - 필수 TF 데이터 준비 확인
+- 메인 루프 진입
 
-- **거래소 크리덴셜은 AWS에만** 존재
-- Render 서비스는 거래소 실행 권한 없이 동작(= DB 조회/분석만)
-- 누락/불일치 데이터는 fail-fast(STRICT · NO-FALLBACK)
+런타임(RUNTIME)
+- 의사결정 입력은 WS 기반 최신 데이터만 사용
+- 런타임에서 REST 폴백으로 의사결정 금지(STRICT)
+- 전략 판단 결과:
+  - ENTER / SKIP / ADJUST
+- 실행 엔진:
+  - guards → 주문 실행 → DB 기록 → 알림
+- 리콘실:
+  - 내부 상태 ↔ 거래소 상태 비교(Desync 감지)
+  - 불일치 발생 시 SAFE_STOP 또는 옵션 강제청산
 
----
+---------------------------------------------------------------------------
+4) 구성 요소(책임 경계)
+---------------------------------------------------------------------------
 
-## 4. 구성 요소 개요
+4.1 AWS Worker(핵심 엔진)
+- infra/market_data_ws.py
+  - Binance Futures WS ingest(캔들/오더북 버퍼)
+- infra/market_data_rest.py
+  - 부팅 시 REST 백필 전용(런타임 폴백 금지)
+- infra/data_health_monitor.py
+  - WS 지연/신선도 감시(헬스 실패 시 SKIP)
+- infra/async_worker.py
+  - Telegram/DB 등 비핵심 I/O 비동기 위임(블로킹 금지)
+- strategy/unified_features_builder.py
+  - WS 기반 피처 생성
+- strategy/account_state_builder.py
+  - equity/peak/dd 등 계좌 상태 생성(스냅샷 핵심)
+- strategy/gpt_strategy.py
+  - GPT 판단(의사결정), I/O 금지(순수 판단)
+- execution/execution_engine.py
+  - 실행만 담당(가드→주문→DB→알림)
+- execution/order_executor.py
+  - 실제 주문 실행 레이어(시장가/TP/SL 등)
+- state/sync_exchange.py
+  - 거래소 truth를 읽어 내부 상태 정합(추정 금지)
+- sync/reconcile_engine.py
+  - 내부 상태 ↔ 거래소 상태 불일치 감지(Desync)
 
-### 4.1 AWS Worker (핵심 엔진)
-- 실시간 데이터 수집: `infra/market_data_ws.py` 등
-- 피처 생성: `strategy/unified_features_builder.py`
-- 전략 판단(GPT 포함): `strategy/gpt_strategy.py` (또는 gpt_trader 계열)
-- 실행: `execution/execution_engine.py`
-- 주문 실행(거래소): `execution/order_executor.py`
-- 거래소 상태 동기화: `state/sync_exchange.py`
-- Desync 감지: `sync/reconcile_engine.py`
-- 비동기 I/O 큐: `infra/async_worker.py`
-
-### 4.2 Render Postgres (실전 분석형 저장소)
-- 거래 기록, 스냅샷, 이벤트, 캔들/오더북/지표 저장
+4.2 Render Postgres(실전 분석형 저장소)
+- trades / snapshots / events + market-data 저장
 - 대시보드/분석의 단일 소스(SSOT)
 
-### 4.3 Render Dashboard/API (조회 전용)
-- Postgres에서 SELECT 기반으로 성과/리스크/드로다운/승률/신호 로그 시각화
-- 주문 실행 로직은 존재하면 안 됨
+4.3 Render Dashboard/API(조회 전용)
+- Postgres SELECT 기반 성과/리스크/드로다운/승률/로그 시각화
+- 주문 실행 로직 금지, 거래소 키/권한 금지
 
----
+---------------------------------------------------------------------------
+5) 환경변수(중요)
+---------------------------------------------------------------------------
 
-## 5. 환경변수 (중요)
+5.1 AWS Worker 필수
+- BINANCE_API_KEY
+- BINANCE_API_SECRET
+- TRADER_DB_URL
+  - Render Postgres External URL
+  - SSL 권장: ?sslmode=require
 
-### 5.1 AWS Worker 필수
-- `BINANCE_API_KEY`
-- `BINANCE_API_SECRET`
-- `TRADER_DB_URL`  
-  - Render Postgres **External URL** 사용(외부 접속)
-  - SSL 포함 권장: `?sslmode=require`
-- (선택) `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+선택
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
 
-### 5.2 Render Dashboard/API 필수
-- `DATABASE_URL` (Render가 제공하는 내부 URL)
-- (선택) `DASHBOARD_SECRET_KEY` 등
+5.2 Render Dashboard/API 필수
+- DATABASE_URL (Render 내부 URL)
 
-### 5.3 운영형(기관급 근접) 설정 키
-- `ASYNC_WORKER_THREADS` (기본 1)
-- `ASYNC_WORKER_QUEUE_SIZE` (기본 2000)
-- `RECONCILE_INTERVAL_SEC` (기본 30)
-- `FORCE_CLOSE_ON_DESYNC` (기본 False)
-- `MAX_SIGNAL_LATENCY_MS` (기본 200)
-- `MAX_EXEC_LATENCY_MS` (기본 400)
+선택
+- DASHBOARD_SECRET_KEY 등
 
----
+5.3 운영형 설정(선택)
+- ASYNC_WORKER_THREADS (기본 1)
+- ASYNC_WORKER_QUEUE_SIZE (기본 2000)
+- RECONCILE_INTERVAL_SEC (기본 30)
+- FORCE_CLOSE_ON_DESYNC (기본 False)
+- MAX_SIGNAL_LATENCY_MS (기본 200)
+- MAX_EXEC_LATENCY_MS (기본 400)
 
-## 6. DB 스키마 (Render Postgres / public)
+5.4 테스트/가상매매
+- TEST_DRY_RUN=1
+  - 주문 없이 DB 기록만 수행(구현에 따라 다름)
+- TEST_BYPASS_GUARDS=1
+  - 운영에서 절대 사용 금지
 
-현재 public 스키마의 테이블 목록:
+주의
+- 잔고가 없으면 실주문은 실패한다.
+- 잔고 없는 환경에서 파이프라인 검증은 TEST_DRY_RUN=1로 진행한다.
 
-- `bt_trades`
-- `bt_trade_snapshots`
-- `bt_trade_exit_snapshots`
-- `bt_events`
-- `bt_external_events`
-- `bt_entry_scores`
-- `bt_regime_scores`
-- `bt_candles`
-- `bt_indicators`
-- `bt_orderbook_snapshots`
-- `bt_funding_rates`
+---------------------------------------------------------------------------
+6) DB 스키마(Render Postgres / public)
+---------------------------------------------------------------------------
 
----
+6.1 테이블 목록
+- bt_trades
+- bt_trade_snapshots
+- bt_trade_exit_snapshots
+- bt_events
+- bt_external_events
+- bt_entry_scores
+- bt_regime_scores
+- bt_candles
+- bt_indicators
+- bt_orderbook_snapshots
+- bt_funding_rates
 
-### 6.1 `bt_trades` (거래 “결과” 중심 테이블)
+6.2 VERIFIED(2026-03-03): bt_trade_snapshots
+목적
+- “왜 진입/스킵했는가” 재현을 위한 진입 시점 상태 저장
+- DD(equity curve / drawdown) 분석의 핵심
 
-**핵심 목적**
-- 실제 진입/청산된 거래를 1 row = 1 trade로 저장
-- 대시보드의 PnL/승률/거래 리스트 기본 소스
+컬럼(핵심)
+- id (int, PK)
+- trade_id (int, FK->bt_trades.id, UNIQUE, ON DELETE CASCADE)
+- symbol (varchar(32), not null)
+- entry_ts (timestamptz, not null)
+- direction (varchar(10), not null)
+- signal_source (varchar(32), null)
+- regime (varchar(32), null)
+- entry_score (double precision, null)
+- engine_total (double precision, null)
+- trend_strength / atr_pct / volume_zscore / depth_ratio / spread_pct (double precision, null)
+- hour_kst / weekday_kst (int, null)
+- last_price (numeric(24,8), null)
+- risk_pct / tp_pct / sl_pct (double precision, null)
+- gpt_action (varchar(16), null)
+- gpt_reason (text, null)
+- created_at (timestamptz, not null, default CURRENT_TIMESTAMP)
 
-**주요 컬럼**
-- `id` (PK, int)
-- `symbol` (varchar(32), not null)
-- `side` (varchar(8), not null)  
-  - 예: BUY/SELL (거래소 실행 기준)
-- `entry_ts` (timestamptz, not null)
-- `exit_ts` (timestamptz, nullable)
-- `entry_price` (numeric(24,8), not null)
-- `exit_price` (numeric(24,8), nullable)
-- `qty` (numeric(24,8), not null)
-- `pnl_usdt` (numeric(24,8), nullable)
-- `pnl_pct_futures` (double precision)
-- `pnl_pct_spot_ref` (double precision)
-- `is_auto` (boolean, not null)
-- `regime_at_entry` / `regime_at_exit` (varchar(16))
-- `entry_score` (double precision)
-- `trend_score_at_entry`, `range_score_at_entry` (double precision)
-- `strategy` (varchar(16))
-- `close_reason` (varchar(32))
-- `leverage` (double precision)
-- `risk_pct` (double precision)
-- `tp_pct`, `sl_pct` (double precision)
-- `note` (varchar(255))
-- `created_at`, `updated_at` (timestamptz, not null)
+DD/Equity(중요)
+- equity_current_usdt (double precision, null)
+- equity_peak_usdt (double precision, null)
+- dd_pct (double precision, null)
 
-**실전 운영/복구 컬럼(중요)**
-- `entry_order_id` (varchar(64))
-- `tp_order_id` (varchar(64))
-- `sl_order_id` (varchar(64))
-- `exchange_position_side` (varchar(16))
-- `remaining_qty` (numeric(24,8))
-- `realized_pnl_usdt` (numeric(24,8))
-- `reconciliation_status` (varchar(32))
-- `last_synced_at` (timestamptz)
+인덱스/제약(핵심)
+- PK: bt_trade_snapshots_pkey(id)
+- UNIQUE: ux_bt_trade_snapshots_tradeid(trade_id)
+- INDEX: ix_bt_trade_snapshots_symbol_entryts(symbol, entry_ts)
+- FK: bt_trade_snapshots_trade_id_fkey(trade_id) ON DELETE CASCADE
 
-**인덱스**
-- PK: `bt_trades_pkey(id)`
-- 조회 최적화: `ix_bt_trades_symbol_entry_ts(symbol, entry_ts)`
+6.3 VERIFIED(2026-03-03): bt_trades
+목적
+- 실제 진입/청산 거래 결과 저장(1 row = 1 trade)
 
----
+컬럼(핵심)
+- id (int, PK)
+- symbol (varchar(32), not null)
+- side (varchar(8), not null)
+- entry_ts (timestamptz, not null)
+- exit_ts (timestamptz, null)
+- entry_price (numeric(24,8), not null)
+- exit_price (numeric(24,8), null)
+- qty (numeric(24,8), not null)
+- pnl_usdt (numeric(24,8), null)
+- pnl_pct_futures / pnl_pct_spot_ref (double precision, null)
+- is_auto (bool, not null)
+- regime_at_entry / regime_at_exit (varchar(16), null)
+- entry_score / trend_score_at_entry / range_score_at_entry (double precision, null)
+- strategy (varchar(16), null)
+- close_reason (varchar(32), null)
+- leverage / risk_pct / tp_pct / sl_pct (double precision, null)
+- note (varchar(255), null)
+- created_at / updated_at (timestamptz, not null)
 
-### 6.2 `bt_trade_snapshots` (거래 “진입 시점” 분석 스냅샷)
+실행/복구(운영형, 중요)
+- entry_order_id / tp_order_id / sl_order_id (varchar(64), null)
+- exchange_position_side (varchar(16), null)
+- remaining_qty (numeric(24,8), null)
+- realized_pnl_usdt (numeric(24,8), null)
+- reconciliation_status (varchar(32), null)
+- last_synced_at (timestamptz, null)
 
-**핵심 목적**
-- “왜 진입/스킵했는가?”를 재현하기 위한 **결정 시점 상태 저장**
-- 대시보드에서 DD(드로다운), equity curve, 전략 성능 분석의 핵심 데이터
+인덱스/참조(핵심)
+- PK: bt_trades_pkey(id)
+- INDEX: ix_bt_trades_symbol_entry_ts(symbol, entry_ts)
+- Referenced by:
+  - bt_entry_scores.trade_id
+  - bt_trade_exit_snapshots.trade_id ON DELETE CASCADE
+  - bt_trade_snapshots.trade_id ON DELETE CASCADE
 
-**주요 컬럼**
-- `id` (PK, int)
-- `trade_id` (FK→bt_trades.id, UNIQUE)
-- `symbol` (varchar(32), not null)
-- `entry_ts` (timestamptz, not null)
-- `direction` (varchar(10), not null)  
-  - 예: LONG/SHORT
-- `signal_source` (varchar(32))
-- `regime` (varchar(32))
-- `entry_score` (double precision)
-- `engine_total` (double precision)
-- `trend_strength`, `atr_pct`, `volume_zscore`, `depth_ratio`, `spread_pct` (double precision)
-- `hour_kst`, `weekday_kst` (int)
-- `last_price` (numeric(24,8))
-- `risk_pct`, `tp_pct`, `sl_pct` (double precision)
-- `gpt_action` (varchar(16))
-- `gpt_reason` (text)
-- `created_at` (timestamptz, not null, default CURRENT_TIMESTAMP)
+6.4 운영 체크 포인트(중요)
+- bt_trade_snapshots의 equity_current_usdt / equity_peak_usdt / dd_pct 가 NULL이면
+  - DD 계산 불가
+  - equity curve 복원 불가
+  - 리스크/HARD_STOP 근거 상실
+  - 분석형 DB가 반쪽이 된다(허용 불가)
 
-**드로다운/자산곡선 핵심 컬럼**
-- `equity_current_usdt` (double precision)
-- `equity_peak_usdt` (double precision)
-- `dd_pct` (double precision)
+---------------------------------------------------------------------------
+7) DB 점검/덤프 명령어(psql)
+---------------------------------------------------------------------------
 
-**인덱스/제약**
-- PK: `bt_trade_snapshots_pkey(id)`
-- UNIQUE: `ux_bt_trade_snapshots_tradeid(trade_id)`
-- 인덱스: `ix_bt_trade_snapshots_symbol_entryts(symbol, entry_ts)`
-- FK: `trade_id`는 `bt_trades(id)` 참조(ON DELETE CASCADE)
+접속
+- psql "$TRADER_DB_URL"
 
----
+테이블 구조 확인(VERIFIED 방식)
+- \d+ bt_trade_snapshots
+- \d+ bt_trades
 
-### 6.3 운영 체크 포인트 (중요)
+컬럼 존재 여부 체크
+- bt_trade_snapshots
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_name='bt_trade_snapshots'
+    AND column_name IN ('equity_current_usdt','equity_peak_usdt','dd_pct');
 
-#### (A) 스냅샷의 equity/dd는 NULL이면 안 된다
-`equity_current_usdt`, `equity_peak_usdt`, `dd_pct`가 NULL이면
-- DD 계산 불가
-- equity curve 복원 불가
-- 리스크/HARD_STOP 근거 상실
+- bt_trades
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_name='bt_trades'
+    AND column_name IN (
+      'entry_order_id','tp_order_id','sl_order_id',
+      'exchange_position_side','remaining_qty','realized_pnl_usdt',
+      'reconciliation_status','last_synced_at'
+    );
 
-즉, 분석형 DB가 “반쪽짜리”가 된다.
+최근 스냅샷에서 DD 값 확인
+- SELECT id, trade_id, symbol, entry_ts,
+         equity_current_usdt, equity_peak_usdt, dd_pct
+  FROM bt_trade_snapshots
+  ORDER BY id DESC
+  LIMIT 5;
 
----
+---------------------------------------------------------------------------
+8) 대시보드/분석 기본 쿼리(예시)
+---------------------------------------------------------------------------
 
-## 7. DB 접속/점검 명령어 (psql)
+8.1 최근 거래 리스트
+- SELECT id, symbol, side, entry_ts, exit_ts,
+         entry_price, exit_price, qty,
+         pnl_usdt, pnl_pct_futures,
+         strategy, close_reason
+  FROM bt_trades
+  ORDER BY id DESC
+  LIMIT 50;
 
-### 7.1 접속
-```bash
-psql "$TRADER_DB_URL"
-## 8. 운영 권장
+8.2 승률(닫힌 거래만)
+- SELECT
+    COUNT(*) AS n_closed,
+    SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) AS n_win,
+    ROUND(100.0 * SUM(CASE WHEN pnl_usdt > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 2)
+      AS win_rate_pct
+  FROM bt_trades
+  WHERE exit_ts IS NOT NULL;
 
-- **24/7 유지**
-  - `systemd` 또는 프로세스 매니저(`pm2` / `supervisor`)로 상시 실행
-- **재시작 시 필수 점검**
-  - 프로세스 재시작 후 **거래소 키/DB 환경변수 재주입**(로드) 여부 확인
-- **로그 파일 저장(옵션)**
-  - `LOG_TO_FILE=1`
-  - `LOG_FILE=/var/log/auto-trader.log` (예시)
+8.3 평균 보유 시간(닫힌 거래만)
+- SELECT
+    AVG(EXTRACT(EPOCH FROM (exit_ts - entry_ts))) AS avg_hold_sec
+  FROM bt_trades
+  WHERE exit_ts IS NOT NULL;
 
----
+8.4 최신 스냅샷(진입 근거)
+- SELECT
+    s.trade_id, s.symbol, s.entry_ts, s.direction,
+    s.entry_score, s.engine_total, s.regime,
+    s.trend_strength, s.atr_pct, s.volume_zscore,
+    s.depth_ratio, s.spread_pct,
+    s.equity_current_usdt, s.equity_peak_usdt, s.dd_pct,
+    s.gpt_action
+  FROM bt_trade_snapshots s
+  ORDER BY s.id DESC
+  LIMIT 50;
 
-## 9. 테스트/가상매매 (주의)
+---------------------------------------------------------------------------
+9) 운영 권장
+---------------------------------------------------------------------------
 
-프로젝트에는 테스트 플래그가 존재할 수 있다.
+- 24/7 유지
+  - systemd 또는 pm2/supervisor로 상시 실행
+- 재시작 시 필수 점검
+  - BINANCE_API_* / TRADER_DB_URL 환경변수 재주입 확인
+  - reconcile_engine 동작 확인(Desync 감지)
+- 로그 저장(옵션)
+  - LOG_TO_FILE=1
+  - LOG_FILE=/var/log/auto-trader.log
 
-- `TEST_DRY_RUN=1`
-  - **주문 없이 DB 기록만 수행**(구현에 따라 다름)
-- `TEST_BYPASS_GUARDS=1`
-  - **운영에서 절대 사용 금지**
+---------------------------------------------------------------------------
+10) 테스트/가상매매(잔고 없을 때)
+---------------------------------------------------------------------------
 
-> 운영 서버(AWS)에서는 테스트 플래그를 사용하지 않는다.
+권장 절차
+1) TEST_DRY_RUN=1로 실행
+2) 엔트리 후보가 발생하도록 충분히 구동
+3) bt_trade_snapshots에 레코드가 생성되는지 확인
+4) equity_current_usdt / equity_peak_usdt / dd_pct가 NULL이 아닌지 확인
 
----
+주의
+- TEST_BYPASS_GUARDS=1은 운영에서 절대 사용 금지
 
-## 10. 파일 구조 (상세 설명)
+---------------------------------------------------------------------------
+11) 알려진 문제/주의사항
+---------------------------------------------------------------------------
 
-아래 설명만 읽어도 “어디가 무엇을 하는지” 알 수 있도록 작성했다.
+11.1 잔고 없음(Insufficient balance)
+- 현상: 주문 단계에서 거래소가 insufficient balance 반환 → 예외로 중단
+- 해결:
+  - 잔고 없는 환경: TEST_DRY_RUN=1로 파이프라인 검증
+  - 실주문 테스트: 선물(USDT-M) 지갑에 USDT 확보 필요
 
-### 10.1 `settings.py`
-- 모든 설정의 단일 소스(SSOT)
-- ENV 우선, 로컬 `.env`는 선택(외부 의존성 없이 내장 로더)
-- 잘못된 설정은 즉시 예외(Fail-Fast)
-- 추가 운영형 키:
-  - `ASYNC_WORKER_THREADS`, `ASYNC_WORKER_QUEUE_SIZE`
-  - `RECONCILE_INTERVAL_SEC`, `FORCE_CLOSE_ON_DESYNC`
-  - `MAX_SIGNAL_LATENCY_MS`, `MAX_EXEC_LATENCY_MS`
+11.2 equity/dd가 NULL로 저장되는 경우
+- 원인 A: execution_engine이 스냅샷 기록 시 meta에 equity/dd를 주입하지 못함
+- 원인 B: TradeSnapshot ORM에 equity/dd 컬럼이 누락됨
+- 해결:
+  - account_state 생성 후 meta에 반드시 주입
+  - ORM-DB 정합 유지(2026-03-03 패치 반영)
 
-### 10.2 `core/run_bot_ws.py`
-- WebSocket 기반 메인 루프
-- 부팅 시 REST 백필 → WS 시작 → 워밍업 → 헬스 모니터 → 메인 루프 진입
-- 엔트리 판단(전략) → 실행 엔진 호출
-- 주기적 리콘실(Reconcile)로 내부 상태 ↔ 거래소 상태 불일치 감지
-- SAFE_STOP / SIGTERM 처리 포함
+---------------------------------------------------------------------------
+12) 면책
+---------------------------------------------------------------------------
 
-### 10.3 `infra/market_data_ws.py`
-- Binance Futures WS ingest
-- 캔들/오더북 버퍼 유지
-- 엔트리/엑싯 판단에 사용할 “WS 기반 최신 데이터” 제공
-
-### 10.4 `infra/market_data_rest.py`
-- 부팅 시점 REST 백필 전용
-- 런타임에서 REST 폴백으로 의사결정하지 않는다(STRICT)
-
-### 10.5 `infra/data_health_monitor.py`
-- WS 데이터의 “신선도/지연” 감시
-- HEALTH_FAIL 시 엔트리 차단(명시적 SKIP)
-
-### 10.6 `infra/async_worker.py`
-- 메인 루프가 텔레그램/DB 작업 때문에 멈추는 것을 방지
-- `submit()`으로 비핵심 I/O 작업을 백그라운드 워커 큐로 위임
-- 큐 포화 시 non-critical 작업은 DROP 가능(운영 안정성)
-
-### 10.7 `sync/reconcile_engine.py`
-- 내부 상태(OPEN_TRADES 등)와 거래소 포지션/주문 상태를 주기적으로 비교
-- 불일치(Desync) 감지 시:
-  - 신규 진입 차단(SAFE_STOP)
-  - 옵션으로 강제 청산(`FORCE_CLOSE_ON_DESYNC=1`)
-
-### 10.8 `strategy/*`
-- `unified_features_builder.py`: WS 데이터 기반 피처 생성
-- `gpt_strategy.py` 또는 `gpt_trader.py`: GPT 판단 포함 진입 결정
-- `regime_engine.py`: 시장 국면(regime) 판정(진입 허용/비허용)
-- `account_state_builder.py`: equity/peak/dd 등 계좌 상태 생성(스냅샷 핵심)
-
-### 10.9 `execution/execution_engine.py`
-- 실행만 담당: 가드 → 주문 실행 → DB 기록 → 알림
-- 핵심 운영형 기능:
-  - 전역 단일 락으로 `execute` 동시 실행 금지(레이스 방지)
-  - 텔레그램은 비동기 위임(블로킹 금지)
-  - deterministic `entry_client_order_id` 사용(중복 진입 방지)
-  - `bt_trades` / `bt_trade_snapshots`에 분석 필드 영속화
-
-### 10.10 `execution/order_executor.py`
-- 거래소 주문 실행 레이어
-- 시장가/TP/SL 등 실제 주문 관련 로직
-- 실행 엔진과 분리되어 책임이 명확해야 한다.
-
-### 10.11 `state/db_writer.py`
-- DB INSERT/UPDATE 전용 모듈
-- trade open/close, snapshot 기록을 담당
-- STRICT 기준: 필수값 누락 시 즉시 예외
-
----
-
-## 11. 운영 체크리스트 (필수)
-
-### 11.1 AWS Worker
-- 거래소 API 키가 AWS에만 존재
-- `TRADER_DB_URL`은 Render External URL + SSL
-- `async_worker` 시작 확인(블로킹 I/O 제거)
-- `reconcile_engine` 활성화(Desync 감지)
-- latency 예산 설정 가능(과도 지연 시 신규 진입 차단)
-
-### 11.2 Render
-- Render 서비스에 거래소 키/권한 없음
-- Dashboard/API는 SELECT 위주
-- DB에 trades/snapshots/events 정상 누적
-
----
-
-## 12. 알려진 문제/주의사항
-
-### 12.1 `bt_trade_snapshots`의 equity/dd 값이 NULL로 저장되는 경우
-- 원인: `execution_engine`이 `record_trade_snapshot` 호출 시  
-  `equity_current_usdt` / `equity_peak_usdt` / `dd_pct`를 meta에서 못 받는 경우
-- 해결: entry 흐름에서 `account_state` 생성 후 meta에 반드시 주입해야 한다.
-
----
-
-## 13. 면책
-자동매매는 손실 위험이 크다.  
-사용자는 모든 책임을 본인이 부담한다.  
+자동매매는 손실 위험이 크다.
+사용자는 모든 책임을 본인이 부담한다.
 운영 전 반드시 소액/테스트로 검증한다.

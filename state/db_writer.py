@@ -23,6 +23,16 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
   - STRICT:
     - 값이 전달되면 반드시 finite/범위 검증
     - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
+
+- 2026-03-03 (PATCH)
+  - bt_trades 실행/복구 필드 영속화 지원(정합):
+    * entry_order_id / tp_order_id / sl_order_id
+    * exchange_position_side
+    * remaining_qty / realized_pnl_usdt
+    * reconciliation_status / last_synced_at
+  - STRICT:
+    - 위 필드가 전달되면 반드시 타입/길이/유효성 검증 후 저장
+    - 빈 문자열/NaN/inf/tz-naive datetime 허용 금지
 ========================================================
 """
 
@@ -124,6 +134,23 @@ def _opt_float_range(v: Any, name: str, *, min_value: float, max_value: float) -
     return float(x)
 
 
+def _opt_nonempty_str_maxlen(v: Any, name: str, *, max_len: int) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        raise ValueError(f"{name} must be non-empty when provided")
+    if len(s) > max_len:
+        raise ValueError(f"{name} length must be <= {max_len}")
+    return s
+
+
+def _opt_tzaware_dt(v: Any, name: str) -> Optional[datetime]:
+    if v is None:
+        return None
+    return _require_tzaware_dt(v, name)
+
+
 # ─────────────────────────────────────────────
 # Trades (bt_trades)
 # ─────────────────────────────────────────────
@@ -145,12 +172,34 @@ def record_trade_open_returning_id(
     tp_pct: Optional[float] = None,
     sl_pct: Optional[float] = None,
     note: Optional[str] = None,
+    # ─────────────────────────────────────────
+    # Execution / Reconciliation Fields (운영형)
+    # ─────────────────────────────────────────
+    entry_order_id: Optional[str] = None,
+    tp_order_id: Optional[str] = None,
+    sl_order_id: Optional[str] = None,
+    exchange_position_side: Optional[str] = None,
+    remaining_qty: Optional[float] = None,
+    realized_pnl_usdt: Optional[float] = None,
+    reconciliation_status: Optional[str] = None,
+    last_synced_at: Optional[datetime] = None,
 ) -> int:
     sym = _require_nonempty_str(symbol, "symbol").upper()
     sd = _require_nonempty_str(side, "side").upper()
     q = _require_positive(qty, "qty")
     ep = _require_positive(entry_price, "entry_price")
     ets = _require_tzaware_dt(entry_ts, "entry_ts")
+
+    # 운영형 실행/복구 필드: 전달되면 STRICT 검증
+    eoid = _opt_nonempty_str_maxlen(entry_order_id, "entry_order_id", max_len=64)
+    tpid = _opt_nonempty_str_maxlen(tp_order_id, "tp_order_id", max_len=64)
+    slid = _opt_nonempty_str_maxlen(sl_order_id, "sl_order_id", max_len=64)
+    pside = _opt_nonempty_str_maxlen(exchange_position_side, "exchange_position_side", max_len=16)
+
+    rem_qty = _opt_float_min(remaining_qty, "remaining_qty", min_value=0.0)
+    rpnl = _opt_float(realized_pnl_usdt)  # 음수 가능(손실), finite만 보장
+    rstat = _opt_nonempty_str_maxlen(reconciliation_status, "reconciliation_status", max_len=32)
+    lsync = _opt_tzaware_dt(last_synced_at, "last_synced_at")
 
     now = _utc_now()
 
@@ -175,6 +224,25 @@ def record_trade_open_returning_id(
             created_at=now,
             updated_at=now,
         )
+
+        # 실행/복구 필드 저장(전달된 값만)
+        if eoid is not None:
+            row.entry_order_id = eoid
+        if tpid is not None:
+            row.tp_order_id = tpid
+        if slid is not None:
+            row.sl_order_id = slid
+        if pside is not None:
+            row.exchange_position_side = pside
+        if rem_qty is not None:
+            row.remaining_qty = float(rem_qty)
+        if rpnl is not None:
+            row.realized_pnl_usdt = float(rpnl)
+        if rstat is not None:
+            row.reconciliation_status = rstat
+        if lsync is not None:
+            row.last_synced_at = lsync
+
         session.add(row)
         session.flush()
         if not getattr(row, "id", None):

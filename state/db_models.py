@@ -10,6 +10,15 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - JSON 컬럼은 Postgres JSON/JSONB 타입을 그대로 사용한다.
 - import 시점에 스키마 생성/변경을 수행하지 않는다.
 - 레거시 호환: 일부 모듈이 `Trade` ORM 심벌을 기대하므로 `Trade = TradeORM` alias를 제공한다.
+- 폴백 금지: 누락/불일치/모호성은 추정으로 메우지 않는다(즉시 예외/중단).
+
+PATCH NOTES — 2026-03-03 (PATCH)
+--------------------------------------------------------
+- bt_trade_snapshots(TradeSnapshot) ORM 정합 수정:
+  - equity_current_usdt, equity_peak_usdt, dd_pct 컬럼 추가
+  - 실제 DB(bt_trade_snapshots) 스키마와 1:1 정합 확보
+- bt_trades(TradeORM) 안정성 보강:
+  - updated_at onupdate=_utc_now 추가(ORM 레벨 자동 갱신)
 
 PATCH NOTES — 2026-03-02
 --------------------------------------------------------
@@ -229,7 +238,7 @@ class TradeORM(Base):
     note = Column(String(255), nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
-    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 
     # ─────────────────────────────────────────
     # Execution / Reconciliation Fields (운영형)
@@ -290,6 +299,13 @@ class TradeSnapshot(Base):
     gpt_reason = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    # ─────────────────────────────────────────
+    # Equity / DD (DB 스키마 정합)
+    # ─────────────────────────────────────────
+    equity_current_usdt = Column(Float, nullable=True)
+    equity_peak_usdt = Column(Float, nullable=True)
+    dd_pct = Column(Float, nullable=True)
 
     __table_args__ = (
         Index("ux_bt_trade_snapshots_tradeid", "trade_id", unique=True),
