@@ -1,13 +1,3 @@
-# =============================================================================
-# PATCH NOTES — 2026-03-01
-# -----------------------------------------------------------------------------
-# - set_leverage_and_mode()를 상태 검증 기반 구조로 전면 수정.
-# - 기존: 무조건 set 시도 → 이미 설정된 경우(-4046 등)도 실패 처리.
-# - 변경: 현재 leverage/marginType 조회 후 다른 경우에만 set 호출.
-# - "이미 설정됨"은 정상 상태로 간주.
-# - req()의 STRICT 예외 정책은 유지 (HTTP 코드 완화하지 않음).
-# =============================================================================
-
 # exchange_api.py
 # =============================================================================
 # Design principles (Binance USDT-M Futures REST Adapter)
@@ -23,6 +13,27 @@
 # Hedge mode is NOT supported.
 # positionSide must always be BOTH in order layer.
 # =============================================================================
+#
+# =============================================================================
+# 변경 이력
+# -----------------------------------------------------------------------------
+# 2026-03-02 (PATCH)
+# 1) retry 정책 STRICT 통일
+#    - execution.retry_policy.execute_with_retry 를 필수 import로 강제
+#    - "없으면 조용히 no-retry" 폴백 제거 (ImportError로 즉시 실패)
+# 2) Settings 단일 소스 정합
+#    - BASE_URL / timeout / recvWindow 를 settings 값으로 우선 적용
+#      (binance_futures_base / request_timeout_sec / recv_window_ms)
+# 3) 불필요 코드 정리
+#    - retry fallback placeholder 제거
+#
+# 2026-03-01
+# - set_leverage_and_mode()를 상태 검증 기반 구조로 전면 수정.
+# - 기존: 무조건 set 시도 → 이미 설정된 경우(-4046 등)도 실패 처리.
+# - 변경: 현재 leverage/marginType 조회 후 다른 경우에만 set 호출.
+# - "이미 설정됨"은 정상 상태로 간주.
+# - req()의 STRICT 예외 정책은 유지 (HTTP 코드 완화하지 않음).
+# =============================================================================
 
 from __future__ import annotations
 
@@ -30,11 +41,12 @@ import hashlib
 import hmac
 import logging
 import time
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
 
+from execution.retry_policy import execute_with_retry  # STRICT (no fallback)
 from settings import load_settings
 
 logger = logging.getLogger(__name__)
@@ -44,9 +56,9 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 SET = load_settings()
 
-BASE_URL: str = "https://fapi.binance.com"
-DEFAULT_TIMEOUT_SEC: int = 10
-RECV_WINDOW_MS: int = 5000
+BASE_URL: str = str(getattr(SET, "binance_futures_base", "") or "").strip() or "https://fapi.binance.com"
+DEFAULT_TIMEOUT_SEC: int = int(getattr(SET, "request_timeout_sec", 10) or 10)
+RECV_WINDOW_MS: int = int(getattr(SET, "recv_window_ms", 5000) or 5000)
 
 _API_KEY: str = str(getattr(SET, "api_key", "") or "")
 _API_SECRET: str = str(getattr(SET, "api_secret", "") or "")
@@ -64,20 +76,6 @@ _SERVER_TIME_OFFSET_MS: int = 0
 _TIME_SYNCED: bool = False
 _LAST_TIME_SYNC_AT: float = 0.0
 _TIME_SYNC_TTL_SEC: int = 60  # resync at most once per minute (safe for -1021)
-
-
-# -----------------------------------------------------------------------------
-# Retry hook (placeholder)
-# -----------------------------------------------------------------------------
-def _default_execute_with_retry(fn: Callable[[], requests.Response]) -> requests.Response:
-    """Default no-retry executor (single call)."""
-    return fn()
-
-
-try:  # pragma: no cover - optional module
-    from retry_policy import execute_with_retry as _execute_with_retry  # type: ignore
-except ImportError:  # pragma: no cover
-    _execute_with_retry = _default_execute_with_retry  # type: ignore[assignment]
 
 
 # -----------------------------------------------------------------------------
@@ -283,7 +281,7 @@ def req(
         return _SESSION.request(m, url, headers=headers or None, timeout=timeout_sec)
 
     try:
-        resp = _execute_with_retry(_do)  # no-retry by default
+        resp = execute_with_retry(_do)
     except requests.RequestException as e:
         raise RuntimeError(f"{m} {p} -> request failed: {e.__class__.__name__}") from None
 
@@ -330,17 +328,7 @@ def assert_one_way_mode() -> None:
 # Public endpoints
 # -----------------------------------------------------------------------------
 def get_exchange_info(symbol: Optional[str] = None) -> Dict[str, Any]:
-    """Get futures exchange info (symbol filters, tick/step, etc.).
-
-    Args:
-        symbol: Optional symbol (e.g., BTCUSDT) to filter results.
-
-    Returns:
-        exchangeInfo JSON dict.
-
-    Raises:
-        RuntimeError: request/response errors.
-    """
+    """Get futures exchange info (symbol filters, tick/step, etc.)."""
     params: Dict[str, Any] = {}
     if symbol:
         params["symbol"] = _normalize_symbol(symbol)
@@ -356,14 +344,7 @@ def get_exchange_info(symbol: Optional[str] = None) -> Dict[str, Any]:
 # Private endpoints (account/positions/orders/settings)
 # -----------------------------------------------------------------------------
 def get_balance() -> List[Dict[str, Any]]:
-    """Get futures account balance (list of assets).
-
-    Returns:
-        List of asset rows from /fapi/v2/balance.
-
-    Raises:
-        RuntimeError: request/response errors.
-    """
+    """Get futures account balance (list of assets)."""
     data = req("GET", "/fapi/v2/balance", {}, private=True)
     if not isinstance(data, list):
         raise RuntimeError("GET /fapi/v2/balance -> unexpected response shape")
@@ -404,7 +385,6 @@ def _fetch_position_risk_raw(symbol: Optional[str] = None) -> List[Dict[str, Any
 
     data = req("GET", "/fapi/v2/positionRisk", params or None, private=True)
     if isinstance(data, dict):
-        # Some clients may return dict-wrapped payload; normalize to list if possible.
         if "raw" in data and isinstance(data["raw"], list):
             data = data["raw"]
 
@@ -433,21 +413,13 @@ def fetch_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def get_position(symbol: str) -> Dict[str, Any]:
-    """Get positionRisk for a specific symbol.
-
-    Returns:
-        The first matching position dict (Binance usually returns a list with 1+ rows).
-
-    Raises:
-        RuntimeError: if no position row is returned.
-    """
+    """Get positionRisk for a specific symbol."""
     s = _normalize_symbol(symbol)
     rows = _fetch_position_risk_raw(s)
     if not rows:
         raise RuntimeError(f"position not found for symbol={s}")
 
     # One-way mode only: Binance returns a single row per symbol.
-    # Hedge mode is NOT supported here.
     return rows[0]
 
 
@@ -514,13 +486,7 @@ def set_margin_mode(symbol: str, mode: str) -> Dict[str, Any]:
 
 
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
-    """Backward-compatible helper to set leverage and margin mode (state-verified).
-
-    STRICT:
-    - Current leverage/marginType are fetched from /fapi/v2/positionRisk.
-    - set_* calls are made only when current state differs from target.
-    - If current state fields are missing/invalid, raises RuntimeError.
-    """
+    """Backward-compatible helper to set leverage and margin mode (state-verified)."""
     if not isinstance(leverage, int):
         raise ValueError("leverage must be int")
     if leverage <= 0:

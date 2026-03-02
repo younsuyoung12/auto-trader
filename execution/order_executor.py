@@ -12,18 +12,25 @@
 # =============================================================================
 # 변경 이력
 # -----------------------------------------------------------------------------
+# 2026-03-02 (PATCH)
+# 1) auto-sizing(기관식 자동 수량 계산) 제거
+#    - qty <= 0 경로 삭제 (수량 계산은 상위 레이어에서만 수행)
+#    - settings.risk_pct(0~100) 기반 계산 로직 전부 제거 (스케일 충돌 원천 차단)
+#    - open_position_with_tp_sl: qty는 반드시 > 0 (STRICT)
+# 2) SL 강제 안전화
+#    - soft_mode=False 인 경우 sl_pct는 반드시 > 0 (SL=0으로 인한 즉시 트리거/무의미 주문 방지)
+# 3) 불필요 코드 정리
+#    - 미사용 유틸/함수 삭제 (math_is_nan_or_inf 등)
+#    - 함수 내부 import 제거(import는 상단으로 통일)
+# 4) allocation_ratio 로깅 정합
+#    - settings.allocation_ratio 우선 사용, 없으면 risk_pct(legacy alias) 사용
+#
 # 2026-03-02
 # 1) STRICT · NO-FALLBACK 강화
 #    - open_position_with_tp_sl: side/leverage/entry_price/TP·SL 설정 실패 시 조용히 진행 금지
 #    - entry_price 획득: "0.0 대입" 금지 → order 조회/체결값으로만 확정, 실패 시 즉시 실패
 #    - TP/SL 설정 실패(soft_mode=False): 포지션 즉시 강제 청산 후 실패 처리
-# 2) 기관급 수량(포지션) 계산 옵션 추가 (신규 파일 없이)
-#    - qty <= 0 이면 자동 계산 모드
-#    - 필요 입력: available_usdt(필수), settings.risk_pct(필수), sl_pct(필수), entry_price_hint(필수)
-#    - 계산: risk_usdt = available_usdt * (risk_pct/100)
-#            qty = risk_usdt / (entry_price_hint * sl_pct)
-#    - 심볼 필터(step/minQty)로 STRICT 라운딩 적용
-# 3) 슬리피지 가드(옵션)
+# 2) 슬리피지 가드(옵션)
 #    - settings.max_entry_slippage_pct(옵션) 존재 시
 #      entry_price vs entry_price_hint 슬리피지 초과하면 즉시 강제 청산 후 실패 처리
 #
@@ -48,6 +55,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import time
@@ -65,9 +73,9 @@ from execution.exchange_api import (
     set_margin_mode,
     sync_server_time,
 )
-from settings import load_settings
-
+from execution.retry_policy import execute_with_retry  # type: ignore
 from events.signals_logger import log_event
+from settings import load_settings
 from state.trader_state import Trade
 
 # Decimal precision for money/qty calculations
@@ -83,18 +91,9 @@ _IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
 _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
 
 
-# -----------------------------------------------------------------------------
-# Retry policy (STRICT)
-# -----------------------------------------------------------------------------
-# NOTE:
-# - retry_policy 모듈을 사용하는 구조라면, 패키지 기준으로 import 되어야 한다.
-# - 폴백(없으면 조용히 통과) 금지. 없으면 ImportError로 즉시 실패.
-from execution.retry_policy import execute_with_retry  # type: ignore
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Event side normalization (EventBus strict: LONG/SHORT/CLOSE)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _event_side_from_open_side(open_side: str) -> str:
     s = str(open_side).upper().strip()
     if s == "BUY":
@@ -108,9 +107,9 @@ def _event_side_close() -> str:
     return "CLOSE"
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Data structures
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class SymbolFilters:
     """Parsed trading filters for a single symbol (Binance USDT-M Futures)."""
@@ -125,9 +124,9 @@ class SymbolFilters:
     market_min_qty: Decimal
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Caches / Locks
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _FILTER_CACHE: Dict[str, Tuple[float, SymbolFilters]] = {}
 _FILTER_LOCK = threading.Lock()
 
@@ -140,9 +139,9 @@ _CLIENT_ID_INFLIGHT: set[str] = set()
 _CLIENT_ID_LOCK = threading.Lock()
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers: normalization / parsing / formatting
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _normalize_symbol(symbol: str) -> str:
     """Normalize symbol to Binance format (e.g., BTCUSDT)."""
     s = str(symbol).replace("-", "").replace("/", "").upper().strip()
@@ -233,14 +232,37 @@ def _require_positive_float(v: Any, name: str) -> float:
         f = float(v)
     except Exception as e:
         raise ValueError(f"{name} must be a number") from e
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be finite")
     if f <= 0:
         raise ValueError(f"{name} must be > 0")
     return f
 
 
-# -----------------------------------------------------------------------------
+def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
+    """
+    로그/분석용 allocation_ratio를 가져온다.
+
+    - 이 파일에서는 포지션 사이징을 계산하지 않는다(상위 레이어 책임).
+    - settings.allocation_ratio 우선, 없으면 settings.risk_pct(legacy alias) 사용.
+    """
+    v = getattr(settings, "allocation_ratio", None)
+    if v is None:
+        v = getattr(settings, "risk_pct", None)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except Exception:
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+# ---------------------------------------------------------------------------
 # Binance error helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 _CODE_RE = re.compile(r"code=([-]?\d+)")
 
 
@@ -315,9 +337,9 @@ def _call_with_time_sync_retry(fn) -> Any:
         raise
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Symbol filters: exchangeInfo cache
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolFilters:
     """Parse tick/step/minQty filters from /fapi/v1/exchangeInfo response."""
     symbols = exchange_info.get("symbols")
@@ -338,10 +360,8 @@ def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolF
         raise RuntimeError(f"exchangeInfo symbol={symbol} missing filters")
 
     tick: Optional[Decimal] = None
-
     lot_step: Optional[Decimal] = None
     lot_min: Optional[Decimal] = None
-
     mkt_step: Optional[Decimal] = None
     mkt_min: Optional[Decimal] = None
 
@@ -407,9 +427,9 @@ def get_symbol_filters(symbol: str) -> SymbolFilters:
     return filt
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Trading settings enforcement (margin mode / leverage)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _require_margin_mode(settings: Any) -> str:
     mm = getattr(settings, "margin_mode", None)
     if not isinstance(mm, str) or not mm.strip():
@@ -489,9 +509,9 @@ def ensure_trading_settings(symbol: str, settings: Optional[Any] = None) -> None
     logger.info("trading settings ensured (symbol=%s margin_mode=%s leverage=%s)", sym, margin_mode, leverage)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Idempotency helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
     orders = get_open_orders(symbol)
     if not isinstance(orders, list):
@@ -541,9 +561,9 @@ def _wait_for_inflight_or_existing(symbol: str, client_order_id: str, timeout_se
         time.sleep(0.05)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Core order placement
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _round_qty_and_price(
     *,
     filters: SymbolFilters,
@@ -912,7 +932,6 @@ def _fetch_filled_entry_price_strict(
         raise RuntimeError("entry order_id missing")
 
     deadline = time.time() + float(max_wait_sec)
-    last: Optional[Dict[str, Any]] = None
 
     while True:
         od = _call_with_time_sync_retry(
@@ -926,11 +945,9 @@ def _fetch_filled_entry_price_strict(
         )
         if not isinstance(od, dict):
             raise RuntimeError("GET /fapi/v1/order returned non-dict")
-        last = od
 
         status = str(od.get("status") or "").upper()
         if status == "FILLED":
-            # 1) avgPrice
             ap = od.get("avgPrice")
             try:
                 apf = float(ap) if ap is not None else 0.0
@@ -940,7 +957,6 @@ def _fetch_filled_entry_price_strict(
             if apf > 0:
                 return apf
 
-            # 2) cummulativeQuoteQty / executedQty
             cq = od.get("cummulativeQuoteQty")
             eq = od.get("executedQty")
             if cq is None or eq is None:
@@ -959,66 +975,6 @@ def _fetch_filled_entry_price_strict(
         if time.time() >= deadline:
             raise RuntimeError(f"entry order not FILLED within {max_wait_sec}s (status={status})")
         time.sleep(0.2)
-
-
-def _calc_auto_qty_from_risk_strict(
-    *,
-    symbol: str,
-    settings: Any,
-    available_usdt: float,
-    entry_price_hint: float,
-    sl_pct: float,
-) -> float:
-    """
-    기관식 자동 수량 계산(옵션).
-    qty <= 0 일 때만 사용.
-
-    필요 조건(STRICT):
-    - available_usdt > 0
-    - entry_price_hint > 0
-    - sl_pct > 0
-    - settings.risk_pct 존재 및 0 < risk_pct <= 100
-
-    계산:
-      risk_usdt = available_usdt * (risk_pct/100)
-      qty_raw  = risk_usdt / (entry_price_hint * sl_pct)
-    """
-    sym = _normalize_symbol(symbol)
-
-    av = _require_positive_float(available_usdt, "available_usdt")
-    eph = _require_positive_float(entry_price_hint, "entry_price_hint")
-    sl = _require_positive_float(sl_pct, "sl_pct")
-
-    rp = getattr(settings, "risk_pct", None)
-    if rp is None:
-        raise ValueError("settings.risk_pct is required for auto-sizing (qty<=0)")
-    try:
-        risk_pct = float(rp)
-    except Exception as e:
-        raise ValueError("settings.risk_pct must be a number") from e
-    if not (0.0 < risk_pct <= 100.0):
-        raise ValueError("settings.risk_pct must be in (0,100]")
-
-    risk_usdt = av * (risk_pct / 100.0)
-    if risk_usdt <= 0:
-        raise ValueError("risk_usdt computed <= 0")
-
-    qty_raw = risk_usdt / (eph * sl)
-    if qty_raw <= 0:
-        raise ValueError("qty_raw computed <= 0")
-
-    filt = get_symbol_filters(sym)
-    qty_n, _, _ = _round_qty_and_price(
-        filters=filt,
-        order_type="MARKET",
-        raw_qty=qty_raw,
-        raw_price=None,
-        raw_stop_price=None,
-    )
-    q = float(qty_n)
-    if q <= 0:
-        raise RuntimeError("auto-sized quantity rounded to 0")
-    return q
 
 
 def open_position_with_tp_sl(
@@ -1040,41 +996,30 @@ def open_position_with_tp_sl(
     - 입력/설정 값 비정상 시 즉시 예외(폴백 금지)
     - entry_price는 실제 체결 데이터로만 확정
     - soft_mode=False 인데 TP/SL 설정 실패 시 포지션 즉시 강제 청산 후 실패 처리
-    - qty <= 0 이면 자동 수량 계산(available_usdt 필수)
+    - qty는 반드시 > 0 (auto-sizing 제거: 상위 레이어에서 수량 산출)
     """
+    _ = available_usdt  # (호환용) auto-sizing 제거로 더 이상 사용하지 않음
+
     sym = _normalize_symbol(symbol)
     open_side = _normalize_side(side_open)
 
-    # leverage는 STRICT로 강제
+    # leverage는 STRICT로 강제 (실제 적용은 ensure_trading_settings에서 수행)
     lev = _require_leverage(settings)
 
-    # tp/sl pct 검증(STRICT)
+    final_qty = _require_positive_float(qty, "qty")
+
     tp_pct_f = float(tp_pct)
     sl_pct_f = float(sl_pct)
     if tp_pct_f < 0 or sl_pct_f < 0:
         raise ValueError("tp_pct and sl_pct must be >= 0")
-    if sl_pct_f == 0:
-        # 자동 수량 계산/기관식 리스크 관점에서 SL=0은 위험. 허용하지 않는다.
-        # (soft_mode=True라도 qty 자동 계산은 불가)
-        if float(qty) <= 0:
-            raise ValueError("sl_pct must be > 0 when qty<=0 (auto-sizing)")
-    eph = float(entry_price_hint)
-    if eph <= 0:
-        if float(qty) <= 0:
-            raise ValueError("entry_price_hint must be > 0 when qty<=0 (auto-sizing)")
 
-    # qty 자동 계산(옵션)
-    final_qty = float(qty)
-    if final_qty <= 0:
-        if available_usdt is None:
-            raise ValueError("available_usdt is required when qty<=0 (auto-sizing)")
-        final_qty = _calc_auto_qty_from_risk_strict(
-            symbol=sym,
-            settings=settings,
-            available_usdt=float(available_usdt),
-            entry_price_hint=float(entry_price_hint),
-            sl_pct=float(sl_pct_f),
-        )
+    # SL은 soft_mode=False면 반드시 켠다(안전)
+    if not bool(soft_mode) and sl_pct_f <= 0:
+        raise ValueError("sl_pct must be > 0 when soft_mode=False")
+
+    eph = float(entry_price_hint)
+    if not math.isfinite(eph):
+        raise ValueError("entry_price_hint must be finite")
 
     cid = _make_client_order_id(prefix="ent")
 
@@ -1145,14 +1090,14 @@ def open_position_with_tp_sl(
         if max_slip_f < 0:
             raise ValueError("settings.max_entry_slippage_pct must be >= 0")
         if max_slip_f > 0:
-            if float(entry_price_hint) <= 0:
+            if eph <= 0:
                 raise ValueError("entry_price_hint must be > 0 when max_entry_slippage_pct is enabled")
-            slip_pct = abs(entry_price - float(entry_price_hint)) / float(entry_price_hint) * 100.0
+            slip_pct = abs(entry_price - eph) / eph * 100.0
             if slip_pct > max_slip_f:
                 logger.warning(
                     "slippage guard triggered (symbol=%s hint=%s fill=%s slip_pct=%.4f limit=%.4f) -> force close",
                     sym,
-                    float(entry_price_hint),
+                    eph,
                     entry_price,
                     slip_pct,
                     max_slip_f,
@@ -1164,7 +1109,7 @@ def open_position_with_tp_sl(
                     side=_event_side_from_open_side(open_side),
                     reason="slippage_guard_force_close",
                     extra_json={
-                        "entry_price_hint": float(entry_price_hint),
+                        "entry_price_hint": float(eph),
                         "entry_price": float(entry_price),
                         "slippage_pct": float(slip_pct),
                         "max_entry_slippage_pct": float(max_slip_f),
@@ -1188,7 +1133,8 @@ def open_position_with_tp_sl(
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
-        risk_pct=getattr(settings, "risk_pct", None),
+        # NOTE: 전환 기간 호환. 계산에는 사용 금지(로깅용).
+        risk_pct=_get_allocation_ratio_for_log(settings),
         reason="MARKET_ENTRY_FILLED",
         extra_json={"open_side": open_side, "clientOrderId": cid},
     )
@@ -1235,11 +1181,9 @@ def open_position_with_tp_sl(
             extra_json={"err": str(e), "soft_mode": bool(soft_mode), "qty": float(final_qty)},
         )
 
-        # soft_mode=True면 SL을 일부러 안 거는 모드이므로, 실패해도 즉시 청산은 하지 않는다.
         if bool(soft_mode):
             return None
 
-        # soft_mode=False: SL 없는 포지션은 운영상 금지 → 즉시 강제 청산
         try:
             close_position_market(sym, open_side, float(final_qty))
         except Exception as e2:
@@ -1256,12 +1200,12 @@ def open_position_with_tp_sl(
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
-        risk_pct=getattr(settings, "risk_pct", None),
+        # NOTE: 전환 기간 호환. 계산에는 사용 금지(로깅용).
+        risk_pct=_get_allocation_ratio_for_log(settings),
         reason="TP_SL_CONFIGURED",
         extra_json={"soft_mode": bool(soft_mode)},
     )
 
-    entry_order_id: Optional[str]
     order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
     entry_order_id = str(order_id) if order_id is not None else None
 
@@ -1361,21 +1305,21 @@ def close_all_positions_market(symbol: str) -> int:
             direction = "LONG" if amt > 0 else "SHORT"
 
         close_side = "SELL" if direction == "LONG" else "BUY"
-        qty = abs(amt)
+        qty2 = abs(amt)
 
         client_id = _make_client_order_id(prefix="sigterm")
         logger.warning(
             "[FORCE_CLOSE] submit reduce-only market close: symbol=%s direction=%s qty=%s positionSide=%s",
             sym,
             direction,
-            qty,
+            qty2,
             pos_side,
         )
 
         resp = place_market(
             symbol=sym,
             side=close_side,
-            qty=float(qty),
+            qty=float(qty2),
             settings=SET,
             reduce_only=True,
             position_side=pos_side,
@@ -1388,7 +1332,7 @@ def close_all_positions_market(symbol: str) -> int:
             regime="SIGTERM_FORCE_CLOSE",
             side=_event_side_close(),  # CLOSE
             price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
-            qty=float(qty),
+            qty=float(qty2),
             leverage=getattr(SET, "leverage", None),
             reason="SIGTERM_DEADLINE_FORCE_CLOSE",
             extra_json={"direction": direction, "close_side": close_side, "positionSide": pos_side},

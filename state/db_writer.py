@@ -14,11 +14,21 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 2026-03-01: bt_trades 실제 스키마 정합
   - open: entry_ts/entry_price/qty/is_auto/... 기록, trade_id 반환
   - close: exit_ts/exit_price/pnl_usdt/... 업데이트, trade_id 반환
+
+- 2026-03-02 (PATCH)
+  - bt_trade_snapshots에 DD 영속화 필드 저장 지원:
+    * equity_current_usdt
+    * equity_peak_usdt
+    * dd_pct
+  - STRICT:
+    - 값이 전달되면 반드시 finite/범위 검증
+    - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
 ========================================================
 """
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -28,9 +38,9 @@ from state.db_core import get_session
 from state.db_models import (
     ExternalEvent,
     FundingRate,
+    TradeExitSnapshot,
     TradeORM,
     TradeSnapshot,
-    TradeExitSnapshot,
 )
 
 
@@ -57,9 +67,12 @@ def _require_number(v: Any, name: str) -> float:
     if v is None:
         raise ValueError(f"{name} is required")
     try:
-        return float(v)
+        x = float(v)
     except Exception as e:
         raise ValueError(f"{name} must be numeric: {e}") from e
+    if not math.isfinite(x):
+        raise ValueError(f"{name} must be finite")
+    return x
 
 
 def _require_positive(v: Any, name: str) -> float:
@@ -85,15 +98,35 @@ def _opt_float(v: Any) -> Optional[float]:
     if v is None:
         return None
     try:
-        return float(v)
+        x = float(v)
     except Exception as e:
         raise ValueError(f"optional float invalid: {e}") from e
+    if not math.isfinite(x):
+        raise ValueError("optional float must be finite")
+    return x
+
+
+def _opt_float_min(v: Any, name: str, *, min_value: float) -> Optional[float]:
+    if v is None:
+        return None
+    x = _require_number(v, name)
+    if x < min_value:
+        raise ValueError(f"{name} must be >= {min_value}")
+    return float(x)
+
+
+def _opt_float_range(v: Any, name: str, *, min_value: float, max_value: float) -> Optional[float]:
+    if v is None:
+        return None
+    x = _require_number(v, name)
+    if x < min_value or x > max_value:
+        raise ValueError(f"{name} must be within {min_value}..{max_value}")
+    return float(x)
 
 
 # ─────────────────────────────────────────────
 # Trades (bt_trades)
 # ─────────────────────────────────────────────
-
 def record_trade_open_returning_id(
     *,
     symbol: str,
@@ -129,21 +162,16 @@ def record_trade_open_returning_id(
             entry_price=ep,
             qty=q,
             is_auto=bool(is_auto),
-
             regime_at_entry=(str(regime_at_entry).strip() if regime_at_entry else None),
             strategy=(str(strategy).strip() if strategy else None),
-
             entry_score=_opt_float(entry_score),
             trend_score_at_entry=_opt_float(trend_score_at_entry),
             range_score_at_entry=_opt_float(range_score_at_entry),
-
             leverage=_opt_float(leverage),
             risk_pct=_opt_float(risk_pct),
             tp_pct=_opt_float(tp_pct),
             sl_pct=_opt_float(sl_pct),
-
             note=(str(note).strip()[:255] if note else None),
-
             created_at=now,
             updated_at=now,
         )
@@ -214,7 +242,6 @@ def close_latest_open_trade_returning_id(
 # ─────────────────────────────────────────────
 # Snapshots (bt_trade_snapshots / bt_trade_exit_snapshots)
 # ─────────────────────────────────────────────
-
 def record_trade_snapshot(
     *,
     trade_id: int,
@@ -238,11 +265,19 @@ def record_trade_snapshot(
     sl_pct: Optional[float] = None,
     gpt_action: Optional[str] = None,
     gpt_reason: Optional[str] = None,
+    # 2026-03-02: DD 영속화 필드
+    equity_current_usdt: Optional[float] = None,
+    equity_peak_usdt: Optional[float] = None,
+    dd_pct: Optional[float] = None,
 ) -> None:
     tid = _require_positive_int(trade_id, "trade_id")
     sym = _require_nonempty_str(symbol, "symbol").upper()
     ets = _require_tzaware_dt(entry_ts, "entry_ts")
     dirn = _require_nonempty_str(direction, "direction").upper()
+
+    eq_cur = _opt_float_min(equity_current_usdt, "equity_current_usdt", min_value=0.0)
+    eq_peak = _opt_float_min(equity_peak_usdt, "equity_peak_usdt", min_value=0.0)
+    dd_v = _opt_float_range(dd_pct, "dd_pct", min_value=0.0, max_value=100.0)
 
     with get_session() as session:
         t = session.query(TradeORM).filter(TradeORM.id == tid).first()
@@ -277,6 +312,23 @@ def record_trade_snapshot(
             gpt_reason=(str(gpt_reason).strip() if gpt_reason else None),
             created_at=_utc_now(),
         )
+
+        # STRICT: 모델 매핑 누락이면 즉시 예외
+        if eq_cur is not None:
+            if not hasattr(row, "equity_current_usdt"):
+                raise RuntimeError("TradeSnapshot model missing equity_current_usdt mapping (db_models mismatch)")
+            setattr(row, "equity_current_usdt", float(eq_cur))
+
+        if eq_peak is not None:
+            if not hasattr(row, "equity_peak_usdt"):
+                raise RuntimeError("TradeSnapshot model missing equity_peak_usdt mapping (db_models mismatch)")
+            setattr(row, "equity_peak_usdt", float(eq_peak))
+
+        if dd_v is not None:
+            if not hasattr(row, "dd_pct"):
+                raise RuntimeError("TradeSnapshot model missing dd_pct mapping (db_models mismatch)")
+            setattr(row, "dd_pct", float(dd_v))
+
         session.add(row)
 
 
@@ -326,7 +378,6 @@ def record_trade_exit_snapshot(
 # ─────────────────────────────────────────────
 # Funding / Events
 # ─────────────────────────────────────────────
-
 def record_funding_rate(
     *,
     symbol: str,

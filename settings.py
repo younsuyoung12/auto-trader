@@ -4,7 +4,7 @@
 # -----------------------------------------------------------------------------
 # - This project must use **settings.py** as the single source of truth.
 # - Environment variables (os.environ) have priority (Render-friendly).
-# - Optional local .env is supported (no external deps) and never overwrites
+# - Optional local .env is supported (**no external deps**) and never overwrites
 #   existing environment variables.
 # - Invalid configuration must fail fast (ValueError/RuntimeError).
 # - Sensitive values (API key/secret) must never be logged.
@@ -15,6 +15,13 @@
 #   - 포지션 사이즈는 RiskPhysicsEngine(=allocation)에서 결정한다.
 #   - Settings.risk_pct는 "호환/참고용"으로만 남긴다(기본 1.0 권장).
 # - LEVERAGE 기본값을 1로 변경(전액 배분형 안전 전제).
+#
+# PATCH NOTES — 2026-03-02 (PATCH)
+# - allocation_ratio(0~1) 설정 키를 정식 도입(의미 통일).
+#   - env: ALLOCATION_RATIO 우선, 없으면 RISK_PCT 사용(호환).
+#   - Settings.risk_pct는 "호환용 alias"로 유지하되 allocation_ratio와 값 일치 강제.
+# - 외부 의존성 제거:
+#   - python-dotenv 사용(load_dotenv) 제거 → 내장 .env 로더(_try_load_local_dotenv)만 사용.
 # =============================================================================
 
 from __future__ import annotations
@@ -27,13 +34,9 @@ from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
-# Korea Standard Time (UTC+9)
+# Korea Standard Time (UTC+9) - (외부 모듈에서 사용할 수 있어 유지)
 KST = timezone(timedelta(hours=9))
 
 
@@ -62,14 +65,16 @@ class Settings:
     recv_window_ms: int = 5000
     request_timeout_sec: int = 10
 
-    # Symbol filters
+    # Symbol filters (legacy; 실제 필터는 exchangeInfo로 확정)
     qty_step: float = 0.001
     min_qty: float = 0.001
     price_tick: float = 0.1
 
     # Strategy / sizing
-    # ✅ 전액 배분형에서는 포지션 사이즈는 risk_physics_engine의 allocation이 결정한다.
-    #    risk_pct는 호환/참고용으로만 남긴다. (기본 1.0 권장)
+    # ✅ canonical: allocation_ratio(0~1) = 계좌 투입 비율
+    allocation_ratio: float = 1.0
+
+    # ✅ legacy alias (호환): 의미는 allocation_ratio와 동일하게 강제
     risk_pct: float = 1.0
 
     tp_pct: float = 0.006
@@ -243,6 +248,7 @@ def _load_env_file_into_environ(dotenv_path: Path) -> None:
         if not key:
             raise ValueError(f"invalid .env line (empty key): {raw_line}")
 
+        # env 우선권: 이미 존재하면 덮어쓰지 않는다.
         if key in os.environ:
             continue
 
@@ -311,6 +317,19 @@ def _as_float(key: str, default: float) -> float:
     return x
 
 
+def _as_float_opt(key: str) -> Optional[float]:
+    v = _get_env(key)
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except Exception:
+        raise ValueError(f"invalid float for {key}") from None
+    if not math.isfinite(x):
+        raise RuntimeError(f"non-finite float for {key}")
+    return x
+
+
 def _as_bool(key: str, default: bool) -> bool:
     v = _get_env(key)
     if v is None:
@@ -372,9 +391,15 @@ def _validate_settings(s: Settings) -> None:
     if mm not in {"ISOLATED", "CROSSED"}:
         raise ValueError("margin_mode must be ISOLATED or CROSSED")
 
-    # 전액 배분형: risk_pct는 호환/참고용이므로 0~1 범위만 강제
+    # Allocation Mode: allocation_ratio(0~1) 강제
+    if not (0.0 < float(s.allocation_ratio) <= 1.0):
+        raise ValueError("allocation_ratio must be within (0,1]")
+
+    # Legacy alias도 같은 범위 + 값 일치 강제(스케일 충돌 방지)
     if not (0.0 < float(s.risk_pct) <= 1.0):
-        raise ValueError("risk_pct must be within (0,1]")
+        raise ValueError("risk_pct must be within (0,1] (legacy alias)")
+    if abs(float(s.risk_pct) - float(s.allocation_ratio)) > 1e-12:
+        raise ValueError("risk_pct must equal allocation_ratio (do not set them differently)")
 
     if s.hard_daily_loss_limit_usdt < 0:
         raise ValueError("hard_daily_loss_limit_usdt must be >= 0")
@@ -424,8 +449,21 @@ def load_settings() -> Settings:
     min_qty = _as_float("MIN_QTY", 0.001)
     price_tick = _as_float("PRICE_TICK", 0.1)
 
-    # ✅ 전액 배분형: RISK_PCT는 호환/참고용 (기본 1.0)
-    risk_pct = _as_float("RISK_PCT", 1.0)
+    # ✅ allocation_ratio: ALLOCATION_RATIO 우선, 없으면 RISK_PCT(호환)
+    alloc_env = _as_float_opt("ALLOCATION_RATIO")
+    risk_env = _as_float_opt("RISK_PCT")
+
+    if alloc_env is None and risk_env is None:
+        allocation_ratio = 1.0
+    elif alloc_env is not None:
+        allocation_ratio = float(alloc_env)
+        if risk_env is not None and abs(float(risk_env) - allocation_ratio) > 1e-12:
+            raise ValueError("ALLOCATION_RATIO and RISK_PCT mismatch (set only one or make them equal)")
+    else:
+        allocation_ratio = float(risk_env)
+
+    # legacy alias는 항상 동일하게 세팅
+    risk_pct = float(allocation_ratio)
 
     tp_pct = _as_float("TP_PCT", 0.006)
     sl_pct = _as_float("SL_PCT", 0.003)
@@ -532,7 +570,8 @@ def load_settings() -> Settings:
         qty_step=qty_step,
         min_qty=min_qty,
         price_tick=price_tick,
-        risk_pct=risk_pct,
+        allocation_ratio=float(allocation_ratio),
+        risk_pct=float(risk_pct),
         tp_pct=tp_pct,
         sl_pct=sl_pct,
         max_sl_pct=max_sl_pct,

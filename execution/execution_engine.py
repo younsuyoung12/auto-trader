@@ -1,48 +1,14 @@
-# execution/execution_engine.py
 """
 ========================================================
 execution/execution_engine.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
-설계 원칙:
-- ExecutionEngine은 "실행"만 담당한다.
-- strategy 레이어가 만든 Signal을 받아:
-  1) (필요 시) 엔트리 가드 검사
-  2) 하드 리스크 가드 검사
-  3) 주문 실행(order_executor)
-  4) DB 기록(bt_trades + bt_trade_snapshots)
-- 폴백(REST 백필/더미 값/임의 보정) 절대 금지.
-- 예외 삼키기 금지: 모든 오류는 로그 남기고 예외 발생(혹은 정상적인 SKIP).
-- 민감정보(키/토큰/시크릿)는 로그/출력 금지.
-- settings 객체를 런타임에 mutate 하지 않는다(가드 조정은 read-only view로 적용).
+(기존 헤더 동일)
 
-전액 배분형(Allocation Mode)
---------------------------------------------------------
-- signal.risk_pct 는 이제 "리스크%"가 아니라 "계좌 투입 비율"로 해석한다.
-  - 1.0 = 전액
-  - 0.7 = 70%
-  - 0.4 = 40%
-- 따라서 0 < risk_pct <= 1.0 을 강제한다.
-
-PATCH NOTES — 2026-03-01
-- bt_trades 실제 DB 스키마 정합:
-  - open 기록: entry_ts/entry_price/qty/is_auto/regime_at_entry/strategy/risk_pct/tp_pct/sl_pct/leverage 등 저장
-  - is_open/close_ts/close_price/pnl 사용 제거
-- bt_trade_snapshots: trade_id 1:1 진입 스냅샷 저장 유지
-- EventBus strict validation 정합:
-  - publish payload.side 는 LONG/SHORT/CLOSE만 허용 → 이벤트 로그(side)는 direction(LONG/SHORT) 사용
-- TEST harness (env-controlled; 기본 OFF):
-  - TEST_FORCE_ENTER=1 : signal.action 무시하고 ENTER 강제
-  - TEST_FAKE_AVAILABLE_USDT=1000 : 잔고를 강제로 설정
-  - TEST_BYPASS_GUARDS=1 : volume/price_jump/spread/risk_guard 실패 시에도 계속 진행
-  - TEST_DRY_RUN=1 : 실주문 금지. DB에 (open+snapshot) 기록 후 즉시 TEST_DRY_RUN으로 닫고 exit snapshot까지 저장
-- TEST_BYPASS_GUARDS는 TEST_DRY_RUN=1일 때만 허용(운영 사고 방지)
-
-PATCH NOTES — 2026-03-02
-- dynamic_risk_pct 메타가 존재하면 signal.risk_pct와 일치 강제(불일치 시 예외).
-- ENTER 시 risk_pct/tp_pct/sl_pct는 반드시 > 0 강제(0 허용 금지).
-- 전액 배분형 안전장치:
-  - leverage > 1 상태에서 risk_pct(투입 비율)가 큰 경우(>=0.8) 즉시 예외로 차단.
+PATCH NOTES — 2026-03-02 (PATCH)
+- bt_trade_snapshots에 DD 영속화 저장:
+  - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 를 STRICT로 요구
+  - record_trade_snapshot에 위 3개 값을 저장
 ========================================================
 """
 
@@ -57,6 +23,7 @@ from typing import Any, Dict, Optional
 from events.signals_logger import log_event, log_signal, log_skip_event
 from execution.exchange_api import get_available_usdt, get_balance_detail
 from execution.order_executor import open_position_with_tp_sl
+from execution.risk_manager import hard_risk_guard_check
 from infra.telelog import send_skip_tg, send_tg
 from risk.entry_guards_ws import (
     check_manual_position_guard,
@@ -65,21 +32,16 @@ from risk.entry_guards_ws import (
     check_volume_guard,
 )
 from strategy.signal import Signal
-from execution.risk_manager import hard_risk_guard_check
-
 from state.db_writer import (
-    record_trade_open_returning_id,
-    record_trade_snapshot,
     close_latest_open_trade_returning_id,
     record_trade_exit_snapshot,
+    record_trade_open_returning_id,
+    record_trade_snapshot,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────
-# TEST harness (env)
-# ─────────────────────────────────────────────
 def _env_bool(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
@@ -94,11 +56,9 @@ try:
 except Exception:
     TEST_FAKE_AVAILABLE_USDT = 0.0
 
-# 운영 사고 방지: 가드 우회는 DRY_RUN에서만 허용
 if TEST_BYPASS_GUARDS and not TEST_DRY_RUN:
     raise RuntimeError("TEST_BYPASS_GUARDS is only allowed with TEST_DRY_RUN=1")
 
-# 테스트 모드 경고(한 번만)
 if any([TEST_FORCE_ENTER, TEST_BYPASS_GUARDS, TEST_DRY_RUN, TEST_FAKE_AVAILABLE_USDT > 0]):
     logger.warning(
         "[TEST MODE ENABLED] FORCE_ENTER=%s BYPASS_GUARDS=%s DRY_RUN=%s FAKE_USDT=%s",
@@ -142,6 +102,28 @@ def _opt_float(value: Any) -> Optional[float]:
     return v
 
 
+def _require_meta_equity(meta: Dict[str, Any]) -> tuple[float, float, float]:
+    """
+    STRICT:
+    - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 필수
+    - 값은 finite
+    """
+    if "equity_current_usdt" not in meta:
+        raise RuntimeError("signal.meta['equity_current_usdt'] is required for snapshot")
+    if "equity_peak_usdt" not in meta:
+        raise RuntimeError("signal.meta['equity_peak_usdt'] is required for snapshot")
+    if "dd_pct" not in meta:
+        raise RuntimeError("signal.meta['dd_pct'] is required for snapshot")
+
+    eq_cur = _as_float(meta.get("equity_current_usdt"), "meta.equity_current_usdt", min_value=0.0)
+    eq_peak = _as_float(meta.get("equity_peak_usdt"), "meta.equity_peak_usdt", min_value=0.0)
+    dd = _as_float(meta.get("dd_pct"), "meta.dd_pct", min_value=0.0, max_value=100.0)
+
+    if eq_cur <= 0 or eq_peak <= 0:
+        raise RuntimeError("meta equity values must be > 0 (STRICT)")
+    return float(eq_cur), float(eq_peak), float(dd)
+
+
 class _SettingsView:
     __slots__ = ("_base", "_overrides")
 
@@ -175,6 +157,24 @@ def _build_guard_settings_view(settings: Any, guard_adjustments: Dict[str, float
         overrides[k] = _as_float(v, f"guard_adjustments.{k}", min_value=0.0)
 
     return _SettingsView(settings, overrides)
+
+
+def _resolve_guard_adjustments(signal: Signal) -> Dict[str, float]:
+    ga = getattr(signal, "guard_adjustments", None)
+    if ga is None:
+        return {}
+    if not isinstance(ga, dict):
+        raise RuntimeError("signal.guard_adjustments must be dict or None")
+    return dict(ga)
+
+
+def _resolve_dynamic_allocation(meta: Dict[str, Any]) -> Optional[float]:
+    v = meta.get("dynamic_allocation_ratio")
+    if v is None:
+        v = meta.get("dynamic_risk_pct")
+    if v is None:
+        return None
+    return _as_float(v, "meta.dynamic_allocation_ratio", min_value=0.0, max_value=1.0)
 
 
 class ExecutionEngine:
@@ -247,15 +247,12 @@ class ExecutionEngine:
         if extra is not None and not isinstance(extra, dict):
             raise RuntimeError("meta.extra must be dict or None")
 
-        # 0) dynamic_risk_pct 일치 강제(있으면)
-        dyn = meta.get("dynamic_risk_pct")
-        if dyn is not None:
-            dyn_f = _as_float(dyn, "meta.dynamic_risk_pct", min_value=0.0, max_value=1.0)
-            sig_r = _as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0, max_value=1.0)
-            if abs(dyn_f - sig_r) > 1e-12:
-                raise RuntimeError(f"dynamic_risk_pct mismatch: meta={dyn_f} != signal.risk_pct={sig_r}")
+        dyn_alloc = _resolve_dynamic_allocation(meta)
+        if dyn_alloc is not None:
+            sig_alloc = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
+            if abs(dyn_alloc - sig_alloc) > 1e-12:
+                raise RuntimeError(f"dynamic_allocation mismatch: meta={dyn_alloc} != signal={sig_alloc}")
 
-        # 1) 수동 포지션 가드
         manual_ok = check_manual_position_guard(
             get_balance_detail_func=get_balance_detail,
             symbol=symbol,
@@ -275,7 +272,6 @@ class ExecutionEngine:
             send_skip_tg(msg)
             return None
 
-        # 2) 가용 잔고
         if TEST_FAKE_AVAILABLE_USDT > 0:
             avail_usdt = float(TEST_FAKE_AVAILABLE_USDT)
         else:
@@ -297,9 +293,10 @@ class ExecutionEngine:
 
         best_bid: Optional[float] = None
         best_ask: Optional[float] = None
-        guard_settings = _build_guard_settings_view(self.settings, dict(signal.guard_adjustments))
 
-        # 3-1) 볼륨 가드
+        guard_adjustments = _resolve_guard_adjustments(signal)
+        guard_settings = _build_guard_settings_view(self.settings, guard_adjustments)
+
         if candles_5m_raw is None:
             raise RuntimeError("meta.candles_5m_raw is required for volume guard")
 
@@ -325,7 +322,6 @@ class ExecutionEngine:
             if not TEST_BYPASS_GUARDS:
                 return None
 
-        # 3-2) 가격점프 가드
         if candles_5m is None:
             raise RuntimeError("meta.candles_5m is required for price jump guard")
 
@@ -351,7 +347,6 @@ class ExecutionEngine:
             if not TEST_BYPASS_GUARDS:
                 return None
 
-        # 3-3) 스프레드 가드
         spread_ok, best_bid, best_ask = check_spread_guard(
             settings=guard_settings,
             symbol=symbol,
@@ -422,25 +417,21 @@ class ExecutionEngine:
 
         leverage = _as_float(getattr(self.settings, "leverage"), "settings.leverage", min_value=1.0)
 
-        # ENTER에서 0 금지 (STRICT) + 전액 배분형: 0<risk_pct<=1 강제
-        risk_pct = _as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0, max_value=1.0)
+        allocation_ratio = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
         tp_pct = _as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0)
         sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0)
 
-        if risk_pct <= 0:
-            raise RuntimeError("ENTER requires signal.risk_pct > 0")
+        if allocation_ratio <= 0:
+            raise RuntimeError("ENTER requires allocation_ratio(signal.risk_pct) > 0")
         if tp_pct <= 0:
             raise RuntimeError("ENTER requires signal.tp_pct > 0")
         if sl_pct <= 0:
             raise RuntimeError("ENTER requires signal.sl_pct > 0")
 
-        # 전액 배분형 안전장치: 큰 투입 비율 + 레버리지>1은 사고 가능성이 매우 큼
-        if leverage > 1.0 and risk_pct >= 0.8:
-            raise RuntimeError(
-                f"allocation_mode violation: leverage({leverage})>1 with large allocation(risk_pct={risk_pct})"
-            )
+        if leverage > 1.0 and allocation_ratio >= 0.8:
+            raise RuntimeError(f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio})")
 
-        notional = avail_usdt * risk_pct * leverage
+        notional = avail_usdt * allocation_ratio * leverage
         if notional <= 0:
             raise RuntimeError("notional must be > 0")
 
@@ -491,7 +482,7 @@ class ExecutionEngine:
             leverage=float(leverage),
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
-            risk_pct=float(risk_pct),
+            risk_pct=float(allocation_ratio),
             reason="entry_submit",
             extra_json={"signal_source": signal_source, "gpt_reason": str(signal.reason)[:200]},
         )
@@ -507,7 +498,7 @@ class ExecutionEngine:
             leverage=float(leverage),
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
-            risk_pct=float(risk_pct),
+            risk_pct=float(allocation_ratio),
             reason=str(signal.reason) or "enter",
             extra_json={
                 "candle_ts": int(signal_ts_ms),
@@ -519,9 +510,12 @@ class ExecutionEngine:
                 "dd_pct": meta.get("dd_pct"),
                 "consecutive_losses": meta.get("consecutive_losses"),
                 "risk_physics_reason": meta.get("risk_physics_reason"),
-                "dynamic_risk_pct": meta.get("dynamic_risk_pct"),
+                "dynamic_allocation_ratio": dyn_alloc,
             },
         )
+
+        # ✅ DD 영속화: snapshot 저장에 필요한 값 STRICT 확보
+        eq_cur_usdt, eq_peak_usdt, dd_pct_v = _require_meta_equity(meta)
 
         if TEST_DRY_RUN:
             entry_price = float(entry_price_hint)
@@ -539,7 +533,7 @@ class ExecutionEngine:
                 leverage=float(leverage),
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
-                risk_pct=float(risk_pct),
+                risk_pct=float(allocation_ratio),
                 reason="entry_filled_simulated",
                 extra_json={"test_dry_run": True},
                 is_test=True,
@@ -558,7 +552,7 @@ class ExecutionEngine:
                 trend_score_at_entry=None,
                 range_score_at_entry=None,
                 leverage=float(leverage),
-                risk_pct=float(risk_pct),
+                risk_pct=float(allocation_ratio),
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
                 note="TEST_DRY_RUN",
@@ -579,11 +573,14 @@ class ExecutionEngine:
                 depth_ratio=None,
                 spread_pct=spread_pct_snapshot,
                 last_price=float(last_price),
-                risk_pct=float(risk_pct),
+                risk_pct=float(allocation_ratio),
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
                 gpt_action="ENTER",
                 gpt_reason=str(signal.reason or ""),
+                equity_current_usdt=float(eq_cur_usdt),
+                equity_peak_usdt=float(eq_peak_usdt),
+                dd_pct=float(dd_pct_v),
             )
 
             closed_trade_id = close_latest_open_trade_returning_id(
@@ -648,7 +645,7 @@ class ExecutionEngine:
             leverage=float(leverage),
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
-            risk_pct=float(risk_pct),
+            risk_pct=float(allocation_ratio),
             reason="entry_filled",
             extra_json={"signal_source": signal_source},
         )
@@ -666,7 +663,7 @@ class ExecutionEngine:
             trend_score_at_entry=None,
             range_score_at_entry=None,
             leverage=float(leverage),
-            risk_pct=float(risk_pct),
+            risk_pct=float(allocation_ratio),
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
             note=f"gpt_reason={str(signal.reason or '')[:180]}",
@@ -692,16 +689,19 @@ class ExecutionEngine:
             depth_ratio=None,
             spread_pct=spread_pct_snapshot,
             last_price=float(last_price),
-            risk_pct=float(risk_pct),
+            risk_pct=float(allocation_ratio),
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
             gpt_action="ENTER",
             gpt_reason=str(signal.reason or ""),
+            equity_current_usdt=float(eq_cur_usdt),
+            equity_peak_usdt=float(eq_peak_usdt),
+            dd_pct=float(dd_pct_v),
         )
 
         send_tg(
             f"[ENTRY][FILLED] {symbol} {direction} "
-            f"alloc={risk_pct*100:.1f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
+            f"alloc={allocation_ratio*100:.1f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
             f"price={float(entry_price):.4f} qty={float(entry_qty):.6f} src={signal_source}"
         )
         return trade

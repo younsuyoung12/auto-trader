@@ -4,7 +4,7 @@ strategy/gpt_strategy.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 설계 원칙:
-- GPT 판단(진입 여부 / risk/tp/sl / guard_adjustments)만 수행한다.
+- GPT 판단(진입 여부 / allocation_ratio/tp/sl / guard_adjustments)만 수행한다.
 - 주문 실행 / 거래소 API 호출 / DB 접근 절대 금지.
 - unified_features + engine_scores는 필수 입력.
 - 데이터 누락/오류는 즉시 예외.
@@ -15,6 +15,16 @@ PATCH NOTES — 2026-03-02
   - dd_pct / consecutive_losses / recent_win_rate / recent_trades_count 필수.
 - account_state를 GPT 입력(extra_to_gpt)에 포함하여 의사결정 컨텍스트 강화.
   (I/O 없음, 추정 없음, caller가 제공한 실제 데이터만 전달)
+
+PATCH NOTES — 2026-03-02 (PATCH)
+- 용어/의미 통일:
+  - 내부 변수명: allocation_ratio(0~1)로 통일.
+  - 설정/입력 호환:
+    - settings.allocation_ratio 우선, 없으면 settings.risk_pct 허용(전환 기간 호환).
+    - extra.effective_allocation_ratio 우선, 없으면 extra.effective_risk_pct 허용.
+    - GPT 결과: effective_allocation_ratio 우선, 없으면 effective_risk_pct 허용.
+  - Signal 필드명(risk_pct)은 유지할 수 있으나, 의미는 allocation_ratio로 고정.
+- 사용하지 않는 import 정리.
 ========================================================
 """
 
@@ -126,7 +136,6 @@ def _require_account_state(value: Any) -> Dict[str, Any]:
     recent_win_rate = _as_float(st.get("recent_win_rate"), "account_state.recent_win_rate", min_value=0.0, max_value=1.0)
     recent_trades_count = _as_int(st.get("recent_trades_count"), "account_state.recent_trades_count", min_value=0)
 
-    # STRICT: 값 저장(정규화/클램프 금지, 단 타입 확정/유효성 검증은 수행)
     st2: Dict[str, Any] = dict(st)
     st2["dd_pct"] = float(dd_pct)
     st2["consecutive_losses"] = int(consecutive_losses)
@@ -189,10 +198,8 @@ def _build_guard_snapshot(settings: Any) -> Dict[str, float]:
 
         v = getattr(settings, key)
 
-        # STRICT: bool 금지
         if isinstance(v, bool):
             raise ValueError(f"guard setting '{key}' must be numeric, not bool")
-
         if not isinstance(v, (int, float)):
             raise ValueError(f"guard setting '{key}' must be numeric")
 
@@ -210,17 +217,14 @@ def _validate_market_features_structure(market_features: Dict[str, Any]) -> None
         if k not in market_features:
             raise RuntimeError(f"market_features missing required key: {k}")
 
-    # symbol
     _require_non_empty_str(market_features.get("symbol"), "market_features.symbol")
 
-    # dict-like sections
     _require_dict(market_features.get("timeframes"), "market_features.timeframes")
     _require_dict(market_features.get("orderbook"), "market_features.orderbook")
     _require_dict(market_features.get("multi_timeframe"), "market_features.multi_timeframe")
     _require_dict(market_features.get("pattern_summary"), "market_features.pattern_summary")
     _require_dict(market_features.get("pattern_features"), "market_features.pattern_features")
 
-    # engine_scores handled separately (more strict)
     _require_dict(market_features.get("engine_scores"), "market_features.engine_scores")
 
 
@@ -241,7 +245,6 @@ def _extract_and_validate_engine_scores(market_features: Dict[str, Any]) -> Tupl
 
         _as_float(section.get("score"), f"engine_scores.{section_key}.score", min_value=0.0, max_value=100.0)
 
-        # trend_4h direction은 있으면 검증
         if section_key == "trend_4h":
             if "direction" in section:
                 d = str(section.get("direction", "")).upper().strip()
@@ -253,6 +256,60 @@ def _extract_and_validate_engine_scores(market_features: Dict[str, Any]) -> Tupl
     return engine_scores, total_score
 
 
+def _get_setting_allocation_ratio(settings: Any) -> float:
+    """
+    settings에서 allocation_ratio(0~1)를 가져온다.
+    - settings.allocation_ratio 우선
+    - 없으면 settings.risk_pct 허용(전환 기간 호환)
+    """
+    if hasattr(settings, "allocation_ratio") and getattr(settings, "allocation_ratio") is not None:
+        v = _as_float(getattr(settings, "allocation_ratio"), "settings.allocation_ratio", min_value=0.0, max_value=1.0)
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"settings.allocation_ratio out of range (0,1]: {v}")
+        return v
+
+    v = _as_float(getattr(settings, "risk_pct"), "settings.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
+    if not (0.0 < v <= 1.0):
+        raise ValueError(f"settings.risk_pct(out of range, expected allocation_ratio (0,1]): {v}")
+    return v
+
+
+def _get_extra_effective_allocation(extra: Optional[Dict[str, Any]], base: float) -> float:
+    if not isinstance(extra, dict):
+        return base
+
+    if extra.get("effective_allocation_ratio") is not None:
+        v = _as_float(extra.get("effective_allocation_ratio"), "extra.effective_allocation_ratio", min_value=0.0, max_value=1.0)
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"effective_allocation_ratio out of range (0,1]: {v}")
+        return v
+
+    if extra.get("effective_risk_pct") is not None:
+        v = _as_float(extra.get("effective_risk_pct"), "extra.effective_risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"effective_risk_pct out of range (0,1]: {v}")
+        return v
+
+    return base
+
+
+def _get_gpt_effective_allocation(gpt_result: Dict[str, Any]) -> float:
+    if "effective_allocation_ratio" in gpt_result:
+        v = _as_float(gpt_result.get("effective_allocation_ratio"), "gpt.effective_allocation_ratio", min_value=0.0, max_value=1.0)
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"gpt effective_allocation_ratio out of range (0,1]: {v}")
+        return v
+
+    # 전환 기간 호환
+    if "effective_risk_pct" in gpt_result:
+        v = _as_float(gpt_result.get("effective_risk_pct"), "gpt.effective_risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
+        if not (0.0 < v <= 1.0):
+            raise ValueError(f"gpt effective_risk_pct out of range (0,1]: {v}")
+        return v
+
+    raise RuntimeError("gpt_result missing required key: effective_allocation_ratio (or effective_risk_pct)")
+
+
 class GPTStrategy(BaseStrategy):
     def __init__(self, settings: Any):
         self.settings = settings
@@ -261,7 +318,6 @@ class GPTStrategy(BaseStrategy):
         if not isinstance(market_data, dict) or not market_data:
             raise RuntimeError("market_data is empty or not a dict")
 
-        # 필수 입력
         symbol = _require_non_empty_str(market_data.get("symbol"), "market_data.symbol")
 
         direction = str(market_data.get("direction", "")).upper().strip()
@@ -291,7 +347,6 @@ class GPTStrategy(BaseStrategy):
             raise RuntimeError("market_data.market_features (unified_features) is required and must be dict")
 
         _validate_market_features_structure(market_features)
-
         engine_scores, engine_total_score = _extract_and_validate_engine_scores(market_features)
 
         extra = market_data.get("extra")
@@ -302,19 +357,17 @@ class GPTStrategy(BaseStrategy):
         candles_5m_raw = market_data.get("candles_5m_raw")
 
         # base params from settings (STRICT validation)
-        base_risk_pct = _as_float(getattr(self.settings, "risk_pct"), "settings.risk_pct", min_value=0.0)
+        base_allocation_ratio = _get_setting_allocation_ratio(self.settings)
         base_tp_pct = _as_float(getattr(self.settings, "tp_pct"), "settings.tp_pct", min_value=0.0)
         base_sl_pct = _as_float(getattr(self.settings, "sl_pct"), "settings.sl_pct", min_value=0.0)
 
-        if not (0.0 < base_risk_pct <= 1.0):
-            raise ValueError(f"settings.risk_pct out of range (0,1]: {base_risk_pct}")
         if not (0.0 < base_tp_pct <= 1.0):
             raise ValueError(f"settings.tp_pct out of range (0,1]: {base_tp_pct}")
         if not (0.0 < base_sl_pct <= 1.0):
             raise ValueError(f"settings.sl_pct out of range (0,1]: {base_sl_pct}")
 
         # extra overrides (존재할 때만 적용)
-        effective_risk_pct = base_risk_pct
+        allocation_ratio = _get_extra_effective_allocation(extra, base_allocation_ratio)
         tp_pct = base_tp_pct
         sl_pct = base_sl_pct
 
@@ -323,11 +376,9 @@ class GPTStrategy(BaseStrategy):
                 tp_pct = _as_float(extra.get("tp_pct"), "extra.tp_pct", min_value=0.0)
             if extra.get("sl_pct") is not None:
                 sl_pct = _as_float(extra.get("sl_pct"), "extra.sl_pct", min_value=0.0)
-            if extra.get("effective_risk_pct") is not None:
-                effective_risk_pct = _as_float(extra.get("effective_risk_pct"), "extra.effective_risk_pct", min_value=0.0)
 
-        if not (0.0 < effective_risk_pct <= 1.0):
-            raise ValueError(f"effective_risk_pct out of range (0,1]: {effective_risk_pct}")
+        if not (0.0 < allocation_ratio <= 1.0):
+            raise ValueError(f"allocation_ratio out of range (0,1]: {allocation_ratio}")
         if not (0.0 < tp_pct <= 1.0):
             raise ValueError(f"tp_pct out of range (0,1]: {tp_pct}")
         if not (0.0 < sl_pct <= 1.0):
@@ -374,7 +425,7 @@ class GPTStrategy(BaseStrategy):
                     direction=direction,
                     tp_pct=float(tp_pct),
                     sl_pct=float(sl_pct),
-                    risk_pct=float(effective_risk_pct),
+                    risk_pct=float(allocation_ratio),  # 의미는 allocation_ratio
                     reason=reason,
                     guard_adjustments={},
                     meta=meta,
@@ -390,6 +441,8 @@ class GPTStrategy(BaseStrategy):
 
         # GPT 판단
         try:
+            # NOTE: decide_entry_with_gpt_trader의 인자명은 기존 유지(base_risk_pct 등).
+            #       의미는 allocation_ratio(0~1)로 고정.
             gpt_result = decide_entry_with_gpt_trader(
                 self.settings,
                 symbol=symbol,
@@ -397,7 +450,7 @@ class GPTStrategy(BaseStrategy):
                 direction=direction,
                 last_price=float(last_price),
                 entry_score=entry_score,
-                base_risk_pct=float(effective_risk_pct),
+                base_risk_pct=float(allocation_ratio),  # allocation_ratio 의미
                 base_tp_pct=float(tp_pct),
                 base_sl_pct=float(sl_pct),
                 extra=extra_to_gpt,
@@ -412,9 +465,14 @@ class GPTStrategy(BaseStrategy):
             raise RuntimeError("gpt_result must be dict")
 
         # ── D) GPT 반환 구조 강제 검증 ─────────────────────────────────
-        for k in ("final_action", "effective_risk_pct", "tp_pct", "sl_pct"):
-            if k not in gpt_result:
-                raise RuntimeError(f"gpt_result missing required key: {k}")
+        if "final_action" not in gpt_result:
+            raise RuntimeError("gpt_result missing required key: final_action")
+        if "tp_pct" not in gpt_result:
+            raise RuntimeError("gpt_result missing required key: tp_pct")
+        if "sl_pct" not in gpt_result:
+            raise RuntimeError("gpt_result missing required key: sl_pct")
+        # allocation 키는 전환 기간 호환으로 별도 검증
+        out_alloc = _get_gpt_effective_allocation(gpt_result)
 
         final_action = str(gpt_result.get("final_action", "")).upper().strip()
         if not final_action:
@@ -423,29 +481,18 @@ class GPTStrategy(BaseStrategy):
         gpt_reason = gpt_result.get("reason")
         reason_s = str(gpt_reason) if isinstance(gpt_reason, str) else ""
 
-        # 결과 값 반영 (ENTER가 아니면 SKIP)
         action = "ENTER" if final_action == "ENTER" else "SKIP"
 
-        out_risk = _as_float(gpt_result.get("effective_risk_pct"), "gpt.effective_risk_pct", min_value=0.0)
         out_tp = _as_float(gpt_result.get("tp_pct"), "gpt.tp_pct", min_value=0.0)
         out_sl = _as_float(gpt_result.get("sl_pct"), "gpt.sl_pct", min_value=0.0)
 
         # ── E) 범위 검증 ───────────────────────────────────────────────
-        if action == "ENTER":
-            if not (0.0 < out_risk <= 1.0):
-                raise ValueError(f"gpt effective_risk_pct out of range (0,1]: {out_risk}")
-            if not (0.0 < out_tp <= 1.0):
-                raise ValueError(f"gpt tp_pct out of range (0,1]: {out_tp}")
-            if not (0.0 < out_sl <= 1.0):
-                raise ValueError(f"gpt sl_pct out of range (0,1]: {out_sl}")
-        else:
-            # SKIP에서도 유효한 숫자여야 한다(추후 로깅/분석용)
-            if not (0.0 < out_risk <= 1.0):
-                raise ValueError(f"gpt effective_risk_pct out of range (0,1]: {out_risk}")
-            if not (0.0 < out_tp <= 1.0):
-                raise ValueError(f"gpt tp_pct out of range (0,1]: {out_tp}")
-            if not (0.0 < out_sl <= 1.0):
-                raise ValueError(f"gpt sl_pct out of range (0,1]: {out_sl}")
+        if not (0.0 < out_tp <= 1.0):
+            raise ValueError(f"gpt tp_pct out of range (0,1]: {out_tp}")
+        if not (0.0 < out_sl <= 1.0):
+            raise ValueError(f"gpt sl_pct out of range (0,1]: {out_sl}")
+        if not (0.0 < out_alloc <= 1.0):
+            raise ValueError(f"gpt allocation_ratio out of range (0,1]: {out_alloc}")
 
         # ── F) guard_adjustments 검증 ─────────────────────────────────
         guard_adjustments: Dict[str, float] = {}
@@ -479,6 +526,8 @@ class GPTStrategy(BaseStrategy):
             "engine_scores": engine_scores,
             "pattern_summary": pattern_summary,
             "gpt_action": str(gpt_result.get("gpt_action", "")).upper().strip(),
+            # 전환/분석용(명시): 실제 의미는 allocation_ratio
+            "allocation_ratio": float(out_alloc),
         }
 
         return Signal(
@@ -486,7 +535,7 @@ class GPTStrategy(BaseStrategy):
             direction=direction,
             tp_pct=float(out_tp),
             sl_pct=float(out_sl),
-            risk_pct=float(out_risk),
+            risk_pct=float(out_alloc),  # 필드명 유지, 의미는 allocation_ratio
             reason=reason_s or ("gpt_approved" if action == "ENTER" else "gpt_skip"),
             guard_adjustments=guard_adjustments,
             meta=meta,

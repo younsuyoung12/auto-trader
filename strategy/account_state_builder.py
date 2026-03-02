@@ -9,7 +9,7 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 이 모듈은 다음 값들을 산출한다:
   1) dd_pct                : (피크 대비) 드로우다운 %
   2) equity_current_usdt   : 현재 평가금(USDT) (caller가 제공)
-  3) equity_peak_usdt      : 런타임 관측 기반 피크 평가금(USDT)
+  3) equity_peak_usdt      : 피크 평가금(USDT)
   4) consecutive_losses    : 최근 청산 트레이드 기준 연속 손실 횟수
   5) recent_win_rate       : 최근 N회 청산 트레이드 승률
   6) recent_planned_rr_avg : 최근 N회 "계획 RR"(tp_pct/sl_pct) 평균 (존재하는 데이터만)
@@ -27,10 +27,10 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 입력 계약(Caller 책임)
 --------------------------------------------------------
 - current_equity_usdt: 현재 평가금(또는 가용/총자산 등) "단 하나"를 숫자로 제공.
-- closed_trades: 최근 청산된 트레이드 목록(내림차순 권장).
+- closed_trades: 최근 청산된 트레이드 목록(최신→과거 내림차순 권장).
   각 원소는 dict이며 최소 키가 필요:
     - id (int)
-    - exit_ts (datetime or ISO8601 str)  *정렬 검증 목적
+    - exit_ts (datetime or ISO8601 str)  *정렬 검증 목적(최신→과거)
     - pnl_usdt (float)                  *승률/연속손실
   선택 키(있으면 planned RR 계산):
     - tp_pct (float)
@@ -38,15 +38,22 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 DD(드로우다운) 정의
 --------------------------------------------------------
-- 본 구현은 "런타임 관측 피크 기반 DD"를 계산한다.
-  (별도 equity/balance 스냅샷 테이블이 없으므로, 재구성 기반 DD는 추정이 되어 금지)
-- 즉, 봇 프로세스가 시작된 이후 관측한 최고 equity를 peak로 사용한다.
-  재시작하면 peak가 리셋된다(명시적 동작).
+- 본 구현은 "피크 기반 DD"를 계산한다.
+- 외부 I/O를 하지 않기 때문에, 재시작 후에도 DD를 유지하려면 caller가
+  persisted_equity_peak_usdt(이전에 저장해둔 피크)를 전달해야 한다.
 
 PATCH NOTES — 2026-03-02
 --------------------------------------------------------
 - AccountStateBuilder 도입(런타임 DD + 최근 승률/연속손실/계획 RR).
 - NO-FALLBACK 검증 강화(필수 키/타입/범위).
+
+PATCH NOTES — 2026-03-02 (PATCH)
+--------------------------------------------------------
+- DD 재시작 리스크 완화(외부 I/O 없이):
+  - build(..., persisted_equity_peak_usdt=...) 옵션 추가.
+  - peak 계산은 max(persisted_peak, runtime_peak, current_equity)로 확정.
+  - caller가 DB에 peak를 저장/복구하면 재시작 후에도 DD가 유지된다.
+- closed_trades 정렬(최신→과거) 검증 추가(위반 시 즉시 예외).
 ========================================================
 """
 
@@ -153,8 +160,8 @@ def _extract_closed_trade_row(row: Any) -> Tuple[int, datetime, float, Optional[
 
     trade_id = _as_int(row.get("id"), "trade.id", min_value=1)
     exit_ts = _as_datetime(row.get("exit_ts"), "trade.exit_ts")
-
     pnl_usdt = _as_float(row.get("pnl_usdt"), "trade.pnl_usdt")
+
     # tp/sl은 선택(있을 때만 planned RR 계산)
     tp_pct = row.get("tp_pct")
     sl_pct = row.get("sl_pct")
@@ -169,6 +176,25 @@ def _extract_closed_trade_row(row: Any) -> Tuple[int, datetime, float, Optional[
         sl_f = None
 
     return trade_id, exit_ts, pnl_usdt, tp_f, sl_f
+
+
+def _validate_closed_trades_sorted_desc(
+    rows: List[Tuple[int, datetime, float, Optional[float], Optional[float]]]
+) -> None:
+    """
+    STRICT: 최신→과거(내림차순) 정렬을 검증한다.
+    - rows[0].exit_ts >= rows[1].exit_ts >= ...
+    """
+    if len(rows) < 2:
+        return
+    prev_ts = rows[0][1]
+    for i in range(1, len(rows)):
+        ts = rows[i][1]
+        if ts > prev_ts:
+            raise AccountStateInputError(
+                "closed_trades must be sorted by exit_ts desc (most recent first)"
+            )
+        prev_ts = ts
 
 
 def _compute_planned_rr_avg(rows: List[Tuple[int, datetime, float, Optional[float], Optional[float]]]) -> Optional[float]:
@@ -193,12 +219,12 @@ def _compute_planned_rr_avg(rows: List[Tuple[int, datetime, float, Optional[floa
 # ─────────────────────────────────────────────
 class AccountStateBuilder:
     """
-    런타임 계정 상태 계산기.
+    계정 상태 계산기.
 
     사용 패턴(권장):
-    - 프로세스 시작 시 1회 생성 후 재사용(peak equity 유지).
-    - 매 루프/진입 판단 직전:
-        state = builder.build(symbol, current_equity_usdt=..., closed_trades=...)
+    - 프로세스 시작 시 1회 생성 후 재사용(런타임 peak 유지).
+    - 재시작 DD 유지가 필요하면 caller가 persisted_equity_peak_usdt를 전달한다.
+      (예: DB에 저장해둔 equity_peak_usdt 값을 꺼내 build()에 주입)
     """
 
     def __init__(
@@ -206,6 +232,7 @@ class AccountStateBuilder:
         *,
         win_rate_window: int = 20,
         min_trades_for_win_rate: int = 5,
+        initial_equity_peak_usdt: Optional[float] = None,
     ) -> None:
         if not isinstance(win_rate_window, int) or win_rate_window <= 0:
             raise ValueError("win_rate_window must be positive int")
@@ -220,6 +247,17 @@ class AccountStateBuilder:
         self._lock = threading.Lock()
         self._equity_peak_usdt: Optional[float] = None
 
+        if initial_equity_peak_usdt is not None:
+            peak = _as_float(initial_equity_peak_usdt, "initial_equity_peak_usdt", min_value=0.0)
+            if peak <= 0:
+                raise ValueError("initial_equity_peak_usdt must be > 0")
+            self._equity_peak_usdt = float(peak)
+
+    def get_peak_equity_usdt(self) -> Optional[float]:
+        """caller가 외부 저장(예: DB)할 수 있도록 현재 peak를 반환한다(없으면 None)."""
+        with self._lock:
+            return None if self._equity_peak_usdt is None else float(self._equity_peak_usdt)
+
     def reset_peak(self) -> None:
         """의도적 리셋(운영에서 일반적으로 사용 금지)."""
         with self._lock:
@@ -231,6 +269,7 @@ class AccountStateBuilder:
         *,
         current_equity_usdt: Any,
         closed_trades: Iterable[Dict[str, Any]],
+        persisted_equity_peak_usdt: Any = None,
     ) -> AccountState:
         sym = _require_non_empty_str(symbol, "symbol").upper()
 
@@ -238,26 +277,35 @@ class AccountStateBuilder:
         if equity_now <= 0.0:
             raise AccountStateInputError("current_equity_usdt must be > 0")
 
-        # peak equity (runtime observed)
+        persisted_peak: Optional[float] = None
+        if persisted_equity_peak_usdt is not None:
+            persisted_peak = _as_float(persisted_equity_peak_usdt, "persisted_equity_peak_usdt", min_value=0.0)
+            if persisted_peak <= 0.0:
+                raise AccountStateInputError("persisted_equity_peak_usdt must be > 0")
+
+        # peak equity 확정(STRICT, 외부 I/O 없이)
         with self._lock:
-            if self._equity_peak_usdt is None:
-                self._equity_peak_usdt = float(equity_now)
-            else:
-                if equity_now > self._equity_peak_usdt:
-                    self._equity_peak_usdt = float(equity_now)
-            equity_peak = float(self._equity_peak_usdt)
+            runtime_peak = self._equity_peak_usdt
+
+            # peak 후보: runtime_peak / persisted_peak / equity_now
+            candidates: List[float] = [float(equity_now)]
+            if runtime_peak is not None:
+                candidates.append(float(runtime_peak))
+            if persisted_peak is not None:
+                candidates.append(float(persisted_peak))
+
+            equity_peak = max(candidates)
+            self._equity_peak_usdt = float(equity_peak)
 
         if equity_peak <= 0.0:
             raise AccountStateError("equity_peak_usdt invalid")
 
         dd_pct = ((equity_peak - equity_now) / equity_peak) * 100.0
         if dd_pct < 0.0:
-            # STRICT: 음수 DD는 계산상 불가능(peak 갱신 로직 오류)
             raise AccountStateError(f"dd_pct computed negative: {dd_pct}")
         if not math.isfinite(dd_pct):
             raise AccountStateError("dd_pct must be finite")
 
-        # closed trades parsing
         if closed_trades is None:
             raise AccountStateInputError("closed_trades must not be None")
 
@@ -268,8 +316,9 @@ class AccountStateBuilder:
         if not parsed:
             raise AccountStateNotReadyError("no closed_trades provided")
 
-        # STRICT: most recent first를 강제하지는 않지만, last_closed는 최댓값 기준으로 뽑지 않는다.
-        # caller는 '최신 순'으로 제공해야 한다.
+        # STRICT: 최신→과거 정렬 검증
+        _validate_closed_trades_sorted_desc(parsed)
+
         last_id, last_ts, *_ = parsed[0]
 
         # consecutive losses: from most recent backwards
@@ -290,7 +339,6 @@ class AccountStateBuilder:
         wins = sum(1 for _, __, pnl, ___, ____ in window if pnl > 0)
         win_rate = wins / len(window)
 
-        # planned RR avg (optional)
         planned_rr_avg = _compute_planned_rr_avg(window)
 
         return AccountState(
