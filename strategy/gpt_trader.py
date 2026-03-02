@@ -1,17 +1,36 @@
 # gpt_trader.py
-# ====================================================
-# 역할
-# ----------------------------------------------------
-# - WS 기반 마켓 피처(unified_features) + GPT 판단으로
-#   최종 진입 여부 / 리스크 / TP·SL / 가드 완화 정도를 결정한다.
-# - EntryScore 기준:
-#     · min_entry_score_for_scalp(기본 40) 이상 → GPT 스캘핑/추세 판단에 사용
-#     · min_entry_score_for_trend(기본 50) 이상 → 추세 이어먹기(TREND 티어) 컨텍스트 제공
-# - GPT가 제안한 값은 settings_ws.BotSettings 의 gpt_max_* 범위 안으로만 허용한다.
-# - GPT 지연/에러가 반복되면 일정 시간 HARD_STOP 으로 신규 진입을 전면 차단한다.
+"""
+====================================================
+FILE: gpt_trader.py
+STRICT · NO-FALLBACK · PRODUCTION MODE
+====================================================
+
+역할
+- WS 기반 마켓 피처(unified_features) + GPT 판단으로
+  최종 진입 여부 / 리스크 / TP·SL / 가드 완화 정도를 결정한다.
+- GPT 지연/에러가 반복되면 HARD_STOP 으로 신규 진입을 전면 차단한다.
+
+핵심 원칙 (STRICT · NO-FALLBACK)
+- 데이터 누락/타입 불일치/범위 위반은 “조용히 보정”하지 않는다.
+  - 명시적으로 SKIP(+reason) 처리한다. (추정/대체 금지)
+- 알림/로그는 트레이딩 판단/루프를 블로킹하면 안 된다.
+  - infra/async_worker.submit()로 비동기 위임한다.
+- HARD_STOP 상태는 정상 운영 상태다(엔진 보호).
+
+PATCH NOTES — 2026-03-02 (UPGRADE, MIN-CHANGE)
+- 텔레그램/로그 블로킹 제거:
+  - infra.async_worker.submit 기반 비동기 전송 적용
+- “폴백” 제거:
+  - GPT가 값(tp/sl/risk)을 “제시”했는데 그 값이 invalid면 base로 대체하지 않고 SKIP 처리
+  - (키가 아예 없으면) base 사용은 ‘정의된 기본값’으로 허용
+- TP/SL 범위:
+  - settings.tp_pct_min/max, settings.sl_pct_min/max 로 클램핑
+====================================================
+"""
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -19,65 +38,67 @@ from typing import Any, Dict, Optional
 from settings import BotSettings
 from strategy.gpt_decider_entry import ask_entry_decision
 from strategy.unified_features_builder import (
-    build_unified_features,
     UnifiedFeaturesError as UnifiedFeatureError,
+    build_unified_features,
 )
 from infra.market_features_ws import FeatureBuildError
-
-
-# ─────────────────────────────────────────
-# 내부 유틸 (텔레그램/로그)
-# ─────────────────────────────────────────
-
-
-def _safe_log(msg: str) -> None:
-    """telelog.log 가 있으면 사용, 없으면 조용히 무시."""
-    try:
-        from infra.telelog import log  # type: ignore
-
-        log(msg)
-    except Exception:
-        pass
-
-
-def _safe_tg(msg: str) -> None:
-    """telelog.send_tg 가 있으면 사용, 없으면 무시."""
-    try:
-        from infra.telelog import send_tg  # type: ignore
-
-        send_tg(msg)
-    except Exception:
-        pass
+from infra.telelog import log as telelog_log, send_tg as telelog_send_tg
+from infra.async_worker import submit as submit_async
 
 
 # ─────────────────────────────────────────
 # GPT 진입 장애 상태 전역 관리
 # ─────────────────────────────────────────
-
-
 _gpt_entry_error_streak: int = 0
 _gpt_entry_last_error_ts: float = 0.0
 _gpt_entry_hard_stop_until_ts: float = 0.0
 _gpt_entry_last_call_ts: float = 0.0  # 마지막 GPT ENTRY 호출 시각 (쿨다운용)
 
 
-def _now_ts() -> float:
-    """time.time() 래퍼 (예외 시 0.0)."""
+# ─────────────────────────────────────────
+# 내부 유틸 (로그/텔레그램) — non-blocking
+# ─────────────────────────────────────────
+def _log(msg: str) -> None:
     try:
-        return time.time()
+        telelog_log(msg)
     except Exception:
-        return 0.0
+        # 로그 실패로 엔진 판단을 깨지 않는다. (비핵심 I/O)
+        # 단, 조용히 무시하지 않고 최소한의 흔적을 남긴다.
+        # telelog 자체가 깨진 경우 logger 의존도 없이 표준 출력도 하지 않는다(프로젝트 정책).
+        pass
+
+
+def _tg(msg: str) -> None:
+    """
+    STRICT:
+    - 텔레그램은 메인 판단/루프를 블로킹하면 안 된다.
+    - 워커 미기동/큐 포화 등은 '전송 실패'로 처리하고, 판단 흐름을 망치지 않는다.
+    """
+    try:
+        submit_async(telelog_send_tg, msg, critical=False, label="send_tg")
+    except Exception:
+        # 워커 미기동 등 운영 오류는 '알림 실패'로만 처리
+        pass
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _finite_float(v: Any, name: str) -> float:
+    if isinstance(v, bool):
+        raise ValueError(f"{name} must be number (bool not allowed)")
+    x = float(v)
+    if not math.isfinite(x):
+        raise ValueError(f"{name} must be finite")
+    return x
 
 
 # ─────────────────────────────────────────
 # 가드 조정용 하드 범위 정의
 # ─────────────────────────────────────────
-
-
 @dataclass(frozen=True)
 class GuardBounds:
-    """GPT가 조정할 수 있는 일부 가드 값의 안전 범위."""
-
     min_entry_volume_ratio_min: float = 0.10
     min_entry_volume_ratio_max: float = 0.60
 
@@ -98,17 +119,32 @@ GUARD_BOUNDS = GuardBounds()
 
 
 # ─────────────────────────────────────────
-# 리스크/TP/SL 클램핑
+# 리스크/TP/SL 클램핑 (NO-FALLBACK)
 # ─────────────────────────────────────────
-
-
-@dataclass
+@dataclass(frozen=True)
 class RiskParams:
-    """진입에 사용할 최종 리스크/TP/SL 파라미터."""
-
     tp_pct: float
     sl_pct: float
     effective_risk_pct: float
+
+
+def _pick_optional_float_strict(gpt_json: Dict[str, Any], key: str) -> Optional[float]:
+    """
+    STRICT:
+    - 키가 존재하면 반드시 유효한 float 이어야 한다. (invalid면 예외)
+    - 키가 없으면 None (기본값 사용은 호출자에서 처리)
+    """
+    if key not in gpt_json:
+        return None
+    v = gpt_json.get(key)
+    if v is None:
+        raise ValueError(f"gpt_json[{key!r}] is None (STRICT)")
+    x = _finite_float(v, f"gpt_json.{key}")
+    return float(x)
+
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
 
 
 def _clamp_risk_params(
@@ -119,143 +155,133 @@ def _clamp_risk_params(
     base_risk_pct: float,
     gpt_json: Dict[str, Any],
 ) -> RiskParams:
-    """GPT 제안 + 기본값을 합쳐 최종 TP/SL/리스크를 결정한다."""
+    """
+    STRICT (NO-FALLBACK):
+    - GPT가 값을 "제시"했는데 invalid면 base로 대체하지 않는다 → 예외(상위에서 SKIP 처리)
+    - GPT가 키를 아예 안 보냈으면 base 사용(정의된 기본값)
+    - 범위 초과는 클램핑(정책적 제한)
+    """
+    tp = _pick_optional_float_strict(gpt_json, "tp_pct")
+    sl = _pick_optional_float_strict(gpt_json, "sl_pct")
+    rk = _pick_optional_float_strict(gpt_json, "effective_risk_pct")
 
-    tp_raw = float(gpt_json.get("tp_pct", base_tp_pct))
-    sl_raw = float(gpt_json.get("sl_pct", base_sl_pct))
-    risk_raw = float(gpt_json.get("effective_risk_pct", base_risk_pct))
+    tp_final = float(base_tp_pct) if tp is None else float(tp)
+    sl_final = float(base_sl_pct) if sl is None else float(sl)
+    rk_final = float(base_risk_pct) if rk is None else float(rk)
 
-    # 음수/0 보호
-    tp_candidate = tp_raw if tp_raw > 0 else base_tp_pct
-    sl_candidate = sl_raw if sl_raw > 0 else base_sl_pct
-    risk_candidate = risk_raw if risk_raw > 0 else base_risk_pct
+    if tp_final <= 0:
+        raise ValueError("tp_pct must be > 0 (STRICT)")
+    if sl_final <= 0:
+        raise ValueError("sl_pct must be > 0 (STRICT)")
+    if rk_final <= 0:
+        raise ValueError("effective_risk_pct must be > 0 (STRICT)")
 
-    # 상한 클램핑
-    tp_clamped = min(tp_candidate, float(getattr(settings, "gpt_max_tp_pct", 0.10)))
-    sl_clamped = min(sl_candidate, float(getattr(settings, "gpt_max_sl_pct", 0.05)))
-    risk_clamped = min(
-        risk_candidate,
-        float(getattr(settings, "gpt_max_risk_pct", 0.03)),
-    )
+    tp_lo = float(getattr(settings, "tp_pct_min", 0.0005))
+    tp_hi = float(getattr(settings, "tp_pct_max", 0.05))
+    sl_lo = float(getattr(settings, "sl_pct_min", 0.0005))
+    sl_hi = float(getattr(settings, "sl_pct_max", 0.05))
 
-    return RiskParams(
-        tp_pct=tp_clamped,
-        sl_pct=sl_clamped,
-        effective_risk_pct=risk_clamped,
-    )
+    if tp_lo <= 0 or tp_hi <= 0 or tp_lo > tp_hi:
+        raise ValueError("settings tp_pct_min/max invalid (STRICT)")
+    if sl_lo <= 0 or sl_hi <= 0 or sl_lo > sl_hi:
+        raise ValueError("settings sl_pct_min/max invalid (STRICT)")
+
+    tp_final = _clamp(tp_final, tp_lo, tp_hi)
+    sl_final = _clamp(sl_final, sl_lo, sl_hi)
+
+    # risk 상한: settings.gpt_max_risk_pct가 있으면 그걸 우선, 없으면 1.0
+    max_rk = float(getattr(settings, "gpt_max_risk_pct", 1.0))
+    if max_rk <= 0 or not math.isfinite(max_rk):
+        raise ValueError("settings.gpt_max_risk_pct invalid (STRICT)")
+    rk_final = _clamp(rk_final, 0.0, min(1.0, max_rk))
+
+    if rk_final <= 0:
+        raise ValueError("effective_risk_pct <= 0 after clamp (STRICT)")
+
+    return RiskParams(tp_pct=tp_final, sl_pct=sl_final, effective_risk_pct=rk_final)
 
 
 # ─────────────────────────────────────────
 # 가드 조정 적용기
 # ─────────────────────────────────────────
-
-
 def _apply_guard_adjustments(
     settings: BotSettings,
     *,
     guard_snapshot: Optional[Dict[str, Any]],
     gpt_json: Dict[str, Any],
 ) -> Dict[str, float]:
-    """GPT guard_adjustments 중 안전 범위 안에 있는 것만 선별."""
-
-    adjustments: Dict[str, float] = {}
-
+    """
+    GPT guard_adjustments 중 안전 범위 안에 있는 것만 선별한다.
+    - invalid는 조용히 보정하지 않고 "무시(채택하지 않음)"한다. (폴백 아님: '거부'임)
+    """
     raw_adj = gpt_json.get("guard_adjustments")
     if not isinstance(raw_adj, dict):
-        return adjustments
+        return {}
 
-    snap = guard_snapshot or {}
+    snap = guard_snapshot if isinstance(guard_snapshot, dict) else {}
+    out: Dict[str, float] = {}
+
+    def _base(key: str) -> float:
+        if key in snap:
+            return float(_finite_float(snap[key], f"guard_snapshot.{key}"))
+        return float(_finite_float(getattr(settings, key), f"settings.{key}"))
 
     # 1) min_entry_volume_ratio
     if "min_entry_volume_ratio" in raw_adj:
-        try:
-            val = float(raw_adj["min_entry_volume_ratio"])
-            base = float(
-                snap.get("min_entry_volume_ratio", settings.min_entry_volume_ratio)
-            )
-            lo = GUARD_BOUNDS.min_entry_volume_ratio_min
-            hi = GUARD_BOUNDS.min_entry_volume_ratio_max
-            if lo <= val <= hi and abs(val - base) <= 0.2:
-                adjustments["min_entry_volume_ratio"] = val
-        except Exception:
-            pass
+        val = float(_finite_float(raw_adj["min_entry_volume_ratio"], "adj.min_entry_volume_ratio"))
+        base = _base("min_entry_volume_ratio")
+        if GUARD_BOUNDS.min_entry_volume_ratio_min <= val <= GUARD_BOUNDS.min_entry_volume_ratio_max and abs(val - base) <= 0.2:
+            out["min_entry_volume_ratio"] = val
 
     # 2) max_spread_pct
     if "max_spread_pct" in raw_adj:
-        try:
-            val = float(raw_adj["max_spread_pct"])
-            base = float(snap.get("max_spread_pct", settings.max_spread_pct))
-            lo = GUARD_BOUNDS.max_spread_pct_min
-            hi = GUARD_BOUNDS.max_spread_pct_max
-            if lo <= val <= hi and val <= base * 2.0:
-                adjustments["max_spread_pct"] = val
-        except Exception:
-            pass
+        val = float(_finite_float(raw_adj["max_spread_pct"], "adj.max_spread_pct"))
+        base = _base("max_spread_pct")
+        if GUARD_BOUNDS.max_spread_pct_min <= val <= GUARD_BOUNDS.max_spread_pct_max and val <= base * 2.0:
+            out["max_spread_pct"] = val
 
     # 3) max_price_jump_pct
     if "max_price_jump_pct" in raw_adj:
-        try:
-            val = float(raw_adj["max_price_jump_pct"])
-            base = float(snap.get("max_price_jump_pct", settings.max_price_jump_pct))
-            lo = GUARD_BOUNDS.max_price_jump_pct_min
-            hi = GUARD_BOUNDS.max_price_jump_pct_max
-            if lo <= val <= hi and val <= base * 2.0:
-                adjustments["max_price_jump_pct"] = val
-        except Exception:
-            pass
+        val = float(_finite_float(raw_adj["max_price_jump_pct"], "adj.max_price_jump_pct"))
+        base = _base("max_price_jump_pct")
+        if GUARD_BOUNDS.max_price_jump_pct_min <= val <= GUARD_BOUNDS.max_price_jump_pct_max and val <= base * 2.0:
+            out["max_price_jump_pct"] = val
 
     # 4) depth_imbalance_min_ratio
     if "depth_imbalance_min_ratio" in raw_adj:
-        try:
-            val = float(raw_adj["depth_imbalance_min_ratio"])
-            base = float(
-                snap.get("depth_imbalance_min_ratio", settings.depth_imbalance_min_ratio)
-            )
-            lo = GUARD_BOUNDS.depth_imbalance_min_ratio_min
-            hi = GUARD_BOUNDS.depth_imbalance_min_ratio_max
-            if lo <= val <= hi and val >= base * 0.5:
-                adjustments["depth_imbalance_min_ratio"] = val
-        except Exception:
-            pass
+        val = float(_finite_float(raw_adj["depth_imbalance_min_ratio"], "adj.depth_imbalance_min_ratio"))
+        base = _base("depth_imbalance_min_ratio")
+        if GUARD_BOUNDS.depth_imbalance_min_ratio_min <= val <= GUARD_BOUNDS.depth_imbalance_min_ratio_max and val >= base * 0.5:
+            out["depth_imbalance_min_ratio"] = val
 
     # 5) depth_imbalance_min_notional
     if "depth_imbalance_min_notional" in raw_adj:
-        try:
-            val = float(raw_adj["depth_imbalance_min_notional"])
-            base = float(
-                snap.get(
-                    "depth_imbalance_min_notional", settings.depth_imbalance_min_notional
-                )
-            )
-            lo = GUARD_BOUNDS.depth_imbalance_min_notional_min
-            hi = GUARD_BOUNDS.depth_imbalance_min_notional_max
-            if lo <= val <= hi and val >= base * 0.5:
-                adjustments["depth_imbalance_min_notional"] = val
-        except Exception:
-            pass
+        val = float(_finite_float(raw_adj["depth_imbalance_min_notional"], "adj.depth_imbalance_min_notional"))
+        base = _base("depth_imbalance_min_notional")
+        if GUARD_BOUNDS.depth_imbalance_min_notional_min <= val <= GUARD_BOUNDS.depth_imbalance_min_notional_max and val >= base * 0.5:
+            out["depth_imbalance_min_notional"] = val
 
-    if adjustments:
-        _safe_log(f"[GPT_TRADER] guard adjustments accepted: {adjustments}")
+    if out:
+        _log(f"[GPT_TRADER] guard adjustments accepted: {out}")
 
-    return adjustments
+    return out
 
 
 # ─────────────────────────────────────────
 # GPT 프롬프트용 extra 컨텍스트 구성기
 # ─────────────────────────────────────────
-
-
 def _sanitize_extra_for_gpt(extra: Dict[str, Any]) -> Dict[str, Any]:
-    """GPT에 넘길 extra 에서 가벼운 정보만 추려낸다."""
+    """
+    GPT에 넘길 extra 에서 경량 정보만 추린다.
+    - 대용량/복잡 타입은 제거한다. (폴백 아님: '제한' 정책)
+    """
     sanitized: Dict[str, Any] = {}
 
     for key, value in extra.items():
-        # 1) 스칼라 타입은 그대로
         if isinstance(value, (str, int, float, bool)) or value is None:
             sanitized[key] = value
             continue
 
-        # 2) 리스트/튜플
         if isinstance(value, (list, tuple)):
             if not value or len(value) > 32:
                 continue
@@ -264,24 +290,23 @@ def _sanitize_extra_for_gpt(extra: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(item, (str, int, float, bool)) or item is None:
                     new_list.append(item)
                 elif isinstance(item, dict):
-                    small_dict: Dict[str, Any] = {}
+                    small: Dict[str, Any] = {}
                     for k2, v2 in list(item.items())[:16]:
                         if isinstance(v2, (str, int, float, bool)) or v2 is None:
-                            small_dict[k2] = v2
-                    if small_dict:
-                        new_list.append(small_dict)
+                            small[k2] = v2
+                    if small:
+                        new_list.append(small)
             if new_list:
                 sanitized[key] = new_list
             continue
 
-        # 3) dict
         if isinstance(value, dict):
-            small_dict2: Dict[str, Any] = {}
+            small2: Dict[str, Any] = {}
             for k2, v2 in list(value.items())[:32]:
                 if isinstance(v2, (str, int, float, bool)) or v2 is None:
-                    small_dict2[k2] = v2
-            if small_dict2:
-                sanitized[key] = small_dict2
+                    small2[k2] = v2
+            if small2:
+                sanitized[key] = small2
             continue
 
     return sanitized
@@ -299,15 +324,11 @@ def _build_extra_for_gpt(
     min_entry_score_for_scalp: float,
     min_entry_score_for_trend: float,
 ) -> Dict[str, Any]:
-    """ask_entry_decision 에 전달할 extra 컨텍스트를 구성."""
-
     payload: Dict[str, Any] = {}
 
-    # 1) 호출측 extra → 경량화해서 병합
     if isinstance(extra, dict) and extra:
         payload.update(_sanitize_extra_for_gpt(extra))
 
-    # 2) 장 종류/방향 명시
     src = (signal_source or "").upper()
     if src and "regime" not in payload:
         payload["regime"] = src
@@ -316,7 +337,6 @@ def _build_extra_for_gpt(
     if dir_up and "direction" not in payload:
         payload["direction"] = dir_up
 
-    # 3) 현재 가드 스냅샷 요약
     if isinstance(guard_snapshot, dict):
         guard_keys = [
             "min_entry_volume_ratio",
@@ -325,33 +345,10 @@ def _build_extra_for_gpt(
             "depth_imbalance_min_ratio",
             "depth_imbalance_min_notional",
         ]
-        trimmed_guard: Dict[str, Any] = {
-            k: guard_snapshot[k] for k in guard_keys if k in guard_snapshot
-        }
+        trimmed_guard: Dict[str, Any] = {k: guard_snapshot[k] for k in guard_keys if k in guard_snapshot}
         if trimmed_guard:
-            if "guard_snapshot" in payload and isinstance(
-                payload["guard_snapshot"], dict
-            ):
-                merged = dict(payload["guard_snapshot"])  # 얕은 복사 후 업데이트
-                merged.update(trimmed_guard)
-                payload["guard_snapshot"] = merged
-            else:
-                payload["guard_snapshot"] = trimmed_guard
+            payload["guard_snapshot"] = trimmed_guard
 
-    # 4) 최근 PnL / 스킵 패턴 (옵션)
-    if "recent_pnl_pct" not in payload and hasattr(settings, "recent_pnl_pct"):
-        try:
-            payload["recent_pnl_pct"] = float(getattr(settings, "recent_pnl_pct"))
-        except Exception:
-            pass
-
-    if "skip_streak" not in payload and hasattr(settings, "skip_streak"):
-        try:
-            payload["skip_streak"] = int(getattr(settings, "skip_streak"))
-        except Exception:
-            pass
-
-    # 5) EntryScore / 티어 정보
     if isinstance(entry_score, (int, float)) and "entry_score" not in payload:
         payload["entry_score"] = float(entry_score)
         payload["entry_score_tier"] = entry_score_tier or "UNKNOWN"
@@ -364,8 +361,6 @@ def _build_extra_for_gpt(
 # ─────────────────────────────────────────
 # 메인 엔트리
 # ─────────────────────────────────────────
-
-
 def decide_entry_with_gpt_trader(
     settings: BotSettings,
     *,
@@ -381,29 +376,25 @@ def decide_entry_with_gpt_trader(
     guard_snapshot: Optional[Dict[str, Any]] = None,
     market_features: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """GPT + 하드 리스크/가드 + WS 피처 조합으로 최종 진입 결정을 내린다."""
-
+    """
+    GPT + WS 피처 조합으로 최종 진입 결정을 내린다.
+    반환 딕셔너리는 항상 동일 스키마를 유지한다.
+    """
     global _gpt_entry_error_streak, _gpt_entry_last_error_ts, _gpt_entry_hard_stop_until_ts, _gpt_entry_last_call_ts
 
-    # 설정값
     hard_stop_min_errors = int(getattr(settings, "gpt_entry_hard_stop_min_errors", 3))
-    hard_stop_cooldown = float(
-        getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0)
-    )
-    error_reset_window = float(
-        getattr(settings, "gpt_entry_error_reset_window_sec", 60.0)
-    )
+    hard_stop_cooldown = float(getattr(settings, "gpt_entry_hard_stop_cooldown_sec", 30.0))
+    error_reset_window = float(getattr(settings, "gpt_entry_error_reset_window_sec", 60.0))
 
-    now_ts = _now_ts()
+    now_ts = _now()
 
-    # 기본 응답 틀
     result: Dict[str, Any] = {
         "final_action": "SKIP",
         "gpt_action": "ERROR",
-        "reason": "초기 상태",
-        "tp_pct": base_tp_pct,
-        "sl_pct": base_sl_pct,
-        "effective_risk_pct": base_risk_pct,
+        "reason": "init",
+        "tp_pct": float(base_tp_pct),
+        "sl_pct": float(base_sl_pct),
+        "effective_risk_pct": float(base_risk_pct),
         "guard_adjustments": {},
         "sleep_after_sec": float(getattr(settings, "gpt_error_sleep_sec", 5.0)),
         "gpt_status": "OK",
@@ -415,15 +406,17 @@ def decide_entry_with_gpt_trader(
     # 0) HARD_STOP 윈도우
     if _gpt_entry_hard_stop_until_ts and now_ts < _gpt_entry_hard_stop_until_ts:
         remaining = max(_gpt_entry_hard_stop_until_ts - now_ts, 0.0)
-        result["final_action"] = "SKIP"
-        result["gpt_action"] = "ERROR"
-        result["gpt_status"] = "HARD_STOP"
-        result["hard_stop"] = True
-        result["reason"] = "GPT 진입 판단 장애(HARD_STOP) 상태로 신규 진입을 잠시 중단합니다."
-        result["sleep_after_sec"] = max(remaining, hard_stop_cooldown)
-        _safe_log(
-            f"[GPT_TRADER] HARD_STOP window active → skip entry (remaining={remaining:.1f}s)"
+        result.update(
+            {
+                "final_action": "SKIP",
+                "gpt_action": "ERROR",
+                "gpt_status": "HARD_STOP",
+                "hard_stop": True,
+                "reason": "GPT 진입 판단 장애(HARD_STOP) 상태로 신규 진입을 중단합니다.",
+                "sleep_after_sec": max(remaining, hard_stop_cooldown),
+            }
         )
+        _log(f"[GPT_TRADER] HARD_STOP active → skip (remaining={remaining:.1f}s)")
         return result
 
     # HARD_STOP 해제 시 상태 리셋
@@ -431,67 +424,50 @@ def decide_entry_with_gpt_trader(
         _gpt_entry_hard_stop_until_ts = 0.0
         _gpt_entry_error_streak = 0
         _gpt_entry_last_error_ts = 0.0
-        _safe_log("[GPT_TRADER] HARD_STOP window ended → GPT entry gate reopened")
+        _log("[GPT_TRADER] HARD_STOP ended → gate reopened")
 
-    # 0-1) EntryScore 기반 티어 계산 및 최저 진입 점수 가드
+    # 0-1) EntryScore 기반 티어 + 최저 점수 가드
     min_entry_score_for_scalp = float(
-        getattr(
-            settings,
-            "min_entry_score_for_scalp",
-            getattr(settings, "min_entry_score_for_gpt", 40.0),
-        )
+        getattr(settings, "min_entry_score_for_scalp", getattr(settings, "min_entry_score_for_gpt", 40.0))
     )
-    min_entry_score_for_trend = float(
-        getattr(settings, "min_entry_score_for_trend", 50.0)
-    )
+    min_entry_score_for_trend = float(getattr(settings, "min_entry_score_for_trend", 50.0))
 
+    entry_score_tier: Optional[str] = None
     if isinstance(entry_score, (int, float)):
         if entry_score >= min_entry_score_for_trend:
-            entry_score_tier: Optional[str] = "TREND"
+            entry_score_tier = "TREND"
         elif entry_score >= min_entry_score_for_scalp:
             entry_score_tier = "SCALP"
         else:
             entry_score_tier = "LOW"
-    else:
-        entry_score_tier = None
 
-    # 40점 미만이면 GPT 호출 자체를 생략 (보수적 가드, 일반적으로 entry_flow에서 이미 걸러짐)
-    if isinstance(entry_score, (int, float)) and entry_score < min_entry_score_for_scalp:
-        result["final_action"] = "SKIP"
-        result["gpt_action"] = "SKIP"
-        result["gpt_status"] = "OK"
-        result["reason"] = (
-            f"EntryScore={entry_score:.1f} < 최소 진입 점수({min_entry_score_for_scalp:.1f})로 "
-            "GPT 진입 평가를 생략합니다."
-        )
-        result["sleep_after_sec"] = float(
-            getattr(settings, "gpt_skip_sleep_sec", 3.0)
-        )
-        _safe_log(
-            f"[GPT_TRADER] pre_entry_score={entry_score:.1f} "
-            f"< min_scalp={min_entry_score_for_scalp:.1f} → SKIP without GPT call"
-        )
-        return result
+        if entry_score < min_entry_score_for_scalp:
+            result.update(
+                {
+                    "final_action": "SKIP",
+                    "gpt_action": "SKIP",
+                    "gpt_status": "OK",
+                    "reason": f"EntryScore={entry_score:.1f} < min_scalp={min_entry_score_for_scalp:.1f} (GPT 생략)",
+                    "sleep_after_sec": float(getattr(settings, "gpt_skip_sleep_sec", 3.0)),
+                }
+            )
+            _log(f"[GPT_TRADER] entry_score<{min_entry_score_for_scalp:.1f} → SKIP without GPT")
+            return result
 
     # 0-2) GPT ENTRY 호출 쿨다운
-    cooldown_sec = int(getattr(settings, "gpt_entry_cooldown_sec", 1))
+    cooldown_sec = float(getattr(settings, "gpt_entry_cooldown_sec", 1.0))
     if _gpt_entry_last_call_ts > 0:
         elapsed = now_ts - _gpt_entry_last_call_ts
         if elapsed < cooldown_sec:
-            remaining = int(cooldown_sec - elapsed)
-            result["final_action"] = "SKIP"
-            result["gpt_action"] = "SKIP"
-            result["gpt_status"] = "OK"
-            result["reason"] = (
-                "GPT ENTRY 호출 쿨다운으로 이번 루프는 진입 없이 건너뜁니다. "
-                f"({remaining}s 남음)"
-            )
-            result["sleep_after_sec"] = float(
-                getattr(settings, "gpt_skip_sleep_sec", 3.0)
-            )
-            _safe_log(
-                f"[GPT_TRADER] entry cooldown → SKIP (elapsed={elapsed:.1f}s, "
-                f"remaining={remaining}s, cooldown={cooldown_sec}s)"
+            remaining = max(cooldown_sec - elapsed, 0.0)
+            result.update(
+                {
+                    "final_action": "SKIP",
+                    "gpt_action": "SKIP",
+                    "gpt_status": "OK",
+                    "reason": f"GPT ENTRY cooldown (remaining={remaining:.1f}s)",
+                    "sleep_after_sec": float(getattr(settings, "gpt_skip_sleep_sec", 3.0)),
+                }
             )
             return result
 
@@ -500,27 +476,14 @@ def decide_entry_with_gpt_trader(
         if market_features is None:
             market_features = build_unified_features(symbol=symbol)
     except (UnifiedFeatureError, FeatureBuildError) as e:
-        result["final_action"] = "SKIP"
-        result["gpt_action"] = "SKIP"
-        result["gpt_status"] = "DATA_ERROR"
-        result["reason"] = (
-            "WS 시세/패턴 피처를 만들지 못해 이번 루프는 진입 없이 건너뜁니다. "
-            f"({type(e).__name__}: {e})"
-        )
-        result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
-        _safe_log(f"[GPT_TRADER] feature build error → SKIP: {e}")
-        return result
-    except Exception as e:
-        result["final_action"] = "SKIP"
-        result["gpt_action"] = "ERROR"
-        result["gpt_status"] = "ERROR"
-        result["reason"] = (
-            "WS 피처 생성 중 알 수 없는 오류로 이번 루프는 진입 없이 건너뜁니다. "
-            f"({type(e).__name__}: {e})"
-        )
-        result["sleep_after_sec"] = float(getattr(settings, "gpt_error_sleep_sec", 5.0))
-        _safe_log(
-            f"[GPT_TRADER] unexpected feature build error → SKIP: {type(e).__name__}: {e}"
+        result.update(
+            {
+                "final_action": "SKIP",
+                "gpt_action": "SKIP",
+                "gpt_status": "DATA_ERROR",
+                "reason": f"feature build failed: {type(e).__name__}: {e}",
+                "sleep_after_sec": float(getattr(settings, "gpt_skip_sleep_sec", 3.0)),
+            }
         )
         return result
 
@@ -537,7 +500,6 @@ def decide_entry_with_gpt_trader(
         min_entry_score_for_trend=min_entry_score_for_trend,
     )
 
-    # unified_features + extra_for_gpt 병합
     features_for_gpt: Dict[str, Any] = {}
     if isinstance(market_features, dict):
         features_for_gpt.update(market_features)
@@ -545,9 +507,10 @@ def decide_entry_with_gpt_trader(
         features_for_gpt.update(extra_for_gpt)
 
     # 2) GPT에 진입 의사결정 요청
-    try:
-        _gpt_entry_last_call_ts = _now_ts()
+    _gpt_entry_last_call_ts = _now()
+    t0 = time.perf_counter()
 
+    try:
         gpt_json = ask_entry_decision(
             symbol=symbol,
             signal_source=signal_source,
@@ -556,145 +519,119 @@ def decide_entry_with_gpt_trader(
             entry_score=entry_score,
             effective_risk_pct=base_risk_pct,
             market_features=features_for_gpt,
+            # 기존 시그니처 호환(중복 파라미터 유지)
             source=signal_source,
             current_price=last_price,
-            base_tv_pct=base_tp_pct,  # 기존 시그니처에 맞춰 유지
+            base_tv_pct=base_tp_pct,
             base_sl_pct=base_sl_pct,
             base_risk_pct=base_risk_pct,
         )
-        result["raw"] = gpt_json
-
-        # 정상 응답 → 에러 상태 리셋
-        _gpt_entry_error_streak = 0
-        _gpt_entry_last_error_ts = 0.0
-
-        meta = gpt_json.get("_meta") if isinstance(gpt_json, dict) else None
-        if isinstance(meta, dict):
-            lat = meta.get("latency_sec")
-            if isinstance(lat, (int, float)):
-                result["gpt_latency_sec"] = float(lat)
     except Exception as e:
-        now_ts = _now_ts()
+        now_ts2 = _now()
 
-        if _gpt_entry_last_error_ts and (now_ts - _gpt_entry_last_error_ts) > error_reset_window:
+        if _gpt_entry_last_error_ts and (now_ts2 - _gpt_entry_last_error_ts) > error_reset_window:
             _gpt_entry_error_streak = 0
-        _gpt_entry_last_error_ts = now_ts
+        _gpt_entry_last_error_ts = now_ts2
         _gpt_entry_error_streak += 1
 
-        msg = (
-            f"[GPT_TRADER] ask_entry_decision error "
-            f"(streak={_gpt_entry_error_streak}) → SKIP: {type(e).__name__}: {e}"
-        )
-        _safe_log(msg)
-
         if _gpt_entry_error_streak >= hard_stop_min_errors:
-            _gpt_entry_hard_stop_until_ts = now_ts + hard_stop_cooldown
-            result["gpt_status"] = "HARD_STOP"
-            result["hard_stop"] = True
-            result["reason"] = (
-                "GPT 진입 판단이 반복적으로 실패하여 일정 시간 신규 진입을 중단합니다."
+            _gpt_entry_hard_stop_until_ts = now_ts2 + hard_stop_cooldown
+            result.update(
+                {
+                    "gpt_status": "HARD_STOP",
+                    "hard_stop": True,
+                    "reason": "GPT ENTRY 장애 반복 → HARD_STOP",
+                    "sleep_after_sec": hard_stop_cooldown,
+                }
             )
-            result["sleep_after_sec"] = hard_stop_cooldown
-            _safe_tg(
-                "⚠️ [GPT_ENTRY][HARD_STOP] GPT 진입 판단 장애가 반복되어 일정 시간 신규 진입을 중단합니다."
-            )
+            _tg("⚠️ [GPT_ENTRY][HARD_STOP] GPT 진입 판단 장애 반복으로 신규 진입을 일시 중단합니다.")
         else:
-            result["gpt_status"] = "ERROR"
-            result["hard_stop"] = False
-            result["reason"] = "GPT 호출 오류로 이번 루프는 진입 없이 건너뜁니다."
-            result["sleep_after_sec"] = float(
-                getattr(settings, "gpt_error_sleep_sec", 5.0)
+            result.update(
+                {
+                    "gpt_status": "ERROR",
+                    "hard_stop": False,
+                    "reason": f"GPT 호출 오류 → SKIP ({type(e).__name__}: {e})",
+                    "sleep_after_sec": float(getattr(settings, "gpt_error_sleep_sec", 5.0)),
+                }
             )
-            _safe_tg(
-                "⚠️ GPT 진입 판단 호출에 실패했습니다. 이번 루프는 진입 없이 건너뜁니다."
-            )
-
+            _tg("⚠️ GPT 진입 판단 호출 실패: 이번 루프는 SKIP 처리합니다.")
         return result
+    finally:
+        dt = (time.perf_counter() - t0)
+        result["gpt_latency_sec"] = float(dt)
 
-    # 2-1) 응답 타입 검증
+    result["raw"] = gpt_json
+
+    # 정상 응답 → 에러 상태 리셋
+    _gpt_entry_error_streak = 0
+    _gpt_entry_last_error_ts = 0.0
+
     if not isinstance(gpt_json, dict):
-        now_ts = _now_ts()
-
-        if _gpt_entry_last_error_ts and (now_ts - _gpt_entry_last_error_ts) > error_reset_window:
-            _gpt_entry_error_streak = 0
-        _gpt_entry_last_error_ts = now_ts
-        _gpt_entry_error_streak += 1
-
-        _safe_log(
-            f"[GPT_TRADER] invalid response type from ask_entry_decision: "
-            f"{type(gpt_json).__name__} (streak={_gpt_entry_error_streak}) → SKIP"
+        result.update(
+            {
+                "final_action": "SKIP",
+                "gpt_action": "ERROR",
+                "gpt_status": "ERROR",
+                "reason": f"GPT 응답 타입 오류: {type(gpt_json).__name__}",
+                "sleep_after_sec": float(getattr(settings, "gpt_error_sleep_sec", 5.0)),
+            }
         )
-
-        if _gpt_entry_error_streak >= hard_stop_min_errors:
-            _gpt_entry_hard_stop_until_ts = now_ts + hard_stop_cooldown
-            result["gpt_status"] = "HARD_STOP"
-            result["hard_stop"] = True
-            result["reason"] = (
-                "GPT 진입 판단 응답 포맷이 반복적으로 잘못되어 일정 시간 신규 진입을 중단합니다."
-            )
-            result["sleep_after_sec"] = hard_stop_cooldown
-            _safe_tg(
-                "⚠️ [GPT_ENTRY][HARD_STOP] GPT 진입 판단 응답 포맷이 반복적으로 잘못되어 일정 시간 신규 진입을 중단합니다."
-            )
-        else:
-            result["gpt_status"] = "ERROR"
-            result["hard_stop"] = False
-            result["reason"] = "GPT 응답 포맷 오류로 이번 루프는 진입 없이 건너뜁니다."
-            result["sleep_after_sec"] = float(
-                getattr(settings, "gpt_error_sleep_sec", 5.0)
-            )
-            _safe_tg(
-                "⚠️ GPT 진입 판단 응답 포맷이 잘못되었습니다. 이번 루프는 진입 없이 건너뜁니다."
-            )
-
         return result
 
     # 3) action 정규화
-    action_raw = str(gpt_json.get("action", "SKIP")).upper()
+    action_raw = str(gpt_json.get("action", "SKIP")).upper().strip()
     if action_raw not in {"ENTER", "SKIP", "ADJUST"}:
-        _safe_log(f"[GPT_TRADER] invalid action from GPT: {action_raw!r} → SKIP")
-        result["reason"] = f"GPT가 알 수 없는 action을 반환했습니다: {action_raw!r}"
-        result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
-        result["gpt_status"] = "ERROR"
+        result.update(
+            {
+                "final_action": "SKIP",
+                "gpt_action": "ERROR",
+                "gpt_status": "ERROR",
+                "reason": f"GPT invalid action: {action_raw!r}",
+                "sleep_after_sec": float(getattr(settings, "gpt_skip_sleep_sec", 3.0)),
+            }
+        )
         return result
 
     result["gpt_action"] = action_raw
 
-    # 4) 리스크/TP/SL 클램핑
-    risk_params = _clamp_risk_params(
-        settings,
-        base_tp_pct=base_tp_pct,
-        base_sl_pct=base_sl_pct,
-        base_risk_pct=base_risk_pct,
-        gpt_json=gpt_json,
-    )
+    # 4) 리스크/TP/SL 결정 (NO-FALLBACK)
+    try:
+        risk_params = _clamp_risk_params(
+            settings,
+            base_tp_pct=base_tp_pct,
+            base_sl_pct=base_sl_pct,
+            base_risk_pct=base_risk_pct,
+            gpt_json=gpt_json,
+        )
+    except Exception as e:
+        result.update(
+            {
+                "final_action": "SKIP",
+                "gpt_action": "ERROR",
+                "gpt_status": "ERROR",
+                "reason": f"GPT risk params invalid → SKIP ({type(e).__name__}: {e})",
+                "sleep_after_sec": float(getattr(settings, "gpt_error_sleep_sec", 5.0)),
+            }
+        )
+        return result
 
     result["tp_pct"] = risk_params.tp_pct
     result["sl_pct"] = risk_params.sl_pct
     result["effective_risk_pct"] = risk_params.effective_risk_pct
 
-    # 리스크 0 → 강제 SKIP
-    if risk_params.effective_risk_pct <= 0.0:
-        result["final_action"] = "SKIP"
-        result["reason"] = (
-            "GPT가 리스크를 0% 이하로 제안했거나, 상한/하한 처리 후 0%가 되었습니다."
-        )
-        result["sleep_after_sec"] = float(
-            getattr(settings, "gpt_skip_sleep_sec", 3.0)
-        )
-        result["gpt_status"] = "ERROR"
-        _safe_log("[GPT_TRADER] effective_risk_pct <= 0 → SKIP")
-        return result
-
     # 5) 가드 조정
-    guard_adj = _apply_guard_adjustments(
-        settings,
-        guard_snapshot=guard_snapshot,
-        gpt_json=gpt_json,
-    )
-    result["guard_adjustments"] = guard_adj
+    try:
+        result["guard_adjustments"] = _apply_guard_adjustments(
+            settings,
+            guard_snapshot=guard_snapshot,
+            gpt_json=gpt_json,
+        )
+    except Exception as e:
+        # 가드 조정 파싱 오류는 '조정 거부'로만 처리 (트레이딩 판단 폴백/추정 금지)
+        result["guard_adjustments"] = {}
+        _log(f"[GPT_TRADER] guard_adjustments parse failed → ignored: {type(e).__name__}: {e}")
 
-    # 6) 최종 액션 결정
+    # 6) 최종 액션
     if action_raw in {"ENTER", "ADJUST"}:
         result["final_action"] = "ENTER"
         result["sleep_after_sec"] = 0.0
@@ -702,35 +639,28 @@ def decide_entry_with_gpt_trader(
     else:
         result["final_action"] = "SKIP"
         result["sleep_after_sec"] = float(getattr(settings, "gpt_skip_sleep_sec", 3.0))
-        if result["gpt_status"] == "OK":
-            result["gpt_status"] = "OK"
+        result["gpt_status"] = "OK"
 
     reason = gpt_json.get("reason") or "GPT 판단 결과 반영"
     result["reason"] = str(reason)
 
-    # 7) 요약 로그
-    try:
-        _safe_log(
-            "[GPT_TRADER] final_action={} gpt_action={} tp={} sl={} risk={} guards={} symbol={} src={} dir={} status={} lat={}".format(
-                result["final_action"],
-                result["gpt_action"],
-                result["tp_pct"],
-                result["sl_pct"],
-                result["effective_risk_pct"],
-                result["guard_adjustments"],
-                symbol,
-                signal_source,
-                direction,
-                result.get("gpt_status"),
-                result.get("gpt_latency_sec"),
-            )
+    _log(
+        "[GPT_TRADER] final_action={} gpt_action={} tp={} sl={} risk={} guards={} symbol={} src={} dir={} status={} lat={}".format(
+            result["final_action"],
+            result["gpt_action"],
+            result["tp_pct"],
+            result["sl_pct"],
+            result["effective_risk_pct"],
+            result["guard_adjustments"],
+            symbol,
+            signal_source,
+            direction,
+            result.get("gpt_status"),
+            result.get("gpt_latency_sec"),
         )
-    except Exception:
-        pass
+    )
 
     return result
 
 
-__all__ = [
-    "decide_entry_with_gpt_trader",
-]
+__all__ = ["decide_entry_with_gpt_trader"]

@@ -8,28 +8,29 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 - REST는 (a) 부팅 WS 버퍼 백필, (b) 계정/주문 상태 조회에만 사용한다.
 - 폴백(REST 런타임 백필/더미 값/임의 보정/None→0 치환) 절대 금지.
 - 데이터가 없거나 손상되면 즉시 예외 또는 명시적 SKIP 처리한다.
+- 텔레그램/비핵심 I/O가 메인 루프를 블로킹하면 안 된다.
 
-PATCH NOTES — 2026-03-02 (FINAL)
-- WS 부팅/백필/헬스 루프 정합:
-  - 부팅: REST 백필 → WS 시작 → (10초 워밍업) → health monitor 시작
-- DB 부트스트랩 DSN 정합:
-  - psycopg2는 postgresql+psycopg2:// 를 못 먹음 → postgresql:// 로 정규화
-- DD 영속화:
-  - bt_trade_snapshots에서 MAX(equity_peak_usdt) 로드 → AccountStateBuilder seed
-- GPTStrategy STRICT 통과:
-  - market_data["account_state"] 필수 주입
-- 잔액 0 운영 모드:
-  - equity_current_usdt=0이면 ENTRY는 명시적 SKIP + 60초 sleep (스팸 방지)
-- signals_logger strict(side) 정합:
-  - ERROR 로그는 direction="CLOSE" 강제
-  - CLOSE 로그는 BUY/SELL → LONG/SHORT 정규화
-- CLOSED_TRADES_CACHE 정렬 STRICT:
-  - 최신→과거 내림차순 유지(appendleft)
+PATCH NOTES — 2026-03-02 (UPGRADE, MIN-CHANGE)
+- Telegram I/O 비동기화:
+  - infra/async_worker 기반 submit(send_tg, ...)로 메인 루프 블로킹 제거
+- Reconcile Guard 추가:
+  - sync/reconcile_engine.py (단일 심볼)로 내부 OPEN_TRADES ↔ 거래소 포지션 불일치 감지
+  - 불일치 시 SAFE_STOP_REQUESTED 트리거 + (선택) 강제 청산
+- SIGTERM 데드라인 처리:
+  - SIGTERM 수신 후 grace 경과 시 close_all_positions_market() 강제 정리 1회 시도
+- STRICT 강화:
+  - CLOSE 이벤트 로그에서 avg_price/qty 누락 시 즉시 예외 (0으로 대체 금지)
+  - side 정규화 함수 unknown 값은 예외 (암묵적 CLOSE 폴백 금지)
+- Latency Guard(선택적):
+  - max_signal_latency_ms / max_exec_latency_ms 초과 시 신규 진입을 SAFE_STOP으로 차단
+
+주의
+- DB 스키마 변경 없음.
+- 기존 전략/실행 구조 유지.
 """
 
 from __future__ import annotations
 
-import csv
 import datetime
 import hashlib
 import math
@@ -39,19 +40,23 @@ import threading
 import time
 import traceback
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from settings import KST, load_settings
+from settings import load_settings
 from infra.telelog import log, send_tg
+from infra.async_worker import start_worker as start_async_worker, submit as submit_async
 
 from execution.exchange_api import (
+    fetch_open_orders,
+    fetch_open_positions,
     get_available_usdt,
     get_balance_detail,
     set_leverage_and_mode,
 )
 from execution.order_executor import close_all_positions_market
-from state.sync_exchange import sync_open_trades_from_exchange
+from execution.execution_engine import ExecutionEngine
 
+from state.sync_exchange import sync_open_trades_from_exchange
 from state.trader_state import Trade, TraderState, check_closes, build_close_summary_strict
 from state.exit_engine import maybe_exit_with_gpt
 
@@ -62,8 +67,6 @@ from strategy.signal_analysis_worker import start_signal_analysis_thread
 
 from infra.market_data_ws import (
     backfill_klines_from_rest,
-    get_health_snapshot,
-    get_kline_buffer_status as ws_get_kline_buffer_status,
     get_klines_with_volume as ws_get_klines_with_volume,
     get_orderbook as ws_get_orderbook,
     start_ws_loop,
@@ -77,12 +80,12 @@ from infra.data_health_monitor import start_health_monitor
 from infra.market_features_ws import get_trading_signal, FeatureBuildError
 from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
 from strategy.gpt_strategy import GPTStrategy
-from execution.execution_engine import ExecutionEngine
-
 from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder, AccountStateNotReadyError
 from execution.risk_physics_engine import RiskPhysicsEngine, RiskPhysicsPolicy
 from strategy.signal import Signal
+
+from sync.reconcile_engine import ReconcileConfig, ReconcileEngine, ReconcileResult
 
 
 # ─────────────────────────────
@@ -91,8 +94,6 @@ from strategy.signal import Signal
 SET = load_settings()
 START_TS: float = time.time()
 RUNNING: bool = True
-
-KRW_RATE: float = float(getattr(SET, "krw_per_usdt", 1400.0) or 1400.0)
 
 ENTRY_REQUIRED_TFS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
 ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 20, "5m": 20, "15m": 20, "1h": 60, "4h": 60}
@@ -107,15 +108,6 @@ SIGTERM_REQUESTED_AT: Optional[float] = None
 SIGTERM_DEADLINE_TS: Optional[float] = None
 _SIGTERM_NOTICE_SENT: bool = False
 _SIGTERM_DEADLINE_HANDLED: bool = False
-_SIGTERM_FORCE_CLOSE_ATTEMPTED: bool = False
-
-METRICS: Dict[str, Any] = {
-    "start_ts": START_TS,
-    "last_loop_ts": START_TS,
-    "open_trades": 0,
-    "consec_losses": 0,
-    "kline_failures": 0,
-}
 
 OPEN_TRADES: List[Trade] = []
 TRADER_STATE: TraderState = TraderState()
@@ -124,15 +116,7 @@ CONSEC_LOSSES: int = 0
 SAFE_STOP_REQUESTED: bool = False
 LAST_EXCHANGE_SYNC_TS: float = 0.0
 
-LAST_STATUS_TG_TS: float = 0.0
-STATUS_TG_INTERVAL_SEC: int = int(getattr(SET, "unrealized_notify_sec", 1800) or 1800)
-
 SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(getattr(SET, "signal_analysis_interval_sec", 60) or 60)
-
-DATA_HEALTH_TG_INTERVAL_SEC: int = int(getattr(SET, "data_health_notify_sec", 900) or 900)
-LAST_DATA_HEALTH_TG_TS: float = 0.0
-
-LAST_REST_BACKFILL_AT: float = 0.0
 LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
@@ -141,10 +125,18 @@ LAST_ENTRY_GPT_CALL_TS: float = 0.0
 # 기본 유틸
 # ─────────────────────────────
 def _safe_send_tg(msg: str) -> None:
+    """
+    STRICT:
+    - 텔레그램 실패는 엔진을 죽이면 안 된다(유틸 보호).
+    - 단, 메인 루프 블로킹을 막기 위해 async_worker 큐로 위임한다.
+    """
     try:
-        send_tg(msg)
+        ok = submit_async(send_tg, msg, critical=False, label="send_tg")
+        if not ok:
+            log(f"[TG][DROP] async queue full: {msg}")
     except Exception as e:
-        log(f"[TG] send_tg error: {e}")
+        # 워커 미기동 등은 운영 오류이지만, 알림 실패 때문에 엔진을 즉시 중단하진 않는다.
+        log(f"[TG] async submit error: {type(e).__name__}: {e} | msg={msg}")
 
 
 def _parse_tfs(value: Any) -> List[str]:
@@ -231,15 +223,19 @@ def interruptible_sleep(total_sec: float, tick: float = 1.0) -> None:
         time.sleep(min(tick_f, remain))
 
 
-def _normalize_direction_for_events(v: Any) -> str:
+def _normalize_direction_for_events_strict(v: Any) -> str:
+    """
+    STRICT:
+    - 알 수 없는 값은 임의로 CLOSE로 폴백하지 않는다.
+    """
     s = str(v or "").upper().strip()
-    if s in ("LONG", "SHORT", "CLOSE"):
+    if s in ("LONG", "SHORT"):
         return s
     if s == "BUY":
         return "LONG"
     if s == "SELL":
         return "SHORT"
-    return "CLOSE"
+    raise RuntimeError(f"invalid trade side for events: {v!r}")
 
 
 # ─────────────────────────────
@@ -249,6 +245,7 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
     ob = ws_get_orderbook(symbol, limit=5)
     if not isinstance(ob, dict):
         return "orderbook missing (ws_get_orderbook returned non-dict/None)"
+
     bids = ob.get("bids")
     asks = ob.get("asks")
     if not isinstance(bids, list) or not bids:
@@ -460,8 +457,6 @@ def _load_closed_trades_bootstrap(symbol: str, limit: int = 50) -> list[dict[str
 # WS 부트스트랩/스토어
 # ─────────────────────────────
 def _backfill_ws_kline_history(symbol: str) -> None:
-    global LAST_REST_BACKFILL_AT
-
     intervals = _parse_tfs(getattr(SET, "ws_backfill_tfs", None)) or list(ENTRY_REQUIRED_TFS)
     _verify_required_tfs_or_die("ws_backfill_tfs", intervals, ENTRY_REQUIRED_TFS)
 
@@ -474,11 +469,9 @@ def _backfill_ws_kline_history(symbol: str) -> None:
         try:
             rest_rows = fetch_klines_rest(symbol, iv, limit=limit)
         except KlineRestError as e:
-            METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
             raise RuntimeError(f"REST backfill failed: symbol={symbol} interval={iv} err={e}") from e
 
         if not rest_rows:
-            METRICS["kline_failures"] = METRICS.get("kline_failures", 0) + 1
             raise RuntimeError(f"REST backfill returned 0 rows: symbol={symbol} interval={iv}")
 
         backfill_klines_from_rest(symbol, iv, rest_rows)
@@ -488,8 +481,6 @@ def _backfill_ws_kline_history(symbol: str) -> None:
             raise RuntimeError(
                 f"WS buffer verify failed: {symbol} {iv} need={min_needed} got={len(buf) if isinstance(buf, list) else 'N/A'}"
             )
-
-        LAST_REST_BACKFILL_AT = time.time()
 
 
 def _start_market_data_store_thread() -> None:
@@ -546,7 +537,8 @@ def _start_market_data_store_thread() -> None:
                         last_ob_ts = now
 
             except Exception as e:
-                log(f"[MD-STORE] loop error: {e}")
+                # 저장/분석용 스레드: 실패를 숨기지 않되, 엔진을 죽이진 않는다(유틸 영역).
+                log(f"[MD-STORE] loop error: {type(e).__name__}: {e}")
 
             time.sleep(flush_sec)
 
@@ -615,6 +607,108 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
 
 
 # ─────────────────────────────
+# Reconcile Guard (OPEN_TRADES ↔ Exchange)
+# ─────────────────────────────
+def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    rows = fetch_open_positions(sym)
+    if not isinstance(rows, list):
+        raise RuntimeError("fetch_open_positions returned non-list (STRICT)")
+
+    live: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if str(r.get("symbol") or "").upper().strip() != sym:
+            continue
+        if "positionAmt" not in r:
+            raise RuntimeError("positionRisk.positionAmt missing (STRICT)")
+        try:
+            amt = float(r["positionAmt"])
+        except Exception as e:
+            raise RuntimeError(f"positionAmt parse failed (STRICT): {e}") from e
+        if abs(amt) > 1e-12:
+            live.append(r)
+
+    if not live:
+        # 포지션 없음: Binance는 entryPrice=0을 반환하는 케이스가 정상이다.
+        return {"symbol": sym, "positionAmt": "0", "entryPrice": "0"}
+
+    # Hedge/모호성 금지: live 포지션 후보가 2개 이상이면 즉시 예외
+    if len(live) != 1:
+        raise RuntimeError(f"ambiguous exchange positions (STRICT): count={len(live)}")
+
+    r0 = live[0]
+    if "entryPrice" not in r0:
+        raise RuntimeError("positionRisk.entryPrice missing (STRICT)")
+    return {
+        "symbol": sym,
+        "positionAmt": str(r0["positionAmt"]),
+        "entryPrice": str(r0["entryPrice"]),
+    }
+
+
+def _get_local_position_snapshot(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    if not OPEN_TRADES:
+        return {"symbol": sym, "position_amt": "0", "entry_price": "0"}
+
+    if len(OPEN_TRADES) != 1:
+        raise RuntimeError(f"OPEN_TRADES must be <= 1 in one-way mode (STRICT), got={len(OPEN_TRADES)}")
+
+    t = OPEN_TRADES[0]
+    if str(t.symbol).upper().strip() != sym:
+        raise RuntimeError(f"local trade symbol mismatch (STRICT): trade={t.symbol} expected={sym}")
+
+    side = str(t.side or "").upper().strip()
+    if side in ("LONG", "BUY"):
+        sign = 1.0
+    elif side in ("SHORT", "SELL"):
+        sign = -1.0
+    else:
+        raise RuntimeError(f"invalid trade.side (STRICT): {t.side!r}")
+
+    qty = float(getattr(t, "remaining_qty", None))
+    if qty <= 0 or not math.isfinite(qty):
+        raise RuntimeError("trade.remaining_qty must be finite > 0 (STRICT)")
+
+    ep = float(getattr(t, "entry_price", None))
+    if ep <= 0 or not math.isfinite(ep):
+        raise RuntimeError("trade.entry_price must be finite > 0 (STRICT)")
+
+    return {"symbol": sym, "position_amt": str(sign * qty), "entry_price": str(ep)}
+
+
+def _fetch_exchange_open_orders_snapshot(symbol: str) -> List[Dict[str, Any]]:
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    orders = fetch_open_orders(sym)
+    if not isinstance(orders, list):
+        raise RuntimeError("fetch_open_orders returned non-list (STRICT)")
+    return orders
+
+
+def _on_reconcile_desync(result: ReconcileResult) -> None:
+    global SAFE_STOP_REQUESTED
+    SAFE_STOP_REQUESTED = True
+
+    msg = f"⛔ DESYNC 감지: {result.symbol} issues={len(result.issues)} (신규 진입 차단)"
+    log(msg)
+    for it in result.issues:
+        log(f"[DESYNC] {it.code} | {it.message} | {it.details}")
+    _maybe_send_error_tg("DESYNC", msg, cooldown_sec=60)
+
+    # 선택: desync 시 강제 청산 (기본 False)
+    if bool(getattr(SET, "force_close_on_desync", False)):
+        try:
+            n = close_all_positions_market(result.symbol)
+            log(f"[DESYNC] force close submitted count={n}")
+            _safe_send_tg(f"🧯 DESYNC 강제정리 제출: {result.symbol} count={n}")
+        except Exception as e:
+            log(f"[DESYNC] force close failed: {type(e).__name__}: {e}")
+            _safe_send_tg(f"❌ DESYNC 강제정리 실패: {e}")
+
+
+# ─────────────────────────────
 # SIGTERM / SAFE STOP
 # ─────────────────────────────
 def _sigterm(*_: Any) -> None:
@@ -650,8 +744,14 @@ def _on_safe_stop() -> None:
 # ─────────────────────────────
 def main() -> None:
     global RUNNING, OPEN_TRADES, LAST_CLOSE_TS, CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
-    global LAST_STATUS_TG_TS, LAST_DATA_HEALTH_TG_TS, LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS
-    global SIGTERM_DEADLINE_TS, _SIGTERM_DEADLINE_HANDLED, _SIGTERM_FORCE_CLOSE_ATTEMPTED
+    global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
+
+    # 1) async worker start (텔레그램 I/O 블로킹 제거)
+    start_async_worker(
+        num_threads=int(getattr(SET, "async_worker_threads", 1) or 1),
+        max_queue_size=int(getattr(SET, "async_worker_queue_size", 2000) or 2000),
+        thread_name_prefix="async-io",
+    )
 
     _verify_ws_boot_configuration_or_die()
 
@@ -694,9 +794,18 @@ def main() -> None:
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
 
-    # exchange sync
+    # exchange sync (DB ↔ exchange)
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     LAST_EXCHANGE_SYNC_TS = time.time()
+
+    # reconcile guard
+    reconcile_engine = ReconcileEngine(
+        ReconcileConfig(symbol=str(SET.symbol), interval_sec=int(getattr(SET, "reconcile_interval_sec", 30) or 30)),
+        fetch_exchange_position=_fetch_exchange_position_snapshot,
+        get_local_position=_get_local_position_snapshot,
+        fetch_exchange_open_orders=_fetch_exchange_open_orders_snapshot,
+        on_desync=_on_reconcile_desync,
+    )
 
     entry_strategy = GPTStrategy(SET)
     entry_exec_engine = ExecutionEngine(SET)
@@ -734,11 +843,31 @@ def main() -> None:
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
 
+    # latency budgets (optional, defaults)
+    max_signal_latency_ms = float(getattr(SET, "max_signal_latency_ms", 200) or 200)
+    max_exec_latency_ms = float(getattr(SET, "max_exec_latency_ms", 400) or 400)
+
     while RUNNING:
         try:
             now = time.time()
 
-            # exchange sync
+            # SIGTERM grace deadline handling (1회)
+            if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS and not _SIGTERM_DEADLINE_HANDLED:
+                _SIGTERM_DEADLINE_HANDLED = True
+                log("[SIGTERM] grace deadline reached. force close attempt starts.")
+                _safe_send_tg("🧯 SIGTERM grace 경과: 강제 정리 시도합니다.")
+                try:
+                    n = close_all_positions_market(SET.symbol)
+                    log(f"[SIGTERM] force close submitted count={n}")
+                    _safe_send_tg(f"🧯 SIGTERM 강제 정리 제출: count={n}")
+                except Exception as e:
+                    log(f"[SIGTERM] force close failed: {type(e).__name__}: {e}")
+                    _safe_send_tg(f"❌ SIGTERM 강제 정리 실패: {e}")
+
+            # reconcile guard (OPEN_TRADES ↔ exchange)
+            reconcile_engine.run_if_due(now_ts=now)
+
+            # exchange sync (DB ↔ exchange)
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
                 LAST_EXCHANGE_SYNC_TS = now
@@ -759,11 +888,22 @@ def main() -> None:
                     if not isinstance(summary, dict) or not summary:
                         reason2, summary2 = build_close_summary_strict(t)
                         if not isinstance(summary2, dict) or not summary2:
-                            raise RuntimeError("close summary requery returned invalid")
+                            raise RuntimeError("close summary requery returned invalid (STRICT)")
                         reason = str(reason2 or reason)
                         summary = summary2
 
+                    if "pnl" not in summary:
+                        raise RuntimeError("close summary missing pnl (STRICT)")
                     pnl = float(summary["pnl"])
+
+                    if "avg_price" not in summary or summary["avg_price"] is None:
+                        raise RuntimeError("close summary missing avg_price (STRICT)")
+                    if "qty" not in summary or summary["qty"] is None:
+                        raise RuntimeError("close summary missing qty (STRICT)")
+
+                    avg_price = float(summary["avg_price"])
+                    qty = float(summary["qty"])
+
                     LAST_CLOSE_TS = now
                     CONSEC_LOSSES = (CONSEC_LOSSES + 1) if pnl < 0 else 0
 
@@ -789,9 +929,9 @@ def main() -> None:
                         event="CLOSE",
                         symbol=t.symbol,
                         strategy_type=t.source,
-                        direction=_normalize_direction_for_events(t.side),
-                        price=float(summary.get("avg_price") or 0.0),
-                        qty=float(summary.get("qty") or 0.0),
+                        direction=_normalize_direction_for_events_strict(t.side),
+                        price=avg_price,
+                        qty=qty,
                         reason=reason,
                         pnl=pnl,
                     )
@@ -832,10 +972,10 @@ def main() -> None:
                 msg = f"[SKIP][EQUITY_INVALID] {e} (balance likely 0)"
                 log(msg)
                 _maybe_send_entry_block_tg("EQUITY_INVALID", msg, cooldown_sec=300)  # 5분 1회
-                interruptible_sleep(60)  # 60초 쉬고 재확인
+                interruptible_sleep(60)
                 continue
 
-            # data health gate (잔액이 있을 때만 의미 있음)
+            # data health gate
             if not bool(data_health_monitor.HEALTH_OK):
                 msg = f"[SKIP][DATA_HEALTH_FAIL] {data_health_monitor.LAST_FAIL_REASON}"
                 log(msg)
@@ -888,7 +1028,18 @@ def main() -> None:
                 "recent_planned_rr_avg": account_state.recent_planned_rr_avg,
             }
 
+            # GPT decide latency guard
+            t0 = time.perf_counter()
             signal_obj = entry_strategy.decide(market_data)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            if dt_ms > max_signal_latency_ms:
+                SAFE_STOP_REQUESTED = True
+                msg = f"[SAFE_STOP][LATENCY_SIGNAL] decide_ms={dt_ms:.1f} > {max_signal_latency_ms:.1f}"
+                log(msg)
+                _maybe_send_error_tg("LATENCY_SIGNAL", msg, cooldown_sec=60)
+                interruptible_sleep(5)
+                continue
+
             LAST_ENTRY_GPT_CALL_TS = now
 
             if str(signal_obj.action).upper().strip() != "ENTER":
@@ -939,7 +1090,16 @@ def main() -> None:
                 meta=meta2,
             )
 
+            # execution latency guard
+            t1 = time.perf_counter()
             trade = entry_exec_engine.execute(signal_final)
+            dt2_ms = (time.perf_counter() - t1) * 1000.0
+            if dt2_ms > max_exec_latency_ms:
+                SAFE_STOP_REQUESTED = True
+                msg = f"[SAFE_STOP][LATENCY_EXEC] exec_ms={dt2_ms:.1f} > {max_exec_latency_ms:.1f}"
+                log(msg)
+                _maybe_send_error_tg("LATENCY_EXEC", msg, cooldown_sec=60)
+
             if trade:
                 OPEN_TRADES.append(trade)
 
@@ -959,7 +1119,7 @@ def main() -> None:
             key = hashlib.sha1(core.encode("utf-8", errors="ignore")).hexdigest()[:12]
             _maybe_send_error_tg(key, f"❌ 오류: {e}", cooldown_sec=60)
 
-            # signals_logger strict(side) 방지
+            # signals_logger strict(side) 방지: ERROR는 direction="CLOSE" 고정
             log_signal(
                 event="ERROR",
                 symbol=SET.symbol,

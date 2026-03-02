@@ -1,3 +1,4 @@
+# execution/execution_engine.py
 """
 ========================================================
 FILE: execution/execution_engine.py
@@ -13,10 +14,13 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 예외 삼키기 금지(단, 상태 기록 목적의 catch 후 즉시 재-raise는 허용)
 - “SKIP”은 정상 흐름(리스크/가드에 의해 실행하지 않는 결정)으로 처리한다.
 - “ENTER”는 필요한 메타/필드가 1개라도 없으면 즉시 중단한다.
-- (9점대 핵심) 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
+- 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
+- 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
 
-PATCH NOTES — 2026-03-02 (PATCH)
-- bt_trade_snapshots에 DD 영속화 저장:
+PATCH NOTES — 2026-03-02 (UPGRADE)
+- Telegram I/O 비동기화:
+  - infra/async_worker.submit()로 send_tg / send_skip_tg를 위임(메인 실행 블로킹 제거)
+- bt_trade_snapshots에 DD 영속화 저장(STRICT):
   - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 를 STRICT로 요구
   - record_trade_snapshot에 위 3개 값을 저장
 - deterministic entry_client_order_id 생성/주입:
@@ -26,9 +30,12 @@ PATCH NOTES — 2026-03-02 (PATCH)
   - exchange_position_side / remaining_qty / realized_pnl_usdt
   - reconciliation_status / last_synced_at
   - 필수 값 누락 시 즉시 예외(폴백 금지)
-- (아키텍처) exceptions/state_machine 도입에 맞춰 예외 타입 정리
-- (9점대 마지막 한 방) 전역 단일 실행 락 추가:
-  - 동시에 execute() 호출되면 즉시 예외(StateViolation)
+- order_state 최소 FSM 도입:
+  - OrderState를 내부 전이로 기록(디버깅/추적용)
+
+PATCH NOTES — 2026-03-02 (FIX)
+- Pylance "Trade is not defined" 해결:
+  - from state.trader_state import Trade 추가
 ========================================================
 """
 
@@ -46,6 +53,7 @@ from execution.exchange_api import get_available_usdt, get_balance_detail
 from execution.order_executor import open_position_with_tp_sl
 from execution.risk_manager import hard_risk_guard_check
 from infra.telelog import send_skip_tg, send_tg
+from infra.async_worker import submit as submit_async
 from risk.entry_guards_ws import (
     check_manual_position_guard,
     check_price_jump_guard,
@@ -59,8 +67,9 @@ from state.db_writer import (
     record_trade_open_returning_id,
     record_trade_snapshot,
 )
-
+from state.trader_state import Trade  # ✅ FIX: Trade 타입 import
 from execution.exceptions import OrderFailed, StateViolation
+from execution.order_state import OrderState
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +90,8 @@ TEST_FORCE_ENTER: bool = _env_bool("TEST_FORCE_ENTER", "0")
 TEST_BYPASS_GUARDS: bool = _env_bool("TEST_BYPASS_GUARDS", "0")
 TEST_DRY_RUN: bool = _env_bool("TEST_DRY_RUN", "0")
 
-TEST_FAKE_AVAILABLE_USDT_RAW = os.getenv("TEST_FAKE_AVAILABLE_USDT", "0")
-TEST_FAKE_AVAILABLE_USDT: float = float(TEST_FAKE_AVAILABLE_USDT_RAW) if TEST_FAKE_AVAILABLE_USDT_RAW else 0.0
+_TEST_FAKE_AVAILABLE_USDT_RAW = os.getenv("TEST_FAKE_AVAILABLE_USDT", "0")
+TEST_FAKE_AVAILABLE_USDT: float = float(_TEST_FAKE_AVAILABLE_USDT_RAW) if _TEST_FAKE_AVAILABLE_USDT_RAW else 0.0
 
 if TEST_BYPASS_GUARDS and not TEST_DRY_RUN:
     raise RuntimeError("TEST_BYPASS_GUARDS is only allowed with TEST_DRY_RUN=1")
@@ -95,6 +104,20 @@ if any([TEST_FORCE_ENTER, TEST_BYPASS_GUARDS, TEST_DRY_RUN, TEST_FAKE_AVAILABLE_
         TEST_DRY_RUN,
         TEST_FAKE_AVAILABLE_USDT,
     )
+
+
+def _submit_tg_nonblocking(func, msg: str, *, label: str) -> None:
+    """
+    STRICT:
+    - 텔레그램 전송은 매매 실행을 블로킹하면 안 된다.
+    - 실패해도 매매 흐름을 깨지 않는다(알림은 비핵심 I/O).
+    """
+    try:
+        ok = submit_async(func, msg, critical=False, label=label)
+        if not ok:
+            logger.warning("[TG][DROP] queue full label=%s", label)
+    except Exception as e:
+        logger.warning("[TG][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
 
 
 def _as_float(
@@ -125,8 +148,18 @@ def _as_float(
 def _opt_float_strict(value: Any, name: str) -> Optional[float]:
     if value is None:
         return None
-    v = _as_float(value, name)
-    return float(v)
+    return float(_as_float(value, name))
+
+
+def _meta_pick_first(meta: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    """
+    STRICT:
+    - 0/False 같은 값이 '없음'으로 오해되지 않도록, 키 존재 여부로만 선택한다.
+    """
+    for k in keys:
+        if k in meta:
+            return meta[k]
+    return None
 
 
 def _require_meta_equity(meta: Dict[str, Any]) -> tuple[float, float, float]:
@@ -281,7 +314,7 @@ class ExecutionEngine:
         if missing:
             raise ValueError(f"settings missing required fields: {missing}")
 
-    def execute(self, signal: Signal):
+    def execute(self, signal: Signal) -> Optional[Trade]:
         if not isinstance(signal, Signal):
             raise ValueError("signal must be Signal")
 
@@ -292,9 +325,10 @@ class ExecutionEngine:
         if TEST_FORCE_ENTER:
             action = "ENTER"
 
-        # STRICT: 동시 실행 금지 (레이스 컨디션 차단)
         if not _EXECUTION_LOCK.acquire(blocking=False):
             raise StateViolation("Concurrent execute() call detected (STRICT)")
+
+        state: OrderState = OrderState.CREATED
 
         try:
             meta = signal.meta
@@ -335,7 +369,7 @@ class ExecutionEngine:
                     reason=str(signal.reason) or "skip",
                     extra={"signal_source": signal_source, "ts_ms": signal_ts_ms},
                 )
-                send_skip_tg(msg)
+                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
 
             last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
@@ -354,42 +388,20 @@ class ExecutionEngine:
                 if abs(dyn_alloc - sig_alloc) > 1e-12:
                     raise OrderFailed(f"dynamic_allocation mismatch: meta={dyn_alloc} != signal={sig_alloc} (STRICT)")
 
-            manual_ok = check_manual_position_guard(
-                get_balance_detail_func=get_balance_detail,
-                symbol=symbol,
-                latest_ts=float(signal_ts_ms),
-            )
+            manual_ok = check_manual_position_guard(get_balance_detail_func=get_balance_detail, symbol=symbol, latest_ts=float(signal_ts_ms))
             if not manual_ok:
                 msg = f"[SKIP] manual_guard_blocked: {symbol}"
                 logger.warning(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.manual",
-                    side=direction,
-                    reason="manual_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms},
-                )
-                send_skip_tg(msg)
+                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.manual", side=direction, reason="manual_guard_blocked", extra={"ts_ms": signal_ts_ms})
+                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
 
-            if TEST_FAKE_AVAILABLE_USDT > 0:
-                avail_usdt = float(TEST_FAKE_AVAILABLE_USDT)
-            else:
-                avail_usdt = _as_float(get_available_usdt(), "available_usdt", min_value=0.0)
-
+            avail_usdt = float(TEST_FAKE_AVAILABLE_USDT) if TEST_FAKE_AVAILABLE_USDT > 0 else _as_float(get_available_usdt(), "available_usdt", min_value=0.0)
             if avail_usdt <= 0:
                 msg = f"[SKIP] available_usdt<=0: {symbol}"
                 logger.warning(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.balance",
-                    side=direction,
-                    reason="balance_zero_or_invalid",
-                    extra={"available_usdt": avail_usdt, "ts_ms": signal_ts_ms},
-                )
-                send_skip_tg(msg)
+                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.balance", side=direction, reason="balance_zero_or_invalid", extra={"available_usdt": avail_usdt, "ts_ms": signal_ts_ms})
+                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
 
             best_bid: Optional[float] = None
@@ -400,79 +412,37 @@ class ExecutionEngine:
 
             if candles_5m_raw is None:
                 raise OrderFailed("meta.candles_5m_raw is required for volume guard (STRICT)")
-
-            vol_ok = check_volume_guard(
-                settings=guard_settings,
-                candles_5m_raw=candles_5m_raw,
-                latest_ts=float(signal_ts_ms),
-                signal_source=signal_source,
-                direction=direction,
-            )
+            vol_ok = check_volume_guard(settings=guard_settings, candles_5m_raw=candles_5m_raw, latest_ts=float(signal_ts_ms), signal_source=signal_source, direction=direction)
             if not vol_ok:
                 msg = f"[SKIP] volume_guard_blocked: {symbol}"
                 logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.volume",
-                    side=direction,
-                    reason="volume_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms},
-                )
-                send_skip_tg(msg)
+                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.volume", side=direction, reason="volume_guard_blocked", extra={"ts_ms": signal_ts_ms})
+                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 if not TEST_BYPASS_GUARDS:
                     return None
 
             if candles_5m is None:
                 raise OrderFailed("meta.candles_5m is required for price jump guard (STRICT)")
-
-            price_ok = check_price_jump_guard(
-                settings=guard_settings,
-                candles_5m=candles_5m,
-                latest_ts=float(signal_ts_ms),
-                signal_source=signal_source,
-                direction=direction,
-            )
+            price_ok = check_price_jump_guard(settings=guard_settings, candles_5m=candles_5m, latest_ts=float(signal_ts_ms), signal_source=signal_source, direction=direction)
             if not price_ok:
                 msg = f"[SKIP] price_jump_guard_blocked: {symbol}"
                 logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.price_jump",
-                    side=direction,
-                    reason="price_jump_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms},
-                )
-                send_skip_tg(msg)
+                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.price_jump", side=direction, reason="price_jump_guard_blocked", extra={"ts_ms": signal_ts_ms})
+                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 if not TEST_BYPASS_GUARDS:
                     return None
 
-            spread_ok, best_bid, best_ask = check_spread_guard(
-                settings=guard_settings,
-                symbol=symbol,
-                latest_ts=float(signal_ts_ms),
-                signal_source=signal_source,
-                direction=direction,
-            )
+            spread_ok, best_bid, best_ask = check_spread_guard(settings=guard_settings, symbol=symbol, latest_ts=float(signal_ts_ms), signal_source=signal_source, direction=direction)
             if not spread_ok:
                 msg = f"[SKIP] spread_guard_blocked: {symbol}"
                 logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.spread",
-                    side=direction,
-                    reason="spread_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms, "best_bid": best_bid, "best_ask": best_ask},
-                )
-                send_skip_tg(msg)
+                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.spread", side=direction, reason="spread_guard_blocked", extra={"ts_ms": signal_ts_ms, "best_bid": best_bid, "best_ask": best_ask})
+                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 if not TEST_BYPASS_GUARDS:
                     return None
 
             entry_price_hint = float(last_price)
             price_for_qty = float(last_price)
-
             if best_bid is not None and best_ask is not None:
                 bb = float(best_bid)
                 ba = float(best_ask)
@@ -494,11 +464,7 @@ class ExecutionEngine:
                     if mid > 0:
                         spread_pct_snapshot = (ba - bb) / mid
 
-            slippage_block_pct = _as_float(
-                getattr(self.settings, "slippage_block_pct"),
-                "settings.slippage_block_pct",
-                min_value=0.0,
-            )
+            slippage_block_pct = _as_float(getattr(self.settings, "slippage_block_pct"), "settings.slippage_block_pct", min_value=0.0)
             slippage_stop_engine = bool(getattr(self.settings, "slippage_stop_engine"))
 
             if slippage_block_pct > 0:
@@ -506,22 +472,14 @@ class ExecutionEngine:
                 if slippage_pct > slippage_block_pct:
                     msg = f"[SKIP] {symbol} {direction} slippage_block slippage_pct={slippage_pct}"
                     logger.warning(msg)
-                    log_skip_event(
-                        symbol=symbol,
-                        regime=regime,
-                        source="execution_engine.slippage",
-                        side=direction,
-                        reason="slippage_block",
-                        extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct, "ts_ms": signal_ts_ms},
-                    )
-                    send_skip_tg(msg)
+                    log_skip_event(symbol=symbol, regime=regime, source="execution_engine.slippage", side=direction, reason="slippage_block", extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct, "ts_ms": signal_ts_ms})
+                    _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                     if slippage_stop_engine:
                         raise OrderFailed("slippage_block triggered and slippage_stop_engine=True (STRICT)")
                     if not TEST_BYPASS_GUARDS:
                         return None
 
             leverage = _as_float(getattr(self.settings, "leverage"), "settings.leverage", min_value=1.0)
-
             allocation_ratio = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
             tp_pct = _as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0)
             sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0)
@@ -534,9 +492,7 @@ class ExecutionEngine:
                 raise OrderFailed("ENTER requires signal.sl_pct > 0 (STRICT)")
 
             if leverage > 1.0 and allocation_ratio >= 0.8:
-                raise OrderFailed(
-                    f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio}) (STRICT)"
-                )
+                raise OrderFailed(f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio}) (STRICT)")
 
             notional = avail_usdt * allocation_ratio * leverage
             if notional <= 0:
@@ -557,15 +513,8 @@ class ExecutionEngine:
             if not ok:
                 msg = f"[SKIP] hard_risk_guard_blocked: {guard_reason}"
                 logger.warning("%s extra=%s", msg, guard_extra)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.risk_guard",
-                    side=direction,
-                    reason=str(guard_reason),
-                    extra=guard_extra,
-                )
-                send_skip_tg(f"{msg} {symbol} {direction}")
+                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.risk_guard", side=direction, reason=str(guard_reason), extra=guard_extra)
+                _submit_tg_nonblocking(send_skip_tg, f"{msg} {symbol} {direction}", label="send_skip_tg")
                 if not TEST_BYPASS_GUARDS:
                     return None
 
@@ -624,7 +573,13 @@ class ExecutionEngine:
             eq_cur_usdt, eq_peak_usdt, dd_pct_v = _require_meta_equity(meta)
             entry_client_order_id = _deterministic_entry_client_order_id(symbol=symbol, direction=direction, signal_ts_ms=signal_ts_ms)
 
+            state = OrderState.SUBMITTED
+
+            entry_score_val = _meta_pick_first(meta, ("entry_score", "entryScore"))
+            engine_total_val = _meta_pick_first(meta, ("engine_total", "engine_total_score", "engine_total_score_v2"))
+
             if TEST_DRY_RUN:
+                state = OrderState.FILLED
                 entry_price = float(entry_price_hint)
                 entry_qty = float(qty_raw)
                 entry_ts_dt = datetime.fromtimestamp(float(signal_ts_ms) / 1000.0, tz=timezone.utc)
@@ -655,7 +610,7 @@ class ExecutionEngine:
                     is_auto=True,
                     regime_at_entry=str(regime),
                     strategy=str(signal_source),
-                    entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
+                    entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
                     trend_score_at_entry=None,
                     range_score_at_entry=None,
                     leverage=float(leverage),
@@ -680,8 +635,8 @@ class ExecutionEngine:
                     direction=str(direction),
                     signal_source=str(signal_source),
                     regime=str(regime),
-                    entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
-                    engine_total=_opt_float_strict(meta.get("engine_total") or meta.get("engine_total_score"), "meta.engine_total"),
+                    entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
+                    engine_total=_opt_float_strict(engine_total_val, "meta.engine_total"),
                     trend_strength=None,
                     atr_pct=None,
                     volume_zscore=None,
@@ -724,7 +679,7 @@ class ExecutionEngine:
                     exit_depth_ratio=None,
                 )
 
-                send_tg(f"[TEST_DRY_RUN] DB recorded + closed: {symbol} {direction} trade_id={trade_id}")
+                _submit_tg_nonblocking(send_tg, f"[TEST_DRY_RUN] DB recorded + closed: {symbol} {direction} trade_id={trade_id}", label="send_tg")
                 return None
 
             trade = open_position_with_tp_sl(
@@ -743,9 +698,13 @@ class ExecutionEngine:
             if trade is None:
                 raise OrderFailed("open_position_with_tp_sl returned None (STRICT)")
 
-            entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(
-                trade, soft_mode=bool(soft_mode)
-            )
+            state = OrderState.FILLED
+            try:
+                setattr(trade, "order_state", state.value)
+            except Exception:
+                pass
+
+            entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(trade, soft_mode=bool(soft_mode))
 
             entry_price = getattr(trade, "entry", getattr(trade, "entry_price", None))
             if entry_price is None:
@@ -774,11 +733,7 @@ class ExecutionEngine:
                 sl_pct=float(sl_pct),
                 risk_pct=float(allocation_ratio),
                 reason="entry_filled",
-                extra_json={
-                    "signal_source": signal_source,
-                    "entry_client_order_id": entry_client_order_id,
-                    "entry_order_id": entry_order_id,
-                },
+                extra_json={"signal_source": signal_source, "entry_client_order_id": entry_client_order_id, "entry_order_id": entry_order_id},
             )
 
             now_sync = datetime.now(timezone.utc)
@@ -792,7 +747,7 @@ class ExecutionEngine:
                 is_auto=True,
                 regime_at_entry=str(regime),
                 strategy=str(signal_source),
-                entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
+                entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
                 trend_score_at_entry=None,
                 range_score_at_entry=None,
                 leverage=float(leverage),
@@ -822,8 +777,8 @@ class ExecutionEngine:
                 direction=str(direction),
                 signal_source=str(signal_source),
                 regime=str(regime),
-                entry_score=_opt_float_strict(meta.get("entry_score") or meta.get("entryScore"), "meta.entry_score"),
-                engine_total=_opt_float_strict(meta.get("engine_total") or meta.get("engine_total_score"), "meta.engine_total"),
+                entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
+                engine_total=_opt_float_strict(engine_total_val, "meta.engine_total"),
                 trend_strength=None,
                 atr_pct=None,
                 volume_zscore=None,
@@ -840,10 +795,12 @@ class ExecutionEngine:
                 dd_pct=float(dd_pct_v),
             )
 
-            send_tg(
+            _submit_tg_nonblocking(
+                send_tg,
                 f"[ENTRY][FILLED] {symbol} {direction} "
                 f"alloc={allocation_ratio*100:.1f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
-                f"price={float(entry_price):.4f} qty={float(entry_qty):.6f} src={signal_source}"
+                f"price={float(entry_price):.4f} qty={float(entry_qty):.6f} src={signal_source}",
+                label="send_tg",
             )
 
             return trade

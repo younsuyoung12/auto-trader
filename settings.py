@@ -33,6 +33,13 @@
 #   - tp/sl 범위 가드 상수화:
 #       * tp_pct_min/max, sl_pct_min/max
 #       * signal 값이 이 범위를 벗어나면 즉시 예외(폴백 금지)
+#
+# PATCH NOTES — 2026-03-02 (PATCH-10PT MIN-CHANGE)
+# - 메인 루프 블로킹 제거/무결성 강화용 설정 추가:
+#   - async_worker_threads / async_worker_queue_size: 텔레그램/비핵심 I/O 비동기 워커
+#   - reconcile_interval_sec: 내부 상태 ↔ 거래소 상태 불일치 감지 주기
+#   - force_close_on_desync: DESYNC 시 강제청산(기본 False)
+#   - max_signal_latency_ms / max_exec_latency_ms: 지연 예산 초과 시 신규 진입 차단
 # =============================================================================
 
 from __future__ import annotations
@@ -180,6 +187,14 @@ class Settings:
     # Operations / runtime safety
     sigterm_grace_sec: int = 30
     allow_start_without_leverage_setup: bool = False
+
+    # 10점 근접(최소 변경) 운영 파라미터
+    async_worker_threads: int = 1
+    async_worker_queue_size: int = 2000
+    reconcile_interval_sec: int = 30
+    force_close_on_desync: bool = False
+    max_signal_latency_ms: int = 200
+    max_exec_latency_ms: int = 400
 
     # Exchange endpoints
     binance_futures_base: str = "https://fapi.binance.com"
@@ -426,7 +441,7 @@ def _validate_settings(s: Settings) -> None:
     if abs(float(s.risk_pct) - float(s.allocation_ratio)) > 1e-12:
         raise ValueError("risk_pct must equal allocation_ratio (do not set them differently)")
 
-    # TP/SL bounds (signal 값 검증용 기준)
+    # TP/SL bounds
     for name, v in [
         ("tp_pct_min", s.tp_pct_min),
         ("tp_pct_max", s.tp_pct_max),
@@ -458,6 +473,21 @@ def _validate_settings(s: Settings) -> None:
     if s.sigterm_grace_sec <= 0:
         raise ValueError("sigterm_grace_sec must be > 0")
 
+    # 10점 근접(최소 변경) 운영 파라미터
+    if s.async_worker_threads < 1:
+        raise ValueError("async_worker_threads must be >= 1")
+    if s.async_worker_queue_size < 1:
+        raise ValueError("async_worker_queue_size must be >= 1")
+    if s.reconcile_interval_sec < 1:
+        raise ValueError("reconcile_interval_sec must be >= 1")
+    if not isinstance(s.force_close_on_desync, bool):
+        raise ValueError("force_close_on_desync must be bool")
+
+    if s.max_signal_latency_ms < 1:
+        raise ValueError("max_signal_latency_ms must be >= 1")
+    if s.max_exec_latency_ms < 1:
+        raise ValueError("max_exec_latency_ms must be >= 1")
+
     # 9점대 운영형
     if not isinstance(s.require_deterministic_client_order_id, bool):
         raise ValueError("require_deterministic_client_order_id must be bool")
@@ -487,7 +517,6 @@ def load_settings() -> Settings:
     symbol = _as_str("SYMBOL", "BTCUSDT").upper().replace("-", "")
     interval = _as_str("INTERVAL", "5m")
 
-    # ✅ 전액 배분형: LEVERAGE 기본값 1
     leverage = _as_int("LEVERAGE", 1)
 
     margin_mode = _as_str("MARGIN_MODE", "ISOLATED").upper()
@@ -519,20 +548,16 @@ def load_settings() -> Settings:
     else:
         allocation_ratio = float(risk_env)
 
-    # legacy alias는 항상 동일하게 세팅
     risk_pct = float(allocation_ratio)
 
-    # Default TP/SL (signals can override)
     tp_pct = _as_float("TP_PCT", 0.006)
     sl_pct = _as_float("SL_PCT", 0.003)
 
-    # 운영형 TP/SL bounds
     tp_pct_min = _as_float("TP_PCT_MIN", 0.0005)
     tp_pct_max = _as_float("TP_PCT_MAX", 0.05)
     sl_pct_min = _as_float("SL_PCT_MIN", 0.0005)
     sl_pct_max = _as_float("SL_PCT_MAX", 0.05)
 
-    # Legacy
     max_sl_pct = _as_float("MAX_SL_PCT", 0.015)
     max_trade_qty = _as_float("MAX_TRADE_QTY", 1.0)
 
@@ -608,6 +633,14 @@ def load_settings() -> Settings:
     sigterm_grace_sec = _as_int("SIGTERM_GRACE_SEC", 30)
     allow_start_without_leverage_setup = _as_bool("ALLOW_START_WITHOUT_LEVERAGE_SETUP", False)
 
+    # 10점 근접(최소 변경) 운영 파라미터
+    async_worker_threads = _as_int("ASYNC_WORKER_THREADS", 1)
+    async_worker_queue_size = _as_int("ASYNC_WORKER_QUEUE_SIZE", 2000)
+    reconcile_interval_sec = _as_int("RECONCILE_INTERVAL_SEC", 30)
+    force_close_on_desync = _as_bool("FORCE_CLOSE_ON_DESYNC", False)
+    max_signal_latency_ms = _as_int("MAX_SIGNAL_LATENCY_MS", 200)
+    max_exec_latency_ms = _as_int("MAX_EXEC_LATENCY_MS", 400)
+
     binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
     binance_recv_window = recv_window_ms
     binance_http_timeout_sec = request_timeout_sec
@@ -621,7 +654,6 @@ def load_settings() -> Settings:
     slippage_stop_engine = _as_bool("SLIPPAGE_STOP_ENGINE", False)
     protection_mode_enabled = _as_bool("PROTECTION_MODE_ENABLED", True)
 
-    # 9점대 운영형
     require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
     entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
     max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
@@ -702,6 +734,12 @@ def load_settings() -> Settings:
         krw_per_usdt=krw_per_usdt,
         sigterm_grace_sec=sigterm_grace_sec,
         allow_start_without_leverage_setup=allow_start_without_leverage_setup,
+        async_worker_threads=async_worker_threads,
+        async_worker_queue_size=async_worker_queue_size,
+        reconcile_interval_sec=reconcile_interval_sec,
+        force_close_on_desync=force_close_on_desync,
+        max_signal_latency_ms=max_signal_latency_ms,
+        max_exec_latency_ms=max_exec_latency_ms,
         binance_futures_base=binance_futures_base,
         binance_recv_window=binance_recv_window,
         binance_http_timeout_sec=binance_http_timeout_sec,
