@@ -8,6 +8,19 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 폴백(REST 백필/더미 값/임의 보정) 절대 금지.
 - 설정/입력 값이 비정상이면 즉시 예외(ValueError/RuntimeError).
 - DB 조회 실패는 즉시 예외(운영 로그에 남게).
+- 트레이딩 엔진(AWS) → DB/대시보드(Render) 원격 환경 전제.
+========================================================
+
+변경 이력
+--------------------------------------------------------
+2026-03-02
+- STRICT 파싱 강화: 거래소/DB 응답에서 필수 필드 누락 시 즉시 예외(폴백 제거)
+- symbol/side 정규화 및 입력 검증 강화
+- 선택(옵션) 하드 가드 추가:
+  - hard_total_loss_limit_usdt: 누적(전체) 실현 손실 한도
+  - hard_daily_loss_limit_pct_of_available: available_usdt 기준 일일 손실 % 한도
+  - hard_consecutive_losses_lookback: 연속 손실 계산 조회 범위
+  - hard_open_unrealized_loss_limit_usdt: 보유 포지션 미실현 손실 한도(물타기 방지)
 ========================================================
 """
 
@@ -28,6 +41,9 @@ logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 
+# ─────────────────────────────────────────────────────────────
+# Strict helpers (NO-FALLBACK)
+# ─────────────────────────────────────────────────────────────
 def _as_float(value: Any, name: str, *, min_value: Optional[float] = None) -> float:
     try:
         if isinstance(value, bool):
@@ -45,7 +61,51 @@ def _as_float(value: Any, name: str, *, min_value: Optional[float] = None) -> fl
     return v
 
 
+def _normalize_symbol(symbol: str) -> str:
+    s = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        raise ValueError("symbol is empty")
+    return s
+
+
+def _normalize_side(side: str) -> str:
+    s = str(side or "").strip().upper()
+    if s in {"LONG", "SHORT", "BUY", "SELL"}:
+        return s
+    raise ValueError("side must be one of LONG/SHORT/BUY/SELL")
+
+
+def _req_float_from_dict(d: Dict[str, Any], key: str) -> float:
+    if key not in d:
+        raise RuntimeError(f"exchange position missing required field: {key}")
+    val = d.get(key)
+    if val is None:
+        raise RuntimeError(f"exchange position field is null: {key}")
+    try:
+        f = float(val)
+    except Exception as e:
+        raise RuntimeError(f"exchange position field not a number: {key}") from e
+    if not math.isfinite(f):
+        raise RuntimeError(f"exchange position field not finite: {key}")
+    return f
+
+
+def _req_float_from_dict_multi(d: Dict[str, Any], keys: Tuple[str, ...], *, name: str) -> float:
+    # "키 후보" 중 하나는 반드시 존재해야 한다. (폴백 추정 금지)
+    for k in keys:
+        if k in d and d.get(k) is not None:
+            try:
+                f = float(d.get(k))
+            except Exception as e:
+                raise RuntimeError(f"exchange position field not a number: {k}") from e
+            if not math.isfinite(f):
+                raise RuntimeError(f"exchange position field not finite: {k}")
+            return f
+    raise RuntimeError(f"exchange position missing required field for {name}: {list(keys)}")
+
+
 def _validate_hard_risk_settings(settings: Any) -> None:
+    # 기존 필수 하드 리스크 필드 (호환 유지)
     required = [
         "hard_daily_loss_limit_usdt",
         "hard_consecutive_losses_limit",
@@ -57,7 +117,12 @@ def _validate_hard_risk_settings(settings: Any) -> None:
         raise ValueError(f"settings missing hard risk fields: {missing}")
 
     daily = _as_float(getattr(settings, "hard_daily_loss_limit_usdt"), "hard_daily_loss_limit_usdt", min_value=0.0)
-    consec = int(getattr(settings, "hard_consecutive_losses_limit"))
+    consec_raw = getattr(settings, "hard_consecutive_losses_limit")
+    try:
+        consec = int(consec_raw)
+    except Exception as e:
+        raise ValueError("hard_consecutive_losses_limit must be int") from e
+
     pct_cap = _as_float(getattr(settings, "hard_position_value_pct_cap"), "hard_position_value_pct_cap", min_value=0.0)
     liq = _as_float(getattr(settings, "hard_liquidation_distance_pct_min"), "hard_liquidation_distance_pct_min", min_value=0.0)
 
@@ -70,6 +135,35 @@ def _validate_hard_risk_settings(settings: Any) -> None:
     if not (0.0 <= liq <= 100.0):
         raise ValueError("hard_liquidation_distance_pct_min must be in [0,100]")
 
+    # 선택(옵션) 필드: 존재하면 엄격 검증
+    if hasattr(settings, "hard_total_loss_limit_usdt"):
+        _as_float(getattr(settings, "hard_total_loss_limit_usdt"), "hard_total_loss_limit_usdt", min_value=0.0)
+
+    if hasattr(settings, "hard_daily_loss_limit_pct_of_available"):
+        pct = _as_float(
+            getattr(settings, "hard_daily_loss_limit_pct_of_available"),
+            "hard_daily_loss_limit_pct_of_available",
+            min_value=0.0,
+        )
+        if not (0.0 <= pct <= 100.0):
+            raise ValueError("hard_daily_loss_limit_pct_of_available must be in [0,100]")
+
+    if hasattr(settings, "hard_consecutive_losses_lookback"):
+        lb_raw = getattr(settings, "hard_consecutive_losses_lookback")
+        try:
+            lb = int(lb_raw)
+        except Exception as e:
+            raise ValueError("hard_consecutive_losses_lookback must be int") from e
+        if lb <= 0:
+            raise ValueError("hard_consecutive_losses_lookback must be > 0")
+
+    if hasattr(settings, "hard_open_unrealized_loss_limit_usdt"):
+        _as_float(
+            getattr(settings, "hard_open_unrealized_loss_limit_usdt"),
+            "hard_open_unrealized_loss_limit_usdt",
+            min_value=0.0,
+        )
+
 
 def _kst_day_start_utc() -> datetime:
     now_kst = datetime.now(tz=KST)
@@ -77,21 +171,9 @@ def _kst_day_start_utc() -> datetime:
     return start_kst.astimezone(timezone.utc)
 
 
-def _safe_float_from_dict(d: Dict[str, Any], key: str) -> Optional[float]:
-    if key not in d:
-        return None
-    val = d.get(key)
-    if val is None:
-        return None
-    try:
-        f = float(val)
-    except Exception:
-        return None
-    if not math.isfinite(f):
-        return None
-    return f
-
-
+# ─────────────────────────────────────────────────────────────
+# DB queries (STRICT)
+# ─────────────────────────────────────────────────────────────
 def _get_today_realized_pnl_usdt(symbol: str) -> float:
     """
     오늘(KST) 기준 실현 PnL 합계.
@@ -123,6 +205,32 @@ def _get_today_realized_pnl_usdt(symbol: str) -> float:
         session.close()
 
 
+def _get_total_realized_pnl_usdt(symbol: str) -> float:
+    """
+    전체(누적) 실현 PnL 합계.
+    - bt_trades.exit_ts가 존재하는 레코드 합산
+    - pnl_usdt NULL 제외
+    """
+    try:
+        session = SessionLocal()
+    except Exception as e:
+        raise RuntimeError(f"DB SessionLocal create failed: {e}") from e
+
+    try:
+        stmt = (
+            select(func.coalesce(func.sum(TradeORM.pnl_usdt), 0))
+            .where(TradeORM.symbol == symbol)
+            .where(TradeORM.exit_ts.isnot(None))
+            .where(TradeORM.pnl_usdt.isnot(None))
+        )
+        result = session.execute(stmt).scalar_one()
+        return float(result)
+    except Exception as e:
+        raise RuntimeError(f"total pnl query failed: {e}") from e
+    finally:
+        session.close()
+
+
 def _get_consecutive_losses(symbol: str, *, lookback: int = 50) -> int:
     """
     최근 종료 트레이드 기준 연속 손실 횟수.
@@ -145,6 +253,7 @@ def _get_consecutive_losses(symbol: str, *, lookback: int = 50) -> int:
             .limit(int(lookback))
         )
         rows = session.execute(stmt).all()
+
         cnt = 0
         for (pnl_val,) in rows:
             pnl = float(pnl_val)
@@ -159,6 +268,19 @@ def _get_consecutive_losses(symbol: str, *, lookback: int = 50) -> int:
         session.close()
 
 
+# ─────────────────────────────────────────────────────────────
+# Exchange position snapshot (STRICT)
+# ─────────────────────────────────────────────────────────────
+def _get_position_snapshot(symbol: str) -> Dict[str, Any]:
+    pos = get_position(symbol)
+    if not isinstance(pos, dict):
+        raise RuntimeError("exchange_api.get_position() returned non-dict")
+    return pos
+
+
+# ─────────────────────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────────────────────
 def hard_risk_guard_check(
     settings: Any,
     *,
@@ -172,15 +294,21 @@ def hard_risk_guard_check(
     문서 기준 하드 리스크 가드.
 
     Checks:
-    - 일일 손실 한도
+    - (옵션) 누적(전체) 실현 손실 한도
+    - 일일 손실 한도(USDT)
+    - (옵션) available_usdt 기준 일일 손실 % 한도
     - 연속 손실 한도
     - 계좌 대비 포지션 가치 상한
     - 청산거리 최소 % (현재 포지션이 있는 경우에만 liquidationPrice 기반 체크)
+    - (옵션) 보유 포지션 미실현 손실 한도(물타기/추가진입 방지)
 
     Returns:
         (ok, reason, extra)
     """
     _validate_hard_risk_settings(settings)
+
+    symbol_n = _normalize_symbol(symbol)
+    side_n = _normalize_side(side)
 
     entry_price_f = _as_float(entry_price, "entry_price", min_value=0.0)
     notional_f = _as_float(notional, "notional", min_value=0.0)
@@ -194,57 +322,91 @@ def hard_risk_guard_check(
         raise ValueError("available_usdt must be > 0")
 
     extra: Dict[str, Any] = {
-        "symbol": symbol,
-        "side": side,
+        "symbol": symbol_n,
+        "side": side_n,
         "entry_price": entry_price_f,
         "notional": notional_f,
         "available_usdt": available_f,
     }
 
-    # [1] 일일 손실 한도
+    # [0] (옵션) 누적(전체) 실현 손실 한도
+    total_loss_limit = float(getattr(settings, "hard_total_loss_limit_usdt", 0.0) or 0.0)
+    if total_loss_limit > 0:
+        pnl_total = _get_total_realized_pnl_usdt(symbol_n)
+        extra["pnl_total_usdt"] = pnl_total
+        extra["hard_total_loss_limit_usdt"] = total_loss_limit
+        if pnl_total <= -total_loss_limit:
+            return False, "hard_total_loss_limit_exceeded", extra
+
+    # [1] 일일 손실 한도(USDT)
     daily_limit = float(getattr(settings, "hard_daily_loss_limit_usdt"))
-    if daily_limit > 0:
-        pnl_today = _get_today_realized_pnl_usdt(symbol)
-        extra["pnl_today_usdt"] = pnl_today
-        extra["hard_daily_loss_limit_usdt"] = daily_limit
-        if pnl_today <= -daily_limit:
-            return False, "hard_daily_loss_limit_exceeded", extra
+    pnl_today = _get_today_realized_pnl_usdt(symbol_n)
+    extra["pnl_today_usdt"] = pnl_today
+    extra["hard_daily_loss_limit_usdt"] = daily_limit
+    if daily_limit > 0 and pnl_today <= -daily_limit:
+        return False, "hard_daily_loss_limit_exceeded", extra
+
+    # [1b] (옵션) available_usdt 기준 일일 손실 % 한도
+    daily_pct = float(getattr(settings, "hard_daily_loss_limit_pct_of_available", 0.0) or 0.0)
+    if daily_pct > 0:
+        derived_limit = available_f * (daily_pct / 100.0)
+        extra["hard_daily_loss_limit_pct_of_available"] = daily_pct
+        extra["hard_daily_loss_limit_usdt_derived"] = derived_limit
+        if derived_limit > 0 and pnl_today <= -derived_limit:
+            return False, "hard_daily_loss_limit_pct_exceeded", extra
 
     # [2] 연속 손실 한도
     consec_limit = int(getattr(settings, "hard_consecutive_losses_limit"))
     if consec_limit > 0:
-        consec_losses = _get_consecutive_losses(symbol)
+        lookback = int(getattr(settings, "hard_consecutive_losses_lookback", 50) or 50)
+        if lookback <= 0:
+            raise ValueError("hard_consecutive_losses_lookback must be > 0")
+
+        consec_losses = _get_consecutive_losses(symbol_n, lookback=lookback)
         extra["consecutive_losses"] = consec_losses
         extra["hard_consecutive_losses_limit"] = consec_limit
+        extra["hard_consecutive_losses_lookback"] = lookback
         if consec_losses >= consec_limit:
             return False, "hard_consecutive_losses_limit_exceeded", extra
 
     # [3] 계좌 대비 포지션 가치 상한
     pct_cap = float(getattr(settings, "hard_position_value_pct_cap"))
-    max_notional = available_f * (pct_cap / 100.0)
     extra["hard_position_value_pct_cap"] = pct_cap
+
+    max_notional = available_f * (pct_cap / 100.0)
     extra["max_notional_by_cap"] = max_notional
     if notional_f > max_notional:
         return False, "hard_position_value_pct_cap_exceeded", extra
 
-    # [4] 청산거리 최소 %
+    # [4] 청산거리 최소 % + [5] (옵션) 보유 포지션 미실현 손실 한도
     liq_min_pct = float(getattr(settings, "hard_liquidation_distance_pct_min"))
-    if liq_min_pct > 0:
-        pos = get_position(symbol)
-        if not isinstance(pos, dict):
-            raise RuntimeError("exchange_api.get_position() returned non-dict")
+    open_unrealized_limit = float(getattr(settings, "hard_open_unrealized_loss_limit_usdt", 0.0) or 0.0)
 
-        pos_amt = _safe_float_from_dict(pos, "positionAmt")
-        liq_price = _safe_float_from_dict(pos, "liquidationPrice")
+    if liq_min_pct > 0 or open_unrealized_limit > 0:
+        pos = _get_position_snapshot(symbol_n)
 
+        pos_amt = _req_float_from_dict(pos, "positionAmt")
         extra["positionAmt"] = pos_amt
-        extra["liquidationPrice"] = liq_price
-        extra["hard_liquidation_distance_pct_min"] = liq_min_pct
 
-        # 포지션이 없는 경우(0)에는 liquidation guard 적용 불가 → 신규 진입은 허용
-        if pos_amt is not None and abs(pos_amt) > 0:
-            if liq_price is None or liq_price <= 0:
-                raise RuntimeError("liquidationPrice unavailable while positionAmt != 0")
+        # [5] (옵션) 보유 포지션 미실현 손실 한도(물타기/추가진입 방지)
+        if open_unrealized_limit > 0 and abs(pos_amt) > 0:
+            unrl = _req_float_from_dict_multi(
+                pos,
+                ("unRealizedProfit", "unrealizedProfit"),
+                name="unrealized_profit",
+            )
+            extra["unrealized_profit_usdt"] = unrl
+            extra["hard_open_unrealized_loss_limit_usdt"] = open_unrealized_limit
+            if unrl <= -open_unrealized_limit:
+                return False, "hard_open_unrealized_loss_limit_exceeded", extra
+
+        # [4] 청산거리 최소 % (포지션이 있을 때만 적용)
+        extra["hard_liquidation_distance_pct_min"] = liq_min_pct
+        if liq_min_pct > 0 and abs(pos_amt) > 0:
+            liq_price = _req_float_from_dict(pos, "liquidationPrice")
+            if liq_price <= 0:
+                raise RuntimeError("liquidationPrice must be > 0 when positionAmt != 0")
+            extra["liquidationPrice"] = liq_price
 
             dist_pct = abs(entry_price_f - liq_price) / entry_price_f * 100.0
             extra["liquidation_distance_pct"] = dist_pct

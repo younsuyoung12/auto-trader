@@ -12,6 +12,21 @@
 # =============================================================================
 # 변경 이력
 # -----------------------------------------------------------------------------
+# 2026-03-02
+# 1) STRICT · NO-FALLBACK 강화
+#    - open_position_with_tp_sl: side/leverage/entry_price/TP·SL 설정 실패 시 조용히 진행 금지
+#    - entry_price 획득: "0.0 대입" 금지 → order 조회/체결값으로만 확정, 실패 시 즉시 실패
+#    - TP/SL 설정 실패(soft_mode=False): 포지션 즉시 강제 청산 후 실패 처리
+# 2) 기관급 수량(포지션) 계산 옵션 추가 (신규 파일 없이)
+#    - qty <= 0 이면 자동 계산 모드
+#    - 필요 입력: available_usdt(필수), settings.risk_pct(필수), sl_pct(필수), entry_price_hint(필수)
+#    - 계산: risk_usdt = available_usdt * (risk_pct/100)
+#            qty = risk_usdt / (entry_price_hint * sl_pct)
+#    - 심볼 필터(step/minQty)로 STRICT 라운딩 적용
+# 3) 슬리피지 가드(옵션)
+#    - settings.max_entry_slippage_pct(옵션) 존재 시
+#      entry_price vs entry_price_hint 슬리피지 초과하면 즉시 강제 청산 후 실패 처리
+#
 # 2026-XX-XX
 # 1) 패키지 구조 정합성 수정
 #    - from exchange_api import ...  →  from execution.exchange_api import ...
@@ -211,6 +226,16 @@ def _make_client_order_id(prefix: str = "at") -> str:
     """Generate a safe client order id within Binance length limits."""
     base = f"{prefix}-{uuid.uuid4().hex}"  # 3 + 32 = 35 chars
     return base[:36]
+
+
+def _require_positive_float(v: Any, name: str) -> float:
+    try:
+        f = float(v)
+    except Exception as e:
+        raise ValueError(f"{name} must be a number") from e
+    if f <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return f
 
 
 # -----------------------------------------------------------------------------
@@ -866,6 +891,136 @@ def set_tp_sl(
         )
 
 
+def _fetch_filled_entry_price_strict(
+    *,
+    symbol: str,
+    order_id: Any,
+    settings: Any,
+    max_wait_sec: float = 2.0,
+) -> float:
+    """
+    STRICT:
+    - entry_price는 실제 체결 값으로만 확정한다.
+    - 0.0 대입/폴백 금지.
+    - /fapi/v1/order로 FILLED 확인 후 avgPrice 또는 (cummulativeQuoteQty/executedQty)로 계산.
+    """
+    sym = _normalize_symbol(symbol)
+    timeout_sec = _require_timeout_sec(settings)
+
+    oid = order_id
+    if oid is None:
+        raise RuntimeError("entry order_id missing")
+
+    deadline = time.time() + float(max_wait_sec)
+    last: Optional[Dict[str, Any]] = None
+
+    while True:
+        od = _call_with_time_sync_retry(
+            lambda: req(
+                "GET",
+                "/fapi/v1/order",
+                {"symbol": sym, "orderId": oid},
+                private=True,
+                timeout_sec=timeout_sec,
+            )
+        )
+        if not isinstance(od, dict):
+            raise RuntimeError("GET /fapi/v1/order returned non-dict")
+        last = od
+
+        status = str(od.get("status") or "").upper()
+        if status == "FILLED":
+            # 1) avgPrice
+            ap = od.get("avgPrice")
+            try:
+                apf = float(ap) if ap is not None else 0.0
+            except Exception:
+                apf = 0.0
+
+            if apf > 0:
+                return apf
+
+            # 2) cummulativeQuoteQty / executedQty
+            cq = od.get("cummulativeQuoteQty")
+            eq = od.get("executedQty")
+            if cq is None or eq is None:
+                raise RuntimeError("FILLED order missing cummulativeQuoteQty/executedQty")
+
+            cqf = float(cq)
+            eqf = float(eq)
+            if eqf <= 0 or cqf <= 0:
+                raise RuntimeError("FILLED order has non-positive executedQty/cummulativeQuoteQty")
+
+            price = cqf / eqf
+            if price <= 0:
+                raise RuntimeError("computed entry price <= 0")
+            return float(price)
+
+        if time.time() >= deadline:
+            raise RuntimeError(f"entry order not FILLED within {max_wait_sec}s (status={status})")
+        time.sleep(0.2)
+
+
+def _calc_auto_qty_from_risk_strict(
+    *,
+    symbol: str,
+    settings: Any,
+    available_usdt: float,
+    entry_price_hint: float,
+    sl_pct: float,
+) -> float:
+    """
+    기관식 자동 수량 계산(옵션).
+    qty <= 0 일 때만 사용.
+
+    필요 조건(STRICT):
+    - available_usdt > 0
+    - entry_price_hint > 0
+    - sl_pct > 0
+    - settings.risk_pct 존재 및 0 < risk_pct <= 100
+
+    계산:
+      risk_usdt = available_usdt * (risk_pct/100)
+      qty_raw  = risk_usdt / (entry_price_hint * sl_pct)
+    """
+    sym = _normalize_symbol(symbol)
+
+    av = _require_positive_float(available_usdt, "available_usdt")
+    eph = _require_positive_float(entry_price_hint, "entry_price_hint")
+    sl = _require_positive_float(sl_pct, "sl_pct")
+
+    rp = getattr(settings, "risk_pct", None)
+    if rp is None:
+        raise ValueError("settings.risk_pct is required for auto-sizing (qty<=0)")
+    try:
+        risk_pct = float(rp)
+    except Exception as e:
+        raise ValueError("settings.risk_pct must be a number") from e
+    if not (0.0 < risk_pct <= 100.0):
+        raise ValueError("settings.risk_pct must be in (0,100]")
+
+    risk_usdt = av * (risk_pct / 100.0)
+    if risk_usdt <= 0:
+        raise ValueError("risk_usdt computed <= 0")
+
+    qty_raw = risk_usdt / (eph * sl)
+    if qty_raw <= 0:
+        raise ValueError("qty_raw computed <= 0")
+
+    filt = get_symbol_filters(sym)
+    qty_n, _, _ = _round_qty_and_price(
+        filters=filt,
+        order_type="MARKET",
+        raw_qty=qty_raw,
+        raw_price=None,
+        raw_stop_price=None,
+    )
+    q = float(qty_n)
+    if q <= 0:
+        raise RuntimeError("auto-sized quantity rounded to 0")
+    return q
+
+
 def open_position_with_tp_sl(
     settings: Any,
     symbol: str,
@@ -877,20 +1032,49 @@ def open_position_with_tp_sl(
     source: str,
     soft_mode: bool = False,
     sl_floor_ratio: Optional[float] = None,
+    *,
+    available_usdt: Optional[float] = None,
 ) -> Optional["Trade"]:
-    # ✅ Trade는 파일 상단에서 `from state.trader_state import Trade` 로 이미 import됨
-
+    """
+    STRICT:
+    - 입력/설정 값 비정상 시 즉시 예외(폴백 금지)
+    - entry_price는 실제 체결 데이터로만 확정
+    - soft_mode=False 인데 TP/SL 설정 실패 시 포지션 즉시 강제 청산 후 실패 처리
+    - qty <= 0 이면 자동 수량 계산(available_usdt 필수)
+    """
     sym = _normalize_symbol(symbol)
-    try:
-        open_side = _normalize_side(side_open)
-    except Exception as e:
-        logger.error("open_position_with_tp_sl invalid side_open=%r err=%s", side_open, str(e))
-        return None
+    open_side = _normalize_side(side_open)
 
-    try:
-        lev = float(getattr(settings, "leverage"))
-    except Exception:
-        lev = float(getattr(SET, "leverage", 1) or 1)
+    # leverage는 STRICT로 강제
+    lev = _require_leverage(settings)
+
+    # tp/sl pct 검증(STRICT)
+    tp_pct_f = float(tp_pct)
+    sl_pct_f = float(sl_pct)
+    if tp_pct_f < 0 or sl_pct_f < 0:
+        raise ValueError("tp_pct and sl_pct must be >= 0")
+    if sl_pct_f == 0:
+        # 자동 수량 계산/기관식 리스크 관점에서 SL=0은 위험. 허용하지 않는다.
+        # (soft_mode=True라도 qty 자동 계산은 불가)
+        if float(qty) <= 0:
+            raise ValueError("sl_pct must be > 0 when qty<=0 (auto-sizing)")
+    eph = float(entry_price_hint)
+    if eph <= 0:
+        if float(qty) <= 0:
+            raise ValueError("entry_price_hint must be > 0 when qty<=0 (auto-sizing)")
+
+    # qty 자동 계산(옵션)
+    final_qty = float(qty)
+    if final_qty <= 0:
+        if available_usdt is None:
+            raise ValueError("available_usdt is required when qty<=0 (auto-sizing)")
+        final_qty = _calc_auto_qty_from_risk_strict(
+            symbol=sym,
+            settings=settings,
+            available_usdt=float(available_usdt),
+            entry_price_hint=float(entry_price_hint),
+            sl_pct=float(sl_pct_f),
+        )
 
     cid = _make_client_order_id(prefix="ent")
 
@@ -898,7 +1082,7 @@ def open_position_with_tp_sl(
         entry_resp = place_market(
             symbol=sym,
             side=open_side,
-            qty=float(qty),
+            qty=float(final_qty),
             settings=settings,
             reduce_only=False,
             position_side="BOTH",
@@ -909,92 +1093,107 @@ def open_position_with_tp_sl(
             "entry order failed (symbol=%s side=%s qty=%s source=%s err=%s)",
             sym,
             open_side,
-            qty,
+            final_qty,
             source,
             str(e),
         )
-        # ✅ EventBus strict side
         log_event(
             event_type="ERROR",
             symbol=sym,
             regime=source,
             side=_event_side_from_open_side(open_side),
             reason=str(e) or "entry_order_failed",
-            extra_json={"open_side": open_side, "qty": float(qty)},
+            extra_json={"open_side": open_side, "qty": float(final_qty)},
         )
         return None
 
-    entry_price: float = 0.0
+    # entry_price STRICT 확정
     try:
-        v = entry_resp.get("avgPrice")
-        entry_price = float(v) if v is not None else 0.0
-    except Exception:
-        entry_price = 0.0
-
-    if entry_price <= 0:
+        entry_price = _fetch_filled_entry_price_strict(
+            symbol=sym,
+            order_id=entry_resp.get("orderId") if isinstance(entry_resp, dict) else None,
+            settings=settings,
+            max_wait_sec=float(getattr(settings, "entry_fill_wait_sec", 2.0) or 2.0),
+        )
+    except Exception as e:
+        logger.error("entry price resolve failed (symbol=%s err=%s)", sym, str(e))
+        log_event(
+            event_type="ERROR",
+            symbol=sym,
+            regime=source,
+            side=_event_side_from_open_side(open_side),
+            reason="entry_price_unavailable",
+            extra_json={"err": str(e), "clientOrderId": cid},
+        )
+        # 포지션이 이미 열렸을 가능성이 있으므로 안전하게 강제 청산 시도
         try:
-            order_id = entry_resp.get("orderId")
-            if order_id is not None:
-                timeout_sec = _require_timeout_sec(settings)
-                od = _call_with_time_sync_retry(
-                    lambda: req(
-                        "GET",
-                        "/fapi/v1/order",
-                        {"symbol": sym, "orderId": order_id},
-                        private=True,
-                        timeout_sec=timeout_sec,
-                    )
-                )
-                if isinstance(od, dict):
-                    v2 = od.get("avgPrice") or od.get("price")
-                    entry_price = float(v2) if v2 is not None else 0.0
-        except Exception:
-            entry_price = 0.0
-
-    if entry_price <= 0:
-        try:
-            from execution.exchange_api import get_position  # ✅ FIXED
-
-            for _ in range(3):
-                pos = get_position(sym)
-                v3 = pos.get("entryPrice") if isinstance(pos, dict) else None
-                ep = float(v3) if v3 is not None else 0.0
-                if ep > 0:
-                    entry_price = ep
-                    break
-                time.sleep(0.1)
-        except Exception:
-            entry_price = 0.0
-
-    if entry_price <= 0:
-        logger.error("entry price unavailable (symbol=%s) hint=%s", sym, entry_price_hint)
+            close_position_market(sym, open_side, float(final_qty))
+        except Exception as e2:
+            logger.critical("force close after entry_price failure also failed (symbol=%s err=%s)", sym, str(e2))
         return None
 
-    # ✅ EventBus strict side
+    if entry_price <= 0:
+        raise RuntimeError("entry_price resolved <= 0 (STRICT violation)")
+
+    # 슬리피지 가드(옵션)
+    max_slip = getattr(settings, "max_entry_slippage_pct", None)
+    if max_slip is not None:
+        try:
+            max_slip_f = float(max_slip)
+        except Exception as e:
+            raise ValueError("settings.max_entry_slippage_pct must be a number") from e
+        if max_slip_f < 0:
+            raise ValueError("settings.max_entry_slippage_pct must be >= 0")
+        if max_slip_f > 0:
+            if float(entry_price_hint) <= 0:
+                raise ValueError("entry_price_hint must be > 0 when max_entry_slippage_pct is enabled")
+            slip_pct = abs(entry_price - float(entry_price_hint)) / float(entry_price_hint) * 100.0
+            if slip_pct > max_slip_f:
+                logger.warning(
+                    "slippage guard triggered (symbol=%s hint=%s fill=%s slip_pct=%.4f limit=%.4f) -> force close",
+                    sym,
+                    float(entry_price_hint),
+                    entry_price,
+                    slip_pct,
+                    max_slip_f,
+                )
+                log_event(
+                    event_type="ERROR",
+                    symbol=sym,
+                    regime=source,
+                    side=_event_side_from_open_side(open_side),
+                    reason="slippage_guard_force_close",
+                    extra_json={
+                        "entry_price_hint": float(entry_price_hint),
+                        "entry_price": float(entry_price),
+                        "slippage_pct": float(slip_pct),
+                        "max_entry_slippage_pct": float(max_slip_f),
+                        "qty": float(final_qty),
+                    },
+                )
+                try:
+                    close_position_market(sym, open_side, float(final_qty))
+                except Exception as e2:
+                    logger.critical("slippage guard force close failed (symbol=%s err=%s)", sym, str(e2))
+                return None
+
+    # ENTRY 이벤트
     log_event(
         event_type="ENTRY",
         symbol=sym,
         regime=source,
         side=_event_side_from_open_side(open_side),  # LONG/SHORT
-        price=entry_price,
-        qty=qty,
-        leverage=lev,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
+        price=float(entry_price),
+        qty=float(final_qty),
+        leverage=int(float(lev)),
+        tp_pct=float(tp_pct_f),
+        sl_pct=float(sl_pct_f),
         risk_pct=getattr(settings, "risk_pct", None),
         reason="MARKET_ENTRY_FILLED",
-        extra_json={"open_side": open_side},
+        extra_json={"open_side": open_side, "clientOrderId": cid},
     )
 
-    try:
-        tp_pct_f = float(tp_pct)
-        sl_pct_f = float(sl_pct)
-        if tp_pct_f < 0 or sl_pct_f < 0:
-            raise ValueError("tp_pct and sl_pct must be >= 0")
-    except Exception as e:
-        logger.error("invalid tp/sl pct (tp_pct=%r sl_pct=%r err=%s)", tp_pct, sl_pct, str(e))
-        return None
-
+    # TP/SL 가격 계산
     if open_side == "BUY":
         tp_price = entry_price * (1.0 + tp_pct_f)
         sl_price = entry_price * (1.0 - sl_pct_f)
@@ -1013,51 +1212,63 @@ def open_position_with_tp_sl(
             if sl_price < floor_price:
                 sl_price = floor_price
 
-    tp_sl_set_ok = False
+    # TP/SL 설정 (STRICT)
     try:
         set_tp_sl(
             symbol=sym,
             side_open=open_side,
-            qty=float(qty),
+            qty=float(final_qty),
             tp_price=float(tp_price),
             sl_price=float(sl_price),
             soft_mode=bool(soft_mode),
             sl_floor_ratio=sl_floor_ratio,
             settings=settings,
         )
-        tp_sl_set_ok = True
     except Exception as e:
-        logger.error("set_tp_sl failed (symbol=%s err=%s)", sym, str(e))
-
-    if tp_sl_set_ok:
-        # ✅ EventBus strict side
+        logger.error("set_tp_sl failed (symbol=%s err=%s soft_mode=%s)", sym, str(e), bool(soft_mode))
         log_event(
-            event_type="TP_SL_SET",
+            event_type="ERROR",
             symbol=sym,
             regime=source,
-            side=_event_side_from_open_side(open_side),  # LONG/SHORT
-            price=entry_price,
-            qty=qty,
-            leverage=lev,
-            tp_pct=tp_pct,
-            sl_pct=sl_pct,
-            risk_pct=getattr(settings, "risk_pct", None),
-            reason="TP_SL_CONFIGURED",
-            extra_json={"soft_mode": bool(soft_mode)},
+            side=_event_side_from_open_side(open_side),
+            reason="tp_sl_set_failed",
+            extra_json={"err": str(e), "soft_mode": bool(soft_mode), "qty": float(final_qty)},
         )
 
-    entry_order_id: Optional[str]
-    try:
-        order_id = entry_resp.get("orderId")
-        entry_order_id = str(order_id) if order_id is not None else None
-    except Exception:
-        entry_order_id = None
+        # soft_mode=True면 SL을 일부러 안 거는 모드이므로, 실패해도 즉시 청산은 하지 않는다.
+        if bool(soft_mode):
+            return None
 
-    # ✅ Trade dataclass(tp_price/sl_price) float → None 금지
+        # soft_mode=False: SL 없는 포지션은 운영상 금지 → 즉시 강제 청산
+        try:
+            close_position_market(sym, open_side, float(final_qty))
+        except Exception as e2:
+            logger.critical("force close after TP/SL failure also failed (symbol=%s err=%s)", sym, str(e2))
+        return None
+
+    log_event(
+        event_type="TP_SL_SET",
+        symbol=sym,
+        regime=source,
+        side=_event_side_from_open_side(open_side),  # LONG/SHORT
+        price=float(entry_price),
+        qty=float(final_qty),
+        leverage=int(float(lev)),
+        tp_pct=float(tp_pct_f),
+        sl_pct=float(sl_pct_f),
+        risk_pct=getattr(settings, "risk_pct", None),
+        reason="TP_SL_CONFIGURED",
+        extra_json={"soft_mode": bool(soft_mode)},
+    )
+
+    entry_order_id: Optional[str]
+    order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
+    entry_order_id = str(order_id) if order_id is not None else None
+
     return Trade(
         symbol=symbol,
         side=open_side,
-        qty=float(qty),
+        qty=float(final_qty),
         entry_price=float(entry_price),
         leverage=int(float(lev)),
         source=str(source or "MARKET"),
@@ -1083,14 +1294,13 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         client_order_id=cid,
     )
 
-    # ✅ EventBus strict side: CLOSE
     log_event(
         event_type="EXIT",
         symbol=sym,
         regime="MANUAL_CLOSE",
         side=_event_side_close(),  # CLOSE
         price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
-        qty=qty,
+        qty=float(qty),
         leverage=getattr(SET, "leverage", None),
         reason="MARKET_CLOSE_EXECUTED",
         extra_json={"close_side": close_side, "clientOrderId": cid},
@@ -1110,15 +1320,9 @@ def close_all_positions_market(symbol: str) -> int:
     """Reduce-Only 시장가로 해당 심볼의 모든 포지션을 정리한다.
 
     STRICT:
-    - 시장데이터(캔들/오더북) 사용 금지.
-    - 포지션/주문 상태(REST)는 허용.
-
-    반환:
-    - 제출한 청산 주문 개수
+    - 포지션 응답에 필수 필드 누락/비정상 시 즉시 예외 (폴백 금지)
     """
     sym = _normalize_symbol(symbol)
-    if not sym:
-        raise ValueError("symbol is required")
 
     positions = fetch_open_positions(sym)
     if not isinstance(positions, list):
@@ -1130,24 +1334,27 @@ def close_all_positions_market(symbol: str) -> int:
 
     for p in positions:
         if not isinstance(p, dict):
-            continue
+            raise RuntimeError("position item is not a dict")
         if str(p.get("symbol") or "").upper() != sym:
             continue
 
-        amt_raw = p.get("positionAmt")
+        if "positionAmt" not in p:
+            raise RuntimeError("position missing positionAmt")
         try:
-            amt = float(amt_raw)
+            amt = float(p.get("positionAmt"))
         except Exception as e:
             raise RuntimeError(f"positionAmt parse failed: {e}") from e
 
         if abs(amt) < 1e-12:
             continue
 
-        pos_side = str(p.get("positionSide") or "BOTH").upper()
+        if "positionSide" not in p:
+            raise RuntimeError("position missing positionSide")
+        pos_side = str(p.get("positionSide") or "").upper().strip()
         if pos_side not in ("BOTH", "LONG", "SHORT"):
-            pos_side = "BOTH"
+            raise RuntimeError(f"invalid positionSide: {pos_side!r}")
 
-        # 포지션 방향 판정
+        # 포지션 방향 판정(STRICT)
         if pos_side in ("LONG", "SHORT"):
             direction = pos_side
         else:
@@ -1175,14 +1382,13 @@ def close_all_positions_market(symbol: str) -> int:
             client_order_id=client_id,
         )
 
-        # ✅ EventBus strict side: CLOSE
         log_event(
             event_type="EXIT",
             symbol=sym,
             regime="SIGTERM_FORCE_CLOSE",
             side=_event_side_close(),  # CLOSE
             price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
-            qty=qty,
+            qty=float(qty),
             leverage=getattr(SET, "leverage", None),
             reason="SIGTERM_DEADLINE_FORCE_CLOSE",
             extra_json={"direction": direction, "close_side": close_side, "positionSide": pos_side},

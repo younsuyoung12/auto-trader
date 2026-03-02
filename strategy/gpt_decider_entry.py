@@ -1,3 +1,51 @@
+"""
+======================================================
+strategy/gpt_decider_entry.py
+STRICT · NO-FALLBACK · PRODUCTION MODE
+======================================================
+역할
+- ENTRY/EXIT GPT 판단 레이어.
+- ENTRY: 로컬 하드 필터 + Regime(레짐) 점수화 기반 필터 + GPT JSON 판단.
+- EXIT : GPT JSON 판단(필수 필드 누락/비정상 시 즉시 예외).
+
+절대 원칙 (STRICT · NO-FALLBACK)
+- 데이터 누락/NaN/Infinity/None 을 0으로 “보정”해서 진행하지 않는다.
+- GPT 응답이 스키마/범위를 위반하면 “ENTER로 보정”하지 않는다.
+  → 명시적 SKIP(ENTRY) 또는 즉시 예외(EXIT).
+- 텔레메트리(telelog/CSV) 실패는 의사결정에 영향을 주지 않는다(로깅만 실패).
+
+인프라 전제
+- 트레이딩 엔진 실행: AWS
+- DB/대시보드: Render
+- 이 파일은 네트워크/DB 접근 없이 GPT 의사결정만 담당한다.
+
+======================================================
+
+변경 이력
+------------------------------------------------------
+2026-03-02
+- 고급 버전 “레짐 점수화 시스템” 적용
+  - trend_strength / atr_pct(volatility) / range_pct / adx / is_low_volatility 기반 점수 계산
+  - 점수 합산으로 TREND / RANGE / HIGH_VOL 3-way 분류
+  - 레짐에 따라 ENTRY 로컬 필터 임계값(entry_score_min) 및 base_risk_pct에 risk_multiplier 적용
+- STRICT · NO-FALLBACK 강화
+  - NaN/Inf/None을 0으로 치환(sanitize)하는 로직 제거 → 발견 즉시 SKIP 또는 예외
+  - ENTRY GPT 응답 필드/범위 위반 시 ENTER로 보정 금지 → 명시적 SKIP
+  - EXIT 응답 필수 필드 위반 시 HOLD로 보정 금지 → 즉시 예외
+  - ask_exit_decision_safe: fallback 제거(실패 시 예외)
+- ENTRY 로컬 필터 버그 수정
+  - trend_strength/volatility를 payload 최상단에서 읽던 오류 수정(시장 피처 dict에서 추출)
+
+2026-03-02 (hotfix)
+- RegimeScorePolicy(slots=True)에서 policy.__dict__ 접근 제거
+  → dataclasses.asdict(policy) 사용
+- 로컬 개발 편의: .env 자동 로딩 지원 (의존성 없이)
+  - OPENAI_API_KEY가 os.environ에 없으면 .env를 읽어 주입
+  - 여전히 OPENAI_API_KEY 없으면 즉시 예외(STRICT)
+  - AWS 운영은 환경변수만 사용(.env 업로드 금지)
+======================================================
+"""
+
 from __future__ import annotations
 
 import csv
@@ -6,10 +54,14 @@ import json
 import math
 import os
 import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from openai import OpenAI
+
+from settings import load_settings
 
 try:
     import infra.telelog as telelog  # type: ignore
@@ -17,47 +69,11 @@ except Exception:  # pragma: no cover
     telelog = None  # type: ignore
 
 
-"""
-2025-12-03 ENTRY/EXIT 안정화 + GPT-4o-mini 최적화 버전
-======================================================
-
-이 파일은 진입(ENTRY) / 청산(EXIT)에 대한 GPT 판단 레이어를 담당한다.
-
-핵심 특징
----------
-
-1) 공통 사항
-   - 기본 모델: GPT-4o-mini (저비용·고속·안정적)
-   - OpenAI Chat Completions API 사용
-   - response_format={"type": "json_object"} 강제
-   - temperature=0.0 (결정적 결과)
-   - NaN/Infinity/None 은 GPT 입력 전에 _sanitize_for_gpt 로 제거
-   - ENTRY / EXIT 레이턴시는 CSV(gpt_latency.csv)에 기록
-
-2) ENTRY (ask_entry_decision)
-   - 시스템 기준 신호(entry_score, trend_strength, volatility)를 기반으로
-     로컬 필터를 먼저 적용해 불필요한 GPT 호출을 차단한다.
-   - 요구 필드(action/direction/tp_pct/sl_pct/risk_pct/reason 등)를
-     GPT JSON 응답에서 정규화해 안전하게 반환한다.
-   - 로컬 SKIP 레이어를 통해 비용 폭증을 방지한다.
-
-3) EXIT (ask_exit_decision / ask_exit_decision_safe)
-   - 포지션 유지(HOLD) / 청산(CLOSE) 여부를 GPT에 묻는다.
-   - GPT 실패 시 fallback_action(HOLD/CLOSE)으로 자동 복구한다.
-   - new_sl_pct/new_tp_pct 등은 선택적이며 누락 가능하다.
-
-4) 프롬프트 최적화
-   - 장문 예시와 잡음 제거.
-   - 반드시 1개의 JSON만 출력하도록 강제.
-   - reason/note는 전문적이고 간결한 한국어 문장 규칙 적용.
-"""
-
-
 # =============================================================================
 # 설정 / 상수
 # =============================================================================
 
-# 기본 모델: GPT-5.1 (일반, pro 아님)
+# 기본 모델 (환경변수로 덮어쓰기)
 GPT_MODEL_DEFAULT = os.getenv("OPENAI_TRADER_MODEL", "gpt-4o-mini")
 
 OPENAI_TRADER_MAX_LATENCY = float(os.getenv("OPENAI_TRADER_MAX_LATENCY", "12"))
@@ -68,70 +84,46 @@ GPT_LATENCY_CSV = os.getenv("GPT_LATENCY_CSV", "gpt_latency.csv")
 TELELOG_CHAT_ID = os.getenv("TELELOG_CHAT_ID", "")
 TELELOG_LEVEL = os.getenv("TELELOG_LEVEL", "INFO").upper()
 
-GPT_MAX_RISK_PCT = float(os.getenv("GPT_MAX_RISK_PCT", "0.03"))  # 3% 기본 한도
+# GPT가 제안할 수 있는 최대 리스크(비율, 예: 0.03 = 3%)
+GPT_MAX_RISK_PCT = float(os.getenv("GPT_MAX_RISK_PCT", "0.03"))
 
-gpt_entry_call_count = 0  # ENTRY 호출 횟수 카운터
+# ENTRY GPT 호출 횟수(프로세스 내 카운터)
+gpt_entry_call_count = 0
 
 _gpt_latency_lock = Lock()
 
+SET = load_settings()  # settings는 단일 소스(불변 전제)
+
 
 # =============================================================================
-# 공용 유틸
+# 공용 유틸 (로깅은 의사결정에 영향 주지 않음)
 # =============================================================================
-
-
 def _safe_log(level: str, msg: str) -> None:
-    """
-    telelog.log(...) 호출을 감싸서, telelog 미설치/에러가 있어도
-    gpt_decider 자체 로직에는 영향을 주지 않도록 한다.
-    """
     if telelog is None:
         return
-
     try:
         level = (level or "INFO").upper()
         if level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             level = "INFO"
         telelog.log(level, msg)  # type: ignore
     except Exception:
-        # 로깅 실패는 무시
-        pass
+        return
 
 
 def _safe_tg(msg: str) -> None:
-    """
-    텔레그램 알림을 보낼 수 있으면 보내고, 실패해도 예외로 이어지지 않도록 보호.
-    """
     if telelog is None:
         return
     if not TELELOG_CHAT_ID:
         return
-
     try:
         telelog.tg(msg)  # type: ignore
     except Exception:
-        pass
-
-
-def _fatal_log_and_raise(msg: str, *, exc: Optional[Exception] = None) -> None:
-    """
-    치명적 오류 상황에서 로그를 남기고 RuntimeError로 감싼 뒤 raise.
-
-    ※ ENTRY 경로에서는 사용하지 않는다.
-    """
-    full_msg = f"[gpt_decider:FATAL] {msg}"
-    if exc is not None:
-        full_msg += f" | exc={type(exc).__name__}: {exc}"
-
-    _safe_log("ERROR", full_msg)
-    _safe_tg(full_msg)
-
-    raise RuntimeError(full_msg) from exc
+        return
 
 
 def _log_gpt_latency_csv(
     *,
-    kind: str,  # "ENTRY" / "EXIT" 등
+    kind: str,
     model: str,
     symbol: Optional[str],
     source: Optional[str],
@@ -141,10 +133,6 @@ def _log_gpt_latency_csv(
     error_type: str = "",
     error_msg: str = "",
 ) -> None:
-    """
-    GPT 호출 레이턴시를 CSV 파일에 append.
-    파일 쓰기 충돌을 피하기 위해 Lock 사용.
-    """
     row = {
         "timestamp": dt.datetime.utcnow().isoformat(),
         "kind": kind,
@@ -155,7 +143,7 @@ def _log_gpt_latency_csv(
         "latency_sec": f"{latency:.4f}",
         "success": "1" if success else "0",
         "error_type": error_type,
-        "error_msg": error_msg[:512],
+        "error_msg": (error_msg or "")[:512],
     }
 
     try:
@@ -167,21 +155,10 @@ def _log_gpt_latency_csv(
                     writer.writeheader()
                 writer.writerow(row)
     except Exception:
-        # 로깅 실패는 전체 로직에 영향을 주지 않게 무시
-        pass
+        return
 
 
 def _extract_text_from_response(resp: Any) -> str:
-    """
-    OpenAI Chat Completions 스타일 응답 객체에서
-    텍스트 부분을 최대한 안전하게 추출한다.
-
-    우선순위:
-    1) resp.choices[0].message.content
-    2) (구) Responses 스타일: resp.output_text
-    3) (구) Responses 스타일: resp.output[0].content[0].text.value
-    4) 최후: repr(resp) 일부
-    """
     choices = getattr(resp, "choices", None)
     if choices and isinstance(choices, (list, tuple)) and len(choices) > 0:
         first = choices[0]
@@ -218,19 +195,405 @@ def _extract_text_from_response(resp: Any) -> str:
 
 
 # =============================================================================
-# OpenAI 클라이언트 / 공통 JSON 호출
+# .env 로딩 (로컬 개발 편의) + OpenAI Client (STRICT)
 # =============================================================================
+def _load_dotenv_if_needed() -> None:
+    """
+    로컬 개발 편의용.
+    - OPENAI_API_KEY가 os.environ에 없을 때만 .env를 읽어 주입한다.
+    - 이미 환경변수가 있으면 덮어쓰지 않는다.
+    - .env가 없으면 아무것도 하지 않는다.
+    - 파일 파싱 실패는 즉시 예외(STRICT). (조용히 무시 금지)
+    """
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        return
+
+    # gpt_decider_entry.py는 strategy/ 아래에 있으므로, 프로젝트 루트는 parents[1]
+    root = Path(__file__).resolve().parents[1]
+    candidates = [
+        root / ".env",          # 프로젝트 루트
+        Path.cwd() / ".env",    # 현재 작업 디렉토리
+    ]
+
+    env_path: Optional[Path] = None
+    for p in candidates:
+        if p.exists() and p.is_file():
+            env_path = p
+            break
+
+    if env_path is None:
+        return
+
+    try:
+        with env_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        raise RuntimeError(f".env 로딩 실패: {e}") from e
 
 
 def _get_client() -> OpenAI:
     """
-    OpenAI 클라이언트를 생성한다.
+    STRICT:
+    - OPENAI_API_KEY 없으면 즉시 예외.
+    - 로컬에서만 .env 로딩을 허용(환경변수 우선, 덮어쓰기 금지).
     """
+    _load_dotenv_if_needed()
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY가 없습니다. "
+            "로컬은 .env에 OPENAI_API_KEY를 넣고, AWS 운영은 환경변수로 설정하십시오."
+        )
+
     api_base = os.getenv("OPENAI_API_BASE", "").strip() or None
-    client = OpenAI(base_url=api_base)
-    return client
+    return OpenAI(api_key=api_key, base_url=api_base)
 
 
+# =============================================================================
+# STRICT JSON/수치 검증 (NO-FALLBACK)
+# =============================================================================
+def _is_finite_number(x: Any) -> bool:
+    try:
+        f = float(x)
+    except Exception:
+        return False
+    return math.isfinite(f)
+
+
+def _req_float(x: Any, name: str, *, min_v: Optional[float] = None, max_v: Optional[float] = None) -> float:
+    if isinstance(x, bool):
+        raise ValueError(f"{name} must be a number (bool not allowed)")
+    try:
+        f = float(x)
+    except Exception as e:
+        raise ValueError(f"{name} must be a number") from e
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be finite")
+    if min_v is not None and f < min_v:
+        raise ValueError(f"{name} must be >= {min_v}")
+    if max_v is not None and f > max_v:
+        raise ValueError(f"{name} must be <= {max_v}")
+    return f
+
+
+def _req_int(x: Any, name: str, *, min_v: Optional[int] = None, max_v: Optional[int] = None) -> int:
+    try:
+        iv = int(x)
+    except Exception as e:
+        raise ValueError(f"{name} must be int") from e
+    if min_v is not None and iv < min_v:
+        raise ValueError(f"{name} must be >= {min_v}")
+    if max_v is not None and iv > max_v:
+        raise ValueError(f"{name} must be <= {max_v}")
+    return iv
+
+
+def _assert_no_nan_inf_none(obj: Any, *, path: str = "root", depth: int = 0, max_depth: int = 12) -> None:
+    if depth > max_depth:
+        raise ValueError(f"payload too deep (>{max_depth}) at {path}")
+
+    if obj is None:
+        raise ValueError(f"None is not allowed at {path}")
+
+    if isinstance(obj, bool):
+        return
+
+    if isinstance(obj, (int, str)):
+        return
+
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise ValueError(f"NaN/Inf is not allowed at {path}")
+        return
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _assert_no_nan_inf_none(v, path=f"{path}.{k}", depth=depth + 1, max_depth=max_depth)
+        return
+
+    if isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _assert_no_nan_inf_none(v, path=f"{path}[{i}]", depth=depth + 1, max_depth=max_depth)
+        return
+
+    raise ValueError(f"unsupported type at {path}: {type(obj).__name__}")
+
+
+# =============================================================================
+# 레짐 점수화 시스템 (고급 버전)
+# =============================================================================
+@dataclass(frozen=True, slots=True)
+class RegimeScorePolicy:
+    # 변동성(atr_pct) 임계 (atr_pct는 ratio: 0.004 = 0.4%)
+    vol_hi_1: float = 0.008  # 0.8%  → 큰 변동성
+    vol_hi_2: float = 0.012  # 1.2%  → 매우 큰 변동성
+    vol_extreme: float = 0.020  # 2.0% → 극단(즉시 HIGH_VOL)
+
+    # trend_strength 임계 (기존 build_regime_features 기준으로 1.x대가 흔함)
+    ts_1: float = 1.2
+    ts_2: float = 1.6
+    ts_3: float = 2.0
+
+    # ADX 임계
+    adx_1: float = 18.0
+    adx_2: float = 25.0
+    adx_3: float = 35.0
+
+    # range_pct 임계 (ratio)
+    range_small_1: float = 0.004  # 0.4%
+    range_small_2: float = 0.002  # 0.2%
+
+    # 분류 기준(총점)
+    trend_score_min: int = 3
+    high_vol_score_max: int = -4  # 이 이하이면 HIGH_VOL
+
+    # 레짐별 로컬 필터/리스크
+    base_entry_score_min: float = 15.0
+    range_entry_add: float = 10.0
+    high_vol_entry_add: float = 20.0
+
+    trend_risk_mult: float = 1.0
+    range_risk_mult: float = 0.7
+    high_vol_risk_mult: float = 0.5
+
+
+def _load_regime_policy(settings: Any) -> RegimeScorePolicy:
+    p = RegimeScorePolicy()
+
+    def g(name: str, default: Any) -> Any:
+        return getattr(settings, name, default)
+
+    pol = RegimeScorePolicy(
+        vol_hi_1=float(g("regime_vol_hi_1", p.vol_hi_1)),
+        vol_hi_2=float(g("regime_vol_hi_2", p.vol_hi_2)),
+        vol_extreme=float(g("regime_vol_extreme", p.vol_extreme)),
+        ts_1=float(g("regime_ts_1", p.ts_1)),
+        ts_2=float(g("regime_ts_2", p.ts_2)),
+        ts_3=float(g("regime_ts_3", p.ts_3)),
+        adx_1=float(g("regime_adx_1", p.adx_1)),
+        adx_2=float(g("regime_adx_2", p.adx_2)),
+        adx_3=float(g("regime_adx_3", p.adx_3)),
+        range_small_1=float(g("regime_range_small_1", p.range_small_1)),
+        range_small_2=float(g("regime_range_small_2", p.range_small_2)),
+        trend_score_min=_req_int(g("regime_trend_score_min", p.trend_score_min), "regime_trend_score_min", min_v=1),
+        high_vol_score_max=_req_int(g("regime_high_vol_score_max", p.high_vol_score_max), "regime_high_vol_score_max"),
+        base_entry_score_min=float(g("regime_base_entry_score_min", p.base_entry_score_min)),
+        range_entry_add=float(g("regime_range_entry_add", p.range_entry_add)),
+        high_vol_entry_add=float(g("regime_high_vol_entry_add", p.high_vol_entry_add)),
+        trend_risk_mult=float(g("regime_trend_risk_mult", p.trend_risk_mult)),
+        range_risk_mult=float(g("regime_range_risk_mult", p.range_risk_mult)),
+        high_vol_risk_mult=float(g("regime_high_vol_risk_mult", p.high_vol_risk_mult)),
+    )
+
+    for name, v in [
+        ("vol_hi_1", pol.vol_hi_1),
+        ("vol_hi_2", pol.vol_hi_2),
+        ("vol_extreme", pol.vol_extreme),
+        ("ts_1", pol.ts_1),
+        ("ts_2", pol.ts_2),
+        ("ts_3", pol.ts_3),
+        ("adx_1", pol.adx_1),
+        ("adx_2", pol.adx_2),
+        ("adx_3", pol.adx_3),
+        ("range_small_1", pol.range_small_1),
+        ("range_small_2", pol.range_small_2),
+        ("base_entry_score_min", pol.base_entry_score_min),
+        ("range_entry_add", pol.range_entry_add),
+        ("high_vol_entry_add", pol.high_vol_entry_add),
+        ("trend_risk_mult", pol.trend_risk_mult),
+        ("range_risk_mult", pol.range_risk_mult),
+        ("high_vol_risk_mult", pol.high_vol_risk_mult),
+    ]:
+        if not math.isfinite(float(v)):
+            raise ValueError(f"regime policy {name} must be finite")
+
+    if not (0 < pol.vol_hi_1 < pol.vol_hi_2 < pol.vol_extreme):
+        raise ValueError("regime vol thresholds must satisfy 0 < hi1 < hi2 < extreme")
+    if not (0 < pol.range_risk_mult <= 1.0 and 0 < pol.high_vol_risk_mult <= 1.0 and pol.trend_risk_mult > 0):
+        raise ValueError("regime risk multipliers invalid")
+    return pol
+
+
+def _pick_tf5_container(market_features: Dict[str, Any]) -> Dict[str, Any]:
+    for k in ("tf5", "tf_5m", "m5", "five_min"):
+        v = market_features.get(k)
+        if isinstance(v, dict):
+            return v
+    return market_features
+
+
+def _extract_regime_inputs_strict(market_features: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(market_features, dict):
+        raise ValueError("market_features must be dict")
+
+    base = market_features
+    tf5 = _pick_tf5_container(market_features)
+
+    trend_strength = None
+    if "trend_strength" in base:
+        trend_strength = base.get("trend_strength")
+    elif "trend_strength" in tf5:
+        trend_strength = tf5.get("trend_strength")
+    else:
+        reg = tf5.get("regime")
+        if isinstance(reg, dict) and "trend_strength" in reg:
+            trend_strength = reg.get("trend_strength")
+
+    atr_pct = None
+    for k in ("volatility", "atr_pct"):
+        if k in base:
+            atr_pct = base.get(k)
+            break
+    if atr_pct is None:
+        for k in ("volatility", "atr_pct"):
+            if k in tf5:
+                atr_pct = tf5.get(k)
+                break
+
+    range_pct = base.get("range_pct") if "range_pct" in base else tf5.get("range_pct")
+    adx = base.get("adx") if "adx" in base else tf5.get("adx")
+    is_lv = base.get("is_low_volatility") if "is_low_volatility" in base else tf5.get("is_low_volatility")
+
+    return {
+        "trend_strength": _req_float(trend_strength, "trend_strength", min_v=0.0),
+        "atr_pct": _req_float(atr_pct, "atr_pct", min_v=0.0),
+        "range_pct": _req_float(range_pct, "range_pct", min_v=0.0),
+        "adx": _req_float(adx, "adx", min_v=0.0),
+        "is_low_volatility": _req_int(is_lv, "is_low_volatility", min_v=0, max_v=1),
+    }
+
+
+def _score_and_classify_regime(
+    *,
+    policy: RegimeScorePolicy,
+    current_price: float,
+    market_features: Dict[str, Any],
+) -> Dict[str, Any]:
+    cp = _req_float(current_price, "current_price", min_v=0.0)
+    if cp <= 0:
+        raise ValueError("current_price must be > 0")
+
+    x = _extract_regime_inputs_strict(market_features)
+
+    ts = x["trend_strength"]
+    atr = x["atr_pct"]
+    rng = x["range_pct"]
+    adx = x["adx"]
+    is_lv = x["is_low_volatility"]
+
+    score = 0
+    comp: Dict[str, int] = {}
+
+    if atr >= policy.vol_extreme:
+        comp["vol_extreme"] = -999
+    elif atr >= policy.vol_hi_2:
+        comp["vol_hi_2"] = -5
+        score += -5
+    elif atr >= policy.vol_hi_1:
+        comp["vol_hi_1"] = -3
+        score += -3
+    else:
+        comp["vol_ok"] = 0
+
+    if ts >= policy.ts_3:
+        comp["ts_3"] = +3
+        score += 3
+    elif ts >= policy.ts_2:
+        comp["ts_2"] = +2
+        score += 2
+    elif ts >= policy.ts_1:
+        comp["ts_1"] = +1
+        score += 1
+    else:
+        comp["ts_weak"] = -1
+        score += -1
+
+    if adx >= policy.adx_3:
+        comp["adx_3"] = +3
+        score += 3
+    elif adx >= policy.adx_2:
+        comp["adx_2"] = +2
+        score += 2
+    elif adx < policy.adx_1:
+        comp["adx_weak"] = -1
+        score += -1
+    else:
+        comp["adx_mid"] = 0
+
+    if rng <= policy.range_small_2:
+        comp["range_tight_2"] = -2
+        score += -2
+    elif rng <= policy.range_small_1:
+        comp["range_tight_1"] = -1
+        score += -1
+    else:
+        comp["range_wide"] = 0
+
+    if is_lv == 1:
+        comp["low_vol_flag"] = -1
+        score += -1
+
+    b_bonus = 0
+    try:
+        hi = market_features.get("high_recent")
+        lo = market_features.get("low_recent")
+        if hi is not None and lo is not None:
+            hi_f = _req_float(hi, "high_recent", min_v=0.0)
+            lo_f = _req_float(lo, "low_recent", min_v=0.0)
+            if cp > hi_f:
+                b_bonus = 1
+                comp["breakout_up"] = 1
+            elif cp < lo_f:
+                b_bonus = 1
+                comp["breakout_down"] = 1
+    except Exception:
+        pass
+    score += b_bonus
+
+    if atr >= policy.vol_extreme or comp.get("vol_extreme") == -999:
+        regime = "HIGH_VOL"
+    elif score <= policy.high_vol_score_max:
+        regime = "HIGH_VOL"
+    elif score >= policy.trend_score_min:
+        regime = "TREND"
+    else:
+        regime = "RANGE"
+
+    if regime == "TREND":
+        risk_mult = policy.trend_risk_mult
+        entry_min = policy.base_entry_score_min
+    elif regime == "HIGH_VOL":
+        risk_mult = policy.high_vol_risk_mult
+        entry_min = policy.base_entry_score_min + policy.high_vol_entry_add
+    else:
+        risk_mult = policy.range_risk_mult
+        entry_min = policy.base_entry_score_min + policy.range_entry_add
+
+    return {
+        "regime": regime,
+        "score": int(score),
+        "risk_multiplier": float(risk_mult),
+        "entry_score_min": float(entry_min),
+        "inputs": x,
+        "components": comp,
+        "policy": asdict(policy),
+    }
+
+
+# =============================================================================
+# OpenAI 공통 JSON 호출(Exit)
+# =============================================================================
 def _call_gpt_json(
     *,
     model: str,
@@ -238,13 +601,6 @@ def _call_gpt_json(
     purpose: str = "EXIT",
     timeout_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    Chat Completions API를 사용해 JSON 응답을 기대하는 GPT 호출을 공통 처리.
-
-    - response_format={"type": "json_object"} 사용
-    - 레이턴시 측정 및 CSV 로깅
-    - 단일 dict로 파싱 실패 시 예외
-    """
     if timeout_sec is None:
         timeout_sec = OPENAI_TRADER_MAX_LATENCY
 
@@ -256,25 +612,14 @@ def _call_gpt_json(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
+            timeout=timeout_sec,
+            temperature=0.0,
+            max_completion_tokens=OPENAI_TRADER_MAX_TOKENS,
         )
         latency = time.monotonic() - start
 
         text = _extract_text_from_response(resp)
-        try:
-            data = json.loads(text)
-        except Exception as e:
-            _log_gpt_latency_csv(
-                kind=purpose.upper(),
-                model=model,
-                symbol=None,
-                source=None,
-                direction=None,
-                latency=latency,
-                success=False,
-                error_type=type(e).__name__,
-                error_msg=f"JSON parse error: {e}",
-            )
-            raise
+        data = json.loads(text)
 
         _log_gpt_latency_csv(
             kind=purpose.upper(),
@@ -306,11 +651,33 @@ def _call_gpt_json(
 
 
 # =============================================================================
-# ENTRY 쪽 GPT 응답 정규화 / 검증
+# ENTRY GPT 응답 정규화(STRICT)
 # =============================================================================
+def _entry_invalid_to_skip(
+    *,
+    symbol: str,
+    source: str,
+    reason: str,
+    note: str,
+    raw_response: str = "",
+) -> Dict[str, Any]:
+    return {
+        "action": "SKIP",
+        "direction": "PASS",
+        "confidence": 0.0,
+        "tp_pct": 0.0,
+        "tv_pct": 0.0,
+        "sl_pct": 0.0,
+        "effective_risk_pct": 0.0,
+        "guard_adjustments": {},
+        "reason": reason,
+        "note": note,
+        "raw_response": raw_response,
+        "_meta": {"symbol": symbol, "source": source},
+    }
 
 
-def _normalize_and_validate_entry_response(
+def _normalize_and_validate_entry_response_strict(
     resp: Dict[str, Any],
     *,
     base_tv_pct: float,
@@ -320,193 +687,93 @@ def _normalize_and_validate_entry_response(
     source: str,
     gpt_max_risk_pct: float,
 ) -> Dict[str, Any]:
-    """
-    ENTRY GPT의 JSON 응답을 정규화하고, 위험/타겟/손절/액션 관련 필드를 검증한다.
-    """
-
-    # ---- action 정규화 ------------------------------------------------------
     raw_action = str(resp.get("action", "") or "").upper().strip()
     if raw_action == "PASS":
         raw_action = "SKIP"
-
     if raw_action not in ("ENTER", "SKIP", "ADJUST"):
-        _safe_log(
-            "WARNING",
-            f"[ENTRY_VALIDATE] invalid action={raw_action!r} -> SKIP | "
-            f"symbol={symbol} source={source}",
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason=f"GPT 응답 action이 유효하지 않음({raw_action}).",
+            note="invalid_gpt_action",
+            raw_response=str(resp)[:500],
         )
-        action = "SKIP"
-    else:
-        action = raw_action
+    action = raw_action
 
-    # ---- direction 정규화 ---------------------------------------------------
     direction = str(resp.get("direction", "") or "").upper().strip()
     if direction not in ("LONG", "SHORT", "PASS"):
-        _safe_log(
-            "WARNING",
-            f"[ENTRY_VALIDATE] invalid direction={direction!r} -> PASS | "
-            f"symbol={symbol} source={source}",
-        )
         direction = "PASS"
 
-    def _as_float(key: str, default: float = 0.0) -> float:
-        v = resp.get(key, default)
-        try:
-            if v is None:
-                return default
-            if isinstance(v, (int, float)):
-                f = float(v)
-                if math.isnan(f) or math.isinf(f):
-                    return default
-                return f
-            f = float(str(v))
-            if math.isnan(f) or math.isinf(f):
-                return default
-            return f
-        except Exception:
-            _safe_log(
-                "WARNING",
-                f"[ENTRY_VALIDATE] {key} parse failed, use default={default} | "
-                f"symbol={symbol} source={source} raw={v!r}",
-            )
-        return default
-
-    def _clamp_float(
-        key: str,
-        v: float,
-        min_val: float,
-        max_val: float,
-        *,
-        allow_zero: bool = False,
-    ) -> float:
-        """
-        숫자 범위를 벗어나더라도 예외를 발생시키지 않고,
-        [min_val, max_val] 구간으로 클램핑하며 WARNING 로그만 남긴다.
-        """
-        if math.isnan(v) or math.isinf(v):
-            _safe_log(
-                "WARNING",
-                f"[ENTRY_VALIDATE] {key} is NaN/Inf -> set to {min_val} | "
-                f"symbol={symbol} source={source}",
-            )
-            return min_val
-
-        if not allow_zero and v == 0.0:
-            return min_val
-
-        if v < min_val:
-            _safe_log(
-                "WARNING",
-                f"[ENTRY_VALIDATE] {key} below min ({v} < {min_val}) -> clamp | "
-                f"symbol={symbol} source={source}",
-            )
-            return min_val
-
-        if v > max_val:
-            _safe_log(
-                "WARNING",
-                f"[ENTRY_VALIDATE] {key} above max ({v} > {max_val}) -> clamp | "
-                f"symbol={symbol} source={source}",
-            )
-            return max_val
-
-        return v
-
-    # ---- 수익/손절/리스크 정규화 -------------------------------------------
-
-    tp_pct = _as_float("tp_pct", base_tv_pct)
-    if "tp_pct" not in resp and "tv_pct" in resp:
-        tp_pct = _as_float("tv_pct", base_tv_pct)
-
-    sl_pct = _as_float("sl_pct", base_sl_pct)
-    effective_risk_pct = _as_float("effective_risk_pct", base_risk_pct)
-
-    if action == "SKIP":
-        tp_pct = 0.0
-        sl_pct = 0.0
-        effective_risk_pct = 0.0
-    else:
-        if tp_pct <= 0.0 and base_tv_pct > 0.0:
-            tp_pct = base_tv_pct
-        if sl_pct <= 0.0 and base_sl_pct > 0.0:
-            sl_pct = base_sl_pct
-
-        tp_pct = _clamp_float("tp_pct", tp_pct, 0.0, 0.5, allow_zero=True)
-        sl_pct = _clamp_float("sl_pct", sl_pct, 0.0, 0.5, allow_zero=True)
-
-        if base_tv_pct > 0 and tp_pct > 0:
-            ratio_tv = tp_pct / base_tv_pct
-            if ratio_tv < 0.02 or ratio_tv > 4.0:
-                _safe_log(
-                    "WARNING",
-                    "[ENTRY_VALIDATE] tp_pct/base_tv_pct ratio out of range 0.02~4.0: "
-                    f"{ratio_tv:.4f} (tp={tp_pct}, base={base_tv_pct}) | "
-                    f"symbol={symbol} source={source}",
-                )
-
-        if base_sl_pct > 0 and sl_pct > 0:
-            ratio_sl = sl_pct / base_sl_pct
-            if ratio_sl < 0.02 or ratio_sl > 4.0:
-                _safe_log(
-                    "WARNING",
-                    "[ENTRY_VALIDATE] sl_pct/base_sl_pct ratio out of range 0.02~4.0: "
-                    f"{ratio_sl:.4f} (sl={sl_pct}, base={base_sl_pct}) | "
-                    f"symbol={symbol} source={source}",
-                )
-
-        if base_risk_pct > 0:
-            tol = max(1e-6, gpt_max_risk_pct * 1e-4)
-            max_allowed = gpt_max_risk_pct + tol
-            min_allowed = 0.0
-            effective_risk_pct = _clamp_float(
-                "effective_risk_pct",
-                effective_risk_pct,
-                min_allowed,
-                max_allowed,
-                allow_zero=True,
-            )
-            if effective_risk_pct > gpt_max_risk_pct:
-                _safe_log(
-                    "WARNING",
-                    "[ENTRY_VALIDATE] effective_risk_pct slightly above max, "
-                    f"clamp to {gpt_max_risk_pct} | "
-                    f"symbol={symbol} source={source} raw={effective_risk_pct}",
-                )
-                effective_risk_pct = gpt_max_risk_pct
-        else:
-            effective_risk_pct = 0.0
-
-    # ---- confidence / reason / note / guard_adjustments ---------------------
-
-    confidence = _as_float("confidence", 0.5)
-    if confidence < 0.0 or confidence > 1.0:
-        _safe_log(
-            "WARNING",
-            f"[ENTRY_VALIDATE] confidence out of 0~1 range: {confidence} -> clamp | "
-            f"symbol={symbol} source={source}",
-        )
-        confidence = max(0.0, min(1.0, confidence))
+    try:
+        confidence = float(resp.get("confidence", 0.5))
+    except Exception:
+        confidence = 0.5
+    if not math.isfinite(confidence):
+        confidence = 0.5
+    confidence = max(0.0, min(1.0, confidence))
 
     note = str(resp.get("note", "") or "").strip()
     reason = str(resp.get("reason", "") or "").strip()
     raw_response = str(resp.get("raw_response", "") or "").strip()
 
+    if action == "SKIP":
+        if not reason:
+            reason = "지표 근거 부족 또는 리스크 과다로 SKIP."
+        return {
+            "action": "SKIP",
+            "direction": "PASS",
+            "confidence": confidence,
+            "tp_pct": 0.0,
+            "tv_pct": 0.0,
+            "sl_pct": 0.0,
+            "effective_risk_pct": 0.0,
+            "guard_adjustments": {},
+            "reason": reason,
+            "note": note,
+            "raw_response": raw_response,
+        }
+
+    tp_raw = resp.get("tp_pct", None)
+    if tp_raw is None and "tv_pct" in resp:
+        tp_raw = resp.get("tv_pct")
+    sl_raw = resp.get("sl_pct", None)
+    rk_raw = resp.get("effective_risk_pct", None)
+
+    try:
+        tp_pct = _req_float(tp_raw, "tp_pct", min_v=0.0, max_v=0.5)
+        sl_pct = _req_float(sl_raw, "sl_pct", min_v=0.0, max_v=0.5)
+        effective_risk_pct = _req_float(rk_raw, "effective_risk_pct", min_v=0.0, max_v=gpt_max_risk_pct)
+    except Exception as e:
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason=f"GPT 응답 수치 필드가 유효하지 않음: {type(e).__name__}: {e}",
+            note="invalid_gpt_numeric_fields",
+            raw_response=str(resp)[:500],
+        )
+
+    if tp_pct <= 0 or sl_pct <= 0 or effective_risk_pct <= 0:
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason="GPT 응답(tp/sl/risk)이 0 이하. ENTER/ADJUST 불가.",
+            note="invalid_zero_fields",
+            raw_response=str(resp)[:500],
+        )
+
     if not reason:
-        if action == "SKIP":
-            reason = "GPT 판단 결과, 이번 캔들은 진입 리스크가 높거나 신뢰도가 낮아 스킵합니다."
-        elif action in ("ENTER", "ADJUST"):
-            reason = "GPT 판단 결과를 바탕으로 이번 캔들에서는 진입을 허용합니다."
+        reason = "지표 근거에 따라 진입을 허용."
 
     guard_adjustments = resp.get("guard_adjustments")
     if not isinstance(guard_adjustments, dict):
         guard_adjustments = {}
 
-    normalized = {
+    return {
         "action": action,
         "direction": direction,
         "confidence": confidence,
         "tp_pct": tp_pct,
-        "tv_pct": tp_pct,  # 하위호환용 alias
+        "tv_pct": tp_pct,
         "sl_pct": sl_pct,
         "effective_risk_pct": effective_risk_pct,
         "guard_adjustments": guard_adjustments,
@@ -514,63 +781,18 @@ def _normalize_and_validate_entry_response(
         "note": note,
         "raw_response": raw_response,
     }
-    return normalized
 
 
 # =============================================================================
-# NaN/Inf/None 정규화 유틸 (GPT 입력 직전용)
-# =============================================================================
-
-
-def _sanitize_for_gpt(
-    obj: Any,
-    *,
-    _depth: int = 0,
-    _max_depth: int = 8,
-) -> Any:
-    """
-    GPT 호출 직전에 JSON으로 직렬화할 payload에 들어 있는
-    NaN / Infinity / None 값을 비교적 단순하게 정규화한다.
-    """
-    if _depth > _max_depth:
-        return obj
-
-    if isinstance(obj, (int, bool)):
-        return obj
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return obj
-
-    if obj is None:
-        return 0
-
-    if isinstance(obj, dict):
-        return {
-            str(k): _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
-            for k, v in obj.items()
-        }
-
-    if isinstance(obj, (list, tuple)):
-        return [
-            _sanitize_for_gpt(v, _depth=_depth + 1, _max_depth=_max_depth)
-            for v in obj
-        ]
-
-    return obj
-
-
-# =============================================================================
-# GPT 프롬프트 정의 (ENTRY)
+# GPT 프롬프트 (ENTRY)
 # =============================================================================
 SYSTEM_PROMPT_ENTRY = """
 You are an expert intraday crypto futures trading decision assistant.
 
 역할:
-- 단기(인트라데이) 비트코인 선물 자동매매 시스템의 '진입 판단 레이어'를 담당한다.
+- 단기 선물 자동매매 시스템의 '진입 판단 레이어'를 담당한다.
 - JSON 컨텍스트를 기반으로 이번 캔들에서 ENTER / ADJUST / SKIP 중 하나를 결정한다.
 - 반드시 하나의 JSON 객체만 출력한다.
-
 
 출력 JSON 스키마:
 - 필수:
@@ -581,41 +803,24 @@ You are an expert intraday crypto futures trading decision assistant.
     - sl_pct: 0.0 ~ 0.5
     - effective_risk_pct: 0.0 ~ {gpt_max_risk_pct}
     - guard_adjustments: 객체 (없으면 빈 객체)
-    - reason: 한국어 1~2문장 (왜 ENTER/ADJUST/SKIP 했는지)
+    - reason: 한국어 1~2문장 (지표/리스크 근거)
     - note: string
     - raw_response: string
 
 규칙:
 - action 이 "ENTER" 또는 "ADJUST"면 tp_pct/sl_pct/effective_risk_pct 모두 0보다 커야 한다.
-- action 이 "SKIP"이면 왜 스킵했는지 reason에 반드시 지표 기반 근거를 포함한다.
+- action 이 "SKIP"이면 reason에 지표 기반 근거를 포함한다.
 - NaN/Infinity/null/None 과 같은 값은 절대 사용하지 않는다.
 - 반드시 순수 JSON 형식으로만 출력한다.
 
-문체 규칙(중요):
-- 말투는 전문적이고 간결하며 감정을 넣지 않는다.
-- 돌려 말하지 않고 있는 그대로 말한다.
-- 이유(reason)는 지표·가격·리스크 근거만 명확하게 제시한다.
-- 불필요한 형용사, 감탄사, 스토리형 설명 금지.
-- 다음과 같은 형식을 우선한다:
-
-예시:
-- "entry_score 36. 추세 불명확. 변동성 약함 → SKIP."
-- "단기·중기 추세 상방. 유동성 우위 → ENTER LONG."
-- "지표 근거 부족 → SKIP."
-
-이 문체 규칙을 reason 과 note 에 반드시 적용한다.
-
-추가 진입 규칙(중요):
-
-- 시장 변동성이 낮거나 entry_score가 중간 수준(40~60)이어도
-  지나치게 보수적으로 SKIP하지 않는다.
-- 약하지만 유의미한 추세/유동성/패턴이 보이면 ENTER 또는 ADJUST를 우선 고려한다.
-- RANGE 장세에서는 롱/숏 모두 진입 가능성을 적극적으로 평가한다.
+문체 규칙:
+- 전문적이고 간결.
+- 감정/수사 금지.
+- 지표·가격·리스크 근거만 명확히 제시.
 """
 
 _USER_PROMPT_TEMPLATE_ENTRY = """
 [거래 정보]
-
 Symbol: {symbol}
 Source: {source}
 Current Price: {current_price}
@@ -625,13 +830,18 @@ Base Parameters:
 - base_sl_pct: {base_sl_pct}
 - base_risk_pct: {base_risk_pct}
 
-Entry Context (JSON 직렬화):
+Regime (score-based):
+- regime: {regime}
+- regime_score: {regime_score}
+- regime_entry_score_min: {regime_entry_score_min}
+- regime_risk_multiplier: {regime_risk_multiplier}
+
+Entry Context (JSON):
 {market_features_json}
 
 [요청]
-
-위 정보를 바탕으로 이번 캔들에서 신규 진입을 할지 말지 판단하고,
-아래 필드를 모두 포함하는 **순수 JSON 객체 한 개만** 출력해라.
+위 정보를 바탕으로 이번 캔들에서 신규 진입을 할지 판단하고,
+아래 필드를 모두 포함하는 순수 JSON 객체 1개만 출력해라.
 
 필수 필드:
 - action: "ENTER" | "SKIP" | "ADJUST"
@@ -641,32 +851,25 @@ Entry Context (JSON 직렬화):
 - sl_pct: 0.0 ~ 0.5
 - effective_risk_pct: 0.0 ~ {gpt_max_risk_pct}
 - guard_adjustments: 객체 (없으면 빈 객체 {{}} )
-- reason: string (한국어, 왜 ENTER/ADJUST/SKIP 했는지 1~2문장)
-- note: string (추가 설명, 한국어)
+- reason: 한국어 1~2문장
+- note: 한국어
 - raw_response: string
 
 주의:
-- action 이 "SKIP" 이어도 reason 은 반드시 한국어로 구체적으로 작성한다.
-- NaN / Infinity / null / "NaN" / "Infinity" / "None" 등은 절대 사용하지 않는다.
-- 반드시 순수 JSON만, 코드블록 없이 응답한다.
+- JSON 이외 텍스트 금지.
+- NaN/Infinity/null/None 금지.
 """
 
 
 def _parse_json(text: str) -> Dict[str, Any]:
-    """
-    GPT가 반환한 텍스트에서 JSON을 파싱.
-    코드블록(````json ...) 이 섞여 있어도 최대한 dict 하나를 뽑아낸다.
-    """
     text = (text or "").strip()
     if not text:
         raise ValueError("GPT 응답이 비어 있습니다.")
 
     if text.startswith("```"):
         lines = text.splitlines()
-        if lines:
-            first = lines[0].strip()
-            if first.startswith("```"):
-                lines = lines[1:]
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
         while lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
@@ -679,25 +882,21 @@ def _parse_json(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    try:
-        first = text.index("{")
-        last = text.rindex("}")
+    first = text.find("{")
+    last = text.rfind("}")
+    if first >= 0 and last > first:
         snippet = text[first : last + 1]
         data = json.loads(snippet)
         if isinstance(data, dict):
             return data
-        raise ValueError(
-            f"중괄호 추출 후에도 dict가 아님: {type(data).__name__}, snippet={snippet[:200]}"
-        )
-    except Exception as e:
-        raise ValueError(f"GPT JSON 파싱 실패: {e} | text={text[:500]}") from e
+        raise ValueError(f"중괄호 추출 후에도 dict가 아님: {type(data).__name__}")
+
+    raise ValueError(f"GPT JSON 파싱 실패: text={text[:500]}")
 
 
 # =============================================================================
-# ENTRY GPT 호출 메인 함수
+# ENTRY payload
 # =============================================================================
-
-
 def _build_entry_payload(
     *,
     symbol: str,
@@ -707,40 +906,35 @@ def _build_entry_payload(
     base_sl_pct: float,
     base_risk_pct: float,
     market_features: Dict[str, Any],
+    regime_meta: Dict[str, Any],
     signal_source: Optional[str] = None,
     chosen_signal: Optional[str] = None,
     last_price: Optional[float] = None,
     entry_score: Optional[float] = None,
     base_effective_risk_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    ENTRY에서 사용할 payload를 FULL FEATURE 버전으로 구성.
-    (요약 필터링 제거 → market_features 전체 전달)
-    """
-
-    # 🔥 EXIT처럼 FULL FEATURE 전체를 GPT ENTRY에 전달
     payload: Dict[str, Any] = {
         "symbol": symbol,
         "source": source,
-        "current_price": current_price,
-        "base_tv_pct": base_tv_pct,
-        "base_sl_pct": base_sl_pct,
-        "base_risk_pct": base_risk_pct,
-        "market_features": market_features,  # ← 핵심 변경점
+        "current_price": float(current_price),
+        "base_tv_pct": float(base_tv_pct),
+        "base_sl_pct": float(base_sl_pct),
+        "base_risk_pct": float(base_risk_pct),
+        "regime_meta": regime_meta,
+        "market_features": market_features,
     }
 
-    # 원래 코드의 entry_meta 유지
     entry_meta: Dict[str, Any] = {}
     if signal_source:
         entry_meta["signal_source"] = signal_source
     if chosen_signal:
         entry_meta["signal_direction_hint"] = chosen_signal
     if last_price is not None:
-        entry_meta["last_price"] = last_price
+        entry_meta["last_price"] = float(last_price)
     if entry_score is not None:
-        entry_meta["entry_score"] = entry_score
+        entry_meta["entry_score"] = float(entry_score)
     if base_effective_risk_pct is not None:
-        entry_meta["base_effective_risk_pct"] = base_effective_risk_pct
+        entry_meta["base_effective_risk_pct"] = float(base_effective_risk_pct)
 
     if entry_meta:
         payload["entry_meta"] = entry_meta
@@ -748,6 +942,9 @@ def _build_entry_payload(
     return payload
 
 
+# =============================================================================
+# ENTRY main
+# =============================================================================
 def ask_entry_decision(
     *,
     symbol: str,
@@ -765,41 +962,65 @@ def ask_entry_decision(
     entry_score: Optional[float] = None,
     effective_risk_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """
-    ENTRY 결정을 위해 GPT에게 질의하고, 응답을 정규화/검증하여 반환한다.
-    """
     global gpt_entry_call_count
 
-    # === GPT 일일 호출 상한 체크 ===
-    from settings import load_settings
-    SET = load_settings()
-    if gpt_entry_call_count >= SET.gpt_daily_call_limit:
-        return {
-            "action": "SKIP",
-            "direction": "PASS",
-            "confidence": 0.0,
-            "tp_pct": 0.0,
-            "tv_pct": 0.0,
-            "sl_pct": 0.0,
-            "effective_risk_pct": 0.0,
-            "guard_adjustments": {},
-            "reason": "GPT 일일 호출 상한 초과로 자동 중지됨.",
-            "note": "daily_gpt_limit_exceeded",
-            "raw_response": "daily_gpt_limit_exceeded",
-        }
-
+    if gpt_entry_call_count >= int(getattr(SET, "gpt_daily_call_limit")):
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason="GPT 일일 호출 상한 초과로 ENTRY GPT 호출을 중단.",
+            note="daily_gpt_limit_exceeded",
+            raw_response="daily_gpt_limit_exceeded",
+        )
 
     if gpt_max_risk_pct is None:
         gpt_max_risk_pct = GPT_MAX_RISK_PCT
 
+    _req_float(current_price, "current_price", min_v=0.0)
+    _req_float(base_tv_pct, "base_tv_pct", min_v=0.0, max_v=0.5)
+    _req_float(base_sl_pct, "base_sl_pct", min_v=0.0, max_v=0.5)
+    _req_float(base_risk_pct, "base_risk_pct", min_v=0.0, max_v=1.0)
+    _req_float(gpt_max_risk_pct, "gpt_max_risk_pct", min_v=0.0, max_v=1.0)
+
+    if not isinstance(market_features, dict):
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason="market_features 타입이 dict가 아님. ENTRY 스킵.",
+            note="invalid_market_features_type",
+            raw_response=str(type(market_features).__name__),
+        )
+
+    try:
+        pol = _load_regime_policy(SET)
+        regime_meta = _score_and_classify_regime(
+            policy=pol,
+            current_price=float(current_price),
+            market_features=market_features,
+        )
+    except Exception as e:
+        _safe_log("ERROR", f"[REGIME_FAIL] symbol={symbol} source={source} err={type(e).__name__}: {e}")
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason="레짐 계산 실패(필수 피처 누락/비정상). ENTRY 스킵.",
+            note="regime_calc_failed",
+            raw_response=f"{type(e).__name__}: {e}",
+        )
+
+    adj_base_risk_pct = float(base_risk_pct) * float(regime_meta["risk_multiplier"])
+    if not math.isfinite(adj_base_risk_pct) or adj_base_risk_pct < 0:
+        raise ValueError("adjusted base_risk_pct invalid")
+
     payload = _build_entry_payload(
         symbol=symbol,
         source=source,
-        current_price=current_price,
-        base_tv_pct=base_tv_pct,
-        base_sl_pct=base_sl_pct,
-        base_risk_pct=base_risk_pct,
+        current_price=float(current_price),
+        base_tv_pct=float(base_tv_pct),
+        base_sl_pct=float(base_sl_pct),
+        base_risk_pct=float(adj_base_risk_pct),
         market_features=market_features,
+        regime_meta=regime_meta,
         signal_source=signal_source,
         chosen_signal=chosen_signal,
         last_price=last_price,
@@ -807,149 +1028,112 @@ def ask_entry_decision(
         base_effective_risk_pct=effective_risk_pct,
     )
 
-    sanitized_payload = _sanitize_for_gpt(payload)
-
-    # GPT가 시장을 충분히 이해하도록 full payload 전달
-
-    market_features_json = json.dumps(
-        sanitized_payload, ensure_ascii=False, separators=(",", ":")
-
-    )  
-
-    # -------------------------------------------------------------------------
-    # [ENTRY 비용 최적화 레이어]
-    #  - 장세가 너무 약하거나(entry_score 낮음) 의미 없는 캔들은
-    #    GPT를 호출하지 않고 로컬에서 즉시 SKIP 처리한다.
-    # -------------------------------------------------------------------------
     try:
-        raw_trend = sanitized_payload.get("trend_strength", 0)
-        raw_vol = sanitized_payload.get("volatility", 0)
+        _assert_no_nan_inf_none(payload)
+    except Exception as e:
+        _safe_log("ERROR", f"[ENTRY_PAYLOAD_INVALID] {type(e).__name__}: {e}")
+        return _entry_invalid_to_skip(
+            symbol=symbol,
+            source=source,
+            reason="ENTRY payload에 None/NaN/Inf 또는 비직렬화 타입이 포함됨. ENTRY 스킵.",
+            note="payload_invalid_no_fallback",
+            raw_response=f"{type(e).__name__}: {e}",
+        )
 
+    es_val: Optional[float] = None
+    if entry_score is not None:
         try:
-            trend_strength = float(raw_trend or 0.0)
-        except Exception:
-            trend_strength = 0.0
-
-        try:
-            vol_score = float(raw_vol or 0.0)
-        except Exception:
-            vol_score = 0.0
-
-        entry_meta = sanitized_payload.get("entry_meta") or {}
-        raw_es = entry_meta.get("entry_score")
-        try:
-            es_val: Optional[float] = float(raw_es) if raw_es is not None else None
+            es_val = float(entry_score)
+            if not math.isfinite(es_val):
+                es_val = None
         except Exception:
             es_val = None
 
-        # 1) 추세/변동성 모두 약한 구간 → 로컬 SKIP
-        #    - trend_strength < 0.015 AND volatility < 0.004
-        if trend_strength < 0.015 and vol_score < 0.004:
-            reason = (
-                "장세 추세와 변동성이 모두 약해 이번 캔들은 진입 후보에서 제외합니다 "
-                "(GPT 호출 생략)."
-            )
-            local_result = {
-                "action": "SKIP",
-                "direction": "PASS",
-                "confidence": 0.1,
-                "tp_pct": 0.0,
-                "tv_pct": 0.0,
-                "sl_pct": 0.0,
-                "effective_risk_pct": 0.0,
-                "guard_adjustments": {},
-                "reason": reason,
-                "note": "local_skip_weak_trend_vol",
-                "raw_response": "local_skip_weak_trend_vol",
-                "_meta": {
-                    "latency_sec": 0.0,
-                    "model": model,
-                    "symbol": symbol,
-                    "source": source,
-                },
-            }
-            _safe_log(
-                "INFO",
-                "[ENTRY_LOCAL_SKIP] weak trend/vol → SKIP | "
-                f"symbol={symbol} source={source} "
-                f"trend={trend_strength:.4f} vol={vol_score:.4f} entry_score={es_val}",
-            )
-            return local_result
-
-        # 2) entry_score 가 너무 낮은 구간 → 로컬 SKIP
-        #    - entry_score < 15.0 기준 (0~100 스케일 가정)
-        if es_val is not None and es_val < 15.0:
-            reason = (
-                "entry_score가 충분히 높지 않아 이번 캔들은 진입을 시도하지 않습니다 "
-                "(GPT 호출 생략)."
-            )
-            local_result = {
-                "action": "SKIP",
-                "direction": "PASS",
-                "confidence": 0.1,
-                "tp_pct": 0.0,
-                "tv_pct": 0.0,
-                "sl_pct": 0.0,
-                "effective_risk_pct": 0.0,
-                "guard_adjustments": {},
-                "reason": reason,
-                "note": "local_skip_low_entry_score",
-                "raw_response": "local_skip_low_entry_score",
-                "_meta": {
-                    "latency_sec": 0.0,
-                    "model": model,
-                    "symbol": symbol,
-                    "source": source,
-                },
-            }
-            _safe_log(
-                "INFO",
-                "[ENTRY_LOCAL_SKIP] low entry_score → SKIP | "
-                f"symbol={symbol} source={source} "
-                f"entry_score={es_val} trend={trend_strength:.4f} vol={vol_score:.4f}",
-            )
-            return local_result
-    except Exception as e:
+    entry_score_min = float(regime_meta["entry_score_min"])
+    if es_val is not None and es_val < entry_score_min:
         _safe_log(
-            "ERROR",
-            f"[ENTRY_LOCAL_SKIP] filter eval failed → fallback to GPT call "
-            f"symbol={symbol} source={source} err={type(e).__name__}: {e}",
+            "INFO",
+            f"[ENTRY_LOCAL_SKIP] entry_score<{entry_score_min:.1f} by regime "
+            f"(regime={regime_meta['regime']} score={regime_meta['score']}) "
+            f"symbol={symbol} source={source} entry_score={es_val}",
         )
+        return {
+            "action": "SKIP",
+            "direction": "PASS",
+            "confidence": 0.1,
+            "tp_pct": 0.0,
+            "tv_pct": 0.0,
+            "sl_pct": 0.0,
+            "effective_risk_pct": 0.0,
+            "guard_adjustments": {},
+            "reason": f"entry_score {es_val:.1f}. 레짐({regime_meta['regime']}) 기준 미달 → SKIP.",
+            "note": "local_skip_regime_entry_score_min",
+            "raw_response": "local_skip_regime_entry_score_min",
+            "_meta": {
+                "latency_sec": 0.0,
+                "model": model,
+                "symbol": symbol,
+                "source": source,
+                "regime": regime_meta["regime"],
+                "regime_score": regime_meta["score"],
+            },
+        }
 
-    # -------------------------------------------------------------------------
-    # 위 두 조건을 통과한 경우에만 GPT 호출을 수행한다.
-    # -------------------------------------------------------------------------
+    if str(regime_meta["regime"]) == "HIGH_VOL" and float(regime_meta["inputs"]["atr_pct"]) >= float(
+        regime_meta["policy"]["vol_extreme"]
+    ):
+        return {
+            "action": "SKIP",
+            "direction": "PASS",
+            "confidence": 0.1,
+            "tp_pct": 0.0,
+            "tv_pct": 0.0,
+            "sl_pct": 0.0,
+            "effective_risk_pct": 0.0,
+            "guard_adjustments": {},
+            "reason": "atr_pct가 극단 수준. 레짐 HIGH_VOL → SKIP.",
+            "note": "local_skip_extreme_volatility",
+            "raw_response": "local_skip_extreme_volatility",
+            "_meta": {
+                "latency_sec": 0.0,
+                "model": model,
+                "symbol": symbol,
+                "source": source,
+                "regime": regime_meta["regime"],
+                "regime_score": regime_meta["score"],
+            },
+        }
 
-    system_prompt = SYSTEM_PROMPT_ENTRY.format(
-        gpt_max_risk_pct=gpt_max_risk_pct,
-        gpt_max_risk_pct_pct=gpt_max_risk_pct * 100.0,
-    )
+    market_features_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    system_prompt = SYSTEM_PROMPT_ENTRY.format(gpt_max_risk_pct=gpt_max_risk_pct)
     user_prompt = _USER_PROMPT_TEMPLATE_ENTRY.format(
         symbol=symbol,
         source=source,
-        current_price=current_price,
-        base_tv_pct=base_tv_pct,
-        base_sl_pct=base_sl_pct,
-        base_risk_pct=base_risk_pct,
+        current_price=float(current_price),
+        base_tv_pct=float(base_tv_pct),
+        base_sl_pct=float(base_sl_pct),
+        base_risk_pct=float(adj_base_risk_pct),
+        regime=str(regime_meta["regime"]),
+        regime_score=int(regime_meta["score"]),
+        regime_entry_score_min=float(regime_meta["entry_score_min"]),
+        regime_risk_multiplier=float(regime_meta["risk_multiplier"]),
         market_features_json=market_features_json,
         gpt_max_risk_pct=gpt_max_risk_pct,
     )
 
     client = _get_client()
-
-    latency = 0.0
-    error_type = ""
-    error_msg = ""
-
     start_ts = time.monotonic()
+    latency = 0.0
+
     try:
         _safe_log(
             "DEBUG",
             f"[ENTRY_CALL] model={model} symbol={symbol} source={source} "
-            f"base_tv={base_tv_pct} base_sl={base_sl_pct} base_risk={base_risk_pct}",
+            f"regime={regime_meta['regime']} score={regime_meta['score']} "
+            f"adj_base_risk={adj_base_risk_pct:.4f}",
         )
-           
-        # GPT 호출
+
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -961,14 +1145,11 @@ def ask_entry_decision(
             timeout=OPENAI_TRADER_MAX_LATENCY,
             temperature=0.0,
         )
-        
-        # ✅ GPT 호출이 실제로 성공적으로 나간 경우에만 카운트 증가
 
         gpt_entry_call_count += 1
         gpt_call_id = gpt_entry_call_count
 
         latency = time.monotonic() - start_ts
-
         text = _extract_text_from_response(resp)
 
         try:
@@ -977,34 +1158,45 @@ def ask_entry_decision(
             raw_dict = _parse_json(text)
 
         if not isinstance(raw_dict, dict):
-            raise ValueError(
-                f"ENTRY GPT 응답 JSON 최상위 타입이 dict가 아님: {type(raw_dict).__name__}"
+            return _entry_invalid_to_skip(
+                symbol=symbol,
+                source=source,
+                reason="ENTRY GPT 응답 JSON 최상위 타입이 dict가 아님. SKIP.",
+                note="invalid_gpt_json_root",
+                raw_response=text[:500],
             )
 
-        normalized = _normalize_and_validate_entry_response(
+        normalized = _normalize_and_validate_entry_response_strict(
             raw_dict,
-            base_tv_pct=base_tv_pct,
-            base_sl_pct=base_sl_pct,
-            base_risk_pct=base_risk_pct,
+            base_tv_pct=float(base_tv_pct),
+            base_sl_pct=float(base_sl_pct),
+            base_risk_pct=float(adj_base_risk_pct),
             symbol=symbol,
             source=source,
-            gpt_max_risk_pct=gpt_max_risk_pct,
+            gpt_max_risk_pct=float(gpt_max_risk_pct),
         )
+
         normalized["raw_response"] = text
         normalized["_meta"] = {
             "latency_sec": float(latency),
             "model": model,
             "symbol": symbol,
             "source": source,
+            "call_id": gpt_call_id,
+            "regime": regime_meta["regime"],
+            "regime_score": regime_meta["score"],
+            "regime_risk_multiplier": regime_meta["risk_multiplier"],
+            "regime_entry_score_min": regime_meta["entry_score_min"],
         }
 
         _safe_log(
             "INFO",
             f"[ENTRY_OK] model={model} symbol={symbol} source={source} "
+            f"regime={regime_meta['regime']} score={regime_meta['score']} "
             f"action={normalized['action']} dir={normalized['direction']} "
             f"conf={normalized['confidence']:.3f} "
-            f"tp={normalized['tp_pct']:.4f} sl={normalized['sl_pct']:.4f} "
-            f"risk={normalized['effective_risk_pct']:.4f} latency={latency:.3f}s "
+            f"tp={float(normalized.get('tp_pct', 0.0)):.4f} sl={float(normalized.get('sl_pct', 0.0)):.4f} "
+            f"risk={float(normalized.get('effective_risk_pct', 0.0)):.4f} latency={latency:.3f}s "
             f"call_id={gpt_call_id}",
         )
 
@@ -1013,7 +1205,7 @@ def ask_entry_decision(
             model=model,
             symbol=symbol,
             source=source,
-            direction=normalized["direction"],
+            direction=str(normalized.get("direction") or ""),
             latency=latency,
             success=True,
         )
@@ -1022,17 +1214,14 @@ def ask_entry_decision(
 
     except Exception as e:
         latency = time.monotonic() - start_ts
-        error_type = type(e).__name__
-        error_msg = str(e)
-
         _safe_log(
             "ERROR",
             f"[ENTRY_FAIL] model={model} symbol={symbol} source={source} "
-            f"latency={latency:.3f}s err={error_type}: {error_msg}",
+            f"latency={latency:.3f}s err={type(e).__name__}: {e}",
         )
         _safe_tg(
             f"[ENTRY_FAIL] model={model} symbol={symbol} source={source} "
-            f"latency={latency:.3f}s err={error_type}: {error_msg}"
+            f"latency={latency:.3f}s err={type(e).__name__}: {e}"
         )
 
         _log_gpt_latency_csv(
@@ -1043,119 +1232,39 @@ def ask_entry_decision(
             direction=None,
             latency=latency,
             success=False,
-            error_type=error_type,
-            error_msg=error_msg,
+            error_type=type(e).__name__,
+            error_msg=str(e),
         )
 
-        raise RuntimeError(
-            f"ENTRY GPT 호출 실패: {error_type}: {error_msg}"
-        ) from e
+        raise RuntimeError(f"ENTRY GPT 호출 실패: {type(e).__name__}: {e}") from e
 
 
 # =============================================================================
-# EXIT 쪽 프롬프트 / 호출 (position_watch_ws 용)
+# EXIT (STRICT)
 # =============================================================================
-
 _EXIT_SYSTEM_PROMPT = """
 당신은 BTC-USDT 인트라데이 자동매매 시스템의 EXIT 전문 어드바이저이다.
 
-역할:
-- 현재 보유 중인 단일 포지션에 대해 지금 청산(CLOSE)할지, 유지(HOLD)할지 결정한다.
-- ENTRY 단계에서 사용된 동일한 시장 정보(1m/5m/15m 캔들, 지표, 패턴, 오더북, 멀티타임프레임 요약)를 EXIT에서도 그대로 분석해야 한다.
-- reason은 반드시 **현재 보유 중인 포지션 방향(LONG/SHORT) 기준으로** 작성한다.
+규칙:
 - 반드시 하나의 JSON 객체만 출력한다.
-
-출력 JSON 스키마:
-- action: "CLOSE" | "HOLD"
-- reason: 한국어 1~3문장 (보유 중인 포지션 방향 기준으로, 지금 HOLD 또는 CLOSE가 왜 합리적인지 구체적 지표 기반으로 설명)
-- close_ratio: 0.0~1.0 (생략 시 CLOSE=1.0, HOLD=0.0)
-- new_sl_pct: 0.0~0.5 (선택)
-- new_tp_pct: 0.0~0.5 (선택)
-- note: string (선택)
-- raw_response: string (선택)
-
-핵심 규칙:
-
-1) **포지션 방향 기준(reason MUST reflect position side)**
-   - LONG 포지션일 때:
-        · 상승은 유리함. 하락은 위험 요소.
-        · 상방 추세 유지, 지표 양호, 오더북 매수 우위이면 HOLD 이유를 상세히 제시.
-        · 기울기 반전, 약세 패턴, 오더북 매도 우위면 CLOSE 이유를 명확하게 제시.
-   - SHORT 포지션일 때:
-        · 하락은 유리함. 상승은 위험 요소.
-        · 하락 추세 유지, 지표 약세 지속이면 HOLD 이유 강조.
-        · 상승 반전, 강한 양봉 모멘텀, 오더북 매수 우위면 CLOSE 이유 제시.
-
-2) **HOLD는 반드시 명확한 이점이 있을 때만 허용**
-   · “5m·15m 추세가 내 포지션 방향과 동일”
-   · “ATR/ADX가 추세 유지 신호”
-   · “MACD·RSI·Stoch이 반전 신호가 아직 없음”
-   · “오더북이 내 방향 우위”
-   → 이런 근거를 반드시 reason에 포함.
-
-3) **CLOSE는 명확한 반전 + 리스크 증가일 때만**
-   · “5m/15m 모두 반대 방향 정렬”
-   · “오더북 매수/매도 쏠림이 포지션에 불리”
-   · “MACD 히스토그램 기울기 반전”
-   · “강한 캔들 패턴 발생”
-   → CLOSE의 사유를 지표 기반으로 1~2문장 안에 명확히 설명.
-
-4) **시장 정보 적극 활용(중요)**
-   반드시 아래 지표를 판단 근거에 넣을 수 있다:
-   - 1m/5m/15m 캔들 방향, 종가 관계
-   - EMA fast/slow 및 정렬
-   - ADX(추세 강도)
-   - ATR_pct(변동성)
-   - range_pct(박스 여부)
-   - RSI 14 과열/과매도
-   - MACD 방향·기울기·히스토그램
-   - Stochastic K/D
-   - 거래량 지표(volume_ratio, volume_zscore)
-   - 오더북(bestBid/bestAsk/spread/imbalance)
-   - 멀티 타임프레임 majority_trend
-   - pattern_features (다이버전스 포함)
-
-5) **문체 규칙**
-   - 감정 X, 객관적·전문적 문장.
-   - 짧지만 중요한 핵심 근거만 포함.
-   - 반드시 “내 포지션 기준으로 왜 지금 유지/청산인지” 설명.
-
-예시(reason):
-- "SHORT 포지션 기준, 5m·15m 하락 정렬 유지되고 오더북 매도 우위 지속으로 하락 모멘텀이 유효해 HOLD가 유리합니다."
-- "LONG 포지션 기준, 단기 조정은 있으나 5m·15m 상방 흐름 유지되고 지표 반전 신호가 없어 포지션 유지가 합리적입니다."
-- "SHORT 기준, 5m·15m 모두 상방 반전하며 MACD·오더북 매수 쏠림이 나타나 단기 리스크가 커져 CLOSE를 권고합니다."
-
-순수 JSON만 출력한다.
+- action은 "CLOSE" 또는 "HOLD" 중 하나여야 한다.
+- reason은 반드시 포함하며, 포지션 방향 기준으로 지표 근거를 1~3문장으로 작성한다.
+- NaN/Infinity/null/None 금지.
 """
 
 _EXIT_USER_PROMPT_TEMPLATE = """
 [포지션 및 시장 컨텍스트(JSON)]
-
-아래 JSON 은 현재 포지션, 시장 상태, 레짐/지표 요약을 포함한다.
-
 {context_json}
 
-위 정보를 바탕으로, 시스템 프롬프트에서 정의한 EXIT 출력 스키마에 맞춰
-단일 JSON 객체만 응답해라.
-
-주의:
-- JSON 이외의 텍스트(마크다운, 설명 문장)는 절대 포함하지 말 것.
-- action, reason 필드는 반드시 포함해야 한다.
+위 정보를 바탕으로 단일 JSON 객체만 응답해라.
+주의: JSON 이외 텍스트 금지.
 """
 
 
 def _make_exit_prompt(payload: Dict[str, Any]) -> str:
-    """
-    EXIT 결정용 user 프롬프트 문자열을 만든다.
-    payload 는 NaN/Inf/None 이 제거된 상태여야 한다.
-    """
-    ctx_json = json.dumps(
-        _sanitize_for_gpt(payload),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    prompt = _EXIT_USER_PROMPT_TEMPLATE.format(context_json=ctx_json)
-    return prompt
+    _assert_no_nan_inf_none(payload)
+    ctx_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return _EXIT_USER_PROMPT_TEMPLATE.format(context_json=ctx_json)
 
 
 def ask_exit_decision(
@@ -1170,9 +1279,6 @@ def ask_exit_decision(
     extra: Dict[str, Any],
     model: str = GPT_MODEL_DEFAULT,
 ) -> Dict[str, Any]:
-    """
-    EXIT 결정을 위해 GPT에게 질의하고, 응답을 dict로 반환한다.
-    """
     now = dt.datetime.utcnow().isoformat()
 
     ctx: Dict[str, Any] = {}
@@ -1185,9 +1291,9 @@ def ask_exit_decision(
             "source": source or "",
             "side": side,
             "scenario": scenario,
-            "entry_price": float(entry_price),
-            "last_price": float(last_price),
-            "leverage": float(leverage),
+            "entry_price": _req_float(entry_price, "entry_price", min_v=0.0),
+            "last_price": _req_float(last_price, "last_price", min_v=0.0),
+            "leverage": _req_float(leverage, "leverage", min_v=0.0),
             "now_utc": now,
         }
     )
@@ -1196,63 +1302,31 @@ def ask_exit_decision(
     system = _EXIT_SYSTEM_PROMPT
 
     start_ts = time.monotonic()
-    latency = 0.0
-
     try:
-        _safe_log(
-            "DEBUG",
-            f"[EXIT_CALL] model={model} symbol={symbol} side={side} "
-            f"entry={entry_price} cur={last_price} scenario={scenario}",
-        )
+        _safe_log("DEBUG", f"[EXIT_CALL] model={model} symbol={symbol} side={side} scenario={scenario}")
 
-        data = _call_gpt_json(
-            model=model,
-            prompt=system + "\n\n" + prompt,
-            purpose="EXIT",
-        )
+        data = _call_gpt_json(model=model, prompt=system + "\n\n" + prompt, purpose="EXIT")
         latency = time.monotonic() - start_ts
 
         raw_action = data.get("action")
-        action = str(raw_action or "HOLD").upper().strip()
-        if action in ("CLOSE_ALL", "CLOSE_PARTIAL"):
-            action = "CLOSE"
+        action = str(raw_action or "").upper().strip()
         if action not in ("CLOSE", "HOLD"):
-            _safe_log(
-                "WARNING",
-                f"[EXIT_VALIDATE] invalid action={raw_action!r} -> HOLD | "
-                f"symbol={symbol} scenario={scenario}",
-            )
-            action = "HOLD"
-
-        def _flt(
-            key: str,
-            default: float = 0.0,
-            *,
-            min_val: float,
-            max_val: float,
-        ) -> float:
-            v = data.get(key, default)
-            try:
-                if v is None:
-                    return default
-                v = float(v)
-            except Exception:
-                return default
-            if math.isnan(v) or math.isinf(v):
-                return default
-            return max(min_val, min(max_val, v))
-
-        close_ratio = _flt("close_ratio", 1.0, min_val=0.0, max_val=1.0)
-        new_sl_pct = _flt("new_sl_pct", 0.0, min_val=0.0, max_val=0.5)
-        new_tp_pct = _flt("new_tp_pct", 0.0, min_val=0.0, max_val=0.5)
-
-        if action == "CLOSE":
-            if close_ratio <= 0.0:
-                close_ratio = 1.0
-        else:  # HOLD
-            close_ratio = 0.0
+            raise ValueError(f"EXIT invalid action: {raw_action!r}")
 
         reason = str(data.get("reason", "") or "").strip()
+        if not reason:
+            raise ValueError("EXIT missing reason")
+
+        close_ratio = float(data.get("close_ratio", 1.0 if action == "CLOSE" else 0.0))
+        if not math.isfinite(close_ratio) or not (0.0 <= close_ratio <= 1.0):
+            raise ValueError("EXIT close_ratio out of range")
+
+        new_sl_pct = float(data.get("new_sl_pct", 0.0))
+        new_tp_pct = float(data.get("new_tp_pct", 0.0))
+        for name, v in [("new_sl_pct", new_sl_pct), ("new_tp_pct", new_tp_pct)]:
+            if not math.isfinite(v) or v < 0.0 or v > 0.5:
+                raise ValueError(f"EXIT {name} out of range")
+
         note = str(data.get("note", "") or "").strip()
         raw_response = str(data.get("raw_response", "") or "").strip()
 
@@ -1274,26 +1348,19 @@ def ask_exit_decision(
             },
         }
 
-        _safe_log(
-            "INFO",
-            f"[EXIT_OK] model={model} symbol={symbol} side={side} "
-            f"scenario={scenario} action={action} close_ratio={close_ratio:.3f} "
-            f"new_sl={new_sl_pct:.4f} new_tp={new_tp_pct:.4f} "
-            f"latency={latency:.3f}s",
-        )
-
+        _safe_log("INFO", f"[EXIT_OK] model={model} symbol={symbol} side={side} action={action} latency={latency:.3f}s")
         return result
 
     except Exception as e:
         latency = time.monotonic() - start_ts
         _safe_log(
             "ERROR",
-            f"[EXIT_FAIL] model={model} symbol={symbol} side={side} "
-            f"scenario={scenario} latency={latency:.3f}s err={type(e).__name__}: {e}",
+            f"[EXIT_FAIL] model={model} symbol={symbol} side={side} scenario={scenario} "
+            f"latency={latency:.3f}s err={type(e).__name__}: {e}",
         )
         _safe_tg(
-            f"[EXIT_FAIL] model={model} symbol={symbol} side={side} "
-            f"scenario={scenario} latency={latency:.3f}s err={type(e).__name__}: {e}"
+            f"[EXIT_FAIL] model={model} symbol={symbol} side={side} scenario={scenario} "
+            f"latency={latency:.3f}s err={type(e).__name__}: {e}"
         )
         raise RuntimeError(f"EXIT GPT 호출 실패: {type(e).__name__}: {e}") from e
 
@@ -1312,49 +1379,24 @@ def ask_exit_decision_safe(
     fallback_action: Literal["HOLD", "CLOSE"] = "HOLD",
 ) -> Tuple[str, Any]:
     """
-    ask_exit_decision 을 감싸는 안전 래퍼.
-    GPT 실패 시에도 fallback_action 으로 복구한다.
+    STRICT:
+    - fallback_action을 사용하지 않는다(호환용 파라미터만 유지).
+    - 성공 시 (action, data) 반환.
+    - 실패 시 예외를 그대로 발생시킨다.
     """
-    try:
-        data = ask_exit_decision(
-            symbol=symbol,
-            source=source,
-            side=side,
-            scenario=scenario,
-            last_price=last_price,
-            entry_price=entry_price,
-            leverage=leverage,
-            extra=extra,
-            model=model,
-        )
-        raw_action = data.get("action")
-        action = str(raw_action or fallback_action).upper().strip()
-        if action not in ("CLOSE", "HOLD"):
-            _safe_log(
-                "WARNING",
-                f"[EXIT_SAFE] invalid action from GPT={raw_action!r} -> {fallback_action} "
-                f"| symbol={symbol} scenario={scenario}",
-            )
-            action = fallback_action
-        return action, data
-    except Exception as e:
-        _safe_log(
-            "ERROR",
-            f"[EXIT_SAFE_FAIL] symbol={symbol} side={side} scenario={scenario} "
-            f"err={type(e).__name__}: {e}",
-        )
-        _safe_tg(
-            f"[EXIT_SAFE_FAIL] GPT EXIT 판단 실패. fallback_action={fallback_action} "
-            f"(symbol={symbol}, scenario={scenario}, err={type(e).__name__}: {e})"
-        )
-        err_data = {
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "symbol": symbol,
-            "side": side,
-            "scenario": scenario,
-        }
-        return fallback_action, err_data
+    _ = fallback_action
+    data = ask_exit_decision(
+        symbol=symbol,
+        source=source,
+        side=side,
+        scenario=scenario,
+        last_price=last_price,
+        entry_price=entry_price,
+        leverage=leverage,
+        extra=extra,
+        model=model,
+    )
+    return str(data["action"]), data
 
 
 __all__ = [

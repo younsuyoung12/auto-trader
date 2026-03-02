@@ -1,0 +1,22 @@
+from strategy.gpt_decider_entry import ask_entry_decision
+
+mock_features = {
+    "trend_strength": 1.8,
+    "atr_pct": 0.004,   # 정상 변동성
+    "range_pct": 0.006,
+    "adx": 28,
+    "is_low_volatility": 0,
+}
+
+res = ask_entry_decision(
+    symbol="BTCUSDT",
+    source="TEST",
+    current_price=70000,
+    base_tv_pct=0.01,
+    base_sl_pct=0.005,
+    base_risk_pct=0.01,
+    market_features=mock_features,
+    entry_score=80.0,  # 높게
+)
+
+print(res)
