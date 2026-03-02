@@ -1,4 +1,6 @@
-# settings.py
+# =============================================================================
+# FILE: settings.py
+# STRICT · NO-FALLBACK · PRODUCTION MODE
 # =============================================================================
 # Design principles (Production Settings for Binance USDT-M Futures Engine)
 # -----------------------------------------------------------------------------
@@ -22,6 +24,15 @@
 #   - Settings.risk_pct는 "호환용 alias"로 유지하되 allocation_ratio와 값 일치 강제.
 # - 외부 의존성 제거:
 #   - python-dotenv 사용(load_dotenv) 제거 → 내장 .env 로더(_try_load_local_dotenv)만 사용.
+#
+# PATCH NOTES — 2026-03-02 (PATCH-9PT)
+# - 9점대 운영형(무감독 24/7) 필수 설정 추가:
+#   - require_deterministic_client_order_id: True면 entry_client_order_id 미지정 시 즉시 예외
+#   - entry_fill_wait_sec: 엔트리 FILLED 대기 시간(STRICT, timeout 시 예외)
+#   - max_entry_slippage_pct: (옵션) 엔트리 hint 대비 체결 슬리피지 초과 시 강제청산/실패
+#   - tp/sl 범위 가드 상수화:
+#       * tp_pct_min/max, sl_pct_min/max
+#       * signal 값이 이 범위를 벗어나면 즉시 예외(폴백 금지)
 # =============================================================================
 
 from __future__ import annotations
@@ -77,8 +88,17 @@ class Settings:
     # ✅ legacy alias (호환): 의미는 allocation_ratio와 동일하게 강제
     risk_pct: float = 1.0
 
+    # Default TP/SL (signal이 이 값을 override 가능)
     tp_pct: float = 0.006
     sl_pct: float = 0.003
+
+    # TP/SL bounds (signal 값 가드)
+    tp_pct_min: float = 0.0005
+    tp_pct_max: float = 0.05
+    sl_pct_min: float = 0.0005
+    sl_pct_max: float = 0.05  # legacy max_sl_pct와 별개(운영형 가드)
+
+    # Legacy (kept)
     max_sl_pct: float = 0.015
     max_trade_qty: float = 1.0
 
@@ -178,6 +198,11 @@ class Settings:
     slippage_block_pct: float = 0.3
     slippage_stop_engine: bool = False
     protection_mode_enabled: bool = True
+
+    # 9점대 운영형 실행/멱등성/체결 확정
+    require_deterministic_client_order_id: bool = True
+    entry_fill_wait_sec: float = 2.0
+    max_entry_slippage_pct: Optional[float] = None  # None이면 비활성
 
 
 # Backward-compatible alias for legacy type hints
@@ -391,7 +416,7 @@ def _validate_settings(s: Settings) -> None:
     if mm not in {"ISOLATED", "CROSSED"}:
         raise ValueError("margin_mode must be ISOLATED or CROSSED")
 
-    # Allocation Mode: allocation_ratio(0~1) 강제
+    # Allocation Mode: allocation_ratio(0~1] 강제
     if not (0.0 < float(s.allocation_ratio) <= 1.0):
         raise ValueError("allocation_ratio must be within (0,1]")
 
@@ -400,6 +425,23 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("risk_pct must be within (0,1] (legacy alias)")
     if abs(float(s.risk_pct) - float(s.allocation_ratio)) > 1e-12:
         raise ValueError("risk_pct must equal allocation_ratio (do not set them differently)")
+
+    # TP/SL bounds (signal 값 검증용 기준)
+    for name, v in [
+        ("tp_pct_min", s.tp_pct_min),
+        ("tp_pct_max", s.tp_pct_max),
+        ("sl_pct_min", s.sl_pct_min),
+        ("sl_pct_max", s.sl_pct_max),
+    ]:
+        if not (isinstance(v, (int, float)) and math.isfinite(float(v))):
+            raise ValueError(f"{name} must be finite number")
+        if float(v) <= 0:
+            raise ValueError(f"{name} must be > 0")
+
+    if float(s.tp_pct_min) > float(s.tp_pct_max):
+        raise ValueError("tp_pct_min must be <= tp_pct_max")
+    if float(s.sl_pct_min) > float(s.sl_pct_max):
+        raise ValueError("sl_pct_min must be <= sl_pct_max")
 
     if s.hard_daily_loss_limit_usdt < 0:
         raise ValueError("hard_daily_loss_limit_usdt must be >= 0")
@@ -415,6 +457,21 @@ def _validate_settings(s: Settings) -> None:
 
     if s.sigterm_grace_sec <= 0:
         raise ValueError("sigterm_grace_sec must be > 0")
+
+    # 9점대 운영형
+    if not isinstance(s.require_deterministic_client_order_id, bool):
+        raise ValueError("require_deterministic_client_order_id must be bool")
+
+    if not (isinstance(s.entry_fill_wait_sec, (int, float)) and math.isfinite(float(s.entry_fill_wait_sec))):
+        raise ValueError("entry_fill_wait_sec must be finite number")
+    if float(s.entry_fill_wait_sec) <= 0:
+        raise ValueError("entry_fill_wait_sec must be > 0")
+
+    if s.max_entry_slippage_pct is not None:
+        if not (isinstance(s.max_entry_slippage_pct, (int, float)) and math.isfinite(float(s.max_entry_slippage_pct))):
+            raise ValueError("max_entry_slippage_pct must be finite number or None")
+        if float(s.max_entry_slippage_pct) < 0:
+            raise ValueError("max_entry_slippage_pct must be >= 0")
 
 
 # -----------------------------------------------------------------------------
@@ -465,9 +522,17 @@ def load_settings() -> Settings:
     # legacy alias는 항상 동일하게 세팅
     risk_pct = float(allocation_ratio)
 
+    # Default TP/SL (signals can override)
     tp_pct = _as_float("TP_PCT", 0.006)
     sl_pct = _as_float("SL_PCT", 0.003)
 
+    # 운영형 TP/SL bounds
+    tp_pct_min = _as_float("TP_PCT_MIN", 0.0005)
+    tp_pct_max = _as_float("TP_PCT_MAX", 0.05)
+    sl_pct_min = _as_float("SL_PCT_MIN", 0.0005)
+    sl_pct_max = _as_float("SL_PCT_MAX", 0.05)
+
+    # Legacy
     max_sl_pct = _as_float("MAX_SL_PCT", 0.015)
     max_trade_qty = _as_float("MAX_TRADE_QTY", 1.0)
 
@@ -556,6 +621,11 @@ def load_settings() -> Settings:
     slippage_stop_engine = _as_bool("SLIPPAGE_STOP_ENGINE", False)
     protection_mode_enabled = _as_bool("PROTECTION_MODE_ENABLED", True)
 
+    # 9점대 운영형
+    require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
+    entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
+    max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
+
     s = Settings(
         api_key=api_key,
         api_secret=api_secret,
@@ -574,6 +644,10 @@ def load_settings() -> Settings:
         risk_pct=float(risk_pct),
         tp_pct=tp_pct,
         sl_pct=sl_pct,
+        tp_pct_min=tp_pct_min,
+        tp_pct_max=tp_pct_max,
+        sl_pct_min=sl_pct_min,
+        sl_pct_max=sl_pct_max,
         max_sl_pct=max_sl_pct,
         max_trade_qty=max_trade_qty,
         entry_cooldown_sec=entry_cooldown_sec,
@@ -638,7 +712,19 @@ def load_settings() -> Settings:
         slippage_block_pct=slippage_block_pct,
         slippage_stop_engine=slippage_stop_engine,
         protection_mode_enabled=protection_mode_enabled,
+        require_deterministic_client_order_id=require_deterministic_client_order_id,
+        entry_fill_wait_sec=entry_fill_wait_sec,
+        max_entry_slippage_pct=max_entry_slippage_pct,
     )
 
     _validate_settings(s)
     return s
+
+
+__all__ = [
+    "Settings",
+    "BotSettings",
+    "PatternStrengthSettings",
+    "load_settings",
+    "KST",
+]

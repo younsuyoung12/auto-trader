@@ -1,14 +1,13 @@
-# events/event_store.py
 """
 ========================================================
-events/event_store.py
+FILE: events/event_store.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 역할:
 - bt_events 테이블에 이벤트를 저장한다.
 
 정책(STRICT):
-- DB 기록 실패 시 예외 전파
+- DB 기록 실패 시 예외 전파 (삼키기 금지)
 - side는 LONG/SHORT/CLOSE만 허용
 - extra_json은 dict로 정규화하여 JSONB로 저장
 
@@ -17,6 +16,8 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 2026-03-01: bt_events 저장 레이어 신규 추가
 - 2026-03-01: SQLAlchemy 바인딩 정합 수정
   - ':extra_json::jsonb' → 'CAST(:extra_json AS JSONB)' 로 변경하여 psycopg2 SyntaxError 제거
+- 2026-03-02: commit 보장(STRICT)
+  - get_session 구현에 의존하지 않고, INSERT 후 session.commit()을 명시 호출
 ========================================================
 """
 
@@ -50,10 +51,13 @@ def _normalize_side(side: Any) -> str:
 def _opt_float(v: Any) -> Optional[float]:
     if v is None or v == "":
         return None
+    if isinstance(v, bool):
+        return None
     try:
-        return float(v)
+        x = float(v)
     except Exception:
         return None
+    return x
 
 
 def _ensure_dict(v: Any) -> Dict[str, Any]:
@@ -92,6 +96,11 @@ def record_event_db(
     extra_json: Any = None,
     is_test: bool = False,
 ) -> None:
+    """
+    STRICT:
+    - 실패 시 예외 전파(폴백 금지)
+    - extra_json은 JSONB로 저장(CAST 사용)
+    """
     if (
         not isinstance(ts_utc, datetime)
         or ts_utc.tzinfo is None
@@ -110,7 +119,6 @@ def record_event_db(
 
     extra = _ensure_dict(extra_json)
 
-    # ✅ 핵심 수정: CAST(:extra_json AS JSONB)
     sql = text(
         """
         INSERT INTO bt_events (
@@ -150,3 +158,10 @@ def record_event_db(
 
     with get_session() as session:
         session.execute(sql, params)
+        # STRICT: commit을 명시한다 (get_session 구현에 의존하지 않음)
+        session.commit()
+
+
+__all__ = [
+    "record_event_db",
+]

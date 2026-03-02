@@ -1,14 +1,20 @@
 """
 ========================================================
-execution/execution_engine.py
+FILE: execution/execution_engine.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
-(기존 헤더 동일)
 
 PATCH NOTES — 2026-03-02 (PATCH)
 - bt_trade_snapshots에 DD 영속화 저장:
   - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 를 STRICT로 요구
   - record_trade_snapshot에 위 3개 값을 저장
+- (9점대 기반) deterministic entry_client_order_id 생성/주입:
+  - 동일 signal 재시도 시 동일 newClientOrderId로 중복 진입 방지
+- (9점대 기반) bt_trades 실행/복구 필드 영속화(STRICT):
+  - entry_order_id / tp_order_id / sl_order_id
+  - exchange_position_side / remaining_qty / realized_pnl_usdt
+  - reconciliation_status / last_synced_at
+  - 필수 값 누락 시 즉시 예외(폴백 금지)
 ========================================================
 """
 
@@ -18,7 +24,7 @@ import logging
 import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from events.signals_logger import log_event, log_signal, log_skip_event
 from execution.exchange_api import get_available_usdt, get_balance_detail
@@ -122,6 +128,84 @@ def _require_meta_equity(meta: Dict[str, Any]) -> tuple[float, float, float]:
     if eq_cur <= 0 or eq_peak <= 0:
         raise RuntimeError("meta equity values must be > 0 (STRICT)")
     return float(eq_cur), float(eq_peak), float(dd)
+
+
+def _deterministic_entry_client_order_id(symbol: str, direction: str, signal_ts_ms: int) -> str:
+    """
+    STRICT:
+    - 동일 signal(심볼/방향/ts) 재시도 시 동일 newClientOrderId가 생성되어 중복 진입을 차단한다.
+    - ASCII, <=36 chars
+    """
+    sym = str(symbol).upper().strip()
+    if not sym:
+        raise ValueError("symbol is empty")
+    dir_u = str(direction).upper().strip()
+    if dir_u not in ("LONG", "SHORT"):
+        raise ValueError("direction must be LONG/SHORT")
+    if not isinstance(signal_ts_ms, int) or signal_ts_ms <= 0:
+        raise ValueError("signal_ts_ms must be int > 0")
+
+    d = "L" if dir_u == "LONG" else "S"
+    # ent-<sym8>-<d>-<ts>  (<= 4 + 8 + 1 + 1 + 13 = 27)
+    sym8 = sym[:8]
+    cid = f"ent-{sym8}-{d}-{signal_ts_ms}"
+    if len(cid) > 36:
+        cid = cid[:36]
+    # ASCII 보장(심볼은 A-Z0-9 가정이지만 STRICT로 한번 더 체크)
+    try:
+        cid.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError("generated client order id must be ASCII")
+    if not cid or len(cid) > 36:
+        raise ValueError("generated client order id invalid")
+    return cid
+
+
+def _require_trade_exec_fields(trade: Any, *, soft_mode: bool) -> Tuple[str, Optional[str], Optional[str], str, float, float]:
+    """
+    STRICT:
+    - 9점대 운영을 위해 bt_trades 실행/복구 필드가 반드시 존재해야 한다.
+    - 누락 시 즉시 예외(폴백 금지)
+    """
+    entry_order_id = getattr(trade, "entry_order_id", None)
+    tp_order_id = getattr(trade, "tp_order_id", None)
+    sl_order_id = getattr(trade, "sl_order_id", None)
+
+    if not isinstance(entry_order_id, str) or not entry_order_id.strip():
+        raise RuntimeError("trade.entry_order_id is required (STRICT)")
+
+    if tp_order_id is not None and (not isinstance(tp_order_id, str) or not tp_order_id.strip()):
+        raise RuntimeError("trade.tp_order_id must be str or None (STRICT)")
+    if sl_order_id is not None and (not isinstance(sl_order_id, str) or not sl_order_id.strip()):
+        raise RuntimeError("trade.sl_order_id must be str or None (STRICT)")
+
+    # soft_mode=False면 SL은 반드시 존재해야 한다(안전)
+    if not bool(soft_mode):
+        if not isinstance(sl_order_id, str) or not sl_order_id.strip():
+            raise RuntimeError("soft_mode=False but trade.sl_order_id is missing (STRICT)")
+
+    exchange_position_side = getattr(trade, "exchange_position_side", None)
+    if exchange_position_side is None:
+        exchange_position_side = "BOTH"
+    if not isinstance(exchange_position_side, str) or not exchange_position_side.strip():
+        raise RuntimeError("trade.exchange_position_side must be non-empty str (STRICT)")
+    exchange_position_side = exchange_position_side.strip().upper()
+
+    remaining_qty = getattr(trade, "remaining_qty", None)
+    if remaining_qty is None:
+        # order_executor가 남겨줘야 한다. 없으면 구조 미완성.
+        raise RuntimeError("trade.remaining_qty is required (STRICT)")
+    remaining_qty_f = _as_float(remaining_qty, "trade.remaining_qty", min_value=0.0)
+
+    realized_pnl_usdt = getattr(trade, "realized_pnl_usdt", None)
+    if realized_pnl_usdt is None:
+        # 초기값은 0이어야 한다.
+        raise RuntimeError("trade.realized_pnl_usdt is required (STRICT)")
+    realized_pnl_usdt_f = _as_float(realized_pnl_usdt, "trade.realized_pnl_usdt", min_value=0.0)
+
+    return entry_order_id.strip(), (tp_order_id.strip() if isinstance(tp_order_id, str) else None), (
+        sl_order_id.strip() if isinstance(sl_order_id, str) else None
+    ), exchange_position_side, float(remaining_qty_f), float(realized_pnl_usdt_f)
 
 
 class _SettingsView:
@@ -517,6 +601,9 @@ class ExecutionEngine:
         # ✅ DD 영속화: snapshot 저장에 필요한 값 STRICT 확보
         eq_cur_usdt, eq_peak_usdt, dd_pct_v = _require_meta_equity(meta)
 
+        # ✅ deterministic entry clientOrderId
+        entry_client_order_id = _deterministic_entry_client_order_id(symbol=symbol, direction=direction, signal_ts_ms=signal_ts_ms)
+
         if TEST_DRY_RUN:
             entry_price = float(entry_price_hint)
             entry_qty = float(qty_raw)
@@ -556,6 +643,15 @@ class ExecutionEngine:
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
                 note="TEST_DRY_RUN",
+                # 실행/복구 필드 (테스트에서는 None 허용)
+                entry_order_id=None,
+                tp_order_id=None,
+                sl_order_id=None,
+                exchange_position_side="BOTH",
+                remaining_qty=float(entry_qty),
+                realized_pnl_usdt=0.0,
+                reconciliation_status="TEST_DRY_RUN",
+                last_synced_at=entry_ts_dt,
             )
 
             record_trade_snapshot(
@@ -623,15 +719,22 @@ class ExecutionEngine:
             source=str(signal_source),
             soft_mode=bool(soft_mode),
             sl_floor_ratio=sl_floor_ratio,
+            entry_client_order_id=str(entry_client_order_id),
         )
         if trade is None:
             raise RuntimeError("open_position_with_tp_sl returned None")
+
+        # 실행/복구 필드 STRICT 확보
+        entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(
+            trade, soft_mode=bool(soft_mode)
+        )
 
         entry_price = getattr(trade, "entry", getattr(trade, "entry_price", entry_price_hint))
         entry_qty = getattr(trade, "qty", qty_raw)
 
         entry_ts_dt = getattr(trade, "entry_ts", None)
         if not isinstance(entry_ts_dt, datetime) or entry_ts_dt.tzinfo is None or entry_ts_dt.tzinfo.utcoffset(entry_ts_dt) is None:
+            # STRICT: 실제 체결시각을 못 받는 경우, 신호시각을 사용(추정이 아니라 "관측된 이벤트 시각")
             entry_ts_dt = datetime.fromtimestamp(float(signal_ts_ms) / 1000.0, tz=timezone.utc)
 
         log_event(
@@ -647,8 +750,10 @@ class ExecutionEngine:
             sl_pct=float(sl_pct),
             risk_pct=float(allocation_ratio),
             reason="entry_filled",
-            extra_json={"signal_source": signal_source},
+            extra_json={"signal_source": signal_source, "entry_client_order_id": entry_client_order_id, "entry_order_id": entry_order_id},
         )
+
+        now_sync = datetime.now(timezone.utc)
 
         trade_id = record_trade_open_returning_id(
             symbol=symbol,
@@ -667,6 +772,15 @@ class ExecutionEngine:
             tp_pct=float(tp_pct),
             sl_pct=float(sl_pct),
             note=f"gpt_reason={str(signal.reason or '')[:180]}",
+            # ✅ 실행/복구 필드(운영형)
+            entry_order_id=str(entry_order_id),
+            tp_order_id=(str(tp_order_id) if tp_order_id is not None else None),
+            sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
+            exchange_position_side=str(pos_side),
+            remaining_qty=float(remaining_qty),
+            realized_pnl_usdt=float(realized_pnl_usdt),
+            reconciliation_status="OK",
+            last_synced_at=now_sync,
         )
 
         try:

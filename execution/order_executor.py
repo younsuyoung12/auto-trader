@@ -1,59 +1,32 @@
-# execution/order_executor.py
-# =============================================================================
-# Binance USDT-M Futures - Order Execution Layer (Production)
-# =============================================================================
-# - REST endpoints: /fapi/*
-# - Symbol filters enforced via /fapi/v1/exchangeInfo (tick/step/minQty)
-# - Idempotency via newClientOrderId (openOrders + order lookup + in-process lock)
-# - Timestamp error (-1021) recovery: sync_server_time() + single retry
-# - No print(); logging only
-# =============================================================================
-#
-# =============================================================================
-# 변경 이력
-# -----------------------------------------------------------------------------
-# 2026-03-02 (PATCH)
-# 1) auto-sizing(기관식 자동 수량 계산) 제거
-#    - qty <= 0 경로 삭제 (수량 계산은 상위 레이어에서만 수행)
-#    - settings.risk_pct(0~100) 기반 계산 로직 전부 제거 (스케일 충돌 원천 차단)
-#    - open_position_with_tp_sl: qty는 반드시 > 0 (STRICT)
-# 2) SL 강제 안전화
-#    - soft_mode=False 인 경우 sl_pct는 반드시 > 0 (SL=0으로 인한 즉시 트리거/무의미 주문 방지)
-# 3) 불필요 코드 정리
-#    - 미사용 유틸/함수 삭제 (math_is_nan_or_inf 등)
-#    - 함수 내부 import 제거(import는 상단으로 통일)
-# 4) allocation_ratio 로깅 정합
-#    - settings.allocation_ratio 우선 사용, 없으면 risk_pct(legacy alias) 사용
-#
-# 2026-03-02
-# 1) STRICT · NO-FALLBACK 강화
-#    - open_position_with_tp_sl: side/leverage/entry_price/TP·SL 설정 실패 시 조용히 진행 금지
-#    - entry_price 획득: "0.0 대입" 금지 → order 조회/체결값으로만 확정, 실패 시 즉시 실패
-#    - TP/SL 설정 실패(soft_mode=False): 포지션 즉시 강제 청산 후 실패 처리
-# 2) 슬리피지 가드(옵션)
-#    - settings.max_entry_slippage_pct(옵션) 존재 시
-#      entry_price vs entry_price_hint 슬리피지 초과하면 즉시 강제 청산 후 실패 처리
-#
-# 2026-XX-XX
-# 1) 패키지 구조 정합성 수정
-#    - from exchange_api import ...  →  from execution.exchange_api import ...
-#    - 내부 get_position import도 동일하게 execution.exchange_api로 통일
-# 2) 기존 로직(주문/청산 흐름) 변경 없음
-#
-# 2026-03-01
-# 1) Trade import 경로 정합
-#    - open_position_with_tp_sl 내부의 `from trader import Trade` 제거
-#    - 상단 `from state.trader_state import Trade` 단일 사용 (No module named 'trader' 해결)
-# 2) EventBus strict validation 정합
-#    - publish payload.side는 LONG/SHORT/CLOSE만 허용
-#    - order_executor 내부 log_event side를 LONG/SHORT/CLOSE로 정규화
-#      (close 관련은 CLOSE, entry 관련은 LONG/SHORT)
-# 3) Trade dataclass 정합
-#    - Trade(tp_price/sl_price)는 float이므로 None 금지 → 0.0으로 저장
-# =============================================================================
+"""
+========================================================
+FILE: execution/order_executor.py
+STRICT · NO-FALLBACK · PRODUCTION MODE
+========================================================
+Binance USDT-M Futures - Order Execution Layer (Production)
+
+핵심:
+- REST endpoints: /fapi/*
+- Symbol filters enforced via /fapi/v1/exchangeInfo (tick/step/minQty)
+- Idempotency via newClientOrderId (openOrders + order lookup + in-process lock)
+- Timestamp error (-1021) recovery: sync_server_time() + single retry
+- No print(); logging only
+
+PATCH NOTES — 2026-03-02
+--------------------------------------------------------
+- TP/SL 주문 생성 시 orderId를 반환/상위로 전달(set_tp_sl -> (tp_order_id, sl_order_id))
+- Entry/TP/SL에 결정적(deterministic) clientOrderId를 주입할 수 있도록 확장
+  - entry_client_order_id(kw-only) 지원
+  - settings.require_deterministic_client_order_id=True 인 경우 미지정 시 즉시 예외(폴백 금지)
+- Trade 객체 생성 시(레거시 호환) Trade 시그니처에 존재하는 필드만 주입(호환성 유지)
+  - entry_order_id/tp_order_id/sl_order_id/exchange_position_side/remaining_qty/realized_pnl_usdt 등
+- STRICT 유지: 누락/불일치/실패 시 즉시 예외 또는 명시적 실패 처리(추정/폴백 금지)
+========================================================
+"""
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import re
@@ -227,6 +200,27 @@ def _make_client_order_id(prefix: str = "at") -> str:
     return base[:36]
 
 
+def _make_child_client_order_id(parent: str, suffix: str) -> str:
+    """
+    Deterministic-ish child id derived from parent id.
+
+    Constraints:
+    - ASCII
+    - <= 36 chars
+    - No fallback: parent must be valid clientOrderId.
+    """
+    p = _validate_client_order_id(parent)
+    sfx = str(suffix).strip().lower()
+    if not sfx:
+        raise ValueError("suffix is empty")
+    # Reserve: "-" + suffix (up to 6 chars typical). Truncate parent to fit 36.
+    tail = f"-{sfx}"
+    if len(tail) >= 36:
+        raise ValueError("suffix too long for client order id")
+    head_max = 36 - len(tail)
+    return f"{p[:head_max]}{tail}"
+
+
 def _require_positive_float(v: Any, name: str) -> float:
     try:
         f = float(v)
@@ -258,6 +252,44 @@ def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
     if not math.isfinite(f):
         return None
     return f
+
+
+def _trade_ctor_supported_fields() -> set[str]:
+    """
+    레거시/버전 차이를 안전하게 흡수하기 위한 호환용.
+
+    STRICT는 "데이터"에 적용한다.
+    여기서는 Trade dataclass/ctor의 시그니처 차이로 인해 런타임 크래시가 나는 것을 방지한다.
+    """
+    try:
+        # dataclass이면 __dataclass_fields__가 가장 정확
+        f = getattr(Trade, "__dataclass_fields__", None)
+        if isinstance(f, dict) and f:
+            return set(f.keys())
+    except Exception:
+        pass
+
+    try:
+        sig = inspect.signature(Trade)  # type: ignore[arg-type]
+        return {p.name for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+    except Exception:
+        # 최후: 비정상 타입이면 그냥 빈 집합(Trade 생성 시 키워드 최소화)
+        return set()
+
+
+def _make_trade_strict(**kwargs: Any) -> Trade:
+    """
+    Trade 객체 생성(호환).
+
+    - Trade ctor에 존재하는 필드만 전달한다.
+    - 값 자체의 유효성(0 대입/추정 등)은 호출부에서 이미 STRICT로 보장해야 한다.
+    """
+    allowed = _trade_ctor_supported_fields()
+    if not allowed:
+        # Trade가 예상과 다르면 그대로 전달 (에러는 상위로, 폴백 금지)
+        return Trade(**kwargs)  # type: ignore[arg-type]
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return Trade(**filtered)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -877,15 +909,27 @@ def set_tp_sl(
     soft_mode: bool = False,
     sl_floor_ratio: Optional[float] = None,
     settings: Optional[Any] = None,
-) -> None:
+    tp_client_order_id: Optional[str] = None,
+    sl_client_order_id: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    STRICT:
+    - TP/SL 주문을 생성하고, 생성된 orderId를 반환한다.
+    - soft_mode=True이면 SL 주문은 생성하지 않는다.
+    - 폴백(룩백/추정) 금지: 반환은 거래소 응답(orderId) 기반.
+    """
     _ = sl_floor_ratio
 
+    sym = _normalize_symbol(symbol)
     open_side = _normalize_side(side_open)
     close_side = "SELL" if open_side == "BUY" else "BUY"
 
+    tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
+
     if tp_price and tp_price > 0:
-        place_conditional(
-            symbol=symbol,
+        tp_resp = place_conditional(
+            symbol=sym,
             side=close_side,
             qty=qty,
             trigger_price=float(tp_price),
@@ -893,14 +937,19 @@ def set_tp_sl(
             settings=settings,
             reduce_only=True,
             position_side="BOTH",
+            client_order_id=tp_client_order_id,
         )
+        oid = tp_resp.get("orderId") if isinstance(tp_resp, dict) else None
+        if oid is None:
+            raise RuntimeError("TP order response missing orderId")
+        tp_order_id = str(oid)
 
     if soft_mode:
-        return
+        return tp_order_id, None
 
     if sl_price and sl_price > 0:
-        place_conditional(
-            symbol=symbol,
+        sl_resp = place_conditional(
+            symbol=sym,
             side=close_side,
             qty=qty,
             trigger_price=float(sl_price),
@@ -908,7 +957,14 @@ def set_tp_sl(
             settings=settings,
             reduce_only=True,
             position_side="BOTH",
+            client_order_id=sl_client_order_id,
         )
+        oid = sl_resp.get("orderId") if isinstance(sl_resp, dict) else None
+        if oid is None:
+            raise RuntimeError("SL order response missing orderId")
+        sl_order_id = str(oid)
+
+    return tp_order_id, sl_order_id
 
 
 def _fetch_filled_entry_price_strict(
@@ -990,6 +1046,7 @@ def open_position_with_tp_sl(
     sl_floor_ratio: Optional[float] = None,
     *,
     available_usdt: Optional[float] = None,
+    entry_client_order_id: Optional[str] = None,
 ) -> Optional["Trade"]:
     """
     STRICT:
@@ -997,6 +1054,8 @@ def open_position_with_tp_sl(
     - entry_price는 실제 체결 데이터로만 확정
     - soft_mode=False 인데 TP/SL 설정 실패 시 포지션 즉시 강제 청산 후 실패 처리
     - qty는 반드시 > 0 (auto-sizing 제거: 상위 레이어에서 수량 산출)
+    - 결정적 clientOrderId 강제 모드(settings.require_deterministic_client_order_id=True)에서는
+      entry_client_order_id 미지정 시 즉시 예외(폴백 금지)
     """
     _ = available_usdt  # (호환용) auto-sizing 제거로 더 이상 사용하지 않음
 
@@ -1021,7 +1080,17 @@ def open_position_with_tp_sl(
     if not math.isfinite(eph):
         raise ValueError("entry_price_hint must be finite")
 
-    cid = _make_client_order_id(prefix="ent")
+    require_det = bool(getattr(settings, "require_deterministic_client_order_id", False))
+    if entry_client_order_id is not None:
+        entry_cid = _validate_client_order_id(entry_client_order_id)
+    else:
+        if require_det:
+            raise ValueError("entry_client_order_id is required when settings.require_deterministic_client_order_id=True")
+        entry_cid = _make_client_order_id(prefix="ent")
+
+    # TP/SL clientOrderId (가능하면 entry_cid 기반으로 결정적으로 파생)
+    tp_cid = _make_child_client_order_id(entry_cid, "tp")
+    sl_cid = _make_child_client_order_id(entry_cid, "sl")
 
     try:
         entry_resp = place_market(
@@ -1031,7 +1100,7 @@ def open_position_with_tp_sl(
             settings=settings,
             reduce_only=False,
             position_side="BOTH",
-            client_order_id=cid,
+            client_order_id=entry_cid,
         )
     except Exception as e:
         logger.error(
@@ -1048,15 +1117,22 @@ def open_position_with_tp_sl(
             regime=source,
             side=_event_side_from_open_side(open_side),
             reason=str(e) or "entry_order_failed",
-            extra_json={"open_side": open_side, "qty": float(final_qty)},
+            extra_json={"open_side": open_side, "qty": float(final_qty), "clientOrderId": entry_cid},
         )
         return None
+
+    # entry_order_id STRICT 확보
+    order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
+    if order_id is None:
+        # RESULT 타입인데 orderId가 없으면 비정상. 폴백 금지.
+        raise RuntimeError("entry response missing orderId (STRICT)")
+    entry_order_id = str(order_id)
 
     # entry_price STRICT 확정
     try:
         entry_price = _fetch_filled_entry_price_strict(
             symbol=sym,
-            order_id=entry_resp.get("orderId") if isinstance(entry_resp, dict) else None,
+            order_id=entry_order_id,
             settings=settings,
             max_wait_sec=float(getattr(settings, "entry_fill_wait_sec", 2.0) or 2.0),
         )
@@ -1068,7 +1144,7 @@ def open_position_with_tp_sl(
             regime=source,
             side=_event_side_from_open_side(open_side),
             reason="entry_price_unavailable",
-            extra_json={"err": str(e), "clientOrderId": cid},
+            extra_json={"err": str(e), "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
         )
         # 포지션이 이미 열렸을 가능성이 있으므로 안전하게 강제 청산 시도
         try:
@@ -1114,6 +1190,8 @@ def open_position_with_tp_sl(
                         "slippage_pct": float(slip_pct),
                         "max_entry_slippage_pct": float(max_slip_f),
                         "qty": float(final_qty),
+                        "entry_order_id": entry_order_id,
+                        "clientOrderId": entry_cid,
                     },
                 )
                 try:
@@ -1136,7 +1214,7 @@ def open_position_with_tp_sl(
         # NOTE: 전환 기간 호환. 계산에는 사용 금지(로깅용).
         risk_pct=_get_allocation_ratio_for_log(settings),
         reason="MARKET_ENTRY_FILLED",
-        extra_json={"open_side": open_side, "clientOrderId": cid},
+        extra_json={"open_side": open_side, "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
     )
 
     # TP/SL 가격 계산
@@ -1158,9 +1236,9 @@ def open_position_with_tp_sl(
             if sl_price < floor_price:
                 sl_price = floor_price
 
-    # TP/SL 설정 (STRICT)
+    # TP/SL 설정 (STRICT) + orderId 반환
     try:
-        set_tp_sl(
+        tp_order_id, sl_order_id = set_tp_sl(
             symbol=sym,
             side_open=open_side,
             qty=float(final_qty),
@@ -1169,6 +1247,8 @@ def open_position_with_tp_sl(
             soft_mode=bool(soft_mode),
             sl_floor_ratio=sl_floor_ratio,
             settings=settings,
+            tp_client_order_id=tp_cid,
+            sl_client_order_id=sl_cid,
         )
     except Exception as e:
         logger.error("set_tp_sl failed (symbol=%s err=%s soft_mode=%s)", sym, str(e), bool(soft_mode))
@@ -1178,7 +1258,7 @@ def open_position_with_tp_sl(
             regime=source,
             side=_event_side_from_open_side(open_side),
             reason="tp_sl_set_failed",
-            extra_json={"err": str(e), "soft_mode": bool(soft_mode), "qty": float(final_qty)},
+            extra_json={"err": str(e), "soft_mode": bool(soft_mode), "qty": float(final_qty), "entry_order_id": entry_order_id},
         )
 
         if bool(soft_mode):
@@ -1189,6 +1269,10 @@ def open_position_with_tp_sl(
         except Exception as e2:
             logger.critical("force close after TP/SL failure also failed (symbol=%s err=%s)", sym, str(e2))
         return None
+
+    # soft_mode=False면 SL은 반드시 있어야 한다(안전). 없으면 즉시 실패.
+    if not bool(soft_mode) and (sl_order_id is None or not str(sl_order_id).strip()):
+        raise RuntimeError("soft_mode=False but SL order_id is missing (STRICT)")
 
     log_event(
         event_type="TP_SL_SET",
@@ -1203,14 +1287,20 @@ def open_position_with_tp_sl(
         # NOTE: 전환 기간 호환. 계산에는 사용 금지(로깅용).
         risk_pct=_get_allocation_ratio_for_log(settings),
         reason="TP_SL_CONFIGURED",
-        extra_json={"soft_mode": bool(soft_mode)},
+        extra_json={
+            "soft_mode": bool(soft_mode),
+            "tp_order_id": tp_order_id,
+            "sl_order_id": sl_order_id,
+            "tp_clientOrderId": tp_cid,
+            "sl_clientOrderId": sl_cid,
+            "entry_order_id": entry_order_id,
+            "entry_clientOrderId": entry_cid,
+        },
     )
 
-    order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
-    entry_order_id = str(order_id) if order_id is not None else None
-
-    return Trade(
-        symbol=symbol,
+    # Trade 생성(호환)
+    return _make_trade_strict(
+        symbol=sym,
         side=open_side,
         qty=float(final_qty),
         entry_price=float(entry_price),
@@ -1219,6 +1309,11 @@ def open_position_with_tp_sl(
         tp_price=float(tp_price) if tp_price > 0 else 0.0,
         sl_price=float(sl_price) if sl_price > 0 else 0.0,
         entry_order_id=entry_order_id,
+        tp_order_id=str(tp_order_id) if tp_order_id is not None else None,
+        sl_order_id=str(sl_order_id) if sl_order_id is not None else None,
+        exchange_position_side="BOTH",
+        remaining_qty=float(final_qty),
+        realized_pnl_usdt=0.0,
     )
 
 
@@ -1247,7 +1342,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         qty=float(qty),
         leverage=getattr(SET, "leverage", None),
         reason="MARKET_CLOSE_EXECUTED",
-        extra_json={"close_side": close_side, "clientOrderId": cid},
+        extra_json={"close_side": close_side, "clientOrderId": cid, "orderId": resp.get("orderId") if isinstance(resp, dict) else None},
     )
 
     logger.info(
@@ -1335,7 +1430,7 @@ def close_all_positions_market(symbol: str) -> int:
             qty=float(qty2),
             leverage=getattr(SET, "leverage", None),
             reason="SIGTERM_DEADLINE_FORCE_CLOSE",
-            extra_json={"direction": direction, "close_side": close_side, "positionSide": pos_side},
+            extra_json={"direction": direction, "close_side": close_side, "positionSide": pos_side, "orderId": resp.get("orderId") if isinstance(resp, dict) else None},
         )
         submitted += 1
 

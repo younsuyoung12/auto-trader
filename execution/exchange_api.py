@@ -1,39 +1,31 @@
-# exchange_api.py
-# =============================================================================
-# Design principles (Binance USDT-M Futures REST Adapter)
-# -----------------------------------------------------------------------------
-# - Binance USDT-M Futures (/fapi/*) REST endpoints only.
-# - Transport/Query layer only: signing, HTTP requests, account/position/order
-#   조회 및 레버리지/마진 모드 설정만 제공한다.
-# - 주문 실행(진입/청산/TP/SL 생성/슬리피지 계산)은 order_executor.py가 담당한다.
-# - Fallback 금지: 오류 발생 시 즉시 예외(RuntimeError/ValueError).
-# - 민감 정보(API key/secret/signature)는 로그/예외 메시지에 포함하지 않는다.
-# =============================================================================
-# One-way mode only.
-# Hedge mode is NOT supported.
-# positionSide must always be BOTH in order layer.
-# =============================================================================
-#
-# =============================================================================
-# 변경 이력
-# -----------------------------------------------------------------------------
-# 2026-03-02 (PATCH)
-# 1) retry 정책 STRICT 통일
-#    - execution.retry_policy.execute_with_retry 를 필수 import로 강제
-#    - "없으면 조용히 no-retry" 폴백 제거 (ImportError로 즉시 실패)
-# 2) Settings 단일 소스 정합
-#    - BASE_URL / timeout / recvWindow 를 settings 값으로 우선 적용
-#      (binance_futures_base / request_timeout_sec / recv_window_ms)
-# 3) 불필요 코드 정리
-#    - retry fallback placeholder 제거
-#
-# 2026-03-01
-# - set_leverage_and_mode()를 상태 검증 기반 구조로 전면 수정.
-# - 기존: 무조건 set 시도 → 이미 설정된 경우(-4046 등)도 실패 처리.
-# - 변경: 현재 leverage/marginType 조회 후 다른 경우에만 set 호출.
-# - "이미 설정됨"은 정상 상태로 간주.
-# - req()의 STRICT 예외 정책은 유지 (HTTP 코드 완화하지 않음).
-# =============================================================================
+"""
+========================================================
+FILE: execution/exchange_api.py
+STRICT · NO-FALLBACK · PRODUCTION MODE
+========================================================
+Design principles (Binance USDT-M Futures REST Adapter)
+--------------------------------------------------------
+- Binance USDT-M Futures (/fapi/*) REST endpoints only.
+- Transport/Query layer only: signing, HTTP requests, account/position/order 조회 및
+  레버리지/마진 모드 설정만 제공한다.
+- 주문 실행(진입/청산/TP/SL 생성/슬리피지 계산)은 order_executor.py가 담당한다.
+- Fallback 금지: 오류 발생 시 즉시 예외(RuntimeError/ValueError).
+- 민감 정보(API key/secret/signature)는 로그/예외 메시지에 포함하지 않는다.
+
+One-way mode only.
+Hedge mode is NOT supported.
+positionSide must always be BOTH in order layer.
+
+PATCH NOTES — 2026-03-02 (PATCH)
+--------------------------------------------------------
+- (9점대 기반) 주문/체결/복구를 위한 조회 함수 추가(STRICT, no fallback)
+  - get_order(symbol, order_id): /fapi/v1/order by orderId
+  - get_order_by_client_id(symbol, client_order_id): /fapi/v1/order by origClientOrderId
+  - get_user_trades(symbol, order_id=None, start_time_ms=None, end_time_ms=None, limit=1000)
+    * orderId 기반 체결 내역 조회(청산 원인/부분청산/실현손익 계산에 사용)
+- __all__에 신규 함수 노출
+========================================================
+"""
 
 from __future__ import annotations
 
@@ -441,6 +433,91 @@ def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
     return get_open_orders(symbol)
 
 
+def get_order(symbol: str, order_id: int | str) -> Dict[str, Any]:
+    """
+    STRICT: orderId로 단일 주문 조회 (/fapi/v1/order)
+
+    - TP/SL 체결 확인, 재시작 복구, 청산 원인 확정에 사용.
+    - 응답 shape이 dict가 아니면 즉시 예외.
+    """
+    s = _normalize_symbol(symbol)
+    try:
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid order_id: {order_id!r}")
+
+    data = req("GET", "/fapi/v1/order", {"symbol": s, "orderId": oid}, private=True)
+    if not isinstance(data, dict):
+        raise RuntimeError("GET /fapi/v1/order -> unexpected response shape")
+    return data
+
+
+def get_order_by_client_id(symbol: str, client_order_id: str) -> Dict[str, Any]:
+    """
+    STRICT: origClientOrderId로 단일 주문 조회 (/fapi/v1/order)
+
+    - deterministic clientOrderId 기반 멱등성 검증에 사용.
+    """
+    s = _normalize_symbol(symbol)
+    cid = str(client_order_id).strip()
+    if not cid:
+        raise ValueError("client_order_id is empty")
+
+    data = req("GET", "/fapi/v1/order", {"symbol": s, "origClientOrderId": cid}, private=True)
+    if not isinstance(data, dict):
+        raise RuntimeError("GET /fapi/v1/order(by client id) -> unexpected response shape")
+    return data
+
+
+def get_user_trades(
+    symbol: str,
+    *,
+    order_id: Optional[int | str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    """
+    STRICT: 체결(userTrades) 조회 (/fapi/v1/userTrades)
+
+    - order_id를 주면 해당 주문에 귀속된 체결 내역을 직접 조회(추정/룩백 폴백 금지)
+    - start/end는 선택(재시작 복구/부분청산 분석 시 사용)
+    """
+    s = _normalize_symbol(symbol)
+    if not isinstance(limit, int) or limit <= 0 or limit > 1000:
+        raise ValueError("limit must be int in [1, 1000]")
+
+    params: Dict[str, Any] = {"symbol": s, "limit": limit}
+
+    if order_id is not None:
+        try:
+            params["orderId"] = int(order_id)
+        except (TypeError, ValueError):
+            raise ValueError(f"invalid order_id: {order_id!r}")
+
+    if start_time_ms is not None:
+        if not isinstance(start_time_ms, int) or start_time_ms <= 0:
+            raise ValueError("start_time_ms must be int > 0")
+        params["startTime"] = start_time_ms
+
+    if end_time_ms is not None:
+        if not isinstance(end_time_ms, int) or end_time_ms <= 0:
+            raise ValueError("end_time_ms must be int > 0")
+        params["endTime"] = end_time_ms
+
+    if start_time_ms is not None and end_time_ms is not None and end_time_ms < start_time_ms:
+        raise ValueError("end_time_ms must be >= start_time_ms")
+
+    data = req("GET", "/fapi/v1/userTrades", params, private=True)
+    if not isinstance(data, list):
+        raise RuntimeError("GET /fapi/v1/userTrades -> unexpected response shape")
+    out: List[Dict[str, Any]] = []
+    for row in data:
+        if isinstance(row, dict):
+            out.append(row)
+    return out
+
+
 def cancel_order(symbol: str, order_id: int | str) -> Dict[str, Any]:
     """Cancel an order by orderId."""
     s = _normalize_symbol(symbol)
@@ -531,6 +608,9 @@ __all__ = [
     "get_position",
     "get_open_orders",
     "fetch_open_orders",
+    "get_order",
+    "get_order_by_client_id",
+    "get_user_trades",
     "cancel_order",
     "set_leverage",
     "set_margin_mode",

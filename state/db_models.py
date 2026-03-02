@@ -1,6 +1,6 @@
 """
 ========================================================
-state/db_models.py
+FILE: state/db_models.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 설계 원칙:
@@ -11,12 +11,14 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - import 시점에 스키마 생성/변경을 수행하지 않는다.
 - 레거시 호환: 일부 모듈이 `Trade` ORM 심벌을 기대하므로 `Trade = TradeORM` alias를 제공한다.
 
-변경 이력
+PATCH NOTES — 2026-03-02
 --------------------------------------------------------
-- 2026-03-01: bt_regime_scores 스키마 정합(컬럼 확장 + Index 정합)
-- 2026-03-01: bt_trade_snapshots / bt_trade_exit_snapshots ORM 추가
-- 2026-03-01: bt_trades ORM을 "실제 DB 스키마"와 1:1 정합
-  (is_open/close_ts/close_price/pnl 제거 → exit_ts/exit_price/pnl_usdt 등으로 교체)
+- bt_trades: 운영형 실행/복구를 위한 컬럼 추가(ORM 정합)
+  - entry_order_id, tp_order_id, sl_order_id
+  - exchange_position_side
+  - remaining_qty, realized_pnl_usdt
+  - reconciliation_status, last_synced_at
+- 기존 설계 원칙/STRICT 정책 유지 (폴백/추정 금지)
 ========================================================
 """
 
@@ -228,6 +230,20 @@ class TradeORM(Base):
 
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    # ─────────────────────────────────────────
+    # Execution / Reconciliation Fields (운영형)
+    # ─────────────────────────────────────────
+    entry_order_id = Column(String(64), nullable=True)
+    tp_order_id = Column(String(64), nullable=True)
+    sl_order_id = Column(String(64), nullable=True)
+
+    exchange_position_side = Column(String(16), nullable=True)  # e.g. BOTH / LONG / SHORT (거래소 정책에 따름)
+    remaining_qty = Column(Numeric(24, 8), nullable=True)
+    realized_pnl_usdt = Column(Numeric(24, 8), nullable=True)
+
+    reconciliation_status = Column(String(32), nullable=True)  # e.g. OK / MISMATCH / RECOVERED / ERROR
+    last_synced_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_bt_trades_symbol_entry_ts", "symbol", "entry_ts"),

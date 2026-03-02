@@ -50,7 +50,7 @@ from execution.exchange_api import (
     set_leverage_and_mode,
 )
 from execution.order_executor import close_all_positions_market
-from execution.sync_exchange import sync_open_trades_from_exchange
+from state.sync_exchange import sync_open_trades_from_exchange
 
 from state.trader_state import Trade, TraderState, check_closes, build_close_summary_strict
 from state.exit_engine import maybe_exit_with_gpt
