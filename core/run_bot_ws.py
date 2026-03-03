@@ -10,6 +10,16 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 - 데이터가 없거나 손상되면 즉시 예외 또는 명시적 SKIP 처리한다.
 - 텔레그램/비핵심 I/O가 메인 루프를 블로킹하면 안 된다.
 
+PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+- GPTStrategy 삭제 반영:
+  - strategy.gpt_strategy 의존 제거
+  - 로컬 결정 함수(_decide_entry_candidate_strict)로 후보 신호 생성(결정은 규칙 기반)
+- RiskPhysicsEngine 입력 확장 반영:
+  - micro_score_risk + EV heatmap(상태/EV/n) 입력을 추가하여 AutoBlock 정책 반영
+- EvHeatmapEngine 도입:
+  - (초기) NOT_READY 상태로 시작하며,
+  - pnl_r 업데이트는 exit 단계에서 entry_price/qty/SL 기반으로 별도 구현(추정 금지)
+
 PATCH NOTES — 2026-03-02 (UPGRADE, MIN-CHANGE)
 - Telegram I/O 비동기화:
   - infra/async_worker 기반 submit(send_tg, ...)로 메인 루프 블로킹 제거
@@ -25,8 +35,7 @@ PATCH NOTES — 2026-03-02 (UPGRADE, MIN-CHANGE)
   - max_signal_latency_ms / max_exec_latency_ms 초과 시 신규 진입을 SAFE_STOP으로 차단
 
 주의
-- DB 스키마 변경 없음.
-- 기존 전략/실행 구조 유지.
+- DB 스키마 변경 없음(단, 스냅샷 확장 컬럼은 DB에 이미 반영되어 있어야 함).
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from settings import load_settings
@@ -79,11 +89,12 @@ from infra.data_health_monitor import start_health_monitor
 
 from infra.market_features_ws import get_trading_signal, FeatureBuildError
 from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
-from strategy.gpt_strategy import GPTStrategy
 from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder, AccountStateNotReadyError
 from execution.risk_physics_engine import RiskPhysicsEngine, RiskPhysicsPolicy
 from strategy.signal import Signal
+
+from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
 from sync.reconcile_engine import ReconcileConfig, ReconcileEngine, ReconcileResult
 
@@ -122,6 +133,96 @@ LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
 
 # ─────────────────────────────
+# Entry Candidate (local, STRICT)
+# ─────────────────────────────
+@dataclass(frozen=True, slots=True)
+class EntryCandidate:
+    action: str  # "ENTER" or "SKIP"
+    direction: str  # LONG/SHORT
+    tp_pct: float
+    sl_pct: float
+    reason: str
+    meta: Dict[str, Any]
+    guard_adjustments: Dict[str, float]
+
+
+def _as_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be numeric (bool not allowed)")
+    try:
+        x = float(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be numeric: {e}") from e
+    if not math.isfinite(x):
+        raise RuntimeError(f"{name} must be finite")
+    if min_value is not None and x < min_value:
+        raise RuntimeError(f"{name} must be >= {min_value}")
+    if max_value is not None and x > max_value:
+        raise RuntimeError(f"{name} must be <= {max_value}")
+    return float(x)
+
+
+def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
+    tp = _as_float(getattr(settings, "tp_pct", None), "settings.tp_pct", min_value=0.0, max_value=1.0)
+    sl = _as_float(getattr(settings, "sl_pct", None), "settings.sl_pct", min_value=0.0, max_value=1.0)
+
+    if isinstance(extra, dict):
+        if extra.get("tp_pct") is not None:
+            tp = _as_float(extra.get("tp_pct"), "extra.tp_pct", min_value=0.0, max_value=1.0)
+        if extra.get("sl_pct") is not None:
+            sl = _as_float(extra.get("sl_pct"), "extra.sl_pct", min_value=0.0, max_value=1.0)
+
+    if tp <= 0.0:
+        raise RuntimeError("tp_pct must be > 0 (STRICT)")
+    if sl <= 0.0:
+        raise RuntimeError("sl_pct must be > 0 (STRICT)")
+    return float(tp), float(sl)
+
+
+def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidate:
+    """
+    STRICT:
+    - 이 함수는 '결정 후보'만 만든다(규칙 기반).
+    - 실제 allocation/risk multiplier/차단은 risk_physics 단계에서 수행한다.
+    - GPT 호출 없음(지연/비용/불확실성 제거).
+    """
+    if not isinstance(market_data, dict) or not market_data:
+        raise RuntimeError("market_data is required (STRICT)")
+
+    symbol = str(market_data.get("symbol") or "").strip()
+    if not symbol:
+        raise RuntimeError("market_data.symbol is required (STRICT)")
+
+    direction = str(market_data.get("direction") or "").upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        raise RuntimeError(f"market_data.direction invalid (STRICT): {direction!r}")
+
+    extra = market_data.get("extra")
+    tp_pct, sl_pct = _require_tp_sl_from_settings_or_extra(SET, extra)
+
+    meta = {
+        "symbol": symbol,
+        "regime": str(market_data.get("regime") or "").strip() or str(market_data.get("signal_source") or "").strip(),
+        "signal_source": str(market_data.get("signal_source") or "").strip(),
+        "signal_ts_ms": int(market_data.get("signal_ts_ms")),
+        "last_price": float(market_data.get("last_price")),
+        "candles_5m": market_data.get("candles_5m"),
+        "candles_5m_raw": market_data.get("candles_5m_raw"),
+        "extra": extra if isinstance(extra, dict) else None,
+    }
+
+    return EntryCandidate(
+        action="ENTER",
+        direction=direction,
+        tp_pct=float(tp_pct),
+        sl_pct=float(sl_pct),
+        reason="ws_signal_candidate",
+        meta=meta,
+        guard_adjustments={},
+    )
+
+
+# ─────────────────────────────
 # 기본 유틸
 # ─────────────────────────────
 def _safe_send_tg(msg: str) -> None:
@@ -135,7 +236,6 @@ def _safe_send_tg(msg: str) -> None:
         if not ok:
             log(f"[TG][DROP] async queue full: {msg}")
     except Exception as e:
-        # 워커 미기동 등은 운영 오류이지만, 알림 실패 때문에 엔진을 즉시 중단하진 않는다.
         log(f"[TG] async submit error: {type(e).__name__}: {e} | msg={msg}")
 
 
@@ -224,10 +324,6 @@ def interruptible_sleep(total_sec: float, tick: float = 1.0) -> None:
 
 
 def _normalize_direction_for_events_strict(v: Any) -> str:
-    """
-    STRICT:
-    - 알 수 없는 값은 임의로 CLOSE로 폴백하지 않는다.
-    """
     s = str(v or "").upper().strip()
     if s in ("LONG", "SHORT"):
         return s
@@ -293,14 +389,6 @@ def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
 # equity / DB bootstrap
 # ─────────────────────────────
 def _get_equity_current_usdt_strict() -> float:
-    """
-    STRICT:
-    - /fapi/v2/balance USDT row 기반 equity 확정
-    - 우선순위:
-      1) balance(or walletBalance) + crossUnPnl
-      2) crossWalletBalance + crossUnPnl
-      3) availableBalance
-    """
     row = get_balance_detail("USDT")
     if not isinstance(row, dict):
         raise RuntimeError("get_balance_detail('USDT') returned non-dict")
@@ -346,11 +434,6 @@ def _get_equity_current_usdt_strict() -> float:
 
 
 def _dsn_strict() -> str:
-    """
-    STRICT:
-    - psycopg2.connect()가 받을 수 있는 DSN만 허용
-    - SQLAlchemy URL(postgresql+psycopg2://, postgresql+asyncpg://)은 postgresql://로 정규화
-    """
     dsn = os.getenv("TRADER_DB_URL") or os.getenv("DATABASE_URL")
     if not dsn or not str(dsn).strip():
         raise RuntimeError("TRADER_DB_URL or DATABASE_URL is required")
@@ -537,7 +620,6 @@ def _start_market_data_store_thread() -> None:
                         last_ob_ts = now
 
             except Exception as e:
-                # 저장/분석용 스레드: 실패를 숨기지 않되, 엔진을 죽이진 않는다(유틸 영역).
                 log(f"[MD-STORE] loop error: {type(e).__name__}: {e}")
 
             time.sleep(flush_sec)
@@ -631,21 +713,15 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
             live.append(r)
 
     if not live:
-        # 포지션 없음: Binance는 entryPrice=0을 반환하는 케이스가 정상이다.
         return {"symbol": sym, "positionAmt": "0", "entryPrice": "0"}
 
-    # Hedge/모호성 금지: live 포지션 후보가 2개 이상이면 즉시 예외
     if len(live) != 1:
         raise RuntimeError(f"ambiguous exchange positions (STRICT): count={len(live)}")
 
     r0 = live[0]
     if "entryPrice" not in r0:
         raise RuntimeError("positionRisk.entryPrice missing (STRICT)")
-    return {
-        "symbol": sym,
-        "positionAmt": str(r0["positionAmt"]),
-        "entryPrice": str(r0["entryPrice"]),
-    }
+    return {"symbol": sym, "positionAmt": str(r0["positionAmt"]), "entryPrice": str(r0["entryPrice"])}
 
 
 def _get_local_position_snapshot(symbol: str) -> Dict[str, Any]:
@@ -697,7 +773,6 @@ def _on_reconcile_desync(result: ReconcileResult) -> None:
         log(f"[DESYNC] {it.code} | {it.message} | {it.details}")
     _maybe_send_error_tg("DESYNC", msg, cooldown_sec=60)
 
-    # 선택: desync 시 강제 청산 (기본 False)
     if bool(getattr(SET, "force_close_on_desync", False)):
         try:
             n = close_all_positions_market(result.symbol)
@@ -746,7 +821,6 @@ def main() -> None:
     global RUNNING, OPEN_TRADES, LAST_CLOSE_TS, CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
 
-    # 1) async worker start (텔레그램 I/O 블로킹 제거)
     start_async_worker(
         num_threads=int(getattr(SET, "async_worker_threads", 1) or 1),
         max_queue_size=int(getattr(SET, "async_worker_queue_size", 2000) or 2000),
@@ -755,7 +829,6 @@ def main() -> None:
 
     _verify_ws_boot_configuration_or_die()
 
-    # WS 부팅(REST 백필 → WS 시작 → (10초 워밍업) → health monitor 시작)
     if bool(getattr(SET, "ws_enabled", True)):
         _backfill_ws_kline_history(SET.symbol)
         start_ws_loop(SET.symbol)
@@ -776,7 +849,6 @@ def main() -> None:
         _safe_send_tg(msg)
         return
 
-    # leverage/margin
     try:
         set_leverage_and_mode(SET.symbol, int(getattr(SET, "leverage", 1) or 1), bool(getattr(SET, "isolated", True)))
     except Exception as e:
@@ -794,11 +866,9 @@ def main() -> None:
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
 
-    # exchange sync (DB ↔ exchange)
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     LAST_EXCHANGE_SYNC_TS = time.time()
 
-    # reconcile guard
     reconcile_engine = ReconcileEngine(
         ReconcileConfig(symbol=str(SET.symbol), interval_sec=int(getattr(SET, "reconcile_interval_sec", 30) or 30)),
         fetch_exchange_position=_fetch_exchange_position_snapshot,
@@ -807,11 +877,11 @@ def main() -> None:
         on_desync=_on_reconcile_desync,
     )
 
-    entry_strategy = GPTStrategy(SET)
     entry_exec_engine = ExecutionEngine(SET)
     regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
 
-    # persisted peak
+    ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
+
     persisted_peak: Optional[float] = None
     try:
         persisted_peak = _load_equity_peak_bootstrap(SET.symbol)
@@ -832,7 +902,7 @@ def main() -> None:
 
     CLOSED_TRADES_CACHE = deque(maxlen=50)
     try:
-        boot_rows = _load_closed_trades_bootstrap(SET.symbol, limit=50)  # DESC
+        boot_rows = _load_closed_trades_bootstrap(SET.symbol, limit=50)
         for r in reversed(boot_rows):
             CLOSED_TRADES_CACHE.appendleft(r)
     except Exception as e:
@@ -843,7 +913,6 @@ def main() -> None:
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
 
-    # latency budgets (optional, defaults)
     max_signal_latency_ms = float(getattr(SET, "max_signal_latency_ms", 200) or 200)
     max_exec_latency_ms = float(getattr(SET, "max_exec_latency_ms", 400) or 400)
 
@@ -851,7 +920,6 @@ def main() -> None:
         try:
             now = time.time()
 
-            # SIGTERM grace deadline handling (1회)
             if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS and not _SIGTERM_DEADLINE_HANDLED:
                 _SIGTERM_DEADLINE_HANDLED = True
                 log("[SIGTERM] grace deadline reached. force close attempt starts.")
@@ -864,20 +932,16 @@ def main() -> None:
                     log(f"[SIGTERM] force close failed: {type(e).__name__}: {e}")
                     _safe_send_tg(f"❌ SIGTERM 강제 정리 실패: {e}")
 
-            # reconcile guard (OPEN_TRADES ↔ exchange)
             reconcile_engine.run_if_due(now_ts=now)
 
-            # exchange sync (DB ↔ exchange)
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
                 LAST_EXCHANGE_SYNC_TS = now
 
-            # balance ping
             if now - last_balance_log >= 60:
                 get_available_usdt()
                 last_balance_log = now
 
-            # close check
             if now - last_fill_check >= float(getattr(SET, "poll_fills_sec", 3.0) or 3.0):
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
                 for closed in closed_list:
@@ -938,7 +1002,6 @@ def main() -> None:
 
                 last_fill_check = now
 
-            # open trades → exit checks
             if OPEN_TRADES:
                 last_1m = ws_get_klines_with_volume(SET.symbol, "1m", limit=1)
                 if last_1m:
@@ -954,28 +1017,24 @@ def main() -> None:
                 interruptible_sleep(1)
                 continue
 
-            # safe stop
             if SAFE_STOP_REQUESTED and not OPEN_TRADES:
                 _safe_send_tg("🛑 포지션 0 확인. 자동매매를 종료합니다.")
                 return
 
-            # entry cooldown
             entry_cooldown_sec = float(getattr(SET, "entry_cooldown_sec", 20) or 20)
             if now - LAST_ENTRY_GPT_CALL_TS < entry_cooldown_sec:
                 interruptible_sleep(1)
                 continue
 
-            # ✅ 잔액 0이면: 엔트리 전체를 60초 쉬고 재확인(스팸 제거)
             try:
                 equity_current_usdt = _get_equity_current_usdt_strict()
             except Exception as e:
                 msg = f"[SKIP][EQUITY_INVALID] {e} (balance likely 0)"
                 log(msg)
-                _maybe_send_entry_block_tg("EQUITY_INVALID", msg, cooldown_sec=300)  # 5분 1회
+                _maybe_send_entry_block_tg("EQUITY_INVALID", msg, cooldown_sec=300)
                 interruptible_sleep(60)
                 continue
 
-            # data health gate
             if not bool(data_health_monitor.HEALTH_OK):
                 msg = f"[SKIP][DATA_HEALTH_FAIL] {data_health_monitor.LAST_FAIL_REASON}"
                 log(msg)
@@ -988,7 +1047,6 @@ def main() -> None:
                 interruptible_sleep(1)
                 continue
 
-            # Regime decision
             mf = market_data.get("market_features")
             eng = (mf or {}).get("engine_scores") if isinstance(mf, dict) else None
             total = (eng or {}).get("total") if isinstance(eng, dict) else None
@@ -1005,7 +1063,6 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
-            # Account state + persisted_peak 유지
             account_state = account_builder.build(
                 symbol=market_data["symbol"],
                 current_equity_usdt=float(equity_current_usdt),
@@ -1018,19 +1075,9 @@ def main() -> None:
                 else float(max(float(persisted_peak), float(account_state.equity_peak_usdt)))
             )
 
-            market_data["account_state"] = {
-                "dd_pct": float(account_state.dd_pct),
-                "consecutive_losses": int(account_state.consecutive_losses),
-                "recent_win_rate": float(account_state.recent_win_rate),
-                "recent_trades_count": int(account_state.recent_trades_count),
-                "equity_current_usdt": float(account_state.equity_current_usdt),
-                "equity_peak_usdt": float(account_state.equity_peak_usdt),
-                "recent_planned_rr_avg": account_state.recent_planned_rr_avg,
-            }
-
-            # GPT decide latency guard
+            # ── 후보 신호 생성(로컬 결정) + latency guard ──
             t0 = time.perf_counter()
-            signal_obj = entry_strategy.decide(market_data)
+            cand = _decide_entry_candidate_strict(market_data)
             dt_ms = (time.perf_counter() - t0) * 1000.0
             if dt_ms > max_signal_latency_ms:
                 SAFE_STOP_REQUESTED = True
@@ -1042,19 +1089,40 @@ def main() -> None:
 
             LAST_ENTRY_GPT_CALL_TS = now
 
-            if str(signal_obj.action).upper().strip() != "ENTER":
-                msg = f"[SKIP][GPT] {signal_obj.reason}"
+            if str(cand.action).upper().strip() != "ENTER":
+                msg = f"[SKIP][CANDIDATE] {cand.reason}"
                 log(msg)
-                _maybe_send_entry_block_tg("GPT_SKIP", msg, cooldown_sec=60)
+                _maybe_send_entry_block_tg("CANDIDATE_SKIP", msg, cooldown_sec=60)
                 interruptible_sleep(5)
                 continue
+
+            # ── microstructure + heatmap ──
+            micro = (mf or {}).get("microstructure") if isinstance(mf, dict) else None
+            if not isinstance(micro, dict):
+                raise RuntimeError("market_features.microstructure missing (STRICT)")
+            if "micro_score_risk" not in micro:
+                raise RuntimeError("microstructure.micro_score_risk missing (STRICT)")
+            micro_score_risk = float(micro["micro_score_risk"])
+            if not math.isfinite(micro_score_risk) or micro_score_risk < 0 or micro_score_risk > 100:
+                raise RuntimeError(f"micro_score_risk out of range (STRICT): {micro_score_risk}")
+
+            hk: HeatmapKey = ev_heatmap.build_key(
+                regime_band=str(regime_decision.band),
+                micro_score_risk=float(micro_score_risk),
+                engine_total_score=float(regime_score),
+            )
+            cell = ev_heatmap.get_cell_status(hk)
 
             rp = risk_physics.decide(
                 regime_allocation=float(regime_decision.allocation),
                 dd_pct=float(account_state.dd_pct),
                 consecutive_losses=int(account_state.consecutive_losses),
-                tp_pct=float(signal_obj.tp_pct),
-                sl_pct=float(signal_obj.sl_pct),
+                tp_pct=float(cand.tp_pct),
+                sl_pct=float(cand.sl_pct),
+                micro_score_risk=float(micro_score_risk),
+                heatmap_status=str(cell.status),
+                heatmap_ev=cell.ev,
+                heatmap_n=int(cell.n),
             )
             if rp.action_override == "SKIP":
                 msg = f"[SKIP][RISK_PHYSICS] {rp.reason}"
@@ -1063,34 +1131,47 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
-            meta2 = dict(signal_obj.meta or {})
+            meta2 = dict(cand.meta or {})
             meta2.update(
                 {
                     "equity_current_usdt": float(account_state.equity_current_usdt),
                     "equity_peak_usdt": float(account_state.equity_peak_usdt),
                     "dd_pct": float(account_state.dd_pct),
                     "consecutive_losses": int(account_state.consecutive_losses),
+
                     "risk_physics_reason": str(rp.reason),
                     "dynamic_allocation_ratio": float(rp.effective_risk_pct),
                     "dynamic_risk_pct": float(rp.effective_risk_pct),
+
                     "regime_score": float(regime_decision.score),
                     "regime_band": str(regime_decision.band),
                     "regime_allocation": float(regime_decision.allocation),
+
+                    "micro_score_risk": float(micro_score_risk),
+                    "ev_cell_key": f"{hk.regime_band}|{hk.distortion_bucket}|{hk.score_bucket}",
+                    "ev_cell_status": str(cell.status),
+                    "ev_cell_ev": cell.ev,
+                    "ev_cell_n": int(cell.n),
+
+                    "auto_blocked": bool(rp.auto_blocked),
+                    "auto_risk_multiplier": float(rp.auto_risk_multiplier),
+                    "heatmap_status": rp.heatmap_status,
+                    "heatmap_ev": rp.heatmap_ev,
+                    "heatmap_n": rp.heatmap_n,
                 }
             )
 
             signal_final = Signal(
                 action="ENTER",
-                direction=signal_obj.direction,
-                tp_pct=float(signal_obj.tp_pct),
-                sl_pct=float(signal_obj.sl_pct),
+                direction=str(cand.direction),
+                tp_pct=float(cand.tp_pct),
+                sl_pct=float(cand.sl_pct),
                 risk_pct=float(rp.effective_risk_pct),
-                reason=str(signal_obj.reason),
-                guard_adjustments=dict(signal_obj.guard_adjustments or {}),
+                reason=str(cand.reason),
+                guard_adjustments=dict(cand.guard_adjustments or {}),
                 meta=meta2,
             )
 
-            # execution latency guard
             t1 = time.perf_counter()
             trade = entry_exec_engine.execute(signal_final)
             dt2_ms = (time.perf_counter() - t1) * 1000.0
@@ -1119,7 +1200,6 @@ def main() -> None:
             key = hashlib.sha1(core.encode("utf-8", errors="ignore")).hexdigest()[:12]
             _maybe_send_error_tg(key, f"❌ 오류: {e}", cooldown_sec=60)
 
-            # signals_logger strict(side) 방지: ERROR는 direction="CLOSE" 고정
             log_signal(
                 event="ERROR",
                 symbol=SET.symbol,

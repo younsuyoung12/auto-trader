@@ -17,21 +17,25 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
 - 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
 
+PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+- bt_trade_snapshots 확장 컬럼 저장 연결:
+  - meta에서 Decision/Micro/EV/AutoBlock 값을 읽어 record_trade_snapshot에 전달
+  - exec_expected_price/exec_filled_avg_price/exec_slippage_pct 즉시 저장(대기 불필요)
+- Execution Quality 이벤트 기록 비동기화:
+  - 체결 후 t+1s/t+3s/t+5s markPrice 조회는 async_worker로 위임(메인 execute 블로킹 제거)
+  - bt_events에 on_execution_quality / on_execution_quality_fail 기록
+
 PATCH NOTES — 2026-03-02 (UPGRADE)
 - Telegram I/O 비동기화:
   - infra/async_worker.submit()로 send_tg / send_skip_tg를 위임(메인 실행 블로킹 제거)
 - bt_trade_snapshots에 DD 영속화 저장(STRICT):
   - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 를 STRICT로 요구
-  - record_trade_snapshot에 위 3개 값을 저장
 - deterministic entry_client_order_id 생성/주입:
   - 동일 signal 재시도 시 동일 newClientOrderId 생성 → 중복 진입 차단
 - bt_trades 실행/복구 필드 영속화(STRICT):
   - entry_order_id / tp_order_id / sl_order_id
   - exchange_position_side / remaining_qty / realized_pnl_usdt
   - reconciliation_status / last_synced_at
-  - 필수 값 누락 시 즉시 예외(폴백 금지)
-- order_state 최소 FSM 도입:
-  - OrderState를 내부 전이로 기록(디버깅/추적용)
 
 PATCH NOTES — 2026-03-02 (FIX)
 - Pylance "Trade is not defined" 해결:
@@ -44,13 +48,15 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
 from events.signals_logger import log_event, log_signal, log_skip_event
-from execution.exchange_api import get_available_usdt, get_balance_detail
+from execution.exchange_api import get_available_usdt, get_balance_detail, req
 from execution.order_executor import open_position_with_tp_sl
+from execution.execution_quality_engine import ExecutionQualityError, build_execution_quality_snapshot_obj
 from execution.risk_manager import hard_risk_guard_check
 from infra.telelog import send_skip_tg, send_tg
 from infra.async_worker import submit as submit_async
@@ -75,8 +81,6 @@ logger = logging.getLogger(__name__)
 
 # ============================================================
 # Global single execution lock (STRICT)
-# - 동시 실행(레이스)로 인한 중복 주문/중복 DB 기록을 구조적으로 차단한다.
-# - acquire 실패 시 즉시 예외(StateViolation). (폴백/조용한 SKIP 금지)
 # ============================================================
 _EXECUTION_LOCK: Lock = Lock()
 
@@ -118,6 +122,19 @@ def _submit_tg_nonblocking(func, msg: str, *, label: str) -> None:
             logger.warning("[TG][DROP] queue full label=%s", label)
     except Exception as e:
         logger.warning("[TG][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
+
+
+def _submit_task_nonblocking(fn, *args: Any, label: str) -> None:
+    """
+    STRICT:
+    - 비핵심 작업(관측/리포팅)은 async_worker로 위임한다.
+    """
+    try:
+        ok = submit_async(fn, *args, critical=False, label=label)
+        if not ok:
+            logger.warning("[ASYNC][DROP] queue full label=%s", label)
+    except Exception as e:
+        logger.warning("[ASYNC][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
 
 
 def _as_float(
@@ -204,6 +221,86 @@ def _deterministic_entry_client_order_id(symbol: str, direction: str, signal_ts_
         raise ValueError("generated client order id invalid")
 
     return cid
+
+
+def _fetch_mark_price_strict(symbol: str) -> float:
+    """
+    STRICT: /fapi/v1/premiumIndex markPrice 조회
+    """
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    if not sym:
+        raise OrderFailed("symbol is empty (STRICT)")
+
+    data = req("GET", "/fapi/v1/premiumIndex", {"symbol": sym}, private=False)
+    if not isinstance(data, dict):
+        raise OrderFailed("premiumIndex response must be dict (STRICT)")
+    if "markPrice" not in data:
+        raise OrderFailed("premiumIndex.markPrice missing (STRICT)")
+
+    px = _as_float(data.get("markPrice"), "premiumIndex.markPrice", min_value=0.0)
+    if px <= 0:
+        raise OrderFailed("premiumIndex.markPrice must be > 0 (STRICT)")
+    return float(px)
+
+
+def _collect_post_prices_strict(symbol: str) -> Dict[str, float]:
+    """
+    STRICT: 체결 후 마크가격을 t+1s/t+3s/t+5s 시점에 각각 조회한다.
+    - 이 함수는 async_worker에서만 실행하도록 설계한다(메인 execute 블로킹 금지).
+    """
+    time.sleep(1.0)
+    p1 = _fetch_mark_price_strict(symbol)
+    time.sleep(2.0)
+    p3 = _fetch_mark_price_strict(symbol)
+    time.sleep(2.0)
+    p5 = _fetch_mark_price_strict(symbol)
+    return {"t+1s": p1, "t+3s": p3, "t+5s": p5}
+
+
+def _exec_quality_task(symbol: str, direction: str, regime: str, expected_price: float, filled_avg_price: float) -> None:
+    """
+    비동기 실행 품질 스냅샷 이벤트 기록.
+    - 실패해도 거래 흐름은 깨지지 않는다(관측용).
+    """
+    try:
+        post_prices = _collect_post_prices_strict(symbol)
+        side = "BUY" if direction == "LONG" else "SELL"
+        snap = build_execution_quality_snapshot_obj(
+            symbol=symbol,
+            side=side,
+            expected_price=float(expected_price),
+            filled_avg_price=float(filled_avg_price),
+            post_prices=post_prices,
+        )
+        log_event(
+            "on_execution_quality",
+            symbol=symbol,
+            regime=regime,
+            source="execution_engine.exec_quality",
+            side=direction,
+            price=float(filled_avg_price),
+            reason="execution_quality_snapshot",
+            extra_json={
+                "expected_price": snap.expected_price,
+                "filled_avg_price": snap.filled_avg_price,
+                "slippage_pct": snap.slippage_pct,
+                "adverse_move_pct": snap.adverse_move_pct,
+                "post_prices": dict(snap.post_prices),
+                "execution_score": snap.execution_score,
+                "meta": dict(snap.meta),
+            },
+        )
+    except (ExecutionQualityError, OrderFailed, ValueError, RuntimeError) as e:
+        log_event(
+            "on_execution_quality_fail",
+            symbol=symbol,
+            regime=regime,
+            source="execution_engine.exec_quality",
+            side=direction,
+            price=float(filled_avg_price) if math.isfinite(float(filled_avg_price)) else None,
+            reason="execution_quality_failed",
+            extra_json={"error": str(e)[:240]},
+        )
 
 
 def _require_trade_exec_fields(
@@ -306,6 +403,160 @@ def _resolve_dynamic_allocation(meta: Dict[str, Any]) -> Optional[float]:
     return _as_float(v, "meta.dynamic_allocation_ratio", min_value=0.0, max_value=1.0)
 
 
+def _meta_optional(meta: Dict[str, Any], key: str) -> Any:
+    return meta.get(key) if key in meta else None
+
+
+def _meta_optional_dict(meta: Dict[str, Any], key: str) -> Optional[dict]:
+    if key not in meta:
+        return None
+    v = meta.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise OrderFailed(f"meta.{key} must be dict when provided (STRICT)")
+    return v
+
+
+def _meta_optional_list(meta: Dict[str, Any], key: str) -> Optional[list]:
+    if key not in meta:
+        return None
+    v = meta.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise OrderFailed(f"meta.{key} must be list when provided (STRICT)")
+    return v
+
+
+def _meta_optional_str(meta: Dict[str, Any], key: str) -> Optional[str]:
+    if key not in meta:
+        return None
+    v = meta.get(key)
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        raise OrderFailed(f"meta.{key} must be non-empty when provided (STRICT)")
+    return s
+
+
+def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float, filled_entry_price: float) -> Dict[str, Any]:
+    """
+    record_trade_snapshot의 확장 필드(TRADE-GRADE) 입력을 meta에서 추출한다.
+    - 값이 '존재하면' STRICT 타입/범위 검증 후 전달
+    - 존재하지 않으면 None(미기록)
+    """
+    # Decision reconciliation
+    decision_id = _meta_optional_str(meta, "decision_id")
+    quant_decision_pre = _meta_optional_dict(meta, "quant_decision_pre")
+    quant_constraints = _meta_optional_dict(meta, "quant_constraints")
+    quant_final_decision = _meta_optional_str(meta, "quant_final_decision") or "ENTER"
+
+    gpt_severity = _meta_optional(meta, "gpt_severity")
+    if gpt_severity is not None:
+        gpt_severity = int(_as_float(gpt_severity, "meta.gpt_severity", min_value=0.0, max_value=3.0))
+    gpt_tags = _meta_optional_list(meta, "gpt_tags")
+    gpt_confidence_penalty = _meta_optional(meta, "gpt_confidence_penalty")
+    if gpt_confidence_penalty is not None:
+        gpt_confidence_penalty = _as_float(gpt_confidence_penalty, "meta.gpt_confidence_penalty", min_value=0.0, max_value=1.0)
+    gpt_suggested_risk_multiplier = _meta_optional(meta, "gpt_suggested_risk_multiplier")
+    if gpt_suggested_risk_multiplier is not None:
+        gpt_suggested_risk_multiplier = _as_float(
+            gpt_suggested_risk_multiplier, "meta.gpt_suggested_risk_multiplier", min_value=0.0, max_value=1.0
+        )
+    gpt_rationale_short = _meta_optional_str(meta, "gpt_rationale_short")
+
+    # Microstructure
+    micro_funding_rate = _meta_optional(meta, "micro_funding_rate")
+    if micro_funding_rate is not None:
+        micro_funding_rate = _as_float(micro_funding_rate, "meta.micro_funding_rate")
+    micro_funding_z = _meta_optional(meta, "micro_funding_z")
+    if micro_funding_z is not None:
+        micro_funding_z = _as_float(micro_funding_z, "meta.micro_funding_z")
+    micro_open_interest = _meta_optional(meta, "micro_open_interest")
+    if micro_open_interest is not None:
+        micro_open_interest = _as_float(micro_open_interest, "meta.micro_open_interest", min_value=0.0)
+    micro_oi_z = _meta_optional(meta, "micro_oi_z")
+    if micro_oi_z is not None:
+        micro_oi_z = _as_float(micro_oi_z, "meta.micro_oi_z")
+    micro_long_short_ratio = _meta_optional(meta, "micro_long_short_ratio")
+    if micro_long_short_ratio is not None:
+        micro_long_short_ratio = _as_float(micro_long_short_ratio, "meta.micro_long_short_ratio", min_value=0.0)
+    micro_lsr_z = _meta_optional(meta, "micro_lsr_z")
+    if micro_lsr_z is not None:
+        micro_lsr_z = _as_float(micro_lsr_z, "meta.micro_lsr_z")
+    micro_distortion_index = _meta_optional(meta, "micro_distortion_index")
+    if micro_distortion_index is not None:
+        micro_distortion_index = _as_float(micro_distortion_index, "meta.micro_distortion_index")
+    micro_score_risk = _meta_optional(meta, "micro_score_risk")
+    if micro_score_risk is not None:
+        micro_score_risk = _as_float(micro_score_risk, "meta.micro_score_risk", min_value=0.0, max_value=100.0)
+
+    # EV heatmap / auto block
+    ev_cell_key = _meta_optional_str(meta, "ev_cell_key")
+    ev_cell_ev = _meta_optional(meta, "ev_cell_ev")
+    if ev_cell_ev is not None:
+        ev_cell_ev = _as_float(ev_cell_ev, "meta.ev_cell_ev")
+    ev_cell_n = _meta_optional(meta, "ev_cell_n")
+    if ev_cell_n is not None:
+        ev_cell_n = int(_as_float(ev_cell_n, "meta.ev_cell_n", min_value=0.0))
+    ev_cell_status = _meta_optional_str(meta, "ev_cell_status")
+
+    auto_blocked = meta.get("auto_blocked") if "auto_blocked" in meta else None
+    if auto_blocked is not None:
+        auto_blocked = bool(auto_blocked)
+    auto_risk_multiplier = _meta_optional(meta, "auto_risk_multiplier")
+    if auto_risk_multiplier is not None:
+        auto_risk_multiplier = _as_float(auto_risk_multiplier, "meta.auto_risk_multiplier", min_value=0.0, max_value=1.0)
+    auto_block_reasons = _meta_optional_dict(meta, "auto_block_reasons")
+
+    # Execution quality: 즉시 저장 가능한 값만(대기 없이)
+    if entry_price_hint <= 0:
+        raise OrderFailed("entry_price_hint must be > 0 for exec snapshot (STRICT)")
+    slip_pct = abs(float(filled_entry_price) - float(entry_price_hint)) / float(entry_price_hint) * 100.0
+    if not math.isfinite(slip_pct) or slip_pct < 0.0:
+        raise OrderFailed(f"computed slippage_pct invalid (STRICT): {slip_pct}")
+
+    return {
+        "decision_id": decision_id,
+        "quant_decision_pre": quant_decision_pre,
+        "quant_constraints": quant_constraints,
+        "quant_final_decision": quant_final_decision,
+
+        "gpt_severity": gpt_severity,
+        "gpt_tags": gpt_tags,
+        "gpt_confidence_penalty": gpt_confidence_penalty,
+        "gpt_suggested_risk_multiplier": gpt_suggested_risk_multiplier,
+        "gpt_rationale_short": gpt_rationale_short,
+
+        "micro_funding_rate": micro_funding_rate,
+        "micro_funding_z": micro_funding_z,
+        "micro_open_interest": micro_open_interest,
+        "micro_oi_z": micro_oi_z,
+        "micro_long_short_ratio": micro_long_short_ratio,
+        "micro_lsr_z": micro_lsr_z,
+        "micro_distortion_index": micro_distortion_index,
+        "micro_score_risk": micro_score_risk,
+
+        "exec_expected_price": float(entry_price_hint),
+        "exec_filled_avg_price": float(filled_entry_price),
+        "exec_slippage_pct": float(slip_pct),
+        "exec_adverse_move_pct": None,
+        "exec_score": None,
+        "exec_post_prices": None,
+
+        "ev_cell_key": ev_cell_key,
+        "ev_cell_ev": ev_cell_ev,
+        "ev_cell_n": ev_cell_n,
+        "ev_cell_status": ev_cell_status,
+
+        "auto_blocked": auto_blocked,
+        "auto_risk_multiplier": auto_risk_multiplier,
+        "auto_block_reasons": auto_block_reasons,
+    }
+
+
 class ExecutionEngine:
     def __init__(self, settings: Any):
         self.settings = settings
@@ -388,7 +639,11 @@ class ExecutionEngine:
                 if abs(dyn_alloc - sig_alloc) > 1e-12:
                     raise OrderFailed(f"dynamic_allocation mismatch: meta={dyn_alloc} != signal={sig_alloc} (STRICT)")
 
-            manual_ok = check_manual_position_guard(get_balance_detail_func=get_balance_detail, symbol=symbol, latest_ts=float(signal_ts_ms))
+            manual_ok = check_manual_position_guard(
+                get_balance_detail_func=get_balance_detail,
+                symbol=symbol,
+                latest_ts=float(signal_ts_ms),
+            )
             if not manual_ok:
                 msg = f"[SKIP] manual_guard_blocked: {symbol}"
                 logger.warning(msg)
@@ -481,8 +736,8 @@ class ExecutionEngine:
 
             leverage = _as_float(getattr(self.settings, "leverage"), "settings.leverage", min_value=1.0)
             allocation_ratio = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
-            tp_pct = _as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0)
-            sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0)
+            tp_pct = _as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0, max_value=1.0)
+            sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0, max_value=1.0)
 
             if allocation_ratio <= 0:
                 raise OrderFailed("ENTER requires allocation_ratio(signal.risk_pct) > 0 (STRICT)")
@@ -540,7 +795,7 @@ class ExecutionEngine:
                 sl_pct=float(sl_pct),
                 risk_pct=float(allocation_ratio),
                 reason="entry_submit",
-                extra_json={"signal_source": signal_source, "gpt_reason": str(signal.reason)[:200]},
+                extra_json={"signal_source": signal_source, "reason": str(signal.reason)[:200]},
             )
 
             log_signal(
@@ -580,9 +835,9 @@ class ExecutionEngine:
 
             if TEST_DRY_RUN:
                 state = OrderState.FILLED
-                entry_price = float(entry_price_hint)
-                entry_qty = float(qty_raw)
-                entry_ts_dt = datetime.fromtimestamp(float(signal_ts_ms) / 1000.0, tz=timezone.utc)
+                entry_price_sim = float(entry_price_hint)
+                entry_qty_sim = float(qty_raw)
+                entry_ts_dt_sim = datetime.fromtimestamp(float(signal_ts_ms) / 1000.0, tz=timezone.utc)
 
                 log_event(
                     "on_entry_filled",
@@ -590,8 +845,8 @@ class ExecutionEngine:
                     regime=regime,
                     source="execution_engine",
                     side=direction,
-                    price=float(entry_price),
-                    qty=float(entry_qty),
+                    price=float(entry_price_sim),
+                    qty=float(entry_qty_sim),
                     leverage=float(leverage),
                     tp_pct=float(tp_pct),
                     sl_pct=float(sl_pct),
@@ -604,9 +859,9 @@ class ExecutionEngine:
                 trade_id = record_trade_open_returning_id(
                     symbol=symbol,
                     side=str(side_open),
-                    qty=float(entry_qty),
-                    entry_price=float(entry_price),
-                    entry_ts=entry_ts_dt,
+                    qty=float(entry_qty_sim),
+                    entry_price=float(entry_price_sim),
+                    entry_ts=entry_ts_dt_sim,
                     is_auto=True,
                     regime_at_entry=str(regime),
                     strategy=str(signal_source),
@@ -622,16 +877,18 @@ class ExecutionEngine:
                     tp_order_id=None,
                     sl_order_id=None,
                     exchange_position_side="BOTH",
-                    remaining_qty=float(entry_qty),
+                    remaining_qty=float(entry_qty_sim),
                     realized_pnl_usdt=0.0,
                     reconciliation_status="TEST_DRY_RUN",
-                    last_synced_at=entry_ts_dt,
+                    last_synced_at=entry_ts_dt_sim,
                 )
+
+                snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price_sim))
 
                 record_trade_snapshot(
                     trade_id=int(trade_id),
                     symbol=symbol,
-                    entry_ts=entry_ts_dt,
+                    entry_ts=entry_ts_dt_sim,
                     direction=str(direction),
                     signal_source=str(signal_source),
                     regime=str(regime),
@@ -651,13 +908,14 @@ class ExecutionEngine:
                     equity_current_usdt=float(eq_cur_usdt),
                     equity_peak_usdt=float(eq_peak_usdt),
                     dd_pct=float(dd_pct_v),
+                    **snap_kwargs,
                 )
 
                 closed_trade_id = close_latest_open_trade_returning_id(
                     symbol=symbol,
                     side=str(side_open),
-                    exit_price=float(entry_price),
-                    exit_ts=entry_ts_dt,
+                    exit_price=float(entry_price_sim),
+                    exit_ts=entry_ts_dt_sim,
                     pnl_usdt=0.0,
                     close_reason="TEST_DRY_RUN",
                     regime_at_exit=str(regime),
@@ -669,8 +927,8 @@ class ExecutionEngine:
                 record_trade_exit_snapshot(
                     trade_id=int(closed_trade_id),
                     symbol=symbol,
-                    close_ts=entry_ts_dt,
-                    close_price=float(entry_price),
+                    close_ts=entry_ts_dt_sim,
+                    close_price=float(entry_price_sim),
                     pnl=0.0,
                     close_reason="TEST_DRY_RUN",
                     exit_atr_pct=None,
@@ -754,7 +1012,7 @@ class ExecutionEngine:
                 risk_pct=float(allocation_ratio),
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
-                note=f"gpt_reason={str(signal.reason or '')[:180]}",
+                note=f"reason={str(signal.reason or '')[:180]}",
                 entry_order_id=str(entry_order_id),
                 tp_order_id=(str(tp_order_id) if tp_order_id is not None else None),
                 sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
@@ -769,6 +1027,8 @@ class ExecutionEngine:
                 setattr(trade, "id", int(trade_id))
             except Exception:
                 pass
+
+            snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price))
 
             record_trade_snapshot(
                 trade_id=int(trade_id),
@@ -793,6 +1053,18 @@ class ExecutionEngine:
                 equity_current_usdt=float(eq_cur_usdt),
                 equity_peak_usdt=float(eq_peak_usdt),
                 dd_pct=float(dd_pct_v),
+                **snap_kwargs,
+            )
+
+            # Execution Quality: 비동기 이벤트 기록(메인 execute 블로킹 금지)
+            _submit_task_nonblocking(
+                _exec_quality_task,
+                str(symbol),
+                str(direction),
+                str(regime),
+                float(entry_price_hint),
+                float(entry_price),
+                label="exec_quality",
             )
 
             _submit_tg_nonblocking(

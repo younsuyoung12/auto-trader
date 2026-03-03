@@ -5,45 +5,55 @@ from __future__ import annotations
 strategy/unified_features_builder.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
-설계 원칙:
-- WS 기반 market_features_ws + pattern_detection 결과를 결합해 GPT 입력 dict를 생성한다.
-- REST 백필/더미값/0 치환/None 반환 금지: 필수 데이터가 없거나 손상되면 즉시 실패한다.
-- 필수 타임프레임: 1m / 5m / 15m / 1h / 4h (없으면 즉시 실패).
-- 각 타임프레임은 필수 raw OHLCV + indicators dict 를 반드시 포함해야 한다.
+역할
+- WS 기반 market_features_ws 결과 + pattern_detection 결과 + 오더북(depth5)을 결합해
+  "통합 피처(unified_features)"를 생성한다.
+- 이 출력은 GPT(감사/해설) 입력 및 Quant Engine(결정권자) 로그/스냅샷 용도로 사용한다.
+  (본 파일은 매매 결정을 하지 않는다.)
+
+절대 원칙 (STRICT · NO-FALLBACK)
+- REST 백필/더미값/0 치환/None 묵살/조용한 continue 금지.
+- 필수 데이터가 없거나 손상/모호하면 즉시 예외로 실패한다.
+- 필수 타임프레임: 1m / 5m / 15m / 1h / 4h (없으면 즉시 실패)
+- 각 TF는 필수 raw OHLCV + indicators dict 를 반드시 포함해야 한다.
 - 오더북은 WS depth5 스냅샷(bids/asks)을 포함하며, 비어 있으면 즉시 실패한다.
 - pattern_features/summary 는 화이트리스트 기반 compact 형태로 축소(토큰 최적화).
-- engine_scores(0~100)는 엔진 1차 정량 점수이며, 최종 해석/결정은 GPT가 수행한다.
+- microstructure(Funding/OI/LSR/DI)는 거래소 REST 기반으로 수집하며 누락/비정상은 즉시 실패한다.
 
-========================================================
 입력 계약(중요)
 - market_features_ws.timeframes[1m|5m|15m].raw_ohlcv_last20:
-  (ts_ms, open, high, low, close, volume) 형태의 list/tuple 이어야 한다. dict 금지.
+  (ts_ms, open, high, low, close, volume) 형태의 sequence(list/tuple) 이어야 한다. dict 금지.
+- market_features_ws.timeframes[1h|4h].raw_ohlcv_last60:
+  (ts_ms, open, high, low, close, volume) 형태의 sequence(list/tuple) 이어야 한다. dict 금지.
 - market_features_ws.timeframes[*].indicators:
-  engine_scores 계산에 필요한 scalar(rsi/ema_fast/ema_slow/atr_pct/macd_hist 등)를 포함해야 한다.
+  엔진 점수 계산에 필요한 scalar(rsi/ema_fast/ema_slow/atr_pct/macd_hist 등)를 포함해야 한다.
 
-========================================================
-PATCH NOTES — 2026-03-02
-- FIX(STRICT): atr_pct / range_pct 스케일 정규화 규칙 추가
-  - 일부 upstream이 atr_pct, range_pct를 "비율(0~1)"로 제공함을 확인.
-  - 본 파일의 점수식은 "%(0~100)" 전제를 사용하므로,
-    아래 규칙으로 STRICT 정규화한다(폴백/추정 아님, 명시 규칙):
-    * 0.0 <= v <= 1.0  → v * 100.0 (ratio → percent)
-    * 1.0 < v <= 100.0 → 그대로 사용 (already percent)
-    * 그 외 범위       → 즉시 실패
-- 적용 대상:
-  - _score_momentum_1h: indicators.atr_pct
-  - _score_timing_5m:   indicators.atr_pct
-  - _score_structure_15m: tf15m.range_pct
-
-- TUNING(TRADE-GRADE): engine_scores.total 가중치 재조정
-  - 문제: trend_4h 가중치가 높으면(0.30) 대부분 구간에서 total이 NO_TRADE로 고정됨
-  - 해결: orderbook_micro 비중을 올리고(0.25), trend_4h 비중을 낮춤(0.15)
-  - 의도: 4h 추세가 약해도 5m/15m/오더북 기반 기회 포착을 허용
+변경 이력
+--------------------------------------------------------
+- 2026-03-03:
+  1) STRICT 강화: silent 예외 삼키기 제거(텔레그램 전송 포함)
+  2) STRICT 강화: 암묵적 기본값(or "", or "NONE") 제거 및 필수 키/형식 강제
+  3) STRICT 강화: symbol 결정 로직에서 빈 문자열/누락을 즉시 실패로 처리
+  4) TRADE-GRADE: microstructure(Funding/OI/LSR/Distortion Index) 스냅샷 생성/결합 추가(STRICT)
+- 2026-03-02:
+  1) FIX(STRICT): atr_pct / range_pct 스케일 정규화 규칙 추가
+     - 일부 upstream이 atr_pct, range_pct를 "비율(0~1)"로 제공함을 확인.
+     - 본 파일의 점수식은 "%(0~100)" 전제를 사용하므로,
+       아래 규칙으로 STRICT 정규화한다(폴백/추정 아님, 명시 규칙):
+       * 0.0 <= v <= 1.0  → v * 100.0 (ratio → percent)
+       * 1.0 < v <= 100.0 → 그대로 사용 (already percent)
+       * 그 외 범위       → 즉시 실패
+     - 적용 대상:
+       * _score_momentum_1h: indicators.atr_pct
+       * _score_timing_5m:   indicators.atr_pct
+       * _score_structure_15m: tf15m.range_pct
+  2) TUNING(TRADE-GRADE): engine_scores.total 가중치 재조정
+     - trend_4h 비중 ↓(0.15), orderbook_micro 비중 ↑(0.25)
 ========================================================
 """
 
 import math
-from typing import Any, Dict, List, NoReturn, Optional, Tuple
+from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
 
 from settings import load_settings
 
@@ -55,6 +65,7 @@ except Exception as e:  # pragma: no cover
 from infra.market_data_ws import get_orderbook
 from infra.market_features_ws import FeatureBuildError, build_entry_features_ws
 from strategy.pattern_detection import PatternError, build_pattern_features
+from strategy.microstructure_engine import MicrostructureError, build_microstructure_snapshot
 
 SET = load_settings()
 
@@ -63,6 +74,11 @@ PATTERN_TFS: Tuple[str, ...] = ("1m", "5m", "15m")
 
 MAX_PATTERNS_PER_TF: int = 4
 MAX_SUMMARY_PATTERNS: int = 10
+
+# Microstructure config defaults (deterministic project defaults; not data fallback)
+_MICRO_PERIOD_DEFAULT: str = "5m"
+_MICRO_LOOKBACK_DEFAULT: int = 30
+_MICRO_CACHE_TTL_SEC_DEFAULT: int = 15
 
 _PATTERN_ITEM_KEYS: Tuple[str, ...] = (
     "pattern",
@@ -100,20 +116,25 @@ _INDICATOR_KEEP_KEYS: Tuple[str, ...] = (
 
 
 class UnifiedFeaturesError(RuntimeError):
-    """마켓 피처 + 패턴 피처 + 엔진 점수 통합 단계에서 사용하는 예외."""
+    """마켓 피처 + 패턴 피처 + 엔진 점수 + 마이크로구조 통합 단계에서 사용하는 예외."""
 
 
-def _safe_tg(msg: str) -> None:
+def _notify_tg_best_effort(symbol: str, msg: str) -> None:
+    """
+    텔레그램은 '부가 채널'이다.
+    거래 판단/피처 생성은 텔레그램 장애로 중단시키지 않는다.
+    단, 조용히 삼키지 않고 로그는 남긴다.
+    """
     try:
         send_tg(msg)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[UNIFIED-FEAT][{symbol}] telegram notify failed (non-fatal): {e!r}")
 
 
 def _fail_unified(symbol: str, stage: str, reason: str, exc: Optional[BaseException] = None) -> NoReturn:
     msg = f"[UNIFIED-FEAT][{symbol}] {stage} 실패: {reason}"
     log(msg)
-    _safe_tg(msg)
+    _notify_tg_best_effort(symbol, msg)
     if exc is None:
         raise UnifiedFeaturesError(msg)
     raise UnifiedFeaturesError(msg) from exc
@@ -128,8 +149,10 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def _require_nonempty_str(symbol: str, stage: str, v: Any, name: str) -> str:
-    s = str(v or "").strip()
-    if not s:
+    if v is None:
+        _fail_unified(symbol, stage, f"{name} is required (None)")
+    s = str(v).strip()
+    if s == "":
         _fail_unified(symbol, stage, f"{name} is required (empty)")
     return s
 
@@ -142,9 +165,9 @@ def _require_dict(symbol: str, stage: str, v: Any, name: str) -> Dict[str, Any]:
     return v
 
 
-def _require_list(symbol: str, stage: str, v: Any, name: str, min_len: int) -> List[Any]:
-    if not isinstance(v, list):
-        _fail_unified(symbol, stage, f"{name} must be list (got={type(v)})")
+def _require_sequence(symbol: str, stage: str, v: Any, name: str, min_len: int) -> Sequence[Any]:
+    if not isinstance(v, (list, tuple)):
+        _fail_unified(symbol, stage, f"{name} must be sequence(list/tuple) (got={type(v)})")
     if len(v) < min_len:
         _fail_unified(symbol, stage, f"{name} length<{min_len} (got={len(v)})")
     return v
@@ -192,7 +215,7 @@ def _parse_ohlcv_rows(
     min_len: int,
     name: str,
 ) -> List[Tuple[int, float, float, float, float, float]]:
-    raw = _require_list(symbol, stage, rows, name, min_len=min_len)
+    raw = _require_sequence(symbol, stage, rows, name, min_len=min_len)
     out: List[Tuple[int, float, float, float, float, float]] = []
 
     sliced = raw[-min_len:]
@@ -245,21 +268,24 @@ def _ensure_timeframe_payloads_strict(symbol: str, timeframes: Dict[str, Any]) -
         if tf in ("1m", "5m", "15m"):
             raw20 = tf_data.get("raw_ohlcv_last20")
             _parse_ohlcv_rows(symbol, stage, raw20, min_len=20, name=f"{tf}.raw_ohlcv_last20")
-        elif tf in ("1h", "4h"):
-            raw60 = tf_data.get("raw_ohlcv_last60")
-            if raw60 is None:
-                candles = tf_data.get("candles")
-                parsed = _parse_ohlcv_rows(symbol, stage, candles, min_len=60, name=f"{tf}.candles")
-                tf_data["raw_ohlcv_last60"] = [[ts, o, h, l, c, v] for (ts, o, h, l, c, v) in parsed]
-            else:
-                _parse_ohlcv_rows(symbol, stage, raw60, min_len=60, name=f"{tf}.raw_ohlcv_last60")
+            continue
+
+        raw60 = tf_data.get("raw_ohlcv_last60")
+        if raw60 is None:
+            candles = tf_data.get("candles")
+            if candles is None:
+                _fail_unified(symbol, stage, "raw_ohlcv_last60 missing and candles missing (STRICT)")
+            parsed = _parse_ohlcv_rows(symbol, stage, candles, min_len=60, name=f"{tf}.candles")
+            tf_data["raw_ohlcv_last60"] = [[ts, o, h, l, c, v] for (ts, o, h, l, c, v) in parsed]
+        else:
+            _parse_ohlcv_rows(symbol, stage, raw60, min_len=60, name=f"{tf}.raw_ohlcv_last60")
 
 
 def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     stage = "orderbook"
     ob = get_orderbook(symbol, limit=limit)
     if not isinstance(ob, dict) or not ob:
-        _fail_unified(symbol, stage, "WS orderbook snapshot missing (get_orderbook returned None/empty)")
+        _fail_unified(symbol, stage, "WS orderbook snapshot missing/invalid")
 
     bids = ob.get("bids")
     asks = ob.get("asks")
@@ -347,10 +373,16 @@ def _compact_pattern_item(symbol: str, stage: str, p: Dict[str, Any], timeframe:
     for key in _PATTERN_ITEM_KEYS:
         if key in p:
             item[key] = p[key]
+
     item["timeframe"] = timeframe
+    item["pattern"] = _require_nonempty_str(symbol, stage, item.get("pattern"), "pattern.pattern")
+    item["direction"] = _require_nonempty_str(symbol, stage, item.get("direction"), "pattern.direction")
+    item["confidence"] = _require_nonempty_str(symbol, stage, item.get("confidence"), "pattern.confidence")
+
     if "strength" not in item:
         _fail_unified(symbol, stage, f"pattern item missing strength (timeframe={timeframe})")
     item["strength"] = _require_float(symbol, stage, item["strength"], "pattern.strength")
+
     return item
 
 
@@ -365,8 +397,8 @@ def _build_pattern_bundle_strict(
     best_strength = -1.0
     best_pattern_name = "NONE"
     best_pattern_direction = "NONE"
-    best_pattern_confidence = "none"
-    best_pattern_timeframe = "None"
+    best_pattern_confidence = "NONE"
+    best_pattern_timeframe = "NONE"
 
     global_pattern_score = 0.0
     global_reversal = 0.0
@@ -433,12 +465,12 @@ def _build_pattern_bundle_strict(
             strength = float(item["strength"])
             if strength > best_strength:
                 best_strength = strength
-                best_pattern_name = str(item.get("pattern") or "NONE")
-                best_pattern_direction = str(item.get("direction") or "NONE")
-                best_pattern_confidence = str(item.get("confidence") or "none")
+                best_pattern_name = item["pattern"]
+                best_pattern_direction = item["direction"]
+                best_pattern_confidence = item["confidence"]
                 best_pattern_timeframe = tf
 
-        compact_patterns.sort(key=lambda x: float(x.get("strength", 0.0)), reverse=True)
+        compact_patterns.sort(key=lambda x: float(x["strength"]), reverse=True)
         if MAX_PATTERNS_PER_TF > 0:
             compact_patterns = compact_patterns[:MAX_PATTERNS_PER_TF]
 
@@ -467,7 +499,7 @@ def _build_pattern_bundle_strict(
         has_bullish_pattern = max(has_bullish_pattern, has_bull)
         has_bearish_pattern = max(has_bearish_pattern, has_bear)
 
-    all_patterns.sort(key=lambda x: float(x.get("strength", 0.0)), reverse=True)
+    all_patterns.sort(key=lambda x: float(x["strength"]), reverse=True)
     if MAX_SUMMARY_PATTERNS > 0:
         all_patterns = all_patterns[:MAX_SUMMARY_PATTERNS]
 
@@ -498,7 +530,7 @@ def _atr_pct_change_from_ohlcv(
     period: int = 14,
 ) -> float:
     if len(ohlcv) < (period * 2 + 1):
-        _fail_unified(symbol, stage, f"need >= {period*2+1} candles for ATR change (got={len(ohlcv)})")
+        _fail_unified(symbol, stage, f"need >= {period * 2 + 1} candles for ATR change (got={len(ohlcv)})")
 
     highs = [x[2] for x in ohlcv]
     lows = [x[3] for x in ohlcv]
@@ -791,7 +823,9 @@ def _score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, 
     imbalance_qty_pct = _require_float(symbol, stage, orderbook.get("imbalance_qty_pct"), "orderbook.imbalance_qty_pct")
     depth_imbalance = _require_float(symbol, stage, orderbook.get("depth_imbalance"), "orderbook.depth_imbalance")
 
-    spread_score = 0.0
+    if spread_pct < 0:
+        _fail_unified(symbol, stage, f"invalid spread_pct (<0): {spread_pct}")
+
     if spread_pct <= 0.02:
         spread_score = 40.0
     elif spread_pct <= 0.05:
@@ -889,26 +923,21 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
         tf_data = _require_dict(symbol, stage, timeframes.get(tf), f"timeframes['{tf}']")
 
         tf_out: Dict[str, Any] = {}
-
         for k, v in tf_data.items():
-            if k in ("candles",):
+            if k == "candles":
                 continue
             if k.startswith("debug") or k.endswith("_series"):
                 continue
             if k == "indicators":
                 continue
-
             if k == "raw_ohlcv_last20" and tf not in ("1m", "5m", "15m"):
                 continue
             if k == "raw_ohlcv_last60" and tf not in ("1h", "4h"):
                 continue
-
             if isinstance(v, list) and len(v) > 200 and k not in ("raw_ohlcv_last20", "raw_ohlcv_last60"):
                 continue
-
             if v is None:
                 continue
-
             tf_out[k] = v
 
         indicators = _require_dict(symbol, stage, tf_data.get("indicators"), f"{tf}.indicators")
@@ -918,7 +947,7 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
             raw20 = tf_data.get("raw_ohlcv_last20")
             parsed20 = _parse_ohlcv_rows(symbol, stage, raw20, min_len=20, name=f"{tf}.raw_ohlcv_last20")
             tf_out["raw_ohlcv_last20"] = [[ts, o, h, l, c, v] for (ts, o, h, l, c, v) in parsed20]
-        elif tf in ("1h", "4h"):
+        else:
             raw60 = tf_data.get("raw_ohlcv_last60")
             parsed60 = _parse_ohlcv_rows(symbol, stage, raw60, min_len=60, name=f"{tf}.raw_ohlcv_last60")
             tf_out["raw_ohlcv_last60"] = [[ts, o, h, l, c, v] for (ts, o, h, l, c, v) in parsed60]
@@ -928,10 +957,41 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
     return out
 
 
+def _load_microstructure_config(symbol: str) -> Tuple[str, int, int]:
+    # Deterministic defaults for new subsystem (microstructure). Not a data fallback.
+    period = str(getattr(SET, "microstructure_period", _MICRO_PERIOD_DEFAULT)).strip()
+    if not period:
+        _fail_unified(symbol, "microstructure.config", "microstructure_period is empty")
+
+    lookback_raw = getattr(SET, "microstructure_lookback", _MICRO_LOOKBACK_DEFAULT)
+    ttl_raw = getattr(SET, "microstructure_cache_ttl_sec", _MICRO_CACHE_TTL_SEC_DEFAULT)
+
+    try:
+        lookback = int(lookback_raw)
+    except Exception as e:
+        _fail_unified(symbol, "microstructure.config", f"microstructure_lookback must be int (got={lookback_raw!r})", e)
+    if lookback < 2 or lookback > 500:
+        _fail_unified(symbol, "microstructure.config", f"microstructure_lookback out of range [2,500] (got={lookback})")
+
+    try:
+        ttl = int(ttl_raw)
+    except Exception as e:
+        _fail_unified(symbol, "microstructure.config", f"microstructure_cache_ttl_sec must be int (got={ttl_raw!r})", e)
+    if ttl <= 0 or ttl > 300:
+        _fail_unified(symbol, "microstructure.config", f"microstructure_cache_ttl_sec out of range [1,300] (got={ttl})")
+
+    return period, lookback, ttl
+
+
 def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
-    sym = str(symbol or getattr(SET, "symbol", "")).strip()
-    if not sym:
-        _fail_unified("UNKNOWN", "symbol", "symbol is empty (provide symbol or set settings.symbol)")
+    if symbol is None:
+        try:
+            sym_raw = getattr(SET, "symbol")
+        except AttributeError as e:
+            _fail_unified("UNKNOWN", "symbol", "settings.symbol missing (STRICT)", e)
+        sym = _require_nonempty_str("UNKNOWN", "symbol", sym_raw, "settings.symbol")
+    else:
+        sym = _require_nonempty_str("UNKNOWN", "symbol", symbol, "symbol")
 
     try:
         base = build_entry_features_ws(sym)
@@ -955,6 +1015,20 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
 
     engine_scores = _build_engine_scores_strict(sym, timeframes, pattern_features, pattern_summary, orderbook)
 
+    # Microstructure (STRICT: required)
+    micro_period, micro_lookback, micro_ttl = _load_microstructure_config(sym)
+    try:
+        microstructure = build_microstructure_snapshot(
+            sym,
+            period=micro_period,
+            lookback=micro_lookback,
+            cache_ttl_sec=micro_ttl,
+        )
+    except MicrostructureError as e:
+        _fail_unified(sym, "microstructure", f"MicrostructureError: {e}", e)
+    except Exception as e:
+        _fail_unified(sym, "microstructure", f"unexpected error: {e!r}", e)
+
     compact_timeframes = _compact_timeframes_for_output(sym, timeframes)
 
     result: Dict[str, Any] = dict(base)
@@ -963,6 +1037,7 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     result["pattern_features"] = pattern_features
     result["pattern_summary"] = pattern_summary
     result["engine_scores"] = engine_scores
+    result["microstructure"] = microstructure
 
     return result
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 ========================================================
 FILE: state/db_models.py
@@ -11,6 +13,23 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - import 시점에 스키마 생성/변경을 수행하지 않는다.
 - 레거시 호환: 일부 모듈이 `Trade` ORM 심벌을 기대하므로 `Trade = TradeORM` alias를 제공한다.
 - 폴백 금지: 누락/불일치/모호성은 추정으로 메우지 않는다(즉시 예외/중단).
+
+PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+--------------------------------------------------------
+- bt_trade_snapshots(TradeSnapshot) 분석형 필드 확장(운영/감사/재현 목적):
+  - Decision Reconciliation:
+    * decision_id
+    * quant_decision_pre (JSONB)
+    * quant_constraints (JSONB)
+    * quant_final_decision
+    * gpt_severity, gpt_tags, gpt_confidence_penalty, gpt_suggested_risk_multiplier, gpt_rationale_short
+  - Microstructure:
+    * micro_* (funding/oi/lsr/z/DI/micro_score_risk)
+  - Execution Quality:
+    * exec_* (expected/filled/slippage/adverse/score/post_prices)
+  - EV Heatmap / AutoBlock:
+    * ev_cell_* / auto_block_* (차단/감쇠 근거 재현)
+  - decision_id UNIQUE 인덱스 추가(다중 NULL 허용, Postgres 특성)
 
 PATCH NOTES — 2026-03-03 (PATCH)
 --------------------------------------------------------
@@ -30,8 +49,6 @@ PATCH NOTES — 2026-03-02
 - 기존 설계 원칙/STRICT 정책 유지 (폴백/추정 금지)
 ========================================================
 """
-
-from __future__ import annotations
 
 from datetime import datetime, timezone
 
@@ -247,11 +264,11 @@ class TradeORM(Base):
     tp_order_id = Column(String(64), nullable=True)
     sl_order_id = Column(String(64), nullable=True)
 
-    exchange_position_side = Column(String(16), nullable=True)  # e.g. BOTH / LONG / SHORT (거래소 정책에 따름)
+    exchange_position_side = Column(String(16), nullable=True)  # BOTH/LONG/SHORT
     remaining_qty = Column(Numeric(24, 8), nullable=True)
     realized_pnl_usdt = Column(Numeric(24, 8), nullable=True)
 
-    reconciliation_status = Column(String(32), nullable=True)  # e.g. OK / MISMATCH / RECOVERED / ERROR
+    reconciliation_status = Column(String(32), nullable=True)  # OK / MISMATCH / RECOVERED / ERROR
     last_synced_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -263,7 +280,7 @@ Trade = TradeORM
 
 
 # ─────────────────────────────────────────────
-# bt_trade_snapshots (진입 스냅샷) - 우리가 생성한 테이블
+# bt_trade_snapshots (진입 스냅샷)
 # ─────────────────────────────────────────────
 class TradeSnapshot(Base):
     __tablename__ = "bt_trade_snapshots"
@@ -301,20 +318,72 @@ class TradeSnapshot(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     # ─────────────────────────────────────────
-    # Equity / DD (DB 스키마 정합)
+    # Equity / DD (정합)
     # ─────────────────────────────────────────
     equity_current_usdt = Column(Float, nullable=True)
     equity_peak_usdt = Column(Float, nullable=True)
     dd_pct = Column(Float, nullable=True)
 
+    # ─────────────────────────────────────────
+    # Decision Reconciliation (TRADE-GRADE)
+    # ─────────────────────────────────────────
+    decision_id = Column(String(64), nullable=True, index=True)
+    quant_decision_pre = Column(JSONB, nullable=True)
+    quant_constraints = Column(JSONB, nullable=True)
+    quant_final_decision = Column(String(16), nullable=True)
+
+    gpt_severity = Column(Integer, nullable=True)
+    gpt_tags = Column(JSONB, nullable=True)
+    gpt_confidence_penalty = Column(Float, nullable=True)
+    gpt_suggested_risk_multiplier = Column(Float, nullable=True)
+    gpt_rationale_short = Column(Text, nullable=True)
+
+    # ─────────────────────────────────────────
+    # Microstructure (TRADE-GRADE)
+    # ─────────────────────────────────────────
+    micro_funding_rate = Column(Float, nullable=True)
+    micro_funding_z = Column(Float, nullable=True)
+
+    micro_open_interest = Column(Float, nullable=True)
+    micro_oi_z = Column(Float, nullable=True)
+
+    micro_long_short_ratio = Column(Float, nullable=True)
+    micro_lsr_z = Column(Float, nullable=True)
+
+    micro_distortion_index = Column(Float, nullable=True)
+    micro_score_risk = Column(Float, nullable=True)
+
+    # ─────────────────────────────────────────
+    # Execution Quality (TRADE-GRADE)
+    # ─────────────────────────────────────────
+    exec_expected_price = Column(Float, nullable=True)
+    exec_filled_avg_price = Column(Float, nullable=True)
+    exec_slippage_pct = Column(Float, nullable=True)
+    exec_adverse_move_pct = Column(Float, nullable=True)
+    exec_score = Column(Float, nullable=True)
+    exec_post_prices = Column(JSONB, nullable=True)
+
+    # ─────────────────────────────────────────
+    # EV Heatmap / AutoBlock (TRADE-GRADE)
+    # ─────────────────────────────────────────
+    ev_cell_key = Column(String(96), nullable=True)
+    ev_cell_ev = Column(Float, nullable=True)
+    ev_cell_n = Column(Integer, nullable=True)
+    ev_cell_status = Column(String(16), nullable=True)
+
+    auto_blocked = Column(Boolean, nullable=True)
+    auto_risk_multiplier = Column(Float, nullable=True)
+    auto_block_reasons = Column(JSONB, nullable=True)
+
     __table_args__ = (
         Index("ux_bt_trade_snapshots_tradeid", "trade_id", unique=True),
+        Index("ux_bt_trade_snapshots_decision_id", "decision_id", unique=True),
         Index("ix_bt_trade_snapshots_symbol_entryts", "symbol", "entry_ts"),
     )
 
 
 # ─────────────────────────────────────────────
-# bt_trade_exit_snapshots (청산 스냅샷) - 우리가 생성한 테이블
+# bt_trade_exit_snapshots (청산 스냅샷)
 # ─────────────────────────────────────────────
 class TradeExitSnapshot(Base):
     __tablename__ = "bt_trade_exit_snapshots"

@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 """
 ========================================================
-strategy/regime_engine.py
+FILE: strategy/regime_engine.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 역할
@@ -31,25 +33,37 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
   - >= 65       -> allocation=1.0 (전액)
 - 퍼센타일 기반 배분은 "옵션"이며, 히스토리 준비가 필수다.
 
+추가 정책 — Microstructure Penalty (TRADE-GRADE)
+--------------------------------------------------------
+- Microstructure(왜곡/과열) 위험도는 micro_score_risk(0~100)로 입력받아
+  allocation에 곱셈 페널티로 반영한다.
+- 본 모듈은 micro_score_risk를 "결정"하지 않으며 caller가 제공해야 한다.
+- 페널티는 명시 정책이며 폴백/클램프가 아니다.
+
+  micro_score_risk < 40   -> multiplier = 1.0
+  40 <= < 60              -> multiplier = 0.8
+  60 <= < 80              -> multiplier = 0.5
+  >= 80                   -> multiplier = 0.0 (진입 금지급 과열)
+
 PATCH NOTES
 --------------------------------------------------------
+- 2026-03-03
+  - TRADE-GRADE: micro_score_risk 기반 allocation 페널티 반영 API 추가(STRICT)
+    * decide_with_microstructure(...)
+    * decide_with_percentile_and_microstructure(...)
 - 2026-03-02
   - RegimeEngine 도입(rolling window + 절대 기준 allocation).
   - 퍼센타일/스냅샷 API 제공(히스토리 준비 강제).
 - 2026-03-02 (Trade-grade tuning)
   - 절대 기준을 65/75/85 → 35/50/65로 조정.
-    이유: 엔진 total score의 실측 분포(20~40대 다수)에서
-    NO_TRADE 고착을 방지하고, 전액 배분은 >=65에서만 허용.
 ========================================================
 """
 
-from __future__ import annotations
-
 import math
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Optional, Tuple
-from collections import deque
 
 
 # ─────────────────────────────────────────────
@@ -67,6 +81,10 @@ class RegimeNotReadyError(RegimeEngineError):
     """Raised when history-dependent operation is requested before readiness."""
 
 
+class MicrostructureScoreError(RegimeEngineError):
+    """Invalid microstructure score input."""
+
+
 # ─────────────────────────────────────────────
 # Data structures
 # ─────────────────────────────────────────────
@@ -78,6 +96,10 @@ class RegimeDecision:
     history_len: int
     window_size: int
     percentile: Optional[float] = None  # only when explicitly computed
+
+    # TRADE-GRADE: microstructure overlay (optional)
+    micro_score_risk: Optional[float] = None
+    micro_multiplier: Optional[float] = None
 
 
 # ─────────────────────────────────────────────
@@ -106,6 +128,29 @@ def _as_score(value: object, *, name: str = "regime_score") -> float:
     return v
 
 
+def _as_micro_score(value: object, *, name: str = "micro_score_risk") -> float:
+    """
+    STRICT:
+    - bool 금지
+    - finite 숫자만 허용
+    - 0~100 범위 강제(클램프 금지)
+    """
+    if isinstance(value, bool):
+        raise MicrostructureScoreError(f"{name} must be numeric (bool not allowed)")
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except Exception as e:
+        raise MicrostructureScoreError(f"{name} must be a number") from e
+
+    if not math.isfinite(v):
+        raise MicrostructureScoreError(f"{name} must be finite")
+
+    if v < 0.0 or v > 100.0:
+        raise MicrostructureScoreError(f"{name} out of range [0,100]: {v}")
+
+    return v
+
+
 def _band_and_allocation_by_absolute_threshold(score: float) -> Tuple[str, float]:
     """
     확정 정책(절대 기준) — Trade-grade tuning:
@@ -123,6 +168,19 @@ def _band_and_allocation_by_absolute_threshold(score: float) -> Tuple[str, float
     return "HIGH", 1.0
 
 
+def _micro_multiplier(micro_score_risk: float) -> float:
+    """
+    확정 정책(명시 룰): micro_score_risk(0~100) -> allocation multiplier.
+    """
+    if micro_score_risk < 40.0:
+        return 1.0
+    if micro_score_risk < 60.0:
+        return 0.8
+    if micro_score_risk < 80.0:
+        return 0.5
+    return 0.0
+
+
 # ─────────────────────────────────────────────
 # Regime Engine
 # ─────────────────────────────────────────────
@@ -133,7 +191,8 @@ class RegimeEngine:
     사용법(권장):
     1) 매 루프마다 update(score)로 히스토리를 축적한다. (신호 유무와 무관)
     2) decide(score)로 절대 기준 allocation을 즉시 얻는다. (히스토리 불필요)
-    3) 퍼센타일 기반 판단이 필요하면:
+    3) microstructure를 반영하려면 decide_with_microstructure(score, micro_score_risk)
+    4) 퍼센타일 기반 판단이 필요하면:
        - is_ready_for_percentile() 확인 후
        - percentile(score) 호출
     """
@@ -208,6 +267,42 @@ class RegimeEngine:
             history_len=hlen,
             window_size=self._window_size,
             percentile=None,
+            micro_score_risk=None,
+            micro_multiplier=None,
+        )
+
+    # ── microstructure overlay (TRADE-GRADE) ────
+    def decide_with_microstructure(self, score: object, *, micro_score_risk: object) -> RegimeDecision:
+        """
+        절대 기준 decision + microstructure penalty 적용.
+
+        STRICT:
+        - score, micro_score_risk 모두 0~100 범위 강제(클램프 금지)
+        - multiplier는 명시 룰로만 산출
+        """
+        base = self.decide(score)
+        ms = _as_micro_score(micro_score_risk, name="micro_score_risk")
+        mul = _micro_multiplier(ms)
+
+        # allocation은 정책에 의해 곱셈 적용(클램프 아님)
+        alloc = float(base.allocation) * float(mul)
+
+        # band는 "의미 보존"을 위해 suffix만 추가(정책적 표기)
+        band = base.band
+        if mul == 0.0:
+            band = f"{band}|MICRO_BLOCK"
+        elif mul < 1.0:
+            band = f"{band}|MICRO_PENALTY"
+
+        return RegimeDecision(
+            score=base.score,
+            allocation=alloc,
+            band=band,
+            history_len=base.history_len,
+            window_size=base.window_size,
+            percentile=None,
+            micro_score_risk=float(ms),
+            micro_multiplier=float(mul),
         )
 
     # ── percentile (optional) ───────────────────
@@ -264,4 +359,37 @@ class RegimeEngine:
             history_len=d.history_len,
             window_size=d.window_size,
             percentile=p,
+            micro_score_risk=None,
+            micro_multiplier=None,
         )
+
+    def decide_with_percentile_and_microstructure(self, score: object, *, micro_score_risk: object) -> RegimeDecision:
+        """
+        절대 기준 decision + percentile + microstructure penalty.
+
+        STRICT:
+        - percentile 준비 안 됐으면 예외
+        - micro_score_risk 유효성 강제
+        """
+        d = self.decide_with_microstructure(score, micro_score_risk=micro_score_risk)
+        p = self.percentile(d.score)
+        return RegimeDecision(
+            score=d.score,
+            allocation=d.allocation,
+            band=d.band,
+            history_len=d.history_len,
+            window_size=d.window_size,
+            percentile=p,
+            micro_score_risk=d.micro_score_risk,
+            micro_multiplier=d.micro_multiplier,
+        )
+
+
+__all__ = [
+    "RegimeEngineError",
+    "RegimeScoreError",
+    "RegimeNotReadyError",
+    "MicrostructureScoreError",
+    "RegimeDecision",
+    "RegimeEngine",
+]

@@ -170,6 +170,7 @@ def check_manual_position_guard(
             event="on_risk_guard_trigger",
             symbol=symbol,
             strategy_type="UNKNOWN",
+            direction="CLOSE",  # ✅ 추가
             reason="manual_position_detected",
             candle_ts=ts_int,
             extra=(

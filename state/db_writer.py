@@ -33,6 +33,17 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
   - STRICT:
     - 위 필드가 전달되면 반드시 타입/길이/유효성 검증 후 저장
     - 빈 문자열/NaN/inf/tz-naive datetime 허용 금지
+
+- 2026-03-03 (TRADE-GRADE)
+  - bt_trade_snapshots 분석형 필드(Decision/Micro/Exec/EV/AutoBlock) 저장 지원:
+    * decision_id / quant_decision_pre / quant_constraints / quant_final_decision
+    * gpt_severity / gpt_tags / gpt_confidence_penalty / gpt_suggested_risk_multiplier / gpt_rationale_short
+    * micro_* (funding/oi/lsr/z/DI/micro_score_risk)
+    * exec_* (expected/filled/slippage/adverse/score/post_prices)
+    * ev_cell_* / auto_block_* (차단/감쇠 근거)
+  - STRICT:
+    - 값이 전달되면 타입/범위/JSON 형태 검증 후 저장
+    - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
 ========================================================
 """
 
@@ -45,13 +56,7 @@ from typing import Any, Optional
 from sqlalchemy import desc
 
 from state.db_core import get_session
-from state.db_models import (
-    ExternalEvent,
-    FundingRate,
-    TradeExitSnapshot,
-    TradeORM,
-    TradeSnapshot,
-)
+from state.db_models import ExternalEvent, FundingRate, TradeExitSnapshot, TradeORM, TradeSnapshot
 
 
 def _utc_now() -> datetime:
@@ -59,7 +64,9 @@ def _utc_now() -> datetime:
 
 
 def _require_nonempty_str(v: Any, name: str) -> str:
-    s = str(v or "").strip()
+    if v is None:
+        raise ValueError(f"{name} is required")
+    s = str(v).strip()
     if not s:
         raise ValueError(f"{name} is required")
     return s
@@ -76,6 +83,8 @@ def _require_tzaware_dt(v: Any, name: str) -> datetime:
 def _require_number(v: Any, name: str) -> float:
     if v is None:
         raise ValueError(f"{name} is required")
+    if isinstance(v, bool):
+        raise ValueError(f"{name} must be numeric (bool not allowed)")
     try:
         x = float(v)
     except Exception as e:
@@ -95,6 +104,8 @@ def _require_positive(v: Any, name: str) -> float:
 def _require_positive_int(v: Any, name: str) -> int:
     if v is None:
         raise ValueError(f"{name} is required")
+    if isinstance(v, bool):
+        raise ValueError(f"{name} must be int (bool not allowed)")
     try:
         iv = int(v)
     except Exception as e:
@@ -104,16 +115,11 @@ def _require_positive_int(v: Any, name: str) -> int:
     return iv
 
 
-def _opt_float(v: Any) -> Optional[float]:
+def _opt_float(v: Any, name: str) -> Optional[float]:
     if v is None:
         return None
-    try:
-        x = float(v)
-    except Exception as e:
-        raise ValueError(f"optional float invalid: {e}") from e
-    if not math.isfinite(x):
-        raise ValueError("optional float must be finite")
-    return x
+    x = _require_number(v, name)
+    return float(x)
 
 
 def _opt_float_min(v: Any, name: str, *, min_value: float) -> Optional[float]:
@@ -134,6 +140,20 @@ def _opt_float_range(v: Any, name: str, *, min_value: float, max_value: float) -
     return float(x)
 
 
+def _opt_int_range(v: Any, name: str, *, min_value: int, max_value: int) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"{name} must be int (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise ValueError(f"{name} must be int: {e}") from e
+    if iv < min_value or iv > max_value:
+        raise ValueError(f"{name} must be within {min_value}..{max_value}")
+    return int(iv)
+
+
 def _opt_nonempty_str_maxlen(v: Any, name: str, *, max_len: int) -> Optional[str]:
     if v is None:
         return None
@@ -149,6 +169,28 @@ def _opt_tzaware_dt(v: Any, name: str) -> Optional[datetime]:
     if v is None:
         return None
     return _require_tzaware_dt(v, name)
+
+
+def _opt_json_dict(v: Any, name: str) -> Optional[dict]:
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise ValueError(f"{name} must be dict when provided")
+    return v
+
+
+def _opt_json_list(v: Any, name: str) -> Optional[list]:
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise ValueError(f"{name} must be list when provided")
+    return v
+
+
+def _setattr_strict(row: Any, field: str, value: Any) -> None:
+    if not hasattr(row, field):
+        raise RuntimeError(f"TradeSnapshot model missing {field} mapping (db_models mismatch)")
+    setattr(row, field, value)
 
 
 # ─────────────────────────────────────────────
@@ -190,14 +232,13 @@ def record_trade_open_returning_id(
     ep = _require_positive(entry_price, "entry_price")
     ets = _require_tzaware_dt(entry_ts, "entry_ts")
 
-    # 운영형 실행/복구 필드: 전달되면 STRICT 검증
     eoid = _opt_nonempty_str_maxlen(entry_order_id, "entry_order_id", max_len=64)
     tpid = _opt_nonempty_str_maxlen(tp_order_id, "tp_order_id", max_len=64)
     slid = _opt_nonempty_str_maxlen(sl_order_id, "sl_order_id", max_len=64)
     pside = _opt_nonempty_str_maxlen(exchange_position_side, "exchange_position_side", max_len=16)
 
     rem_qty = _opt_float_min(remaining_qty, "remaining_qty", min_value=0.0)
-    rpnl = _opt_float(realized_pnl_usdt)  # 음수 가능(손실), finite만 보장
+    rpnl = _opt_float(realized_pnl_usdt, "realized_pnl_usdt")
     rstat = _opt_nonempty_str_maxlen(reconciliation_status, "reconciliation_status", max_len=32)
     lsync = _opt_tzaware_dt(last_synced_at, "last_synced_at")
 
@@ -211,21 +252,20 @@ def record_trade_open_returning_id(
             entry_price=ep,
             qty=q,
             is_auto=bool(is_auto),
-            regime_at_entry=(str(regime_at_entry).strip() if regime_at_entry else None),
-            strategy=(str(strategy).strip() if strategy else None),
-            entry_score=_opt_float(entry_score),
-            trend_score_at_entry=_opt_float(trend_score_at_entry),
-            range_score_at_entry=_opt_float(range_score_at_entry),
-            leverage=_opt_float(leverage),
-            risk_pct=_opt_float(risk_pct),
-            tp_pct=_opt_float(tp_pct),
-            sl_pct=_opt_float(sl_pct),
+            regime_at_entry=(str(regime_at_entry).strip()[:16] if regime_at_entry else None),
+            strategy=(str(strategy).strip()[:16] if strategy else None),
+            entry_score=_opt_float(entry_score, "entry_score"),
+            trend_score_at_entry=_opt_float(trend_score_at_entry, "trend_score_at_entry"),
+            range_score_at_entry=_opt_float(range_score_at_entry, "range_score_at_entry"),
+            leverage=_opt_float(leverage, "leverage"),
+            risk_pct=_opt_float(risk_pct, "risk_pct"),
+            tp_pct=_opt_float(tp_pct, "tp_pct"),
+            sl_pct=_opt_float(sl_pct, "sl_pct"),
             note=(str(note).strip()[:255] if note else None),
             created_at=now,
             updated_at=now,
         )
 
-        # 실행/복구 필드 저장(전달된 값만)
         if eoid is not None:
             row.entry_order_id = eoid
         if tpid is not None:
@@ -289,14 +329,14 @@ def close_latest_open_trade_returning_id(
         trade.exit_price = float(xp)
         trade.exit_ts = xts
         trade.pnl_usdt = float(pnl_val)
-        trade.close_reason = str(reason)[:32]
+        trade.close_reason = str(reason).strip()[:32]
 
         if regime_at_exit:
             trade.regime_at_exit = str(regime_at_exit).strip()[:16]
         if pnl_pct_futures is not None:
-            trade.pnl_pct_futures = float(pnl_pct_futures)
+            trade.pnl_pct_futures = _opt_float(pnl_pct_futures, "pnl_pct_futures")
         if pnl_pct_spot_ref is not None:
-            trade.pnl_pct_spot_ref = float(pnl_pct_spot_ref)
+            trade.pnl_pct_spot_ref = _opt_float(pnl_pct_spot_ref, "pnl_pct_spot_ref")
 
         if note:
             trade.note = str(note).strip()[:255]
@@ -333,19 +373,94 @@ def record_trade_snapshot(
     sl_pct: Optional[float] = None,
     gpt_action: Optional[str] = None,
     gpt_reason: Optional[str] = None,
-    # 2026-03-02: DD 영속화 필드
+    # 2026-03-02: DD 영속화
     equity_current_usdt: Optional[float] = None,
     equity_peak_usdt: Optional[float] = None,
     dd_pct: Optional[float] = None,
+    # 2026-03-03: Decision Reconciliation (TRADE-GRADE)
+    decision_id: Optional[str] = None,
+    quant_decision_pre: Optional[dict] = None,
+    quant_constraints: Optional[dict] = None,
+    quant_final_decision: Optional[str] = None,
+    gpt_severity: Optional[int] = None,
+    gpt_tags: Optional[list] = None,
+    gpt_confidence_penalty: Optional[float] = None,
+    gpt_suggested_risk_multiplier: Optional[float] = None,
+    gpt_rationale_short: Optional[str] = None,
+    # 2026-03-03: Microstructure (TRADE-GRADE)
+    micro_funding_rate: Optional[float] = None,
+    micro_funding_z: Optional[float] = None,
+    micro_open_interest: Optional[float] = None,
+    micro_oi_z: Optional[float] = None,
+    micro_long_short_ratio: Optional[float] = None,
+    micro_lsr_z: Optional[float] = None,
+    micro_distortion_index: Optional[float] = None,
+    micro_score_risk: Optional[float] = None,
+    # 2026-03-03: Execution Quality (TRADE-GRADE)
+    exec_expected_price: Optional[float] = None,
+    exec_filled_avg_price: Optional[float] = None,
+    exec_slippage_pct: Optional[float] = None,
+    exec_adverse_move_pct: Optional[float] = None,
+    exec_score: Optional[float] = None,
+    exec_post_prices: Optional[dict] = None,
+    # 2026-03-03: EV Heatmap / AutoBlock (TRADE-GRADE)
+    ev_cell_key: Optional[str] = None,
+    ev_cell_ev: Optional[float] = None,
+    ev_cell_n: Optional[int] = None,
+    ev_cell_status: Optional[str] = None,
+    auto_blocked: Optional[bool] = None,
+    auto_risk_multiplier: Optional[float] = None,
+    auto_block_reasons: Optional[dict] = None,
 ) -> None:
     tid = _require_positive_int(trade_id, "trade_id")
     sym = _require_nonempty_str(symbol, "symbol").upper()
     ets = _require_tzaware_dt(entry_ts, "entry_ts")
     dirn = _require_nonempty_str(direction, "direction").upper()
 
+    # DD (기존)
     eq_cur = _opt_float_min(equity_current_usdt, "equity_current_usdt", min_value=0.0)
     eq_peak = _opt_float_min(equity_peak_usdt, "equity_peak_usdt", min_value=0.0)
     dd_v = _opt_float_range(dd_pct, "dd_pct", min_value=0.0, max_value=100.0)
+
+    # Decision Reconciliation
+    did = _opt_nonempty_str_maxlen(decision_id, "decision_id", max_len=64)
+    qpre = _opt_json_dict(quant_decision_pre, "quant_decision_pre")
+    qcon = _opt_json_dict(quant_constraints, "quant_constraints")
+    qfin = _opt_nonempty_str_maxlen(quant_final_decision, "quant_final_decision", max_len=16)
+
+    gsev = _opt_int_range(gpt_severity, "gpt_severity", min_value=0, max_value=3)
+    gtags = _opt_json_list(gpt_tags, "gpt_tags")
+    gcp = _opt_float_range(gpt_confidence_penalty, "gpt_confidence_penalty", min_value=0.0, max_value=1.0)
+    grm = _opt_float_range(gpt_suggested_risk_multiplier, "gpt_suggested_risk_multiplier", min_value=0.0, max_value=1.0)
+    grat = _opt_nonempty_str_maxlen(gpt_rationale_short, "gpt_rationale_short", max_len=800)
+
+    # Microstructure
+    mf = _opt_float(micro_funding_rate, "micro_funding_rate")
+    mfz = _opt_float(micro_funding_z, "micro_funding_z")
+    moi = _opt_float_min(micro_open_interest, "micro_open_interest", min_value=0.0)
+    moiz = _opt_float(micro_oi_z, "micro_oi_z")
+    mlsr = _opt_float_min(micro_long_short_ratio, "micro_long_short_ratio", min_value=0.0)
+    mlsrz = _opt_float(micro_lsr_z, "micro_lsr_z")
+    mdi = _opt_float(micro_distortion_index, "micro_distortion_index")
+    msr = _opt_float_range(micro_score_risk, "micro_score_risk", min_value=0.0, max_value=100.0)
+
+    # Execution quality
+    eexp = _opt_float_min(exec_expected_price, "exec_expected_price", min_value=0.0)
+    efll = _opt_float_min(exec_filled_avg_price, "exec_filled_avg_price", min_value=0.0)
+    eslip = _opt_float_range(exec_slippage_pct, "exec_slippage_pct", min_value=0.0, max_value=100.0)
+    eadv = _opt_float_range(exec_adverse_move_pct, "exec_adverse_move_pct", min_value=0.0, max_value=100.0)
+    esc = _opt_float_range(exec_score, "exec_score", min_value=0.0, max_value=100.0)
+    epost = _opt_json_dict(exec_post_prices, "exec_post_prices")
+
+    # EV Heatmap / AutoBlock
+    evk = _opt_nonempty_str_maxlen(ev_cell_key, "ev_cell_key", max_len=96)
+    evev = _opt_float(ev_cell_ev, "ev_cell_ev")
+    evn = _opt_int_range(ev_cell_n, "ev_cell_n", min_value=0, max_value=1_000_000)
+    evs = _opt_nonempty_str_maxlen(ev_cell_status, "ev_cell_status", max_len=16)
+
+    ab = None if auto_blocked is None else bool(auto_blocked)
+    arm = _opt_float_range(auto_risk_multiplier, "auto_risk_multiplier", min_value=0.0, max_value=1.0)
+    abr = _opt_json_dict(auto_block_reasons, "auto_block_reasons")
 
     with get_session() as session:
         t = session.query(TradeORM).filter(TradeORM.id == tid).first()
@@ -356,6 +471,12 @@ def record_trade_snapshot(
         if existed is not None:
             raise RuntimeError(f"trade snapshot already exists: trade_id={tid}")
 
+        if did is not None:
+            # UNIQUE(decision_id) 보조 검증(명확한 에러 메시지)
+            dup = session.query(TradeSnapshot).filter(TradeSnapshot.decision_id == did).first()
+            if dup is not None:
+                raise RuntimeError(f"decision_id already exists: decision_id={did}")
+
         row = TradeSnapshot(
             trade_id=tid,
             symbol=sym,
@@ -363,41 +484,109 @@ def record_trade_snapshot(
             direction=dirn,
             signal_source=(str(signal_source).strip() if signal_source else None),
             regime=(str(regime).strip() if regime else None),
-            entry_score=_opt_float(entry_score),
-            engine_total=_opt_float(engine_total),
-            trend_strength=_opt_float(trend_strength),
-            atr_pct=_opt_float(atr_pct),
-            volume_zscore=_opt_float(volume_zscore),
-            depth_ratio=_opt_float(depth_ratio),
-            spread_pct=_opt_float(spread_pct),
+            entry_score=_opt_float(entry_score, "entry_score"),
+            engine_total=_opt_float(engine_total, "engine_total"),
+            trend_strength=_opt_float(trend_strength, "trend_strength"),
+            atr_pct=_opt_float(atr_pct, "atr_pct"),
+            volume_zscore=_opt_float(volume_zscore, "volume_zscore"),
+            depth_ratio=_opt_float(depth_ratio, "depth_ratio"),
+            spread_pct=_opt_float(spread_pct, "spread_pct"),
             hour_kst=int(hour_kst) if hour_kst is not None else None,
             weekday_kst=int(weekday_kst) if weekday_kst is not None else None,
             last_price=float(last_price) if last_price is not None else None,
-            risk_pct=_opt_float(risk_pct),
-            tp_pct=_opt_float(tp_pct),
-            sl_pct=_opt_float(sl_pct),
+            risk_pct=_opt_float(risk_pct, "risk_pct"),
+            tp_pct=_opt_float(tp_pct, "tp_pct"),
+            sl_pct=_opt_float(sl_pct, "sl_pct"),
             gpt_action=(str(gpt_action).strip() if gpt_action else None),
             gpt_reason=(str(gpt_reason).strip() if gpt_reason else None),
             created_at=_utc_now(),
         )
 
-        # STRICT: 모델 매핑 누락이면 즉시 예외
+        # DD (기존)
         if eq_cur is not None:
-            if not hasattr(row, "equity_current_usdt"):
-                raise RuntimeError("TradeSnapshot model missing equity_current_usdt mapping (db_models mismatch)")
-            setattr(row, "equity_current_usdt", float(eq_cur))
-
+            _setattr_strict(row, "equity_current_usdt", float(eq_cur))
         if eq_peak is not None:
-            if not hasattr(row, "equity_peak_usdt"):
-                raise RuntimeError("TradeSnapshot model missing equity_peak_usdt mapping (db_models mismatch)")
-            setattr(row, "equity_peak_usdt", float(eq_peak))
-
+            _setattr_strict(row, "equity_peak_usdt", float(eq_peak))
         if dd_v is not None:
-            if not hasattr(row, "dd_pct"):
-                raise RuntimeError("TradeSnapshot model missing dd_pct mapping (db_models mismatch)")
-            setattr(row, "dd_pct", float(dd_v))
+            _setattr_strict(row, "dd_pct", float(dd_v))
+
+        # Decision Reconciliation
+        if did is not None:
+            _setattr_strict(row, "decision_id", did)
+        if qpre is not None:
+            _setattr_strict(row, "quant_decision_pre", qpre)
+        if qcon is not None:
+            _setattr_strict(row, "quant_constraints", qcon)
+        if qfin is not None:
+            _setattr_strict(row, "quant_final_decision", qfin)
+
+        if gsev is not None:
+            _setattr_strict(row, "gpt_severity", int(gsev))
+        if gtags is not None:
+            _setattr_strict(row, "gpt_tags", gtags)
+        if gcp is not None:
+            _setattr_strict(row, "gpt_confidence_penalty", float(gcp))
+        if grm is not None:
+            _setattr_strict(row, "gpt_suggested_risk_multiplier", float(grm))
+        if grat is not None:
+            _setattr_strict(row, "gpt_rationale_short", grat)
+
+        # Microstructure
+        if mf is not None:
+            _setattr_strict(row, "micro_funding_rate", float(mf))
+        if mfz is not None:
+            _setattr_strict(row, "micro_funding_z", float(mfz))
+        if moi is not None:
+            _setattr_strict(row, "micro_open_interest", float(moi))
+        if moiz is not None:
+            _setattr_strict(row, "micro_oi_z", float(moiz))
+        if mlsr is not None:
+            _setattr_strict(row, "micro_long_short_ratio", float(mlsr))
+        if mlsrz is not None:
+            _setattr_strict(row, "micro_lsr_z", float(mlsrz))
+        if mdi is not None:
+            _setattr_strict(row, "micro_distortion_index", float(mdi))
+        if msr is not None:
+            _setattr_strict(row, "micro_score_risk", float(msr))
+
+        # Execution quality
+        if eexp is not None:
+            _setattr_strict(row, "exec_expected_price", float(eexp))
+        if efll is not None:
+            _setattr_strict(row, "exec_filled_avg_price", float(efll))
+        if eslip is not None:
+            _setattr_strict(row, "exec_slippage_pct", float(eslip))
+        if eadv is not None:
+            _setattr_strict(row, "exec_adverse_move_pct", float(eadv))
+        if esc is not None:
+            _setattr_strict(row, "exec_score", float(esc))
+        if epost is not None:
+            # 최소 키 검증(존재 시)
+            for k in ("t+1s", "t+3s", "t+5s"):
+                if k not in epost:
+                    raise ValueError(f"exec_post_prices missing key: {k}")
+                _require_positive(epost.get(k), f"exec_post_prices[{k}]")
+            _setattr_strict(row, "exec_post_prices", epost)
+
+        # EV heatmap / AutoBlock
+        if evk is not None:
+            _setattr_strict(row, "ev_cell_key", evk)
+        if evev is not None:
+            _setattr_strict(row, "ev_cell_ev", float(evev))
+        if evn is not None:
+            _setattr_strict(row, "ev_cell_n", int(evn))
+        if evs is not None:
+            _setattr_strict(row, "ev_cell_status", evs)
+
+        if ab is not None:
+            _setattr_strict(row, "auto_blocked", bool(ab))
+        if arm is not None:
+            _setattr_strict(row, "auto_risk_multiplier", float(arm))
+        if abr is not None:
+            _setattr_strict(row, "auto_block_reasons", abr)
 
         session.add(row)
+        session.flush()
 
 
 def record_trade_exit_snapshot(
@@ -432,15 +621,16 @@ def record_trade_exit_snapshot(
             symbol=sym,
             close_ts=cts,
             close_price=float(cp),
-            pnl=float(pnl) if pnl is not None else None,
+            pnl=_opt_float(pnl, "pnl") if pnl is not None else None,
             close_reason=(str(close_reason).strip() if close_reason else None),
-            exit_atr_pct=_opt_float(exit_atr_pct),
-            exit_trend_strength=_opt_float(exit_trend_strength),
-            exit_volume_zscore=_opt_float(exit_volume_zscore),
-            exit_depth_ratio=_opt_float(exit_depth_ratio),
+            exit_atr_pct=_opt_float(exit_atr_pct, "exit_atr_pct"),
+            exit_trend_strength=_opt_float(exit_trend_strength, "exit_trend_strength"),
+            exit_volume_zscore=_opt_float(exit_volume_zscore, "exit_volume_zscore"),
+            exit_depth_ratio=_opt_float(exit_depth_ratio, "exit_depth_ratio"),
             created_at=_utc_now(),
         )
         session.add(row)
+        session.flush()
 
 
 # ─────────────────────────────────────────────
@@ -456,7 +646,7 @@ def record_funding_rate(
     sym = _require_nonempty_str(symbol, "symbol").upper()
     ts_dt = _require_tzaware_dt(ts, "ts")
     rate_val = _require_number(rate, "rate")
-    mp = float(mark_price) if mark_price is not None else None
+    mp = _opt_float(mark_price, "mark_price") if mark_price is not None else None
 
     with get_session() as session:
         fr = FundingRate(
@@ -467,6 +657,7 @@ def record_funding_rate(
             created_at=_utc_now(),
         )
         session.add(fr)
+        session.flush()
 
 
 def record_external_event(
@@ -495,6 +686,7 @@ def record_external_event(
             created_at=_utc_now(),
         )
         session.add(ev)
+        session.flush()
 
 
 __all__ = [

@@ -12,6 +12,15 @@ Binance USDT-M Futures - Order Execution Layer (Production)
 - Timestamp error (-1021) recovery: sync_server_time() + single retry
 - No print(); logging only
 
+PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+--------------------------------------------------------
+- Trade STRICT 필드 정합 보강:
+  - state.trader_state.Trade.__post_init__ 요구사항 충족:
+    * last_synced_at (tz-aware) 반드시 주입
+    * client_entry_id(=entry_client_order_id) 주입
+    * reconciliation_status 명시
+  - 결과: open_position_with_tp_sl() 반환 Trade가 STRICT 검증을 통과하도록 보장
+
 PATCH NOTES — 2026-03-02
 --------------------------------------------------------
 - TP/SL 주문 생성 시 orderId를 반환/상위로 전달(set_tp_sl -> (tp_order_id, sl_order_id))
@@ -34,6 +43,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -213,7 +223,6 @@ def _make_child_client_order_id(parent: str, suffix: str) -> str:
     sfx = str(suffix).strip().lower()
     if not sfx:
         raise ValueError("suffix is empty")
-    # Reserve: "-" + suffix (up to 6 chars typical). Truncate parent to fit 36.
     tail = f"-{sfx}"
     if len(tail) >= 36:
         raise ValueError("suffix too long for client order id")
@@ -262,7 +271,6 @@ def _trade_ctor_supported_fields() -> set[str]:
     여기서는 Trade dataclass/ctor의 시그니처 차이로 인해 런타임 크래시가 나는 것을 방지한다.
     """
     try:
-        # dataclass이면 __dataclass_fields__가 가장 정확
         f = getattr(Trade, "__dataclass_fields__", None)
         if isinstance(f, dict) and f:
             return set(f.keys())
@@ -273,7 +281,6 @@ def _trade_ctor_supported_fields() -> set[str]:
         sig = inspect.signature(Trade)  # type: ignore[arg-type]
         return {p.name for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
     except Exception:
-        # 최후: 비정상 타입이면 그냥 빈 집합(Trade 생성 시 키워드 최소화)
         return set()
 
 
@@ -286,7 +293,6 @@ def _make_trade_strict(**kwargs: Any) -> Trade:
     """
     allowed = _trade_ctor_supported_fields()
     if not allowed:
-        # Trade가 예상과 다르면 그대로 전달 (에러는 상위로, 폴백 금지)
         return Trade(**kwargs)  # type: ignore[arg-type]
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
     return Trade(**filtered)  # type: ignore[arg-type]
@@ -299,7 +305,6 @@ _CODE_RE = re.compile(r"code=([-]?\d+)")
 
 
 def _extract_code(err: Exception) -> Optional[int]:
-    """Extract Binance error code from exception string when available."""
     m = _CODE_RE.search(str(err))
     if not m:
         return None
@@ -310,22 +315,18 @@ def _extract_code(err: Exception) -> Optional[int]:
 
 
 def _is_timestamp_error(err: Exception) -> bool:
-    """Detect Binance timestamp/recvWindow errors (-1021)."""
     s = str(err).lower()
     code = _extract_code(err)
     if code == -1021:
         return True
     if "-1021" in s:
         return True
-    if "timestamp" in s and (
-        "recvwindow" in s or "ahead of the server" in s or "behind the server" in s
-    ):
+    if "timestamp" in s and ("recvwindow" in s or "ahead of the server" in s or "behind the server" in s):
         return True
     return False
 
 
 def _is_order_not_found(err: Exception) -> bool:
-    """Detect order-not-found when querying by origClientOrderId."""
     s = str(err).lower()
     code = _extract_code(err)
     if code in {-2013, -2011}:
@@ -336,7 +337,6 @@ def _is_order_not_found(err: Exception) -> bool:
 
 
 def _is_no_need_change_margin(err: Exception) -> bool:
-    """Detect idempotent response when setting margin mode."""
     s = str(err).lower()
     code = _extract_code(err)
     if code == -4046:
@@ -347,7 +347,6 @@ def _is_no_need_change_margin(err: Exception) -> bool:
 
 
 def _is_no_need_change_leverage(err: Exception) -> bool:
-    """Detect idempotent response when setting leverage."""
     s = str(err).lower()
     code = _extract_code(err)
     if code in {-4047, -4048}:
@@ -364,7 +363,7 @@ def _call_with_time_sync_retry(fn) -> Any:
     except Exception as e:
         if _is_timestamp_error(e):
             logger.warning("timestamp error detected; syncing server time and retrying once")
-            sync_server_time()  # raises on failure
+            sync_server_time()
             return execute_with_retry(fn)
         raise
 
@@ -373,7 +372,6 @@ def _call_with_time_sync_retry(fn) -> Any:
 # Symbol filters: exchangeInfo cache
 # ---------------------------------------------------------------------------
 def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolFilters:
-    """Parse tick/step/minQty filters from /fapi/v1/exchangeInfo response."""
     symbols = exchange_info.get("symbols")
     if not isinstance(symbols, list):
         raise RuntimeError("exchangeInfo missing 'symbols' list")
@@ -438,7 +436,6 @@ def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolF
 
 
 def get_symbol_filters(symbol: str) -> SymbolFilters:
-    """Get symbol filters with in-memory cache + TTL."""
     sym = _normalize_symbol(symbol)
     now = time.time()
 
@@ -559,9 +556,7 @@ def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional
 def _get_order_by_client_id(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
     params = {"symbol": symbol, "origClientOrderId": client_order_id}
     try:
-        data = _call_with_time_sync_retry(
-            lambda: req("GET", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec)
-        )
+        data = _call_with_time_sync_retry(lambda: req("GET", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec))
     except Exception as e:
         if _is_order_not_found(e):
             return None
@@ -746,8 +741,7 @@ def _place_order(
             "newOrderRespType": "RESULT",
         }
 
-        if pos_side_u:
-            params["positionSide"] = pos_side_u
+        params["positionSide"] = pos_side_u
 
         if reduce_only is not None:
             params["reduceOnly"] = bool(reduce_only)
@@ -912,12 +906,6 @@ def set_tp_sl(
     tp_client_order_id: Optional[str] = None,
     sl_client_order_id: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    STRICT:
-    - TP/SL 주문을 생성하고, 생성된 orderId를 반환한다.
-    - soft_mode=True이면 SL 주문은 생성하지 않는다.
-    - 폴백(룩백/추정) 금지: 반환은 거래소 응답(orderId) 기반.
-    """
     _ = sl_floor_ratio
 
     sym = _normalize_symbol(symbol)
@@ -974,12 +962,6 @@ def _fetch_filled_entry_price_strict(
     settings: Any,
     max_wait_sec: float = 2.0,
 ) -> float:
-    """
-    STRICT:
-    - entry_price는 실제 체결 값으로만 확정한다.
-    - 0.0 대입/폴백 금지.
-    - /fapi/v1/order로 FILLED 확인 후 avgPrice 또는 (cummulativeQuoteQty/executedQty)로 계산.
-    """
     sym = _normalize_symbol(symbol)
     timeout_sec = _require_timeout_sec(settings)
 
@@ -1048,21 +1030,11 @@ def open_position_with_tp_sl(
     available_usdt: Optional[float] = None,
     entry_client_order_id: Optional[str] = None,
 ) -> Optional["Trade"]:
-    """
-    STRICT:
-    - 입력/설정 값 비정상 시 즉시 예외(폴백 금지)
-    - entry_price는 실제 체결 데이터로만 확정
-    - soft_mode=False 인데 TP/SL 설정 실패 시 포지션 즉시 강제 청산 후 실패 처리
-    - qty는 반드시 > 0 (auto-sizing 제거: 상위 레이어에서 수량 산출)
-    - 결정적 clientOrderId 강제 모드(settings.require_deterministic_client_order_id=True)에서는
-      entry_client_order_id 미지정 시 즉시 예외(폴백 금지)
-    """
-    _ = available_usdt  # (호환용) auto-sizing 제거로 더 이상 사용하지 않음
+    _ = available_usdt
 
     sym = _normalize_symbol(symbol)
     open_side = _normalize_side(side_open)
 
-    # leverage는 STRICT로 강제 (실제 적용은 ensure_trading_settings에서 수행)
     lev = _require_leverage(settings)
 
     final_qty = _require_positive_float(qty, "qty")
@@ -1072,7 +1044,6 @@ def open_position_with_tp_sl(
     if tp_pct_f < 0 or sl_pct_f < 0:
         raise ValueError("tp_pct and sl_pct must be >= 0")
 
-    # SL은 soft_mode=False면 반드시 켠다(안전)
     if not bool(soft_mode) and sl_pct_f <= 0:
         raise ValueError("sl_pct must be > 0 when soft_mode=False")
 
@@ -1088,7 +1059,6 @@ def open_position_with_tp_sl(
             raise ValueError("entry_client_order_id is required when settings.require_deterministic_client_order_id=True")
         entry_cid = _make_client_order_id(prefix="ent")
 
-    # TP/SL clientOrderId (가능하면 entry_cid 기반으로 결정적으로 파생)
     tp_cid = _make_child_client_order_id(entry_cid, "tp")
     sl_cid = _make_child_client_order_id(entry_cid, "sl")
 
@@ -1121,14 +1091,11 @@ def open_position_with_tp_sl(
         )
         return None
 
-    # entry_order_id STRICT 확보
     order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
     if order_id is None:
-        # RESULT 타입인데 orderId가 없으면 비정상. 폴백 금지.
         raise RuntimeError("entry response missing orderId (STRICT)")
     entry_order_id = str(order_id)
 
-    # entry_price STRICT 확정
     try:
         entry_price = _fetch_filled_entry_price_strict(
             symbol=sym,
@@ -1146,7 +1113,6 @@ def open_position_with_tp_sl(
             reason="entry_price_unavailable",
             extra_json={"err": str(e), "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
         )
-        # 포지션이 이미 열렸을 가능성이 있으므로 안전하게 강제 청산 시도
         try:
             close_position_market(sym, open_side, float(final_qty))
         except Exception as e2:
@@ -1156,7 +1122,6 @@ def open_position_with_tp_sl(
     if entry_price <= 0:
         raise RuntimeError("entry_price resolved <= 0 (STRICT violation)")
 
-    # 슬리피지 가드(옵션)
     max_slip = getattr(settings, "max_entry_slippage_pct", None)
     if max_slip is not None:
         try:
@@ -1200,24 +1165,21 @@ def open_position_with_tp_sl(
                     logger.critical("slippage guard force close failed (symbol=%s err=%s)", sym, str(e2))
                 return None
 
-    # ENTRY 이벤트
     log_event(
         event_type="ENTRY",
         symbol=sym,
         regime=source,
-        side=_event_side_from_open_side(open_side),  # LONG/SHORT
+        side=_event_side_from_open_side(open_side),
         price=float(entry_price),
         qty=float(final_qty),
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
-        # NOTE: 전환 기간 호환. 계산에는 사용 금지(로깅용).
         risk_pct=_get_allocation_ratio_for_log(settings),
         reason="MARKET_ENTRY_FILLED",
         extra_json={"open_side": open_side, "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
     )
 
-    # TP/SL 가격 계산
     if open_side == "BUY":
         tp_price = entry_price * (1.0 + tp_pct_f)
         sl_price = entry_price * (1.0 - sl_pct_f)
@@ -1236,7 +1198,6 @@ def open_position_with_tp_sl(
             if sl_price < floor_price:
                 sl_price = floor_price
 
-    # TP/SL 설정 (STRICT) + orderId 반환
     try:
         tp_order_id, sl_order_id = set_tp_sl(
             symbol=sym,
@@ -1270,7 +1231,6 @@ def open_position_with_tp_sl(
             logger.critical("force close after TP/SL failure also failed (symbol=%s err=%s)", sym, str(e2))
         return None
 
-    # soft_mode=False면 SL은 반드시 있어야 한다(안전). 없으면 즉시 실패.
     if not bool(soft_mode) and (sl_order_id is None or not str(sl_order_id).strip()):
         raise RuntimeError("soft_mode=False but SL order_id is missing (STRICT)")
 
@@ -1278,13 +1238,12 @@ def open_position_with_tp_sl(
         event_type="TP_SL_SET",
         symbol=sym,
         regime=source,
-        side=_event_side_from_open_side(open_side),  # LONG/SHORT
+        side=_event_side_from_open_side(open_side),
         price=float(entry_price),
         qty=float(final_qty),
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
-        # NOTE: 전환 기간 호환. 계산에는 사용 금지(로깅용).
         risk_pct=_get_allocation_ratio_for_log(settings),
         reason="TP_SL_CONFIGURED",
         extra_json={
@@ -1298,7 +1257,8 @@ def open_position_with_tp_sl(
         },
     )
 
-    # Trade 생성(호환)
+    now_sync = datetime.now(timezone.utc)
+
     return _make_trade_strict(
         symbol=sym,
         side=open_side,
@@ -1311,9 +1271,12 @@ def open_position_with_tp_sl(
         entry_order_id=entry_order_id,
         tp_order_id=str(tp_order_id) if tp_order_id is not None else None,
         sl_order_id=str(sl_order_id) if sl_order_id is not None else None,
+        client_entry_id=str(entry_cid),
         exchange_position_side="BOTH",
         remaining_qty=float(final_qty),
         realized_pnl_usdt=0.0,
+        reconciliation_status="ENTRY_FILLED",
+        last_synced_at=now_sync,
     )
 
 
@@ -1337,7 +1300,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         event_type="EXIT",
         symbol=sym,
         regime="MANUAL_CLOSE",
-        side=_event_side_close(),  # CLOSE
+        side=_event_side_close(),
         price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
         qty=float(qty),
         leverage=getattr(SET, "leverage", None),
@@ -1356,11 +1319,6 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
 
 
 def close_all_positions_market(symbol: str) -> int:
-    """Reduce-Only 시장가로 해당 심볼의 모든 포지션을 정리한다.
-
-    STRICT:
-    - 포지션 응답에 필수 필드 누락/비정상 시 즉시 예외 (폴백 금지)
-    """
     sym = _normalize_symbol(symbol)
 
     positions = fetch_open_positions(sym)
@@ -1393,7 +1351,6 @@ def close_all_positions_market(symbol: str) -> int:
         if pos_side not in ("BOTH", "LONG", "SHORT"):
             raise RuntimeError(f"invalid positionSide: {pos_side!r}")
 
-        # 포지션 방향 판정(STRICT)
         if pos_side in ("LONG", "SHORT"):
             direction = pos_side
         else:
@@ -1425,7 +1382,7 @@ def close_all_positions_market(symbol: str) -> int:
             event_type="EXIT",
             symbol=sym,
             regime="SIGTERM_FORCE_CLOSE",
-            side=_event_side_close(),  # CLOSE
+            side=_event_side_close(),
             price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
             qty=float(qty2),
             leverage=getattr(SET, "leverage", None),

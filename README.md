@@ -5,7 +5,7 @@ STRICT · NO-FALLBACK · PRODUCTION
 목표는 “수익률 과장”이 아니라 운영 안정성(무중단/무결성/Fail-Fast)이다.
 
 - WebSocket 기반 시세 수집(캔들/오더북)
-- 전략 판단(지표/피처 + GPT)
+- 전략 판단(지표/피처 + Quant Engine + GPT Supervisor)
 - 실행(주문/TP·SL) + DB 영속화(거래/스냅샷/이벤트)
 - 대시보드/분석은 Render에서 DB 조회 전용(read-only analytics)
 
@@ -20,8 +20,8 @@ STRICT · NO-FALLBACK · PRODUCTION
   - 추정/보정/대체값으로 계속 진행하지 않는다.
   - 즉시 예외(raise) 또는 명시적 SKIP로 종료한다.
 
-잔고가 없으면 실주문은 실패한다.
-잔고 없는 환경에서 파이프라인 검증은 TEST_DRY_RUN=1로 진행한다.
+- 잔고가 없으면 실주문은 실패한다.
+- 잔고 없는 환경에서 파이프라인 검증은 TEST_DRY_RUN=1로 진행한다.
 
 ---------------------------------------------------------------------------
 1) 설계 원칙(절대 준수)
@@ -66,20 +66,21 @@ STRICT · NO-FALLBACK · PRODUCTION
 
 부팅(BOOT)
 - REST 백필(boot only):
-  - 시장 데이터 초기 버퍼(candles/indicators) 채우기
+  - 시장 데이터 초기 버퍼(candles/orderbook/필수 TF) 채우기
 - WS 시작:
   - 캔들/오더북 버퍼 유지
 - 워밍업:
   - 필수 TF 데이터 준비 확인
+  - data_health_monitor 시작(신선도/지연 감시)
 - 메인 루프 진입
 
 런타임(RUNTIME)
 - 의사결정 입력은 WS 기반 최신 데이터만 사용
 - 런타임에서 REST 폴백으로 의사결정 금지(STRICT)
 - 전략 판단 결과:
-  - ENTER / SKIP / ADJUST
+  - ENTER / SKIP
 - 실행 엔진:
-  - guards → 주문 실행 → DB 기록 → 알림
+  - guards → 주문 실행 → DB 기록(trades/snapshots/events) → 알림
 - 리콘실:
   - 내부 상태 ↔ 거래소 상태 비교(Desync 감지)
   - 불일치 발생 시 SAFE_STOP 또는 옵션 강제청산
@@ -96,21 +97,33 @@ STRICT · NO-FALLBACK · PRODUCTION
 - infra/data_health_monitor.py
   - WS 지연/신선도 감시(헬스 실패 시 SKIP)
 - infra/async_worker.py
-  - Telegram/DB 등 비핵심 I/O 비동기 위임(블로킹 금지)
+  - Telegram/비핵심 I/O 비동기 위임(블로킹 금지)
 - strategy/unified_features_builder.py
-  - WS 기반 피처 생성
-- strategy/account_state_builder.py
-  - equity/peak/dd 등 계좌 상태 생성(스냅샷 핵심)
-- strategy/gpt_strategy.py
-  - GPT 판단(의사결정), I/O 금지(순수 판단)
+  - WS 기반 통합 피처 생성(timeframes + orderbook + pattern + engine_scores)
+- strategy/microstructure_engine.py
+  - 기초 데이터 확장 계층(funding/OI/LSR 기반 과열/왜곡 점수)
+- strategy/regime_engine.py
+  - 레짐 점수 히스토리 + 절대 기준 allocation 산출(0.0/0.4/0.7/1.0)
+- strategy/ev_heatmap_engine.py
+  - regime × distortion × score 버킷별 EV(rolling mean of pnl_r) 추정/차단 후보
+- risk/auto_block_engine.py
+  - micro_score_risk + EV 셀 상태 기반 자동 차단/감쇠 결정
+- execution/risk_physics_engine.py
+  - Regime allocation + DD/연속손실 + RR + AutoBlock을 합쳐 최종 allocation 결정
+  - action_override: ENTER / SKIP / STOP
 - execution/execution_engine.py
   - 실행만 담당(가드→주문→DB→알림)
+  - Execution Quality 이벤트 기록은 비동기 위임(메인 블로킹 금지)
 - execution/order_executor.py
-  - 실제 주문 실행 레이어(시장가/TP/SL 등)
+  - 실제 주문 실행 레이어(시장가/TP/SL, 결정적 clientOrderId, 멱등성)
+- execution/execution_quality_engine.py
+  - 예상체결가 vs 실체결가, t+1/3/5s 가격 이동, execution_score 산출
 - state/sync_exchange.py
   - 거래소 truth를 읽어 내부 상태 정합(추정 금지)
 - sync/reconcile_engine.py
   - 내부 상태 ↔ 거래소 상태 불일치 감지(Desync)
+- strategy/supervision_report_engine.py
+  - DD/EV/Execution/GPT severity/AutoBlock 기반 운영 안정성 점수/리포트 생성(순수 연산)
 
 4.2 Render Postgres(실전 분석형 저장소)
 - trades / snapshots / events + market-data 저장
@@ -176,12 +189,13 @@ STRICT · NO-FALLBACK · PRODUCTION
 - bt_orderbook_snapshots
 - bt_funding_rates
 
-6.2 VERIFIED(2026-03-03): bt_trade_snapshots
+6.2 VERIFIED(2026-03-03): bt_trade_snapshots (확장 포함)
 목적
 - “왜 진입/스킵했는가” 재현을 위한 진입 시점 상태 저장
 - DD(equity curve / drawdown) 분석의 핵심
+- (TRADE-GRADE) Decision/Micro/Exec/EV/AutoBlock까지 재현 가능한 형태로 확장
 
-컬럼(핵심)
+기본 컬럼(핵심)
 - id (int, PK)
 - trade_id (int, FK->bt_trades.id, UNIQUE, ON DELETE CASCADE)
 - symbol (varchar(32), not null)
@@ -204,11 +218,59 @@ DD/Equity(중요)
 - equity_peak_usdt (double precision, null)
 - dd_pct (double precision, null)
 
+(TRADE-GRADE) Decision Reconciliation
+- decision_id (varchar(64), UNIQUE, null)
+- quant_decision_pre (jsonb, null)
+- quant_constraints (jsonb, null)
+- quant_final_decision (varchar(16), null)
+- gpt_severity (int, null)
+- gpt_tags (jsonb, null)
+- gpt_confidence_penalty (double precision, null)
+- gpt_suggested_risk_multiplier (double precision, null)
+- gpt_rationale_short (text, null)
+
+(TRADE-GRADE) Microstructure
+- micro_funding_rate (double precision, null)
+- micro_funding_z (double precision, null)
+- micro_open_interest (double precision, null)
+- micro_oi_z (double precision, null)
+- micro_long_short_ratio (double precision, null)
+- micro_lsr_z (double precision, null)
+- micro_distortion_index (double precision, null)
+- micro_score_risk (double precision, null)
+
+(TRADE-GRADE) Execution Quality
+- exec_expected_price (double precision, null)
+- exec_filled_avg_price (double precision, null)
+- exec_slippage_pct (double precision, null)
+- exec_adverse_move_pct (double precision, null)
+- exec_score (double precision, null)
+- exec_post_prices (jsonb, null)
+
+(TRADE-GRADE) EV Heatmap / AutoBlock
+- ev_cell_key (varchar(96), null)
+- ev_cell_ev (double precision, null)
+- ev_cell_n (int, null)
+- ev_cell_status (varchar(16), null)
+- auto_blocked (bool, null)
+- auto_risk_multiplier (double precision, null)
+- auto_block_reasons (jsonb, null)
+
 인덱스/제약(핵심)
 - PK: bt_trade_snapshots_pkey(id)
 - UNIQUE: ux_bt_trade_snapshots_tradeid(trade_id)
+- UNIQUE: ux_bt_trade_snapshots_decision_id(decision_id)
 - INDEX: ix_bt_trade_snapshots_symbol_entryts(symbol, entry_ts)
+- INDEX: ix_bt_trade_snapshots_entry_ts(entry_ts)
+- INDEX: ix_bt_trade_snapshots_regime(regime)
 - FK: bt_trade_snapshots_trade_id_fkey(trade_id) ON DELETE CASCADE
+
+운영 체크 포인트(중요)
+- bt_trade_snapshots의 equity_current_usdt / equity_peak_usdt / dd_pct 가 NULL이면
+  - DD 계산 불가
+  - equity curve 복원 불가
+  - 리스크/HARD_STOP 근거 상실
+  - 분석형 DB가 반쪽이 된다(허용 불가)
 
 6.3 VERIFIED(2026-03-03): bt_trades
 목적
@@ -245,17 +307,6 @@ DD/Equity(중요)
 인덱스/참조(핵심)
 - PK: bt_trades_pkey(id)
 - INDEX: ix_bt_trades_symbol_entry_ts(symbol, entry_ts)
-- Referenced by:
-  - bt_entry_scores.trade_id
-  - bt_trade_exit_snapshots.trade_id ON DELETE CASCADE
-  - bt_trade_snapshots.trade_id ON DELETE CASCADE
-
-6.4 운영 체크 포인트(중요)
-- bt_trade_snapshots의 equity_current_usdt / equity_peak_usdt / dd_pct 가 NULL이면
-  - DD 계산 불가
-  - equity curve 복원 불가
-  - 리스크/HARD_STOP 근거 상실
-  - 분석형 DB가 반쪽이 된다(허용 불가)
 
 ---------------------------------------------------------------------------
 7) DB 점검/덤프 명령어(psql)
@@ -264,30 +315,25 @@ DD/Equity(중요)
 접속
 - psql "$TRADER_DB_URL"
 
-테이블 구조 확인(VERIFIED 방식)
+테이블 구조 확인
 - \d+ bt_trade_snapshots
 - \d+ bt_trades
 
-컬럼 존재 여부 체크
-- bt_trade_snapshots
-  SELECT column_name
+확장 컬럼 존재 여부 체크(bt_trade_snapshots)
+- SELECT column_name
   FROM information_schema.columns
-  WHERE table_name='bt_trade_snapshots'
-    AND column_name IN ('equity_current_usdt','equity_peak_usdt','dd_pct');
-
-- bt_trades
-  SELECT column_name
-  FROM information_schema.columns
-  WHERE table_name='bt_trades'
+  WHERE table_schema='public'
+    AND table_name='bt_trade_snapshots'
     AND column_name IN (
-      'entry_order_id','tp_order_id','sl_order_id',
-      'exchange_position_side','remaining_qty','realized_pnl_usdt',
-      'reconciliation_status','last_synced_at'
-    );
+      'decision_id','quant_decision_pre','quant_constraints','quant_final_decision',
+      'micro_score_risk','exec_slippage_pct','ev_cell_status','auto_blocked'
+    )
+  ORDER BY column_name;
 
-최근 스냅샷에서 DD 값 확인
+최근 스냅샷 확인
 - SELECT id, trade_id, symbol, entry_ts,
-         equity_current_usdt, equity_peak_usdt, dd_pct
+         equity_current_usdt, equity_peak_usdt, dd_pct,
+         micro_score_risk, exec_slippage_pct, ev_cell_status, auto_blocked
   FROM bt_trade_snapshots
   ORDER BY id DESC
   LIMIT 5;
@@ -320,14 +366,15 @@ DD/Equity(중요)
   FROM bt_trades
   WHERE exit_ts IS NOT NULL;
 
-8.4 최신 스냅샷(진입 근거)
+8.4 최신 스냅샷(진입 근거 + 확장)
 - SELECT
     s.trade_id, s.symbol, s.entry_ts, s.direction,
     s.entry_score, s.engine_total, s.regime,
     s.trend_strength, s.atr_pct, s.volume_zscore,
     s.depth_ratio, s.spread_pct,
     s.equity_current_usdt, s.equity_peak_usdt, s.dd_pct,
-    s.gpt_action
+    s.micro_score_risk, s.exec_slippage_pct,
+    s.ev_cell_key, s.ev_cell_status, s.auto_blocked, s.auto_risk_multiplier
   FROM bt_trade_snapshots s
   ORDER BY s.id DESC
   LIMIT 50;
@@ -354,6 +401,7 @@ DD/Equity(중요)
 2) 엔트리 후보가 발생하도록 충분히 구동
 3) bt_trade_snapshots에 레코드가 생성되는지 확인
 4) equity_current_usdt / equity_peak_usdt / dd_pct가 NULL이 아닌지 확인
+5) (확장) micro_score_risk / exec_slippage_pct / ev_cell_status / auto_blocked 확인
 
 주의
 - TEST_BYPASS_GUARDS=1은 운영에서 절대 사용 금지
@@ -373,7 +421,13 @@ DD/Equity(중요)
 - 원인 B: TradeSnapshot ORM에 equity/dd 컬럼이 누락됨
 - 해결:
   - account_state 생성 후 meta에 반드시 주입
-  - ORM-DB 정합 유지(2026-03-03 패치 반영)
+  - ORM-DB 정합 유지(패치 반영)
+
+11.3 EV heatmap NOT_READY 지속
+- 원인: pnl_r(=R 단위) 업데이트가 아직 exit 단계에 연결되지 않음
+- 해결:
+  - exit 시점에 entry_price/qty/SL 기준으로 pnl_r 확정 후 ev_heatmap_engine.on_trade_close() 업데이트
+  - 추정/대충 변환 금지(STRICT)
 
 ---------------------------------------------------------------------------
 12) 면책
@@ -381,4 +435,4 @@ DD/Equity(중요)
 
 자동매매는 손실 위험이 크다.
 사용자는 모든 책임을 본인이 부담한다.
-운영 전 반드시 소액/테스트로 검증한다.
+운영 전 반드시 소액/테스트로 검증한다

@@ -18,6 +18,10 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 2026-03-01:
   1) CSV 기록 제거 → bt_events DB 저장으로 전환
   2) legacy wrapper(log_candle_snapshot/log_gpt_entry_event/log_gpt_exit_event/_ensure_today_csv) 유지
+- 2026-03-03:
+  1) FIX(STRICT): log_signal()에서 side 미제공 시 direction을 STRICT 매핑해 side로 주입
+     - 레거시 콜사이트(direction만 전달)가 존재
+     - side/direction 모두 없으면 즉시 예외(폴백 금지)
 ========================================================
 """
 
@@ -48,6 +52,35 @@ def _normalize_side(side: Any) -> str:
     raise RuntimeError("payload.side must be LONG/SHORT/CLOSE")
 
 
+def _side_from_direction_strict(direction: Any) -> str:
+    """
+    STRICT:
+    - 레거시 호환: direction -> side 매핑만 수행한다.
+    - 잘못된 값이면 즉시 예외(폴백 금지)
+    """
+    d = str(direction or "").upper().strip()
+    if d in ("LONG", "SHORT", "CLOSE"):
+        return d
+    if d == "BUY":
+        return "LONG"
+    if d == "SELL":
+        return "SHORT"
+    raise RuntimeError("payload.direction must be LONG/SHORT/CLOSE (or BUY/SELL)")
+
+
+def _normalize_extra_json(v: Any) -> Dict[str, Any]:
+    """
+    STRICT:
+    - bt_events.extra_json은 jsonb dict 전제.
+    - dict가 아니면 즉시 예외(조용히 변환/폴백 금지)
+    """
+    if v is None:
+        return {}
+    if not isinstance(v, dict):
+        raise RuntimeError(f"extra_json must be dict (got={type(v)})")
+    return v
+
+
 def log_event(event_type: str, **kwargs: Any) -> None:
     et = _require_nonempty_str(event_type, "event_type")
     symbol = _require_nonempty_str(kwargs.get("symbol"), "symbol")
@@ -56,6 +89,8 @@ def log_event(event_type: str, **kwargs: Any) -> None:
     side = _normalize_side(kwargs.get("side"))
 
     ts_utc = _now_utc()
+
+    extra_json = _normalize_extra_json(kwargs.get("extra_json", kwargs.get("extra")))
 
     payload: Dict[str, Any] = {
         "symbol": symbol,
@@ -70,7 +105,7 @@ def log_event(event_type: str, **kwargs: Any) -> None:
         "risk_pct": kwargs.get("risk_pct"),
         "pnl_pct": kwargs.get("pnl_pct"),
         "reason": reason,
-        "extra_json": kwargs.get("extra_json", kwargs.get("extra")),
+        "extra_json": extra_json,
         "ts_kst_epoch": ts_utc.timestamp(),  # legacy key
         "ts_iso": ts_utc.isoformat(),
     }
@@ -100,8 +135,22 @@ def log_event(event_type: str, **kwargs: Any) -> None:
 
 
 def log_signal(**kwargs: Any) -> None:
+    """
+    STRICT:
+    - event 필수
+    - side 필수
+    - (호환) side 미제공 시 direction을 STRICT 매핑하여 side로 주입
+    """
     event = kwargs.pop("event", None)
     et = _require_nonempty_str(event, "event")
+
+    # ✅ FIX: 레거시 호출(direction만 넘김) 호환
+    if "side" not in kwargs or kwargs.get("side") in (None, ""):
+        if "direction" in kwargs:
+            kwargs["side"] = _side_from_direction_strict(kwargs.get("direction"))
+        else:
+            raise RuntimeError("payload.side is required (or provide payload.direction for compatibility)")
+
     log_event(et, **kwargs)
 
 

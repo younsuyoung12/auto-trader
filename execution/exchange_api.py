@@ -5,16 +5,34 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 Design principles (Binance USDT-M Futures REST Adapter)
 --------------------------------------------------------
-- Binance USDT-M Futures (/fapi/*) REST endpoints only.
+- Binance Futures endpoints only:
+  - Trading/Account: /fapi/*
+  - Public market data (microstructure): /futures/data/*
 - Transport/Query layer only: signing, HTTP requests, account/position/order 조회 및
   레버리지/마진 모드 설정만 제공한다.
 - 주문 실행(진입/청산/TP/SL 생성/슬리피지 계산)은 order_executor.py가 담당한다.
-- Fallback 금지: 오류 발생 시 즉시 예외(RuntimeError/ValueError).
+- Fallback 금지: 오류/누락/비정상 응답은 즉시 예외(RuntimeError/ValueError).
 - 민감 정보(API key/secret/signature)는 로그/예외 메시지에 포함하지 않는다.
 
 One-way mode only.
 Hedge mode is NOT supported.
 positionSide must always be BOTH in order layer.
+
+PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+--------------------------------------------------------
+- Microstructure 데이터 계층 확장(STRICT, no fallback)
+  - /fapi/* 외에 /futures/data/* (public) 엔드포인트를 허용한다.
+  - Funding/OI/Long-Short Ratio 계열 조회 함수 추가:
+    * get_premium_index(symbol)                         : /fapi/v1/premiumIndex (public)
+    * get_current_funding_rate(symbol)                  : premiumIndex.lastFundingRate (float)
+    * get_funding_rate_history(symbol, ...)             : /fapi/v1/fundingRate (public)
+    * get_open_interest(symbol)                         : /fapi/v1/openInterest (public)
+    * get_open_interest_hist(symbol, period, ...)       : /futures/data/openInterestHist (public)
+    * get_global_long_short_account_ratio(symbol, ...)  : /futures/data/globalLongShortAccountRatio (public)
+    * get_top_long_short_account_ratio(symbol, ...)     : /futures/data/topLongShortAccountRatio (public)
+    * get_top_long_short_position_ratio(symbol, ...)    : /futures/data/topLongShortPositionRatio (public)
+- STRICT 강화
+  - settings 값(기본 URL/timeout/recvWindow) 누락/비정상 시 즉시 실패(Fail-Fast)
 
 PATCH NOTES — 2026-03-02 (PATCH)
 --------------------------------------------------------
@@ -22,8 +40,6 @@ PATCH NOTES — 2026-03-02 (PATCH)
   - get_order(symbol, order_id): /fapi/v1/order by orderId
   - get_order_by_client_id(symbol, client_order_id): /fapi/v1/order by origClientOrderId
   - get_user_trades(symbol, order_id=None, start_time_ms=None, end_time_ms=None, limit=1000)
-    * orderId 기반 체결 내역 조회(청산 원인/부분청산/실현손익 계산에 사용)
-- __all__에 신규 함수 노출
 ========================================================
 """
 
@@ -43,17 +59,43 @@ from settings import load_settings
 
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Global settings / session
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# Global settings / session (STRICT: fail-fast)
+# -----------------------------------------------------------------------------#
 SET = load_settings()
 
-BASE_URL: str = str(getattr(SET, "binance_futures_base", "") or "").strip() or "https://fapi.binance.com"
-DEFAULT_TIMEOUT_SEC: int = int(getattr(SET, "request_timeout_sec", 10) or 10)
-RECV_WINDOW_MS: int = int(getattr(SET, "recv_window_ms", 5000) or 5000)
 
-_API_KEY: str = str(getattr(SET, "api_key", "") or "")
-_API_SECRET: str = str(getattr(SET, "api_secret", "") or "")
+def _require_setting_str(name: str) -> str:
+    try:
+        v = getattr(SET, name)
+    except AttributeError as e:
+        raise RuntimeError(f"settings.{name} is missing (STRICT)") from e
+    s = str(v).strip()
+    if not s:
+        raise RuntimeError(f"settings.{name} is empty (STRICT)")
+    return s
+
+
+def _require_setting_int(name: str) -> int:
+    try:
+        v = getattr(SET, name)
+    except AttributeError as e:
+        raise RuntimeError(f"settings.{name} is missing (STRICT)") from e
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise RuntimeError(f"settings.{name} must be int (got={v!r})") from e
+    if iv <= 0:
+        raise RuntimeError(f"settings.{name} must be positive (got={iv})")
+    return iv
+
+
+BASE_URL: str = _require_setting_str("binance_futures_base")
+DEFAULT_TIMEOUT_SEC: int = _require_setting_int("request_timeout_sec")
+RECV_WINDOW_MS: int = _require_setting_int("recv_window_ms")
+
+_API_KEY: str = _require_setting_str("api_key")
+_API_SECRET: str = _require_setting_str("api_secret")
 
 _SESSION: requests.Session = requests.Session()
 _SESSION.headers.update(
@@ -69,10 +111,14 @@ _TIME_SYNCED: bool = False
 _LAST_TIME_SYNC_AT: float = 0.0
 _TIME_SYNC_TTL_SEC: int = 60  # resync at most once per minute (safe for -1021)
 
+# Allowed endpoints
+_ALLOWED_PUBLIC_PREFIXES: Tuple[str, ...] = ("/fapi/", "/futures/data/")
+_ALLOWED_PRIVATE_PREFIX: str = "/fapi/"
 
-# -----------------------------------------------------------------------------
-# Internal helpers
-# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------#
+# Internal helpers (STRICT)
+# -----------------------------------------------------------------------------#
 def _normalize_symbol(symbol: str) -> str:
     """Normalize symbol to Binance format (e.g., BTCUSDT)."""
     s = str(symbol).replace("-", "").replace("/", "").upper().strip()
@@ -83,12 +129,11 @@ def _normalize_symbol(symbol: str) -> str:
 
 def _normalize_margin_type(value: Any) -> str:
     """Normalize marginType from Binance positionRisk to 'ISOLATED' or 'CROSSED'."""
-    v = str(value or "").strip().upper()
+    v = str(value).strip().upper()
     if not v:
         raise RuntimeError("positionRisk.marginType is missing/empty")
 
-    # Binance positionRisk marginType commonly: 'isolated' or 'cross'
-    if v in {"ISOLATED"}:
+    if v == "ISOLATED":
         return "ISOLATED"
     if v in {"CROSS", "CROSSED"}:
         return "CROSSED"
@@ -97,46 +142,33 @@ def _normalize_margin_type(value: Any) -> str:
 
 
 def _local_ts_ms() -> int:
-    """Local timestamp in milliseconds."""
     return int(time.time() * 1000)
 
 
 def _ts_ms() -> int:
-    """Timestamp in milliseconds adjusted by server time offset."""
     return _local_ts_ms() + _SERVER_TIME_OFFSET_MS
 
 
-def _ensure_credentials() -> None:
-    """Ensure API key/secret exist."""
-    if not _API_KEY or not _API_SECRET:
-        raise RuntimeError("BINANCE API key/secret missing (settings.api_key/api_secret)")
-
-
 def _coerce_params(params: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
-    """Convert params to a sorted list of (key, value) strings for query signing."""
     items: List[Tuple[str, str]] = []
-    if not params:
+    if params is None:
         return items
 
     for k, v in params.items():
         if v is None:
             continue
-
         key = str(k)
         if isinstance(v, bool):
             val = "true" if v else "false"
         else:
             val = str(v)
-
         items.append((key, val))
 
-    # Binance signature uses the raw query string; make it stable by sorting keys.
     items.sort(key=lambda kv: kv[0])
     return items
 
 
 def _encode_query(params: Optional[Mapping[str, Any]]) -> str:
-    """URL-encode parameters deterministically."""
     items = _coerce_params(params)
     if not items:
         return ""
@@ -144,8 +176,6 @@ def _encode_query(params: Optional[Mapping[str, Any]]) -> str:
 
 
 def _sign(query_string: str) -> str:
-    """HMAC SHA256 signature for the given query string."""
-    _ensure_credentials()
     return hmac.new(
         _API_SECRET.encode("utf-8"),
         query_string.encode("utf-8"),
@@ -153,18 +183,54 @@ def _sign(query_string: str) -> str:
     ).hexdigest()
 
 
+def _require_int(name: str, v: Any) -> int:
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise ValueError(f"{name} must be int (got={v!r})") from e
+    return iv
+
+
+def _require_float(name: str, v: Any) -> float:
+    try:
+        fv = float(v)
+    except Exception as e:
+        raise ValueError(f"{name} must be float (got={v!r})") from e
+    if fv != fv or fv in (float("inf"), float("-inf")):
+        raise ValueError(f"{name} must be finite (got={fv})")
+    return fv
+
+
+def _validate_ms_range(start_ms: Optional[int], end_ms: Optional[int]) -> None:
+    if start_ms is not None:
+        if not isinstance(start_ms, int) or start_ms <= 0:
+            raise ValueError("start_time_ms must be int > 0")
+    if end_ms is not None:
+        if not isinstance(end_ms, int) or end_ms <= 0:
+            raise ValueError("end_time_ms must be int > 0")
+    if start_ms is not None and end_ms is not None and end_ms < start_ms:
+        raise ValueError("end_time_ms must be >= start_time_ms")
+
+
+def _validate_period(period: str) -> str:
+    p = str(period).strip()
+    if not p:
+        raise ValueError("period is empty")
+    # Binance futures data endpoints accepted values (common)
+    allowed = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+    if p not in allowed:
+        raise ValueError(f"period must be one of {sorted(allowed)} (got={p!r})")
+    return p
+
+
 def sync_server_time() -> int:
     """Sync Binance server time and return offset in milliseconds.
 
     Calls GET /fapi/v1/time, computes server-local offset using midpoint
     to reduce RTT skew.
-
-    Raises:
-        RuntimeError: network/HTTP/JSON errors.
     """
     global _SERVER_TIME_OFFSET_MS, _TIME_SYNCED, _LAST_TIME_SYNC_AT
 
-    # midpoint method to reduce RTT skew
     t0 = time.time()
     data = req("GET", "/fapi/v1/time", private=False)
     t1 = time.time()
@@ -172,11 +238,7 @@ def sync_server_time() -> int:
     if not isinstance(data, dict) or "serverTime" not in data:
         raise RuntimeError("GET /fapi/v1/time -> unexpected response shape")
 
-    try:
-        server_ms = int(data["serverTime"])
-    except (TypeError, ValueError):
-        raise RuntimeError("GET /fapi/v1/time -> invalid serverTime")
-
+    server_ms = _require_int("serverTime", data["serverTime"])
     local_mid_ms = int(((t0 + t1) / 2.0) * 1000)
     offset_ms = server_ms - local_mid_ms
 
@@ -189,12 +251,10 @@ def sync_server_time() -> int:
 
 
 def sync_server_time_offset() -> int:
-    """Backward-compatible alias for sync_server_time()."""
     return sync_server_time()
 
 
 def _ensure_time_sync(force: bool = False) -> None:
-    """Ensure server time is synced (raises on failure)."""
     global _TIME_SYNCED
     if force or (not _TIME_SYNCED) or (time.time() - _LAST_TIME_SYNC_AT > _TIME_SYNC_TTL_SEC):
         sync_server_time()
@@ -219,22 +279,11 @@ def req(
     Private:
         - Adds timestamp/recvWindow, signs query, sends X-MBX-APIKEY header.
 
-    Args:
-        method: HTTP method (GET/POST/DELETE/PUT).
-        path: REST path (must start with /fapi/).
-        params: Query parameters (Binance expects form-style params).
-        body: Unused. Kept for compatibility with older call sites.
-        private: True for signed endpoints.
-        timeout_sec: Request timeout in seconds.
-
-    Returns:
-        Parsed JSON (dict/list).
-
-    Raises:
-        ValueError: invalid inputs.
-        RuntimeError: network/HTTP/JSON/Binance error codes.
+    STRICT endpoint policy:
+        - private=True: only /fapi/*
+        - private=False: /fapi/* and /futures/data/* allowed
     """
-    _ = body  # explicitly unused (kept for signature compatibility)
+    _ = body  # explicitly unused
 
     m = str(method).upper().strip()
     if m not in {"GET", "POST", "PUT", "DELETE"}:
@@ -244,20 +293,21 @@ def req(
     if not p.startswith("/"):
         p = "/" + p
 
-    # STRICT: Binance USDT-M Futures only
-    if not p.startswith("/fapi/"):
-        raise ValueError(f"only /fapi/* endpoints are allowed: {p}")
+    if private:
+        if not p.startswith(_ALLOWED_PRIVATE_PREFIX):
+            raise ValueError(f"private endpoints must be /fapi/* (got={p})")
+    else:
+        if not any(p.startswith(pref) for pref in _ALLOWED_PUBLIC_PREFIXES):
+            raise ValueError(f"public endpoints must be /fapi/* or /futures/data/* (got={p})")
 
-    if timeout_sec <= 0:
-        raise ValueError("timeout_sec must be positive")
+    if not isinstance(timeout_sec, int) or timeout_sec <= 0:
+        raise ValueError("timeout_sec must be positive int")
 
     q_params: Dict[str, Any] = dict(params or {})
-
     headers: Dict[str, str] = {}
-    if private:
-        _ensure_credentials()
-        _ensure_time_sync()
 
+    if private:
+        _ensure_time_sync()
         q_params.setdefault("recvWindow", RECV_WINDOW_MS)
         q_params["timestamp"] = _ts_ms()
 
@@ -275,10 +325,10 @@ def req(
     try:
         resp = execute_with_retry(_do)
     except requests.RequestException as e:
+        # Sanitize: do not include URL (contains signature for private)
         raise RuntimeError(f"{m} {p} -> request failed: {e.__class__.__name__}") from None
 
     if resp.status_code != 200:
-        # Sanitize: do not include URL (contains signature)
         try:
             err = resp.json()
         except Exception:
@@ -295,7 +345,6 @@ def req(
     except Exception as e:
         raise RuntimeError(f"{m} {p} -> invalid json: {e.__class__.__name__}") from None
 
-    # Some endpoints may return 200 with error-style payload
     if isinstance(data, dict) and isinstance(data.get("code"), int) and int(data["code"]) < 0:
         raise RuntimeError(f"{m} {p} -> binance code={data.get('code')}, msg={data.get('msg')}")
 
@@ -303,52 +352,228 @@ def req(
 
 
 def assert_one_way_mode() -> None:
-    """
-    Ensure account is in One-way mode.
-    Raises RuntimeError if account is in Hedge mode.
-    """
+    """Ensure account is in One-way mode. Raises RuntimeError if account is in Hedge mode."""
     data = req("GET", "/fapi/v1/positionSide/dual", private=True)
-
     if not isinstance(data, dict):
         raise RuntimeError("positionSide/dual unexpected response")
-
     if data.get("dualSidePosition") is True:
         raise RuntimeError("Account is in HEDGE mode. Switch Binance Futures to ONE-WAY mode.")
 
 
-# -----------------------------------------------------------------------------
-# Public endpoints
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# Public endpoints (exchange / microstructure)
+# -----------------------------------------------------------------------------#
 def get_exchange_info(symbol: Optional[str] = None) -> Dict[str, Any]:
-    """Get futures exchange info (symbol filters, tick/step, etc.)."""
     params: Dict[str, Any] = {}
-    if symbol:
+    if symbol is not None:
         params["symbol"] = _normalize_symbol(symbol)
 
     data = req("GET", "/fapi/v1/exchangeInfo", params or None, private=False)
-
     if not isinstance(data, dict):
         raise RuntimeError("GET /fapi/v1/exchangeInfo -> unexpected response shape")
     return data
 
 
-# -----------------------------------------------------------------------------
+def get_premium_index(symbol: str) -> Dict[str, Any]:
+    """Public: premium index (mark/index + funding info) via /fapi/v1/premiumIndex."""
+    s = _normalize_symbol(symbol)
+    data = req("GET", "/fapi/v1/premiumIndex", {"symbol": s}, private=False)
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError("GET /fapi/v1/premiumIndex -> unexpected response shape")
+    return data
+
+
+def get_current_funding_rate(symbol: str) -> float:
+    """Public: current funding rate from premiumIndex.lastFundingRate."""
+    d = get_premium_index(symbol)
+    if "lastFundingRate" not in d:
+        raise RuntimeError("premiumIndex.lastFundingRate missing")
+    return _require_float("lastFundingRate", d["lastFundingRate"])
+
+
+def get_funding_rate_history(
+    symbol: str,
+    *,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    """Public: funding rate history via /fapi/v1/fundingRate."""
+    s = _normalize_symbol(symbol)
+    if not isinstance(limit, int) or limit <= 0 or limit > 1000:
+        raise ValueError("limit must be int in [1, 1000]")
+    _validate_ms_range(start_time_ms, end_time_ms)
+
+    params: Dict[str, Any] = {"symbol": s, "limit": limit}
+    if start_time_ms is not None:
+        params["startTime"] = start_time_ms
+    if end_time_ms is not None:
+        params["endTime"] = end_time_ms
+
+    data = req("GET", "/fapi/v1/fundingRate", params, private=False)
+    if not isinstance(data, list):
+        raise RuntimeError("GET /fapi/v1/fundingRate -> unexpected response shape")
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"fundingRate[{i}] is not dict (STRICT)")
+        out.append(row)
+    return out
+
+
+def get_open_interest(symbol: str) -> float:
+    """Public: current open interest via /fapi/v1/openInterest."""
+    s = _normalize_symbol(symbol)
+    data = req("GET", "/fapi/v1/openInterest", {"symbol": s}, private=False)
+    if not isinstance(data, dict) or "openInterest" not in data:
+        raise RuntimeError("GET /fapi/v1/openInterest -> unexpected response shape")
+    return _require_float("openInterest", data["openInterest"])
+
+
+def get_open_interest_hist(
+    symbol: str,
+    *,
+    period: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """Public: open interest history via /futures/data/openInterestHist."""
+    s = _normalize_symbol(symbol)
+    p = _validate_period(period)
+    if not isinstance(limit, int) or limit <= 0 or limit > 500:
+        raise ValueError("limit must be int in [1, 500]")
+    _validate_ms_range(start_time_ms, end_time_ms)
+
+    params: Dict[str, Any] = {"symbol": s, "period": p, "limit": limit}
+    if start_time_ms is not None:
+        params["startTime"] = start_time_ms
+    if end_time_ms is not None:
+        params["endTime"] = end_time_ms
+
+    data = req("GET", "/futures/data/openInterestHist", params, private=False)
+    if not isinstance(data, list):
+        raise RuntimeError("GET /futures/data/openInterestHist -> unexpected response shape")
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"openInterestHist[{i}] is not dict (STRICT)")
+        out.append(row)
+    return out
+
+
+def get_global_long_short_account_ratio(
+    symbol: str,
+    *,
+    period: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """Public: global long/short account ratio via /futures/data/globalLongShortAccountRatio."""
+    s = _normalize_symbol(symbol)
+    p = _validate_period(period)
+    if not isinstance(limit, int) or limit <= 0 or limit > 500:
+        raise ValueError("limit must be int in [1, 500]")
+    _validate_ms_range(start_time_ms, end_time_ms)
+
+    params: Dict[str, Any] = {"symbol": s, "period": p, "limit": limit}
+    if start_time_ms is not None:
+        params["startTime"] = start_time_ms
+    if end_time_ms is not None:
+        params["endTime"] = end_time_ms
+
+    data = req("GET", "/futures/data/globalLongShortAccountRatio", params, private=False)
+    if not isinstance(data, list):
+        raise RuntimeError("GET /futures/data/globalLongShortAccountRatio -> unexpected response shape")
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"globalLongShortAccountRatio[{i}] is not dict (STRICT)")
+        out.append(row)
+    return out
+
+
+def get_top_long_short_account_ratio(
+    symbol: str,
+    *,
+    period: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """Public: top long/short account ratio via /futures/data/topLongShortAccountRatio."""
+    s = _normalize_symbol(symbol)
+    p = _validate_period(period)
+    if not isinstance(limit, int) or limit <= 0 or limit > 500:
+        raise ValueError("limit must be int in [1, 500]")
+    _validate_ms_range(start_time_ms, end_time_ms)
+
+    params: Dict[str, Any] = {"symbol": s, "period": p, "limit": limit}
+    if start_time_ms is not None:
+        params["startTime"] = start_time_ms
+    if end_time_ms is not None:
+        params["endTime"] = end_time_ms
+
+    data = req("GET", "/futures/data/topLongShortAccountRatio", params, private=False)
+    if not isinstance(data, list):
+        raise RuntimeError("GET /futures/data/topLongShortAccountRatio -> unexpected response shape")
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"topLongShortAccountRatio[{i}] is not dict (STRICT)")
+        out.append(row)
+    return out
+
+
+def get_top_long_short_position_ratio(
+    symbol: str,
+    *,
+    period: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """Public: top long/short position ratio via /futures/data/topLongShortPositionRatio."""
+    s = _normalize_symbol(symbol)
+    p = _validate_period(period)
+    if not isinstance(limit, int) or limit <= 0 or limit > 500:
+        raise ValueError("limit must be int in [1, 500]")
+    _validate_ms_range(start_time_ms, end_time_ms)
+
+    params: Dict[str, Any] = {"symbol": s, "period": p, "limit": limit}
+    if start_time_ms is not None:
+        params["startTime"] = start_time_ms
+    if end_time_ms is not None:
+        params["endTime"] = end_time_ms
+
+    data = req("GET", "/futures/data/topLongShortPositionRatio", params, private=False)
+    if not isinstance(data, list):
+        raise RuntimeError("GET /futures/data/topLongShortPositionRatio -> unexpected response shape")
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"topLongShortPositionRatio[{i}] is not dict (STRICT)")
+        out.append(row)
+    return out
+
+
+# -----------------------------------------------------------------------------#
 # Private endpoints (account/positions/orders/settings)
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
 def get_balance() -> List[Dict[str, Any]]:
-    """Get futures account balance (list of assets)."""
     data = req("GET", "/fapi/v2/balance", {}, private=True)
     if not isinstance(data, list):
         raise RuntimeError("GET /fapi/v2/balance -> unexpected response shape")
     out: List[Dict[str, Any]] = []
-    for row in data:
-        if isinstance(row, dict):
-            out.append(row)
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"balance[{i}] is not dict (STRICT)")
+        out.append(row)
     return out
 
 
 def get_balance_detail(asset: str = "USDT") -> Dict[str, Any]:
-    """Get balance row for a specific asset (default: USDT)."""
     asset_u = str(asset).upper().strip()
     if not asset_u:
         raise ValueError("asset is empty")
@@ -361,90 +586,75 @@ def get_balance_detail(asset: str = "USDT") -> Dict[str, Any]:
 
 
 def get_available_usdt() -> float:
-    """Get available USDT balance as float (availableBalance)."""
     row = get_balance_detail("USDT")
-    try:
-        return float(row.get("availableBalance"))
-    except (TypeError, ValueError):
-        raise RuntimeError("USDT availableBalance parse failed")
+    if "availableBalance" not in row:
+        raise RuntimeError("USDT availableBalance missing")
+    return _require_float("availableBalance", row["availableBalance"])
 
 
 def _fetch_position_risk_raw(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Fetch raw positionRisk list (may include zero positions)."""
     params: Dict[str, Any] = {}
-    if symbol:
+    if symbol is not None:
         params["symbol"] = _normalize_symbol(symbol)
 
     data = req("GET", "/fapi/v2/positionRisk", params or None, private=True)
-    if isinstance(data, dict):
-        if "raw" in data and isinstance(data["raw"], list):
-            data = data["raw"]
+    if isinstance(data, dict) and "raw" in data:
+        raw = data.get("raw")
+        if not isinstance(raw, list):
+            raise RuntimeError("positionRisk.raw is not list (STRICT)")
+        data = raw
 
     if not isinstance(data, list):
         raise RuntimeError("GET /fapi/v2/positionRisk -> unexpected response shape")
 
     out: List[Dict[str, Any]] = []
-    for row in data:
-        if isinstance(row, dict):
-            out.append(row)
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"positionRisk[{i}] is not dict (STRICT)")
+        out.append(row)
     return out
 
 
 def fetch_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Fetch open positions (positionAmt != 0) for a symbol or all symbols."""
     rows = _fetch_position_risk_raw(symbol)
     open_rows: List[Dict[str, Any]] = []
     for row in rows:
-        try:
-            amt = float(row.get("positionAmt", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            raise RuntimeError("positionAmt parse failed")
+        if "positionAmt" not in row:
+            raise RuntimeError("positionAmt missing in positionRisk row (STRICT)")
+        amt = _require_float("positionAmt", row["positionAmt"])
         if amt != 0.0:
             open_rows.append(row)
     return open_rows
 
 
 def get_position(symbol: str) -> Dict[str, Any]:
-    """Get positionRisk for a specific symbol."""
     s = _normalize_symbol(symbol)
     rows = _fetch_position_risk_raw(s)
     if not rows:
         raise RuntimeError(f"position not found for symbol={s}")
-
-    # One-way mode only: Binance returns a single row per symbol.
     return rows[0]
 
 
 def get_open_orders(symbol: str) -> List[Dict[str, Any]]:
-    """Get open orders for a symbol."""
     s = _normalize_symbol(symbol)
     data = req("GET", "/fapi/v1/openOrders", {"symbol": s}, private=True)
     if not isinstance(data, list):
         raise RuntimeError("GET /fapi/v1/openOrders -> unexpected response shape")
     out: List[Dict[str, Any]] = []
-    for row in data:
-        if isinstance(row, dict):
-            out.append(row)
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"openOrders[{i}] is not dict (STRICT)")
+        out.append(row)
     return out
 
 
 def fetch_open_orders(symbol: str) -> List[Dict[str, Any]]:
-    """Backward-compatible alias for get_open_orders()."""
     return get_open_orders(symbol)
 
 
 def get_order(symbol: str, order_id: int | str) -> Dict[str, Any]:
-    """
-    STRICT: orderId로 단일 주문 조회 (/fapi/v1/order)
-
-    - TP/SL 체결 확인, 재시작 복구, 청산 원인 확정에 사용.
-    - 응답 shape이 dict가 아니면 즉시 예외.
-    """
     s = _normalize_symbol(symbol)
-    try:
-        oid = int(order_id)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid order_id: {order_id!r}")
+    oid = _require_int("order_id", order_id)
 
     data = req("GET", "/fapi/v1/order", {"symbol": s, "orderId": oid}, private=True)
     if not isinstance(data, dict):
@@ -453,11 +663,6 @@ def get_order(symbol: str, order_id: int | str) -> Dict[str, Any]:
 
 
 def get_order_by_client_id(symbol: str, client_order_id: str) -> Dict[str, Any]:
-    """
-    STRICT: origClientOrderId로 단일 주문 조회 (/fapi/v1/order)
-
-    - deterministic clientOrderId 기반 멱등성 검증에 사용.
-    """
     s = _normalize_symbol(symbol)
     cid = str(client_order_id).strip()
     if not cid:
@@ -477,12 +682,6 @@ def get_user_trades(
     end_time_ms: Optional[int] = None,
     limit: int = 1000,
 ) -> List[Dict[str, Any]]:
-    """
-    STRICT: 체결(userTrades) 조회 (/fapi/v1/userTrades)
-
-    - order_id를 주면 해당 주문에 귀속된 체결 내역을 직접 조회(추정/룩백 폴백 금지)
-    - start/end는 선택(재시작 복구/부분청산 분석 시 사용)
-    """
     s = _normalize_symbol(symbol)
     if not isinstance(limit, int) or limit <= 0 or limit > 1000:
         raise ValueError("limit must be int in [1, 1000]")
@@ -490,41 +689,28 @@ def get_user_trades(
     params: Dict[str, Any] = {"symbol": s, "limit": limit}
 
     if order_id is not None:
-        try:
-            params["orderId"] = int(order_id)
-        except (TypeError, ValueError):
-            raise ValueError(f"invalid order_id: {order_id!r}")
+        params["orderId"] = _require_int("order_id", order_id)
 
+    _validate_ms_range(start_time_ms, end_time_ms)
     if start_time_ms is not None:
-        if not isinstance(start_time_ms, int) or start_time_ms <= 0:
-            raise ValueError("start_time_ms must be int > 0")
         params["startTime"] = start_time_ms
-
     if end_time_ms is not None:
-        if not isinstance(end_time_ms, int) or end_time_ms <= 0:
-            raise ValueError("end_time_ms must be int > 0")
         params["endTime"] = end_time_ms
-
-    if start_time_ms is not None and end_time_ms is not None and end_time_ms < start_time_ms:
-        raise ValueError("end_time_ms must be >= start_time_ms")
 
     data = req("GET", "/fapi/v1/userTrades", params, private=True)
     if not isinstance(data, list):
         raise RuntimeError("GET /fapi/v1/userTrades -> unexpected response shape")
     out: List[Dict[str, Any]] = []
-    for row in data:
-        if isinstance(row, dict):
-            out.append(row)
+    for i, row in enumerate(data):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"userTrades[{i}] is not dict (STRICT)")
+        out.append(row)
     return out
 
 
 def cancel_order(symbol: str, order_id: int | str) -> Dict[str, Any]:
-    """Cancel an order by orderId."""
     s = _normalize_symbol(symbol)
-    try:
-        oid = int(order_id)
-    except (TypeError, ValueError):
-        raise ValueError(f"invalid order_id: {order_id!r}")
+    oid = _require_int("order_id", order_id)
 
     data = req("DELETE", "/fapi/v1/order", {"symbol": s, "orderId": oid}, private=True)
     if not isinstance(data, dict):
@@ -533,12 +719,9 @@ def cancel_order(symbol: str, order_id: int | str) -> Dict[str, Any]:
 
 
 def set_leverage(symbol: str, leverage: int) -> Dict[str, Any]:
-    """Set leverage for a symbol."""
     s = _normalize_symbol(symbol)
-    if not isinstance(leverage, int):
-        raise ValueError("leverage must be int")
-    if leverage <= 0:
-        raise ValueError("leverage must be positive")
+    if not isinstance(leverage, int) or leverage <= 0:
+        raise ValueError("leverage must be positive int")
 
     data = req("POST", "/fapi/v1/leverage", {"symbol": s, "leverage": leverage}, private=True)
     if not isinstance(data, dict):
@@ -547,10 +730,8 @@ def set_leverage(symbol: str, leverage: int) -> Dict[str, Any]:
 
 
 def set_margin_mode(symbol: str, mode: str) -> Dict[str, Any]:
-    """Set margin mode for a symbol (ISOLATED or CROSSED)."""
     s = _normalize_symbol(symbol)
     mode_u = str(mode).upper().strip()
-
     if mode_u in {"CROSS", "CROSSED"}:
         mode_u = "CROSSED"
     if mode_u not in {"ISOLATED", "CROSSED"}:
@@ -563,22 +744,15 @@ def set_margin_mode(symbol: str, mode: str) -> Dict[str, Any]:
 
 
 def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> None:
-    """Backward-compatible helper to set leverage and margin mode (state-verified)."""
-    if not isinstance(leverage, int):
-        raise ValueError("leverage must be int")
-    if leverage <= 0:
-        raise ValueError("leverage must be positive")
+    if not isinstance(leverage, int) or leverage <= 0:
+        raise ValueError("leverage must be positive int")
 
     s = _normalize_symbol(symbol)
     current = get_position(s)
 
     if "leverage" not in current:
         raise RuntimeError("positionRisk.leverage is missing")
-    try:
-        current_leverage = int(current["leverage"])
-    except (TypeError, ValueError):
-        raise RuntimeError(f"positionRisk.leverage parse failed: {current.get('leverage')!r}")
-
+    current_leverage = _require_int("positionRisk.leverage", current["leverage"])
     current_margin = _normalize_margin_type(current.get("marginType"))
 
     target_leverage = leverage
@@ -596,11 +770,23 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 __all__ = [
+    # core
     "req",
     "sync_server_time",
     "sync_server_time_offset",
     "assert_one_way_mode",
+    # exchange
     "get_exchange_info",
+    # microstructure (public)
+    "get_premium_index",
+    "get_current_funding_rate",
+    "get_funding_rate_history",
+    "get_open_interest",
+    "get_open_interest_hist",
+    "get_global_long_short_account_ratio",
+    "get_top_long_short_account_ratio",
+    "get_top_long_short_position_ratio",
+    # account/positions/orders
     "get_balance",
     "get_balance_detail",
     "get_available_usdt",
@@ -612,6 +798,7 @@ __all__ = [
     "get_order_by_client_id",
     "get_user_trades",
     "cancel_order",
+    # settings
     "set_leverage",
     "set_margin_mode",
     "set_leverage_and_mode",
