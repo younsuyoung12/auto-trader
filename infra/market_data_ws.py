@@ -1,7 +1,8 @@
+# infra/market_data_ws.py
 """
 ========================================================
-infra/market_data_ws.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+FILE: infra/market_data_ws.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할:
 - Binance USDT-M Futures WebSocket(multiplex /stream)으로부터
@@ -13,24 +14,26 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 핵심 원칙 (STRICT · NO-FALLBACK):
 - WS 원본 데이터는 보정/추정/REST 폴백 없이 그대로 버퍼링한다.
 - 데이터 누락/손상은 "정상 상태"로 취급하지 않는다. (health에서 FAIL)
-- 더미 값 생성/None→0 치환 금지.
+- 더미 값 생성/None→0 치환/행 단위 조용한 skip 금지.
+- 환경변수 직접 접근 금지: 이 모듈은 settings(SSOT)만 사용한다.
 
-PATCH NOTES — 2026-03-02 (PATCH)
-1) 레거시 호환 복구:
-   - get_klines / get_last_kline_ts / get_last_kline_delay_ms 유지
-2) health FAIL 원인 가시화:
-   - get_health_snapshot에 overall_reasons 포함
-   - overall_ok=False 시 원인 요약 로그(rate-limit)
-3) 장기 TF 최소버퍼 완화(운영 기준):
-   - 닫힌 캔들(x=True)만 저장 정책 때문에 1w/1M 등에 60개 기준은 비현실적
-   - long TF는 기본 2로 완화(설정 ws_min_kline_buffer_long_tf로 override 가능)
+변경 이력
+--------------------------------------------------------
+- 2026-03-03 (TRADE-GRADE):
+  1) ENV 직접 접근 제거:
+     - os.getenv("BINANCE_FUTURES_WS_BASE") 제거
+     - settings.ws_combined_base 를 단일 사용(SSOT)
+  2) 프로토콜 무결성 강화:
+     - kline/orderbook payload 불량(필수 필드 누락, 숫자 파싱 불가 등) 시 WSProtocolError로 연결 종료
+     - “로그만 남기고 무시” 방식 제거(조용한 데이터 손상 금지)
+  3) REST backfill 입력도 STRICT:
+     - backfill_klines_from_rest 에서 invalid row continue 제거 → 즉시 예외
 ========================================================
 """
 
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,9 +44,6 @@ from infra.telelog import log
 from settings import load_settings
 
 SET = load_settings()
-
-_ws_base = os.getenv("BINANCE_FUTURES_WS_BASE")
-WS_BASE_URL = (_ws_base.strip() if _ws_base and _ws_base.strip() else "wss://fstream.binance.com/stream")
 
 DEFAULT_INTERVALS: List[str] = [
     "1m",
@@ -64,7 +64,7 @@ DEFAULT_INTERVALS: List[str] = [
 
 
 class WSProtocolError(RuntimeError):
-    """Binance multiplex payload protocol violation."""
+    """Binance multiplex payload protocol violation (STRICT)."""
 
 
 def _now_ms() -> int:
@@ -102,6 +102,41 @@ def _to_stream_symbol(sym: str) -> str:
     return _normalize_symbol(sym).lower()
 
 
+def _require_int_ms(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise WSProtocolError(f"{name} must be int ms (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise WSProtocolError(f"{name} must be int ms: {e}") from e
+    if iv <= 0:
+        raise WSProtocolError(f"{name} must be > 0")
+    return iv
+
+
+def _require_float(v: Any, name: str, *, allow_zero: bool = False) -> float:
+    if v is None:
+        raise WSProtocolError(f"{name} missing")
+    if isinstance(v, bool):
+        raise WSProtocolError(f"{name} must be float (bool not allowed)")
+    try:
+        fv = float(v)
+    except Exception as e:
+        raise WSProtocolError(f"{name} must be float: {e}") from e
+    if not (fv == fv) or fv in (float("inf"), float("-inf")):
+        raise WSProtocolError(f"{name} must be finite")
+    if allow_zero:
+        if fv < 0:
+            raise WSProtocolError(f"{name} must be >= 0")
+    else:
+        if fv <= 0:
+            raise WSProtocolError(f"{name} must be > 0")
+    return float(fv)
+
+
+# ─────────────────────────────────────────────
+# Streams / URL (SSOT)
+# ─────────────────────────────────────────────
 WS_INTERVALS: List[str] = [_normalize_interval(x) for x in (list(getattr(SET, "ws_subscribe_tfs", None) or DEFAULT_INTERVALS))]
 WS_INTERVALS = [x for x in WS_INTERVALS if x]
 
@@ -119,6 +154,24 @@ if _missing_required:
         "ws_required_tfs contains intervals not present in ws_subscribe_tfs. "
         f"missing={_missing_required}. Fix your settings to subscribe required intervals."
     )
+
+# TRADE-GRADE: multiplex base는 settings에서만 받는다.
+_WS_COMBINED_BASE = str(getattr(SET, "ws_combined_base", "") or "").strip()
+if not _WS_COMBINED_BASE:
+    raise RuntimeError("settings.ws_combined_base is required (STRICT)")
+
+# 기대 형태: ".../stream?streams="
+if "?streams=" not in _WS_COMBINED_BASE:
+    # 허용: ".../stream" 이면 suffix 부여
+    if _WS_COMBINED_BASE.endswith("/stream"):
+        _WS_COMBINED_BASE = _WS_COMBINED_BASE + "?streams="
+    else:
+        raise RuntimeError(f"settings.ws_combined_base must contain '?streams=' (STRICT): {_WS_COMBINED_BASE!r}")
+
+if not _WS_COMBINED_BASE.endswith("streams="):
+    # "?streams=" 다음에 아무 문자열이 붙어있으면 위험. (URL 구성 깨짐)
+    raise RuntimeError(f"settings.ws_combined_base must end with 'streams=' (STRICT): {_WS_COMBINED_BASE!r}")
+
 
 KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 60))
 KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 120.0))
@@ -169,7 +222,7 @@ def _build_stream_names(symbol: str) -> List[str]:
 
 def _build_ws_url(symbol: str) -> str:
     streams = _build_stream_names(symbol)
-    return f"{WS_BASE_URL}?streams={'/'.join(streams)}"
+    return f"{_WS_COMBINED_BASE}{'/'.join(streams)}"
 
 
 def _decode_msg(raw: Any) -> Any:
@@ -192,24 +245,13 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
 
     key = (sym, iv)
 
-    try:
-        ts = int(kline_obj.get("t") or 0)
-    except Exception:
-        ts = 0
-
-    if ts <= 0:
-        log(f"[MD_BINANCE_WS WARN] invalid kline ts for {sym} {iv}: payload={_safe_dump_for_log(kline_obj)}")
-        return
-
-    try:
-        o = float(kline_obj.get("o"))
-        h = float(kline_obj.get("h"))
-        l = float(kline_obj.get("l"))
-        c = float(kline_obj.get("c"))
-        v = float(kline_obj.get("v"))
-    except Exception:
-        log(f"[MD_BINANCE_WS WARN] invalid kline numeric fields for {sym} {iv}: payload={_safe_dump_for_log(kline_obj)}")
-        return
+    # STRICT: 필수 필드/파싱 실패는 프로토콜 에러로 처리
+    ts = _require_int_ms(kline_obj.get("t"), "kline.t")
+    o = _require_float(kline_obj.get("o"), "kline.o")
+    h = _require_float(kline_obj.get("h"), "kline.h")
+    l = _require_float(kline_obj.get("l"), "kline.l")
+    c = _require_float(kline_obj.get("c"), "kline.c")
+    v = _require_float(kline_obj.get("v"), "kline.v", allow_zero=True)
 
     is_closed = bool(kline_obj.get("x", False))
 
@@ -227,51 +269,57 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
                     del buf[0 : len(buf) - MAX_KLINES]
 
 
-def _normalize_depth_side(side_val: Any) -> List[List[float]]:
-    if not side_val:
-        return []
+def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
+    """
+    STRICT:
+    - depth levels는 [price, qty] 또는 {"price":..., "qty":...} 형태만 허용
+    - price > 0, qty > 0, finite
+    - 파싱 불가/불량 값이 하나라도 있으면 프로토콜 에러
+    """
+    if side_val is None:
+        raise WSProtocolError(f"{name} missing")
+    if not isinstance(side_val, (list, tuple)):
+        raise WSProtocolError(f"{name} must be list/tuple")
+
     out: List[List[float]] = []
-    for row in side_val:
+    for i, row in enumerate(side_val):
         if isinstance(row, (list, tuple)) and len(row) >= 2:
-            try:
-                price = float(row[0])
-                qty = float(row[1])
-                if price <= 0 or qty <= 0:
-                    continue
-                out.append([price, qty])
-            except Exception:
-                continue
-        elif isinstance(row, dict):
-            try:
-                price = float(row.get("price"))
-                qty = float(row.get("qty"))
-                if price <= 0 or qty <= 0:
-                    continue
-                out.append([price, qty])
-            except Exception:
-                continue
+            p = _require_float(row[0], f"{name}[{i}].price")
+            q = _require_float(row[1], f"{name}[{i}].qty")
+            out.append([p, q])
+            continue
+        if isinstance(row, dict):
+            p = _require_float(row.get("price"), f"{name}[{i}].price")
+            q = _require_float(row.get("qty"), f"{name}[{i}].qty")
+            out.append([p, q])
+            continue
+        raise WSProtocolError(f"{name}[{i}] invalid level type: {type(row).__name__}")
+
+    if not out:
+        raise WSProtocolError(f"{name} empty after parse (STRICT)")
     return out
 
 
-def _compute_best_prices(bids: List[List[float]], asks: List[List[float]]) -> Optional[Tuple[float, float]]:
+def _compute_best_prices_strict(bids: List[List[float]], asks: List[List[float]]) -> Tuple[float, float]:
     if not bids or not asks:
-        return None
-    try:
-        best_bid = max(float(r[0]) for r in bids if isinstance(r, list) and len(r) >= 2)
-        best_ask = min(float(r[0]) for r in asks if isinstance(r, list) and len(r) >= 2)
-    except Exception:
-        return None
+        raise WSProtocolError("bids/asks empty (STRICT)")
+    best_bid = max(float(r[0]) for r in bids)
+    best_ask = min(float(r[0]) for r in asks)
     if best_bid <= 0 or best_ask <= 0:
-        return None
-    return best_bid, best_ask
-
-
-def _compute_spread_pct(best_bid: float, best_ask: float) -> Optional[float]:
-    if best_bid <= 0 or best_ask <= 0:
-        return None
+        raise WSProtocolError("best prices invalid (STRICT)")
     if best_ask <= best_bid:
-        return None
+        raise WSProtocolError("crossed book (bestAsk<=bestBid) (STRICT)")
+    return float(best_bid), float(best_ask)
+
+
+def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
+    if best_bid <= 0 or best_ask <= 0:
+        raise WSProtocolError("best prices invalid for spread (STRICT)")
+    if best_ask <= best_bid:
+        raise WSProtocolError("crossed book for spread (STRICT)")
     mid = (best_bid + best_ask) / 2.0
+    if mid <= 0:
+        raise WSProtocolError("mid invalid (STRICT)")
     return (best_ask - best_bid) / mid * 100.0
 
 
@@ -283,42 +331,31 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
     raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
 
-    normalized_bids = _normalize_depth_side(raw_bids or [])
-    normalized_asks = _normalize_depth_side(raw_asks or [])
+    normalized_bids = _normalize_depth_side_strict(raw_bids, name="orderbook.bids")
+    normalized_asks = _normalize_depth_side_strict(raw_asks, name="orderbook.asks")
 
     now_ms = _now_ms()
 
-    best_bid = None
-    best_ask = None
-    spread_pct = None
+    best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
+    spread_pct = _compute_spread_pct(best_bid, best_ask)
 
-    best = _compute_best_prices(normalized_bids, normalized_asks)
-    if best is not None:
-        best_bid, best_ask = best
-        spread_pct = _compute_spread_pct(best_bid, best_ask)
-
-    ob: Dict[str, Any] = {"bids": normalized_bids, "asks": normalized_asks, "ts": now_ms}
+    ob: Dict[str, Any] = {
+        "bids": normalized_bids,
+        "asks": normalized_asks,
+        "ts": now_ms,  # 로컬 수신 시각(필수)
+        "bestBid": best_bid,
+        "bestAsk": best_ask,
+        "spreadPct": spread_pct,
+    }
 
     last_update_id = payload.get("u") if payload.get("u") is not None else payload.get("lastUpdateId")
     if last_update_id is not None:
-        try:
-            ob["lastUpdateId"] = int(last_update_id)
-        except Exception:
-            ob["lastUpdateId"] = last_update_id
+        ob["lastUpdateId"] = int(last_update_id)  # 실패하면 예외(STRICT)
 
+    # Binance depth event time
     exch_ts = payload.get("E") or payload.get("T")
     if exch_ts is not None:
-        try:
-            ob["exchTs"] = int(exch_ts)
-        except Exception:
-            pass
-
-    if best_bid is not None:
-        ob["bestBid"] = best_bid
-    if best_ask is not None:
-        ob["bestAsk"] = best_ask
-    if spread_pct is not None:
-        ob["spreadPct"] = spread_pct
+        ob["exchTs"] = _require_int_ms(exch_ts, "orderbook.exchTs")
 
     with _orderbook_lock:
         _orderbook_buffers[sym] = ob
@@ -326,12 +363,12 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
 
 def _handle_single_msg(expected_symbol: str, data: Any) -> None:
     if not isinstance(data, dict):
-        return
+        raise WSProtocolError("message item must be dict (STRICT)")
 
     stream = data.get("stream")
     payload = data.get("data")
     if not isinstance(stream, str) or not isinstance(payload, dict):
-        return
+        raise WSProtocolError("multiplex message missing stream/data (STRICT)")
 
     sym = _normalize_symbol(expected_symbol)
     if not sym:
@@ -344,18 +381,14 @@ def _handle_single_msg(expected_symbol: str, data: Any) -> None:
 
         interval = str(k.get("i") or "").strip()
         if not interval:
-            try:
-                interval = stream.split("@kline_")[-1]
-            except Exception:
-                interval = ""
+            interval = stream.split("@kline_")[-1]
         interval = _normalize_interval(interval)
         if not interval:
             raise WSProtocolError(f"kline interval parse failed: stream={stream} payload={_safe_dump_for_log(payload)}")
 
         payload_symbol = _normalize_symbol(str(payload.get("s") or sym))
         if payload_symbol and payload_symbol != sym:
-            log(f"[MD_BINANCE_WS WARN] unexpected symbol (expected={sym}, got={payload_symbol}, stream={stream})")
-            return
+            raise WSProtocolError(f"unexpected symbol in stream (expected={sym}, got={payload_symbol})")
 
         _push_kline(sym, interval, k)
         return
@@ -364,12 +397,15 @@ def _handle_single_msg(expected_symbol: str, data: Any) -> None:
         _push_orderbook(sym, payload)
         return
 
+    # 알 수 없는 stream은 프로토콜 위반으로 처리
+    raise WSProtocolError(f"unknown stream type (STRICT): {stream}")
+
 
 def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
     try:
         data = _decode_msg(message)
     except Exception as e:
-        log(f"[MD_BINANCE_WS] decode error: {e}")
+        log(f"[MD_BINANCE_WS] decode error: {type(e).__name__}: {e}")
         try:
             ws.close()
         except Exception:
@@ -414,15 +450,32 @@ def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, floa
     if not iv:
         raise ValueError("interval is required")
 
+    # STRICT: preload rows 검증
+    cleaned: List[Tuple[int, float, float, float, float, float]] = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, (list, tuple)) or len(r) != 6:
+            raise RuntimeError(f"preload row[{i}] must be 6-tuple (STRICT)")
+        ts = _require_int_ms(r[0], f"preload[{i}].ts")
+        o = _require_float(r[1], f"preload[{i}].o")
+        h = _require_float(r[2], f"preload[{i}].h")
+        l = _require_float(r[3], f"preload[{i}].l")
+        c = _require_float(r[4], f"preload[{i}].c")
+        v = _require_float(r[5], f"preload[{i}].v", allow_zero=True)
+        cleaned.append((ts, o, h, l, c, v))
+
     key = (sym, iv)
     with _kline_lock:
-        trimmed = list(rows[-MAX_KLINES:])
+        trimmed = list(cleaned[-MAX_KLINES:])
         _kline_buffers[key] = trimmed
         if trimmed:
             _kline_last_recv_ts[key] = _now_ms()
 
 
 def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]) -> None:
+    """
+    STRICT:
+    - REST 입력이 불량이면 조용히 건너뛰지 않는다(부팅 무결성).
+    """
     sym = _normalize_symbol(symbol)
     iv = _normalize_interval(interval)
     if not sym:
@@ -430,45 +483,38 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
     if not iv:
         raise ValueError("interval is required")
 
-    converted: List[Tuple[int, float, float, float, float, float]] = []
-    for row in rest_klines:
-        try:
-            if isinstance(row, (list, tuple)):
-                if len(row) < 6:
-                    continue
-                ts = int(row[0])
-                o = float(row[1])
-                h = float(row[2])
-                l = float(row[3])
-                c = float(row[4])
-                v = float(row[5])
-            elif isinstance(row, dict):
-                ts = int(row.get("t") or row.get("openTime") or row.get("T") or 0)
-                o = float(row.get("o") or row.get("open"))
-                h = float(row.get("h") or row.get("high"))
-                l = float(row.get("l") or row.get("low"))
-                c = float(row.get("c") or row.get("close"))
-                v = float(row.get("v") or row.get("volume"))
-            else:
-                continue
+    if not isinstance(rest_klines, list):
+        raise RuntimeError("rest_klines must be list (STRICT)")
+    if not rest_klines:
+        raise RuntimeError("rest_klines empty (STRICT)")
 
-            if ts <= 0:
-                continue
-            if o <= 0 or h <= 0 or l <= 0 or c <= 0 or v < 0:
-                continue
-        except Exception:
+    converted: List[Tuple[int, float, float, float, float, float]] = []
+    for idx, row in enumerate(rest_klines):
+        if isinstance(row, (list, tuple)):
+            if len(row) < 6:
+                raise RuntimeError(f"rest_klines[{idx}] invalid len<{6} (STRICT)")
+            ts = _require_int_ms(row[0], f"rest_klines[{idx}].ts")
+            o = _require_float(row[1], f"rest_klines[{idx}].o")
+            h = _require_float(row[2], f"rest_klines[{idx}].h")
+            l = _require_float(row[3], f"rest_klines[{idx}].l")
+            c = _require_float(row[4], f"rest_klines[{idx}].c")
+            v = _require_float(row[5], f"rest_klines[{idx}].v", allow_zero=True)
+            converted.append((ts, o, h, l, c, v))
             continue
 
-        converted.append((ts, o, h, l, c, v))
+        if isinstance(row, dict):
+            ts = _require_int_ms(row.get("t") or row.get("openTime") or row.get("T"), f"rest_klines[{idx}].ts")
+            o = _require_float(row.get("o") or row.get("open"), f"rest_klines[{idx}].o")
+            h = _require_float(row.get("h") or row.get("high"), f"rest_klines[{idx}].h")
+            l = _require_float(row.get("l") or row.get("low"), f"rest_klines[{idx}].l")
+            c = _require_float(row.get("c") or row.get("close"), f"rest_klines[{idx}].c")
+            v = _require_float(row.get("v") or row.get("volume"), f"rest_klines[{idx}].v", allow_zero=True)
+            converted.append((ts, o, h, l, c, v))
+            continue
 
-    if not converted:
-        return
+        raise RuntimeError(f"rest_klines[{idx}] invalid type (STRICT): {type(row).__name__}")
 
-    try:
-        converted.sort(key=lambda x: x[0])
-    except Exception:
-        pass
-
+    converted.sort(key=lambda x: x[0])
     preload_klines(sym, iv, converted)
 
 
@@ -747,7 +793,7 @@ def start_ws_loop(symbol: str) -> None:
         while True:
             session_dur = 0.0
             try:
-                log(f"[MD_BINANCE_WS] connecting to {url} ...")
+                log(f"[MD_BINANCE_WS] connecting ... url={url}")
 
                 ws = websocket.WebSocketApp(
                     url,
@@ -763,7 +809,7 @@ def start_ws_loop(symbol: str) -> None:
                 log("[MD_BINANCE_WS] WS disconnected → retrying ...")
 
             except Exception as e:
-                log(f"[MD_BINANCE_WS] run_forever exception: {e}")
+                log(f"[MD_BINANCE_WS] run_forever exception: {type(e).__name__}: {e}")
 
             retry_wait = 1.0 if session_dur > 60.0 else min(retry_wait * 2.0, 10.0)
             log(f"[MD_BINANCE_WS] reconnecting after {retry_wait:.1f}s ...")

@@ -1,7 +1,8 @@
+# state/trader_state.py
 """
 ========================================================
 FILE: state/trader_state.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 역할
@@ -14,25 +15,30 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
   - 누락/모호/정합 실패 시 즉시 예외
   - “첫 번째 row 선택”, “0이면 qty로 대체”, “시간 없으면 임의로 보정” 같은 추정 금지
 - 민감정보(API키/토큰/DB비번 등) 로그/출력 금지
+- 환경변수 직접 접근 금지: os.getenv 사용 금지 → settings.py(SSOT)만 사용
+- 텔레그램 I/O는 비핵심: async_worker로 위임(실행 흐름을 블로킹하지 않음)
 
-PATCH NOTES — 2026-03-02 (PATCH)
-- (상태머신 연동) Trade.lifecycle_state 추가 및 check_closes에서 상태 검증/전이 적용
-  - ENTERED 상태만 close-check 허용
-  - 완전 청산 감지 시 SYNC_SET_CLOSED 전이
-- (NO-FALLBACK 강화)
-  - Trade.remaining_qty / last_synced_at / exchange_position_side 필수화(0/None 자동 보정 제거)
-  - positionRisk row 선택 시 “첫 row 폴백” 제거(유효 후보 없으면 즉시 예외)
-  - partial close reconciliation window 생성 시 start_ms 폴백 제거(유효하지 않으면 즉시 예외)
-- (9점대 핵심) 청산 요약 orderId 확정(STRICT)
-  - TP/SL orderId가 있으면 FILLED + userTrades(orderId)로 요약
-  - 그 외 케이스는 userTrades를 orderId로 그룹핑하여 “유일” 후보만 허용
+변경 이력
+--------------------------------------------------------
+- 2026-03-03 (TRADE-GRADE):
+  1) ENV 직접 접근 제거:
+     - os.getenv 기반 설정 읽기 제거(SLIPPAGE_MAX_TICKS, SLIPPAGE_MAX_NOTIONAL_PCT, STOP_ON_HEAVY_SLIPPAGE)
+     - settings(SSOT) 필드로만 사용하도록 변경
+  2) 폴백 제거/정합 강화:
+     - close_time_ms가 없으면 now_ms로 대체하지 않음 → 즉시 예외
+     - userTrades 요약에서 close_time(마지막 fill time) 필수화(없으면 예외)
+     - _utc_now()로 DB exit_ts를 임의 보정하지 않음 → close_time 기반만 사용
+  3) 텔레그램 비동기화:
+     - send_tg 직접 호출 제거 → async_worker submit으로 위임
+  4) 설정 의존성 명시:
+     - slippage_max_ticks / slippage_max_notional_pct / stop_on_heavy_slippage / max_tp_sl_reset_failures
+       가 Settings에 존재해야 함(없으면 즉시 예외)
 ========================================================
 """
 
 from __future__ import annotations
 
 import math
-import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,11 +47,29 @@ from typing import Any, Dict, List, Optional, Tuple
 from execution.exchange_api import fetch_open_positions, req
 from execution.exceptions import OrderFailed, StateViolation, SyncMismatch
 from execution.state_machine import TradeEvent, TradeLifecycleState, apply_event, get_state
+from infra.async_worker import submit as submit_async
 from infra.telelog import log, send_tg
 from settings import load_settings
 from state.db_writer import close_latest_open_trade_returning_id, record_trade_exit_snapshot
 
 SET = load_settings()
+
+
+# ─────────────────────────────────────────────────────────────
+# Telegram (non-blocking)
+# ─────────────────────────────────────────────────────────────
+def _submit_tg_nonblocking(msg: str) -> None:
+    """
+    STRICT:
+    - 텔레그램은 비핵심 I/O → async_worker로 위임
+    - 실패해도 핵심 흐름을 깨지 않는다(알림은 관측/운영 편의)
+    """
+    try:
+        ok = submit_async(send_tg, msg, critical=False, label="send_tg")
+        if not ok:
+            log(f"[TG][DROP] queue full: {msg}")
+    except Exception as e:
+        log(f"[TG][SUBMIT_FAIL] {type(e).__name__}: {e} | msg={msg}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -72,17 +96,16 @@ def _require_float(v: Any, name: str) -> float:
     return float(f)
 
 
-def _get_env_required_float(name: str) -> float:
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
-        raise OrderFailed(f"required env var missing: {name} (STRICT)")
+def _require_int(v: Any, name: str) -> int:
+    if v is None:
+        raise OrderFailed(f"{name} is required (STRICT)")
+    if isinstance(v, bool):
+        raise OrderFailed(f"{name} must be int (bool not allowed) (STRICT)")
     try:
-        v = float(raw)
+        i = int(v)
     except Exception as e:
-        raise OrderFailed(f"invalid env var {name}: {e} (STRICT)") from e
-    if not math.isfinite(v):
-        raise OrderFailed(f"invalid env var {name}: not finite (STRICT)")
-    return float(v)
+        raise OrderFailed(f"{name} must be int: {e} (STRICT)") from e
+    return i
 
 
 def _epoch_ms_to_dt_utc(ms: int) -> datetime:
@@ -100,10 +123,6 @@ def _dt_to_epoch_ms_utc(dt: datetime) -> int:
     if ms <= 0:
         raise OrderFailed("dt timestamp invalid (STRICT)")
     return ms
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -222,9 +241,14 @@ class TraderState:
         self.tp_sl_reset_failures = 0
 
     def should_stop_bot(self) -> bool:
-        max_fail = int(getattr(SET, "max_tp_sl_reset_failures", 999999))
+        if not hasattr(SET, "max_tp_sl_reset_failures"):
+            raise OrderFailed("settings.max_tp_sl_reset_failures missing (STRICT)")
+        max_fail = int(getattr(SET, "max_tp_sl_reset_failures"))
+        if max_fail < 0:
+            raise OrderFailed("settings.max_tp_sl_reset_failures must be >= 0 (STRICT)")
+
         if self.tp_sl_reset_failures >= max_fail:
-            send_tg(
+            _submit_tg_nonblocking(
                 "🚫 TP/SL 재설정 실패가 누적되었습니다.\n"
                 f"- 실패 횟수: {self.tp_sl_reset_failures}\n"
                 f"- 허용 한도: {max_fail}\n"
@@ -240,30 +264,22 @@ class TraderState:
 def evaluate_slippage(
     expected_entry: float,
     actual_entry: float,
-    tick_size: Optional[float] = None,
-    max_ticks: Optional[int] = None,
-    max_notional_pct: Optional[float] = None,
+    tick_size: float,
+    max_ticks: int,
+    max_notional_pct: float,
 ) -> Tuple[bool, str]:
     exp = _require_float(expected_entry, "expected_entry")
     act = _require_float(actual_entry, "actual_entry")
 
-    if tick_size is None:
-        raise OrderFailed("tick_size is required (symbol filter) (STRICT)")
     tick = _require_float(tick_size, "tick_size")
     if tick <= 0:
         raise OrderFailed("tick_size must be > 0 (STRICT)")
 
-    if max_ticks is None:
-        mt = getattr(SET, "slippage_max_ticks", None)
-        max_ticks = int(mt) if mt is not None else int(_get_env_required_float("SLIPPAGE_MAX_TICKS"))
+    if not isinstance(max_ticks, int) or max_ticks <= 0:
+        raise OrderFailed("max_ticks must be int > 0 (STRICT)")
 
-    if max_notional_pct is None:
-        mnp = getattr(SET, "slippage_max_notional_pct", None)
-        max_notional_pct = float(mnp) if mnp is not None else float(_get_env_required_float("SLIPPAGE_MAX_NOTIONAL_PCT"))
-
-    if max_ticks <= 0:
-        raise OrderFailed("max_ticks must be > 0 (STRICT)")
-    if max_notional_pct <= 0:
+    mnp = _require_float(max_notional_pct, "max_notional_pct")
+    if mnp <= 0:
         raise OrderFailed("max_notional_pct must be > 0 (STRICT)")
 
     diff = abs(act - exp)
@@ -276,10 +292,10 @@ def evaluate_slippage(
 
     if ticks > max_ticks:
         return False, f"slippage too large: ticks={ticks} > max_ticks={max_ticks}"
-    if notional_pct > max_notional_pct:
+    if notional_pct > mnp:
         return False, (
             f"slippage too large: notional_pct={notional_pct:.4f}% "
-            f"> max_notional_pct={max_notional_pct:.4f}%"
+            f"> max_notional_pct={mnp:.4f}%"
         )
     return True, "OK"
 
@@ -305,13 +321,17 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
     if tick_size <= 0:
         raise OrderFailed(f"tick_size must be > 0: symbol={sym}, value={tick_size} (STRICT)")
 
-    max_ticks = getattr(SET, "slippage_max_ticks", None)
-    max_ticks = int(max_ticks) if max_ticks is not None else int(_get_env_required_float("SLIPPAGE_MAX_TICKS"))
+    # STRICT: settings에 존재해야 한다(ENV 폴백 금지)
+    if not hasattr(SET, "slippage_max_ticks"):
+        raise OrderFailed("settings.slippage_max_ticks missing (STRICT)")
+    if not hasattr(SET, "slippage_max_notional_pct"):
+        raise OrderFailed("settings.slippage_max_notional_pct missing (STRICT)")
+    if not hasattr(SET, "stop_on_heavy_slippage"):
+        raise OrderFailed("settings.stop_on_heavy_slippage missing (STRICT)")
 
-    max_notional_pct = getattr(SET, "slippage_max_notional_pct", None)
-    max_notional_pct = float(max_notional_pct) if max_notional_pct is not None else float(_get_env_required_float("SLIPPAGE_MAX_NOTIONAL_PCT"))
-
-    stop_on_heavy = bool(int(os.getenv("STOP_ON_HEAVY_SLIPPAGE", "0")))
+    max_ticks = int(getattr(SET, "slippage_max_ticks"))
+    max_notional_pct = float(getattr(SET, "slippage_max_notional_pct"))
+    stop_on_heavy = bool(getattr(SET, "stop_on_heavy_slippage"))
 
     positions = fetch_open_positions(sym)
     if not isinstance(positions, list):
@@ -319,7 +339,7 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
 
     pos = None
     for p in positions:
-        if str(p.get("symbol", "")).upper() == sym.upper():
+        if isinstance(p, dict) and str(p.get("symbol", "")).upper() == sym.upper():
             pos = p
             break
     if pos is None:
@@ -345,7 +365,7 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
         f"- 실제 진입가: {actual_entry}\n"
         f"- 사유: {reason}"
     )
-    send_tg(msg)
+    _submit_tg_nonblocking(msg)
     log(f"[SLIPPAGE] {msg}")
 
     if stop_on_heavy:
@@ -354,7 +374,7 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
             side_u = "BUY"
         elif side_u == "SHORT":
             side_u = "SELL"
-        send_tg("🛑 설정(STOP_ON_HEAVY_SLIPPAGE=1)에 따라 즉시 시장가로 포지션을 정리합니다.")
+        _submit_tg_nonblocking("🛑 설정(stop_on_heavy_slippage=True)에 따라 즉시 시장가로 포지션을 정리합니다.")
         close_position_market(symbol=sym, side=side_u, qty=float(trade.qty))
 
     return False
@@ -519,6 +539,9 @@ def _summarize_user_trades_for_order(trades: List[Dict[str, Any]], *, order_id: 
     if qty_sum <= 0:
         raise CloseSummaryError("no fills for orderId (STRICT)")
 
+    if last_time_ms is None or last_time_ms <= 0:
+        raise CloseSummaryError("userTrades missing time for close (STRICT)")
+
     avg_price = px_qty_sum / qty_sum
     if avg_price <= 0 or not math.isfinite(avg_price):
         raise CloseSummaryError("avg_price invalid (STRICT)")
@@ -530,9 +553,8 @@ def _summarize_user_trades_for_order(trades: List[Dict[str, Any]], *, order_id: 
         "pnl": float(pnl_net),
         "fee": float(fee_usdt_sum),
         "realizedPnl": float(realized_sum),
+        "close_time": int(last_time_ms),  # STRICT: 필수
     }
-    if last_time_ms is not None:
-        out["close_time"] = int(last_time_ms)
     return out
 
 
@@ -589,10 +611,14 @@ def build_close_summary_strict(
     now_ms: Optional[int] = None,
     lookback_sec: int = 6 * 3600,
 ) -> Tuple[str, Dict[str, Any]]:
+    """
+    STRICT:
+    - now_ms는 '관측 시각'으로만 사용(윈도우 생성용).
+    - 거래소 order/userTrades에 close time이 없으면 예외(임의 보정 금지).
+    """
     sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
-    if now_ms is None:
-        now_ms = int(time.time() * 1000)
-    if now_ms <= 0:
+    observed_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if observed_at_ms <= 0:
         raise CloseSummaryError("now_ms invalid (STRICT)")
     if lookback_sec <= 0:
         raise CloseSummaryError("lookback_sec must be > 0 (STRICT)")
@@ -614,20 +640,20 @@ def build_close_summary_strict(
         close_oid, close_order = filled[0]
         reason = "TP" if close_oid == tp_id else "SL"
 
-        close_time_ms = None
+        close_time_ms: Optional[int] = None
         for k in ("updateTime", "time", "transactTime"):
             if close_order.get(k) is not None:
                 close_time_ms = int(close_order.get(k))
                 break
         if close_time_ms is None or close_time_ms <= 0:
-            # 거래소가 시간을 주지 않으면 “감지 시각(now_ms)”를 기록한다(추정값이 아니라 관측 시각).
-            close_time_ms = now_ms
+            raise CloseSummaryError("close order time missing (STRICT)")
 
         win_ms = 2 * 3600 * 1000
         start_ms = max(1, close_time_ms - win_ms)
         end_ms = close_time_ms + win_ms
         user_trades = _fetch_user_trades_strict(sym, start_ms=start_ms, end_ms=end_ms)
         summary = _summarize_user_trades_for_order(user_trades, order_id=_int_strict(close_oid, "close_order_id"))
+        summary["observed_at_ms"] = int(observed_at_ms)
         return reason, summary
 
     if len(filled) > 1:
@@ -639,24 +665,25 @@ def build_close_summary_strict(
         if status != "FILLED":
             raise CloseSummaryError(f"close_order_id present but not FILLED (status={status}) (STRICT)")
 
-        close_time_ms = None
+        close_time_ms: Optional[int] = None
         for k in ("updateTime", "time", "transactTime"):
             if o.get(k) is not None:
                 close_time_ms = int(o.get(k))
                 break
         if close_time_ms is None or close_time_ms <= 0:
-            close_time_ms = now_ms
+            raise CloseSummaryError("manual close order time missing (STRICT)")
 
         win_ms = 2 * 3600 * 1000
         start_ms = max(1, close_time_ms - win_ms)
         end_ms = close_time_ms + win_ms
         user_trades = _fetch_user_trades_strict(sym, start_ms=start_ms, end_ms=end_ms)
         summary = _summarize_user_trades_for_order(user_trades, order_id=_int_strict(close_id, "close_order_id"))
+        summary["observed_at_ms"] = int(observed_at_ms)
         return "MANUAL", summary
 
     expected_qty = _float_strict(trade.qty, "trade.qty")
-    start_ms = max(1, now_ms - int(lookback_sec * 1000))
-    end_ms = now_ms
+    start_ms = max(1, observed_at_ms - int(lookback_sec * 1000))
+    end_ms = observed_at_ms
     user_trades = _fetch_user_trades_strict(sym, start_ms=start_ms, end_ms=end_ms)
 
     oid, summary = _infer_unique_close_order_id_strict(
@@ -666,6 +693,7 @@ def build_close_summary_strict(
         tolerance_ratio=0.01,
     )
     trade.close_order_id = str(oid)
+    summary["observed_at_ms"] = int(observed_at_ms)
     return "MANUAL", summary
 
 
@@ -686,7 +714,7 @@ def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str,
 
     if not isinstance(summary, dict):
         raise CloseSummaryError("summary must be dict (STRICT)")
-    for k in ("avg_price", "pnl"):
+    for k in ("avg_price", "pnl", "close_time"):
         if k not in summary:
             raise CloseSummaryError(f"summary missing required key: {k} (STRICT)")
 
@@ -695,11 +723,8 @@ def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str,
     if exit_price <= 0:
         raise CloseSummaryError("summary.avg_price must be > 0 (STRICT)")
 
-    close_time_ms = summary.get("close_time")
-    if close_time_ms is not None:
-        exit_ts_dt = _epoch_ms_to_dt_utc(_int_strict(close_time_ms, "summary.close_time"))
-    else:
-        exit_ts_dt = _utc_now()
+    close_time_ms = _int_strict(summary.get("close_time"), "summary.close_time")
+    exit_ts_dt = _epoch_ms_to_dt_utc(close_time_ms)
 
     close_reason = _require_nonempty_str(reason, "reason")[:32]
     pnl_pct_futures = _calc_pnl_pct_futures(trade, pnl_usdt)
@@ -816,8 +841,9 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
 
         if t.last_synced_at is None:
             raise CloseSummaryError("trade.last_synced_at is required for partial reconciliation (STRICT)")
+
         start_ms = _dt_to_epoch_ms_utc(t.last_synced_at) - 2000
-        now_dt = _utc_now()
+        now_dt = datetime.now(timezone.utc)
         end_ms = _dt_to_epoch_ms_utc(now_dt) + 2000
         if start_ms <= 0:
             raise CloseSummaryError("partial reconciliation start_ms invalid (STRICT)")
@@ -835,7 +861,7 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
         t.last_synced_at = now_dt
         t.reconciliation_status = "PARTIAL_OK"
 
-        send_tg(
+        _submit_tg_nonblocking(
             f"[PARTIAL_CLOSE] {symbol} side={t.side} "
             f"delta={delta:.6f} remaining={t.remaining_qty:.6f} pnl_delta={pnl_delta:.4f} pnl_total={t.realized_pnl_usdt:.4f}"
         )
@@ -855,10 +881,13 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
 
         t.is_open = False
         t.close_reason = str(reason)
-        t.close_ts = _utc_now().timestamp()
+
+        close_time_ms = _int_strict(summary.get("close_time"), "summary.close_time")
+        t.close_ts = _epoch_ms_to_dt_utc(close_time_ms).timestamp()
+
         t.remaining_qty = 0.0
         t.reconciliation_status = "CLOSED_OK"
-        t.last_synced_at = _utc_now()
+        t.last_synced_at = datetime.now(timezone.utc)
 
         return [], [{"trade": t, "reason": reason, "summary": summary}]
 

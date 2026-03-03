@@ -4,51 +4,57 @@ from __future__ import annotations
 """
 ========================================================
 FILE: state/exit_engine.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할
 - Binance WS 데이터 기반으로 현재 포지션(Trade)의 EXIT/HOLD를 평가한다.
 - 최종 청산 결정은 규칙 기반(Quant)으로만 수행한다.
-- GPT는 "감사/해설"만 수행한다(결정 금지). 실패해도 거래 흐름을 깨지 않는다.
+- GPT는 "감사/해설"만 수행한다(결정 금지). 실패해도 거래 흐름을 깨지 않는다(옵션).
 
-근본 해결(필수)
-- 삭제된 strategy.gpt_decider_entry 의존 제거
+절대 원칙 (TRADE-GRADE)
+- 폴백 금지: None→0/기본값 주입/조용한 continue 금지
+- 환경 변수 직접 접근 금지: os.getenv 사용 금지 → settings.py(SSOT)만 사용
+- 데이터 불충분/미준비는 명시적 HOLD로 처리하되, “불량 데이터(형식/범위 오류)”는 예외
 - DB 업데이트는 state.db_writer(SSOT)로 통일
 - 텔레그램은 async_worker로 위임(메인 루프 블로킹 금지)
 
 변경 이력
 --------------------------------------------------------
 - 2026-03-03 (TRADE-GRADE, FIX):
-  1) gpt_decider_entry 제거 → gpt_supervisor(감사/해설 전용)로 교체
-  2) EXIT 결정은 RUNTIME 규칙만 사용(STRICT)
-  3) SessionLocal/직접 ORM 업데이트 제거 → db_writer로 통일
+  1) ENV 직접 접근 제거:
+     - EXIT_SUPERVISOR_ENABLED os.getenv 제거 → settings.exit_supervisor_enabled만 사용
+  2) 폴백 제거:
+     - _trade_key / supervisor 입력에서 entry/qty 0.0 폴백 제거
+     - candle volume 0.0 폴백 제거 (필드 누락이면 candle 자체를 “없음”으로 간주)
+  3) 상태/필드 검증 강화:
+     - trade.qty / trade.entry 누락/비정상은 즉시 예외(상태 오염)
+  4) supervisor는 best-effort 유지:
+     - key/필드 불충분하면 supervisor 해설만 스킵(거래 결정에 영향 없음)
 ========================================================
 """
 
 import math
-import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from infra.telelog import log, send_tg
 from infra.async_worker import submit as submit_async
 from infra.market_data_ws import (
     get_klines as ws_get_klines,
     get_klines_with_volume as ws_get_klines_with_vol,
 )
+from infra.telelog import log, send_tg
 from execution.order_executor import close_position_market
-from events.signals_logger import log_signal, log_candle_snapshot, log_skip_event, log_event
-from state.trader_state import Trade
+from events.signals_logger import log_event, log_signal, log_skip_event, log_candle_snapshot
 from state.db_writer import close_latest_open_trade_returning_id, record_trade_exit_snapshot
-from strategy.indicators import build_regime_features_from_candles
-
+from state.trader_state import Trade
 
 # (옵션) GPT Supervisor: 감사/해설 전용
 from strategy.gpt_supervisor import run_gpt_supervisor, GptSupervisorError
 
 # (옵션) unified features: supervisor 입력용(없으면 해설 생략)
 from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
+
 
 LOG_PW = "[PW_BINANCE]"
 LOG_EXIT = "[PW_BINANCE][EXIT]"
@@ -128,22 +134,24 @@ def _pnl_pct(pnl: float, entry: float, qty: float) -> float:
 
 def _get_last_candle_with_volume(symbol: str) -> Optional[Tuple[int, float, float, float, float, float]]:
     """
-    STRICT:
-    - WS 1m 우선, 없으면 5m
+    STRICT(데이터):
+    - WS 1m 우선, 없으면 5m (둘 다 WS이며 '데이터 대체'가 아닌 TF fallback)
+    - candle row 형식이 불량하면 None(데이터 미준비)로 처리하여 HOLD 유도
+    - volume 누락 시 0.0 폴백 금지 → None(미준비) 처리
     """
     try:
         candles = ws_get_klines_with_vol(symbol, "1m", 1)
         if not candles:
             candles = ws_get_klines_with_vol(symbol, "5m", 1)
     except Exception as e:
-        log(f"{LOG_EXIT} kline fetch error symbol={symbol}: {e}")
+        log(f"{LOG_EXIT} kline fetch error symbol={symbol}: {type(e).__name__}:{e}")
         return None
 
     if not candles:
         return None
 
     row = candles[-1]
-    if len(row) < 5:
+    if not isinstance(row, (list, tuple)) or len(row) < 6:
         return None
 
     try:
@@ -152,19 +160,21 @@ def _get_last_candle_with_volume(symbol: str) -> Optional[Tuple[int, float, floa
         h = float(row[2])
         l = float(row[3])
         c = float(row[4])
-        v = float(row[5]) if len(row) >= 6 else 0.0
+        v = float(row[5])
     except (TypeError, ValueError):
         return None
 
     if ts <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0:
+        return None
+    if v < 0 or not math.isfinite(v):
         return None
     return ts, o, h, l, c, v
 
 
 def _get_15m_trend_dir(symbol: str) -> str:
     """
-    STRICT:
-    - 데이터 부족/오류는 "" 반환(명시적 HOLD 판단에 사용)
+    BEST-EFFORT:
+    - 데이터 부족/오류는 "" 반환(명시적 HOLD 판단에 사용: opposite=false)
     """
     try:
         candles_15m = ws_get_klines(symbol, "15m", 120)
@@ -181,7 +191,7 @@ def _get_15m_trend_dir(symbol: str) -> str:
             return "SHORT"
         return ""
     except Exception as e:
-        log(f"{LOG_PW}[TREND15] ws_get_klines error symbol={symbol}: {e}")
+        log(f"{LOG_PW}[TREND15] ws_get_klines error symbol={symbol}: {type(e).__name__}:{e}")
         return ""
 
 
@@ -195,43 +205,60 @@ def _is_opposite(trade_side: Any, trend_dir: str) -> bool:
 
 def _runtime_thresholds(settings: Any) -> Dict[str, float]:
     """
-    정책 기본값(명시):
-    - opposite + profit >= +0.2% -> 익절
-    - opposite + loss   <= -0.5% -> 손절
-    - hard_stop_loss_pct (옵션): -X%면 즉시 청산
+    STRICT:
+    - settings에 명시된 값만 사용한다.
+    - 값이 없으면 예외(설정 누락은 운영 오류).
     """
-    op_profit = float(getattr(settings, "exit_opposite_profit_take_pct", 0.002) or 0.002)
-    op_loss = float(getattr(settings, "exit_opposite_loss_cut_pct", 0.005) or 0.005)
-    hard_stop = float(getattr(settings, "exit_hard_stop_loss_pct", 0.0) or 0.0)
+    if not hasattr(settings, "exit_opposite_profit_take_pct"):
+        raise RuntimeError("settings.exit_opposite_profit_take_pct missing (STRICT)")
+    if not hasattr(settings, "exit_opposite_loss_cut_pct"):
+        raise RuntimeError("settings.exit_opposite_loss_cut_pct missing (STRICT)")
+    if not hasattr(settings, "exit_hard_stop_loss_pct"):
+        raise RuntimeError("settings.exit_hard_stop_loss_pct missing (STRICT)")
+
+    op_profit = _as_float(getattr(settings, "exit_opposite_profit_take_pct"), "settings.exit_opposite_profit_take_pct", min_value=0.0)
+    op_loss = _as_float(getattr(settings, "exit_opposite_loss_cut_pct"), "settings.exit_opposite_loss_cut_pct", min_value=0.0)
+    hard_stop = _as_float(getattr(settings, "exit_hard_stop_loss_pct"), "settings.exit_hard_stop_loss_pct", min_value=0.0)
 
     if op_profit <= 0 or op_loss <= 0:
         raise RuntimeError("exit thresholds must be positive (STRICT)")
-    if hard_stop < 0:
-        raise RuntimeError("exit_hard_stop_loss_pct must be >= 0 (STRICT)")
-
-    return {"op_profit": op_profit, "op_loss": op_loss, "hard_stop": hard_stop}
+    return {"op_profit": float(op_profit), "op_loss": float(op_loss), "hard_stop": float(hard_stop)}
 
 
 def _exit_supervisor_enabled(settings: Any) -> bool:
     """
-    기본 OFF.
-    - 켜려면:
-      1) settings.exit_supervisor_enabled=True 또는
-      2) ENV EXIT_SUPERVISOR_ENABLED=1
+    STRICT:
+    - ENV 직접 접근 금지
+    - settings.exit_supervisor_enabled만 사용
+    - 설정 키가 없으면 False(옵션 기능 기본 OFF)
     """
-    env = os.getenv("EXIT_SUPERVISOR_ENABLED", "0").strip().lower()
-    if env in ("1", "true", "t", "yes", "y", "on"):
-        return True
     return bool(getattr(settings, "exit_supervisor_enabled", False))
 
 
-def _trade_key(trade: Trade) -> str:
+def _trade_key_strict(trade: Trade) -> str:
+    """
+    STRICT:
+    - id가 있으면 id 기반.
+    - id가 없으면 entry/qty를 반드시 요구(0 폴백 금지).
+    """
     tid = getattr(trade, "id", None)
     if isinstance(tid, int) and tid > 0:
         return f"id:{tid}"
-    entry = float(getattr(trade, "entry", 0.0) or 0.0)
-    qty = float(getattr(trade, "qty", 0.0) or 0.0)
-    return f"{trade.symbol}:{trade.side}:{entry:.8f}:{qty:.8f}"
+
+    sym = str(getattr(trade, "symbol", "")).strip()
+    if not sym:
+        raise RuntimeError("trade.symbol missing (STRICT)")
+
+    side = str(getattr(trade, "side", "")).strip()
+    if not side:
+        raise RuntimeError("trade.side missing (STRICT)")
+
+    entry = _as_float(getattr(trade, "entry", None), "trade.entry", min_value=0.0)
+    qty = _as_float(getattr(trade, "qty", None), "trade.qty", min_value=0.0)
+    if entry <= 0 or qty <= 0:
+        raise RuntimeError("trade.entry/qty must be > 0 (STRICT)")
+
+    return f"{sym}:{side}:{entry:.8f}:{qty:.8f}"
 
 
 def _run_exit_supervisor_best_effort(
@@ -253,27 +280,38 @@ def _run_exit_supervisor_best_effort(
     if not _exit_supervisor_enabled(settings):
         return
 
-    key = _trade_key(trade)
+    try:
+        key = _trade_key_strict(trade)
+    except Exception as e:
+        log(f"{LOG_EXIT}[SUP] trade key build failed -> narration skip: {type(e).__name__}:{e}")
+        return
+
     now = time.time()
     cooldown = float(getattr(settings, "exit_supervisor_cooldown_sec", 180.0) or 180.0)
     last = _EXIT_SUP_LAST_CALL_TS.get(key)
     if last is not None and (now - last) < cooldown:
         return
 
-    # unified_features는 STRICT 빌더이므로 준비 안 됐으면 예외 → 여기서는 해설 생략
     try:
         unified = build_unified_features(trade.symbol)
     except (UnifiedFeaturesError, Exception) as e:
         log(f"{LOG_EXIT}[SUP] unified_features build failed -> narration skip: {type(e).__name__}:{e}")
         return
 
-    decision_id = f"exit-{trade.symbol}-{candle_ts_ms}"
+    # STRICT: supervisor 입력에 0/None 폴백 금지
+    entry_price = _as_float(getattr(trade, "entry", None), "trade.entry", min_value=0.0)
+    qty = _as_float(getattr(trade, "qty", None), "trade.qty", min_value=0.0)
+    if entry_price <= 0 or qty <= 0:
+        log(f"{LOG_EXIT}[SUP] invalid entry/qty -> narration skip")
+        return
+
+    decision_id = f"exit-{trade.symbol}-{int(candle_ts_ms)}"
     quant_pre = {
         "scenario": scenario,
         "symbol": trade.symbol,
         "side": str(trade.side),
-        "entry_price": float(getattr(trade, "entry", 0.0) or 0.0),
-        "qty": float(getattr(trade, "qty", 0.0) or 0.0),
+        "entry_price": float(entry_price),
+        "qty": float(qty),
         "last_price": float(last_price),
         "pnl_pct": float(pnl_pct_val),
         "trend15_dir": trend15_dir,
@@ -314,7 +352,6 @@ def _run_exit_supervisor_best_effort(
 
     _EXIT_SUP_LAST_CALL_TS[key] = now
 
-    # events 기록(감사)
     log_event(
         "on_exit_supervisor",
         symbol=trade.symbol,
@@ -330,7 +367,9 @@ def _run_exit_supervisor_best_effort(
             "confidence_penalty": float(res.auditor.confidence_penalty),
             "suggested_risk_multiplier": float(res.auditor.suggested_risk_multiplier),
             "rationale_short": res.auditor.rationale_short,
-            "narration": None if res.narration is None else {"title": res.narration.title, "message": res.narration.message, "tone": res.narration.tone},
+            "narration": None
+            if res.narration is None
+            else {"title": res.narration.title, "message": res.narration.message, "tone": res.narration.tone},
         },
     )
 
@@ -367,10 +406,8 @@ def _close_and_record_strict(
     pnl = _pnl_usdt(open_side=open_side, entry=entry, last=close_price_f, qty=qty)
     pnl_pct_val = _pnl_pct(pnl=pnl, entry=entry, qty=qty)
 
-    # 1) 주문 실행
     close_position_market(symbol, open_side, float(qty))
 
-    # 2) DB close + exit snapshot
     exit_dt = datetime.fromtimestamp(int(candle_ts_ms) / 1000.0, tz=timezone.utc)
     closed_trade_id = close_latest_open_trade_returning_id(
         symbol=symbol,
@@ -414,21 +451,32 @@ def maybe_exit_with_gpt(  # 이름은 호출부 호환을 위해 유지
     """
     regime_label = getattr(trade, "source", "") or "UNKNOWN"
 
+    # STRICT: trade 상태(필수 필드) 오염은 즉시 예외
     qty = _as_float(getattr(trade, "qty", None), "trade.qty", min_value=0.0)
-    if qty <= 0:
-        log(f"{LOG_EXIT} invalid qty<=0 → HOLD (symbol={trade.symbol})")
-        return False
+    entry = _as_float(getattr(trade, "entry", None), "trade.entry", min_value=0.0)
+    if qty <= 0 or entry <= 0:
+        raise RuntimeError("trade.qty/trade.entry must be > 0 (STRICT)")
 
     last_candle = _get_last_candle_with_volume(trade.symbol)
     if last_candle is None:
+        # 명시적 HOLD: 데이터 미준비(폴백 없음)
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="exit_engine",
+                side=getattr(trade, "side", ""),
+                reason="ws_candle_not_ready",
+                extra={"scenario": scenario},
+            )
+        except Exception as e:
+            log(f"{LOG_EXIT}[HOLD][SKIP_LOG] failed symbol={trade.symbol}: {e}")
         log(f"{LOG_EXIT} no recent WS candle → HOLD (symbol={trade.symbol})")
         return False
 
     candle_ts, o, h, l, c, v = last_candle
-    entry = _as_float(getattr(trade, "entry", None), "trade.entry", min_value=0.0)
-    if entry <= 0 or c <= 0:
-        log(f"{LOG_EXIT} invalid entry/last_close → HOLD (symbol={trade.symbol})")
-        return False
+    if c <= 0:
+        raise RuntimeError("last_close must be > 0 (STRICT)")
 
     # candle snapshot (best-effort)
     try:

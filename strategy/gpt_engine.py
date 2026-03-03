@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 ========================================================
 FILE: strategy/_gpt_engine.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할
 - OpenAI 호출(Transport) + latency 측정 + 응답 텍스트 추출 + JSON object 1개 추출을 담당한다.
@@ -14,28 +14,32 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - OPENAI_API_KEY 없으면 즉시 예외.
 - 응답이 비어있거나 JSON 파싱 불가하면 즉시 예외.
 - timeout/latency 예산 초과 시 즉시 예외.
-- 민감정보(키/시그니처/주문ID 등)는 로그/예외 메시지에 포함하지 않는다.
+- 민감정보(키/프롬프트/시그니처/주문ID 등)는 로그/예외 메시지에 포함하지 않는다.
+- 환경 변수 직접 접근 금지: os.getenv 사용 금지 → settings.py(SSOT)만 사용.
 
 변경 이력
 --------------------------------------------------------
 - 2026-03-03:
-  1) 신규 생성: OpenAI 호출 전용 엔진(단일 진입점) + JSON 1개 추출 + latency guard
+  1) ENV 직접 접근 제거: DEFAULT_* 를 os.getenv로 읽던 구조 제거 → settings 기반으로 통합
+  2) 설정 SSOT 강제: openai_api_key/openai_model/openai_* 누락 시 즉시 예외
+  3) timeout/latency budget을 요청 timeout으로도 강제(가능한 범위에서)
 ========================================================
 """
 
 import json
 import math
-import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional
 
 from openai import OpenAI
+
+from settings import load_settings
 
 try:
     from infra.telelog import log
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · PRODUCTION MODE)") from e
+    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · TRADE-GRADE MODE)") from e
 
 
 # -----------------------------------------------------------------------------
@@ -46,12 +50,83 @@ class GptEngineError(RuntimeError):
 
 
 # -----------------------------------------------------------------------------
-# Config (STRICT)
+# Settings (SSOT)
 # -----------------------------------------------------------------------------
-DEFAULT_MODEL: str = os.getenv("OPENAI_SUPERVISOR_MODEL", os.getenv("OPENAI_TRADER_MODEL", "gpt-4o-mini")).strip()
-DEFAULT_MAX_TOKENS: int = int(os.getenv("OPENAI_SUPERVISOR_MAX_TOKENS", os.getenv("OPENAI_TRADER_MAX_TOKENS", "512")))
-DEFAULT_TEMPERATURE: float = float(os.getenv("OPENAI_SUPERVISOR_TEMPERATURE", "0.2"))
-DEFAULT_MAX_LATENCY_SEC: float = float(os.getenv("OPENAI_SUPERVISOR_MAX_LATENCY", os.getenv("OPENAI_TRADER_MAX_LATENCY", "12")))
+SET = load_settings()
+
+
+def _require_nonempty_str(stage: str, v: Any, name: str) -> str:
+    if v is None:
+        _fail(stage, f"{name} is None")
+    s = str(v).strip()
+    if not s:
+        _fail(stage, f"{name} is empty")
+    return s
+
+
+def _require_int(stage: str, v: Any, name: str) -> int:
+    if v is None:
+        _fail(stage, f"{name} is None")
+    if isinstance(v, bool):
+        _fail(stage, f"{name} must be int (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        _fail(stage, f"{name} must be int", e)
+    return iv
+
+
+def _require_float(stage: str, v: Any, name: str) -> float:
+    if v is None:
+        _fail(stage, f"{name} is None")
+    if isinstance(v, bool):
+        _fail(stage, f"{name} must be float (bool not allowed)")
+    try:
+        fv = float(v)
+    except Exception as e:
+        _fail(stage, f"{name} must be float", e)
+    if not math.isfinite(fv):
+        _fail(stage, f"{name} must be finite")
+    return float(fv)
+
+
+def _settings_openai_api_key() -> str:
+    if not hasattr(SET, "openai_api_key"):
+        raise GptEngineError("settings.openai_api_key missing (STRICT)")
+    return _require_nonempty_str("config", getattr(SET, "openai_api_key"), "settings.openai_api_key")
+
+
+def _settings_model() -> str:
+    if not hasattr(SET, "openai_model"):
+        raise GptEngineError("settings.openai_model missing (STRICT)")
+    return _require_nonempty_str("config", getattr(SET, "openai_model"), "settings.openai_model")
+
+
+def _settings_max_tokens() -> int:
+    if not hasattr(SET, "openai_max_tokens"):
+        raise GptEngineError("settings.openai_max_tokens missing (STRICT)")
+    mt = _require_int("config", getattr(SET, "openai_max_tokens"), "settings.openai_max_tokens")
+    if mt <= 0 or mt > 4096:
+        _fail("config", f"openai_max_tokens out of range (1..4096)")
+    return int(mt)
+
+
+def _settings_temperature() -> float:
+    if not hasattr(SET, "openai_temperature"):
+        raise GptEngineError("settings.openai_temperature missing (STRICT)")
+    t = _require_float("config", getattr(SET, "openai_temperature"), "settings.openai_temperature")
+    if t < 0.0 or t > 2.0:
+        _fail("config", "openai_temperature out of range [0,2]")
+    return float(t)
+
+
+def _settings_max_latency_sec() -> float:
+    if not hasattr(SET, "openai_max_latency_sec"):
+        raise GptEngineError("settings.openai_max_latency_sec missing (STRICT)")
+    b = _require_float("config", getattr(SET, "openai_max_latency_sec"), "settings.openai_max_latency_sec")
+    if b <= 0:
+        _fail("config", "openai_max_latency_sec must be > 0")
+    return float(b)
 
 
 # -----------------------------------------------------------------------------
@@ -83,9 +158,7 @@ def _get_client() -> OpenAI:
     if _CLIENT is not None:
         return _CLIENT
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise GptEngineError("OPENAI_API_KEY missing (STRICT)")
+    api_key = _settings_openai_api_key()
     _CLIENT = OpenAI(api_key=api_key)
     return _CLIENT
 
@@ -94,38 +167,12 @@ def _get_client() -> OpenAI:
 # Helpers (STRICT)
 # -----------------------------------------------------------------------------
 def _fail(stage: str, reason: str, exc: Optional[BaseException] = None) -> None:
+    # STRICT: 프롬프트/키/민감정보를 절대 로그에 포함하지 않는다.
     msg = f"[GPT-ENGINE] {stage} 실패: {reason}"
     log(msg)
     if exc is None:
         raise GptEngineError(msg)
     raise GptEngineError(msg) from exc
-
-
-def _require_nonempty_str(stage: str, v: Any, name: str) -> str:
-    if v is None:
-        _fail(stage, f"{name} is None")
-    s = str(v).strip()
-    if not s:
-        _fail(stage, f"{name} is empty")
-    return s
-
-
-def _require_int(stage: str, v: Any, name: str) -> int:
-    try:
-        iv = int(v)
-    except Exception as e:
-        _fail(stage, f"{name} must be int (got={v!r})", e)
-    return iv
-
-
-def _require_float(stage: str, v: Any, name: str) -> float:
-    try:
-        fv = float(v)
-    except Exception as e:
-        _fail(stage, f"{name} must be float (got={v!r})", e)
-    if not math.isfinite(fv):
-        _fail(stage, f"{name} must be finite (got={fv})")
-    return fv
 
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
@@ -145,7 +192,7 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
         except Exception as e:
             _fail("parse", "json.loads failed (full text)", e)
         if not isinstance(obj, dict):
-            _fail("parse", f"json root must be object (got={type(obj)})")
+            _fail("parse", f"json root must be object (got={type(obj).__name__})")
         return obj
 
     start = s.find("{")
@@ -166,7 +213,7 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
                 except Exception as e:
                     _fail("parse", "json.loads failed (chunk)", e)
                 if not isinstance(obj, dict):
-                    _fail("parse", f"json root must be object (got={type(obj)})")
+                    _fail("parse", f"json root must be object (got={type(obj).__name__})")
                 return obj
 
     _fail("parse", "unterminated json object")
@@ -189,18 +236,18 @@ def call_chat(
     OpenAI Chat 호출(텍스트만 반환) — STRICT
     - caller는 user_content에 민감정보를 포함하지 않아야 한다.
     """
-    m = _require_nonempty_str("input", (model or DEFAULT_MODEL), "model")
-    mt = _require_int("input", (max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS), "max_tokens")
+    m = _require_nonempty_str("input", (model or _settings_model()), "model")
+    mt = _require_int("input", (max_tokens if max_tokens is not None else _settings_max_tokens()), "max_tokens")
     if mt <= 0 or mt > 4096:
-        _fail("input", f"max_tokens out of allowed range (1..4096) (got={mt})")
+        _fail("input", "max_tokens out of allowed range (1..4096)")
 
-    temp = _require_float("input", (temperature if temperature is not None else DEFAULT_TEMPERATURE), "temperature")
+    temp = _require_float("input", (temperature if temperature is not None else _settings_temperature()), "temperature")
     if temp < 0.0 or temp > 2.0:
-        _fail("input", f"temperature out of range [0,2] (got={temp})")
+        _fail("input", "temperature out of range [0,2]")
 
-    budget = _require_float("input", (max_latency_sec if max_latency_sec is not None else DEFAULT_MAX_LATENCY_SEC), "max_latency_sec")
+    budget = _require_float("input", (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()), "max_latency_sec")
     if budget <= 0:
-        _fail("input", f"max_latency_sec must be > 0 (got={budget})")
+        _fail("input", "max_latency_sec must be > 0")
 
     sp = _require_nonempty_str("input", system_prompt, "system_prompt")
     uc = _require_nonempty_str("input", user_content, "user_content")
@@ -209,17 +256,19 @@ def call_chat(
 
     t0 = time.time()
     try:
+        # STRICT: timeout도 budget으로 강제 (라이브러리가 지원하지 않으면 즉시 실패(=정책 위반))
         resp = client.chat.completions.create(
             model=m,
             messages=[
                 {"role": "system", "content": sp},
                 {"role": "user", "content": uc},
             ],
-            temperature=temp,
-            max_tokens=mt,
+            temperature=float(temp),
+            max_tokens=int(mt),
+            timeout=float(budget),
         )
     except Exception as e:
-        # sanitize: do not include prompts or URL; only error class
+        # sanitize: 프롬프트/키/URL 등 민감/대용량 정보는 포함 금지
         _fail("openai", f"request failed: {e.__class__.__name__}", e)
 
     dt = time.time() - t0

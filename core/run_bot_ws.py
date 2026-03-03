@@ -1,7 +1,11 @@
 # core/run_bot_ws.py
 """
-run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 ============================================================
+FILE: core/run_bot_ws.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
+============================================================
+
+run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 핵심 원칙 (STRICT · NO-FALLBACK)
 - 시장데이터(캔들/오더북) 의사결정은 WS 버퍼 데이터만 사용한다.
@@ -10,32 +14,27 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 - 데이터가 없거나 손상되면 즉시 예외 또는 명시적 SKIP 처리한다.
 - 텔레그램/비핵심 I/O가 메인 루프를 블로킹하면 안 된다.
 
-PATCH NOTES — 2026-03-03 (TRADE-GRADE)
-- GPTStrategy 삭제 반영:
-  - strategy.gpt_strategy 의존 제거
-  - 로컬 결정 함수(_decide_entry_candidate_strict)로 후보 신호 생성(결정은 규칙 기반)
-- RiskPhysicsEngine 입력 확장 반영:
-  - micro_score_risk + EV heatmap(상태/EV/n) 입력을 추가하여 AutoBlock 정책 반영
-- EvHeatmapEngine 도입:
-  - (초기) NOT_READY 상태로 시작하며,
-  - pnl_r 업데이트는 exit 단계에서 entry_price/qty/SL 기반으로 별도 구현(추정 금지)
+중요 (TRADE-GRADE)
+- DB 접근 단일화: state/db_core(get_session) 경유. psycopg2 직접 연결 금지.
+- DB DSN 폴백 금지: TRADER_DB_URL 단일 소스(검증/정규화는 db_core가 수행).
+- 비핵심 루프라도 “조용한 실패” 금지: 치명 오류는 SAFE_STOP + 예외 전파.
 
-PATCH NOTES — 2026-03-02 (UPGRADE, MIN-CHANGE)
-- Telegram I/O 비동기화:
-  - infra/async_worker 기반 submit(send_tg, ...)로 메인 루프 블로킹 제거
-- Reconcile Guard 추가:
-  - sync/reconcile_engine.py (단일 심볼)로 내부 OPEN_TRADES ↔ 거래소 포지션 불일치 감지
-  - 불일치 시 SAFE_STOP_REQUESTED 트리거 + (선택) 강제 청산
-- SIGTERM 데드라인 처리:
-  - SIGTERM 수신 후 grace 경과 시 close_all_positions_market() 강제 정리 1회 시도
-- STRICT 강화:
-  - CLOSE 이벤트 로그에서 avg_price/qty 누락 시 즉시 예외 (0으로 대체 금지)
-  - side 정규화 함수 unknown 값은 예외 (암묵적 CLOSE 폴백 금지)
-- Latency Guard(선택적):
-  - max_signal_latency_ms / max_exec_latency_ms 초과 시 신규 진입을 SAFE_STOP으로 차단
-
-주의
-- DB 스키마 변경 없음(단, 스냅샷 확장 컬럼은 DB에 이미 반영되어 있어야 함).
+변경 이력
+------------------------------------------------------------
+- 2026-03-03 (TRADE-GRADE):
+  1) DB 접근 단일화:
+     - _dsn_strict() 삭제
+     - psycopg2 직접 연결 기반 bootstrap 삭제
+     - get_session + SQL(text) 기반 bootstrap으로 교체
+  2) DB DSN 폴백 제거:
+     - TRADER_DB_URL / DATABASE_URL 폴백 경로 제거(환경 직접 접근 제거)
+  3) market_data_store thread STRICT화:
+     - 루프 내부 예외 삼키기(로그 후 계속) 제거
+     - 치명 오류 시 SAFE_STOP_REQUESTED=True + TG 알림 + 예외 재-raise
+     - orderbook ts_ms now() 폴백 제거(필수 키 없으면 즉시 예외)
+  4) “조용한 default” 최소화:
+     - ws_backfill_tfs 미설정 시 required로 채우되, 명시 로그로 가시화
+============================================================
 """
 
 from __future__ import annotations
@@ -43,7 +42,6 @@ from __future__ import annotations
 import datetime
 import hashlib
 import math
-import os
 import signal
 import threading
 import time
@@ -51,6 +49,8 @@ import traceback
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+
+from sqlalchemy import text
 
 from settings import load_settings
 from infra.telelog import log, send_tg
@@ -66,6 +66,7 @@ from execution.exchange_api import (
 from execution.order_executor import close_all_positions_market
 from execution.execution_engine import ExecutionEngine
 
+from state.db_core import get_session
 from state.sync_exchange import sync_open_trades_from_exchange
 from state.trader_state import Trade, TraderState, check_closes, build_close_summary_strict
 from state.exit_engine import maybe_exit_with_gpt
@@ -162,6 +163,18 @@ def _as_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value
     return float(x)
 
 
+def _require_int_ms(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be int ms (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be int ms (STRICT): {e}") from e
+    if iv <= 0:
+        raise RuntimeError(f"{name} must be > 0 (STRICT)")
+    return iv
+
+
 def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
     tp = _as_float(getattr(settings, "tp_pct", None), "settings.tp_pct", min_value=0.0, max_value=1.0)
     sl = _as_float(getattr(settings, "sl_pct", None), "settings.sl_pct", min_value=0.0, max_value=1.0)
@@ -200,12 +213,22 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidat
     extra = market_data.get("extra")
     tp_pct, sl_pct = _require_tp_sl_from_settings_or_extra(SET, extra)
 
+    if market_data.get("signal_ts_ms") is None:
+        raise RuntimeError("market_data.signal_ts_ms is required (STRICT)")
+    signal_ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
+
+    if market_data.get("last_price") is None:
+        raise RuntimeError("market_data.last_price is required (STRICT)")
+    last_price = _as_float(market_data.get("last_price"), "market_data.last_price", min_value=0.0)
+    if last_price <= 0:
+        raise RuntimeError("market_data.last_price must be > 0 (STRICT)")
+
     meta = {
         "symbol": symbol,
         "regime": str(market_data.get("regime") or "").strip() or str(market_data.get("signal_source") or "").strip(),
         "signal_source": str(market_data.get("signal_source") or "").strip(),
-        "signal_ts_ms": int(market_data.get("signal_ts_ms")),
-        "last_price": float(market_data.get("last_price")),
+        "signal_ts_ms": int(signal_ts_ms),
+        "last_price": float(last_price),
         "candles_5m": market_data.get("candles_5m"),
         "candles_5m_raw": market_data.get("candles_5m_raw"),
         "extra": extra if isinstance(extra, dict) else None,
@@ -271,7 +294,9 @@ def _verify_ws_boot_configuration_or_die() -> None:
 
     ws_backfill_tfs = _parse_tfs(getattr(SET, "ws_backfill_tfs", None))
     if not ws_backfill_tfs:
+        # TRADE-GRADE: silent default 금지 → 명시 로그
         ws_backfill_tfs = list(ENTRY_REQUIRED_TFS)
+        log(f"[BOOT][DEFAULT] ws_backfill_tfs missing -> using required={ws_backfill_tfs}")
     _verify_required_tfs_or_die("ws_backfill_tfs", ws_backfill_tfs, ENTRY_REQUIRED_TFS)
 
 
@@ -386,7 +411,7 @@ def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
 
 
 # ─────────────────────────────
-# equity / DB bootstrap
+# equity / DB bootstrap (STRICT via db_core)
 # ─────────────────────────────
 def _get_equity_current_usdt_strict() -> float:
     row = get_balance_detail("USDT")
@@ -433,107 +458,91 @@ def _get_equity_current_usdt_strict() -> float:
     raise RuntimeError("equity_current_usdt invalid: 0.0")
 
 
-def _dsn_strict() -> str:
-    dsn = os.getenv("TRADER_DB_URL") or os.getenv("DATABASE_URL")
-    if not dsn or not str(dsn).strip():
-        raise RuntimeError("TRADER_DB_URL or DATABASE_URL is required")
-    s = str(dsn).strip()
-
-    if s.startswith("postgresql+psycopg2://"):
-        s = "postgresql://" + s[len("postgresql+psycopg2://") :]
-    if s.startswith("postgresql+asyncpg://"):
-        s = "postgresql://" + s[len("postgresql+asyncpg://") :]
-
-    return s
-
-
 def _load_equity_peak_bootstrap(symbol: str) -> Optional[float]:
-    dsn = _dsn_strict()
-    try:
-        import psycopg2
-    except Exception as e:
-        raise RuntimeError("psycopg2 is required for equity_peak bootstrap") from e
+    """
+    STRICT:
+    - psycopg2 직접 연결 금지
+    - db_core(get_session) 경유
+    """
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    if not sym:
+        raise RuntimeError("symbol is empty (STRICT)")
 
-    q = """
+    q = text(
+        """
         SELECT MAX(equity_peak_usdt)
         FROM bt_trade_snapshots
-        WHERE symbol = %s
+        WHERE symbol = :symbol
           AND equity_peak_usdt IS NOT NULL
-    """
-    conn = None
-    cur = None
-    try:
-        conn = psycopg2.connect(dsn)
-        cur = conn.cursor()
-        cur.execute(q, (symbol,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        v = row[0]
-        if v is None:
-            return None
-        peak = float(v)
-        if peak <= 0:
-            raise RuntimeError(f"persisted equity_peak_usdt invalid: {peak}")
-        return float(peak)
-    finally:
-        try:
-            if cur is not None:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
+        """
+    )
+
+    with get_session() as session:
+        v = session.execute(q, {"symbol": sym}).scalar()
+
+    if v is None:
+        return None
+
+    peak = float(v)
+    if not math.isfinite(peak) or peak <= 0:
+        raise RuntimeError(f"persisted equity_peak_usdt invalid (STRICT): {peak}")
+    return float(peak)
 
 
 def _load_closed_trades_bootstrap(symbol: str, limit: int = 50) -> list[dict[str, Any]]:
-    dsn = _dsn_strict()
-    try:
-        import psycopg2
-    except Exception as e:
-        raise RuntimeError("psycopg2 is required for account_state bootstrap") from e
+    """
+    STRICT:
+    - psycopg2 직접 연결 금지
+    - db_core(get_session) 경유
+    - exit_ts는 datetime(tz-aware)이어야 한다(무결성)
+    """
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    if not sym:
+        raise RuntimeError("symbol is empty (STRICT)")
 
-    q = """
+    lim = int(limit)
+    if lim <= 0:
+        raise RuntimeError("limit must be > 0 (STRICT)")
+
+    q = text(
+        """
         SELECT id, exit_ts, pnl_usdt, tp_pct, sl_pct
         FROM bt_trades
-        WHERE symbol = %s
+        WHERE symbol = :symbol
           AND exit_ts IS NOT NULL
           AND pnl_usdt IS NOT NULL
         ORDER BY exit_ts DESC
-        LIMIT %s
-    """
+        LIMIT :limit
+        """
+    )
+
     rows: list[dict[str, Any]] = []
-    conn = None
-    cur = None
-    try:
-        conn = psycopg2.connect(dsn)
-        cur = conn.cursor()
-        cur.execute(q, (symbol, int(limit)))
-        for (trade_id, exit_ts, pnl_usdt, tp_pct, sl_pct) in cur.fetchall():
-            rows.append(
-                {
-                    "id": int(trade_id),
-                    "exit_ts": exit_ts,
-                    "pnl_usdt": float(pnl_usdt),
-                    "tp_pct": None if tp_pct is None else float(tp_pct),
-                    "sl_pct": None if sl_pct is None else float(sl_pct),
-                }
-            )
-        return rows
-    finally:
-        try:
-            if cur is not None:
-                cur.close()
-        except Exception:
-            pass
-        try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
+    with get_session() as session:
+        result = session.execute(q, {"symbol": sym, "limit": lim}).fetchall()
+
+    for (trade_id, exit_ts, pnl_usdt, tp_pct, sl_pct) in result:
+        if not isinstance(trade_id, int) and not (isinstance(trade_id, (str, float)) and str(trade_id).strip()):
+            raise RuntimeError("trade_id invalid (STRICT)")
+
+        if not isinstance(exit_ts, datetime.datetime):
+            raise RuntimeError(f"exit_ts must be datetime (STRICT), got={type(exit_ts).__name__}")
+        if exit_ts.tzinfo is None or exit_ts.tzinfo.utcoffset(exit_ts) is None:
+            raise RuntimeError("exit_ts must be tz-aware (STRICT)")
+
+        pnl_f = float(pnl_usdt)
+        if not math.isfinite(pnl_f):
+            raise RuntimeError("pnl_usdt must be finite (STRICT)")
+
+        rows.append(
+            {
+                "id": int(trade_id),
+                "exit_ts": exit_ts,
+                "pnl_usdt": pnl_f,
+                "tp_pct": None if tp_pct is None else float(tp_pct),
+                "sl_pct": None if sl_pct is None else float(sl_pct),
+            }
+        )
+    return rows
 
 
 # ─────────────────────────────
@@ -567,6 +576,11 @@ def _backfill_ws_kline_history(symbol: str) -> None:
 
 
 def _start_market_data_store_thread() -> None:
+    """
+    TRADE-GRADE:
+    - DB 저장 루프에서 오류가 나면 '조용히 계속' 하지 않는다.
+    - SAFE_STOP_REQUESTED=True 로 신규 진입을 차단하고, 예외를 재-raise 하여 스레드를 종료한다.
+    """
     symbol = SET.symbol
     flush_sec = float(getattr(SET, "md_store_flush_sec", 5) or 5)
     ob_interval_sec = float(getattr(SET, "ob_store_interval_sec", 5) or 5)
@@ -574,19 +588,28 @@ def _start_market_data_store_thread() -> None:
 
     last_candle_ts: Dict[str, int] = {iv: 0 for iv in store_tfs}
     last_ob_ts: float = 0.0
+    last_ob_missing_log_ts: float = 0.0
 
     def _loop() -> None:
-        nonlocal last_ob_ts
-        log(f"[MD-STORE] loop started: flush_sec={flush_sec}, ob_interval_sec={ob_interval_sec}, store_tfs={store_tfs}")
-        while RUNNING:
-            try:
-                now = time.time()
-                candles_to_save: List[Dict[str, Any]] = []
+        nonlocal last_ob_ts, last_ob_missing_log_ts
+        global SAFE_STOP_REQUESTED
 
+        try:
+            log(f"[MD-STORE] loop started: flush_sec={flush_sec}, ob_interval_sec={ob_interval_sec}, store_tfs={store_tfs}")
+            while RUNNING:
+                now = time.time()
+
+                candles_to_save: List[Dict[str, Any]] = []
                 for iv in store_tfs:
                     buf = ws_get_klines_with_volume(symbol, iv, limit=500)
+                    if buf is None:
+                        # ws_get_klines_with_volume는 list를 기대한다. None은 프로토콜 위반.
+                        raise RuntimeError(f"[MD-STORE] ws_get_klines_with_volume returned None (STRICT) interval={iv}")
+                    if not isinstance(buf, list):
+                        raise RuntimeError(f"[MD-STORE] kline buffer invalid type (STRICT) interval={iv} type={type(buf).__name__}")
                     if not buf:
                         continue
+
                     newest_ts = last_candle_ts.get(iv, 0)
                     new_rows = [row for row in buf if row[0] > newest_ts]
                     if not new_rows:
@@ -604,25 +627,51 @@ def _start_market_data_store_thread() -> None:
                                 "close": float(c),
                                 "volume": float(v),
                                 "quote_volume": None,
-                                "source": "ws",
+                                "source": "ws",  # STRICT: required
                             }
                         )
                     last_candle_ts[iv] = int(new_rows[-1][0])
 
                 if candles_to_save:
+                    # STRICT: market_data_store에서 예외 발생 시 여기서 바로 propagate
                     save_candles_bulk_from_ws(candles_to_save)
 
                 if now - last_ob_ts >= ob_interval_sec:
                     ob = ws_get_orderbook(symbol, limit=5)
-                    if ob and ob.get("bids") and ob.get("asks"):
-                        ts_ms = int(ob.get("exchTs") or ob.get("ts") or int(now * 1000))
-                        save_orderbook_from_ws(symbol=symbol, ts_ms=ts_ms, bids=ob["bids"], asks=ob["asks"])
-                        last_ob_ts = now
+                    if not isinstance(ob, dict) or not ob:
+                        # 빈 오더북은 저장하지 않되, 장기간 지속 시 가시화
+                        if now - last_ob_missing_log_ts >= 60:
+                            last_ob_missing_log_ts = now
+                            log(f"[MD-STORE][WARN] orderbook missing: symbol={symbol}")
+                        time.sleep(flush_sec)
+                        continue
 
-            except Exception as e:
-                log(f"[MD-STORE] loop error: {type(e).__name__}: {e}")
+                    if not ob.get("bids") or not ob.get("asks"):
+                        if now - last_ob_missing_log_ts >= 60:
+                            last_ob_missing_log_ts = now
+                            log(f"[MD-STORE][WARN] orderbook empty bids/asks: symbol={symbol}")
+                        time.sleep(flush_sec)
+                        continue
 
-            time.sleep(flush_sec)
+                    # STRICT: ts_ms 폴백 금지( now*1000 사용 금지 )
+                    if "exchTs" in ob and ob.get("exchTs") is not None:
+                        ts_ms = _require_int_ms(ob.get("exchTs"), "orderbook.exchTs")
+                    elif "ts" in ob and ob.get("ts") is not None:
+                        ts_ms = _require_int_ms(ob.get("ts"), "orderbook.ts")
+                    else:
+                        raise RuntimeError("[MD-STORE] orderbook missing exchTs/ts (STRICT)")
+
+                    save_orderbook_from_ws(symbol=symbol, ts_ms=int(ts_ms), bids=ob["bids"], asks=ob["asks"])
+                    last_ob_ts = now
+
+                time.sleep(flush_sec)
+
+        except Exception as e:
+            SAFE_STOP_REQUESTED = True
+            msg = f"⛔ [MD-STORE][FATAL] {type(e).__name__}: {e}"
+            log(msg)
+            _safe_send_tg(msg)
+            raise
 
     threading.Thread(target=_loop, name="md-store-loop", daemon=True).start()
     log("[MD-STORE] background store thread started")
@@ -652,10 +701,7 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     if not signal_source_s:
         raise RuntimeError("signal_source is empty")
 
-    ts_ms = int(latest_ts)
-    if ts_ms <= 0:
-        raise RuntimeError(f"invalid latest_ts: {latest_ts!r}")
-
+    ts_ms = _require_int_ms(latest_ts, "latest_ts")
     prereq_reason = _validate_ws_entry_prereqs(symbol)
     if prereq_reason:
         msg = f"[SKIP][WS_NOT_READY] entry blocked: {symbol} ({prereq_reason})"
@@ -674,15 +720,19 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
 
+    lp = _as_float(last_price, "last_price", min_value=0.0)
+    if lp <= 0:
+        raise RuntimeError("last_price must be > 0 (STRICT)")
+
     return {
         "symbol": symbol,
         "direction": direction,
         "signal_source": signal_source_s,
         "regime": signal_source_s,
-        "signal_ts_ms": ts_ms,
+        "signal_ts_ms": int(ts_ms),
         "candles_5m": candles_5m,
         "candles_5m_raw": candles_5m_raw,
-        "last_price": float(last_price),
+        "last_price": float(lp),
         "extra": extra,
         "market_features": market_features,
     }
@@ -879,17 +929,12 @@ def main() -> None:
 
     entry_exec_engine = ExecutionEngine(SET)
     regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
-
     ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
 
-    persisted_peak: Optional[float] = None
-    try:
-        persisted_peak = _load_equity_peak_bootstrap(SET.symbol)
-        if persisted_peak is not None:
-            log(f"[BOOT] persisted equity_peak_usdt loaded: {persisted_peak:.4f}")
-    except Exception as e:
-        log(f"[WARN] equity_peak bootstrap failed: {type(e).__name__}: {e}")
-        persisted_peak = None
+    # ── DB bootstrap (STRICT) ──
+    persisted_peak = _load_equity_peak_bootstrap(SET.symbol)
+    if persisted_peak is not None:
+        log(f"[BOOT] persisted equity_peak_usdt loaded: {persisted_peak:.4f}")
 
     account_builder = AccountStateBuilder(
         win_rate_window=20,
@@ -901,13 +946,9 @@ def main() -> None:
     risk_physics = RiskPhysicsEngine(policy=risk_policy)
 
     CLOSED_TRADES_CACHE = deque(maxlen=50)
-    try:
-        boot_rows = _load_closed_trades_bootstrap(SET.symbol, limit=50)
-        for r in reversed(boot_rows):
-            CLOSED_TRADES_CACHE.appendleft(r)
-    except Exception as e:
-        log(f"[WARN] closed_trades bootstrap failed: {type(e).__name__}: {e}")
-        CLOSED_TRADES_CACHE.clear()
+    boot_rows = _load_closed_trades_bootstrap(SET.symbol, limit=50)
+    for r in reversed(boot_rows):
+        CLOSED_TRADES_CACHE.appendleft(r)
 
     position_resync_sec = float(getattr(SET, "position_resync_sec", 20) or 20)
     last_fill_check: float = 0.0
@@ -1069,11 +1110,7 @@ def main() -> None:
                 closed_trades=list(CLOSED_TRADES_CACHE),
                 persisted_equity_peak_usdt=persisted_peak,
             )
-            persisted_peak = (
-                float(account_state.equity_peak_usdt)
-                if persisted_peak is None
-                else float(max(float(persisted_peak), float(account_state.equity_peak_usdt)))
-            )
+            persisted_peak = float(max(float(persisted_peak or 0.0), float(account_state.equity_peak_usdt)))
 
             # ── 후보 신호 생성(로컬 결정) + latency guard ──
             t0 = time.perf_counter()
@@ -1138,21 +1175,17 @@ def main() -> None:
                     "equity_peak_usdt": float(account_state.equity_peak_usdt),
                     "dd_pct": float(account_state.dd_pct),
                     "consecutive_losses": int(account_state.consecutive_losses),
-
                     "risk_physics_reason": str(rp.reason),
                     "dynamic_allocation_ratio": float(rp.effective_risk_pct),
                     "dynamic_risk_pct": float(rp.effective_risk_pct),
-
                     "regime_score": float(regime_decision.score),
                     "regime_band": str(regime_decision.band),
                     "regime_allocation": float(regime_decision.allocation),
-
                     "micro_score_risk": float(micro_score_risk),
                     "ev_cell_key": f"{hk.regime_band}|{hk.distortion_bucket}|{hk.score_bucket}",
                     "ev_cell_status": str(cell.status),
                     "ev_cell_ev": cell.ev,
                     "ev_cell_n": int(cell.n),
-
                     "auto_blocked": bool(rp.auto_blocked),
                     "auto_risk_multiplier": float(rp.auto_risk_multiplier),
                     "heatmap_status": rp.heatmap_status,

@@ -1,14 +1,13 @@
-from __future__ import annotations
-
+# strategy/score_engine.py
 """
 ========================================================
-strategy/score_engine.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+FILE: strategy/score_engine.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할:
 - 엔진 1차 정량 점수(engine_scores)를 계산한다.
-- GPT가 최종 판단을 하도록, 멀티 타임프레임/오더북/패턴 요약을
-  0~100 점수와 해석 가능한 컴포넌트로 정리해 제공한다.
+- 멀티 타임프레임/오더북/패턴 요약을 0~100 점수와 해석 가능한 컴포넌트로 정리해 제공한다.
+- "매매 결정"은 하지 않는다(상위 레이어 책임).
 
 핵심 원칙 (STRICT · NO-FALLBACK):
 - REST 호출/백필/외부 폴백 금지.
@@ -18,14 +17,10 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 점수는 0~100로 클램핑하며, total은 고정 가중치로 합산한다.
 
 입력 전제:
-- timeframes: "4h","1h","15m","5m" 키를 포함하며, 각 TF는
-  - last_close (float)
-  - indicators (dict; 최소 요구 키 포함)
-  - raw_ohlcv_last60 (1h/4h) 또는 raw_ohlcv_last20 (15m/5m)
-    포맷: [[ts,o,h,l,c,v], ...] (ts=ms)
-- pattern_features: {"5m": {...}} 포함 (timing_5m 계산에 사용)
+- timeframes: "4h","1h","15m","5m" 키 포함
+- pattern_features: {"5m": {...}} 포함
 - pattern_summary: {"pattern_score": 0~1} 포함
-- orderbook: bids/asks 포함 또는 best_bid/best_ask/spread_pct/depth_imbalance 포함
+- orderbook: bids/asks 또는 bestBid/bestAsk/spreadPct 등 포함
 
 가중치(고정):
 - trend_4h        0.30
@@ -33,6 +28,14 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - structure_15m   0.20
 - timing_5m       0.20
 - orderbook_micro 0.10
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-03 (TRADE-GRADE):
+  1) orderbook 키 정합 강화(STRICT, 폴백 아님):
+     - bestBid/bestAsk/spreadPct/depthImbalance/imbalanceQtyPct 등 camelCase/snake_case 모두 허용
+     - 존재하는 키만 선택(0/False를 “없음”으로 오해하지 않음)
+  2) total weight 무결성 체크 추가(합=1.0 강제)
 ========================================================
 """
 
@@ -74,9 +77,20 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return v
 
 
+def _pick_first_key(d: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    """
+    STRICT:
+    - 0/False를 “없음”으로 취급하지 않기 위해 key 존재 여부로만 선택한다.
+    """
+    for k in keys:
+        if k in d:
+            return d[k]
+    return None
+
+
 def _require_dict(symbol: str, stage: str, v: Any, name: str) -> Dict[str, Any]:
     if not isinstance(v, dict):
-        _fail(symbol, stage, f"{name} must be dict (got={type(v)})")
+        _fail(symbol, stage, f"{name} must be dict (got={type(v).__name__})")
     if not v:
         _fail(symbol, stage, f"{name} is empty")
     return v
@@ -84,13 +98,17 @@ def _require_dict(symbol: str, stage: str, v: Any, name: str) -> Dict[str, Any]:
 
 def _require_list(symbol: str, stage: str, v: Any, name: str, min_len: int) -> List[Any]:
     if not isinstance(v, list):
-        _fail(symbol, stage, f"{name} must be list (got={type(v)})")
+        _fail(symbol, stage, f"{name} must be list (got={type(v).__name__})")
     if len(v) < min_len:
         _fail(symbol, stage, f"{name} length<{min_len} (got={len(v)})")
     return v
 
 
 def _require_int(symbol: str, stage: str, v: Any, name: str) -> int:
+    if v is None:
+        _fail(symbol, stage, f"{name} is None")
+    if isinstance(v, bool):
+        _fail(symbol, stage, f"{name} must be int (bool not allowed)")
     try:
         iv = int(v)
     except Exception as e:
@@ -99,6 +117,10 @@ def _require_int(symbol: str, stage: str, v: Any, name: str) -> int:
 
 
 def _require_float(symbol: str, stage: str, v: Any, name: str) -> float:
+    if v is None:
+        _fail(symbol, stage, f"{name} is None")
+    if isinstance(v, bool):
+        _fail(symbol, stage, f"{name} must be float (bool not allowed)")
     try:
         fv = float(v)
     except Exception as e:
@@ -262,21 +284,19 @@ def _best_prices_from_orderbook_rows(
 def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, float]:
     """
     STRICT:
-    - best_bid/best_ask/spread_pct/depth_imbalance 는 필수.
-      단, best_bid/best_ask/spread_pct 는 bids/asks 가 있으면 계산 가능.
-    - depth_imbalance 는 bids/asks 로 계산 가능. 둘 다 없으면 실패.
+    - best_bid/best_ask/spread_pct/depth_imbalance/imbalance_qty_pct는 "존재하면 사용", 없으면 bids/asks로 계산.
+    - camelCase/snake_case 모두 허용(키 alias 처리; 폴백/대체값 주입 아님).
     """
     stage = "engine_scores.orderbook_micro"
 
-    # 1) best_bid/best_ask
-    best_bid = orderbook.get("best_bid")
-    best_ask = orderbook.get("best_ask")
+    best_bid = _pick_first_key(orderbook, ("best_bid", "bestBid"))
+    best_ask = _pick_first_key(orderbook, ("best_ask", "bestAsk"))
 
     if best_bid is None or best_ask is None:
-        bids = orderbook.get("bids")
-        asks = orderbook.get("asks")
+        bids = _pick_first_key(orderbook, ("bids",))
+        asks = _pick_first_key(orderbook, ("asks",))
         if not isinstance(bids, list) or not isinstance(asks, list):
-            _fail(symbol, stage, "orderbook missing best_bid/best_ask and bids/asks (cannot compute)")
+            _fail(symbol, stage, "orderbook missing bestBid/bestAsk and bids/asks (cannot compute)")
         bb, ba = _best_prices_from_orderbook_rows(symbol, stage, bids, asks)
         best_bid = bb
         best_ask = ba
@@ -286,8 +306,7 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
         if best_bid <= 0 or best_ask <= 0 or best_ask <= best_bid:
             _fail(symbol, stage, f"invalid best prices: best_bid={best_bid}, best_ask={best_ask}")
 
-    # 2) spread_pct
-    spread_pct = orderbook.get("spread_pct")
+    spread_pct = _pick_first_key(orderbook, ("spread_pct", "spreadPct"))
     if spread_pct is None:
         mid = (best_bid + best_ask) / 2.0
         if mid <= 0:
@@ -297,11 +316,10 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
     if spread_pct < 0 or not math.isfinite(spread_pct):
         _fail(symbol, stage, f"invalid spread_pct: {spread_pct}")
 
-    # 3) depth_imbalance
-    depth_imbalance = orderbook.get("depth_imbalance")
+    depth_imbalance = _pick_first_key(orderbook, ("depth_imbalance", "depthImbalance"))
     if depth_imbalance is None:
-        bids = orderbook.get("bids")
-        asks = orderbook.get("asks")
+        bids = _pick_first_key(orderbook, ("bids",))
+        asks = _pick_first_key(orderbook, ("asks",))
         if not isinstance(bids, list) or not isinstance(asks, list):
             _fail(symbol, stage, "orderbook missing depth_imbalance and bids/asks (cannot compute)")
         bid_notional = 0.0
@@ -331,11 +349,10 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
     if not math.isfinite(depth_imbalance) or depth_imbalance < -1.0 or depth_imbalance > 1.0:
         _fail(symbol, stage, f"invalid depth_imbalance (range/finite): {depth_imbalance}")
 
-    # 4) imbalance_qty_pct (옵션: 있으면 사용, 없으면 bids/asks로 계산)
-    imbalance_qty_pct = orderbook.get("imbalance_qty_pct")
+    imbalance_qty_pct = _pick_first_key(orderbook, ("imbalance_qty_pct", "imbalanceQtyPct"))
     if imbalance_qty_pct is None:
-        bids = orderbook.get("bids")
-        asks = orderbook.get("asks")
+        bids = _pick_first_key(orderbook, ("bids",))
+        asks = _pick_first_key(orderbook, ("asks",))
         if isinstance(bids, list) and isinstance(asks, list) and bids and asks:
             bid_qty = 0.0
             ask_qty = 0.0
@@ -397,7 +414,6 @@ def score_trend_4h(symbol: str, tf4h: Dict[str, Any]) -> Dict[str, Any]:
 
     slope_pct_60 = ((closes[-1] - closes[0]) / closes[0]) * 100.0
 
-    # HH/HL vs LL/LH 구조 (최근 20봉 vs 직전 20봉)
     last20_high = max(highs[-20:])
     prev20_high = max(highs[-40:-20])
     last20_low = min(lows[-20:])
@@ -418,7 +434,6 @@ def score_trend_4h(symbol: str, tf4h: Dict[str, Any]) -> Dict[str, Any]:
     elif last_close < ema_slow and ema_fast < ema_slow and structure_bias <= 0:
         direction = "SHORT"
 
-    # 점수(0~100): 추세 선명도(거리/EMA정렬/기울기/구조) 합산
     comp_price_dist = _clamp(abs(price_vs_ema_pct) * 8.0, 0.0, 30.0)
     comp_ema_spread = _clamp(abs(ema_spread_pct) * 10.0, 0.0, 20.0)
     comp_slope = _clamp(abs(slope_pct_60) * 5.0, 0.0, 20.0)
@@ -460,11 +475,9 @@ def score_momentum_1h(symbol: str, tf1h: Dict[str, Any]) -> Dict[str, Any]:
     if last_close <= 0:
         _fail(symbol, stage, f"invalid last_close (<=0): {last_close}")
 
-    # RSI dev from 50
     rsi_dev = abs(rsi - 50.0)
     comp_rsi = _clamp(rsi_dev * 1.6, 0.0, 40.0)
 
-    # MACD hist relative magnitude (%)
     macd_hist_pct = (abs(macd_hist) / last_close) * 100.0
     comp_macd = _clamp(macd_hist_pct * 300.0, 0.0, 30.0)
 
@@ -582,7 +595,6 @@ def score_timing_5m(
 
     mom_pct_5 = abs((closes[-1] - closes[-6]) / closes[-6]) * 100.0
 
-    # 최근 5봉 평균 range vs 이전 5봉 평균 range
     def _avg_range_pct(seg_high: List[float], seg_low: List[float], seg_close: List[float]) -> float:
         if len(seg_high) != len(seg_low) or len(seg_low) != len(seg_close) or not seg_close:
             _fail(symbol, stage, "invalid segment lengths for range_pct")
@@ -602,7 +614,6 @@ def score_timing_5m(
     if not math.isfinite(range_ratio) or range_ratio <= 0:
         _fail(symbol, stage, f"invalid range_ratio: {range_ratio}")
 
-    # 패턴 스코어: 5m + 전역 summary
     p5_score = _require_prob_0_1(symbol, stage, pattern_features_5m.get("pattern_score"), "pattern_features_5m.pattern_score")
     global_pattern_score = _require_prob_0_1(symbol, stage, pattern_summary.get("pattern_score"), "pattern_summary.pattern_score")
 
@@ -637,14 +648,12 @@ def score_timing_5m(
 
 
 def score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, Any]:
-    stage = "engine_scores.orderbook_micro"
     m = _orderbook_metrics_strict(symbol, orderbook)
 
     spread_pct = m["spread_pct"]
     imbalance_qty_pct = m["imbalance_qty_pct"]
     depth_imbalance = m["depth_imbalance"]
 
-    # spread 낮을수록 점수↑
     if spread_pct <= 0.02:
         spread_score = 40.0
     elif spread_pct <= 0.05:
@@ -659,7 +668,7 @@ def score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, A
     imbalance_score = _clamp(abs(imbalance_qty_pct) * 0.6, 0.0, 30.0)
     depth_score = _clamp(abs(depth_imbalance) * 30.0, 0.0, 30.0)
 
-    quality_score = 10.0  # strict validation 통과 보너스
+    quality_score = 10.0
     score = _clamp(spread_score + imbalance_score + depth_score + quality_score, 0.0, 100.0)
 
     return {
@@ -685,21 +694,15 @@ def build_engine_scores(
     pattern_summary: Dict[str, Any],
     orderbook: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """
-    엔진 1차 정량 점수 계산(STRICT).
-    반환 포맷:
-    {
-      "trend_4h": {...},
-      "momentum_1h": {...},
-      "structure_15m": {...},
-      "timing_5m": {...},
-      "orderbook_micro": {...},
-      "total": {"score": 0~100, "weights": {...}}
-    }
-    """
     sym = str(symbol or "").strip()
     if not sym:
         _fail("UNKNOWN", "build_engine_scores", "symbol is empty")
+
+    # TRADE-GRADE: total weight 무결성 체크
+    w = TOTAL_WEIGHTS
+    wsum = float(sum(w.values()))
+    if not math.isfinite(wsum) or abs(wsum - 1.0) > 1e-9:
+        _fail(sym, "build_engine_scores", f"TOTAL_WEIGHTS sum must be 1.0 (got={wsum})")
 
     tfs = _require_dict(sym, "build_engine_scores", timeframes, "timeframes")
     pf = _require_dict(sym, "build_engine_scores", pattern_features, "pattern_features")
@@ -713,7 +716,6 @@ def build_engine_scores(
 
     pf5 = _require_dict(sym, "build_engine_scores", pf.get("5m"), "pattern_features['5m']")
 
-    # pattern_summary.pattern_score 필수(0~1)
     _require_prob_0_1(sym, "build_engine_scores", ps.get("pattern_score"), "pattern_summary.pattern_score")
 
     trend_4h = score_trend_4h(sym, tf4h)
@@ -722,7 +724,6 @@ def build_engine_scores(
     timing_5m = score_timing_5m(sym, tf5, pf5, ps)
     orderbook_micro = score_orderbook_micro(sym, ob)
 
-    w = TOTAL_WEIGHTS
     total_score = (
         float(trend_4h["score"]) * w["trend_4h"]
         + float(momentum_1h["score"]) * w["momentum_1h"]

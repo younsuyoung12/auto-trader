@@ -2,7 +2,7 @@
 """
 ========================================================
 FILE: execution/execution_engine.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 역할
@@ -11,11 +11,22 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 폴백 금지: 누락/불일치/모호성은 즉시 예외
 
 핵심 원칙
-- 예외 삼키기 금지(단, 상태 기록 목적의 catch 후 즉시 재-raise는 허용)
+- 예외 삼키기 금지(단, 관측/알림 목적의 예외는 별도 이벤트로 기록 후 흐름에 영향 X)
 - “SKIP”은 정상 흐름(리스크/가드에 의해 실행하지 않는 결정)으로 처리한다.
 - “ENTER”는 필요한 메타/필드가 1개라도 없으면 즉시 중단한다.
 - 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
 - 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
+
+PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+- ENV 직접 접근 제거(SSOT 준수):
+  - os.getenv 기반 TEST_* 플래그 제거
+  - settings 객체의 test_* 필드로만 테스트 모드 제어(미존재 시 안전 기본값 False/0.0)
+- 운영 사고 방지:
+  - test_force_enter / test_bypass_guards / test_fake_available_usdt 는 test_dry_run=1에서만 허용(아니면 즉시 예외)
+- 예외 삼키기 제거:
+  - trade.order_state / trade.id setattr 실패를 조용히 무시하지 않음(실패 시 예외 전파)
+- 폴백 제거:
+  - quant_final_decision 기본값 "ENTER" 강제 주입 제거(존재할 때만 기록)
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
 - bt_trade_snapshots 확장 컬럼 저장 연결:
@@ -47,7 +58,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import time
 from datetime import datetime, timezone
 from threading import Lock
@@ -55,11 +65,13 @@ from typing import Any, Dict, Optional, Tuple
 
 from events.signals_logger import log_event, log_signal, log_skip_event
 from execution.exchange_api import get_available_usdt, get_balance_detail, req
-from execution.order_executor import open_position_with_tp_sl
 from execution.execution_quality_engine import ExecutionQualityError, build_execution_quality_snapshot_obj
+from execution.exceptions import OrderFailed, StateViolation
+from execution.order_executor import open_position_with_tp_sl
+from execution.order_state import OrderState
 from execution.risk_manager import hard_risk_guard_check
-from infra.telelog import send_skip_tg, send_tg
 from infra.async_worker import submit as submit_async
+from infra.telelog import send_skip_tg, send_tg
 from risk.entry_guards_ws import (
     check_manual_position_guard,
     check_price_jump_guard,
@@ -74,8 +86,6 @@ from state.db_writer import (
     record_trade_snapshot,
 )
 from state.trader_state import Trade  # ✅ FIX: Trade 타입 import
-from execution.exceptions import OrderFailed, StateViolation
-from execution.order_state import OrderState
 
 logger = logging.getLogger(__name__)
 
@@ -85,56 +95,17 @@ logger = logging.getLogger(__name__)
 _EXECUTION_LOCK: Lock = Lock()
 
 
-def _env_bool(name: str, default: str = "0") -> bool:
-    v = os.getenv(name, default)
-    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
-
-
-TEST_FORCE_ENTER: bool = _env_bool("TEST_FORCE_ENTER", "0")
-TEST_BYPASS_GUARDS: bool = _env_bool("TEST_BYPASS_GUARDS", "0")
-TEST_DRY_RUN: bool = _env_bool("TEST_DRY_RUN", "0")
-
-_TEST_FAKE_AVAILABLE_USDT_RAW = os.getenv("TEST_FAKE_AVAILABLE_USDT", "0")
-TEST_FAKE_AVAILABLE_USDT: float = float(_TEST_FAKE_AVAILABLE_USDT_RAW) if _TEST_FAKE_AVAILABLE_USDT_RAW else 0.0
-
-if TEST_BYPASS_GUARDS and not TEST_DRY_RUN:
-    raise RuntimeError("TEST_BYPASS_GUARDS is only allowed with TEST_DRY_RUN=1")
-
-if any([TEST_FORCE_ENTER, TEST_BYPASS_GUARDS, TEST_DRY_RUN, TEST_FAKE_AVAILABLE_USDT > 0]):
-    logger.warning(
-        "[TEST MODE ENABLED] FORCE_ENTER=%s BYPASS_GUARDS=%s DRY_RUN=%s FAKE_USDT=%s",
-        TEST_FORCE_ENTER,
-        TEST_BYPASS_GUARDS,
-        TEST_DRY_RUN,
-        TEST_FAKE_AVAILABLE_USDT,
-    )
-
-
-def _submit_tg_nonblocking(func, msg: str, *, label: str) -> None:
-    """
-    STRICT:
-    - 텔레그램 전송은 매매 실행을 블로킹하면 안 된다.
-    - 실패해도 매매 흐름을 깨지 않는다(알림은 비핵심 I/O).
-    """
-    try:
-        ok = submit_async(func, msg, critical=False, label=label)
-        if not ok:
-            logger.warning("[TG][DROP] queue full label=%s", label)
-    except Exception as e:
-        logger.warning("[TG][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
-
-
-def _submit_task_nonblocking(fn, *args: Any, label: str) -> None:
-    """
-    STRICT:
-    - 비핵심 작업(관측/리포팅)은 async_worker로 위임한다.
-    """
-    try:
-        ok = submit_async(fn, *args, critical=False, label=label)
-        if not ok:
-            logger.warning("[ASYNC][DROP] queue full label=%s", label)
-    except Exception as e:
-        logger.warning("[ASYNC][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
+def _as_bool_strict(v: Any, name: str) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be bool-like (got {v!r})")
 
 
 def _as_float(
@@ -221,6 +192,33 @@ def _deterministic_entry_client_order_id(symbol: str, direction: str, signal_ts_
         raise ValueError("generated client order id invalid")
 
     return cid
+
+
+def _submit_tg_nonblocking(func, msg: str, *, label: str) -> None:
+    """
+    STRICT:
+    - 텔레그램 전송은 매매 실행을 블로킹하면 안 된다.
+    - 실패해도 매매 흐름을 깨지 않는다(알림은 비핵심 I/O).
+    """
+    try:
+        ok = submit_async(func, msg, critical=False, label=label)
+        if not ok:
+            logger.warning("[TG][DROP] queue full label=%s", label)
+    except Exception as e:
+        logger.warning("[TG][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
+
+
+def _submit_task_nonblocking(fn, *args: Any, label: str) -> None:
+    """
+    STRICT:
+    - 비핵심 작업(관측/리포팅)은 async_worker로 위임한다.
+    """
+    try:
+        ok = submit_async(fn, *args, critical=False, label=label)
+        if not ok:
+            logger.warning("[ASYNC][DROP] queue full label=%s", label)
+    except Exception as e:
+        logger.warning("[ASYNC][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
 
 
 def _fetch_mark_price_strict(symbol: str) -> float:
@@ -451,7 +449,7 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
     decision_id = _meta_optional_str(meta, "decision_id")
     quant_decision_pre = _meta_optional_dict(meta, "quant_decision_pre")
     quant_constraints = _meta_optional_dict(meta, "quant_constraints")
-    quant_final_decision = _meta_optional_str(meta, "quant_final_decision") or "ENTER"
+    quant_final_decision = _meta_optional_str(meta, "quant_final_decision")  # ✅ 폴백 금지: 없으면 None
 
     gpt_severity = _meta_optional(meta, "gpt_severity")
     if gpt_severity is not None:
@@ -560,10 +558,39 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
 class ExecutionEngine:
     def __init__(self, settings: Any):
         self.settings = settings
-        required = ["symbol", "leverage", "slippage_block_pct", "slippage_stop_engine"]
+
+        required = ["symbol", "leverage", "slippage_block_pct", "slippage_stop_engine", "require_deterministic_client_order_id"]
         missing = [k for k in required if not hasattr(settings, k)]
         if missing:
             raise ValueError(f"settings missing required fields: {missing}")
+
+        if bool(getattr(settings, "require_deterministic_client_order_id")) is not True:
+            raise ValueError("settings.require_deterministic_client_order_id must be True (TRADE-GRADE)")
+
+        # ---- test controls (must come from settings; ENV direct access forbidden) ----
+        self.test_force_enter: bool = _as_bool_strict(getattr(settings, "test_force_enter", False), "settings.test_force_enter")
+        self.test_bypass_guards: bool = _as_bool_strict(getattr(settings, "test_bypass_guards", False), "settings.test_bypass_guards")
+        self.test_dry_run: bool = _as_bool_strict(getattr(settings, "test_dry_run", False), "settings.test_dry_run")
+
+        fake_usdt_raw = getattr(settings, "test_fake_available_usdt", 0.0)
+        self.test_fake_available_usdt: float = float(_as_float(fake_usdt_raw, "settings.test_fake_available_usdt", min_value=0.0))
+
+        # ---- hard safety: test knobs allowed only in dry-run ----
+        if self.test_bypass_guards and not self.test_dry_run:
+            raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
+        if self.test_force_enter and not self.test_dry_run:
+            raise RuntimeError("test_force_enter is only allowed with test_dry_run=True (STRICT)")
+        if self.test_fake_available_usdt > 0 and not self.test_dry_run:
+            raise RuntimeError("test_fake_available_usdt is only allowed with test_dry_run=True (STRICT)")
+
+        if any([self.test_force_enter, self.test_bypass_guards, self.test_dry_run, self.test_fake_available_usdt > 0]):
+            logger.warning(
+                "[TEST MODE ENABLED] FORCE_ENTER=%s BYPASS_GUARDS=%s DRY_RUN=%s FAKE_USDT=%s",
+                self.test_force_enter,
+                self.test_bypass_guards,
+                self.test_dry_run,
+                self.test_fake_available_usdt,
+            )
 
     def execute(self, signal: Signal) -> Optional[Trade]:
         if not isinstance(signal, Signal):
@@ -573,7 +600,8 @@ class ExecutionEngine:
         if action not in ("ENTER", "SKIP"):
             raise ValueError(f"signal.action invalid: {signal.action!r}")
 
-        if TEST_FORCE_ENTER:
+        # STRICT: force-enter is allowed only in dry-run (enforced in __init__)
+        if self.test_force_enter:
             action = "ENTER"
 
         if not _EXECUTION_LOCK.acquire(blocking=False):
@@ -647,15 +675,33 @@ class ExecutionEngine:
             if not manual_ok:
                 msg = f"[SKIP] manual_guard_blocked: {symbol}"
                 logger.warning(msg)
-                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.manual", side=direction, reason="manual_guard_blocked", extra={"ts_ms": signal_ts_ms})
+                log_skip_event(
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine.guard.manual",
+                    side=direction,
+                    reason="manual_guard_blocked",
+                    extra={"ts_ms": signal_ts_ms},
+                )
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
 
-            avail_usdt = float(TEST_FAKE_AVAILABLE_USDT) if TEST_FAKE_AVAILABLE_USDT > 0 else _as_float(get_available_usdt(), "available_usdt", min_value=0.0)
+            avail_usdt = (
+                float(self.test_fake_available_usdt)
+                if self.test_fake_available_usdt > 0
+                else _as_float(get_available_usdt(), "available_usdt", min_value=0.0)
+            )
             if avail_usdt <= 0:
                 msg = f"[SKIP] available_usdt<=0: {symbol}"
                 logger.warning(msg)
-                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.balance", side=direction, reason="balance_zero_or_invalid", extra={"available_usdt": avail_usdt, "ts_ms": signal_ts_ms})
+                log_skip_event(
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine.balance",
+                    side=direction,
+                    reason="balance_zero_or_invalid",
+                    extra={"available_usdt": avail_usdt, "ts_ms": signal_ts_ms},
+                )
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
 
@@ -667,33 +713,72 @@ class ExecutionEngine:
 
             if candles_5m_raw is None:
                 raise OrderFailed("meta.candles_5m_raw is required for volume guard (STRICT)")
-            vol_ok = check_volume_guard(settings=guard_settings, candles_5m_raw=candles_5m_raw, latest_ts=float(signal_ts_ms), signal_source=signal_source, direction=direction)
+            vol_ok = check_volume_guard(
+                settings=guard_settings,
+                candles_5m_raw=candles_5m_raw,
+                latest_ts=float(signal_ts_ms),
+                signal_source=signal_source,
+                direction=direction,
+            )
             if not vol_ok:
                 msg = f"[SKIP] volume_guard_blocked: {symbol}"
                 logger.info(msg)
-                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.volume", side=direction, reason="volume_guard_blocked", extra={"ts_ms": signal_ts_ms})
+                log_skip_event(
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine.guard.volume",
+                    side=direction,
+                    reason="volume_guard_blocked",
+                    extra={"ts_ms": signal_ts_ms},
+                )
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                if not TEST_BYPASS_GUARDS:
+                if not self.test_bypass_guards:
                     return None
 
             if candles_5m is None:
                 raise OrderFailed("meta.candles_5m is required for price jump guard (STRICT)")
-            price_ok = check_price_jump_guard(settings=guard_settings, candles_5m=candles_5m, latest_ts=float(signal_ts_ms), signal_source=signal_source, direction=direction)
+            price_ok = check_price_jump_guard(
+                settings=guard_settings,
+                candles_5m=candles_5m,
+                latest_ts=float(signal_ts_ms),
+                signal_source=signal_source,
+                direction=direction,
+            )
             if not price_ok:
                 msg = f"[SKIP] price_jump_guard_blocked: {symbol}"
                 logger.info(msg)
-                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.price_jump", side=direction, reason="price_jump_guard_blocked", extra={"ts_ms": signal_ts_ms})
+                log_skip_event(
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine.guard.price_jump",
+                    side=direction,
+                    reason="price_jump_guard_blocked",
+                    extra={"ts_ms": signal_ts_ms},
+                )
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                if not TEST_BYPASS_GUARDS:
+                if not self.test_bypass_guards:
                     return None
 
-            spread_ok, best_bid, best_ask = check_spread_guard(settings=guard_settings, symbol=symbol, latest_ts=float(signal_ts_ms), signal_source=signal_source, direction=direction)
+            spread_ok, best_bid, best_ask = check_spread_guard(
+                settings=guard_settings,
+                symbol=symbol,
+                latest_ts=float(signal_ts_ms),
+                signal_source=signal_source,
+                direction=direction,
+            )
             if not spread_ok:
                 msg = f"[SKIP] spread_guard_blocked: {symbol}"
                 logger.info(msg)
-                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.guard.spread", side=direction, reason="spread_guard_blocked", extra={"ts_ms": signal_ts_ms, "best_bid": best_bid, "best_ask": best_ask})
+                log_skip_event(
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine.guard.spread",
+                    side=direction,
+                    reason="spread_guard_blocked",
+                    extra={"ts_ms": signal_ts_ms, "best_bid": best_bid, "best_ask": best_ask},
+                )
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                if not TEST_BYPASS_GUARDS:
+                if not self.test_bypass_guards:
                     return None
 
             entry_price_hint = float(last_price)
@@ -727,11 +812,18 @@ class ExecutionEngine:
                 if slippage_pct > slippage_block_pct:
                     msg = f"[SKIP] {symbol} {direction} slippage_block slippage_pct={slippage_pct}"
                     logger.warning(msg)
-                    log_skip_event(symbol=symbol, regime=regime, source="execution_engine.slippage", side=direction, reason="slippage_block", extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct, "ts_ms": signal_ts_ms})
+                    log_skip_event(
+                        symbol=symbol,
+                        regime=regime,
+                        source="execution_engine.slippage",
+                        side=direction,
+                        reason="slippage_block",
+                        extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct, "ts_ms": signal_ts_ms},
+                    )
                     _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                     if slippage_stop_engine:
                         raise OrderFailed("slippage_block triggered and slippage_stop_engine=True (STRICT)")
-                    if not TEST_BYPASS_GUARDS:
+                    if not self.test_bypass_guards:
                         return None
 
             leverage = _as_float(getattr(self.settings, "leverage"), "settings.leverage", min_value=1.0)
@@ -747,7 +839,9 @@ class ExecutionEngine:
                 raise OrderFailed("ENTER requires signal.sl_pct > 0 (STRICT)")
 
             if leverage > 1.0 and allocation_ratio >= 0.8:
-                raise OrderFailed(f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio}) (STRICT)")
+                raise OrderFailed(
+                    f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio}) (STRICT)"
+                )
 
             notional = avail_usdt * allocation_ratio * leverage
             if notional <= 0:
@@ -768,9 +862,16 @@ class ExecutionEngine:
             if not ok:
                 msg = f"[SKIP] hard_risk_guard_blocked: {guard_reason}"
                 logger.warning("%s extra=%s", msg, guard_extra)
-                log_skip_event(symbol=symbol, regime=regime, source="execution_engine.risk_guard", side=direction, reason=str(guard_reason), extra=guard_extra)
+                log_skip_event(
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine.risk_guard",
+                    side=direction,
+                    reason=str(guard_reason),
+                    extra=guard_extra,
+                )
                 _submit_tg_nonblocking(send_skip_tg, f"{msg} {symbol} {direction}", label="send_skip_tg")
-                if not TEST_BYPASS_GUARDS:
+                if not self.test_bypass_guards:
                     return None
 
             side_open = "BUY" if direction == "LONG" else "SELL"
@@ -833,7 +934,7 @@ class ExecutionEngine:
             entry_score_val = _meta_pick_first(meta, ("entry_score", "entryScore"))
             engine_total_val = _meta_pick_first(meta, ("engine_total", "engine_total_score", "engine_total_score_v2"))
 
-            if TEST_DRY_RUN:
+            if self.test_dry_run:
                 state = OrderState.FILLED
                 entry_price_sim = float(entry_price_hint)
                 entry_qty_sim = float(qty_raw)
@@ -957,10 +1058,8 @@ class ExecutionEngine:
                 raise OrderFailed("open_position_with_tp_sl returned None (STRICT)")
 
             state = OrderState.FILLED
-            try:
-                setattr(trade, "order_state", state.value)
-            except Exception:
-                pass
+            # STRICT: setattr 실패를 숨기지 않는다.
+            setattr(trade, "order_state", state.value)
 
             entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(trade, soft_mode=bool(soft_mode))
 
@@ -1023,10 +1122,8 @@ class ExecutionEngine:
                 last_synced_at=now_sync,
             )
 
-            try:
-                setattr(trade, "id", int(trade_id))
-            except Exception:
-                pass
+            # STRICT: setattr 실패를 숨기지 않는다.
+            setattr(trade, "id", int(trade_id))
 
             snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price))
 

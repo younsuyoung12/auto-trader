@@ -1,3 +1,23 @@
+<!--
+========================================================
+FILE: templates/dashboard.html
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
+========================================================
+
+설계 원칙
+- “조용한 실패” 금지: API 실패/JSON 파싱 실패/네트워크 오류는 화면에 명시적으로 표시한다.
+- 기존 값 유지(묵시적 폴백) 금지: 실패 시 해당 위젯은 ERROR 상태로 전환한다.
+- 민감정보 노출 금지: 화면/콘솔에 키/토큰/DB URL 등 출력 금지.
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-03:
+  1) fetch 실패를 silent return 하지 않고, UI에 ERROR 배너/위젯별 오류 표시 추가
+  2) fetch timeout(AbortController) 추가
+  3) 마지막 업데이트 표기를 KST(Asia/Seoul) 기준으로 고정
+========================================================
+-->
+
 <!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -15,7 +35,7 @@
 <body class="min-h-screen text-slate-100">
   <div class="max-w-6xl mx-auto px-4 py-6 md:py-10">
 
-    <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
+    <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
       <div>
         <h1 class="text-2xl md:text-3xl font-semibold tracking-tight text-white">
           Binance Auto Trader 대시보드
@@ -32,6 +52,20 @@
         </button>
       </div>
     </header>
+
+    <!-- Global error banner (STRICT: silent failure 금지) -->
+    <div id="error-banner" class="hidden mb-4 rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-3">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <div class="text-sm font-semibold text-rose-200">데이터 로딩 실패</div>
+          <div id="error-banner-msg" class="text-xs text-rose-200/80 mt-1 break-words"></div>
+        </div>
+        <button id="error-banner-close"
+          class="text-xs text-rose-200/80 hover:text-rose-100 underline underline-offset-2">
+          닫기
+        </button>
+      </div>
+    </div>
 
     <section class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
       <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
@@ -65,6 +99,7 @@
         <div class="h-48 md:h-60">
           <canvas id="dailyPnlChart"></canvas>
         </div>
+        <div id="dailyPnlError" class="hidden mt-2 text-xs text-rose-300"></div>
       </div>
 
       <div class="glass-card rounded-2xl p-4 shadow-lg">
@@ -75,6 +110,7 @@
         <div class="h-48 md:h-60">
           <canvas id="entryScoreHistChart"></canvas>
         </div>
+        <div id="entryScoreError" class="hidden mt-2 text-xs text-rose-300"></div>
         <div class="mt-2 text-xs text-slate-400">
           운영 데이터가 아직 적으면 비어 있을 수 있습니다. (필요 시 API에 include_test=true 사용)
         </div>
@@ -89,6 +125,7 @@
           <span class="text-xs text-slate-400">최근 7일</span>
         </div>
         <div id="skipReasonsBox" class="text-xs md:text-sm text-slate-200 space-y-2"></div>
+        <div id="skipReasonsError" class="hidden mt-2 text-xs text-rose-300"></div>
       </div>
 
       <div class="glass-card rounded-2xl p-4 shadow-lg">
@@ -99,30 +136,103 @@
         <div class="h-48 md:h-60">
           <canvas id="skipHourlyChart"></canvas>
         </div>
+        <div id="skipHourlyError" class="hidden mt-2 text-xs text-rose-300"></div>
       </div>
     </section>
   </div>
 
   <script>
+    // ─────────────────────────────────────────────
+    // STRICT helpers (silent failure 금지)
+    // ─────────────────────────────────────────────
+    const $ = (id) => document.getElementById(id);
+
+    const showBannerError = (msg) => {
+      $("error-banner-msg").textContent = String(msg || "알 수 없는 오류");
+      $("error-banner").classList.remove("hidden");
+    };
+
+    const hideBannerError = () => {
+      $("error-banner").classList.add("hidden");
+      $("error-banner-msg").textContent = "";
+    };
+
+    const setWidgetError = (elemId, msg) => {
+      const el = $(elemId);
+      if (!el) return;
+      el.textContent = String(msg || "ERROR");
+      el.classList.remove("hidden");
+    };
+
+    const clearWidgetError = (elemId) => {
+      const el = $(elemId);
+      if (!el) return;
+      el.classList.add("hidden");
+      el.textContent = "";
+    };
+
+    const fetchJsonStrict = async (url, label, timeoutMs = 8000) => {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), timeoutMs);
+
+      let res;
+      try {
+        res = await fetch(url, { signal: controller.signal });
+      } catch (e) {
+        clearTimeout(t);
+        throw new Error(`${label}: fetch failed (${e && e.name ? e.name : "ERR"})`);
+      } finally {
+        clearTimeout(t);
+      }
+
+      if (!res.ok) {
+        throw new Error(`${label}: HTTP ${res.status}`);
+      }
+
+      let data;
+      try {
+        data = await res.json();
+      } catch (e) {
+        throw new Error(`${label}: invalid JSON`);
+      }
+
+      if (data === null || typeof data !== "object") {
+        throw new Error(`${label}: JSON root invalid`);
+      }
+      return data;
+    };
+
     const fmtNumber = (v, digits = 2) => {
       const num = Number(v);
-      if (Number.isNaN(num)) return "-";
+      if (Number.isNaN(num)) return "ERR";
       return num.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
     };
+
     const fmtPnlWithSign = (v, digits = 2) => {
       const num = Number(v);
-      if (Number.isNaN(num)) return "-";
+      if (Number.isNaN(num)) return "ERR";
       const s = num.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
       return num > 0 ? `+${s}` : s;
     };
-    const setLastUpdated = () => {
+
+    const setLastUpdatedKST = () => {
       const now = new Date();
-      const yyyy = now.getFullYear();
-      const mm = String(now.getMonth() + 1).padStart(2, "0");
-      const dd = String(now.getDate()).padStart(2, "0");
-      const hh = String(now.getHours()).padStart(2, "0");
-      const mi = String(now.getMinutes()).padStart(2, "0");
-      document.getElementById("last-updated-label").textContent = `마지막 업데이트: ${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+      const fmt = new Intl.DateTimeFormat("ko-KR", {
+        timeZone: "Asia/Seoul",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false
+      });
+      const parts = fmt.formatToParts(now).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+      const yyyy = parts.year;
+      const mm = parts.month;
+      const dd = parts.day;
+      const hh = parts.hour;
+      const mi = parts.minute;
+      $("last-updated-label").textContent = `마지막 업데이트: ${yyyy}-${mm}-${dd} ${hh}:${mi} (KST)`;
     };
 
     let dailyPnlChart = null;
@@ -130,110 +240,160 @@
     let skipHourlyChart = null;
 
     async function loadSummary() {
-      const res = await fetch("/api/summary");
-      if (!res.ok) return;
-      const data = await res.json();
+      clearWidgetError("summaryError");
+      try {
+        const data = await fetchJsonStrict("/api/summary", "summary");
 
-      document.getElementById("summary-total-trades").textContent = fmtNumber(data.total_trades, 0);
-      document.getElementById("summary-win-rate").textContent = fmtNumber(data.win_rate_pct, 1) + "%";
-      document.getElementById("summary-win-loss").textContent =
-        `이긴 ${fmtNumber(data.wins,0)} / 진 ${fmtNumber(data.losses,0)} / 본전 ${fmtNumber(data.breakevens,0)}`;
+        $("summary-total-trades").textContent = fmtNumber(data.total_trades, 0);
+        $("summary-win-rate").textContent = fmtNumber(data.win_rate_pct, 1) + "%";
+        $("summary-win-loss").textContent =
+          `이긴 ${fmtNumber(data.wins,0)} / 진 ${fmtNumber(data.losses,0)} / 본전 ${fmtNumber(data.breakevens,0)}`;
 
-      const totalPnlElem = document.getElementById("summary-total-pnl");
-      const totalPnl = Number(data.total_pnl_usdt || 0);
-      totalPnlElem.textContent = fmtPnlWithSign(totalPnl, 2);
-      totalPnlElem.className = "text-xl md:text-2xl font-semibold " + (totalPnl > 0 ? "text-emerald-400" : totalPnl < 0 ? "text-rose-400" : "text-slate-300");
+        const totalPnlElem = $("summary-total-pnl");
+        const totalPnl = Number(data.total_pnl_usdt);
+        if (Number.isNaN(totalPnl)) throw new Error("summary: total_pnl_usdt invalid");
 
-      document.getElementById("summary-avg-pnl").textContent = fmtPnlWithSign(Number(data.avg_pnl_usdt || 0), 2);
+        totalPnlElem.textContent = fmtPnlWithSign(totalPnl, 2);
+        totalPnlElem.className = "text-xl md:text-2xl font-semibold " +
+          (totalPnl > 0 ? "text-emerald-400" : totalPnl < 0 ? "text-rose-400" : "text-slate-300");
+
+        const avgPnl = Number(data.avg_pnl_usdt);
+        if (Number.isNaN(avgPnl)) throw new Error("summary: avg_pnl_usdt invalid");
+        $("summary-avg-pnl").textContent = fmtPnlWithSign(avgPnl, 2);
+      } catch (e) {
+        showBannerError(e.message || String(e));
+        // STRICT: 위젯에 명시적 오류 표시
+        $("summary-total-trades").textContent = "ERR";
+        $("summary-win-rate").textContent = "ERR";
+        $("summary-win-loss").textContent = "ERR";
+        $("summary-total-pnl").textContent = "ERR";
+        $("summary-avg-pnl").textContent = "ERR";
+      }
     }
 
     async function loadDailyPnlChart() {
-      const res = await fetch("/api/daily-pnl?days=30");
-      if (!res.ok) return;
-      const data = await res.json();
-      const items = data.items || [];
+      clearWidgetError("dailyPnlError");
+      try {
+        const data = await fetchJsonStrict("/api/daily-pnl?days=30", "daily-pnl");
+        const items = Array.isArray(data.items) ? data.items : null;
+        if (!items) throw new Error("daily-pnl: items invalid");
 
-      const labels = items.map(x => x.date);
-      const pnls = items.map(x => Number(x.pnl_usdt || 0));
+        const labels = items.map(x => String(x.date));
+        const pnls = items.map(x => {
+          const v = Number(x.pnl_usdt);
+          if (Number.isNaN(v)) throw new Error("daily-pnl: pnl_usdt invalid");
+          return v;
+        });
 
-      const ctx = document.getElementById("dailyPnlChart").getContext("2d");
-      if (dailyPnlChart) dailyPnlChart.destroy();
+        const ctx = $("dailyPnlChart").getContext("2d");
+        if (dailyPnlChart) dailyPnlChart.destroy();
 
-      dailyPnlChart = new Chart(ctx, {
-        type: "line",
-        data: { labels, datasets: [{ label: "Daily PnL", data: pnls, borderWidth: 2, tension: 0.3, fill: true }] },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-      });
+        dailyPnlChart = new Chart(ctx, {
+          type: "line",
+          data: { labels, datasets: [{ label: "Daily PnL", data: pnls, borderWidth: 2, tension: 0.3, fill: true }] },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+        });
+      } catch (e) {
+        setWidgetError("dailyPnlError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
     }
 
     async function loadEntryScoreHist() {
-      const res = await fetch("/api/entry-scores/recent?limit=300");
-      if (!res.ok) return;
-      const data = await res.json();
+      clearWidgetError("entryScoreError");
+      try {
+        const data = await fetchJsonStrict("/api/entry-scores/recent?limit=300", "entry-scores");
+        const labels = Array.isArray(data.hist_labels) ? data.hist_labels : null;
+        const counts = Array.isArray(data.hist_counts) ? data.hist_counts : null;
+        if (!labels || !counts) throw new Error("entry-scores: histogram invalid");
+        if (labels.length !== counts.length) throw new Error("entry-scores: histogram length mismatch");
 
-      const labels = data.hist_labels || [];
-      const counts = data.hist_counts || [];
+        const ctx = $("entryScoreHistChart").getContext("2d");
+        if (entryScoreHistChart) entryScoreHistChart.destroy();
 
-      const ctx = document.getElementById("entryScoreHistChart").getContext("2d");
-      if (entryScoreHistChart) entryScoreHistChart.destroy();
-
-      entryScoreHistChart = new Chart(ctx, {
-        type: "bar",
-        data: { labels, datasets: [{ label: "count", data: counts, borderWidth: 1 }] },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-      });
+        entryScoreHistChart = new Chart(ctx, {
+          type: "bar",
+          data: { labels, datasets: [{ label: "count", data: counts, borderWidth: 1 }] },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+        });
+      } catch (e) {
+        setWidgetError("entryScoreError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
     }
 
     async function loadSkipReasons() {
-      const res = await fetch("/api/events/skip-reasons?days=7&limit=15");
-      if (!res.ok) return;
-      const data = await res.json();
-      const items = data.items || [];
+      clearWidgetError("skipReasonsError");
+      try {
+        const data = await fetchJsonStrict("/api/events/skip-reasons?days=7&limit=15", "skip-reasons");
+        const items = Array.isArray(data.items) ? data.items : null;
+        if (!items) throw new Error("skip-reasons: items invalid");
 
-      const box = document.getElementById("skipReasonsBox");
-      box.innerHTML = "";
+        const box = $("skipReasonsBox");
+        box.innerHTML = "";
 
-      for (const it of items) {
-        const div = document.createElement("div");
-        div.className = "flex justify-between border-b border-slate-800/60 pb-1";
-        div.innerHTML = `<span class="truncate max-w-[70%]">${it.reason}</span><span>${it.n}</span>`;
-        box.appendChild(div);
+        for (const it of items) {
+          if (!it || typeof it !== "object") throw new Error("skip-reasons: item invalid");
+          const reason = String(it.reason ?? "");
+          const n = Number(it.n);
+          if (!reason) throw new Error("skip-reasons: reason empty");
+          if (Number.isNaN(n)) throw new Error("skip-reasons: n invalid");
+
+          const div = document.createElement("div");
+          div.className = "flex justify-between border-b border-slate-800/60 pb-1";
+          div.innerHTML = `<span class="truncate max-w-[70%]">${reason}</span><span>${n}</span>`;
+          box.appendChild(div);
+        }
+      } catch (e) {
+        setWidgetError("skipReasonsError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
       }
     }
 
     async function loadSkipHourly() {
-      const res = await fetch("/api/events/skip-hourly?days=7");
-      if (!res.ok) return;
-      const data = await res.json();
-      const items = data.items || [];
+      clearWidgetError("skipHourlyError");
+      try {
+        const data = await fetchJsonStrict("/api/events/skip-hourly?days=7", "skip-hourly");
+        const items = Array.isArray(data.items) ? data.items : null;
+        if (!items) throw new Error("skip-hourly: items invalid");
 
-      const labels = items.map(x => String(x.hour_kst));
-      const vals = items.map(x => Number(x.n || 0));
+        const labels = items.map(x => String(x.hour_kst));
+        const vals = items.map(x => {
+          const v = Number(x.n);
+          if (Number.isNaN(v)) throw new Error("skip-hourly: n invalid");
+          return v;
+        });
 
-      const ctx = document.getElementById("skipHourlyChart").getContext("2d");
-      if (skipHourlyChart) skipHourlyChart.destroy();
+        const ctx = $("skipHourlyChart").getContext("2d");
+        if (skipHourlyChart) skipHourlyChart.destroy();
 
-      skipHourlyChart = new Chart(ctx, {
-        type: "bar",
-        data: { labels, datasets: [{ label: "skip_count", data: vals, borderWidth: 1 }] },
-        options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-      });
+        skipHourlyChart = new Chart(ctx, {
+          type: "bar",
+          data: { labels, datasets: [{ label: "skip_count", data: vals, borderWidth: 1 }] },
+          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+        });
+      } catch (e) {
+        setWidgetError("skipHourlyError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
     }
 
     async function loadAll() {
-      await Promise.all([
-        loadSummary(),
-        loadDailyPnlChart(),
-        loadEntryScoreHist(),
-        loadSkipReasons(),
-        loadSkipHourly(),
-      ]);
-      setLastUpdated();
+      // STRICT: 이전 에러를 숨기지 않고, 새 로딩 시작 시 배너만 초기화
+      hideBannerError();
+
+      await loadSummary();
+      await loadDailyPnlChart();
+      await loadEntryScoreHist();
+      await loadSkipReasons();
+      await loadSkipHourly();
+      setLastUpdatedKST();
     }
 
     window.addEventListener("DOMContentLoaded", () => {
       loadAll();
-      document.getElementById("refresh-btn").addEventListener("click", () => loadAll());
+      $("refresh-btn").addEventListener("click", () => loadAll());
+      $("error-banner-close").addEventListener("click", () => hideBannerError());
     });
   </script>
 </body>

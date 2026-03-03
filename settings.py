@@ -1,46 +1,33 @@
-# =============================================================================
-# FILE: settings.py
-# STRICT · NO-FALLBACK · PRODUCTION MODE
-# =============================================================================
-# Design principles (Production Settings for Binance USDT-M Futures Engine)
-# -----------------------------------------------------------------------------
-# - This project must use **settings.py** as the single source of truth.
-# - Environment variables (os.environ) have priority (Render-friendly).
-# - Optional local .env is supported (**no external deps**) and never overwrites
-#   existing environment variables.
-# - Invalid configuration must fail fast (ValueError/RuntimeError).
-# - Sensitive values (API key/secret) must never be logged.
-# - Python 3.11+
-#
-# PATCH NOTES — 2026-03-02
-# - Allocation Mode(전액 배분형) 도입:
-#   - 포지션 사이즈는 RiskPhysicsEngine(=allocation)에서 결정한다.
-#   - Settings.risk_pct는 "호환/참고용"으로만 남긴다(기본 1.0 권장).
-# - LEVERAGE 기본값을 1로 변경(전액 배분형 안전 전제).
-#
-# PATCH NOTES — 2026-03-02 (PATCH)
-# - allocation_ratio(0~1) 설정 키를 정식 도입(의미 통일).
-#   - env: ALLOCATION_RATIO 우선, 없으면 RISK_PCT 사용(호환).
-#   - Settings.risk_pct는 "호환용 alias"로 유지하되 allocation_ratio와 값 일치 강제.
-# - 외부 의존성 제거:
-#   - python-dotenv 사용(load_dotenv) 제거 → 내장 .env 로더(_try_load_local_dotenv)만 사용.
-#
-# PATCH NOTES — 2026-03-02 (PATCH-9PT)
-# - 9점대 운영형(무감독 24/7) 필수 설정 추가:
-#   - require_deterministic_client_order_id: True면 entry_client_order_id 미지정 시 즉시 예외
-#   - entry_fill_wait_sec: 엔트리 FILLED 대기 시간(STRICT, timeout 시 예외)
-#   - max_entry_slippage_pct: (옵션) 엔트리 hint 대비 체결 슬리피지 초과 시 강제청산/실패
-#   - tp/sl 범위 가드 상수화:
-#       * tp_pct_min/max, sl_pct_min/max
-#       * signal 값이 이 범위를 벗어나면 즉시 예외(폴백 금지)
-#
-# PATCH NOTES — 2026-03-02 (PATCH-10PT MIN-CHANGE)
-# - 메인 루프 블로킹 제거/무결성 강화용 설정 추가:
-#   - async_worker_threads / async_worker_queue_size: 텔레그램/비핵심 I/O 비동기 워커
-#   - reconcile_interval_sec: 내부 상태 ↔ 거래소 상태 불일치 감지 주기
-#   - force_close_on_desync: DESYNC 시 강제청산(기본 False)
-#   - max_signal_latency_ms / max_exec_latency_ms: 지연 예산 초과 시 신규 진입 차단
-# =============================================================================
+# settings.py
+"""
+========================================================
+FILE: settings.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
+========================================================
+
+설계 원칙
+- settings.py 는 단일 설정 소스(SSOT)다.
+- env(os.environ) 우선, 로컬 .env는 옵션이며 env를 덮어쓰지 않는다.
+- 잘못된 설정은 즉시 예외(Fail-Fast).
+- 민감정보(API key/secret, DB URL 등) 로그 금지.
+- 테스트 토글은 settings에서만 읽는다(다른 모듈의 os.getenv 직접 접근 금지).
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-03 (TRADE-GRADE):
+  1) 테스트 토글을 settings로 공식화(SSOT):
+     - test_dry_run / test_bypass_guards / test_force_enter / test_fake_available_usdt 추가
+  2) 운영 사고 방지:
+     - test_bypass_guards / test_force_enter / test_fake_available_usdt 는 test_dry_run=True에서만 허용(아니면 즉시 예외)
+  3) run_bot_ws에서 getattr 기본값으로 읽던 운영 파라미터를 settings로 정식 수용:
+     - ws_backfill_tfs / ws_backfill_limit
+     - md_store_flush_sec / ob_store_interval_sec / md_store_tfs
+     - position_resync_sec
+  4) 누락된 env 매핑 보완:
+     - session_jump_mult_* env 로딩 추가
+
+========================================================
+"""
 
 from __future__ import annotations
 
@@ -91,7 +78,6 @@ class Settings:
     # Strategy / sizing
     # ✅ canonical: allocation_ratio(0~1) = 계좌 투입 비율
     allocation_ratio: float = 1.0
-
     # ✅ legacy alias (호환): 의미는 allocation_ratio와 동일하게 강제
     risk_pct: float = 1.0
 
@@ -156,6 +142,15 @@ class Settings:
     ws_log_interval_sec: int = 60
     ws_stale_reset_sec: float = 600.0
 
+    # WS bootstrap/backfill (run_bot_ws)
+    ws_backfill_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
+    ws_backfill_limit: int = 120
+
+    # Market-data store worker settings (run_bot_ws)
+    md_store_flush_sec: float = 5.0
+    ob_store_interval_sec: float = 5.0
+    md_store_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
+
     # Guards (entry_guards_ws)
     max_spread_pct: float = 0.0008
     max_spread_abs: float = 0.0
@@ -196,6 +191,9 @@ class Settings:
     max_signal_latency_ms: int = 200
     max_exec_latency_ms: int = 400
 
+    # run_bot_ws: exchange state resync
+    position_resync_sec: float = 20.0
+
     # Exchange endpoints
     binance_futures_base: str = "https://fapi.binance.com"
 
@@ -218,6 +216,14 @@ class Settings:
     require_deterministic_client_order_id: bool = True
     entry_fill_wait_sec: float = 2.0
     max_entry_slippage_pct: Optional[float] = None  # None이면 비활성
+
+    # ─────────────────────────────────────────────
+    # TEST controls (TRADE-GRADE)
+    # ─────────────────────────────────────────────
+    test_dry_run: bool = False
+    test_bypass_guards: bool = False
+    test_force_enter: bool = False
+    test_fake_available_usdt: float = 0.0
 
 
 # Backward-compatible alias for legacy type hints
@@ -480,13 +486,20 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("async_worker_queue_size must be >= 1")
     if s.reconcile_interval_sec < 1:
         raise ValueError("reconcile_interval_sec must be >= 1")
-    if not isinstance(s.force_close_on_desync, bool):
-        raise ValueError("force_close_on_desync must be bool")
-
     if s.max_signal_latency_ms < 1:
         raise ValueError("max_signal_latency_ms must be >= 1")
     if s.max_exec_latency_ms < 1:
         raise ValueError("max_exec_latency_ms must be >= 1")
+
+    # WS bootstrap/store
+    if s.ws_backfill_limit < 1:
+        raise ValueError("ws_backfill_limit must be >= 1")
+    if s.md_store_flush_sec <= 0:
+        raise ValueError("md_store_flush_sec must be > 0")
+    if s.ob_store_interval_sec <= 0:
+        raise ValueError("ob_store_interval_sec must be > 0")
+    if s.position_resync_sec <= 0:
+        raise ValueError("position_resync_sec must be > 0")
 
     # 9점대 운영형
     if not isinstance(s.require_deterministic_client_order_id, bool):
@@ -502,6 +515,16 @@ def _validate_settings(s: Settings) -> None:
             raise ValueError("max_entry_slippage_pct must be finite number or None")
         if float(s.max_entry_slippage_pct) < 0:
             raise ValueError("max_entry_slippage_pct must be >= 0")
+
+    # TEST controls (TRADE-GRADE) — 운영 사고 방지
+    if s.test_bypass_guards and not s.test_dry_run:
+        raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
+    if s.test_force_enter and not s.test_dry_run:
+        raise RuntimeError("test_force_enter is only allowed with test_dry_run=True (STRICT)")
+    if float(s.test_fake_available_usdt) > 0 and not s.test_dry_run:
+        raise RuntimeError("test_fake_available_usdt is only allowed with test_dry_run=True (STRICT)")
+    if float(s.test_fake_available_usdt) < 0:
+        raise ValueError("test_fake_available_usdt must be >= 0 (STRICT)")
 
 
 # -----------------------------------------------------------------------------
@@ -593,14 +616,19 @@ def load_settings() -> Settings:
 
     ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
-
     ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 60)
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_orderbook_max_delay_sec = _as_float("WS_ORDERBOOK_MAX_DELAY_SEC", 10.0)
-
     ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)
     ws_log_interval_sec = _as_int("WS_LOG_INTERVAL_SEC", 60)
     ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
+
+    ws_backfill_tfs = _as_csv_list("WS_BACKFILL_TFS", ["1m", "5m", "15m", "1h", "4h"])
+    ws_backfill_limit = _as_int("WS_BACKFILL_LIMIT", 120)
+
+    md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 5.0)
+    ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 5.0)
+    md_store_tfs = _as_csv_list("MD_STORE_TFS", ["1m", "5m", "15m"])
 
     max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0008)
     max_spread_abs = _as_float("MAX_SPREAD_ABS", 0.0)
@@ -622,6 +650,7 @@ def load_settings() -> Settings:
     session_spread_mult_eu = _as_float("SESSION_SPREAD_MULT_EU", 1.1)
     session_spread_mult_us = _as_float("SESSION_SPREAD_MULT_US", 1.2)
 
+    # ✅ 누락되었던 env 매핑 보완
     session_jump_mult_asia = _as_float("SESSION_JUMP_MULT_ASIA", 1.0)
     session_jump_mult_eu = _as_float("SESSION_JUMP_MULT_EU", 1.1)
     session_jump_mult_us = _as_float("SESSION_JUMP_MULT_US", 1.2)
@@ -641,6 +670,8 @@ def load_settings() -> Settings:
     max_signal_latency_ms = _as_int("MAX_SIGNAL_LATENCY_MS", 200)
     max_exec_latency_ms = _as_int("MAX_EXEC_LATENCY_MS", 400)
 
+    position_resync_sec = _as_float("POSITION_RESYNC_SEC", 20.0)
+
     binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
     binance_recv_window = recv_window_ms
     binance_http_timeout_sec = request_timeout_sec
@@ -657,6 +688,12 @@ def load_settings() -> Settings:
     require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
     entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
     max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
+
+    # TEST controls (TRADE-GRADE) — settings에서만 읽는다.
+    test_dry_run = _as_bool("TEST_DRY_RUN", False)
+    test_bypass_guards = _as_bool("TEST_BYPASS_GUARDS", False)
+    test_force_enter = _as_bool("TEST_FORCE_ENTER", False)
+    test_fake_available_usdt = _as_float("TEST_FAKE_AVAILABLE_USDT", 0.0)
 
     s = Settings(
         api_key=api_key,
@@ -711,6 +748,11 @@ def load_settings() -> Settings:
         ws_log_enabled=ws_log_enabled,
         ws_log_interval_sec=ws_log_interval_sec,
         ws_stale_reset_sec=ws_stale_reset_sec,
+        ws_backfill_tfs=ws_backfill_tfs,
+        ws_backfill_limit=ws_backfill_limit,
+        md_store_flush_sec=md_store_flush_sec,
+        ob_store_interval_sec=ob_store_interval_sec,
+        md_store_tfs=md_store_tfs,
         max_spread_pct=max_spread_pct,
         max_spread_abs=max_spread_abs,
         min_entry_volume_ratio=min_entry_volume_ratio,
@@ -740,6 +782,7 @@ def load_settings() -> Settings:
         force_close_on_desync=force_close_on_desync,
         max_signal_latency_ms=max_signal_latency_ms,
         max_exec_latency_ms=max_exec_latency_ms,
+        position_resync_sec=position_resync_sec,
         binance_futures_base=binance_futures_base,
         binance_recv_window=binance_recv_window,
         binance_http_timeout_sec=binance_http_timeout_sec,
@@ -753,6 +796,10 @@ def load_settings() -> Settings:
         require_deterministic_client_order_id=require_deterministic_client_order_id,
         entry_fill_wait_sec=entry_fill_wait_sec,
         max_entry_slippage_pct=max_entry_slippage_pct,
+        test_dry_run=test_dry_run,
+        test_bypass_guards=test_bypass_guards,
+        test_force_enter=test_force_enter,
+        test_fake_available_usdt=test_fake_available_usdt,
     )
 
     _validate_settings(s)
