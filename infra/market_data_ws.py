@@ -28,6 +28,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - “로그만 남기고 무시” 방식 제거(조용한 데이터 손상 금지)
   3) REST backfill 입력도 STRICT:
      - backfill_klines_from_rest 에서 invalid row continue 제거 → 즉시 예외
+- 2026-03-04:
+  1) Atomic Market Snapshot 추가
+     - get_market_snapshot(symbol) 구현
+     - kline + orderbook 동시 snapshot 제공
+     - strategy layer에서 데이터 시점 불일치 방지
 ========================================================
 """
 
@@ -820,6 +825,44 @@ def start_ws_loop(symbol: str) -> None:
     log(f"[MD_BINANCE_WS] background ws started for {sym}")
 
 
+def get_market_snapshot(symbol: str) -> Dict[str, Any]:
+    """
+    Atomic Market Snapshot (STRICT)
+
+    목적:
+    - strategy/feature builder가 kline + orderbook을 "동일 시점"으로 읽도록 한다.
+    - 개별 getter(get_klines*, get_orderbook) 조합 호출 시 발생 가능한
+      non-atomic read(데이터 시점 불일치)를 방지한다.
+
+    반환:
+    {
+        "symbol": str,
+        "orderbook": dict | None,
+        "klines": { "<interval>": [ (ts,o,h,l,c,v), ... ], ... }
+    }
+    """
+    sym = _normalize_symbol(symbol)
+
+    # NOTE:
+    # - STRICT 정책상 여기서 더미 값 생성/보정은 하지 않는다.
+    # - 데이터가 없으면 orderbook=None 또는 klines={} 로 반환한다.
+    #   (상위 레이어는 health snapshot으로 FAIL 처리 가능)
+    with _kline_lock, _orderbook_lock:
+        snapshot: Dict[str, Any] = {"symbol": sym, "orderbook": None, "klines": {}}
+
+        ob = _orderbook_buffers.get(sym)
+        if ob:
+            snapshot["orderbook"] = dict(ob)
+
+        kl_map: Dict[str, Any] = {}
+        for (s, iv), rows in _kline_buffers.items():
+            if s == sym:
+                kl_map[iv] = list(rows)
+        snapshot["klines"] = kl_map
+
+        return snapshot
+
+
 __all__ = [
     "start_ws_loop",
     "preload_klines",
@@ -832,4 +875,5 @@ __all__ = [
     "get_orderbook",
     "get_health_snapshot",
     "is_data_healthy",
+    "get_market_snapshot",
 ]

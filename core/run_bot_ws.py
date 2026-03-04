@@ -56,6 +56,9 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
      - 단발 실패는 경고/스킵(로그+TG)로 처리하되,
        연속 실패 N회 시 SAFE_STOP + 예외 전파
   4) DESYNC 콜백은 확정(desync_confirmed=True) 시 즉시 SAFE_STOP + 예외 전파
+  5) 연속 손실 하드스탑 연결:
+     - settings.hard_consecutive_losses_limit(ENV: HARD_CONSECUTIVE_LOSSES_LIMIT) >= 1 인 경우
+       CLOSE 후 CONSEC_LOSSES가 limit 이상이면 SAFE_STOP + TG 알림 후 엔진 종료(신규 진입 차단)
 ============================================================
 """
 
@@ -1078,6 +1081,15 @@ def main() -> None:
     if confirm_n_i < 1:
         raise RuntimeError("settings.reconcile_confirm_n must be >= 1 (STRICT)")
 
+    # NEW: hard consecutive losses limit (0 = disabled)
+    hard_consec_limit = getattr(SET, "hard_consecutive_losses_limit", None)
+    if hard_consec_limit is None:
+        hard_consec_limit = 0
+        log(f"[BOOT][DEFAULT] hard_consecutive_losses_limit missing -> using {hard_consec_limit} (disabled)")
+    hard_consec_limit_i = int(hard_consec_limit)
+    if hard_consec_limit_i < 0:
+        raise RuntimeError("settings.hard_consecutive_losses_limit must be >= 0 (STRICT)")
+
     reconcile_engine = ReconcileEngine(
         ReconcileConfig(
             symbol=str(SET.symbol),
@@ -1226,6 +1238,18 @@ def main() -> None:
                         reason=reason,
                         pnl=pnl,
                     )
+
+                    # NEW: consecutive loss hard-stop (policy-level SAFE_STOP)
+                    if hard_consec_limit_i > 0 and CONSEC_LOSSES >= hard_consec_limit_i:
+                        SAFE_STOP_REQUESTED = True
+                        msg = (
+                            "🛑 [SAFE_STOP][CONSEC_LOSS] 연속 손실 한도 도달: "
+                            f"consecutive_losses={CONSEC_LOSSES} limit={hard_consec_limit_i} "
+                            "(신규 진입 중단, 엔진 종료)"
+                        )
+                        log(msg)
+                        _maybe_send_error_tg("CONSEC_LOSS_HARDSTOP", msg, cooldown_sec=60)
+                        return
 
                 last_fill_check = now
 

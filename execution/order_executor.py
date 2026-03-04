@@ -1240,14 +1240,13 @@ def open_position_with_tp_sl(
             client_order_id=entry_cid,
         )
     except Exception as e:
-        # STRICT: 이벤트 기록 후 예외 전파(삼키기 금지)
-        logger.error(
-            "entry order failed (symbol=%s side=%s qty=%s source=%s err=%s)",
+        # STRICT: 이벤트 기록 후 예외 전파(삼키기 금지) + stack trace
+        logger.exception(
+            "entry order failed (symbol=%s side=%s qty=%s source=%s)",
             sym,
             open_side,
             expected_qty_f,
             source,
-            str(e),
         )
         log_event(
             event_type="ERROR",
@@ -1342,7 +1341,7 @@ def open_position_with_tp_sl(
                 try:
                     close_position_market(sym, open_side, float(expected_qty_f))
                 except Exception as e2:
-                    logger.critical("slippage guard force close failed (symbol=%s err=%s)", sym, str(e2))
+                    logger.exception("slippage guard force close failed (symbol=%s)", sym)
                     raise OrderExecutionError("slippage guard close failed") from e2
                 raise OrderExecutionError("slippage guard triggered")
 
@@ -1396,7 +1395,7 @@ def open_position_with_tp_sl(
             sl_client_order_id=sl_cid,
         )
     except Exception as e:
-        logger.error("set_tp_sl failed (symbol=%s err=%s soft_mode=%s)", sym, str(e), bool(soft_mode))
+        logger.exception("set_tp_sl failed (symbol=%s soft_mode=%s)", sym, bool(soft_mode))
         log_event(
             event_type="ERROR",
             symbol=sym,
@@ -1417,7 +1416,7 @@ def open_position_with_tp_sl(
             try:
                 close_position_market(sym, open_side, float(expected_qty_f))
             except Exception as e2:
-                logger.critical("force close after TP failure failed (symbol=%s err=%s)", sym, str(e2))
+                logger.exception("force close after TP failure failed (symbol=%s)", sym)
                 raise OrderExecutionError("force close after TP failure failed") from e2
             raise OrderExecutionError("tp set failed (soft_mode)")
 
@@ -1425,7 +1424,7 @@ def open_position_with_tp_sl(
         try:
             close_position_market(sym, open_side, float(expected_qty_f))
         except Exception as e2:
-            logger.critical("force close after TP/SL failure also failed (symbol=%s err=%s)", sym, str(e2))
+            logger.exception("force close after TP/SL failure also failed (symbol=%s)", sym)
             raise OrderExecutionError("force close after TP/SL failure failed") from e2
         raise OrderExecutionError("tp/sl set failed") from e
 
