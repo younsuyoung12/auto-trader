@@ -1,11 +1,11 @@
 # Auto-Trader (Binance USDT-M Futures)
-STRICT · NO-FALLBACK · PRODUCTION
+STRICT · NO-FALLBACK · TRADE-GRADE
 
 이 저장소는 BTCUSDT 단일 심볼 기준의 실전형(운영형) 자동매매 엔진이다.
 목표는 “수익률 과장”이 아니라 운영 안정성(무중단/무결성/Fail-Fast)이다.
 
 - WebSocket 기반 시세 수집(캔들/오더북)
-- 전략 판단(지표/피처 + Quant Engine + GPT Supervisor)
+- 전략 판단(지표/피처 + Quant Engine + GPT Supervisor + Meta L3(multiplier only))
 - 실행(주문/TP·SL) + DB 영속화(거래/스냅샷/이벤트)
 - 대시보드/분석은 Render에서 DB 조회 전용(read-only analytics)
 
@@ -23,6 +23,10 @@ STRICT · NO-FALLBACK · PRODUCTION
 - 잔고가 없으면 실주문은 실패한다.
 - 잔고 없는 환경에서 파이프라인 검증은 TEST_DRY_RUN=1로 진행한다.
 
+- 운영 실행 엔트리 포인트는 core/run_bot_preflight.py 이다.
+  - Preflight ALL GREEN 통과 후에만 core/run_bot_ws.py 실행을 허용한다(우회 금지).
+  - run_bot_ws 직접 실행 금지(운영 사고 방지).
+
 ---------------------------------------------------------------------------
 1) 설계 원칙(절대 준수)
 ---------------------------------------------------------------------------
@@ -32,6 +36,7 @@ STRICT · NO-FALLBACK · PRODUCTION
 - 즉시 예외(raise) 또는 명시적 SKIP 처리
 - “조용히 넘어가기” 금지
 - 예외를 삼키지 않는다(로그 남기고 재-raise는 허용)
+- 시간 역전(timestamp rollback) 발생 시 즉시 SAFE_STOP + 예외 전파
 
 1.2 보안(Security Boundary)
 - 거래소 API Key/Secret은 AWS Worker에만 존재
@@ -44,6 +49,7 @@ STRICT · NO-FALLBACK · PRODUCTION
 - 내부 상태 ↔ 거래소 상태 Reconcile(불일치 감지) 도입
 - 지연(latency) 예산 초과 시 신규 진입 차단(SAFE_STOP) 가능
 - 재시작 후 정합(sync_exchange) 및 불일치 감지(reconcile_engine) 필수
+- 원시 데이터 무결성(DataIntegrityGuard) + 수학 무결성(InvariantGuard) + 급변 감지(DriftDetector)를 런타임에 강제
 
 ---------------------------------------------------------------------------
 2) 배포 토폴로지(Production)
@@ -54,6 +60,7 @@ STRICT · NO-FALLBACK · PRODUCTION
 - WebSocket ingest → strategy → execution
 - 거래소 키 보관(절대 Render 저장 금지)
 - Render Postgres External URL로 TLS 연결하여 DB 기록
+- OpenAI 관련 키/모델(OPENAI_API_KEY/OPENAI_MODEL)은 AWS Worker에만 존재(권장)
 
 2.2 Database + Dashboard: Render
 - Render Managed Postgres에 trades/snapshots/events/market-data 저장
@@ -63,6 +70,22 @@ STRICT · NO-FALLBACK · PRODUCTION
 ---------------------------------------------------------------------------
 3) 런타임 데이터 플로우
 ---------------------------------------------------------------------------
+
+3.0 Preflight(운영 Gate, 필수)
+- 운영 시작 전 반드시 core/run_bot_preflight.py 실행
+- Preflight는 런타임 파이프라인을 1회 “완전 재현(B)”한다:
+  1) Settings 정상
+  2) DB 연결 정상
+  3) Binance API 정상
+  4) REST 백필 + WS 준비(필수 TF/오더북)
+  5) UnifiedFeatures 계산(WS 기반 통합 피처 생성)
+  6) Regime 계산(밴드/할당)
+  7) RiskPhysics 계산(DD/연속손실/AutoBlock 포함 최종 allocation)
+  8) Drift Detector(급변 감지)
+  9) Invariant Guard(수학 무결성)
+  10) ExecutionEngine DRY_RUN(주문 없이 DB 기록)
+  11) DB Round-trip 정합 검증
+- ALL GREEN 통과 시에만 run_bot_ws 실행을 허용한다.
 
 부팅(BOOT)
 - REST 백필(boot only):
@@ -85,11 +108,28 @@ STRICT · NO-FALLBACK · PRODUCTION
   - 내부 상태 ↔ 거래소 상태 비교(Desync 감지)
   - 불일치 발생 시 SAFE_STOP 또는 옵션 강제청산
 
+추가(TRADE-GRADE Safety Layers)
+- DataIntegrityGuard:
+  - 캔들: timestamp rollback 금지, 미래 timestamp 금지, high>=low, close∈[low,high], volume>=0, finite 강제
+  - 오더북: bestAsk>bestBid, bids/asks 레벨 price/qty>0, ts(exchTs|ts) 존재(폴백 금지)
+  - 위반 시 SAFE_STOP + 예외 전파
+- InvariantGuard:
+  - allocation/risk_pct 0..1, tp/sl>0, dd_pct 0..100, micro_score_risk 0..100,
+    notional>0, qty>0, slippage finite 등
+  - 위반 시 SAFE_STOP + 예외 전파
+- DriftDetector:
+  - allocation/multiplier/regime/micro_score_risk 급변 감지
+  - 위반 시 SAFE_STOP + 예외 전파
+
 ---------------------------------------------------------------------------
 4) 구성 요소(책임 경계)
 ---------------------------------------------------------------------------
 
 4.1 AWS Worker(핵심 엔진)
+- core/run_bot_preflight.py
+  - 운영형 사전검증 Gate(완전 재현) → 통과 시 run_bot_ws 실행 허용
+- core/run_bot_ws.py
+  - Binance USDT-M Futures WebSocket 메인 루프
 - infra/market_data_ws.py
   - Binance Futures WS ingest(캔들/오더북 버퍼)
 - infra/market_data_rest.py
@@ -98,8 +138,19 @@ STRICT · NO-FALLBACK · PRODUCTION
   - WS 지연/신선도 감시(헬스 실패 시 SKIP)
 - infra/async_worker.py
   - Telegram/비핵심 I/O 비동기 위임(블로킹 금지)
+
+- infra/data_integrity_guard.py   (신규)
+  - 원시 데이터 무결성(캔들/오더북) STRICT 검증 + timestamp rollback 차단
+- execution/invariant_guard.py     (신규)
+  - 수학 무결성(핵심 값) STRICT 검증
+- infra/drift_detector.py          (신규)
+  - 급변(Drift) 감지(alloc/multiplier/regime/micro) → SAFE_STOP 트리거
+
 - strategy/unified_features_builder.py
-  - WS 기반 통합 피처 생성(timeframes + orderbook + pattern + engine_scores)
+  - WS 기반 통합 피처 생성(timeframes + orderbook + pattern + engine_scores + microstructure)
+  - (중요) 4h.regime 의존 제거:
+    - 4h OHLCV/EMA/구조는 필수
+    - 4h.regime 객체가 없으면 trend_strength(0..1)를 “명시 규칙”으로 산출(폴백 아님)
 - strategy/microstructure_engine.py
   - 기초 데이터 확장 계층(funding/OI/LSR 기반 과열/왜곡 점수)
 - strategy/regime_engine.py
@@ -143,6 +194,10 @@ STRICT · NO-FALLBACK · PRODUCTION
 - TRADER_DB_URL
   - Render Postgres External URL
   - SSL 권장: ?sslmode=require
+- OPENAI_API_KEY
+- OPENAI_MODEL
+  - 권장: gpt-4o-mini (비용/속도 균형)
+  - 예: OPENAI_MODEL=gpt-4o-mini
 
 선택
 - TELEGRAM_BOT_TOKEN
@@ -386,11 +441,18 @@ DD/Equity(중요)
 - 24/7 유지
   - systemd 또는 pm2/supervisor로 상시 실행
 - 재시작 시 필수 점검
-  - BINANCE_API_* / TRADER_DB_URL 환경변수 재주입 확인
+  - BINANCE_API_* / TRADER_DB_URL / OPENAI_* 환경변수 재주입 확인
   - reconcile_engine 동작 확인(Desync 감지)
 - 로그 저장(옵션)
   - LOG_TO_FILE=1
   - LOG_FILE=/var/log/auto-trader.log
+
+추가(운영 실행 순서, 권장)
+1) Preflight만 실행(점검)
+- python -m core.run_bot_preflight --preflight-only
+2) ALL GREEN 확인 후 운영 실행
+- python -m core.run_bot_ws
+(또는 python -m core.run_bot_preflight 로 통과 후 자동 핸드오프)
 
 ---------------------------------------------------------------------------
 10) 테스트/가상매매(잔고 없을 때)
@@ -398,10 +460,11 @@ DD/Equity(중요)
 
 권장 절차
 1) TEST_DRY_RUN=1로 실행
-2) 엔트리 후보가 발생하도록 충분히 구동
-3) bt_trade_snapshots에 레코드가 생성되는지 확인
-4) equity_current_usdt / equity_peak_usdt / dd_pct가 NULL이 아닌지 확인
-5) (확장) micro_score_risk / exec_slippage_pct / ev_cell_status / auto_blocked 확인
+2) Preflight ALL GREEN 확인
+3) 엔트리 후보가 발생하도록 충분히 구동
+4) bt_trade_snapshots에 레코드가 생성되는지 확인
+5) equity_current_usdt / equity_peak_usdt / dd_pct가 NULL이 아닌지 확인
+6) (확장) micro_score_risk / exec_slippage_pct / ev_cell_status / auto_blocked 확인
 
 주의
 - TEST_BYPASS_GUARDS=1은 운영에서 절대 사용 금지
@@ -429,10 +492,20 @@ DD/Equity(중요)
   - exit 시점에 entry_price/qty/SL 기준으로 pnl_r 확정 후 ev_heatmap_engine.on_trade_close() 업데이트
   - 추정/대충 변환 금지(STRICT)
 
+11.4 OpenAI 설정 누락
+- 현상: Preflight SETTINGS 단계에서 즉시 실패(openai_api_key/openai_model 누락)
+- 해결:
+  - OPENAI_API_KEY / OPENAI_MODEL 환경변수 설정 후 재시도
+  - 모델 예: OPENAI_MODEL=gpt-4o-mini
+
+11.5 4H 관련(중요)
+- 4H OHLCV/EMA/구조 계산은 필수(데이터 없으면 즉시 실패).
+- 4h.regime 객체는 upstream에 없을 수 있으며, 이 경우 trend_strength는 규칙 기반으로 산출(폴백 아님).
+
 ---------------------------------------------------------------------------
 12) 면책
 ---------------------------------------------------------------------------
 
 자동매매는 손실 위험이 크다.
 사용자는 모든 책임을 본인이 부담한다.
-운영 전 반드시 소액/테스트로 검증한다
+운영 전 반드시 소액/테스트로 검증한다.
