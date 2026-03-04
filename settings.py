@@ -107,7 +107,7 @@ class Settings:
     max_trade_qty: float = 1.0
 
     # Entry/exit cadence
-    entry_cooldown_sec: float = 1.0
+    entry_cooldown_sec: float = 8.0
     cooldown_after_close: float = 3.0
     min_entry_score_for_gpt: float = 28
     gpt_entry_cooldown_sec: float = 10.0

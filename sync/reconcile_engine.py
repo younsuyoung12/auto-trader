@@ -1,14 +1,13 @@
-# sync/reconcile_engine.py
 """
 ========================================================
-sync/reconcile_engine.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+FILE: sync/reconcile_engine.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 역할
 --------------------------------------------------------
 - "내부 상태"와 "거래소 실제 상태"가 틀어지는(Desync) 상황을 조기에 감지한다.
-- run_bot_ws.py 같은 메인 루프에서 30초마다 호출하는 용도.
+- run_bot_ws.py 같은 메인 루프에서 주기적으로 호출하는 용도.
 - DB 스키마/저장은 건드리지 않는다. (조회 + 판단 + 상위로 신호만)
 
 핵심 원칙 (STRICT)
@@ -16,8 +15,9 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 1) 폴백 금지:
    - 거래소/로컬 스냅샷에 필요한 필드가 없으면 즉시 예외.
    - None/빈값을 임의로 0으로 바꾸거나 추정하지 않는다.
-2) Desync는 "넘어가면" 안 된다:
-   - 불일치 감지 시 상위(리스크 엔진)가 HARD_STOP 또는 강제 정리 정책을 수행해야 한다.
+2) 단발 mismatch로 즉시 HARD_STOP 금지 (TRADE-GRADE):
+   - N회 연속 mismatch일 때만 "확정 desync"로 승격한다.
+   - 단발/일시적 지연(거래소 반영/조회 지연)으로 봇이 과민 정지하는 것을 방지한다.
 3) 본 모듈은 "판단"만 한다:
    - 주문 실행/청산/DB 저장은 여기서 하지 않는다.
    - 필요 시 on_desync 콜백으로만 알린다.
@@ -30,16 +30,20 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
   - (선택) fetch_exchange_open_orders(symbol) -> list[dict]
   - (선택) on_desync(result) -> None  # 여기서 HARD_STOP 트리거
 
-PATCH NOTES — 2026-03-02
+변경 이력
 --------------------------------------------------------
-- Initial implementation: strict reconcile for single-symbol futures bot.
+- 2026-03-04:
+  1) 단발 mismatch 즉시 HARD_STOP 금지: N회 연속 mismatch로 desync 확정(TRADE-GRADE)
+  2) 결과에 consecutive_mismatches / desync_confirmed 필드 추가(기존 호환 유지)
+  3) 예외 삼키기/None 보정/조용한 무시는 그대로 금지(STRICT 유지)
+========================================================
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -61,6 +65,9 @@ class ReconcileConfig:
     # 수량/가격 오차 허용치 (거래소/로컬 표현 차이를 최소 허용)
     qty_tolerance: Decimal = Decimal("0.000001")
     price_tolerance: Decimal = Decimal("0.50")  # BTC entryPrice 오차 0.5달러까지 허용 (필요 시 조정)
+
+    # TRADE-GRADE: 단발 mismatch는 "경고"로 두고, N회 연속일 때만 desync 확정
+    desync_confirm_n: int = 3
 
 
 @dataclass(frozen=True)
@@ -95,6 +102,11 @@ class ReconcileResult:
     local: LocalPosition
     open_orders_count: Optional[int] = None
 
+    # TRADE-GRADE: 단발 mismatch는 ok=False라도 즉시 HARD_STOP로 승격하지 않도록
+    # 연속 카운터와 확정 여부를 명시한다.
+    consecutive_mismatches: int = 0
+    desync_confirmed: bool = False
+
 
 # =========================
 # Engine
@@ -102,8 +114,12 @@ class ReconcileResult:
 
 class ReconcileEngine:
     """
-    단일 심볼(BTCUSDT) 기준 최소 reconcile 엔진.
+    단일 심볼 기준 reconcile 엔진.
     - run_bot_ws.py에서 주기적으로 run_if_due() 호출
+
+    TRADE-GRADE:
+    - 단발 mismatch(일시적 조회 지연/반영 지연)으로 즉시 HARD_STOP 금지
+    - N회 연속 mismatch일 때만 on_desync 콜백 호출
     """
 
     def __init__(
@@ -117,6 +133,8 @@ class ReconcileEngine:
     ) -> None:
         if config.interval_sec < 1:
             raise ValueError("interval_sec must be >= 1")
+        if not isinstance(config.desync_confirm_n, int) or config.desync_confirm_n < 1:
+            raise ValueError("desync_confirm_n must be int >= 1 (STRICT)")
 
         self._cfg = config
         self._fetch_exchange_position = fetch_exchange_position
@@ -126,35 +144,72 @@ class ReconcileEngine:
 
         self._last_run_ts: float = 0.0
 
+        # TRADE-GRADE: consecutive mismatch counter
+        self._consecutive_mismatches: int = 0
+
     def run_if_due(self, now_ts: Optional[float] = None) -> Optional[ReconcileResult]:
         """
         주기 조건이 되면 reconcile 수행 후 결과 반환.
         - 실행 시점이 아니면 None 반환.
+
+        STRICT:
+        - reconcile_once 내부에서 필드 누락/형 변환 실패는 예외로 즉시 전파된다.
+        - 여기서는 예외를 삼키지 않는다.
         """
         ts = now_ts if now_ts is not None else time.time()
         if (ts - self._last_run_ts) < self._cfg.interval_sec:
             return None
 
         self._last_run_ts = ts
-        result = reconcile_once(
+
+        base = reconcile_once(
             self._cfg,
             fetch_exchange_position=self._fetch_exchange_position,
             get_local_position=self._get_local_position,
             fetch_exchange_open_orders=self._fetch_exchange_open_orders,
         )
 
-        if not result.ok:
-            logger.error(
-                "[RECONCILE] DESYNC symbol=%s issues=%d",
-                result.symbol,
-                len(result.issues),
-            )
-            for issue in result.issues:
-                logger.error("[RECONCILE] %s: %s | %s", issue.code, issue.message, issue.details)
+        if base.ok:
+            # 정상 -> 연속 mismatch 리셋
+            if self._consecutive_mismatches != 0:
+                logger.info("[RECONCILE] recovered (symbol=%s) consecutive_mismatches=%d -> 0", base.symbol, self._consecutive_mismatches)
+            self._consecutive_mismatches = 0
+            return replace(base, consecutive_mismatches=0, desync_confirmed=False)
 
+        # ok=False: mismatch 발생
+        self._consecutive_mismatches += 1
+        confirm_n = int(self._cfg.desync_confirm_n)
+        confirmed = self._consecutive_mismatches >= confirm_n
+
+        result = replace(
+            base,
+            consecutive_mismatches=int(self._consecutive_mismatches),
+            desync_confirmed=bool(confirmed),
+        )
+
+        # 로그는 항상 남긴다(단, HARD_STOP 트리거는 confirmed일 때만)
+        logger.error(
+            "[RECONCILE] mismatch symbol=%s issues=%d consecutive=%d/%d confirmed=%s",
+            result.symbol,
+            len(result.issues),
+            result.consecutive_mismatches,
+            confirm_n,
+            result.desync_confirmed,
+        )
+        for issue in result.issues:
+            logger.error("[RECONCILE] %s: %s | %s", issue.code, issue.message, issue.details)
+
+        if confirmed:
+            logger.critical("[RECONCILE] DESYNC CONFIRMED (symbol=%s) -> on_desync", result.symbol)
             if self._on_desync is not None:
                 # 상위(리스크 엔진)에서 HARD_STOP / 강제정리 정책 수행
                 self._on_desync(result)
+        else:
+            # 단발/미확정 mismatch: HARD_STOP 금지. 상위에선 result.desync_confirmed로 분기 가능.
+            logger.warning(
+                "[RECONCILE] mismatch not confirmed yet (symbol=%s) - HARD_STOP NOT triggered",
+                result.symbol,
+            )
 
         return result
 
@@ -187,7 +242,12 @@ def reconcile_once(
         orders = fetch_exchange_open_orders(symbol)
         if orders is None:
             raise RuntimeError("fetch_exchange_open_orders returned None (STRICT)")
-        open_orders_count = len(list(orders))
+        # STRICT: orders는 Sequence[dict] 여야 한다. list()로 강제 materialize해 타입 검증한다.
+        ol = list(orders)
+        for i, row in enumerate(ol):
+            if not isinstance(row, dict):
+                raise TypeError(f"open_orders[{i}] must be dict (STRICT)")
+        open_orders_count = len(ol)
 
     issues: List[ReconcileIssue] = []
 
@@ -261,6 +321,7 @@ def reconcile_once(
         exchange=ex,
         local=loc,
         open_orders_count=open_orders_count,
+        # consecutive/confirmed은 Engine에서 채운다(호환 유지)
     )
 
 
@@ -340,3 +401,14 @@ def _sign(x: Decimal) -> int:
     if x < 0:
         return -1
     return 0
+
+
+__all__ = [
+    "ReconcileConfig",
+    "ExchangePosition",
+    "LocalPosition",
+    "ReconcileIssue",
+    "ReconcileResult",
+    "ReconcileEngine",
+    "reconcile_once",
+]

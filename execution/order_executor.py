@@ -1,7 +1,7 @@
 """
 ========================================================
 FILE: execution/order_executor.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 Binance USDT-M Futures - Order Execution Layer (Production)
 
@@ -11,6 +11,19 @@ Binance USDT-M Futures - Order Execution Layer (Production)
 - Idempotency via newClientOrderId (openOrders + order lookup + in-process lock)
 - Timestamp error (-1021) recovery: sync_server_time() + single retry
 - No print(); logging only
+
+PATCH NOTES — 2026-03-04 (TRADE-GRADE)
+--------------------------------------------------------
+- 체결 안정성 강화(Partial fill/지연 체결/가시성 지연 대응)
+  - ENTRY/EXIT MARKET 주문 후 주문 상태(FILLED) + executedQty/avgPrice STRICT 검증
+  - 체결 수량 mismatch 시 즉시 예외(진행 금지)
+  - 포지션 반영(positionAmt) 확인 루프 추가(짧은 대기, 제한 횟수) 후 불일치 시 예외
+- 동시성/일관성 강화
+  - Idempotency 조회에서 비정상 타입 발견 시 즉시 예외(조용한 continue 금지)
+  - entry 주문 전 동일한 라운딩(필터 기반)으로 “예상 수량” 확정 후 전송
+- 예외 전파 구조 정비
+  - open_position_with_tp_sl()에서 예외를 삼키고 None 반환하던 흐름 제거(STRICT)
+  - 필요한 이벤트 기록 후 예외 전파(폴백/조용한 종료 금지)
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
 --------------------------------------------------------
@@ -51,6 +64,7 @@ from execution.exchange_api import (
     fetch_open_positions,
     get_exchange_info,
     get_open_orders,
+    get_position,
     req,
     set_leverage,
     set_margin_mode,
@@ -72,6 +86,25 @@ SET = load_settings()
 _FILTER_CACHE_TTL_SEC: int = 1800  # 30 minutes
 _IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
 _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
+
+
+# ---------------------------------------------------------------------------
+# Exceptions (TRADE-GRADE)
+# ---------------------------------------------------------------------------
+class OrderExecutionError(RuntimeError):
+    """Raised when order execution/verification fails (STRICT)."""
+
+
+class OrderFillTimeoutError(OrderExecutionError):
+    """Raised when an order is not FILLED within deadline (STRICT)."""
+
+
+class PartialFillError(OrderExecutionError):
+    """Raised when executedQty mismatches expectedQty (STRICT)."""
+
+
+class PositionVerificationError(OrderExecutionError):
+    """Raised when exchange position does not reflect expected execution (STRICT)."""
 
 
 # ---------------------------------------------------------------------------
@@ -265,36 +298,33 @@ def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
 
 def _trade_ctor_supported_fields() -> set[str]:
     """
-    레거시/버전 차이를 안전하게 흡수하기 위한 호환용.
-
-    STRICT는 "데이터"에 적용한다.
-    여기서는 Trade dataclass/ctor의 시그니처 차이로 인해 런타임 크래시가 나는 것을 방지한다.
+    STRICT:
+    - Trade ctor 시그니처를 탐지하지 못하면 즉시 예외(조용한 호환 처리 금지)
     """
-    try:
-        f = getattr(Trade, "__dataclass_fields__", None)
-        if isinstance(f, dict) and f:
-            return set(f.keys())
-    except Exception:
-        pass
+    f = getattr(Trade, "__dataclass_fields__", None)
+    if isinstance(f, dict) and f:
+        return set(f.keys())
 
     try:
         sig = inspect.signature(Trade)  # type: ignore[arg-type]
-        return {p.name for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
-    except Exception:
-        return set()
+        names = {p.name for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+        if not names:
+            raise RuntimeError("Trade signature has no parameters (unexpected)")
+        return names
+    except Exception as e:
+        raise RuntimeError("unable to introspect Trade ctor fields (STRICT)") from e
 
 
 def _make_trade_strict(**kwargs: Any) -> Trade:
     """
-    Trade 객체 생성(호환).
+    Trade 객체 생성(STRICT).
 
     - Trade ctor에 존재하는 필드만 전달한다.
-    - 값 자체의 유효성(0 대입/추정 등)은 호출부에서 이미 STRICT로 보장해야 한다.
+    - ctor 필드 탐지 실패 시 즉시 예외(폴백 금지).
     """
     allowed = _trade_ctor_supported_fields()
-    if not allowed:
-        return Trade(**kwargs)  # type: ignore[arg-type]
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    # STRICT: 필수 필드 누락/오타 등은 Trade ctor에서 예외로 터져야 한다.
     return Trade(**filtered)  # type: ignore[arg-type]
 
 
@@ -397,7 +427,7 @@ def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolF
 
     for f in filters:
         if not isinstance(f, dict):
-            continue
+            raise RuntimeError("exchangeInfo.filters contains non-dict (STRICT)")
         ftype = str(f.get("filterType", "")).upper().strip()
 
         if ftype == "PRICE_FILTER":
@@ -547,7 +577,7 @@ def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional
         raise RuntimeError("get_open_orders returned non-list")
     for o in orders:
         if not isinstance(o, dict):
-            continue
+            raise RuntimeError("openOrders contains non-dict (STRICT)")
         if str(o.get("clientOrderId", "")).strip() == client_order_id:
             return o
     return None
@@ -556,7 +586,9 @@ def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional
 def _get_order_by_client_id(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
     params = {"symbol": symbol, "origClientOrderId": client_order_id}
     try:
-        data = _call_with_time_sync_retry(lambda: req("GET", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec))
+        data = _call_with_time_sync_retry(
+            lambda: req("GET", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec)
+        )
     except Exception as e:
         if _is_order_not_found(e):
             return None
@@ -893,6 +925,188 @@ def cancel_order_safe(
     return data
 
 
+# ---------------------------------------------------------------------------
+# Fill / Position verification (TRADE-GRADE)
+# ---------------------------------------------------------------------------
+def _decimal_abs(x: Decimal) -> Decimal:
+    return x if x >= 0 else -x
+
+
+def _require_decimal(v: Any, *, name: str) -> Decimal:
+    try:
+        d = Decimal(str(v))
+    except Exception as e:
+        raise OrderExecutionError(f"{name} not decimal-convertible") from e
+    return d
+
+
+def _require_order_field_strict(od: Dict[str, Any], key: str) -> Any:
+    if key not in od:
+        raise OrderExecutionError(f"order missing required field: {key}")
+    v = od[key]
+    if v is None:
+        raise OrderExecutionError(f"order field {key} is None")
+    return v
+
+
+def _compute_avg_price_strict(order: Dict[str, Any]) -> float:
+    ap = order.get("avgPrice")
+    if ap is not None:
+        try:
+            apf = float(ap)
+        except Exception:
+            apf = 0.0
+        if apf > 0 and math.isfinite(apf):
+            return float(apf)
+
+    cq = _require_order_field_strict(order, "cummulativeQuoteQty")
+    eq = _require_order_field_strict(order, "executedQty")
+    cqf = float(cq)
+    eqf = float(eq)
+    if not math.isfinite(cqf) or not math.isfinite(eqf) or cqf <= 0 or eqf <= 0:
+        raise OrderExecutionError("FILLED order has non-positive executedQty/cummulativeQuoteQty")
+    px = cqf / eqf
+    if not math.isfinite(px) or px <= 0:
+        raise OrderExecutionError("computed avg price invalid")
+    return float(px)
+
+
+def _wait_order_filled_strict(
+    *,
+    symbol: str,
+    order_id: str,
+    settings: Any,
+    expected_qty: Decimal,
+    qty_step: Decimal,
+    max_wait_sec: float,
+) -> Tuple[Dict[str, Any], Decimal, float]:
+    """
+    STRICT:
+    - deadline 내 FILLED 아니면 예외
+    - executedQty/avgPrice 무결성 검증
+    - executedQty mismatch 시 예외
+    """
+    sym = _normalize_symbol(symbol)
+    timeout_sec = _require_timeout_sec(settings)
+
+    if not str(order_id).strip():
+        raise OrderExecutionError("order_id is empty (STRICT)")
+    if expected_qty <= 0:
+        raise OrderExecutionError("expected_qty must be > 0 (STRICT)")
+    if qty_step <= 0:
+        raise OrderExecutionError("qty_step must be > 0 (STRICT)")
+
+    deadline = time.time() + float(max_wait_sec)
+    last_status = "UNKNOWN"
+
+    while True:
+        od = _call_with_time_sync_retry(
+            lambda: req(
+                "GET",
+                "/fapi/v1/order",
+                {"symbol": sym, "orderId": order_id},
+                private=True,
+                timeout_sec=timeout_sec,
+            )
+        )
+        if not isinstance(od, dict):
+            raise OrderExecutionError("GET /fapi/v1/order returned non-dict")
+
+        status = str(od.get("status") or "").upper()
+        last_status = status
+
+        if status == "FILLED":
+            exec_qty = _require_decimal(_require_order_field_strict(od, "executedQty"), name="order.executedQty")
+            if exec_qty <= 0:
+                raise OrderExecutionError("FILLED but executedQty <= 0 (STRICT)")
+
+            # executedQty mismatch: 허용 오차는 step의 절반(실전 표현 오차 방지)
+            diff = _decimal_abs(exec_qty - expected_qty)
+            tol = qty_step / Decimal("2")
+            if diff > tol:
+                raise PartialFillError(
+                    f"executedQty mismatch (expected={_d_to_str(expected_qty)}, got={_d_to_str(exec_qty)}, step={_d_to_str(qty_step)})"
+                )
+
+            avg_price = _compute_avg_price_strict(od)
+            return od, exec_qty, avg_price
+
+        if time.time() >= deadline:
+            raise OrderFillTimeoutError(
+                f"order not FILLED within {max_wait_sec}s (status={last_status})"
+            )
+
+        # NEW/PARTIALLY_FILLED 등: 짧게 대기
+        time.sleep(0.2)
+
+
+def _verify_position_reflects_execution_strict(
+    *,
+    symbol: str,
+    open_side: str,
+    executed_qty: Decimal,
+    qty_step: Decimal,
+    settings: Any,
+    max_wait_sec: float = 1.2,
+) -> Decimal:
+    """
+    STRICT:
+    - 거래소 포지션이 체결 방향/수량을 반영하는지 확인한다(짧은 폴링, 제한).
+    - 불일치 시 예외.
+    """
+    sym = _normalize_symbol(symbol)
+    side_u = _normalize_side(open_side)
+    if executed_qty <= 0:
+        raise PositionVerificationError("executed_qty must be > 0 (STRICT)")
+    if qty_step <= 0:
+        raise PositionVerificationError("qty_step must be > 0 (STRICT)")
+
+    deadline = time.time() + float(max_wait_sec)
+    last_amt: Optional[Decimal] = None
+
+    while True:
+        pos = get_position(sym)
+        if not isinstance(pos, dict):
+            raise PositionVerificationError("get_position returned non-dict (STRICT)")
+
+        if "positionAmt" not in pos:
+            raise PositionVerificationError("position missing positionAmt (STRICT)")
+
+        amt = _require_decimal(pos.get("positionAmt"), name="position.positionAmt")
+        last_amt = amt
+
+        # 방향 확인
+        if side_u == "BUY":
+            if amt <= 0:
+                # 아직 반영 안 됐을 수 있으니 deadline 전까지 재시도
+                pass
+            else:
+                # 수량 반영 확인(최소 executed_qty - step)
+                if _decimal_abs(amt) + qty_step < executed_qty:
+                    raise PositionVerificationError(
+                        f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
+                    )
+                return amt
+        else:
+            if amt >= 0:
+                pass
+            else:
+                if _decimal_abs(amt) + qty_step < executed_qty:
+                    raise PositionVerificationError(
+                        f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
+                    )
+                return amt
+
+        if time.time() >= deadline:
+            raise PositionVerificationError(
+                f"position not reflecting execution within {max_wait_sec}s (last_positionAmt={_d_to_str(last_amt) if last_amt is not None else 'None'})"
+            )
+        time.sleep(0.2)
+
+
+# ---------------------------------------------------------------------------
+# TP/SL
+# ---------------------------------------------------------------------------
 def set_tp_sl(
     *,
     symbol: str,
@@ -955,66 +1169,6 @@ def set_tp_sl(
     return tp_order_id, sl_order_id
 
 
-def _fetch_filled_entry_price_strict(
-    *,
-    symbol: str,
-    order_id: Any,
-    settings: Any,
-    max_wait_sec: float = 2.0,
-) -> float:
-    sym = _normalize_symbol(symbol)
-    timeout_sec = _require_timeout_sec(settings)
-
-    oid = order_id
-    if oid is None:
-        raise RuntimeError("entry order_id missing")
-
-    deadline = time.time() + float(max_wait_sec)
-
-    while True:
-        od = _call_with_time_sync_retry(
-            lambda: req(
-                "GET",
-                "/fapi/v1/order",
-                {"symbol": sym, "orderId": oid},
-                private=True,
-                timeout_sec=timeout_sec,
-            )
-        )
-        if not isinstance(od, dict):
-            raise RuntimeError("GET /fapi/v1/order returned non-dict")
-
-        status = str(od.get("status") or "").upper()
-        if status == "FILLED":
-            ap = od.get("avgPrice")
-            try:
-                apf = float(ap) if ap is not None else 0.0
-            except Exception:
-                apf = 0.0
-
-            if apf > 0:
-                return apf
-
-            cq = od.get("cummulativeQuoteQty")
-            eq = od.get("executedQty")
-            if cq is None or eq is None:
-                raise RuntimeError("FILLED order missing cummulativeQuoteQty/executedQty")
-
-            cqf = float(cq)
-            eqf = float(eq)
-            if eqf <= 0 or cqf <= 0:
-                raise RuntimeError("FILLED order has non-positive executedQty/cummulativeQuoteQty")
-
-            price = cqf / eqf
-            if price <= 0:
-                raise RuntimeError("computed entry price <= 0")
-            return float(price)
-
-        if time.time() >= deadline:
-            raise RuntimeError(f"entry order not FILLED within {max_wait_sec}s (status={status})")
-        time.sleep(0.2)
-
-
 def open_position_with_tp_sl(
     settings: Any,
     symbol: str,
@@ -1037,7 +1191,7 @@ def open_position_with_tp_sl(
 
     lev = _require_leverage(settings)
 
-    final_qty = _require_positive_float(qty, "qty")
+    final_qty_raw = _require_positive_float(qty, "qty")
 
     tp_pct_f = float(tp_pct)
     sl_pct_f = float(sl_pct)
@@ -1062,22 +1216,36 @@ def open_position_with_tp_sl(
     tp_cid = _make_child_client_order_id(entry_cid, "tp")
     sl_cid = _make_child_client_order_id(entry_cid, "sl")
 
+    # TRADE-GRADE: 주문 전 라운딩으로 예상 수량 확정(실제 전송/검증 일치)
+    ensure_trading_settings(sym, settings)
+    filt = get_symbol_filters(sym)
+    expected_qty_dec, _, _ = _round_qty_and_price(
+        filters=filt,
+        order_type="MARKET",
+        raw_qty=final_qty_raw,
+        raw_price=None,
+        raw_stop_price=None,
+    )
+    expected_qty_f = float(expected_qty_dec)
+
+    # 1) ENTRY 제출
     try:
         entry_resp = place_market(
             symbol=sym,
             side=open_side,
-            qty=float(final_qty),
+            qty=float(expected_qty_f),
             settings=settings,
             reduce_only=False,
             position_side="BOTH",
             client_order_id=entry_cid,
         )
     except Exception as e:
+        # STRICT: 이벤트 기록 후 예외 전파(삼키기 금지)
         logger.error(
             "entry order failed (symbol=%s side=%s qty=%s source=%s err=%s)",
             sym,
             open_side,
-            final_qty,
+            expected_qty_f,
             source,
             str(e),
         )
@@ -1087,40 +1255,52 @@ def open_position_with_tp_sl(
             regime=source,
             side=_event_side_from_open_side(open_side),
             reason=str(e) or "entry_order_failed",
-            extra_json={"open_side": open_side, "qty": float(final_qty), "clientOrderId": entry_cid},
+            extra_json={"open_side": open_side, "qty": float(expected_qty_f), "clientOrderId": entry_cid},
         )
-        return None
+        raise OrderExecutionError("entry order submission failed") from e
 
     order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
     if order_id is None:
-        raise RuntimeError("entry response missing orderId (STRICT)")
+        raise OrderExecutionError("entry response missing orderId (STRICT)")
     entry_order_id = str(order_id)
 
-    try:
-        entry_price = _fetch_filled_entry_price_strict(
-            symbol=sym,
-            order_id=entry_order_id,
-            settings=settings,
-            max_wait_sec=float(getattr(settings, "entry_fill_wait_sec", 2.0) or 2.0),
-        )
-    except Exception as e:
-        logger.error("entry price resolve failed (symbol=%s err=%s)", sym, str(e))
-        log_event(
-            event_type="ERROR",
-            symbol=sym,
-            regime=source,
-            side=_event_side_from_open_side(open_side),
-            reason="entry_price_unavailable",
-            extra_json={"err": str(e), "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
-        )
-        try:
-            close_position_market(sym, open_side, float(final_qty))
-        except Exception as e2:
-            logger.critical("force close after entry_price failure also failed (symbol=%s err=%s)", sym, str(e2))
-        return None
+    # 2) ENTRY 체결 검증(FILLED + executedQty + avgPrice)
+    max_wait = float(getattr(settings, "entry_fill_wait_sec", 2.0) or 2.0)
+    od, exec_qty_dec, entry_price = _wait_order_filled_strict(
+        symbol=sym,
+        order_id=entry_order_id,
+        settings=settings,
+        expected_qty=expected_qty_dec,
+        qty_step=filt.market_step,
+        max_wait_sec=max_wait,
+    )
+    _ = od  # reserved for future diagnostics
 
-    if entry_price <= 0:
-        raise RuntimeError("entry_price resolved <= 0 (STRICT violation)")
+    if entry_price <= 0 or not math.isfinite(entry_price):
+        raise OrderExecutionError("entry_price resolved invalid (<=0 or non-finite)")
+
+    # 3) 포지션 반영 확인(가시성 지연 방어)
+    _verify_position_reflects_execution_strict(
+        symbol=sym,
+        open_side=open_side,
+        executed_qty=exec_qty_dec,
+        qty_step=filt.market_step,
+        settings=settings,
+        max_wait_sec=float(getattr(settings, "position_reflect_wait_sec", 1.2) or 1.2),
+    )
+
+    # 4) 슬리피지 진단(민감정보 없음)
+    if eph > 0 and math.isfinite(eph):
+        slip_pct = abs(entry_price - eph) / eph * 100.0
+        logger.info(
+            "entry slippage diag (symbol=%s hint=%s fill=%s slip_pct=%.4f clientOrderId=%s orderId=%s)",
+            sym,
+            eph,
+            entry_price,
+            slip_pct,
+            entry_cid,
+            entry_order_id,
+        )
 
     max_slip = getattr(settings, "max_entry_slippage_pct", None)
     if max_slip is not None:
@@ -1154,24 +1334,26 @@ def open_position_with_tp_sl(
                         "entry_price": float(entry_price),
                         "slippage_pct": float(slip_pct),
                         "max_entry_slippage_pct": float(max_slip_f),
-                        "qty": float(final_qty),
+                        "qty": float(expected_qty_f),
                         "entry_order_id": entry_order_id,
                         "clientOrderId": entry_cid,
                     },
                 )
                 try:
-                    close_position_market(sym, open_side, float(final_qty))
+                    close_position_market(sym, open_side, float(expected_qty_f))
                 except Exception as e2:
                     logger.critical("slippage guard force close failed (symbol=%s err=%s)", sym, str(e2))
-                return None
+                    raise OrderExecutionError("slippage guard close failed") from e2
+                raise OrderExecutionError("slippage guard triggered")
 
+    # ENTRY 이벤트 기록
     log_event(
         event_type="ENTRY",
         symbol=sym,
         regime=source,
         side=_event_side_from_open_side(open_side),
         price=float(entry_price),
-        qty=float(final_qty),
+        qty=float(expected_qty_f),
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
@@ -1180,6 +1362,7 @@ def open_position_with_tp_sl(
         extra_json={"open_side": open_side, "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
     )
 
+    # 5) TP/SL 가격 계산
     if open_side == "BUY":
         tp_price = entry_price * (1.0 + tp_pct_f)
         sl_price = entry_price * (1.0 - sl_pct_f)
@@ -1198,11 +1381,12 @@ def open_position_with_tp_sl(
             if sl_price < floor_price:
                 sl_price = floor_price
 
+    # 6) TP/SL 설치 (체결 수량을 그대로 사용)
     try:
         tp_order_id, sl_order_id = set_tp_sl(
             symbol=sym,
             side_open=open_side,
-            qty=float(final_qty),
+            qty=float(expected_qty_f),
             tp_price=float(tp_price),
             sl_price=float(sl_price),
             soft_mode=bool(soft_mode),
@@ -1219,20 +1403,34 @@ def open_position_with_tp_sl(
             regime=source,
             side=_event_side_from_open_side(open_side),
             reason="tp_sl_set_failed",
-            extra_json={"err": str(e), "soft_mode": bool(soft_mode), "qty": float(final_qty), "entry_order_id": entry_order_id},
+            extra_json={
+                "err": str(e),
+                "soft_mode": bool(soft_mode),
+                "qty": float(expected_qty_f),
+                "entry_order_id": entry_order_id,
+                "clientOrderId": entry_cid,
+            },
         )
 
         if bool(soft_mode):
-            return None
+            # STRICT: soft_mode라도 실패는 실패. 포지션을 방치하지 않는다.
+            try:
+                close_position_market(sym, open_side, float(expected_qty_f))
+            except Exception as e2:
+                logger.critical("force close after TP failure failed (symbol=%s err=%s)", sym, str(e2))
+                raise OrderExecutionError("force close after TP failure failed") from e2
+            raise OrderExecutionError("tp set failed (soft_mode)")
 
+        # STRICT: TP/SL 세팅 실패 시 포지션 방치 금지 -> 강제 청산 후 예외
         try:
-            close_position_market(sym, open_side, float(final_qty))
+            close_position_market(sym, open_side, float(expected_qty_f))
         except Exception as e2:
             logger.critical("force close after TP/SL failure also failed (symbol=%s err=%s)", sym, str(e2))
-        return None
+            raise OrderExecutionError("force close after TP/SL failure failed") from e2
+        raise OrderExecutionError("tp/sl set failed") from e
 
     if not bool(soft_mode) and (sl_order_id is None or not str(sl_order_id).strip()):
-        raise RuntimeError("soft_mode=False but SL order_id is missing (STRICT)")
+        raise OrderExecutionError("soft_mode=False but SL order_id is missing (STRICT)")
 
     log_event(
         event_type="TP_SL_SET",
@@ -1240,7 +1438,7 @@ def open_position_with_tp_sl(
         regime=source,
         side=_event_side_from_open_side(open_side),
         price=float(entry_price),
-        qty=float(final_qty),
+        qty=float(expected_qty_f),
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
@@ -1262,7 +1460,7 @@ def open_position_with_tp_sl(
     return _make_trade_strict(
         symbol=sym,
         side=open_side,
-        qty=float(final_qty),
+        qty=float(expected_qty_f),
         entry_price=float(entry_price),
         leverage=int(float(lev)),
         source=str(source or "MARKET"),
@@ -1273,7 +1471,7 @@ def open_position_with_tp_sl(
         sl_order_id=str(sl_order_id) if sl_order_id is not None else None,
         client_entry_id=str(entry_cid),
         exchange_position_side="BOTH",
-        remaining_qty=float(final_qty),
+        remaining_qty=float(expected_qty_f),
         realized_pnl_usdt=0.0,
         reconciliation_status="ENTRY_FILLED",
         last_synced_at=now_sync,
@@ -1285,15 +1483,41 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     open_side = _normalize_side(side_open)
     close_side = "SELL" if open_side == "BUY" else "BUY"
 
+    # TRADE-GRADE: close 수량도 필터 기반 라운딩으로 확정
+    ensure_trading_settings(sym, SET)
+    filt = get_symbol_filters(sym)
+    expected_qty_dec, _, _ = _round_qty_and_price(
+        filters=filt,
+        order_type="MARKET",
+        raw_qty=_require_positive_float(qty, "qty"),
+        raw_price=None,
+        raw_stop_price=None,
+    )
+    expected_qty_f = float(expected_qty_dec)
+
     cid = _make_client_order_id(prefix="cls")
     resp = place_market(
         symbol=sym,
         side=close_side,
-        qty=float(qty),
+        qty=float(expected_qty_f),
         settings=SET,
         reduce_only=True,
         position_side="BOTH",
         client_order_id=cid,
+    )
+
+    order_id = resp.get("orderId") if isinstance(resp, dict) else None
+    if order_id is None:
+        raise OrderExecutionError("close response missing orderId (STRICT)")
+
+    # FILLED 확인(체결가 계산용)
+    _, _, avg_px = _wait_order_filled_strict(
+        symbol=sym,
+        order_id=str(order_id),
+        settings=SET,
+        expected_qty=expected_qty_dec,
+        qty_step=filt.market_step,
+        max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
     )
 
     log_event(
@@ -1301,20 +1525,20 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         symbol=sym,
         regime="MANUAL_CLOSE",
         side=_event_side_close(),
-        price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
-        qty=float(qty),
+        price=float(avg_px),
+        qty=float(expected_qty_f),
         leverage=getattr(SET, "leverage", None),
-        reason="MARKET_CLOSE_EXECUTED",
-        extra_json={"close_side": close_side, "clientOrderId": cid, "orderId": resp.get("orderId") if isinstance(resp, dict) else None},
+        reason="MARKET_CLOSE_FILLED",
+        extra_json={"close_side": close_side, "clientOrderId": cid, "orderId": str(order_id)},
     )
 
     logger.info(
-        "close market submitted (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
+        "close market filled (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
         sym,
         close_side,
-        qty,
-        resp.get("orderId") if isinstance(resp, dict) else None,
-        resp.get("clientOrderId") if isinstance(resp, dict) else None,
+        expected_qty_f,
+        order_id,
+        cid,
     )
 
 
@@ -1387,7 +1611,12 @@ def close_all_positions_market(symbol: str) -> int:
             qty=float(qty2),
             leverage=getattr(SET, "leverage", None),
             reason="SIGTERM_DEADLINE_FORCE_CLOSE",
-            extra_json={"direction": direction, "close_side": close_side, "positionSide": pos_side, "orderId": resp.get("orderId") if isinstance(resp, dict) else None},
+            extra_json={
+                "direction": direction,
+                "close_side": close_side,
+                "positionSide": pos_side,
+                "orderId": resp.get("orderId") if isinstance(resp, dict) else None,
+            },
         )
         submitted += 1
 

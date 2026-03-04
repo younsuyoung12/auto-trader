@@ -44,6 +44,18 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
   3) Drift Detector 연결:
      - allocation/multiplier/regime/micro_score_risk 급변 감지 시 SAFE_STOP + 예외 전파
   4) SAFE_STOP 발생 오류는 “예외 전파”로 엔진 종료(조용한 복구 금지)
+
+- 2026-03-04 (TRADE-GRADE, 추가):
+  1) 메인 루프 예외 처리 구조 정비:
+     - catch-all 예외 후 sleep/continue(사실상 복구) 제거
+     - 미분류 예외는 SAFE_STOP + TG + 예외 전파로 종료(조용한 실패 금지)
+  2) WS Liveness Guard 강화:
+     - 1m 캔들 최신성(staleness) 가드 추가(기본값 사용 시 명시 로그)
+     - 연속 실패 N회 시 SAFE_STOP + 예외 전파
+  3) Balance/Equity 조회 내구성(명시적 정책):
+     - 단발 실패는 경고/스킵(로그+TG)로 처리하되,
+       연속 실패 N회 시 SAFE_STOP + 예외 전파
+  4) DESYNC 콜백은 확정(desync_confirmed=True) 시 즉시 SAFE_STOP + 예외 전파
 ============================================================
 """
 
@@ -161,6 +173,17 @@ LAST_EXCHANGE_SYNC_TS: float = 0.0
 SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(getattr(SET, "signal_analysis_interval_sec", 60) or 60)
 LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
+
+# ─────────────────────────────
+# TRADE-GRADE counters / thresholds (explicit, no silent retry)
+# ─────────────────────────────
+_BALANCE_CONSEC_FAILS: int = 0
+_EQUITY_CONSEC_FAILS: int = 0
+_WS_LIVENESS_CONSEC_FAILS: int = 0
+
+_BALANCE_FAIL_HARDSTOP_N: int = 3
+_EQUITY_FAIL_HARDSTOP_N: int = 3
+_WS_LIVENESS_FAIL_HARDSTOP_N: int = 3
 
 
 # ─────────────────────────────
@@ -387,6 +410,59 @@ def _normalize_direction_for_events_strict(v: Any) -> str:
     if s == "SELL":
         return "SHORT"
     raise RuntimeError(f"invalid trade side for events: {v!r}")
+
+
+# ─────────────────────────────
+# WS Liveness Guard (TRADE-GRADE)
+# ─────────────────────────────
+def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
+    """
+    TRADE-GRADE:
+    - 1m 캔들의 openTime이 과도하게 과거이면 WS 갱신이 멈춘 것으로 간주한다.
+    - 단발 실패는 경고로 누적하고, N회 연속 실패 시 SAFE_STOP + 예외 전파한다.
+    """
+    global _WS_LIVENESS_CONSEC_FAILS, SAFE_STOP_REQUESTED
+
+    # 기본값은 명시 로그로 가시화한다(조용한 default 금지)
+    stale_sec = getattr(SET, "ws_klines_stale_sec", None)
+    if stale_sec is None:
+        # 1m openTime이 60초 동안 고정될 수 있으므로, 여유를 충분히 둔다.
+        stale_sec = 180.0
+        # 부팅 이후 1회만 찍히도록(과도 로그 방지) START_TS 기반
+        if now_ts - START_TS < 30:
+            log(f"[BOOT][DEFAULT] ws_klines_stale_sec missing -> using {stale_sec}s")
+    stale_sec_f = float(stale_sec)
+    if stale_sec_f <= 30:
+        raise RuntimeError("settings.ws_klines_stale_sec must be > 30 sec (STRICT)")
+
+    buf = ws_get_klines_with_volume(symbol, "1m", limit=1)
+    if not isinstance(buf, list) or not buf:
+        _WS_LIVENESS_CONSEC_FAILS += 1
+        log(f"[WS_LIVENESS][FAIL] 1m kline buffer missing/empty consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
+    else:
+        ts_ms = buf[0][0]
+        t_ms = _require_int_ms(ts_ms, "ws.1m.openTime")
+        now_ms = int(float(now_ts) * 1000.0)
+        age_ms = now_ms - int(t_ms)
+        if age_ms < 0:
+            # 미래 ts는 데이터 무결성 위반
+            _WS_LIVENESS_CONSEC_FAILS += 1
+            log(f"[WS_LIVENESS][FAIL] future kline ts detected age_ms={age_ms} consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
+        elif age_ms > int(stale_sec_f * 1000.0):
+            _WS_LIVENESS_CONSEC_FAILS += 1
+            log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
+        else:
+            # 정상 회복
+            if _WS_LIVENESS_CONSEC_FAILS != 0:
+                log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
+            _WS_LIVENESS_CONSEC_FAILS = 0
+
+    if _WS_LIVENESS_CONSEC_FAILS >= _WS_LIVENESS_FAIL_HARDSTOP_N:
+        SAFE_STOP_REQUESTED = True
+        msg = f"[SAFE_STOP][WS_LIVENESS] stale/missing WS 1m data confirmed consecutive={_WS_LIVENESS_CONSEC_FAILS}"
+        log(msg)
+        _maybe_send_error_tg("WS_LIVENESS", msg, cooldown_sec=60)
+        raise RuntimeError(msg)
 
 
 # ─────────────────────────────
@@ -821,6 +897,7 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
             live.append(r)
 
     if not live:
+        # "포지션 없음"은 정상 상태 표현이다(폴백이 아니라 명시적 상태).
         return {"symbol": sym, "positionAmt": "0", "entryPrice": "0"}
 
     if len(live) != 1:
@@ -835,6 +912,7 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
 def _get_local_position_snapshot(symbol: str) -> Dict[str, Any]:
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not OPEN_TRADES:
+        # "로컬 포지션 없음"은 정상 상태 표현.
         return {"symbol": sym, "position_amt": "0", "entry_price": "0"}
 
     if len(OPEN_TRADES) != 1:
@@ -872,14 +950,23 @@ def _fetch_exchange_open_orders_snapshot(symbol: str) -> List[Dict[str, Any]]:
 
 
 def _on_reconcile_desync(result: ReconcileResult) -> None:
+    """
+    TRADE-GRADE:
+    - DESYNC 확정 시 즉시 SAFE_STOP + 예외 전파(조용한 진행 금지)
+    - 강제정리 옵션이 켜져 있으면 제출 시도, 실패하면 그 또한 예외 전파(치명)
+    """
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
 
-    msg = f"⛔ DESYNC 감지: {result.symbol} issues={len(result.issues)} (신규 진입 차단)"
+    if not bool(getattr(result, "desync_confirmed", True)):
+        # 이 콜백은 confirmed에서만 호출되어야 한다.
+        raise RuntimeError("on_desync called but desync_confirmed is False (STRICT)")
+
+    msg = f"⛔ DESYNC 확정: {result.symbol} issues={len(result.issues)} (신규 진입 차단, 종료)"
     log(msg)
     for it in result.issues:
         log(f"[DESYNC] {it.code} | {it.message} | {it.details}")
-    _maybe_send_error_tg("DESYNC", msg, cooldown_sec=60)
+    _maybe_send_error_tg("DESYNC_CONFIRMED", msg, cooldown_sec=60)
 
     if bool(getattr(SET, "force_close_on_desync", False)):
         try:
@@ -889,6 +976,9 @@ def _on_reconcile_desync(result: ReconcileResult) -> None:
         except Exception as e:
             log(f"[DESYNC] force close failed: {type(e).__name__}: {e}")
             _safe_send_tg(f"❌ DESYNC 강제정리 실패: {e}")
+            raise RuntimeError(f"DESYNC force close failed: {type(e).__name__}: {e}") from e
+
+    raise RuntimeError("DESYNC confirmed (STRICT): engine must stop")
 
 
 # ─────────────────────────────
@@ -928,6 +1018,7 @@ def _on_safe_stop() -> None:
 def main() -> None:
     global RUNNING, OPEN_TRADES, LAST_CLOSE_TS, CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
+    global _BALANCE_CONSEC_FAILS, _EQUITY_CONSEC_FAILS
 
     start_async_worker(
         num_threads=int(getattr(SET, "async_worker_threads", 1) or 1),
@@ -964,6 +1055,7 @@ def main() -> None:
         msg = f"❗ 레버리지/마진 설정 실패: {e}"
         log(msg)
         if allow:
+            # 운영 정책(명시 설정)에 따른 허용. 조용한 진행 금지 -> TG로 가시화.
             _safe_send_tg(msg + "\n⚠ allow_start_without_leverage_setup=True 이므로 계속 진행합니다.")
         else:
             _safe_send_tg(msg + "\n⛔ 기본 정책에 따라 중단합니다.")
@@ -977,8 +1069,21 @@ def main() -> None:
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     LAST_EXCHANGE_SYNC_TS = time.time()
 
+    # TRADE-GRADE: reconcile confirm N (단발 mismatch 과민 정지 방지)
+    confirm_n = getattr(SET, "reconcile_confirm_n", None)
+    if confirm_n is None:
+        confirm_n = 3
+        log(f"[BOOT][DEFAULT] reconcile_confirm_n missing -> using {confirm_n}")
+    confirm_n_i = int(confirm_n)
+    if confirm_n_i < 1:
+        raise RuntimeError("settings.reconcile_confirm_n must be >= 1 (STRICT)")
+
     reconcile_engine = ReconcileEngine(
-        ReconcileConfig(symbol=str(SET.symbol), interval_sec=int(getattr(SET, "reconcile_interval_sec", 30) or 30)),
+        ReconcileConfig(
+            symbol=str(SET.symbol),
+            interval_sec=int(getattr(SET, "reconcile_interval_sec", 30) or 30),
+            desync_confirm_n=int(confirm_n_i),
+        ),
         fetch_exchange_position=_fetch_exchange_position_snapshot,
         get_local_position=_get_local_position_snapshot,
         fetch_exchange_open_orders=_fetch_exchange_open_orders_snapshot,
@@ -1022,6 +1127,10 @@ def main() -> None:
         try:
             now = time.time()
 
+            # WS liveness guard (WS enabled일 때만)
+            if bool(getattr(SET, "ws_enabled", True)):
+                _ws_liveness_guard_or_raise(SET.symbol, now)
+
             if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS and not _SIGTERM_DEADLINE_HANDLED:
                 _SIGTERM_DEADLINE_HANDLED = True
                 log("[SIGTERM] grace deadline reached. force close attempt starts.")
@@ -1033,16 +1142,32 @@ def main() -> None:
                 except Exception as e:
                     log(f"[SIGTERM] force close failed: {type(e).__name__}: {e}")
                     _safe_send_tg(f"❌ SIGTERM 강제 정리 실패: {e}")
+                    # SIGTERM deadline 이후 강제정리 실패는 치명
+                    SAFE_STOP_REQUESTED = True
+                    raise
 
+            # reconcile: confirmed이면 콜백이 예외를 raise 하여 즉시 종료한다.
             reconcile_engine.run_if_due(now_ts=now)
 
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
                 LAST_EXCHANGE_SYNC_TS = now
 
+            # balance ping: 단발 실패 허용(명시), 연속 실패는 HARD_STOP
             if now - last_balance_log >= 60:
-                get_available_usdt()
-                last_balance_log = now
+                try:
+                    get_available_usdt()
+                    _BALANCE_CONSEC_FAILS = 0
+                except Exception as e:
+                    _BALANCE_CONSEC_FAILS += 1
+                    msg = f"[WARN][BALANCE_FAIL] {type(e).__name__}: {e} consecutive={_BALANCE_CONSEC_FAILS}/{_BALANCE_FAIL_HARDSTOP_N}"
+                    log(msg)
+                    _maybe_send_error_tg("BALANCE_FAIL", msg, cooldown_sec=60)
+                    if _BALANCE_CONSEC_FAILS >= _BALANCE_FAIL_HARDSTOP_N:
+                        SAFE_STOP_REQUESTED = True
+                        raise RuntimeError("balance check failed consecutively (STRICT)") from e
+                finally:
+                    last_balance_log = now
 
             if now - last_fill_check >= float(getattr(SET, "poll_fills_sec", 3.0) or 3.0):
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
@@ -1135,12 +1260,20 @@ def main() -> None:
                 interruptible_sleep(1)
                 continue
 
+            # equity: 단발 실패는 SKIP(명시), 연속 실패는 HARD_STOP
             try:
                 equity_current_usdt = _get_equity_current_usdt_strict()
+                _EQUITY_CONSEC_FAILS = 0
             except Exception as e:
-                msg = f"[SKIP][EQUITY_INVALID] {e} (balance likely 0)"
+                _EQUITY_CONSEC_FAILS += 1
+                msg = f"[SKIP][EQUITY_INVALID] {type(e).__name__}: {e} consecutive={_EQUITY_CONSEC_FAILS}/{_EQUITY_FAIL_HARDSTOP_N}"
                 log(msg)
                 _maybe_send_entry_block_tg("EQUITY_INVALID", msg, cooldown_sec=300)
+
+                if _EQUITY_CONSEC_FAILS >= _EQUITY_FAIL_HARDSTOP_N:
+                    SAFE_STOP_REQUESTED = True
+                    raise RuntimeError("equity fetch failed consecutively (STRICT)") from e
+
                 interruptible_sleep(60)
                 continue
 
@@ -1345,12 +1478,15 @@ def main() -> None:
             interruptible_sleep(10)
 
         except Exception as e:
+            # TRADE-GRADE: 미분류 예외는 조용히 복구하지 않는다.
+            SAFE_STOP_REQUESTED = True
+
             tb = traceback.format_exc()
-            log(f"ERROR: {e}\n{tb}")
+            log(f"ERROR(FATAL): {e}\n{tb}")
 
             core = f"{type(e).__name__}:{str(e)[:200]}"
             key = hashlib.sha1(core.encode("utf-8", errors="ignore")).hexdigest()[:12]
-            _maybe_send_error_tg(key, f"❌ 오류: {e}", cooldown_sec=60)
+            _maybe_send_error_tg(key, f"❌ 치명 오류: {e}", cooldown_sec=60)
 
             log_signal(
                 event="ERROR",
@@ -1360,11 +1496,8 @@ def main() -> None:
                 reason=str(e),
             )
 
-            # STRICT: SAFE_STOP 발생 오류는 예외 전파(조용한 복구 금지)
-            if SAFE_STOP_REQUESTED:
-                raise
-
-            interruptible_sleep(5)
+            # STRICT: 예외 전파로 엔진 종료
+            raise
 
     return
 

@@ -1,7 +1,7 @@
 """
 ========================================================
 FILE: execution/exchange_api.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 Design principles (Binance USDT-M Futures REST Adapter)
 --------------------------------------------------------
@@ -17,6 +17,21 @@ Design principles (Binance USDT-M Futures REST Adapter)
 One-way mode only.
 Hedge mode is NOT supported.
 positionSide must always be BOTH in order layer.
+
+PATCH NOTES — 2026-03-04 (TRADE-GRADE)
+--------------------------------------------------------
+- 네트워크 내구성 강화
+  - HTTP 5xx/429/Timeout 재시도 + exponential backoff(명시적, silent retry 금지)
+  - Circuit breaker(연속 실패 보호) 추가
+- 동시성 안전성 보강
+  - _SERVER_TIME_OFFSET_MS / _TIME_SYNCED / _LAST_TIME_SYNC_AT 접근 Lock 보호
+  - timestamp 계산 atomic 보장
+- -1021(timestamp) 대응 강화
+  - -1021 감지 시 강제 time sync 후 재시도(제한 횟수)
+- 예외 전파 구조 정비
+  - URL(서명 포함) 노출 금지 유지
+  - 모든 실패는 Custom Exception(RuntimeError 계열)로 즉시 전파
+========================================================
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
 --------------------------------------------------------
@@ -48,7 +63,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 
@@ -111,9 +128,108 @@ _TIME_SYNCED: bool = False
 _LAST_TIME_SYNC_AT: float = 0.0
 _TIME_SYNC_TTL_SEC: int = 60  # resync at most once per minute (safe for -1021)
 
+# TIME state lock (TRADE-GRADE: thread-safe)
+_TIME_STATE_LOCK = threading.Lock()
+_TIME_SYNC_LOCK = threading.Lock()
+
 # Allowed endpoints
 _ALLOWED_PUBLIC_PREFIXES: Tuple[str, ...] = ("/fapi/", "/futures/data/")
 _ALLOWED_PRIVATE_PREFIX: str = "/fapi/"
+
+# -----------------------------------------------------------------------------#
+# Circuit breaker (TRADE-GRADE)
+# -----------------------------------------------------------------------------#
+_CB_LOCK = threading.Lock()
+_CB_FAILURES: int = 0
+_CB_OPEN_UNTIL_TS: float = 0.0
+
+_CB_FAIL_THRESHOLD: int = 6          # consecutive failures to open
+_CB_OPEN_SEC: float = 12.0           # circuit open duration (seconds)
+_CB_MAX_OPEN_SEC: float = 60.0       # cap
+_CB_BYPASS_PATHS: Tuple[str, ...] = ("/fapi/v1/time",)  # allow recovery
+
+
+def _cb_is_open(now: float) -> bool:
+    with _CB_LOCK:
+        return now < _CB_OPEN_UNTIL_TS
+
+
+def _cb_on_success() -> None:
+    global _CB_FAILURES, _CB_OPEN_UNTIL_TS
+    with _CB_LOCK:
+        _CB_FAILURES = 0
+        _CB_OPEN_UNTIL_TS = 0.0
+
+
+def _cb_on_failure(*, reason: str) -> None:
+    global _CB_FAILURES, _CB_OPEN_UNTIL_TS
+    now = time.time()
+    with _CB_LOCK:
+        _CB_FAILURES += 1
+        if _CB_FAILURES >= _CB_FAIL_THRESHOLD:
+            # Exponential-ish open duration based on failure count
+            extra = float(_CB_FAILURES - _CB_FAIL_THRESHOLD)
+            open_sec = min(_CB_MAX_OPEN_SEC, _CB_OPEN_SEC * (1.0 + extra / 2.0))
+            _CB_OPEN_UNTIL_TS = max(_CB_OPEN_UNTIL_TS, now + open_sec)
+
+    # 민감정보 없이 이유만 로깅
+    logger.warning("circuit failure recorded (failures=%s, reason=%s)", _CB_FAILURES, reason)
+
+
+# -----------------------------------------------------------------------------#
+# Retry policy (TRADE-GRADE)
+# -----------------------------------------------------------------------------#
+@dataclass(frozen=True)
+class _NetRetryPolicy:
+    max_attempts: int = 5
+    base_delay_sec: float = 0.6
+    max_delay_sec: float = 8.0
+    jitter_sec: float = 0.15
+
+
+def _sleep_backoff(policy: _NetRetryPolicy, attempt_idx: int, *, reason: str) -> None:
+    delay = policy.base_delay_sec * (2.0 ** attempt_idx)
+    if delay > policy.max_delay_sec:
+        delay = policy.max_delay_sec
+
+    # time-based jitter (no random)
+    frac = time.time() % 1.0
+    delay = delay + min(policy.jitter_sec, frac * policy.jitter_sec)
+
+    logger.warning("net backoff sleep=%0.3fs reason=%s", delay, reason)
+    time.sleep(delay)
+
+
+def _timeout_tuple(timeout_sec: int) -> Tuple[float, float]:
+    # connect/read timeout 분리 (요청 signature 노출 없음)
+    if not isinstance(timeout_sec, int) or timeout_sec <= 0:
+        raise ValueError("timeout_sec must be positive int")
+    connect = 3.5 if timeout_sec >= 4 else max(1.0, float(timeout_sec) * 0.7)
+    read = float(timeout_sec)
+    return (float(connect), float(read))
+
+
+def _local_ts_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _get_time_state() -> Tuple[int, bool, float]:
+    with _TIME_STATE_LOCK:
+        return (_SERVER_TIME_OFFSET_MS, _TIME_SYNCED, _LAST_TIME_SYNC_AT)
+
+
+def _set_time_state(*, offset_ms: int) -> None:
+    global _SERVER_TIME_OFFSET_MS, _TIME_SYNCED, _LAST_TIME_SYNC_AT
+    with _TIME_STATE_LOCK:
+        _SERVER_TIME_OFFSET_MS = int(offset_ms)
+        _TIME_SYNCED = True
+        _LAST_TIME_SYNC_AT = time.time()
+
+
+def _ts_ms() -> int:
+    # atomic read of offset
+    offset, _, _ = _get_time_state()
+    return _local_ts_ms() + int(offset)
 
 
 # -----------------------------------------------------------------------------#
@@ -139,14 +255,6 @@ def _normalize_margin_type(value: Any) -> str:
         return "CROSSED"
 
     raise RuntimeError(f"positionRisk.marginType unexpected value: {value!r}")
-
-
-def _local_ts_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _ts_ms() -> int:
-    return _local_ts_ms() + _SERVER_TIME_OFFSET_MS
 
 
 def _coerce_params(params: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
@@ -228,26 +336,28 @@ def sync_server_time() -> int:
 
     Calls GET /fapi/v1/time, computes server-local offset using midpoint
     to reduce RTT skew.
+
+    TRADE-GRADE:
+    - time sync는 단일 in-flight를 보장한다(_TIME_SYNC_LOCK).
+    - circuit breaker가 열려 있어도 /fapi/v1/time 은 bypass로 복구 가능해야 한다.
     """
-    global _SERVER_TIME_OFFSET_MS, _TIME_SYNCED, _LAST_TIME_SYNC_AT
+    # 단일 in-flight 보장
+    with _TIME_SYNC_LOCK:
+        t0 = time.time()
+        data = req("GET", "/fapi/v1/time", private=False)
+        t1 = time.time()
 
-    t0 = time.time()
-    data = req("GET", "/fapi/v1/time", private=False)
-    t1 = time.time()
+        if not isinstance(data, dict) or "serverTime" not in data:
+            raise RuntimeError("GET /fapi/v1/time -> unexpected response shape")
 
-    if not isinstance(data, dict) or "serverTime" not in data:
-        raise RuntimeError("GET /fapi/v1/time -> unexpected response shape")
+        server_ms = _require_int("serverTime", data["serverTime"])
+        local_mid_ms = int(((t0 + t1) / 2.0) * 1000)
+        offset_ms = server_ms - local_mid_ms
 
-    server_ms = _require_int("serverTime", data["serverTime"])
-    local_mid_ms = int(((t0 + t1) / 2.0) * 1000)
-    offset_ms = server_ms - local_mid_ms
+        _set_time_state(offset_ms=offset_ms)
 
-    _SERVER_TIME_OFFSET_MS = offset_ms
-    _TIME_SYNCED = True
-    _LAST_TIME_SYNC_AT = time.time()
-
-    logger.info("Binance server time synced (offset_ms=%s)", offset_ms)
-    return offset_ms
+        logger.info("Binance server time synced (offset_ms=%s)", offset_ms)
+        return int(offset_ms)
 
 
 def sync_server_time_offset() -> int:
@@ -255,11 +365,137 @@ def sync_server_time_offset() -> int:
 
 
 def _ensure_time_sync(force: bool = False) -> None:
-    global _TIME_SYNCED
-    if force or (not _TIME_SYNCED) or (time.time() - _LAST_TIME_SYNC_AT > _TIME_SYNC_TTL_SEC):
+    # state 확인은 락으로 안전하게
+    offset, synced, last_ts = _get_time_state()
+    _ = offset  # unused (kept for clarity)
+
+    if force or (not synced) or (time.time() - float(last_ts) > _TIME_SYNC_TTL_SEC):
         sync_server_time()
-        if not _TIME_SYNCED:
+        _, synced2, _ = _get_time_state()
+        if not synced2:
             raise RuntimeError("server time sync failed")
+
+
+def _parse_error_payload(resp: requests.Response) -> Dict[str, Any]:
+    try:
+        j = resp.json()
+        if isinstance(j, dict):
+            return j
+        return {"message": str(j)[:300]}
+    except Exception:
+        return {"message": (resp.text or "").strip()[:300]}
+
+
+def _is_transient_http(status_code: int) -> bool:
+    return status_code in (429, 502, 503, 504)
+
+
+def _request_with_resilience(
+    *,
+    method: str,
+    url: str,
+    path_for_logs: str,
+    headers: Optional[Dict[str, str]],
+    timeout: Tuple[float, float],
+    policy: _NetRetryPolicy,
+) -> requests.Response:
+    """
+    TRADE-GRADE request wrapper.
+
+    - execute_with_retry는 유지한다(기존 복구 로직 호환).
+    - 추가로 HTTP 5xx/429/Timeout에 대해 제한된 재시도를 수행한다.
+    - silent retry 금지: backoff는 로그로 남긴다(서명/URL 노출 금지).
+    - circuit breaker 적용(단, bypass path는 제외).
+    """
+    now = time.time()
+    if path_for_logs not in _CB_BYPASS_PATHS and _cb_is_open(now):
+        # STRICT: 회로가 열려있으면 즉시 예외
+        with _CB_LOCK:
+            remain = max(0.0, _CB_OPEN_UNTIL_TS - now)
+        raise RuntimeError(f"circuit_open (path={path_for_logs}, retry_after_sec={remain:.1f})")
+
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(policy.max_attempts):
+        def _do() -> requests.Response:
+            return _SESSION.request(method, url, headers=headers or None, timeout=timeout)
+
+        try:
+            # 기존 정책 유지(예: -1021 1회 재시도 등)
+            resp = execute_with_retry(_do)
+        except requests.Timeout as e:
+            last_exc = e
+            _cb_on_failure(reason=f"timeout:{path_for_logs}")
+            if attempt >= policy.max_attempts - 1:
+                raise RuntimeError(f"{method} {path_for_logs} -> timeout after retries") from None
+            _sleep_backoff(policy, attempt, reason=f"timeout:{path_for_logs}")
+            continue
+        except requests.RequestException as e:
+            last_exc = e
+            _cb_on_failure(reason=f"request_exception:{e.__class__.__name__}:{path_for_logs}")
+            if attempt >= policy.max_attempts - 1:
+                raise RuntimeError(f"{method} {path_for_logs} -> request failed: {e.__class__.__name__}") from None
+            _sleep_backoff(policy, attempt, reason=f"request_exception:{e.__class__.__name__}:{path_for_logs}")
+            continue
+        except Exception as e:
+            # execute_with_retry 내부에서 다른 예외가 나면 폴백 없이 실패
+            raise RuntimeError(f"{method} {path_for_logs} -> unexpected error: {e.__class__.__name__}") from e
+
+        sc = int(getattr(resp, "status_code", 0) or 0)
+
+        if sc == 200:
+            _cb_on_success()
+            return resp
+
+        # 오류 페이로드(민감정보 없음)
+        err = _parse_error_payload(resp)
+        code = err.get("code")
+        msg = err.get("msg") or err.get("message")
+
+        # -1021 timestamp error: 강제 time sync 후 재시도(제한)
+        if isinstance(code, int) and int(code) == -1021:
+            _cb_on_failure(reason=f"binance_-1021:{path_for_logs}")
+            if attempt >= policy.max_attempts - 1:
+                raise RuntimeError(f"{method} {path_for_logs} -> binance -1021 after retries") from None
+            logger.warning("%s %s -> binance -1021, forcing time sync then retry", method, path_for_logs)
+            _ensure_time_sync(force=True)
+            _sleep_backoff(policy, attempt, reason=f"-1021:{path_for_logs}")
+            continue
+
+        # 429 rate limit: Retry-After 우선, 없으면 backoff
+        if sc == 429:
+            _cb_on_failure(reason=f"http_429:{path_for_logs}")
+            if attempt >= policy.max_attempts - 1:
+                raise RuntimeError(f"{method} {path_for_logs} -> HTTP 429 after retries") from None
+            ra = None
+            try:
+                ra_h = resp.headers.get("Retry-After") if hasattr(resp, "headers") else None
+                if ra_h is not None:
+                    ra = float(str(ra_h).strip())
+            except Exception:
+                ra = None
+            if ra is not None and ra > 0:
+                logger.warning("%s %s -> HTTP 429 Retry-After=%s sec", method, path_for_logs, ra)
+                time.sleep(min(float(ra), policy.max_delay_sec))
+            else:
+                _sleep_backoff(policy, attempt, reason=f"http_429:{path_for_logs}")
+            continue
+
+        # 5xx transient retry
+        if sc in (502, 503, 504):
+            _cb_on_failure(reason=f"http_{sc}:{path_for_logs}")
+            if attempt >= policy.max_attempts - 1:
+                raise RuntimeError(f"{method} {path_for_logs} -> HTTP {sc} after retries, msg={msg}") from None
+            _sleep_backoff(policy, attempt, reason=f"http_{sc}:{path_for_logs}")
+            continue
+
+        # 기타: 즉시 실패(폴백/재시도 남발 금지)
+        _cb_on_failure(reason=f"http_{sc}:{path_for_logs}")
+        raise RuntimeError(f"{method} {path_for_logs} -> HTTP {sc}, code={code}, msg={msg}")
+
+    if last_exc is not None:
+        raise RuntimeError(f"{method} {path_for_logs} -> request failed after retries: {last_exc.__class__.__name__}") from None
+    raise RuntimeError(f"{method} {path_for_logs} -> request failed after retries (unknown)")
 
 
 def req(
@@ -319,34 +555,50 @@ def req(
         query = _encode_query(q_params)
         url = f"{BASE_URL}{p}" + (f"?{query}" if query else "")
 
-    def _do() -> requests.Response:
-        return _SESSION.request(m, url, headers=headers or None, timeout=timeout_sec)
+    timeout = _timeout_tuple(timeout_sec)
 
-    try:
-        resp = execute_with_retry(_do)
-    except requests.RequestException as e:
-        # Sanitize: do not include URL (contains signature for private)
-        raise RuntimeError(f"{m} {p} -> request failed: {e.__class__.__name__}") from None
+    resp = _request_with_resilience(
+        method=m,
+        url=url,
+        path_for_logs=p,  # URL(서명 포함) 대신 path만 사용
+        headers=headers or None,
+        timeout=timeout,
+        policy=_NetRetryPolicy(),
+    )
 
-    if resp.status_code != 200:
-        try:
-            err = resp.json()
-        except Exception:
-            err = {"message": (resp.text or "").strip()[:300]}
-
-        if isinstance(err, dict):
-            code = err.get("code")
-            msg = err.get("msg") or err.get("message")
-            raise RuntimeError(f"{m} {p} -> HTTP {resp.status_code}, code={code}, msg={msg}")
-        raise RuntimeError(f"{m} {p} -> HTTP {resp.status_code}")
-
+    # status code는 wrapper에서 200만 통과
     try:
         data = resp.json()
     except Exception as e:
+        # 200인데 JSON 파싱 실패: 즉시 예외(폴백 금지)
         raise RuntimeError(f"{m} {p} -> invalid json: {e.__class__.__name__}") from None
 
+    # 일부 엔드포인트는 200에도 code/msg 형태로 에러를 담을 수 있음
     if isinstance(data, dict) and isinstance(data.get("code"), int) and int(data["code"]) < 0:
-        raise RuntimeError(f"{m} {p} -> binance code={data.get('code')}, msg={data.get('msg')}")
+        code = data.get("code")
+        msg = data.get("msg")
+        # -1021이면 여기서도 복구 시도(제한적으로)
+        if int(code) == -1021 and private:
+            logger.warning("%s %s -> 200 payload has -1021, forcing time sync then re-request once", m, p)
+            _ensure_time_sync(force=True)
+            # 1회만 추가 재요청(무한 루프 금지)
+            resp2 = _request_with_resilience(
+                method=m,
+                url=url,
+                path_for_logs=p,
+                headers=headers or None,
+                timeout=timeout,
+                policy=_NetRetryPolicy(max_attempts=2, base_delay_sec=0.4, max_delay_sec=1.2),
+            )
+            try:
+                data2 = resp2.json()
+            except Exception as e2:
+                raise RuntimeError(f"{m} {p} -> invalid json after -1021 recovery: {e2.__class__.__name__}") from None
+            if isinstance(data2, dict) and isinstance(data2.get("code"), int) and int(data2["code"]) < 0:
+                raise RuntimeError(f"{m} {p} -> binance code={data2.get('code')}, msg={data2.get('msg')}")
+            return data2
+
+        raise RuntimeError(f"{m} {p} -> binance code={code}, msg={msg}")
 
     return data
 

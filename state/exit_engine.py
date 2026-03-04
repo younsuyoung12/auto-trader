@@ -30,10 +30,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - trade.qty / trade.entry 누락/비정상은 즉시 예외(상태 오염)
   4) supervisor는 best-effort 유지:
      - key/필드 불충분하면 supervisor 해설만 스킵(거래 결정에 영향 없음)
+
+- 2026-03-05 (TRADE-GRADE):
+  1) 능동형 익절(Trend Extension / Hybrid Exit) 추가:
+     - TP 근접(arm) 구간에서 추세 강하면 TP 주문을 취소하고 HOLD로 전환
+     - 추세 약화 시(또는 보호 바닥선 이탈 시) 시장가 청산으로 이익 확정
+  2) 손절(SL) 로직은 절대 변경하지 않는다.
 ========================================================
 """
 
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,7 +51,7 @@ from infra.market_data_ws import (
     get_klines_with_volume as ws_get_klines_with_vol,
 )
 from infra.telelog import log, send_tg
-from execution.order_executor import close_position_market
+from execution.order_executor import close_position_market, cancel_order_safe
 from events.signals_logger import log_event, log_signal, log_skip_event, log_candle_snapshot
 from state.db_writer import close_latest_open_trade_returning_id, record_trade_exit_snapshot
 from state.trader_state import Trade
@@ -59,11 +66,37 @@ from strategy.unified_features_builder import build_unified_features, UnifiedFea
 LOG_PW = "[PW_BINANCE]"
 LOG_EXIT = "[PW_BINANCE][EXIT]"
 
-EXIT_CHECK_INTERVAL_SEC: float = 60.0
+EXIT_CHECK_INTERVAL_SEC: float = 10.0
 
 # supervisor 쿨다운(포지션별)
 _EXIT_SUP_LAST_CALL_TS: Dict[str, float] = {}
 _RECENT_SUP_MSGS: List[str] = []  # repetition 방지용(최근 메시지)
+
+# ─────────────────────────────────────────────
+# Trend Extension (능동형 익절) — TRADE-GRADE
+# ─────────────────────────────────────────────
+# NOTE:
+# - TP는 거래소 조건부 주문으로 설치되어 있으므로, "익절 미루기"를 하려면 TP 주문을 취소해야 한다.
+# - exit_engine은 1m cadence로 동작하므로, TP 정확 도달 시점에 취소하면 늦을 수 있다.
+#   따라서 TP의 일정 비율(arm ratio) 도달 시점에 "추세 강함"이면 취소+HOLD로 전환한다.
+#
+# 손절(SL)은 절대 변경하지 않는다.
+_TREND_EXT_REGIME_SCORE_TH: float = 65.0
+_TREND_EXT_MICRO_RISK_MAX: float = 40.0
+
+# TP 근접 시점(arm). 0.6% TP라면 0.54% 도달 시점부터 개입 가능.
+_TREND_EXT_ARM_RATIO: float = 0.90
+
+# TP 취소 후 이익 보호 바닥선: TP의 33% (0.6% TP라면 약 +0.198%)
+_TREND_EXT_FLOOR_RATIO: float = 0.33
+
+# 상태: trade_key -> state
+_TREND_EXT_STATE: Dict[str, Dict[str, Any]] = {}
+_TREND_EXT_LAST_NOTICE_TS: Dict[str, float] = {}
+_TREND_EXT_NOTICE_COOLDOWN_SEC: float = 120.0
+
+# cancel not found codes (-2011/-2013) detection
+_CODE_RE = re.compile(r"code=([-]?\d+)")
 
 
 def _submit_tg(msg: str) -> None:
@@ -216,9 +249,21 @@ def _runtime_thresholds(settings: Any) -> Dict[str, float]:
     if not hasattr(settings, "exit_hard_stop_loss_pct"):
         raise RuntimeError("settings.exit_hard_stop_loss_pct missing (STRICT)")
 
-    op_profit = _as_float(getattr(settings, "exit_opposite_profit_take_pct"), "settings.exit_opposite_profit_take_pct", min_value=0.0)
-    op_loss = _as_float(getattr(settings, "exit_opposite_loss_cut_pct"), "settings.exit_opposite_loss_cut_pct", min_value=0.0)
-    hard_stop = _as_float(getattr(settings, "exit_hard_stop_loss_pct"), "settings.exit_hard_stop_loss_pct", min_value=0.0)
+    op_profit = _as_float(
+        getattr(settings, "exit_opposite_profit_take_pct"),
+        "settings.exit_opposite_profit_take_pct",
+        min_value=0.0,
+    )
+    op_loss = _as_float(
+        getattr(settings, "exit_opposite_loss_cut_pct"),
+        "settings.exit_opposite_loss_cut_pct",
+        min_value=0.0,
+    )
+    hard_stop = _as_float(
+        getattr(settings, "exit_hard_stop_loss_pct"),
+        "settings.exit_hard_stop_loss_pct",
+        min_value=0.0,
+    )
 
     if op_profit <= 0 or op_loss <= 0:
         raise RuntimeError("exit thresholds must be positive (STRICT)")
@@ -259,6 +304,174 @@ def _trade_key_strict(trade: Trade) -> str:
         raise RuntimeError("trade.entry/qty must be > 0 (STRICT)")
 
     return f"{sym}:{side}:{entry:.8f}:{qty:.8f}"
+
+
+def _extract_code(err: Exception) -> Optional[int]:
+    m = _CODE_RE.search(str(err))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _is_order_not_found(err: Exception) -> bool:
+    code = _extract_code(err)
+    if code in (-2011, -2013):
+        return True
+    s = str(err).lower()
+    if "order does not exist" in s:
+        return True
+    return False
+
+
+def _tp_pct_strict(settings: Any, trade: Trade) -> float:
+    """
+    STRICT:
+    - 기본 tp_pct는 settings.tp_pct (SSOT)
+    - trade.tp_pct가 있으면(포지션별) 우선 적용 가능(값 검증 필수)
+    """
+    if not hasattr(settings, "tp_pct"):
+        raise RuntimeError("settings.tp_pct missing (STRICT)")
+    tp = _as_float(getattr(settings, "tp_pct"), "settings.tp_pct", min_value=0.0)
+    if tp <= 0:
+        raise RuntimeError("settings.tp_pct must be > 0 (STRICT)")
+
+    tp_trade = getattr(trade, "tp_pct", None)
+    if tp_trade is None:
+        return float(tp)
+
+    tp2 = _as_float(tp_trade, "trade.tp_pct", min_value=0.0)
+    if tp2 <= 0:
+        raise RuntimeError("trade.tp_pct must be > 0 (STRICT)")
+    return float(tp2)
+
+
+def _sl_pct_strict(settings: Any) -> float:
+    """
+    STRICT:
+    - 손절(SL)은 settings.sl_pct만 사용(절대 변경 금지)
+    """
+    if not hasattr(settings, "sl_pct"):
+        raise RuntimeError("settings.sl_pct missing (STRICT)")
+    sl = _as_float(getattr(settings, "sl_pct"), "settings.sl_pct", min_value=0.0)
+    if sl <= 0:
+        raise RuntimeError("settings.sl_pct must be > 0 (STRICT)")
+    return float(sl)
+
+
+def _meta_scores_best_effort(trade: Trade) -> Optional[Tuple[float, float]]:
+    """
+    TRADE-GRADE:
+    - meta 누락은 '데이터 미준비'로 간주하여 None 반환(명시적 HOLD 유도).
+    - 형식/범위 오류는 예외(불량 데이터).
+    """
+    meta = getattr(trade, "meta", None)
+    if meta is None:
+        return None
+    if not isinstance(meta, dict):
+        raise RuntimeError("trade.meta must be dict (STRICT)")
+
+    if "regime_score" not in meta or "micro_score_risk" not in meta:
+        return None
+
+    regime_score = _as_float(meta.get("regime_score"), "meta.regime_score")
+    micro_score_risk = _as_float(meta.get("micro_score_risk"), "meta.micro_score_risk")
+
+    # 범위는 run_bot_ws에서 이미 가드하지만, 여기서도 최소 가드
+    if not (0.0 <= regime_score <= 100.0):
+        raise RuntimeError(f"meta.regime_score out of range (STRICT): {regime_score}")
+    if not (0.0 <= micro_score_risk <= 100.0):
+        raise RuntimeError(f"meta.micro_score_risk out of range (STRICT): {micro_score_risk}")
+
+    return float(regime_score), float(micro_score_risk)
+
+
+def _trend_strong_from_scores(regime_score: float, micro_score_risk: float) -> bool:
+    return (float(regime_score) > _TREND_EXT_REGIME_SCORE_TH) and (float(micro_score_risk) < _TREND_EXT_MICRO_RISK_MAX)
+
+
+def _cancel_attached_orders_best_effort(*, trade: Trade, settings: Any) -> None:
+    """
+    BEST-EFFORT:
+    - 포지션 청산 시 남아있는 TP/SL 주문이 이후에 오동작하지 않도록 취소 시도.
+    - 실패해도 거래 흐름(청산)을 깨지 않는다.
+    """
+    sym = str(getattr(trade, "symbol", "")).strip()
+    if not sym:
+        raise RuntimeError("trade.symbol missing (STRICT)")
+
+    for name in ("tp_order_id", "sl_order_id"):
+        oid = getattr(trade, name, None)
+        if oid is None:
+            continue
+        s = str(oid).strip()
+        if not s:
+            continue
+        try:
+            cancel_order_safe(sym, s, settings=settings)
+        except Exception as e:
+            # order not found는 정상(이미 체결/취소)
+            if _is_order_not_found(e):
+                continue
+            log(f"{LOG_EXIT}[CANCEL][WARN] cancel {name} failed: {type(e).__name__}:{e}")
+
+
+def _cancel_tp_for_trend_extension_strict(*, trade: Trade, settings: Any) -> bool:
+    """
+    STRICT(결정 영향):
+    - TP 확장을 위해서는 TP 주문 취소가 필요하다.
+    - tp_order_id가 없으면 확장 불가 -> False 반환.
+    - 취소 실패(미정의 오류) 시 확장 금지 -> False 반환(조용한 진행 금지, 로그/이벤트 기록).
+    """
+    sym = str(getattr(trade, "symbol", "")).strip()
+    if not sym:
+        raise RuntimeError("trade.symbol missing (STRICT)")
+
+    tp_oid = getattr(trade, "tp_order_id", None)
+    if tp_oid is None or not str(tp_oid).strip():
+        return False
+
+    try:
+        cancel_order_safe(sym, str(tp_oid).strip(), settings=settings)
+        log_event(
+            "trend_ext_tp_cancelled",
+            symbol=sym,
+            regime=str(getattr(trade, "source", "") or "UNKNOWN"),
+            source="exit_engine.trend_extension",
+            side=_dir_strict(getattr(trade, "side", "")),
+            price=None,
+            reason="tp_cancelled_for_trend_extension",
+            extra_json={"tp_order_id": str(tp_oid).strip()},
+        )
+        return True
+    except Exception as e:
+        if _is_order_not_found(e):
+            # 이미 체결/취소된 경우: 확장 의미가 없으므로 False
+            return False
+
+        log_event(
+            "trend_ext_tp_cancel_fail",
+            symbol=sym,
+            regime=str(getattr(trade, "source", "") or "UNKNOWN"),
+            source="exit_engine.trend_extension",
+            side=_dir_strict(getattr(trade, "side", "")),
+            price=None,
+            reason="tp_cancel_failed",
+            extra_json={"err": f"{type(e).__name__}:{str(e)[:200]}", "tp_order_id": str(tp_oid).strip()},
+        )
+        log(f"{LOG_EXIT}[TREND_EXT][WARN] TP cancel failed (symbol={sym}): {type(e).__name__}:{e}")
+        return False
+
+
+def _trend_ext_notice_once(key: str, msg: str) -> None:
+    now = time.time()
+    last = _TREND_EXT_LAST_NOTICE_TS.get(key)
+    if last is not None and (now - last) < _TREND_EXT_NOTICE_COOLDOWN_SEC:
+        return
+    _TREND_EXT_LAST_NOTICE_TS[key] = now
+    _submit_tg(msg)
 
 
 def _run_exit_supervisor_best_effort(
@@ -382,6 +595,7 @@ def _run_exit_supervisor_best_effort(
 def _close_and_record_strict(
     *,
     trade: Trade,
+    settings: Any,
     close_price: float,
     candle_ts_ms: int,
     reason: str,
@@ -389,6 +603,7 @@ def _close_and_record_strict(
 ) -> None:
     """
     STRICT:
+    - (best-effort) TP/SL 등 잔존 주문 취소
     - 시장가 청산 → bt_trades close → bt_trade_exit_snapshots 기록
     """
     symbol = str(getattr(trade, "symbol", "")).strip()
@@ -406,6 +621,10 @@ def _close_and_record_strict(
     pnl = _pnl_usdt(open_side=open_side, entry=entry, last=close_price_f, qty=qty)
     pnl_pct_val = _pnl_pct(pnl=pnl, entry=entry, qty=qty)
 
+    # BEST-EFFORT: 남은 보호 주문 취소(실패해도 청산 진행)
+    _cancel_attached_orders_best_effort(trade=trade, settings=settings)
+
+    # 실제 청산
     close_position_market(symbol, open_side, float(qty))
 
     exit_dt = datetime.fromtimestamp(int(candle_ts_ms) / 1000.0, tz=timezone.utc)
@@ -523,11 +742,18 @@ def maybe_exit_with_gpt(  # 이름은 호출부 호환을 위해 유지
         )
         _close_and_record_strict(
             trade=trade,
+            settings=settings,
             close_price=float(c),
             candle_ts_ms=int(candle_ts),
             reason=reason,
             regime_label=regime_label,
         )
+        # 상태 정리(best-effort)
+        try:
+            k = _trade_key_strict(trade)
+            _TREND_EXT_STATE.pop(k, None)
+        except Exception:
+            pass
         return True
 
     if opposite and pnl_pct_val >= float(th["op_profit"]):
@@ -545,11 +771,17 @@ def maybe_exit_with_gpt(  # 이름은 호출부 호환을 위해 유지
         )
         _close_and_record_strict(
             trade=trade,
+            settings=settings,
             close_price=float(c),
             candle_ts_ms=int(candle_ts),
             reason=reason,
             regime_label=regime_label,
         )
+        try:
+            k = _trade_key_strict(trade)
+            _TREND_EXT_STATE.pop(k, None)
+        except Exception:
+            pass
         return True
 
     if opposite and pnl_pct_val <= -float(th["op_loss"]):
@@ -567,12 +799,168 @@ def maybe_exit_with_gpt(  # 이름은 호출부 호환을 위해 유지
         )
         _close_and_record_strict(
             trade=trade,
+            settings=settings,
             close_price=float(c),
             candle_ts_ms=int(candle_ts),
             reason=reason,
             regime_label=regime_label,
         )
+        try:
+            k = _trade_key_strict(trade)
+            _TREND_EXT_STATE.pop(k, None)
+        except Exception:
+            pass
         return True
+
+    # ─────────────────────────────────────────
+    # 손절(SL) — 절대 변경 금지 (settings.sl_pct)
+    # ─────────────────────────────────────────
+    sl_pct = _sl_pct_strict(settings)
+    if pnl_pct_val <= -float(sl_pct):
+        reason = "runtime_sl_fixed"
+        _submit_tg(f"❌ [EXIT][SL] {trade.symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+        log_signal(
+            event="CLOSE",
+            symbol=trade.symbol,
+            strategy_type=regime_label,
+            direction=getattr(trade, "side", ""),
+            price=float(c),
+            qty=float(qty),
+            reason=reason,
+            pnl=float(pnl),
+        )
+        _close_and_record_strict(
+            trade=trade,
+            settings=settings,
+            close_price=float(c),
+            candle_ts_ms=int(candle_ts),
+            reason=reason,
+            regime_label=regime_label,
+        )
+        try:
+            k = _trade_key_strict(trade)
+            _TREND_EXT_STATE.pop(k, None)
+        except Exception:
+            pass
+        return True
+
+    # ─────────────────────────────────────────
+    # 능동형 익절 (Trend Extension / Hybrid Exit)
+    # ─────────────────────────────────────────
+    tp_pct = _tp_pct_strict(settings, trade)
+
+    # trade key는 STRICT. 여기서 실패하면 상태 추적 불가 -> 즉시 예외(상태 오염)
+    key = _trade_key_strict(trade)
+
+    # 1) 이미 Trend Extension 상태인 경우: 보호 바닥선/추세 약화 시 EXIT
+    st = _TREND_EXT_STATE.get(key)
+    if isinstance(st, dict) and st.get("active") is True:
+        floor_pct = _as_float(st.get("floor_pct"), "trend_ext.floor_pct", min_value=0.0)
+        max_seen = _as_float(st.get("max_pnl_pct"), "trend_ext.max_pnl_pct", min_value=0.0)
+
+        # max update
+        if pnl_pct_val > max_seen and math.isfinite(pnl_pct_val):
+            st["max_pnl_pct"] = float(pnl_pct_val)
+
+        scores = _meta_scores_best_effort(trade)
+
+        # (A) 보호 바닥선 이탈 → 이익 확정 청산
+        if pnl_pct_val <= floor_pct:
+            reason = "trend_ext_floor_exit"
+            _submit_tg(f"💰 [EXIT][TREND_EXT_FLOOR] {trade.symbol} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+            log_signal(
+                event="CLOSE",
+                symbol=trade.symbol,
+                strategy_type=regime_label,
+                direction=getattr(trade, "side", ""),
+                price=float(c),
+                qty=float(qty),
+                reason=reason,
+                pnl=float(pnl),
+            )
+            _close_and_record_strict(
+                trade=trade,
+                settings=settings,
+                close_price=float(c),
+                candle_ts_ms=int(candle_ts),
+                reason=reason,
+                regime_label=regime_label,
+            )
+            _TREND_EXT_STATE.pop(key, None)
+            return True
+
+        # (B) TP 수준 이상에서 추세 약화 → 이익 확정 청산
+        if pnl_pct_val >= tp_pct and scores is not None:
+            rs, msr = scores
+            if not _trend_strong_from_scores(rs, msr):
+                reason = "trend_ext_exit_on_weakness"
+                _submit_tg(f"💰 [EXIT][TREND_EXT_WEAK] {trade.symbol} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+                log_signal(
+                    event="CLOSE",
+                    symbol=trade.symbol,
+                    strategy_type=regime_label,
+                    direction=getattr(trade, "side", ""),
+                    price=float(c),
+                    qty=float(qty),
+                    reason=reason,
+                    pnl=float(pnl),
+                )
+                _close_and_record_strict(
+                    trade=trade,
+                    settings=settings,
+                    close_price=float(c),
+                    candle_ts_ms=int(candle_ts),
+                    reason=reason,
+                    regime_label=regime_label,
+                )
+                _TREND_EXT_STATE.pop(key, None)
+                return True
+
+        # (C) 유지: 추가 exit 없음 -> HOLD
+        try:
+            log_skip_event(
+                symbol=trade.symbol,
+                regime=regime_label,
+                source="exit_engine.trend_extension",
+                side=getattr(trade, "side", ""),
+                reason="trend_ext_hold",
+                extra={
+                    "scenario": scenario,
+                    "pnl_usdt": float(pnl),
+                    "pnl_pct": float(pnl_pct_val),
+                    "max_pnl_pct": float(st.get("max_pnl_pct")),
+                    "floor_pct": float(floor_pct),
+                },
+            )
+        except Exception as e:
+            log(f"{LOG_EXIT}[HOLD][TREND_EXT][SKIP_LOG] failed symbol={trade.symbol}: {e}")
+        return False
+
+    # 2) Trend Extension 신규 arm: TP 근접 & 추세 강함이면 TP 취소 + HOLD 활성화
+    arm_pct = float(tp_pct) * float(_TREND_EXT_ARM_RATIO)
+    scores2 = _meta_scores_best_effort(trade)
+    if (scores2 is not None) and (pnl_pct_val >= arm_pct):
+        rs2, msr2 = scores2
+        if _trend_strong_from_scores(rs2, msr2):
+            cancelled = _cancel_tp_for_trend_extension_strict(trade=trade, settings=settings)
+            if cancelled:
+                floor_pct = float(tp_pct) * float(_TREND_EXT_FLOOR_RATIO)
+                _TREND_EXT_STATE[key] = {
+                    "active": True,
+                    "started_ts": time.time(),
+                    "tp_pct": float(tp_pct),
+                    "arm_pct": float(arm_pct),
+                    "floor_pct": float(floor_pct),
+                    "max_pnl_pct": float(max(0.0, pnl_pct_val)),
+                }
+                _trend_ext_notice_once(
+                    key,
+                    f"🟦 [HOLD][TREND_EXT] {trade.symbol} 추세 강함 감지 → TP 취소 후 홀딩 (pnl={pnl_pct_val*100:.2f}%, floor≈{floor_pct*100:.2f}%)",
+                )
+                return False
+            # 취소 실패면 확장 불가 -> 기존 로직으로 진행(HOLD)
+            # (TP는 원래대로 동작한다. 조용한 변경 없음)
+            log(f"{LOG_EXIT}[TREND_EXT] arm met but tp cancel failed/not-possible -> no extension (symbol={trade.symbol})")
 
     # ─────────────────────────────────────────
     # HOLD (explicit) + optional supervisor narration/audit

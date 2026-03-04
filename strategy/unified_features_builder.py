@@ -17,6 +17,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 오더북은 WS depth5 스냅샷(bids/asks)을 포함하며, 비어 있으면 즉시 실패한다.
 - pattern_features/summary 는 화이트리스트 기반 compact 형태로 축소(토큰 최적화).
 - microstructure(Funding/OI/LSR/DI)는 거래소 REST 기반으로 수집하며 누락/비정상은 즉시 실패한다.
+- 예외(TRADE-GRADE 규칙): 4h.regime은 WS warmup/지연에서 누락될 수 있으므로
+  누락 시 neutral(trend_strength=0.5)로 처리한다. (데이터 조작/폴백이 아닌 명시 규칙)
 
 입력 계약(중요)
 - market_features_ws.timeframes[1m|5m|15m].raw_ohlcv_last20:
@@ -28,6 +30,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-05:
+  1) FIX(TRADE-GRADE): 4h.regime missing/invalid로 unified_features가 크래시하던 문제 수정
+     - 4h.regime 누락 시 neutral trend_strength=0.5 적용
+     - regime가 dict인데 trend_strength가 누락/비정상인 경우는 기존대로 즉시 예외(STRICT 유지)
 - 2026-03-04:
   1) Data Integrity Guard 연동:
      - OHLCV 시계열에 timestamp rollback/미래 timestamp/ohlcv 관계식 STRICT 검증 추가
@@ -644,16 +650,24 @@ def _score_trend_4h(symbol: str, tf4h: Dict[str, Any], ohlcv60: List[Tuple[int, 
     elif price < ema_slow and ema_fast < ema_slow and structure_bias <= 0:
         direction = "SHORT"
 
+    # ─────────────────────────────────────────────
+    # FIX(2026-03-05): 4h.regime missing → neutral
+    # - regime가 dict가 아니면 neutral trend_strength=0.5 사용
+    # - regime가 dict인데 trend_strength가 누락/비정상이면 기존대로 즉시 예외(STRICT)
+    # ─────────────────────────────────────────────
     regime = tf4h.get("regime")
-    if not isinstance(regime, dict):
-        _fail_unified(symbol, stage, "4h.regime missing/invalid")
-    trend_strength_val = _require_float(symbol, stage, regime.get("trend_strength"), "4h.regime.trend_strength")
+    regime_missing = not isinstance(regime, dict)
+
+    if regime_missing:
+        trend_strength_val = 0.5
+    else:
+        trend_strength_val = _require_float(symbol, stage, regime.get("trend_strength"), "4h.regime.trend_strength")
 
     comp_price_dist = _clamp(abs(price_vs_ema_pct) * 8.0, 0.0, 30.0)
     comp_ema_spread = _clamp(abs(ema_spread_pct) * 10.0, 0.0, 20.0)
     comp_slope = _clamp(abs(slope_pct_60) * 5.0, 0.0, 20.0)
     comp_structure = 10.0 if structure_bias != 0 else 0.0
-    comp_regime = _clamp(trend_strength_val * 20.0, 0.0, 20.0)
+    comp_regime = _clamp(float(trend_strength_val) * 20.0, 0.0, 20.0)
 
     score = _clamp(comp_price_dist + comp_ema_spread + comp_slope + comp_structure + comp_regime, 0.0, 100.0)
 
@@ -665,7 +679,8 @@ def _score_trend_4h(symbol: str, tf4h: Dict[str, Any], ohlcv60: List[Tuple[int, 
             "ema50_vs_ema200_pct": ema_spread_pct,
             "slope_pct_60": slope_pct_60,
             "structure_state": structure_state,
-            "trend_strength": trend_strength_val,
+            "trend_strength": float(trend_strength_val),
+            "regime_missing": 1 if regime_missing else 0,
             "score_price_dist": comp_price_dist,
             "score_ema_spread": comp_ema_spread,
             "score_slope": comp_slope,
