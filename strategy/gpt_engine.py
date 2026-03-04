@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 ========================================================
 FILE: strategy/_gpt_engine.py
@@ -23,13 +21,22 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   1) ENV 직접 접근 제거: DEFAULT_* 를 os.getenv로 읽던 구조 제거 → settings 기반으로 통합
   2) 설정 SSOT 강제: openai_api_key/openai_model/openai_* 누락 시 즉시 예외
   3) timeout/latency budget을 요청 timeout으로도 강제(가능한 범위에서)
+- 2026-03-04:
+  1) docstring 위치 정상화(__future__ import보다 앞) — 모듈 문서/정적 분석 정합
+  2) JSON 추출 로직 강화(raw_decode 기반) — 문자열 내부 braces로 인한 오탐/파손 제거
+  3) OpenAI client 생성 레이스 방지(락) — 동시 호출 안정성 강화
+  4) user_payload JSON 직렬화 STRICT(allow_nan=False) — NaN/Inf 즉시 예외
+  5) 로그 실패가 본 예외를 가리지 않게 처리 — 예외 전파 보장
 ========================================================
 """
+
+from __future__ import annotations
 
 import json
 import math
 import time
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Dict, Optional
 
 from openai import OpenAI
@@ -53,6 +60,27 @@ class GptEngineError(RuntimeError):
 # Settings (SSOT)
 # -----------------------------------------------------------------------------
 SET = load_settings()
+
+
+def _safe_log(msg: str) -> None:
+    """
+    STRICT:
+    - 로깅 실패가 본 예외 흐름을 가리면 안 된다.
+    """
+    try:
+        log(msg)
+    except Exception:
+        # 로깅은 비핵심 I/O. 실패해도 원래 예외 전파를 방해하지 않는다.
+        return
+
+
+def _fail(stage: str, reason: str, exc: Optional[BaseException] = None) -> None:
+    # STRICT: 프롬프트/키/민감정보를 절대 로그에 포함하지 않는다.
+    msg = f"[GPT-ENGINE] {stage} 실패: {reason}"
+    _safe_log(msg)
+    if exc is None:
+        raise GptEngineError(msg)
+    raise GptEngineError(msg) from exc
 
 
 def _require_nonempty_str(stage: str, v: Any, name: str) -> str:
@@ -107,7 +135,7 @@ def _settings_max_tokens() -> int:
         raise GptEngineError("settings.openai_max_tokens missing (STRICT)")
     mt = _require_int("config", getattr(SET, "openai_max_tokens"), "settings.openai_max_tokens")
     if mt <= 0 or mt > 4096:
-        _fail("config", f"openai_max_tokens out of range (1..4096)")
+        _fail("config", "openai_max_tokens out of range (1..4096)")
     return int(mt)
 
 
@@ -151,6 +179,7 @@ class GptJsonResponse:
 # OpenAI client (STRICT)
 # -----------------------------------------------------------------------------
 _CLIENT: Optional[OpenAI] = None
+_CLIENT_LOCK: Lock = Lock()
 
 
 def _get_client() -> OpenAI:
@@ -158,34 +187,34 @@ def _get_client() -> OpenAI:
     if _CLIENT is not None:
         return _CLIENT
 
-    api_key = _settings_openai_api_key()
-    _CLIENT = OpenAI(api_key=api_key)
-    return _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is not None:
+            return _CLIENT
+        api_key = _settings_openai_api_key()
+        _CLIENT = OpenAI(api_key=api_key)
+        return _CLIENT
 
 
 # -----------------------------------------------------------------------------
-# Helpers (STRICT)
+# JSON extraction (STRICT)
 # -----------------------------------------------------------------------------
-def _fail(stage: str, reason: str, exc: Optional[BaseException] = None) -> None:
-    # STRICT: 프롬프트/키/민감정보를 절대 로그에 포함하지 않는다.
-    msg = f"[GPT-ENGINE] {stage} 실패: {reason}"
-    log(msg)
-    if exc is None:
-        raise GptEngineError(msg)
-    raise GptEngineError(msg) from exc
+_JSON_DECODER = json.JSONDecoder()
 
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
     """
     STRICT: 응답에서 첫 JSON object를 추출한다.
-    - 코드블록/앞뒤 텍스트가 있어도 첫 {...} 블록을 찾아 파싱한다.
+
+    정책:
+    - 응답 전체가 JSON이면 그대로 파싱
+    - 아니면 문자열에서 '{'를 순차 탐색하며 raw_decode로 첫 object를 파싱한다.
     - JSON root는 반드시 object(dict)여야 한다.
     """
     s = str(text).strip()
     if not s:
         _fail("parse", "empty response text")
 
-    # Fast path: whole text JSON
+    # Fast path: whole text JSON (object)
     if s.startswith("{") and s.endswith("}"):
         try:
             obj = json.loads(s)
@@ -195,29 +224,21 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
             _fail("parse", f"json root must be object (got={type(obj).__name__})")
         return obj
 
-    start = s.find("{")
-    if start < 0:
-        _fail("parse", "no '{' found")
-
-    depth = 0
-    for i in range(start, len(s)):
-        ch = s[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                chunk = s[start : i + 1]
-                try:
-                    obj = json.loads(chunk)
-                except Exception as e:
-                    _fail("parse", "json.loads failed (chunk)", e)
-                if not isinstance(obj, dict):
-                    _fail("parse", f"json root must be object (got={type(obj).__name__})")
-                return obj
-
-    _fail("parse", "unterminated json object")
-    raise AssertionError("unreachable")  # pragma: no cover
+    # Robust path: scan for first decodable JSON object
+    idx = 0
+    while True:
+        start = s.find("{", idx)
+        if start < 0:
+            _fail("parse", "no JSON object found")
+        try:
+            obj, end = _JSON_DECODER.raw_decode(s, start)
+        except Exception:
+            # 다음 '{'로 진행
+            idx = start + 1
+            continue
+        if not isinstance(obj, dict):
+            _fail("parse", f"json root must be object (got={type(obj).__name__})")
+        return obj
 
 
 # -----------------------------------------------------------------------------
@@ -301,7 +322,12 @@ def call_chat_json(
     if not isinstance(user_payload, dict) or not user_payload:
         _fail("input", "user_payload must be non-empty dict")
 
-    user_content = json.dumps(user_payload, ensure_ascii=False)
+    try:
+        # STRICT: NaN/Infinity JSON 직렬화 금지
+        user_content = json.dumps(user_payload, ensure_ascii=False, allow_nan=False)
+    except Exception as e:
+        _fail("input", "user_payload must be JSON-serializable (strict)", e)
+
     raw = call_chat(
         system_prompt=system_prompt,
         user_content=user_content,

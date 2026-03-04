@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 """
 ========================================================
 FILE: state/db_models.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 설계 원칙:
 - Base는 state.db_core.Base 단일 소스를 사용한다.
@@ -14,41 +12,24 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 레거시 호환: 일부 모듈이 `Trade` ORM 심벌을 기대하므로 `Trade = TradeORM` alias를 제공한다.
 - 폴백 금지: 누락/불일치/모호성은 추정으로 메우지 않는다(즉시 예외/중단).
 
-PATCH NOTES — 2026-03-03 (TRADE-GRADE)
+변경 이력
 --------------------------------------------------------
-- bt_trade_snapshots(TradeSnapshot) 분석형 필드 확장(운영/감사/재현 목적):
-  - Decision Reconciliation:
-    * decision_id
-    * quant_decision_pre (JSONB)
-    * quant_constraints (JSONB)
-    * quant_final_decision
-    * gpt_severity, gpt_tags, gpt_confidence_penalty, gpt_suggested_risk_multiplier, gpt_rationale_short
-  - Microstructure:
-    * micro_* (funding/oi/lsr/z/DI/micro_score_risk)
-  - Execution Quality:
-    * exec_* (expected/filled/slippage/adverse/score/post_prices)
-  - EV Heatmap / AutoBlock:
-    * ev_cell_* / auto_block_* (차단/감쇠 근거 재현)
-  - decision_id UNIQUE 인덱스 추가(다중 NULL 허용, Postgres 특성)
-
-PATCH NOTES — 2026-03-03 (PATCH)
---------------------------------------------------------
-- bt_trade_snapshots(TradeSnapshot) ORM 정합 수정:
-  - equity_current_usdt, equity_peak_usdt, dd_pct 컬럼 추가
-  - 실제 DB(bt_trade_snapshots) 스키마와 1:1 정합 확보
-- bt_trades(TradeORM) 안정성 보강:
-  - updated_at onupdate=_utc_now 추가(ORM 레벨 자동 갱신)
-
-PATCH NOTES — 2026-03-02
---------------------------------------------------------
-- bt_trades: 운영형 실행/복구를 위한 컬럼 추가(ORM 정합)
-  - entry_order_id, tp_order_id, sl_order_id
-  - exchange_position_side
-  - remaining_qty, realized_pnl_usdt
-  - reconciliation_status, last_synced_at
-- 기존 설계 원칙/STRICT 정책 유지 (폴백/추정 금지)
+- 2026-03-04:
+  1) 모듈 docstring 위치 정합화(문서/정적분석 인식 보장): docstring을 파일 최상단으로 이동
+  2) 헤더 표기 TRADE-GRADE로 정합(정책 문서와 일치)
+  3) 로직/스키마/컬럼 정의는 변경하지 않음(동작 동일)
+- 2026-03-03 (TRADE-GRADE):
+  1) bt_trade_snapshots(TradeSnapshot) 분석형 필드 확장(운영/감사/재현 목적)
+  2) decision_id UNIQUE 인덱스 추가(다중 NULL 허용: Postgres 특성)
+- 2026-03-03 (PATCH):
+  1) bt_trade_snapshots ORM 정합 수정(equity_current_usdt/equity_peak_usdt/dd_pct)
+  2) bt_trades updated_at onupdate=_utc_now 추가
+- 2026-03-02:
+  1) bt_trades 실행/복구 컬럼 추가(ORM 정합)
 ========================================================
 """
+
+from __future__ import annotations
 
 from datetime import datetime, timezone
 

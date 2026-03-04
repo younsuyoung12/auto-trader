@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 """
 ========================================================
-strategy/unified_features_builder.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+FILE: strategy/unified_features_builder.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할
 - WS 기반 market_features_ws 결과 + pattern_detection 결과 + 오더북(depth5)을 결합해
@@ -30,6 +28,13 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-04:
+  1) Data Integrity Guard 연동:
+     - OHLCV 시계열에 timestamp rollback/미래 timestamp/ohlcv 관계식 STRICT 검증 추가
+     - 오더북 원시 스냅샷에 bestAsk>bestBid/레벨 price·qty>0/ts(exchTs|ts) 존재 STRICT 검증 추가
+  2) Invariant Guard 연동(최소):
+     - micro_score_risk 및 settings(tp/sl) 기반 최소 수학 invariant 검증(폴백 없음)
+  3) 모듈 docstring 위치 정합화(__future__ import보다 앞으로 이동)
 - 2026-03-03:
   1) STRICT 강화: silent 예외 삼키기 제거(텔레그램 전송 포함)
   2) STRICT 강화: 암묵적 기본값(or "", or "NONE") 제거 및 필수 키/형식 강제
@@ -52,6 +57,8 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
 """
 
+from __future__ import annotations
+
 import math
 from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
 
@@ -60,12 +67,27 @@ from settings import load_settings
 try:
     from infra.telelog import log, send_tg
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · PRODUCTION MODE)") from e
+    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · TRADE-GRADE MODE)") from e
 
 from infra.market_data_ws import get_orderbook
 from infra.market_features_ws import FeatureBuildError, build_entry_features_ws
 from strategy.pattern_detection import PatternError, build_pattern_features
 from strategy.microstructure_engine import MicrostructureError, build_microstructure_snapshot
+
+# NEW: Data Integrity Guard (TRADE-GRADE)
+from infra.data_integrity_guard import (  # noqa: E402
+    DataIntegrityError,
+    extract_orderbook_ts_ms_strict,
+    validate_kline_series_strict,
+    validate_orderbook_strict,
+)
+
+# NEW: Invariant Guard (TRADE-GRADE)
+from execution.invariant_guard import (  # noqa: E402
+    InvariantViolation,
+    SignalInvariantInputs,
+    validate_signal_invariants_strict,
+)
 
 SET = load_settings()
 
@@ -216,10 +238,15 @@ def _parse_ohlcv_rows(
     name: str,
 ) -> List[Tuple[int, float, float, float, float, float]]:
     raw = _require_sequence(symbol, stage, rows, name, min_len=min_len)
+    sliced = list(raw[-min_len:])
+
+    # NEW: Data Integrity Guard (timestamp rollback/미래 ts/ohlcv 관계식)
+    try:
+        validate_kline_series_strict(sliced, name=name, min_len=min_len)
+    except DataIntegrityError as e:
+        _fail_unified(symbol, stage, f"{name} integrity fail (STRICT): {e}", e)
+
     out: List[Tuple[int, float, float, float, float, float]] = []
-
-    sliced = raw[-min_len:]
-
     for i, row in enumerate(sliced):
         if not isinstance(row, (list, tuple)) or len(row) < 6:
             _fail_unified(symbol, stage, f"{name}[{i}] must be (ts,o,h,l,c,v) list/tuple (got={row!r})")
@@ -287,6 +314,12 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if not isinstance(ob, dict) or not ob:
         _fail_unified(symbol, stage, "WS orderbook snapshot missing/invalid")
 
+    # NEW: Data Integrity Guard (bestAsk>bestBid, 레벨 price/qty>0, ts 존재)
+    try:
+        validate_orderbook_strict(ob, symbol=str(symbol), require_ts=True)
+    except DataIntegrityError as e:
+        _fail_unified(symbol, stage, f"orderbook integrity fail (STRICT): {e}", e)
+
     bids = ob.get("bids")
     asks = ob.get("asks")
     if not isinstance(bids, list) or not bids:
@@ -349,12 +382,14 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if not math.isfinite(depth_imbalance):
         _fail_unified(symbol, stage, f"invalid depth_imbalance: {depth_imbalance}")
 
-    checked_at_ms = _require_int(symbol, stage, ob.get("ts"), "checked_at_ms(ts)")
-    if checked_at_ms <= 0:
-        _fail_unified(symbol, stage, f"invalid checked_at_ms(ts): {checked_at_ms}")
+    # STRICT: exchTs/ts 중 하나가 필수 (폴백 금지)
+    try:
+        checked_at_ms = extract_orderbook_ts_ms_strict(ob, name="orderbook")
+    except DataIntegrityError as e:
+        _fail_unified(symbol, stage, f"orderbook ts missing/invalid (STRICT): {e}", e)
 
     return {
-        "checked_at_ms": checked_at_ms,
+        "checked_at_ms": int(checked_at_ms),
         "best_bid": best_bid,
         "best_ask": best_ask,
         "spread": spread,
@@ -958,7 +993,6 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
 
 
 def _load_microstructure_config(symbol: str) -> Tuple[str, int, int]:
-    # Deterministic defaults for new subsystem (microstructure). Not a data fallback.
     period = str(getattr(SET, "microstructure_period", _MICRO_PERIOD_DEFAULT)).strip()
     if not period:
         _fail_unified(symbol, "microstructure.config", "microstructure_period is empty")
@@ -1028,6 +1062,42 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
         _fail_unified(sym, "microstructure", f"MicrostructureError: {e}", e)
     except Exception as e:
         _fail_unified(sym, "microstructure", f"unexpected error: {e!r}", e)
+
+    if not isinstance(microstructure, dict) or not microstructure:
+        _fail_unified(sym, "microstructure", "microstructure snapshot must be non-empty dict (STRICT)")
+
+    # NEW: Invariant Guard(최소) — micro_score_risk + settings(tp/sl) 기반 검증
+    # NOTE: unified_features는 아직 '최종 매매 신호'가 아니므로 risk_pct는 더미(상수)로만 검증한다.
+    #       실제 risk_pct는 run_bot_ws → risk_physics → execution_engine에서 다시 STRICT 검증된다.
+    if "micro_score_risk" not in microstructure:
+        _fail_unified(sym, "microstructure", "micro_score_risk missing (STRICT)")
+    msr = _require_float(sym, "microstructure", microstructure.get("micro_score_risk"), "micro_score_risk")
+    if msr < 0.0 or msr > 100.0:
+        _fail_unified(sym, "microstructure", f"micro_score_risk out of range [0,100] (STRICT): {msr}")
+
+    try:
+        tp_pct = float(getattr(SET, "tp_pct"))
+        sl_pct = float(getattr(SET, "sl_pct"))
+    except Exception as e:
+        _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct required for invariant check (STRICT)", e)
+
+    try:
+        validate_signal_invariants_strict(
+            SignalInvariantInputs(
+                symbol=str(sym),
+                direction="LONG",
+                risk_pct=0.01,
+                tp_pct=float(tp_pct),
+                sl_pct=float(sl_pct),
+                dd_pct=None,
+                micro_score_risk=float(msr),
+                final_risk_multiplier=None,
+                equity_current_usdt=None,
+                equity_peak_usdt=None,
+            )
+        )
+    except InvariantViolation as e:
+        _fail_unified(sym, "invariant_guard", f"invariant violation (STRICT): {e}", e)
 
     compact_timeframes = _compact_timeframes_for_output(sym, timeframes)
 

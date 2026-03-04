@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 """
 ========================================================
 FILE: strategy/gpt_supervisor.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할
 - GPT를 "중간 브레인(Strategy Supervisor)"로 사용한다.
@@ -13,7 +11,7 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 중요 (Decision Reconciliation 계약)
 - GPT는 절대 매매 결정을 내리지 않는다. (ENTER/HOLD/EXIT 지시 금지)
-- GPT 출력은 오직 "감사 라벨 + 설명 문장 + 제안(페널티/리스크 조정 힌트)" 형태다.
+- GPT 출력은 오직 "감사 라벨 + 설명 문장 + 제안(페널티/리스크 multiplier 힌트)" 형태다.
 - 최종 결정(ENTER/HOLD/EXIT, 사이징, TP/SL)은 Quant Engine의 규칙으로만 확정한다.
 
 절대 원칙 (STRICT · NO-FALLBACK)
@@ -31,37 +29,37 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 2026-03-03:
   1) 신규 생성: GPT Supervisor(감사/해설/사후감사) JSON 계약 + STRICT 검증/금지 규칙 적용
   2) 반복 방지: 최근 메시지와 유사도(간단 토큰 Jaccard)로 2회까지 재생성 시도(동일 의미 변주)
+- 2026-03-04:
+  1) ENV 직접 접근(os.getenv) 전면 제거(규약 위반 제거) → settings SSOT 강제
+  2) OpenAI 직접 호출 제거 → strategy/_gpt_engine.py 단일 진입점(call_chat_json) 사용
+  3) 금지 키/금지 표현 검증 강화: 응답 JSON 전체(재귀) 스캔 + 원문 포함 스캔
+  4) 최상위 스키마 화이트리스트 적용(auditor/narration/postmortem 외 즉시 예외)
+  5) payload JSON 직렬화 STRICT(allow_nan=False) + timeout budget 강제
 ========================================================
 """
 
+from __future__ import annotations
+
 import json
 import math
-import os
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
-
-from openai import OpenAI
-
-from settings import load_settings
 
 try:
     from infra.telelog import log
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · PRODUCTION MODE)") from e
+    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · TRADE-GRADE MODE)") from e
 
+try:
+    from strategy.gpt_engine import GptEngineError, call_chat_json
+except Exception as e:  # pragma: no cover
+    raise RuntimeError("strategy._gpt_engine import failed (STRICT · NO-FALLBACK · TRADE-GRADE MODE)") from e
 
-SET = load_settings()
 
 # -----------------------------------------------------------------------------
 # Policy / constants (STRICT)
 # -----------------------------------------------------------------------------
-DEFAULT_MODEL = os.getenv("OPENAI_SUPERVISOR_MODEL", os.getenv("OPENAI_TRADER_MODEL", "gpt-4o-mini"))
-MAX_LATENCY_SEC = float(os.getenv("OPENAI_SUPERVISOR_MAX_LATENCY", os.getenv("OPENAI_TRADER_MAX_LATENCY", "12")))
-MAX_TOKENS = int(os.getenv("OPENAI_SUPERVISOR_MAX_TOKENS", os.getenv("OPENAI_TRADER_MAX_TOKENS", "512")))
-TEMPERATURE = float(os.getenv("OPENAI_SUPERVISOR_TEMPERATURE", "0.2"))
-
 # 금지어/금지 패턴(투자 권유/확정 표현/공격 표현 최소 세트)
 _PROHIBITED_SUBSTRINGS: Tuple[str, ...] = (
     "무조건",
@@ -77,8 +75,16 @@ _PROHIBITED_SUBSTRINGS: Tuple[str, ...] = (
     "지금 팔",
 )
 
-# GPT가 "결정"을 직접 내리려는 키 금지
-_FORBIDDEN_TOP_KEYS: Tuple[str, ...] = (
+# narration에서 특히 금지(대중용 문장에 등장하면 규약 위반)
+_AVOID_TERMS: Tuple[str, ...] = (
+    "레버리지",
+    "ATR",
+    "RSI",
+    "MACD",
+)
+
+# GPT가 "결정"을 직접 내리려는 키 금지(응답 JSON 어디서든 등장 금지)
+_FORBIDDEN_KEYS_ANYWHERE: Tuple[str, ...] = (
     "action",
     "decision",
     "enter",
@@ -91,6 +97,8 @@ _FORBIDDEN_TOP_KEYS: Tuple[str, ...] = (
     "tp",
     "sl",
 )
+
+_ALLOWED_TOP_KEYS: Tuple[str, ...] = ("auditor", "narration", "postmortem")
 
 _TAG_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 
@@ -112,7 +120,7 @@ class Auditor:
 class Narration:
     title: str
     message: str
-    tone: str  # e.g. calm/neutral/caution
+    tone: str  # calm/neutral/caution
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,29 +140,18 @@ class SupervisorResult:
 
 
 # -----------------------------------------------------------------------------
-# OpenAI client (STRICT)
-# -----------------------------------------------------------------------------
-_CLIENT: Optional[OpenAI] = None
-
-
-def _get_client() -> OpenAI:
-    global _CLIENT
-    if _CLIENT is not None:
-        return _CLIENT
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise GptSupervisorError("OPENAI_API_KEY missing (STRICT)")
-    _CLIENT = OpenAI(api_key=api_key)
-    return _CLIENT
-
-
-# -----------------------------------------------------------------------------
 # Strict helpers
 # -----------------------------------------------------------------------------
+def _safe_log(msg: str) -> None:
+    try:
+        log(msg)
+    except Exception:
+        return
+
+
 def _fail(stage: str, reason: str, exc: Optional[BaseException] = None) -> None:
     msg = f"[GPT-SUPERVISOR] {stage} 실패: {reason}"
-    log(msg)
+    _safe_log(msg)
     if exc is None:
         raise GptSupervisorError(msg)
     raise GptSupervisorError(msg) from exc
@@ -171,7 +168,7 @@ def _require_nonempty_str(stage: str, v: Any, name: str) -> str:
 
 def _require_dict(stage: str, v: Any, name: str) -> Dict[str, Any]:
     if not isinstance(v, dict):
-        _fail(stage, f"{name} must be dict (got={type(v)})")
+        _fail(stage, f"{name} must be dict (got={type(v).__name__})")
     if not v:
         _fail(stage, f"{name} is empty")
     return v
@@ -179,13 +176,17 @@ def _require_dict(stage: str, v: Any, name: str) -> Dict[str, Any]:
 
 def _require_list(stage: str, v: Any, name: str, *, min_len: int = 0) -> List[Any]:
     if not isinstance(v, list):
-        _fail(stage, f"{name} must be list (got={type(v)})")
+        _fail(stage, f"{name} must be list (got={type(v).__name__})")
     if len(v) < min_len:
         _fail(stage, f"{name} length<{min_len} (got={len(v)})")
     return v
 
 
 def _require_int(stage: str, v: Any, name: str) -> int:
+    if v is None:
+        _fail(stage, f"{name} is None")
+    if isinstance(v, bool):
+        _fail(stage, f"{name} must be int (bool not allowed)")
     try:
         iv = int(v)
     except Exception as e:
@@ -194,63 +195,23 @@ def _require_int(stage: str, v: Any, name: str) -> int:
 
 
 def _require_float(stage: str, v: Any, name: str) -> float:
+    if v is None:
+        _fail(stage, f"{name} is None")
+    if isinstance(v, bool):
+        _fail(stage, f"{name} must be float (bool not allowed)")
     try:
         fv = float(v)
     except Exception as e:
         _fail(stage, f"{name} must be float (got={v!r})", e)
     if not math.isfinite(fv):
         _fail(stage, f"{name} must be finite (got={fv})")
-    return fv
+    return float(fv)
 
 
 def _require_range(stage: str, v: float, name: str, lo: float, hi: float) -> float:
     if v < lo or v > hi:
         _fail(stage, f"{name} out of range [{lo},{hi}] (got={v})")
     return v
-
-
-def _extract_first_json_object(text: str) -> Dict[str, Any]:
-    """
-    STRICT: 응답에서 첫 JSON object를 추출한다.
-    - 코드블록/앞뒤 텍스트가 있어도 첫 {...} 블록을 찾아 파싱
-    """
-    s = text.strip()
-    if not s:
-        _fail("parse", "empty response text")
-
-    # 빠른 경로: 전체가 JSON
-    if s.startswith("{") and s.endswith("}"):
-        try:
-            obj = json.loads(s)
-        except Exception as e:
-            _fail("parse", "json.loads failed (full text)", e)
-        if not isinstance(obj, dict):
-            _fail("parse", f"json root must be object (got={type(obj)})")
-        return obj
-
-    # 브레이스 스캔
-    start = s.find("{")
-    if start < 0:
-        _fail("parse", "no '{' found")
-    depth = 0
-    for i in range(start, len(s)):
-        ch = s[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                chunk = s[start : i + 1]
-                try:
-                    obj = json.loads(chunk)
-                except Exception as e:
-                    _fail("parse", "json.loads failed (chunk)", e)
-                if not isinstance(obj, dict):
-                    _fail("parse", f"json root must be object (got={type(obj)})")
-                return obj
-
-    _fail("parse", "unterminated json object")
-    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _contains_prohibited(text: str) -> Optional[str]:
@@ -261,6 +222,57 @@ def _contains_prohibited(text: str) -> Optional[str]:
         if bad in t:
             return bad
     return None
+
+
+def _contains_avoid_terms(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    for bad in _AVOID_TERMS:
+        if bad in t:
+            return bad
+    return None
+
+
+def _scan_forbidden_keys_anywhere(obj: Any) -> None:
+    """
+    STRICT:
+    - 응답 JSON 어디서든 금지 키가 등장하면 즉시 예외
+    """
+    stage = "parse"
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).lower().strip()
+            if lk in _FORBIDDEN_KEYS_ANYWHERE:
+                _fail(stage, f"forbidden key present anywhere: {k!r}")
+            _scan_forbidden_keys_anywhere(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            _scan_forbidden_keys_anywhere(it)
+
+
+def _scan_prohibited_strings_anywhere(obj: Any) -> None:
+    """
+    STRICT:
+    - 응답 JSON 어디서든 금지 문구가 등장하면 즉시 예외
+    """
+    stage = "parse"
+    if isinstance(obj, str):
+        bad = _contains_prohibited(obj)
+        if bad is not None:
+            _fail(stage, f"prohibited phrase present: {bad!r}")
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            # 키 문자열에도 금지어가 포함되면 즉시 실패
+            ks = str(k)
+            badk = _contains_prohibited(ks)
+            if badk is not None:
+                _fail(stage, f"prohibited phrase present in key: {badk!r}")
+            _scan_prohibited_strings_anywhere(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            _scan_prohibited_strings_anywhere(it)
 
 
 def _jaccard(a: str, b: str) -> float:
@@ -292,13 +304,6 @@ def _compact_unified_features(unified: Dict[str, Any]) -> Dict[str, Any]:
     unified_features에서 필요한 최소 요약만 뽑는다(STRICT 키 검증).
     """
     stage = "payload"
-    symbol = _require_nonempty_str(stage, unified.get("symbol"), "symbol") if "symbol" in unified else ""
-    # unified_features_builder가 symbol을 최상위에 싣지 않는 경우가 있어 timeframes 쪽에서 보완
-    if not symbol:
-        # STRICT: timeframes 없으면 unified 자체가 잘못
-        tfs = _require_dict(stage, unified.get("timeframes"), "timeframes")
-        # 1m의 last_close가 있는 경우 사용(심볼은 caller가 별도 전달하는 게 정석)
-        _ = tfs  # only validation
 
     engine_scores = _require_dict(stage, unified.get("engine_scores"), "engine_scores")
     total = _require_dict(stage, engine_scores.get("total"), "engine_scores.total")
@@ -318,20 +323,21 @@ def _compact_unified_features(unified: Dict[str, Any]) -> Dict[str, Any]:
     micro_risk = _require_float(stage, micro.get("micro_score_risk"), "microstructure.micro_score_risk")
     _require_range(stage, micro_risk, "microstructure.micro_score_risk", 0.0, 100.0)
 
+    def _score_band(key: str) -> float:
+        v = engine_scores.get(key)
+        if not isinstance(v, dict):
+            _fail(stage, f"engine_scores.{key} missing/invalid")
+        return _require_float(stage, v.get("score"), f"engine_scores.{key}.score")
+
     return {
         "engine": {
             "engine_total_score": total_score,
             "band_scores": {
-                "trend_4h": _require_float(stage, engine_scores.get("trend_4h", {}).get("score"), "engine_scores.trend_4h.score")
-                if isinstance(engine_scores.get("trend_4h"), dict) else _fail(stage, "engine_scores.trend_4h missing/invalid"),
-                "momentum_1h": _require_float(stage, engine_scores.get("momentum_1h", {}).get("score"), "engine_scores.momentum_1h.score")
-                if isinstance(engine_scores.get("momentum_1h"), dict) else _fail(stage, "engine_scores.momentum_1h missing/invalid"),
-                "structure_15m": _require_float(stage, engine_scores.get("structure_15m", {}).get("score"), "engine_scores.structure_15m.score")
-                if isinstance(engine_scores.get("structure_15m"), dict) else _fail(stage, "engine_scores.structure_15m missing/invalid"),
-                "timing_5m": _require_float(stage, engine_scores.get("timing_5m", {}).get("score"), "engine_scores.timing_5m.score")
-                if isinstance(engine_scores.get("timing_5m"), dict) else _fail(stage, "engine_scores.timing_5m missing/invalid"),
-                "orderbook_micro": _require_float(stage, engine_scores.get("orderbook_micro", {}).get("score"), "engine_scores.orderbook_micro.score")
-                if isinstance(engine_scores.get("orderbook_micro"), dict) else _fail(stage, "engine_scores.orderbook_micro missing/invalid"),
+                "trend_4h": _score_band("trend_4h"),
+                "momentum_1h": _score_band("momentum_1h"),
+                "structure_15m": _score_band("structure_15m"),
+                "timing_5m": _score_band("timing_5m"),
+                "orderbook_micro": _score_band("orderbook_micro"),
             },
         },
         "orderbook": {
@@ -422,7 +428,7 @@ def _build_user_payload(
             "no_jargon": True,
             "no_guarantee": True,
             "max_sentences": 2,
-            "avoid_terms": ["레버리지", "ATR", "RSI", "MACD", "확실", "무조건", "100%"],
+            "avoid_terms": list(_AVOID_TERMS),
         },
     }
 
@@ -455,11 +461,19 @@ def _validate_output(
 ) -> SupervisorResult:
     stage = "parse"
 
-    # top-level forbidden keys
+    # 원문에도 금지 문구가 있으면 즉시 실패(코드블록/추가 텍스트 포함 방지)
+    bad_raw = _contains_prohibited(raw_text)
+    if bad_raw is not None:
+        _fail(stage, f"prohibited phrase present in raw_text: {bad_raw!r}")
+
+    # top-level key whitelist
     for k in obj.keys():
-        lk = str(k).lower().strip()
-        if lk in _FORBIDDEN_TOP_KEYS:
-            _fail(stage, f"forbidden top-level key present: {k!r}")
+        if str(k) not in _ALLOWED_TOP_KEYS:
+            _fail(stage, f"unknown top-level key present: {k!r}")
+
+    # forbidden keys anywhere + prohibited phrases anywhere
+    _scan_forbidden_keys_anywhere(obj)
+    _scan_prohibited_strings_anywhere(obj)
 
     auditor_raw = _require_dict(stage, obj.get("auditor"), "auditor")
     sev = _require_int(stage, auditor_raw.get("severity"), "auditor.severity")
@@ -467,9 +481,12 @@ def _validate_output(
         _fail(stage, f"auditor.severity must be 0..3 (got={sev})")
 
     tags = _validate_tags(_require_list(stage, auditor_raw.get("tags"), "auditor.tags", min_len=1))
+
     rationale = _require_nonempty_str(stage, auditor_raw.get("rationale_short"), "auditor.rationale_short")
     if len(rationale) > 240:
         _fail(stage, "auditor.rationale_short too long (>240)")
+    if _contains_avoid_terms(rationale) is not None:
+        _fail(stage, "auditor.rationale_short contains jargon/avoid_terms (STRICT)")
 
     cp = _require_float(stage, auditor_raw.get("confidence_penalty"), "auditor.confidence_penalty")
     cp = _require_range(stage, cp, "auditor.confidence_penalty", 0.0, 1.0)
@@ -480,30 +497,39 @@ def _validate_output(
     narration_val = obj.get("narration")
     narration: Optional[Narration] = None
     if narration_val is not None:
-        if narration_val is not None and not isinstance(narration_val, dict):
-            _fail(stage, f"narration must be object or null (got={type(narration_val)})")
-        if isinstance(narration_val, dict):
-            title = _require_nonempty_str(stage, narration_val.get("title"), "narration.title")
-            msg = _require_nonempty_str(stage, narration_val.get("message"), "narration.message")
-            tone = _require_nonempty_str(stage, narration_val.get("tone"), "narration.tone")
-            if len(msg) > 240:
-                _fail(stage, "narration.message too long (>240)")
-            bad = _contains_prohibited(msg)
-            if bad is not None:
-                _fail(stage, f"narration contains prohibited phrase: {bad!r}")
-            narration = Narration(title=title, message=msg, tone=tone)
+        if not isinstance(narration_val, dict):
+            _fail(stage, f"narration must be object or null (got={type(narration_val).__name__})")
+        title = _require_nonempty_str(stage, narration_val.get("title"), "narration.title")
+        msg = _require_nonempty_str(stage, narration_val.get("message"), "narration.message")
+        tone = _require_nonempty_str(stage, narration_val.get("tone"), "narration.tone")
+
+        if tone not in ("calm", "neutral", "caution"):
+            _fail(stage, f"narration.tone invalid: {tone!r}")
+
+        if len(title) > 80:
+            _fail(stage, "narration.title too long (>80)")
+        if len(msg) > 240:
+            _fail(stage, "narration.message too long (>240)")
+
+        bad = _contains_avoid_terms(msg)
+        if bad is not None:
+            _fail(stage, f"narration contains avoid_terms: {bad!r}")
+
+        narration = Narration(title=title, message=msg, tone=tone)
 
     post_val = obj.get("postmortem")
     post: Optional[Postmortem] = None
     if post_val is not None:
         if not isinstance(post_val, dict):
-            _fail(stage, f"postmortem must be object or null (got={type(post_val)})")
+            _fail(stage, f"postmortem must be object or null (got={type(post_val).__name__})")
         kind = _require_nonempty_str(stage, post_val.get("kind"), "postmortem.kind")
         if kind not in ("probabilistic_loss", "strategy_issue", "execution_issue"):
             _fail(stage, f"postmortem.kind invalid: {kind!r}")
         notes = _require_nonempty_str(stage, post_val.get("notes"), "postmortem.notes")
         if len(notes) > 500:
             _fail(stage, "postmortem.notes too long (>500)")
+        if _contains_avoid_terms(notes) is not None:
+            _fail(stage, "postmortem.notes contains jargon/avoid_terms (STRICT)")
         post = Postmortem(kind=kind, notes=notes)
 
     auditor = Auditor(
@@ -547,24 +573,22 @@ def run_gpt_supervisor(
     """
     did = _require_nonempty_str("input", decision_id, "decision_id")
     et = _require_nonempty_str("input", event_type, "event_type")
-    m = (model or DEFAULT_MODEL).strip()
-    if not m:
-        _fail("input", "model is empty")
 
-    tsec = float(timeout_sec if timeout_sec is not None else MAX_LATENCY_SEC)
-    if not math.isfinite(tsec) or tsec <= 0:
-        _fail("input", f"timeout_sec invalid: {timeout_sec!r}")
+    # timeout은 budget 개념. 미지정이면 _gpt_engine settings.openai_max_latency_sec를 사용한다.
+    tsec: Optional[float] = None
+    if timeout_sec is not None:
+        tsec = float(timeout_sec)
+        if not math.isfinite(tsec) or tsec <= 0:
+            _fail("input", f"timeout_sec invalid: {timeout_sec!r}")
 
     system_prompt = _build_system_prompt()
-    client = _get_client()
 
-    # 2-pass anti-repeat (STRICT quality rule)
     last_msg = (recent_messages[-1] if recent_messages else None)
 
     attempt = 0
     last_text = ""
     while attempt < 2:
-        force_rephrase = attempt == 1
+        force_rephrase = (attempt == 1)
 
         payload = _build_user_payload(
             decision_id=did,
@@ -576,42 +600,31 @@ def run_gpt_supervisor(
             force_rephrase=force_rephrase,
         )
 
-        t0 = time.time()
         try:
-            resp = client.chat.completions.create(
-                model=m,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
+            # STRICT: payload 직렬화에서 NaN/Inf 금지
+            json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        except Exception as e:
+            _fail("payload", "payload must be JSON-serializable (strict)", e)
+
+        try:
+            raw = call_chat_json(
+                system_prompt=system_prompt,
+                user_payload=payload,
+                model=model,
+                max_latency_sec=tsec,
             )
-        except Exception as e:
-            _fail("openai", f"request failed: {e.__class__.__name__}", e)
-        dt = time.time() - t0
-        if dt > tsec:
-            _fail("openai", f"latency budget exceeded: {dt:.2f}s > {tsec:.2f}s")
+        except GptEngineError as e:
+            _fail("openai", "call_chat_json failed", e)
 
-        # Extract text (STRICT)
-        try:
-            content = resp.choices[0].message.content  # type: ignore[index]
-        except Exception as e:
-            _fail("openai", "response content missing", e)
-        if not isinstance(content, str) or not content.strip():
-            _fail("openai", "empty content")
+        last_text = raw.text
+        if not isinstance(raw.obj, dict) or not raw.obj:
+            _fail("parse", "call_chat_json returned empty/non-dict obj (STRICT)")
 
-        last_text = content.strip()
+        result = _validate_output(decision_id=did, event_type=et, raw_text=last_text, obj=raw.obj)
 
-        # Parse/validate
-        obj = _extract_first_json_object(last_text)
-        result = _validate_output(decision_id=did, event_type=et, raw_text=last_text, obj=obj)
-
-        # anti-repeat check only if narration exists
         if last_msg is not None and result.narration is not None:
             sim = _jaccard(last_msg, result.narration.message)
             if sim >= 0.80:
-                # too similar: retry with force_rephrase
                 attempt += 1
                 continue
 

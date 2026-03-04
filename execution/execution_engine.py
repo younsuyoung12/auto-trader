@@ -1,4 +1,3 @@
-# execution/execution_engine.py
 """
 ========================================================
 FILE: execution/execution_engine.py
@@ -16,6 +15,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - “ENTER”는 필요한 메타/필드가 1개라도 없으면 즉시 중단한다.
 - 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
 - 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
+
+PATCH NOTES — 2026-03-04 (TRADE-GRADE)
+- Invariant Guard 연결(STRICT):
+  - ENTER 흐름에서 meta/signal 수학 무결성(0..1/finite/필수키)을 execute() 초기에 검증
+  - notional/qty/slippage/spread 등 실행 수학값을 hard_risk_guard_check 이전에 재검증
+  - 위반 시 폴백 없이 즉시 OrderFailed로 중단
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
 - ENV 직접 접근 제거(SSOT 준수):
@@ -86,6 +91,16 @@ from state.db_writer import (
     record_trade_snapshot,
 )
 from state.trader_state import Trade  # ✅ FIX: Trade 타입 import
+
+# NEW: Invariant Guard (TRADE-GRADE)
+from execution.invariant_guard import (  # noqa: E402
+    ExecutionInvariantInputs,
+    InvariantViolation,
+    SignalInvariantInputs,
+    validate_execution_invariants_strict,
+    validate_signal_from_meta_strict,
+    validate_signal_invariants_strict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -445,11 +460,10 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
     - 값이 '존재하면' STRICT 타입/범위 검증 후 전달
     - 존재하지 않으면 None(미기록)
     """
-    # Decision reconciliation
     decision_id = _meta_optional_str(meta, "decision_id")
     quant_decision_pre = _meta_optional_dict(meta, "quant_decision_pre")
     quant_constraints = _meta_optional_dict(meta, "quant_constraints")
-    quant_final_decision = _meta_optional_str(meta, "quant_final_decision")  # ✅ 폴백 금지: 없으면 None
+    quant_final_decision = _meta_optional_str(meta, "quant_final_decision")
 
     gpt_severity = _meta_optional(meta, "gpt_severity")
     if gpt_severity is not None:
@@ -465,7 +479,6 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
         )
     gpt_rationale_short = _meta_optional_str(meta, "gpt_rationale_short")
 
-    # Microstructure
     micro_funding_rate = _meta_optional(meta, "micro_funding_rate")
     if micro_funding_rate is not None:
         micro_funding_rate = _as_float(micro_funding_rate, "meta.micro_funding_rate")
@@ -491,7 +504,6 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
     if micro_score_risk is not None:
         micro_score_risk = _as_float(micro_score_risk, "meta.micro_score_risk", min_value=0.0, max_value=100.0)
 
-    # EV heatmap / auto block
     ev_cell_key = _meta_optional_str(meta, "ev_cell_key")
     ev_cell_ev = _meta_optional(meta, "ev_cell_ev")
     if ev_cell_ev is not None:
@@ -509,7 +521,6 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
         auto_risk_multiplier = _as_float(auto_risk_multiplier, "meta.auto_risk_multiplier", min_value=0.0, max_value=1.0)
     auto_block_reasons = _meta_optional_dict(meta, "auto_block_reasons")
 
-    # Execution quality: 즉시 저장 가능한 값만(대기 없이)
     if entry_price_hint <= 0:
         raise OrderFailed("entry_price_hint must be > 0 for exec snapshot (STRICT)")
     slip_pct = abs(float(filled_entry_price) - float(entry_price_hint)) / float(entry_price_hint) * 100.0
@@ -521,13 +532,11 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
         "quant_decision_pre": quant_decision_pre,
         "quant_constraints": quant_constraints,
         "quant_final_decision": quant_final_decision,
-
         "gpt_severity": gpt_severity,
         "gpt_tags": gpt_tags,
         "gpt_confidence_penalty": gpt_confidence_penalty,
         "gpt_suggested_risk_multiplier": gpt_suggested_risk_multiplier,
         "gpt_rationale_short": gpt_rationale_short,
-
         "micro_funding_rate": micro_funding_rate,
         "micro_funding_z": micro_funding_z,
         "micro_open_interest": micro_open_interest,
@@ -536,19 +545,16 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
         "micro_lsr_z": micro_lsr_z,
         "micro_distortion_index": micro_distortion_index,
         "micro_score_risk": micro_score_risk,
-
         "exec_expected_price": float(entry_price_hint),
         "exec_filled_avg_price": float(filled_entry_price),
         "exec_slippage_pct": float(slip_pct),
         "exec_adverse_move_pct": None,
         "exec_score": None,
         "exec_post_prices": None,
-
         "ev_cell_key": ev_cell_key,
         "ev_cell_ev": ev_cell_ev,
         "ev_cell_n": ev_cell_n,
         "ev_cell_status": ev_cell_status,
-
         "auto_blocked": auto_blocked,
         "auto_risk_multiplier": auto_risk_multiplier,
         "auto_block_reasons": auto_block_reasons,
@@ -567,7 +573,6 @@ class ExecutionEngine:
         if bool(getattr(settings, "require_deterministic_client_order_id")) is not True:
             raise ValueError("settings.require_deterministic_client_order_id must be True (TRADE-GRADE)")
 
-        # ---- test controls (must come from settings; ENV direct access forbidden) ----
         self.test_force_enter: bool = _as_bool_strict(getattr(settings, "test_force_enter", False), "settings.test_force_enter")
         self.test_bypass_guards: bool = _as_bool_strict(getattr(settings, "test_bypass_guards", False), "settings.test_bypass_guards")
         self.test_dry_run: bool = _as_bool_strict(getattr(settings, "test_dry_run", False), "settings.test_dry_run")
@@ -575,7 +580,6 @@ class ExecutionEngine:
         fake_usdt_raw = getattr(settings, "test_fake_available_usdt", 0.0)
         self.test_fake_available_usdt: float = float(_as_float(fake_usdt_raw, "settings.test_fake_available_usdt", min_value=0.0))
 
-        # ---- hard safety: test knobs allowed only in dry-run ----
         if self.test_bypass_guards and not self.test_dry_run:
             raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
         if self.test_force_enter and not self.test_dry_run:
@@ -600,7 +604,6 @@ class ExecutionEngine:
         if action not in ("ENTER", "SKIP"):
             raise ValueError(f"signal.action invalid: {signal.action!r}")
 
-        # STRICT: force-enter is allowed only in dry-run (enforced in __init__)
         if self.test_force_enter:
             action = "ENTER"
 
@@ -654,6 +657,26 @@ class ExecutionEngine:
             last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
             if last_price <= 0:
                 raise OrderFailed("meta.last_price must be > 0 (STRICT)")
+
+            # NEW: Invariant Guard (signal/meta) — execute() 진입 시점 검증
+            try:
+                validate_signal_from_meta_strict(meta)
+                validate_signal_invariants_strict(
+                    SignalInvariantInputs(
+                        symbol=str(symbol),
+                        direction=str(direction),
+                        risk_pct=float(_as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0, max_value=1.0)),
+                        tp_pct=float(_as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0, max_value=1.0)),
+                        sl_pct=float(_as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0, max_value=1.0)),
+                        dd_pct=(float(meta["dd_pct"]) if "dd_pct" in meta and meta.get("dd_pct") is not None else None),
+                        micro_score_risk=(float(meta["micro_score_risk"]) if "micro_score_risk" in meta and meta.get("micro_score_risk") is not None else None),
+                        final_risk_multiplier=None,
+                        equity_current_usdt=(float(meta["equity_current_usdt"]) if "equity_current_usdt" in meta and meta.get("equity_current_usdt") is not None else None),
+                        equity_peak_usdt=(float(meta["equity_peak_usdt"]) if "equity_peak_usdt" in meta and meta.get("equity_peak_usdt") is not None else None),
+                    )
+                )
+            except (InvariantViolation, ValueError) as e:
+                raise OrderFailed(f"invariant violation (STRICT): {e}") from e
 
             candles_5m = meta.get("candles_5m")
             candles_5m_raw = meta.get("candles_5m_raw")
@@ -804,11 +827,14 @@ class ExecutionEngine:
                     if mid > 0:
                         spread_pct_snapshot = (ba - bb) / mid
 
+            # slippage 계산 (fraction) — 이후 invariant로 재검증
+            slippage_pct_for_invariant = abs(float(entry_price_hint) - float(last_price)) / float(last_price)
+
             slippage_block_pct = _as_float(getattr(self.settings, "slippage_block_pct"), "settings.slippage_block_pct", min_value=0.0)
             slippage_stop_engine = bool(getattr(self.settings, "slippage_stop_engine"))
 
             if slippage_block_pct > 0:
-                slippage_pct = abs(entry_price_hint - last_price) / last_price
+                slippage_pct = slippage_pct_for_invariant
                 if slippage_pct > slippage_block_pct:
                     msg = f"[SKIP] {symbol} {direction} slippage_block slippage_pct={slippage_pct}"
                     logger.warning(msg)
@@ -850,6 +876,26 @@ class ExecutionEngine:
             qty_raw = notional / price_for_qty
             if qty_raw <= 0:
                 raise OrderFailed("qty_raw must be > 0 (STRICT)")
+
+            # NEW: Invariant Guard (execution-level) — slippage 포함 재검증
+            try:
+                validate_execution_invariants_strict(
+                    ExecutionInvariantInputs(
+                        symbol=str(symbol),
+                        direction=str(direction),
+                        leverage=float(leverage),
+                        available_usdt=float(avail_usdt),
+                        notional=float(notional),
+                        price_for_qty=float(price_for_qty),
+                        qty_raw=float(qty_raw),
+                        entry_price_hint=float(entry_price_hint),
+                        last_price=float(last_price),
+                        slippage_pct=float(slippage_pct_for_invariant),
+                        spread_pct_snapshot=(float(spread_pct_snapshot) if spread_pct_snapshot is not None else None),
+                    )
+                )
+            except InvariantViolation as e:
+                raise OrderFailed(f"execution invariant violation (STRICT): {e}") from e
 
             ok, guard_reason, guard_extra = hard_risk_guard_check(
                 self.settings,
@@ -1058,7 +1104,6 @@ class ExecutionEngine:
                 raise OrderFailed("open_position_with_tp_sl returned None (STRICT)")
 
             state = OrderState.FILLED
-            # STRICT: setattr 실패를 숨기지 않는다.
             setattr(trade, "order_state", state.value)
 
             entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(trade, soft_mode=bool(soft_mode))
@@ -1122,7 +1167,6 @@ class ExecutionEngine:
                 last_synced_at=now_sync,
             )
 
-            # STRICT: setattr 실패를 숨기지 않는다.
             setattr(trade, "id", int(trade_id))
 
             snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price))
@@ -1153,7 +1197,6 @@ class ExecutionEngine:
                 **snap_kwargs,
             )
 
-            # Execution Quality: 비동기 이벤트 기록(메인 execute 블로킹 금지)
             _submit_task_nonblocking(
                 _exec_quality_task,
                 str(symbol),

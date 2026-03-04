@@ -34,6 +34,16 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
      - orderbook ts_ms now() 폴백 제거(필수 키 없으면 즉시 예외)
   4) “조용한 default” 최소화:
      - ws_backfill_tfs 미설정 시 required로 채우되, 명시 로그로 가시화
+
+- 2026-03-04 (TRADE-GRADE):
+  1) Data Integrity Guard 연결:
+     - WS 오더북/캔들 버퍼를 data_integrity_guard로 STRICT 검증
+     - timestamp rollback / 미래 timestamp / bestAsk<=bestBid 즉시 차단(치명)
+  2) Invariant Guard 연결:
+     - RiskPhysics 출력 및 Signal 입력을 invariant_guard로 STRICT 검증
+  3) Drift Detector 연결:
+     - allocation/multiplier/regime/micro_score_risk 급변 감지 시 SAFE_STOP + 예외 전파
+  4) SAFE_STOP 발생 오류는 “예외 전파”로 엔진 종료(조용한 복구 금지)
 ============================================================
 """
 
@@ -99,6 +109,26 @@ from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
 from sync.reconcile_engine import ReconcileConfig, ReconcileEngine, ReconcileResult
 
+# ─────────────────────────────
+# NEW: Integrity / Invariant / Drift
+# ─────────────────────────────
+from infra.data_integrity_guard import (  # noqa: E402
+    DataIntegrityError,
+    validate_entry_market_data_bundle_strict,
+    validate_kline_series_strict,
+    validate_orderbook_strict,
+)
+from execution.invariant_guard import (  # noqa: E402
+    InvariantViolation,
+    SignalInvariantInputs,
+    validate_signal_invariants_strict,
+)
+from infra.drift_detector import (  # noqa: E402
+    DriftDetectedError,
+    DriftDetector,
+    DriftDetectorConfig,
+    DriftSnapshot,
+)
 
 # ─────────────────────────────
 # 전역 상태
@@ -367,6 +397,13 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
     if not isinstance(ob, dict):
         return "orderbook missing (ws_get_orderbook returned non-dict/None)"
 
+    # STRICT: 무결성 검증(단, ws_get_orderbook는 ts가 없을 수 있어 require_ts=False)
+    try:
+        validate_orderbook_strict(ob, symbol=str(symbol), require_ts=False)
+    except DataIntegrityError as e:
+        # readiness 차단 사유로 반환(명시적 SKIP)
+        return f"orderbook integrity fail: {e}"
+
     bids = ob.get("bids")
     asks = ob.get("asks")
     if not isinstance(bids, list) or not bids:
@@ -397,6 +434,13 @@ def _validate_klines_for_entry(symbol: str) -> Optional[str]:
             return f"kline buffer invalid type for {iv}"
         if len(buf) < min_len:
             return f"kline buffer 부족: {iv} need={min_len} got={len(buf)}"
+
+        # STRICT: kline 무결성(rollback/future/ohlcv 관계식)
+        try:
+            validate_kline_series_strict(buf, name=f"ws_kline[{iv}]", min_len=min_len)
+        except DataIntegrityError as e:
+            return f"kline integrity fail {iv}: {e}"
+
     return None
 
 
@@ -603,7 +647,6 @@ def _start_market_data_store_thread() -> None:
                 for iv in store_tfs:
                     buf = ws_get_klines_with_volume(symbol, iv, limit=500)
                     if buf is None:
-                        # ws_get_klines_with_volume는 list를 기대한다. None은 프로토콜 위반.
                         raise RuntimeError(f"[MD-STORE] ws_get_klines_with_volume returned None (STRICT) interval={iv}")
                     if not isinstance(buf, list):
                         raise RuntimeError(f"[MD-STORE] kline buffer invalid type (STRICT) interval={iv} type={type(buf).__name__}")
@@ -614,6 +657,12 @@ def _start_market_data_store_thread() -> None:
                     new_rows = [row for row in buf if row[0] > newest_ts]
                     if not new_rows:
                         continue
+
+                    # STRICT: 저장 전 kline 무결성(rollback은 upstream에서 차단되어야 하지만, 여기서도 형식/finite 체크)
+                    try:
+                        validate_kline_series_strict(new_rows, name=f"md_store.ws_kline[{iv}]", min_len=1)
+                    except DataIntegrityError as e:
+                        raise RuntimeError(f"[MD-STORE] kline integrity fail (STRICT): {e}") from e
 
                     for ts_ms, o, h, l, c, v in new_rows:
                         candles_to_save.append(
@@ -627,19 +676,17 @@ def _start_market_data_store_thread() -> None:
                                 "close": float(c),
                                 "volume": float(v),
                                 "quote_volume": None,
-                                "source": "ws",  # STRICT: required
+                                "source": "ws",
                             }
                         )
                     last_candle_ts[iv] = int(new_rows[-1][0])
 
                 if candles_to_save:
-                    # STRICT: market_data_store에서 예외 발생 시 여기서 바로 propagate
                     save_candles_bulk_from_ws(candles_to_save)
 
                 if now - last_ob_ts >= ob_interval_sec:
                     ob = ws_get_orderbook(symbol, limit=5)
                     if not isinstance(ob, dict) or not ob:
-                        # 빈 오더북은 저장하지 않되, 장기간 지속 시 가시화
                         if now - last_ob_missing_log_ts >= 60:
                             last_ob_missing_log_ts = now
                             log(f"[MD-STORE][WARN] orderbook missing: symbol={symbol}")
@@ -653,13 +700,19 @@ def _start_market_data_store_thread() -> None:
                         time.sleep(flush_sec)
                         continue
 
-                    # STRICT: ts_ms 폴백 금지( now*1000 사용 금지 )
+                    # STRICT: ts_ms 폴백 금지
                     if "exchTs" in ob and ob.get("exchTs") is not None:
                         ts_ms = _require_int_ms(ob.get("exchTs"), "orderbook.exchTs")
                     elif "ts" in ob and ob.get("ts") is not None:
                         ts_ms = _require_int_ms(ob.get("ts"), "orderbook.ts")
                     else:
                         raise RuntimeError("[MD-STORE] orderbook missing exchTs/ts (STRICT)")
+
+                    # STRICT: orderbook 무결성(ask>bid 등)
+                    try:
+                        validate_orderbook_strict(ob, symbol=str(symbol), require_ts=True)
+                    except DataIntegrityError as e:
+                        raise RuntimeError(f"[MD-STORE] orderbook integrity fail (STRICT): {e}") from e
 
                     save_orderbook_from_ws(symbol=symbol, ts_ms=int(ts_ms), bids=ob["bids"], asks=ob["asks"])
                     last_ob_ts = now
@@ -724,7 +777,7 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     if lp <= 0:
         raise RuntimeError("last_price must be > 0 (STRICT)")
 
-    return {
+    out = {
         "symbol": symbol,
         "direction": direction,
         "signal_source": signal_source_s,
@@ -736,6 +789,11 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         "extra": extra,
         "market_features": market_features,
     }
+
+    # STRICT: 번들 무결성(캔들/필수키/finite/형태)
+    validate_entry_market_data_bundle_strict(out)
+
+    return out
 
 
 # ─────────────────────────────
@@ -931,6 +989,9 @@ def main() -> None:
     regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
     ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
 
+    # NEW: Drift detector (기관형 안전장치)
+    drift_detector = DriftDetector(DriftDetectorConfig())
+
     # ── DB bootstrap (STRICT) ──
     persisted_peak = _load_equity_peak_bootstrap(SET.symbol)
     if persisted_peak is not None:
@@ -1049,12 +1110,19 @@ def main() -> None:
                     last_ts_ms = int(last_1m[0][0])
                     if LAST_EXIT_CANDLE_TS_1M is None:
                         LAST_EXIT_CANDLE_TS_1M = last_ts_ms
-                    elif last_ts_ms > LAST_EXIT_CANDLE_TS_1M:
-                        for t in list(OPEN_TRADES):
-                            if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
-                                OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
-                                LAST_CLOSE_TS = now
-                        LAST_EXIT_CANDLE_TS_1M = last_ts_ms
+                    else:
+                        if last_ts_ms < LAST_EXIT_CANDLE_TS_1M:
+                            SAFE_STOP_REQUESTED = True
+                            msg = f"[SAFE_STOP][TS_ROLLBACK] 1m ts rollback: prev={LAST_EXIT_CANDLE_TS_1M} now={last_ts_ms}"
+                            log(msg)
+                            _maybe_send_error_tg("TS_ROLLBACK", msg, cooldown_sec=60)
+                            raise RuntimeError(msg)
+                        if last_ts_ms > LAST_EXIT_CANDLE_TS_1M:
+                            for t in list(OPEN_TRADES):
+                                if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
+                                    OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
+                                    LAST_CLOSE_TS = now
+                            LAST_EXIT_CANDLE_TS_1M = last_ts_ms
                 interruptible_sleep(1)
                 continue
 
@@ -1087,6 +1155,16 @@ def main() -> None:
             if market_data is None:
                 interruptible_sleep(1)
                 continue
+
+            # STRICT: 번들 무결성 재검증(치명)
+            try:
+                validate_entry_market_data_bundle_strict(market_data)
+            except DataIntegrityError as e:
+                SAFE_STOP_REQUESTED = True
+                msg = f"[SAFE_STOP][DATA_INTEGRITY] {e}"
+                log(msg)
+                _maybe_send_error_tg("DATA_INTEGRITY", msg, cooldown_sec=60)
+                raise RuntimeError(msg) from e
 
             mf = market_data.get("market_features")
             eng = (mf or {}).get("engine_scores") if isinstance(mf, dict) else None
@@ -1121,8 +1199,7 @@ def main() -> None:
                 msg = f"[SAFE_STOP][LATENCY_SIGNAL] decide_ms={dt_ms:.1f} > {max_signal_latency_ms:.1f}"
                 log(msg)
                 _maybe_send_error_tg("LATENCY_SIGNAL", msg, cooldown_sec=60)
-                interruptible_sleep(5)
-                continue
+                raise RuntimeError(msg)
 
             LAST_ENTRY_GPT_CALL_TS = now
 
@@ -1167,6 +1244,47 @@ def main() -> None:
                 _maybe_send_entry_block_tg("RISK_PHYSICS_SKIP", msg, cooldown_sec=60)
                 interruptible_sleep(5)
                 continue
+
+            # NEW: Drift detector (치명)
+            try:
+                drift_detector.update_and_check(
+                    DriftSnapshot(
+                        symbol=str(market_data["symbol"]),
+                        allocation_ratio=float(rp.effective_risk_pct),
+                        risk_multiplier=float(rp.auto_risk_multiplier),
+                        regime_band=str(regime_decision.band),
+                        micro_score_risk=float(micro_score_risk),
+                    )
+                )
+            except DriftDetectedError as e:
+                SAFE_STOP_REQUESTED = True
+                msg = f"[SAFE_STOP][DRIFT] {e}"
+                log(msg)
+                _maybe_send_error_tg("DRIFT", msg, cooldown_sec=60)
+                raise RuntimeError(msg) from e
+
+            # NEW: Invariant guard (signal-level)
+            try:
+                validate_signal_invariants_strict(
+                    SignalInvariantInputs(
+                        symbol=str(market_data["symbol"]),
+                        direction=str(cand.direction),
+                        risk_pct=float(rp.effective_risk_pct),
+                        tp_pct=float(cand.tp_pct),
+                        sl_pct=float(cand.sl_pct),
+                        dd_pct=float(account_state.dd_pct),
+                        micro_score_risk=float(micro_score_risk),
+                        final_risk_multiplier=None,
+                        equity_current_usdt=float(account_state.equity_current_usdt),
+                        equity_peak_usdt=float(account_state.equity_peak_usdt),
+                    )
+                )
+            except InvariantViolation as e:
+                SAFE_STOP_REQUESTED = True
+                msg = f"[SAFE_STOP][INVARIANT] {e}"
+                log(msg)
+                _maybe_send_error_tg("INVARIANT", msg, cooldown_sec=60)
+                raise RuntimeError(msg) from e
 
             meta2 = dict(cand.meta or {})
             meta2.update(
@@ -1213,6 +1331,7 @@ def main() -> None:
                 msg = f"[SAFE_STOP][LATENCY_EXEC] exec_ms={dt2_ms:.1f} > {max_exec_latency_ms:.1f}"
                 log(msg)
                 _maybe_send_error_tg("LATENCY_EXEC", msg, cooldown_sec=60)
+                raise RuntimeError(msg)
 
             if trade:
                 OPEN_TRADES.append(trade)
@@ -1240,10 +1359,18 @@ def main() -> None:
                 direction="CLOSE",
                 reason=str(e),
             )
+
+            # STRICT: SAFE_STOP 발생 오류는 예외 전파(조용한 복구 금지)
+            if SAFE_STOP_REQUESTED:
+                raise
+
             interruptible_sleep(5)
 
     return
 
 
 if __name__ == "__main__":
-    main()
+    # STRICT: run_bot_ws 직접 실행 금지 → preflight 엔트리로 강제
+    from core.run_bot_preflight import run_preflight
+
+    run_preflight(preflight_only=False)

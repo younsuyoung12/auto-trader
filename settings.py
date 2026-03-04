@@ -14,6 +14,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-04 (TRADE-GRADE):
+  1) OpenAI 설정 SSOT 필드 추가:
+     - openai_api_key / openai_model / openai_max_tokens / openai_temperature / openai_max_latency_sec
+  2) ENV 매핑 추가:
+     - OPENAI_API_KEY → openai_api_key
+     - OPENAI_MODEL/OPENAI_TRADER_MODEL/OPENAI_SUPERVISOR_MODEL → openai_model (alias 우선순위)
+     - OPENAI_MAX_TOKENS 등 OpenAI 관련 설정 매핑 추가
+  3) STRICT 검증 추가:
+     - openai_api_key / openai_model 누락 시 즉시 예외
+     - openai_max_tokens 범위, temperature 범위, max_latency_sec > 0 검증
+
 - 2026-03-03 (TRADE-GRADE):
   1) 테스트 토글을 settings로 공식화(SSOT):
      - test_dry_run / test_bypass_guards / test_force_enter / test_fake_available_usdt 추가
@@ -106,6 +117,17 @@ class Settings:
     gpt_max_risk_pct: float = 0.02
     gpt_min_confidence: float = 0.6
     gpt_reject_if_over_pnl_pct: float = 0.02
+
+    # ─────────────────────────────────────────────
+    # OpenAI (SSOT) — TRADE-GRADE
+    # ─────────────────────────────────────────────
+    # NOTE: OPENAI_API_KEY는 반드시 존재해야 한다(Preflight에서 강제).
+    openai_api_key: str = ""
+    # NOTE: 모델은 반드시 명시되어야 한다(OPENAI_MODEL 또는 alias env로 설정).
+    openai_model: str = ""
+    openai_max_tokens: int = 512
+    openai_temperature: float = 0.2
+    openai_max_latency_sec: float = 12.0
 
     # Notifications
     unrealized_notify_sec: int = 1800
@@ -338,6 +360,11 @@ def _as_str(key: str, default: str) -> str:
     return v if v is not None else default
 
 
+def _as_str_opt(key: str) -> Optional[str]:
+    v = _get_env(key)
+    return v if v is not None else None
+
+
 def _as_int(key: str, default: int) -> int:
     v = _get_env(key)
     if v is None:
@@ -516,6 +543,18 @@ def _validate_settings(s: Settings) -> None:
         if float(s.max_entry_slippage_pct) < 0:
             raise ValueError("max_entry_slippage_pct must be >= 0")
 
+    # OpenAI (SSOT) — STRICT
+    if not str(s.openai_api_key or "").strip():
+        raise RuntimeError("missing OpenAI key (OPENAI_API_KEY)")
+    if not str(s.openai_model or "").strip():
+        raise RuntimeError("missing OpenAI model (OPENAI_MODEL or OPENAI_TRADER_MODEL or OPENAI_SUPERVISOR_MODEL)")
+    if not (1 <= int(s.openai_max_tokens) <= 4096):
+        raise ValueError("openai_max_tokens must be within 1..4096")
+    if not (0.0 <= float(s.openai_temperature) <= 2.0):
+        raise ValueError("openai_temperature must be within 0..2")
+    if not (isinstance(s.openai_max_latency_sec, (int, float)) and math.isfinite(float(s.openai_max_latency_sec)) and float(s.openai_max_latency_sec) > 0):
+        raise ValueError("openai_max_latency_sec must be finite > 0")
+
     # TEST controls (TRADE-GRADE) — 운영 사고 방지
     if s.test_bypass_guards and not s.test_dry_run:
         raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
@@ -594,6 +633,18 @@ def load_settings() -> Settings:
     gpt_max_risk_pct = _as_float("GPT_MAX_RISK_PCT", 0.02)
     gpt_min_confidence = _as_float("GPT_MIN_CONFIDENCE", 0.6)
     gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
+
+    # OpenAI (SSOT) — env alias 지원(동일 의미 필드 매핑)
+    openai_api_key = _as_str("OPENAI_API_KEY", "")
+    openai_model = (
+        _as_str_opt("OPENAI_MODEL")
+        or _as_str_opt("OPENAI_TRADER_MODEL")
+        or _as_str_opt("OPENAI_SUPERVISOR_MODEL")
+        or ""
+    )
+    openai_max_tokens = _as_int("OPENAI_MAX_TOKENS", _as_int("OPENAI_TRADER_MAX_TOKENS", 512))
+    openai_temperature = _as_float("OPENAI_TEMPERATURE", _as_float("OPENAI_SUPERVISOR_TEMPERATURE", 0.2))
+    openai_max_latency_sec = _as_float("OPENAI_MAX_LATENCY_SEC", _as_float("OPENAI_TRADER_MAX_LATENCY", 12.0))
 
     unrealized_notify_sec = _as_int("UNREALIZED_NOTIFY_SEC", 1800)
     enable_exit_gpt = _as_bool("ENABLE_EXIT_GPT", True)
@@ -727,6 +778,11 @@ def load_settings() -> Settings:
         gpt_max_risk_pct=gpt_max_risk_pct,
         gpt_min_confidence=gpt_min_confidence,
         gpt_reject_if_over_pnl_pct=gpt_reject_if_over_pnl_pct,
+        openai_api_key=openai_api_key,
+        openai_model=openai_model,
+        openai_max_tokens=openai_max_tokens,
+        openai_temperature=openai_temperature,
+        openai_max_latency_sec=openai_max_latency_sec,
         unrealized_notify_sec=unrealized_notify_sec,
         enable_exit_gpt=enable_exit_gpt,
         poll_fills_sec=poll_fills_sec,
