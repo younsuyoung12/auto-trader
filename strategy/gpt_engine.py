@@ -1,6 +1,6 @@
 """
 ========================================================
-FILE: strategy/_gpt_engine.py
+FILE: strategy/gpt_engine.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 역할
@@ -30,9 +30,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 2026-03-05:
   1) OpenAI Chat Completions API → Responses API 전환 (GPT-5 계열 호환 / Logs→Responses 기록 보장)
   2) 토큰 파라미터: max_* → max_output_tokens 로 전환
-  3) 응답 텍스트 추출: response.output_text 사용(STRICT)
-  4) 기존 STRICT 정책 유지(예산/예외/민감정보 로그 금지/JSON 추출)
-
+  3) store=True 사용(Responses 로그 저장)  :contentReference[oaicite:1]{index=1}
+  4) 응답 텍스트 추출을 output_text 단일 의존에서 제거:
+     - output_text는 SDK convenience(없거나 empty 가능) :contentReference[oaicite:2]{index=2}
+     - output 배열의 message.content[*].type=="output_text"의 text를 STRICT 추출 :contentReference[oaicite:3]{index=3}
+  5) 기존 STRICT 정책 유지(예산/예외/민감정보 로그 금지/JSON 추출)
 ========================================================
 """
 
@@ -76,7 +78,6 @@ def _safe_log(msg: str) -> None:
     try:
         log(msg)
     except Exception:
-        # 로깅은 비핵심 I/O. 실패해도 원래 예외 전파를 방해하지 않는다.
         return
 
 
@@ -220,7 +221,6 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
     if not s:
         _fail("parse", "empty response text")
 
-    # Fast path: whole text JSON (object)
     if s.startswith("{") and s.endswith("}"):
         try:
             obj = json.loads(s)
@@ -230,7 +230,6 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
             _fail("parse", f"json root must be object (got={type(obj).__name__})")
         return obj
 
-    # Robust path: scan for first decodable JSON object
     idx = 0
     while True:
         start = s.find("{", idx)
@@ -239,12 +238,59 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
         try:
             obj, _end = _JSON_DECODER.raw_decode(s, start)
         except Exception:
-            # 다음 '{'로 진행
             idx = start + 1
             continue
         if not isinstance(obj, dict):
             _fail("parse", f"json root must be object (got={type(obj).__name__})")
         return obj
+
+
+# -----------------------------------------------------------------------------
+# Responses text extraction (STRICT)
+# -----------------------------------------------------------------------------
+def _extract_response_text_strict(resp: Any) -> str:
+    """
+    STRICT:
+    - output_text는 SDK convenience이며 empty일 수 있다. :contentReference[oaicite:4]{index=4}
+    - 따라서 output 배열의 message.content[*].type=="output_text"의 text를 정식으로 추출한다. :contentReference[oaicite:5]{index=5}
+    """
+    # 1) SDK convenience (있으면 사용)
+    t = getattr(resp, "output_text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+
+    # 2) 정식 구조: resp.output[*].content[*].type=="output_text"의 text
+    output = getattr(resp, "output", None)
+    if isinstance(output, list):
+        for item in output:
+            # item: message output
+            content_list = getattr(item, "content", None)
+            if not isinstance(content_list, list):
+                continue
+
+            for c in content_list:
+                ctype = getattr(c, "type", None)
+                if ctype == "refusal":
+                    refusal = getattr(c, "refusal", None)
+                    r = str(refusal).strip() if refusal is not None else ""
+                    _fail("openai", f"refusal: {r[:120] if r else 'refused'}")
+
+                if ctype != "output_text":
+                    continue
+
+                text = getattr(c, "text", None)
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+
+    # 3) incomplete 사유가 있으면 원인만 노출(민감정보 없음)
+    status = getattr(resp, "status", None)
+    if isinstance(status, str) and status == "incomplete":
+        details = getattr(resp, "incomplete_details", None)
+        reason = getattr(details, "reason", None) if details is not None else None
+        r = str(reason).strip() if reason is not None else ""
+        _fail("openai", f"response incomplete: {r or 'unknown'}")
+
+    _fail("openai", "response text missing/empty")
 
 
 # -----------------------------------------------------------------------------
@@ -260,26 +306,20 @@ def call_chat(
     max_latency_sec: Optional[float] = None,
 ) -> GptRawResponse:
     """
-    OpenAI 호출(텍스트만 반환) — STRICT
-
-    - GPT-5 계열 + Logs→Responses 기록 보장을 위해 Responses API를 사용한다.
-    - caller는 user_content에 민감정보를 포함하지 않아야 한다.
+    OpenAI Responses 호출(텍스트만 반환) — STRICT
+    - GPT-5 계열 호환 + OpenAI Console Logs→Responses 기록(store) 목적.
     """
     m = _require_nonempty_str("input", (model or _settings_model()), "model")
     mt = _require_int("input", (max_tokens if max_tokens is not None else _settings_max_tokens()), "max_tokens")
     if mt <= 0 or mt > 4096:
         _fail("input", "max_tokens out of allowed range (1..4096)")
 
-    # NOTE: GPT-5 계열에서 temperature가 지원되지 않을 수 있어, 기존 동작(검증만, 전송은 하지 않음)을 유지한다.
+    # temperature는 설정 검증만 유지(일부 모델에서 미지원 가능)
     temp = _require_float("input", (temperature if temperature is not None else _settings_temperature()), "temperature")
     if temp < 0.0 or temp > 2.0:
         _fail("input", "temperature out of range [0,2]")
 
-    budget = _require_float(
-        "input",
-        (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()),
-        "max_latency_sec",
-    )
+    budget = _require_float("input", (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()), "max_latency_sec")
     if budget <= 0:
         _fail("input", "max_latency_sec must be > 0")
 
@@ -290,30 +330,26 @@ def call_chat(
 
     t0 = time.time()
     try:
-        # STRICT: 요청 timeout을 budget으로 강제(클라이언트 옵션)
+        # STRICT: 가능한 범위에서 request timeout 강제
         client = base_client.with_options(timeout=float(budget))
+        if not hasattr(client, "responses"):
+            _fail("openai", "client.with_options() lost 'responses' namespace (STRICT)")
+
         resp = client.responses.create(
             model=m,
-            instructions=sp,
-            input=uc,
+            instructions=sp,          # system/developer message :contentReference[oaicite:6]{index=6}
+            input=uc,                 # text input supports string :contentReference[oaicite:7]{index=7}
             max_output_tokens=int(mt),
-            # Logs → Responses 기록을 "반드시" 남기기 위한 명시적 store=True
-            store=True,
+            store=True,               # 로그 저장 :contentReference[oaicite:8]{index=8}
         )
     except Exception as e:
-        # sanitize: 프롬프트/키/URL 등 민감/대용량 정보는 포함 금지
         _fail("openai", f"request failed: {e.__class__.__name__}", e)
 
     dt = time.time() - t0
     if dt > budget:
         _fail("openai", f"latency budget exceeded: {dt:.2f}s > {budget:.2f}s")
 
-    # STRICT: output_text는 SDK가 제공하는 표준 합성 텍스트(텍스트 응답 경로)
-    try:
-        content = getattr(resp, "output_text")
-    except Exception as e:
-        _fail("openai", "response output_text missing", e)
-
+    content = _extract_response_text_strict(resp)
     if not isinstance(content, str) or not content.strip():
         _fail("openai", "empty content")
 
@@ -336,7 +372,6 @@ def call_chat_json(
         _fail("input", "user_payload must be non-empty dict")
 
     try:
-        # STRICT: NaN/Infinity JSON 직렬화 금지
         user_content = json.dumps(user_payload, ensure_ascii=False, allow_nan=False)
     except Exception as e:
         _fail("input", "user_payload must be JSON-serializable (strict)", e)
