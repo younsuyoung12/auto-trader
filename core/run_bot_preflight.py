@@ -627,7 +627,7 @@ def _stage_gpt_contract_ping_strict() -> None:
         r = call_chat_json(
             system_prompt=system_prompt,
             user_payload=payload,
-            max_tokens=96,
+            max_tokens=512,
             temperature=0.0,
             max_latency_sec=float(getattr(SET, "openai_max_latency_sec")),
         )
