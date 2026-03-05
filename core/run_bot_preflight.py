@@ -335,20 +335,26 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
     if not symbol:
         raise PreflightError("settings.symbol empty (STRICT)")
 
-    # REST backfill for all required TFs
-    for tf, lim, need in (
-        ("1m", 120, 20),
-        ("5m", 140, 20),
-        ("15m", 140, ENTRY_REQUIRED_KLINES_MIN["15m"]),
-        ("1h", 140, ENTRY_REQUIRED_KLINES_MIN["1h"]),
-        ("4h", 140, ENTRY_REQUIRED_KLINES_MIN["4h"]),
-    ):
+    limit = SET.ws_backfill_limit
+
+    for tf in ("1m", "5m", "15m", "1h", "4h"):
+        lim = limit
+        need = 200
+
         try:
             rows = fetch_klines_rest(symbol, tf, limit=lim)
         except KlineRestError as e:
-            raise PreflightError(f"REST klines failed (STRICT): {symbol} {tf} {e}") from e
-        _validate_kline_rows_strict(rows, name=f"REST_KLINES_{tf}", min_len=int(need))
-        backfill_klines_from_rest(symbol, tf, rows)
+            raise PreflightError(
+                f"REST klines failed (STRICT): {symbol} {tf} {e}"
+            ) from e
+
+        _validate_kline_rows_strict(
+            rows,
+            name=f"REST_KLINES_{tf}",
+            min_len=int(need),
+        )
+
+    backfill_klines_from_rest(symbol, tf, rows)
 
     start_ws_loop(symbol)
 

@@ -157,7 +157,7 @@ class Settings:
     ws_combined_base: str = "wss://fstream.binance.com/stream?streams="
     ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-    ws_min_kline_buffer: int = 60
+    ws_min_kline_buffer: int = 300
     ws_max_kline_delay_sec: float = 120.0
     ws_orderbook_max_delay_sec: float = 10.0
     ws_log_enabled: bool = False
@@ -667,7 +667,7 @@ def load_settings() -> Settings:
 
     ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_min_kline_buffer = 120
+    ws_min_kline_buffer = 300
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_orderbook_max_delay_sec = _as_float("WS_ORDERBOOK_MAX_DELAY_SEC", 10.0)
     ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)
@@ -675,7 +675,7 @@ def load_settings() -> Settings:
     ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
 
     ws_backfill_tfs = _as_csv_list("WS_BACKFILL_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_backfill_limit = 300
+    ws_backfill_limit = 500
 
     md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 5.0)
     ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 5.0)
