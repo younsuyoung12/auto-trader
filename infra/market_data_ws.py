@@ -34,9 +34,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - kline + orderbook 동시 snapshot 제공
      - strategy layer에서 데이터 시점 불일치 방지
 - 2026-03-05 (TRADE-GRADE):
-  1) Orderbook updateId sequence validation 추가
-     - update id 역전(outdated) / 갭(sequence gap) 발견 시 WSProtocolError로 즉시 연결 종료
-     - reconnect 시 baseline 리셋(이전 update id/버퍼 제거)
+  1) Orderbook updateId sequence validation 수정
+     - 기존: update_id == prev_update_id + 1 강제
+     - 문제: Binance depth stream은 updateId가 +1로 증가하지 않음(정상 jump 존재)
+     - 수정: outdated packet(update_id <= prev_update_id)만 오류 처리, jump 허용
+     - STRICT 정책 유지: fallback 없음 / silent skip 없음
 ========================================================
 """
 
@@ -352,6 +354,9 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
         raise WSProtocolError("orderbook update id must be > 0 (STRICT)")
 
     # 1) sequence validation (read-only check first)
+    # NOTE:
+    # - Binance depth stream의 updateId는 +1 연속 증가가 보장되지 않는다(정상 jump 존재).
+    # - STRICT에서는 "역전(outdated)"만 프로토콜 오류로 처리한다.
     with _orderbook_lock:
         prev_update_id = _orderbook_last_update_id.get(sym)
 
@@ -359,10 +364,6 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
         if update_id <= int(prev_update_id):
             raise WSProtocolError(
                 f"orderbook outdated packet (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
-            )
-        if update_id != int(prev_update_id) + 1:
-            raise WSProtocolError(
-                f"orderbook sequence gap detected (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
             )
 
     # 2) normalization (STRICT)
@@ -400,10 +401,6 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
             if update_id <= int(prev2):
                 raise WSProtocolError(
                     f"orderbook outdated packet (STRICT, race): prev={int(prev2)} new={int(update_id)}"
-                )
-            if update_id != int(prev2) + 1:
-                raise WSProtocolError(
-                    f"orderbook sequence gap detected (STRICT, race): prev={int(prev2)} new={int(update_id)}"
                 )
 
         _orderbook_buffers[sym] = ob
