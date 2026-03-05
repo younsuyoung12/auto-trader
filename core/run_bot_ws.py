@@ -59,6 +59,11 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
   5) 연속 손실 하드스탑 연결:
      - settings.hard_consecutive_losses_limit(ENV: HARD_CONSECUTIVE_LOSSES_LIMIT) >= 1 인 경우
        CLOSE 후 CONSEC_LOSSES가 limit 이상이면 SAFE_STOP + TG 알림 후 엔진 종료(신규 진입 차단)
+
+- 2026-03-05 (TRADE-GRADE):
+  1) FIX: entry market_data candles_5m/candles_5m_raw 정규화
+     - get_trading_signal이 Candle 객체 / 5튜플 / 6튜플을 혼합 반환할 수 있으므로,
+       _build_entry_market_data에서 항상 6튜플(OHLCV)로 통일 후 STRICT 검증 수행
 ============================================================
 """
 
@@ -505,6 +510,7 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
         return f"orderbook crossed (bestAsk={ba} <= bestBid={bb})"
     return None
 
+
 def _validate_klines_for_entry(symbol: str) -> Optional[str]:
     for iv, min_len in ENTRY_REQUIRED_KLINES_MIN.items():
         buf = ws_get_klines_with_volume(symbol, iv, limit=min_len)
@@ -530,6 +536,7 @@ def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
     if r:
         return r
     return None
+
 
 def _get_equity_current_usdt_strict() -> float:
     """
@@ -879,11 +886,51 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         "market_features": market_features,
     }
 
+    # 🔧 candle 구조 정규화 (STRICT)
+    def _normalize_candles(arr: Any, *, name: str) -> Any:
+        # arr가 없거나 비어있으면 그대로 두고, 아래 STRICT 검증이 잡게 한다.
+        if not isinstance(arr, list) or not arr:
+            return arr
+
+        fixed: list[tuple[int, float, float, float, float, float]] = []
+        for i, it in enumerate(arr):
+            # tuple/list candle
+            if isinstance(it, (list, tuple)):
+                if len(it) >= 6:
+                    ts, o, h, l, c, v = it[0], it[1], it[2], it[3], it[4], it[5]
+                    fixed.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
+                    continue
+                if len(it) == 5:
+                    ts, o, h, l, c = it[0], it[1], it[2], it[3], it[4]
+                    fixed.append((int(ts), float(o), float(h), float(l), float(c), 0.0))
+                    continue
+                raise RuntimeError(f"{name}[{i}] invalid candle tuple len<{5} (STRICT): len={len(it)}")
+
+            # Candle-like object
+            if all(hasattr(it, a) for a in ("ts", "open", "high", "low", "close")):
+                fixed.append(
+                    (
+                        int(getattr(it, "ts")),
+                        float(getattr(it, "open")),
+                        float(getattr(it, "high")),
+                        float(getattr(it, "low")),
+                        float(getattr(it, "close")),
+                        0.0,
+                    )
+                )
+                continue
+
+            raise RuntimeError(f"{name}[{i}] invalid candle type (STRICT): {type(it).__name__}")
+
+        return fixed
+
+    out["candles_5m"] = _normalize_candles(out.get("candles_5m"), name="candles_5m")
+    out["candles_5m_raw"] = _normalize_candles(out.get("candles_5m_raw"), name="candles_5m_raw")
+
     # STRICT: 번들 무결성(캔들/필수키/finite/형태)
     validate_entry_market_data_bundle_strict(out)
 
     return out
-
 
 # ─────────────────────────────
 # Reconcile Guard (OPEN_TRADES ↔ Exchange)
