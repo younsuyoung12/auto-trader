@@ -13,6 +13,15 @@ from __future__ import annotations
 # 3) 문서/타입힌트/파서 전면 정합
 # -----------------------------------------------------
 
+# PATCH NOTES — 2026-03-05
+# -----------------------------------------------------
+# 1) FIX(TRADE-GRADE): pattern item direction 값이 None이면 다운스트림(unified_features_builder)
+#    STRICT 검증에서 크래시가 발생하므로, 방향성 없는 패턴은 direction="NEUTRAL"로 고정한다.
+#    적용 패턴: doji, doji_long_legged, triangle_sym, pennant, volume_climax
+# 2) FIX: add_pattern 호출부의 쉼표 누락으로 인한 SyntaxError를 모두 제거한다.
+# 3) STRICT: add_pattern()에서 direction이 None/비허용 값이면 PatternError로 즉시 실패한다.
+# -----------------------------------------------------
+
 
 """
 pattern_detection.py (Ultra Version, tuned)
@@ -806,14 +815,23 @@ def build_pattern_features(
     ) -> None:
         if not enabled:
             return
+
+        if direction is None:
+            raise PatternError(f"[패턴오류] pattern.direction must not be None (key={key})")
+
+        d = str(direction).upper().strip()
+        if d not in {"BULLISH", "BEARISH", "NEUTRAL"}:
+            raise PatternError(f"[패턴오류] pattern.direction invalid (key={key}, direction={direction!r})")
+
         strength = max(0.0, min(1.0, base_strength + extra_boost))
         conf = _confidence_from_strength(strength)
         if conf == "none":
             return
+
         patterns.append(
             {
                 "pattern": key,
-                "direction": direction,
+                "direction": d,
                 "kind": kind,
                 "strength": strength,
                 "confidence": conf,
@@ -866,7 +884,7 @@ def build_pattern_features(
         add_pattern(
             key="doji",
             enabled=1,
-            direction=None,
+            direction="NEUTRAL",
             kind="candle",
             base_strength=_strength("doji", 0.4),
             explanation=(f"몸통이 매우 작은 도지 캔들이 감지되었습니다{iv_txt}. 방향성 모멘텀이 약하거나 추세 전환 구간일 가능성이 있습니다."),
@@ -875,7 +893,7 @@ def build_pattern_features(
         add_pattern(
             key="doji_long_legged",
             enabled=1,
-            direction=None,
+            direction="NEUTRAL",
             kind="candle",
             base_strength=_strength("doji_long_legged", 0.5),
             explanation=(f"양쪽 꼬리가 긴 롱레그드 도지 패턴이 감지되었습니다{iv_txt}. 매수·매도 세력이 강하게 충돌한 구간일 수 있습니다."),
@@ -936,7 +954,7 @@ def build_pattern_features(
     add_pattern(
         key="triangle_sym",
         enabled=tri_sym,
-        direction=None,
+        direction="NEUTRAL",
         kind="structure",
         base_strength=_strength("triangle_sym", 0.6),
         explanation=(f"대칭 삼각수렴 패턴이 감지되었습니다{iv_txt}."),
@@ -977,7 +995,7 @@ def build_pattern_features(
     add_pattern(
         key="pennant",
         enabled=pennant,
-        direction=None,
+        direction="NEUTRAL",
         kind="structure",
         base_strength=_strength("pennant", 0.6),
         explanation=(f"페넌트 패턴이 감지되었습니다{iv_txt}."),
@@ -1019,7 +1037,7 @@ def build_pattern_features(
     add_pattern(
         key="volume_climax",
         enabled=vol_climax,
-        direction=None,
+        direction="NEUTRAL",
         kind="volume",
         base_strength=_strength("volume_climax", 0.6),
         extra_boost=vol_ratio * 0.2,
