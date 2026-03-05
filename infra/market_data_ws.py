@@ -33,6 +33,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - get_market_snapshot(symbol) 구현
      - kline + orderbook 동시 snapshot 제공
      - strategy layer에서 데이터 시점 불일치 방지
+- 2026-03-05 (TRADE-GRADE):
+  1) Orderbook updateId sequence validation 추가
+     - update id 역전(outdated) / 갭(sequence gap) 발견 시 WSProtocolError로 즉시 연결 종료
+     - reconnect 시 baseline 리셋(이전 update id/버퍼 제거)
 ========================================================
 """
 
@@ -197,6 +201,9 @@ _kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
 # { symbol: {"bids": [...], "asks": [...], "ts": ..., "exchTs": ..., "bestBid": ..., "bestAsk": ..., "spreadPct": ...} }
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 
+# TRADE-GRADE PATCH: orderbook updateId sequence tracking (symbol -> lastUpdateId)
+_orderbook_last_update_id: Dict[str, int] = {}  # TRADE-GRADE PATCH
+
 _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
 
@@ -333,6 +340,32 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     if not sym:
         raise WSProtocolError("empty symbol in orderbook push")
 
+    # TRADE-GRADE PATCH: update id parse -> sequence validation (STRICT)
+    raw_update_id = payload.get("u") if payload.get("u") is not None else payload.get("lastUpdateId")
+    if raw_update_id is None:
+        raise WSProtocolError("orderbook missing update id (u/lastUpdateId) (STRICT)")
+    try:
+        update_id = int(raw_update_id)
+    except Exception as e:
+        raise WSProtocolError(f"orderbook update id must be int (STRICT): {e}") from e
+    if update_id <= 0:
+        raise WSProtocolError("orderbook update id must be > 0 (STRICT)")
+
+    # 1) sequence validation (read-only check first)
+    with _orderbook_lock:
+        prev_update_id = _orderbook_last_update_id.get(sym)
+
+    if prev_update_id is not None:
+        if update_id <= int(prev_update_id):
+            raise WSProtocolError(
+                f"orderbook outdated packet (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
+            )
+        if update_id != int(prev_update_id) + 1:
+            raise WSProtocolError(
+                f"orderbook sequence gap detected (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
+            )
+
+    # 2) normalization (STRICT)
     raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
     raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
 
@@ -341,6 +374,7 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
 
     now_ms = _now_ms()
 
+    # 3) best price + spread (STRICT)
     best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
     spread_pct = _compute_spread_pct(best_bid, best_ask)
 
@@ -351,19 +385,29 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spreadPct": spread_pct,
+        "lastUpdateId": int(update_id),  # TRADE-GRADE PATCH: always present
     }
-
-    last_update_id = payload.get("u") if payload.get("u") is not None else payload.get("lastUpdateId")
-    if last_update_id is not None:
-        ob["lastUpdateId"] = int(last_update_id)  # 실패하면 예외(STRICT)
 
     # Binance depth event time
     exch_ts = payload.get("E") or payload.get("T")
     if exch_ts is not None:
         ob["exchTs"] = _require_int_ms(exch_ts, "orderbook.exchTs")
 
+    # 4) buffer update (atomic + re-validate to avoid race)
     with _orderbook_lock:
+        prev2 = _orderbook_last_update_id.get(sym)
+        if prev2 is not None:
+            if update_id <= int(prev2):
+                raise WSProtocolError(
+                    f"orderbook outdated packet (STRICT, race): prev={int(prev2)} new={int(update_id)}"
+                )
+            if update_id != int(prev2) + 1:
+                raise WSProtocolError(
+                    f"orderbook sequence gap detected (STRICT, race): prev={int(prev2)} new={int(update_id)}"
+                )
+
         _orderbook_buffers[sym] = ob
+        _orderbook_last_update_id[sym] = int(update_id)  # TRADE-GRADE PATCH
 
 
 def _handle_single_msg(expected_symbol: str, data: Any) -> None:
@@ -444,7 +488,14 @@ def _on_close(ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
 def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
     _ = ws
     streams = _build_stream_names(symbol)
-    log(f"[MD_BINANCE_WS] opened: symbol={_normalize_symbol(symbol)} streams={streams}")
+
+    # TRADE-GRADE PATCH: reconnect baseline reset (no fallback, no stale carryover)
+    sym = _normalize_symbol(symbol)
+    with _orderbook_lock:
+        _orderbook_last_update_id.pop(sym, None)
+        _orderbook_buffers.pop(sym, None)
+
+    log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
 
 
 def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, float, float, float, float]]) -> None:
