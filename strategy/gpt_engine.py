@@ -284,7 +284,7 @@ def call_chat(
                 {"role": "system", "content": sp},
                 {"role": "user", "content": uc},
             ],            
-            max_completion_tokens=int(mt),
+            max_tokens=int(mt),
             timeout=float(budget),
         )
     except Exception as e:
