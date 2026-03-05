@@ -721,7 +721,7 @@ def load_settings() -> Settings:
     reconcile_interval_sec = _as_int("RECONCILE_INTERVAL_SEC", 30)
     force_close_on_desync = _as_bool("FORCE_CLOSE_ON_DESYNC", False)
     max_signal_latency_ms = _as_int("MAX_SIGNAL_LATENCY_MS", 200)
-    max_exec_latency_ms = _as_int("MAX_EXEC_LATENCY_MS", 400)
+    max_exec_latency_ms = 1500
 
     position_resync_sec = _as_float("POSITION_RESYNC_SEC", 20.0)
 
