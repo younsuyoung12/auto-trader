@@ -675,7 +675,7 @@ def _backfill_ws_kline_history(symbol: str) -> None:
     intervals = _parse_tfs(getattr(SET, "ws_backfill_tfs", None)) or list(ENTRY_REQUIRED_TFS)
     _verify_required_tfs_or_die("ws_backfill_tfs", intervals, ENTRY_REQUIRED_TFS)
 
-    limit = int(getattr(SET, "ws_backfill_limit", 120) or 120)
+    limit = int(SET.ws_backfill_limit)
 
     for iv in intervals:
         min_needed = ENTRY_REQUIRED_KLINES_MIN.get(iv, 1)
