@@ -125,7 +125,7 @@ class Settings:
     openai_api_key: str = ""
     # NOTE: 모델은 반드시 명시되어야 한다(OPENAI_MODEL 또는 alias env로 설정).
     openai_model: str = ""
-    openai_max_tokens: int = 512
+    openai_max_tokens: int = 1500
     openai_temperature: float = 0.2
     openai_max_latency_sec: float = 12.0
 
