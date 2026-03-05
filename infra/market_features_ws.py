@@ -167,7 +167,7 @@ def _fetch_candles_strict(
         KLINE_MIN_BUFFER,
         atr_len * 2,  # ADX 계산을 위한 최소 캔들 수(대략 2 * length)
     )
-    buf = get_klines_with_volume(symbol, interval, limit=need_len * 2)
+    buf = get_klines_with_volume(symbol, interval, limit=max(300, need_len * 2))
 
     if not buf or len(buf) < need_len:
         reason = (
