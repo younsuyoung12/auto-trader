@@ -338,23 +338,16 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
     limit = SET.ws_backfill_limit
 
     for tf in ("1m", "5m", "15m", "1h", "4h"):
-        lim = limit
-        need = 200
 
-        try:
-            rows = fetch_klines_rest(symbol, tf, limit=lim)
-        except KlineRestError as e:
-            raise PreflightError(
-                f"REST klines failed (STRICT): {symbol} {tf} {e}"
-            ) from e
+        rows = fetch_klines_rest(symbol, tf, limit=limit)
 
         _validate_kline_rows_strict(
             rows,
             name=f"REST_KLINES_{tf}",
-            min_len=int(need),
-        )
-
-    backfill_klines_from_rest(symbol, tf, rows)
+            min_len=200,
+        ) 
+       
+        backfill_klines_from_rest(symbol, tf, rows)
 
     start_ws_loop(symbol)
 
