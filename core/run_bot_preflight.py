@@ -25,6 +25,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - RegimeEngine/RiskPhysics/EvHeatmap/DriftDetector/Invariant까지 포함한 시뮬레이션 수행
   2) UnifiedFeatures 실패 원인(4h.regime) 제거 후, Preflight가 실제 체인을 끝까지 통과하는지 검증
   3) dry-run 실행으로 DB round-trip까지 검증 후에만 run_bot_ws.main() 핸드오프
+- 2026-03-05:
+  1) FIX(TRADE-GRADE): Preflight PIPELINE_SIMULATION 단계에서 테스트 모드(TEST_DRY_RUN)일 때
+     settings.test_fake_available_usdt 를 equity_current_usdt 로 사용하도록 명시 규칙 추가.
+     (실계좌 Futures 잔고가 0이어도 Dry-Run 검증 체인을 통과 가능)
 ========================================================
 """
 
@@ -267,14 +271,8 @@ def _stage_binance_private_api_strict() -> None:
         raise PreflightError("settings.symbol empty (STRICT)")
 
     bal = get_balance_detail("USDT")
-
-    # TEST MODE 지원 (STRICT)
-    if getattr(SET, "test_dry_run", False) and getattr(SET, "test_fake_available_usdt", 0) > 0:
-        eq_cur = float(getattr(SET, "test_fake_available_usdt"))
-    else:
-        eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
-        if eq_cur <= 0:
-            raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
+    if not isinstance(bal, dict) or not bal:
+        raise PreflightError("get_balance_detail('USDT') returned non-dict/empty (STRICT)")
 
     for k in ("availableBalance", "crossUnPnl"):
         if k not in bal:
@@ -282,6 +280,18 @@ def _stage_binance_private_api_strict() -> None:
 
     _ = _finite(bal.get("availableBalance"), "balance.availableBalance")
     _ = _finite(bal.get("crossUnPnl"), "balance.crossUnPnl")
+
+    # TEST MODE (TRADE-GRADE):
+    # - test_dry_run=True AND test_fake_available_usdt>0 인 경우, 실계좌 잔고가 0이어도 Preflight를 통과시킨다.
+    # - 단, 테스트 잔고는 반드시 finite & >0 이어야 한다.
+    if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
+        fake_eq = _finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt")
+        if fake_eq <= 0:
+            raise PreflightError("settings.test_fake_available_usdt must be > 0 in test_dry_run (STRICT)")
+    else:
+        eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
+        if eq_cur <= 0:
+            raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
 
     pos = fetch_open_positions(symbol)
     if not isinstance(pos, list):
@@ -477,9 +487,18 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         raise PreflightError("get_balance_detail('USDT') returned invalid (STRICT)")
     if "availableBalance" not in bal or "crossUnPnl" not in bal:
         raise PreflightError("balance detail missing keys (STRICT)")
-    eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
-    if eq_cur <= 0:
-        raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
+
+    # TEST MODE (TRADE-GRADE):
+    # - test_dry_run=True AND test_fake_available_usdt>0 인 경우, 실계좌 잔고가 0이어도 Preflight 파이프라인을 통과시킨다.
+    # - 단, 테스트 잔고는 반드시 finite & >0 이어야 한다.
+    if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
+        eq_cur = float(_finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt"))
+        if eq_cur <= 0:
+            raise PreflightError("settings.test_fake_available_usdt must be > 0 in test_dry_run (STRICT)")
+    else:
+        eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
+        if eq_cur <= 0:
+            raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
 
     # peak from DB snapshots (optional)
     eq_peak = eq_cur
