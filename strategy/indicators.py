@@ -488,7 +488,7 @@ def build_regime_features_from_candles(
             raise InputDataError(f"{nm} must be positive int (got={v})")
 
     # 실제 사용 지표 기준 최소 길이(EMA200, ADX=2*atr_len 포함)
-    need = max(fast_ema_len, slow_ema_len, 100, 200, atr_len + 1, rsi_len + 1, range_window, 2 * atr_len)
+    need = max(fast_ema_len, slow_ema_len, 100, 120, atr_len + 1, rsi_len + 1, range_window, 2 * atr_len)
     if len(candles) < need:
         raise InputDataError(f"regime.candles length<{need} (got={len(candles)})")
 

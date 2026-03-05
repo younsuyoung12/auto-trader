@@ -166,7 +166,7 @@ class Settings:
 
     # WS bootstrap/backfill (run_bot_ws)
     ws_backfill_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-    ws_backfill_limit: int = 120
+    ws_backfill_limit: int = 500
 
     # Market-data store worker settings (run_bot_ws)
     md_store_flush_sec: float = 5.0
