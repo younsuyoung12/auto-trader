@@ -505,7 +505,6 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
         return f"orderbook crossed (bestAsk={ba} <= bestBid={bb})"
     return None
 
-
 def _validate_klines_for_entry(symbol: str) -> Optional[str]:
     for iv, min_len in ENTRY_REQUIRED_KLINES_MIN.items():
         buf = ws_get_klines_with_volume(symbol, iv, limit=min_len)
@@ -532,11 +531,22 @@ def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
         return r
     return None
 
-
-# ─────────────────────────────
-# equity / DB bootstrap (STRICT via db_core)
-# ─────────────────────────────
 def _get_equity_current_usdt_strict() -> float:
+    """
+    STRICT · TRADE-GRADE
+    - TEST_DRY_RUN 모드에서는 settings.test_fake_available_usdt 를 equity로 사용한다.
+    - LIVE 모드에서는 Binance balance detail로 equity를 계산한다.
+    - 폴백/None→0 치환 금지: test_dry_run인데 fake<=0이면 즉시 예외.
+    """
+
+    # TEST MODE (STRICT)
+    if bool(getattr(SET, "test_dry_run", False)):
+        fake = float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0)
+        if not math.isfinite(fake) or fake <= 0.0:
+            raise RuntimeError("test_fake_available_usdt invalid (STRICT)")
+        return float(fake)
+
+    # LIVE MODE (STRICT)
     row = get_balance_detail("USDT")
     if not isinstance(row, dict):
         raise RuntimeError("get_balance_detail('USDT') returned non-dict")
