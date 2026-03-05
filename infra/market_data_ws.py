@@ -586,7 +586,7 @@ def _log_no_buffer_once(symbol: str, interval: str, requested: int) -> None:
     log(f"[MD_BINANCE_WS KLINES] no kline buffer for {symbol} {interval} (requested={requested})")
 
 
-def get_klines_with_volume(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, float, float, float, float, float]]:
+def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List[Tuple[int, float, float, float, float, float]]:
     if limit <= 0:
         raise ValueError("limit must be > 0")
 
