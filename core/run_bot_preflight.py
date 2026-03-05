@@ -619,9 +619,10 @@ def _stage_gpt_contract_ping_strict() -> None:
     system_prompt = (
         "Return STRICT JSON only (single object). No markdown.\n"
         'Schema: {"ok": true, "ts_utc": "ISO8601"}\n'
+        "Always generate the JSON object.\n"
         "Rules: do not include any other keys.\n"
     )
-    payload = {"ping": True}
+    payload = {"ping": True, "reply": "PONG"}
     try:
         r = call_chat_json(
             system_prompt=system_prompt,
