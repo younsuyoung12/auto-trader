@@ -19,6 +19,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   2) connect/read timeout 분리 + Session 재사용(성능/안정성)
   3) 정렬 실패/정규화 누락/무결성 위반 시 즉시 예외(STRICT)
   4) 예외 삼키기/행 드랍/print 폴백 제거(절대 NO-FALLBACK)
+- 2026-03-05:
+  1) SETTINGS PATCH:
+     - fetch_klines_rest() 기본 limit을 settings(ws_backfill_limit)에서 읽도록 변경
 ========================================================
 """
 
@@ -29,6 +32,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+# SETTINGS PATCH: settings SSOT 연동 (백필 limit 기본값을 settings에서 읽는다)
+from settings import load_settings  # SETTINGS PATCH
+
+SET = load_settings()  # SETTINGS PATCH
 
 # STRICT: telelog는 운영 필수. 없으면 즉시 예외 (NO-FALLBACK).
 try:
@@ -281,7 +289,7 @@ def _request_klines_with_retry(
     raise KlineRestError("REST kline failed: unknown (no response)")
 
 
-def fetch_klines_rest(symbol: str, interval: str, limit: int = 120) -> List[List[Any]]:
+def fetch_klines_rest(symbol: str, interval: str, limit: Optional[int] = None) -> List[List[Any]]:
     """
     Binance Futures REST /fapi/v1/klines 히스토리를 조회해서 list[list] 로 반환한다.
 
@@ -290,6 +298,10 @@ def fetch_klines_rest(symbol: str, interval: str, limit: int = 120) -> List[List
     - 네트워크/HTTP/파싱/정렬/정규화 실패 시 즉시 예외
     - 행 드랍/정렬 무시/print 폴백 없음
     """
+    # SETTINGS PATCH: limit 미지정이면 settings.ws_backfill_limit 사용
+    if limit is None:
+        limit = int(getattr(SET, "ws_backfill_limit", 120) or 120)  # SETTINGS PATCH
+
     if limit <= 0:
         raise ValueError("limit 은 1 이상이어야 합니다.")
     # Binance /fapi/v1/klines 최대 limit=1500

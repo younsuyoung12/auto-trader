@@ -675,7 +675,7 @@ def load_settings() -> Settings:
     ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
 
     ws_backfill_tfs = _as_csv_list("WS_BACKFILL_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_backfill_limit = _as_int("WS_BACKFILL_LIMIT", 500)
+    ws_backfill_limit = _as_int("WS_BACKFILL_LIMIT", 400)
 
     md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 5.0)
     ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 5.0)
