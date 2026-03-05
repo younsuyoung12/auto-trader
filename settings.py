@@ -157,6 +157,8 @@ class Settings:
     ws_combined_base: str = "wss://fstream.binance.com/stream?streams="
     ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
+    # PRE-FLIGHT WS bootstrap timeout
+    preflight_ws_wait_sec = 60
     ws_min_kline_buffer: int = 300
     ws_max_kline_delay_sec: float = 120.0
     ws_orderbook_max_delay_sec: float = 10.0
