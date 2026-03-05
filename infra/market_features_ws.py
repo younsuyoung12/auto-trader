@@ -209,7 +209,7 @@ def _candles_from_ws_buf(
     buf: List[Tuple[int, float, float, float, float, float]]
 ) -> List[Candle]:
     """WS 버퍼 포맷(ts, o, h, l, c, v) → indicators.Candle(ts, o, h, l, c)."""
-    return [(int(ts), float(o), float(h), float(l), float(c)) for (ts, o, h, l, c, _v) in buf]
+    return [(int(ts), float(o), float(h), float(l), float(c), float(_v)) for (ts, o, h, l, c, _v) in buf]
 
 
 def _last_two_valid(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
