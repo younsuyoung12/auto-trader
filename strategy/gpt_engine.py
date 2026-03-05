@@ -283,8 +283,7 @@ def call_chat(
             messages=[
                 {"role": "system", "content": sp},
                 {"role": "user", "content": uc},
-            ],
-            temperature=float(temp),
+            ],            
             max_completion_tokens=int(mt),
             timeout=float(budget),
         )
