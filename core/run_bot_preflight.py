@@ -267,8 +267,14 @@ def _stage_binance_private_api_strict() -> None:
         raise PreflightError("settings.symbol empty (STRICT)")
 
     bal = get_balance_detail("USDT")
-    if not isinstance(bal, dict) or not bal:
-        raise PreflightError("get_balance_detail('USDT') returned non-dict/empty (STRICT)")
+
+    # TEST MODE 지원 (STRICT)
+    if getattr(SET, "test_dry_run", False) and getattr(SET, "test_fake_available_usdt", 0) > 0:
+        eq_cur = float(getattr(SET, "test_fake_available_usdt"))
+    else:
+        eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
+        if eq_cur <= 0:
+            raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
 
     for k in ("availableBalance", "crossUnPnl"):
         if k not in bal:
