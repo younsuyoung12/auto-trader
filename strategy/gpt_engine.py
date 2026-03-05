@@ -27,6 +27,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   3) OpenAI client 생성 레이스 방지(락) — 동시 호출 안정성 강화
   4) user_payload JSON 직렬화 STRICT(allow_nan=False) — NaN/Inf 즉시 예외
   5) 로그 실패가 본 예외를 가리지 않게 처리 — 예외 전파 보장
+- 2026-03-05:
+  1) OpenAI Chat Completions API → Responses API 전환 (GPT-5 계열 호환 / Logs→Responses 기록 보장)
+  2) 토큰 파라미터: max_* → max_output_tokens 로 전환
+  3) 응답 텍스트 추출: response.output_text 사용(STRICT)
+  4) 기존 STRICT 정책 유지(예산/예외/민감정보 로그 금지/JSON 추출)
+
 ========================================================
 """
 
@@ -231,7 +237,7 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
         if start < 0:
             _fail("parse", "no JSON object found")
         try:
-            obj, end = _JSON_DECODER.raw_decode(s, start)
+            obj, _end = _JSON_DECODER.raw_decode(s, start)
         except Exception:
             # 다음 '{'로 진행
             idx = start + 1
@@ -254,7 +260,9 @@ def call_chat(
     max_latency_sec: Optional[float] = None,
 ) -> GptRawResponse:
     """
-    OpenAI Chat 호출(텍스트만 반환) — STRICT
+    OpenAI 호출(텍스트만 반환) — STRICT
+
+    - GPT-5 계열 + Logs→Responses 기록 보장을 위해 Responses API를 사용한다.
     - caller는 user_content에 민감정보를 포함하지 않아야 한다.
     """
     m = _require_nonempty_str("input", (model or _settings_model()), "model")
@@ -262,30 +270,35 @@ def call_chat(
     if mt <= 0 or mt > 4096:
         _fail("input", "max_tokens out of allowed range (1..4096)")
 
+    # NOTE: GPT-5 계열에서 temperature가 지원되지 않을 수 있어, 기존 동작(검증만, 전송은 하지 않음)을 유지한다.
     temp = _require_float("input", (temperature if temperature is not None else _settings_temperature()), "temperature")
     if temp < 0.0 or temp > 2.0:
         _fail("input", "temperature out of range [0,2]")
 
-    budget = _require_float("input", (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()), "max_latency_sec")
+    budget = _require_float(
+        "input",
+        (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()),
+        "max_latency_sec",
+    )
     if budget <= 0:
         _fail("input", "max_latency_sec must be > 0")
 
     sp = _require_nonempty_str("input", system_prompt, "system_prompt")
     uc = _require_nonempty_str("input", user_content, "user_content")
 
-    client = _get_client()
+    base_client = _get_client()
 
     t0 = time.time()
     try:
-        # STRICT: timeout도 budget으로 강제 (라이브러리가 지원하지 않으면 즉시 실패(=정책 위반))
-        resp = client.chat.completions.create(
+        # STRICT: 요청 timeout을 budget으로 강제(클라이언트 옵션)
+        client = base_client.with_options(timeout=float(budget))
+        resp = client.responses.create(
             model=m,
-            messages=[
-                {"role": "system", "content": sp},
-                {"role": "user", "content": uc},
-            ],            
-            max_tokens=int(mt),
-            timeout=float(budget),
+            instructions=sp,
+            input=uc,
+            max_output_tokens=int(mt),
+            # Logs → Responses 기록을 "반드시" 남기기 위한 명시적 store=True
+            store=True,
         )
     except Exception as e:
         # sanitize: 프롬프트/키/URL 등 민감/대용량 정보는 포함 금지
@@ -295,10 +308,11 @@ def call_chat(
     if dt > budget:
         _fail("openai", f"latency budget exceeded: {dt:.2f}s > {budget:.2f}s")
 
+    # STRICT: output_text는 SDK가 제공하는 표준 합성 텍스트(텍스트 응답 경로)
     try:
-        content = resp.choices[0].message.content  # type: ignore[index]
+        content = getattr(resp, "output_text")
     except Exception as e:
-        _fail("openai", "response content missing", e)
+        _fail("openai", "response output_text missing", e)
 
     if not isinstance(content, str) or not content.strip():
         _fail("openai", "empty content")
@@ -316,7 +330,7 @@ def call_chat_json(
     max_latency_sec: Optional[float] = None,
 ) -> GptJsonResponse:
     """
-    OpenAI Chat 호출 후 JSON object 1개를 추출해 반환 — STRICT
+    OpenAI 호출 후 JSON object 1개를 추출해 반환 — STRICT
     """
     if not isinstance(user_payload, dict) or not user_payload:
         _fail("input", "user_payload must be non-empty dict")
