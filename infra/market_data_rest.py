@@ -319,7 +319,7 @@ def fetch_klines_rest(symbol: str, interval: str, limit: Optional[int] = None) -
     # (여유분 자체는 REST window 계산용이며, 반환은 아래에서 limit로 강제 절단)
     start_ms = end_ms - iv_ms * (limit + 20)
 
-    raw_limit = min(limit + 20, 1500)
+    raw_limit = min(limit + 200, 1500)
 
     url = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/klines"
     params: Dict[str, Any] = {
