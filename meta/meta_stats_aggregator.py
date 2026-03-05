@@ -23,6 +23,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - 최근 N 트레이드 요약, 레짐/방향별 성과, 스코어 버킷, 드리프트 지표 제공
   3) STRICT 보장:
      - 스냅샷 누락/필수값 누락/NaN/INF 즉시 예외
+
+- 2026-03-05:
+  1) FIX(TRADE-GRADE): DetachedInstanceError 근본 해결
+     - ORM 객체(TradeORM/TradeSnapshot)를 Session 종료 이후 접근하지 않도록 수정
+     - ORM → MetaTradeRow/MetaSnapshotRow 변환을 반드시 get_session() 내부에서 완료
+  2) 잘못된 __dict__.copy() 기반 변환 제거(사용 금지)
 ========================================================
 """
 
@@ -125,6 +131,13 @@ def _bucket_0_100(v: float, *, step: int = 10) -> str:
     if hi == lo:
         hi = min(lo + step, 100)
     return f"{lo:02d}-{hi:02d}"
+
+
+def _str_opt(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
 
 
 # ─────────────────────────────────────────────
@@ -239,10 +252,16 @@ def _is_test_trade_strict(t: MetaTradeRow) -> bool:
 
 
 def _fetch_closed_trades_strict(cfg: MetaStatsConfig) -> List[MetaTradeRow]:
+    """
+    STRICT:
+    - ORM(TradeORM)을 session 밖으로 전달하지 않는다.
+    - ORM → MetaTradeRow 변환은 반드시 session 내부에서 완료한다.
+    """
     sym = _require_nonempty_str(cfg.symbol, "cfg.symbol").upper().replace("-", "").replace("/", "").replace("_", "")
     if cfg.lookback_trades <= 0:
         raise MetaStatsError("cfg.lookback_trades must be > 0 (STRICT)")
 
+    out: List[MetaTradeRow] = []
     with get_session() as session:
         q = (
             session.query(TradeORM)
@@ -254,66 +273,67 @@ def _fetch_closed_trades_strict(cfg: MetaStatsConfig) -> List[MetaTradeRow]:
         )
         rows = q.all()
 
-    if not rows:
-        raise MetaStatsError(f"no closed trades found for symbol={sym} (STRICT)")
+        if not rows:
+            raise MetaStatsError(f"no closed trades found for symbol={sym} (STRICT)")
 
-    out: List[MetaTradeRow] = []
-    for r in rows:
-        tid = _to_int_strict(getattr(r, "id", None), "bt_trades.id")
-        entry_ts = _require_tz_aware_dt(getattr(r, "entry_ts", None), "bt_trades.entry_ts")
-        exit_ts = _require_tz_aware_dt(getattr(r, "exit_ts", None), "bt_trades.exit_ts")
+        for r in rows:
+            # 모든 ORM 속성 접근은 session 내부에서만 수행한다.
+            tid = _to_int_strict(getattr(r, "id", None), "bt_trades.id")
 
-        entry_price = _to_float_strict(getattr(r, "entry_price", None), "bt_trades.entry_price")
-        exit_price = _to_float_strict(getattr(r, "exit_price", None), "bt_trades.exit_price")
-        qty = _to_float_strict(getattr(r, "qty", None), "bt_trades.qty")
-        pnl_usdt = _to_float_strict(getattr(r, "pnl_usdt", None), "bt_trades.pnl_usdt")
+            entry_ts = _require_tz_aware_dt(getattr(r, "entry_ts", None), "bt_trades.entry_ts")
+            exit_ts = _require_tz_aware_dt(getattr(r, "exit_ts", None), "bt_trades.exit_ts")
 
-        pnl_pct_futures = getattr(r, "pnl_pct_futures", None)
-        if pnl_pct_futures is not None:
-            pnl_pct_futures = _to_float_strict(pnl_pct_futures, "bt_trades.pnl_pct_futures")
+            entry_price = _to_float_strict(getattr(r, "entry_price", None), "bt_trades.entry_price")
+            exit_price = _to_float_strict(getattr(r, "exit_price", None), "bt_trades.exit_price")
+            qty = _to_float_strict(getattr(r, "qty", None), "bt_trades.qty")
+            pnl_usdt = _to_float_strict(getattr(r, "pnl_usdt", None), "bt_trades.pnl_usdt")
 
-        side = _require_nonempty_str(getattr(r, "side", None), "bt_trades.side").upper()
+            pnl_pct_futures = getattr(r, "pnl_pct_futures", None)
+            if pnl_pct_futures is not None:
+                pnl_pct_futures = _to_float_strict(pnl_pct_futures, "bt_trades.pnl_pct_futures")
 
-        leverage = getattr(r, "leverage", None)
-        if leverage is not None:
-            leverage = _to_float_strict(leverage, "bt_trades.leverage")
+            side = _require_nonempty_str(getattr(r, "side", None), "bt_trades.side").upper()
 
-        risk_pct = getattr(r, "risk_pct", None)
-        if risk_pct is not None:
-            risk_pct = _to_float_strict(risk_pct, "bt_trades.risk_pct")
+            leverage = getattr(r, "leverage", None)
+            if leverage is not None:
+                leverage = _to_float_strict(leverage, "bt_trades.leverage")
 
-        tp_pct = getattr(r, "tp_pct", None)
-        if tp_pct is not None:
-            tp_pct = _to_float_strict(tp_pct, "bt_trades.tp_pct")
+            risk_pct = getattr(r, "risk_pct", None)
+            if risk_pct is not None:
+                risk_pct = _to_float_strict(risk_pct, "bt_trades.risk_pct")
 
-        sl_pct = getattr(r, "sl_pct", None)
-        if sl_pct is not None:
-            sl_pct = _to_float_strict(sl_pct, "bt_trades.sl_pct")
+            tp_pct = getattr(r, "tp_pct", None)
+            if tp_pct is not None:
+                tp_pct = _to_float_strict(tp_pct, "bt_trades.tp_pct")
 
-        out.append(
-            MetaTradeRow(
-                trade_id=int(tid),
-                symbol=sym,
-                side=side,
-                entry_ts=entry_ts,
-                exit_ts=exit_ts,
-                entry_price=float(entry_price),
-                exit_price=float(exit_price),
-                qty=float(qty),
-                pnl_usdt=float(pnl_usdt),
-                pnl_pct_futures=pnl_pct_futures,
-                leverage=leverage,
-                risk_pct=risk_pct,
-                tp_pct=tp_pct,
-                sl_pct=sl_pct,
-                strategy=(str(getattr(r, "strategy", "")).strip() or None),
-                regime_at_entry=(str(getattr(r, "regime_at_entry", "")).strip() or None),
-                regime_at_exit=(str(getattr(r, "regime_at_exit", "")).strip() or None),
-                close_reason=(str(getattr(r, "close_reason", "")).strip() or None),
-                reconciliation_status=(str(getattr(r, "reconciliation_status", "")).strip() or None),
-                note=(str(getattr(r, "note", "")).strip() or None),
+            sl_pct = getattr(r, "sl_pct", None)
+            if sl_pct is not None:
+                sl_pct = _to_float_strict(sl_pct, "bt_trades.sl_pct")
+
+            out.append(
+                MetaTradeRow(
+                    trade_id=int(tid),
+                    symbol=sym,
+                    side=side,
+                    entry_ts=entry_ts,
+                    exit_ts=exit_ts,
+                    entry_price=float(entry_price),
+                    exit_price=float(exit_price),
+                    qty=float(qty),
+                    pnl_usdt=float(pnl_usdt),
+                    pnl_pct_futures=pnl_pct_futures,
+                    leverage=leverage,
+                    risk_pct=risk_pct,
+                    tp_pct=tp_pct,
+                    sl_pct=sl_pct,
+                    strategy=_str_opt(getattr(r, "strategy", None)),
+                    regime_at_entry=_str_opt(getattr(r, "regime_at_entry", None)),
+                    regime_at_exit=_str_opt(getattr(r, "regime_at_exit", None)),
+                    close_reason=_str_opt(getattr(r, "close_reason", None)),
+                    reconciliation_status=_str_opt(getattr(r, "reconciliation_status", None)),
+                    note=_str_opt(getattr(r, "note", None)),
+                )
             )
-        )
 
     # optional exclude test trades
     if cfg.exclude_test_trades:
@@ -326,6 +346,11 @@ def _fetch_closed_trades_strict(cfg: MetaStatsConfig) -> List[MetaTradeRow]:
 
 
 def _fetch_snapshots_by_trade_ids_strict(symbol: str, trade_ids: Sequence[int]) -> Dict[int, MetaSnapshotRow]:
+    """
+    STRICT:
+    - ORM(TradeSnapshot)을 session 밖으로 전달하지 않는다.
+    - ORM → MetaSnapshotRow 변환은 반드시 session 내부에서 완료한다.
+    """
     sym = _require_nonempty_str(symbol, "symbol").upper().replace("-", "").replace("/", "").replace("_", "")
     if not trade_ids:
         raise MetaStatsError("trade_ids empty (STRICT)")
@@ -335,6 +360,7 @@ def _fetch_snapshots_by_trade_ids_strict(symbol: str, trade_ids: Sequence[int]) 
     if not ids:
         raise MetaStatsError("trade_ids invalid (STRICT)")
 
+    by_id: Dict[int, MetaSnapshotRow] = {}
     with get_session() as session:
         q = (
             session.query(TradeSnapshot)
@@ -343,52 +369,51 @@ def _fetch_snapshots_by_trade_ids_strict(symbol: str, trade_ids: Sequence[int]) 
         )
         rows = q.all()
 
-    if not rows:
-        raise MetaStatsError("no trade snapshots found (STRICT)")
+        if not rows:
+            raise MetaStatsError("no trade snapshots found (STRICT)")
 
-    by_id: Dict[int, MetaSnapshotRow] = {}
-    for r in rows:
-        tid = _to_int_strict(getattr(r, "trade_id", None), "bt_trade_snapshots.trade_id")
-        entry_ts = _require_tz_aware_dt(getattr(r, "entry_ts", None), "bt_trade_snapshots.entry_ts")
-        direction = _require_nonempty_str(getattr(r, "direction", None), "bt_trade_snapshots.direction").upper()
-        if direction not in ("LONG", "SHORT"):
-            raise MetaStatsError(f"bt_trade_snapshots.direction invalid (STRICT): {direction!r}")
+        for r in rows:
+            tid = _to_int_strict(getattr(r, "trade_id", None), "bt_trade_snapshots.trade_id")
+            entry_ts = _require_tz_aware_dt(getattr(r, "entry_ts", None), "bt_trade_snapshots.entry_ts")
+            direction = _require_nonempty_str(getattr(r, "direction", None), "bt_trade_snapshots.direction").upper()
+            if direction not in ("LONG", "SHORT"):
+                raise MetaStatsError(f"bt_trade_snapshots.direction invalid (STRICT): {direction!r}")
 
-        # optional numeric fields: if present must be finite
-        def opt_f(val: Any, nm: str) -> Optional[float]:
-            if val is None:
-                return None
-            return _to_float_strict(val, nm)
+            # optional numeric fields: if present must be finite
+            def opt_f(val: Any, nm: str) -> Optional[float]:
+                if val is None:
+                    return None
+                return _to_float_strict(val, nm)
 
-        def opt_i(val: Any, nm: str) -> Optional[int]:
-            if val is None:
-                return None
-            return _to_int_strict(val, nm)
+            def opt_i(val: Any, nm: str) -> Optional[int]:
+                if val is None:
+                    return None
+                return _to_int_strict(val, nm)
 
-        by_id[int(tid)] = MetaSnapshotRow(
-            trade_id=int(tid),
-            symbol=sym,
-            entry_ts=entry_ts,
-            direction=direction,
-            signal_source=(str(getattr(r, "signal_source", "")).strip() or None),
-            regime=(str(getattr(r, "regime", "")).strip() or None),
-            entry_score=opt_f(getattr(r, "entry_score", None), "bt_trade_snapshots.entry_score"),
-            engine_total=opt_f(getattr(r, "engine_total", None), "bt_trade_snapshots.engine_total"),
-            dd_pct=opt_f(getattr(r, "dd_pct", None), "bt_trade_snapshots.dd_pct"),
-            hour_kst=opt_i(getattr(r, "hour_kst", None), "bt_trade_snapshots.hour_kst"),
-            weekday_kst=opt_i(getattr(r, "weekday_kst", None), "bt_trade_snapshots.weekday_kst"),
-            micro_score_risk=opt_f(getattr(r, "micro_score_risk", None), "bt_trade_snapshots.micro_score_risk"),
-            ev_cell_key=(str(getattr(r, "ev_cell_key", "")).strip() or None),
-            ev_cell_ev=opt_f(getattr(r, "ev_cell_ev", None), "bt_trade_snapshots.ev_cell_ev"),
-            ev_cell_n=opt_i(getattr(r, "ev_cell_n", None), "bt_trade_snapshots.ev_cell_n"),
-            ev_cell_status=(str(getattr(r, "ev_cell_status", "")).strip() or None),
-            auto_blocked=(bool(getattr(r, "auto_blocked")) if getattr(r, "auto_blocked", None) is not None else None),
-            auto_risk_multiplier=opt_f(getattr(r, "auto_risk_multiplier", None), "bt_trade_snapshots.auto_risk_multiplier"),
-            gpt_severity=opt_i(getattr(r, "gpt_severity", None), "bt_trade_snapshots.gpt_severity"),
-            gpt_tags=getattr(r, "gpt_tags", None),
-            gpt_confidence_penalty=opt_f(getattr(r, "gpt_confidence_penalty", None), "bt_trade_snapshots.gpt_confidence_penalty"),
-            gpt_suggested_risk_multiplier=opt_f(getattr(r, "gpt_suggested_risk_multiplier", None), "bt_trade_snapshots.gpt_suggested_risk_multiplier"),
-        )
+            by_id[int(tid)] = MetaSnapshotRow(
+                trade_id=int(tid),
+                symbol=sym,
+                entry_ts=entry_ts,
+                direction=direction,
+                signal_source=_str_opt(getattr(r, "signal_source", None)),
+                regime=_str_opt(getattr(r, "regime", None)),
+                entry_score=opt_f(getattr(r, "entry_score", None), "bt_trade_snapshots.entry_score"),
+                engine_total=opt_f(getattr(r, "engine_total", None), "bt_trade_snapshots.engine_total"),
+                dd_pct=opt_f(getattr(r, "dd_pct", None), "bt_trade_snapshots.dd_pct"),
+                hour_kst=opt_i(getattr(r, "hour_kst", None), "bt_trade_snapshots.hour_kst"),
+                weekday_kst=opt_i(getattr(r, "weekday_kst", None), "bt_trade_snapshots.weekday_kst"),
+                micro_score_risk=opt_f(getattr(r, "micro_score_risk", None), "bt_trade_snapshots.micro_score_risk"),
+                ev_cell_key=_str_opt(getattr(r, "ev_cell_key", None)),
+                ev_cell_ev=opt_f(getattr(r, "ev_cell_ev", None), "bt_trade_snapshots.ev_cell_ev"),
+                ev_cell_n=opt_i(getattr(r, "ev_cell_n", None), "bt_trade_snapshots.ev_cell_n"),
+                ev_cell_status=_str_opt(getattr(r, "ev_cell_status", None)),
+                auto_blocked=(bool(getattr(r, "auto_blocked")) if getattr(r, "auto_blocked", None) is not None else None),
+                auto_risk_multiplier=opt_f(getattr(r, "auto_risk_multiplier", None), "bt_trade_snapshots.auto_risk_multiplier"),
+                gpt_severity=opt_i(getattr(r, "gpt_severity", None), "bt_trade_snapshots.gpt_severity"),
+                gpt_tags=getattr(r, "gpt_tags", None),
+                gpt_confidence_penalty=opt_f(getattr(r, "gpt_confidence_penalty", None), "bt_trade_snapshots.gpt_confidence_penalty"),
+                gpt_suggested_risk_multiplier=opt_f(getattr(r, "gpt_suggested_risk_multiplier", None), "bt_trade_snapshots.gpt_suggested_risk_multiplier"),
+            )
 
     # STRICT: snapshot 누락 금지
     missing = [tid for tid in ids if tid not in by_id]
@@ -460,7 +485,10 @@ def _group_stats_by_key(
         k = key_fn(t, s)
         k = str(k or "").strip() or "UNKNOWN"
 
-        bucket = out.setdefault(k, {"n": 0, "wins": 0, "losses": 0, "breakevens": 0, "total_pnl_usdt": 0.0, "avg_pnl_usdt": 0.0})
+        bucket = out.setdefault(
+            k,
+            {"n": 0, "wins": 0, "losses": 0, "breakevens": 0, "total_pnl_usdt": 0.0, "avg_pnl_usdt": 0.0},
+        )
         bucket["n"] += 1
         pnl = float(t.pnl_usdt)
         bucket["total_pnl_usdt"] += pnl
@@ -508,8 +536,8 @@ def build_meta_stats(cfg: MetaStatsConfig) -> MetaStatsResult:
     recent = trades[:rw]
     baseline = trades[rw : rw + bw]
 
-    _, rw_w, _, _, rw_wr, _, rw_avg, _ = _agg_basic(recent)
-    _, bw_w, _, _, bw_wr, _, bw_avg, _ = _agg_basic(baseline)
+    _, _rw_w, _, _, rw_wr, _, rw_avg, _ = _agg_basic(recent)
+    _, _bw_w, _, _, bw_wr, _, bw_avg, _ = _agg_basic(baseline)
 
     # breakdowns
     by_direction = _group_stats_by_key(
@@ -567,7 +595,6 @@ def build_meta_stats(cfg: MetaStatsConfig) -> MetaStatsResult:
     return MetaStatsResult(
         symbol=sym,
         generated_at_utc=datetime.now(timezone.utc),
-
         n_trades=int(n),
         wins=int(wins),
         losses=int(losses),
@@ -576,17 +603,14 @@ def build_meta_stats(cfg: MetaStatsConfig) -> MetaStatsResult:
         total_pnl_usdt=float(total_pnl),
         avg_pnl_usdt=float(avg_pnl),
         avg_pnl_pct_futures=avg_pnl_pct,
-
         recent_win_rate_pct=float(rw_wr),
         baseline_win_rate_pct=float(bw_wr),
         recent_avg_pnl_usdt=float(rw_avg),
         baseline_avg_pnl_usdt=float(bw_avg),
-
         by_direction=by_direction,
         by_regime=by_regime,
         by_engine_total_bucket=by_engine_total_bucket,
         by_entry_score_bucket=by_entry_score_bucket,
-
         recent_trades=recent_trades_payload,
     )
 
