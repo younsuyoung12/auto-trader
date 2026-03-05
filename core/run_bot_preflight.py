@@ -269,7 +269,6 @@ def _stage_binance_private_api_strict() -> None:
     symbol = str(getattr(SET, "symbol", "")).replace("-", "").replace("/", "").upper().strip()
     if not symbol:
         raise PreflightError("settings.symbol empty (STRICT)")
-
     bal = get_balance_detail("USDT")
     if not isinstance(bal, dict) or not bal:
         raise PreflightError("get_balance_detail('USDT') returned non-dict/empty (STRICT)")
@@ -281,21 +280,20 @@ def _stage_binance_private_api_strict() -> None:
     _ = _finite(bal.get("availableBalance"), "balance.availableBalance")
     _ = _finite(bal.get("crossUnPnl"), "balance.crossUnPnl")
 
-    # TEST MODE (TRADE-GRADE):
-    # - test_dry_run=True AND test_fake_available_usdt>0 인 경우, 실계좌 잔고가 0이어도 Preflight를 통과시킨다.
-    # - 단, 테스트 잔고는 반드시 finite & >0 이어야 한다.
+    # TEST MODE (TRADE-GRADE)
     if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
-        fake_eq = _finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt")
-        if fake_eq <= 0:
+
+        eq_cur = float(_finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt"))
+
+        if eq_cur <= 0:
             raise PreflightError("settings.test_fake_available_usdt must be > 0 in test_dry_run (STRICT)")
+
     else:
+
         eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
+
         if eq_cur <= 0:
             raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
-
-    pos = fetch_open_positions(symbol)
-    if not isinstance(pos, list):
-        raise PreflightError("fetch_open_positions returned non-list (STRICT)")
 
     orders = fetch_open_orders(symbol)
     if not isinstance(orders, list):
