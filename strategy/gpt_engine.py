@@ -285,7 +285,7 @@ def call_chat(
                 {"role": "user", "content": uc},
             ],
             temperature=float(temp),
-            max_tokens=int(mt),
+            max_completion_tokens=int(mt),
             timeout=float(budget),
         )
     except Exception as e:
