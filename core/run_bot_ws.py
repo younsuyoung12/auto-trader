@@ -701,7 +701,7 @@ def _backfill_ws_kline_history(symbol: str) -> None:
 
         backfill_klines_from_rest(symbol, iv, rest_rows)
 
-        buf = ws_get_klines_with_volume(symbol, iv, limit=max(60, min_needed))
+        buf = ws_get_klines_with_volume(symbol, iv, limit=max(300, min_needed))
         if not isinstance(buf, list) or len(buf) < min_needed:
             raise RuntimeError(
                 f"WS buffer verify failed: {symbol} {iv} need={min_needed} got={len(buf) if isinstance(buf, list) else 'N/A'}"
