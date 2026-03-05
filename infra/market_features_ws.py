@@ -202,7 +202,7 @@ def _fetch_candles_strict(
             log(f"[MKT-FEAT] optional {reason}")
             return []
 
-    return list(buf[-need_len:])
+    return list(buf[-max(300, need_len):])
 
 
 def _candles_from_ws_buf(
