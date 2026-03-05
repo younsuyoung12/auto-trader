@@ -30,6 +30,14 @@ STRICT 정책
 주의: manual_position_guard는 Binance /fapi/v2/balance 응답 구조에 100% 정합해야 한다.
 - 사용 필드: availableBalance, crossWalletBalance, crossUnPnl
 - unrealizedProfit 사용 금지
+
+변경 이력
+-----------------------------------------------------
+- 2026-03-06:
+  1) FIX(TRADE-GRADE): signals_logger STRICT 정책 준수
+     - log_signal 호출에서 extra(str) 전달 금지
+     - extra_json(dict)로 통일하여 bt_events.extra_json(JSONB) 계약 준수
+     - 가드 로직/판정/리턴 흐름은 변경하지 않음
 """
 
 from __future__ import annotations
@@ -173,12 +181,13 @@ def check_manual_position_guard(
             direction="CLOSE",  # ✅ 추가
             reason="manual_position_detected",
             candle_ts=ts_int,
-            extra=(
-                f"availableBalance={available_balance}, "
-                f"crossWalletBalance={cross_wallet_balance}, "
-                f"crossUnPnl={cross_un_pnl}, "
-                f"equity={equity}, used_margin={used_margin}"
-            ),
+            extra_json={
+                "availableBalance": float(available_balance),
+                "crossWalletBalance": float(cross_wallet_balance),
+                "crossUnPnl": float(cross_un_pnl),
+                "equity": float(equity),
+                "used_margin": float(used_margin),
+            },
         )
         return False
 
@@ -221,7 +230,7 @@ def check_volume_guard(
             direction=direction,
             reason="volume_guard_insufficient_samples",
             candle_ts=latest_ts,
-            extra=f"len={len(candles_5m_raw)}",
+            extra_json={"len": int(len(candles_5m_raw))},
         )
         return False
 
@@ -239,7 +248,7 @@ def check_volume_guard(
             direction=direction,
             reason="volume_guard_parse_error",
             candle_ts=latest_ts,
-            extra=str(e),
+            extra_json={"error": str(e)},
         )
         return False
 
@@ -256,7 +265,7 @@ def check_volume_guard(
             direction=direction,
             reason="volume_guard_no_reference",
             candle_ts=latest_ts,
-            extra=f"last_vol={last_vol}, avg_vol_20={avg_vol_20}",
+            extra_json={"last_vol": float(last_vol), "avg_vol_20": float(avg_vol_20)},
         )
         return False
 
@@ -274,10 +283,12 @@ def check_volume_guard(
             direction=direction,
             reason="volume_too_low_for_entry",
             candle_ts=latest_ts,
-            extra=(
-                f"last_vol={last_vol}, avg_vol_20={avg_vol_20}, "
-                f"ratio={ratio:.4f}, threshold={min_vol_ratio:.4f}"
-            ),
+            extra_json={
+                "last_vol": float(last_vol),
+                "avg_vol_20": float(avg_vol_20),
+                "ratio": float(ratio),
+                "threshold": float(min_vol_ratio),
+            },
         )
         return False
 
@@ -321,7 +332,7 @@ def check_5m_delay_guard(
             direction=direction,
             reason="5m_delay_no_5m_candles",
             candle_ts=latest_ts,
-            extra=f"len_1m={len(candles_1m)}, len_5m={len(candles_5m)}",
+            extra_json={"len_1m": int(len(candles_1m)), "len_5m": int(len(candles_5m))},
         )
         return False
 
@@ -337,7 +348,7 @@ def check_5m_delay_guard(
             direction=direction,
             reason="5m_delay_ts_parse_error",
             candle_ts=latest_ts,
-            extra=str(e),
+            extra_json={"error": str(e)},
         )
         return False
 
@@ -384,7 +395,15 @@ def check_5m_delay_guard(
             direction=direction,
             reason=reason,
             candle_ts=latest_ts,
-            extra=extra,
+            extra_json={
+                "missing_5m_count": int(missing_5m_count),
+                "now_gap_ms": int(now_ms - last_5m_ts),
+                "max_delay_ms": int(max_delay_ms),
+                "last_1m_ts": None if last_1m_ts is None else int(last_1m_ts),
+                "last_5m_ts": int(last_5m_ts),
+                "delayed_by_gap": bool(delayed_by_gap),
+                "delayed_by_time": bool(delayed_by_time),
+            },
         )
         return False
 
@@ -423,7 +442,7 @@ def check_price_jump_guard(
             direction=direction,
             reason="price_jump_insufficient_candles",
             candle_ts=latest_ts,
-            extra=f"len_5m={len(candles_5m)}",
+            extra_json={"len_5m": int(len(candles_5m))},
         )
         return False
 
@@ -446,7 +465,7 @@ def check_price_jump_guard(
             direction=direction,
             reason="price_jump_parse_error",
             candle_ts=latest_ts,
-            extra=str(e),
+            extra_json={"error": str(e)},
         )
         return False
 
@@ -463,7 +482,7 @@ def check_price_jump_guard(
             direction=direction,
             reason="price_jump_invalid_price",
             candle_ts=latest_ts,
-            extra=f"prev_price={prev_price}, last_price={last_price}",
+            extra_json={"prev_price": float(prev_price), "last_price": float(last_price)},
         )
         return False
 
@@ -483,7 +502,7 @@ def check_price_jump_guard(
             direction=direction,
             reason="price_jump_guard",
             candle_ts=latest_ts,
-            extra=f"move_pct={move_pct:.6f}, sess_mult={jump_mult}",
+            extra_json={"move_pct": float(move_pct), "limit": float(max_jump_pct), "sess_mult": float(jump_mult)},
         )
         return False
 
@@ -503,7 +522,7 @@ def check_price_jump_guard(
             direction=direction,
             reason="candle_volatility_guard",
             candle_ts=latest_ts,
-            extra=f"range_pct={range_pct:.6f}, sess_mult={jump_mult}",
+            extra_json={"range_pct": float(range_pct), "limit": float(candle_vol_limit), "sess_mult": float(jump_mult)},
         )
         return False
 
@@ -658,7 +677,7 @@ def check_spread_guard(
             direction=direction,
             reason="orderbook_stale",
             candle_ts=latest_ts,
-            extra=f"ob_age_ms={ob_age_ms}, max={max_ob_age}",
+            extra_json={"ob_age_ms": int(ob_age_ms), "max_ob_age": int(max_ob_age)},
         )
         return False, None, None
 
@@ -708,7 +727,7 @@ def check_spread_guard(
             direction=direction,
             reason="spread_guard_parse_error",
             candle_ts=latest_ts,
-            extra=str(e),
+            extra_json={"error": str(e)},
         )
         return False, None, None
 
@@ -722,7 +741,7 @@ def check_spread_guard(
             direction=direction,
             reason="bbo_crossed_or_invalid",
             candle_ts=latest_ts,
-            extra=f"best_bid={best_bid}, best_ask={best_ask}",
+            extra_json={"best_bid": float(best_bid), "best_ask": float(best_ask)},
         )
         return False, best_bid, best_ask
 
@@ -746,10 +765,11 @@ def check_spread_guard(
                 direction=direction,
                 reason="bbo_notional_too_small",
                 candle_ts=latest_ts,
-                extra=(
-                    f"bid_notional={top_bid_notional:.2f}, "
-                    f"ask_notional={top_ask_notional:.2f}, min={min_bbo_notional}"
-                ),
+                extra_json={
+                    "bid_notional": float(top_bid_notional),
+                    "ask_notional": float(top_ask_notional),
+                    "min_bbo_notional": float(min_bbo_notional),
+                },
             )
             return False, best_bid, best_ask
 
@@ -784,11 +804,15 @@ def check_spread_guard(
             reason="spread_guard",
             candle_ts=latest_ts,
             spread_pct=spread_pct,
-            extra=(
-                f"ob_age_ms={ob_age_ms}, spread_abs={spread_abs:.2f}, "
-                f"sess_mult={spread_mult}, top_bid_notional={top_bid_notional:.2f}, "
-                f"top_ask_notional={top_ask_notional:.2f}"
-            ),
+            extra_json={
+                "ob_age_ms": int(ob_age_ms),
+                "spread_abs": float(spread_abs),
+                "spread_pct_limit": float(max_spread_pct),
+                "spread_abs_limit": float(max_spread_abs),
+                "sess_mult": float(spread_mult),
+                "top_bid_notional": float(top_bid_notional),
+                "top_ask_notional": float(top_ask_notional),
+            },
         )
         return False, best_bid, best_ask
 
@@ -802,7 +826,7 @@ def check_spread_guard(
             direction=direction,
             reason="depth_imbalance_guard",
             candle_ts=latest_ts,
-            extra=f"ob_age_ms={ob_age_ms}",
+            extra_json={"ob_age_ms": int(ob_age_ms)},
         )
         return False, best_bid, best_ask
 
@@ -816,7 +840,7 @@ def check_spread_guard(
             direction=direction,
             reason="price_deviation_guard",
             candle_ts=latest_ts,
-            extra=f"ob_age_ms={ob_age_ms}",
+            extra_json={"ob_age_ms": int(ob_age_ms)},
         )
         return False, best_bid, best_ask
 
