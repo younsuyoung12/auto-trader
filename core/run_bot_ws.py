@@ -153,7 +153,7 @@ START_TS: float = time.time()
 RUNNING: bool = True
 
 ENTRY_REQUIRED_TFS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
-ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 200, "5m": 200, "15m": 200, "1h": 200, "4h": 200}
+ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 60, "5m": 60, "15m": 60, "1h": 60, "4h": 60}
 
 _LAST_ENTRY_BLOCK_TG_TS: float = 0.0
 _LAST_ENTRY_BLOCK_KEY: str = ""
