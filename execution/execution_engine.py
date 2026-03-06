@@ -16,6 +16,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
 - 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
 
+PATCH NOTES — 2026-03-07 (TRADE-GRADE)
+- POSITION 이벤트 기록 보강(STRICT):
+  - 실제 진입 성공 후 bt_events 에 event_type="POSITION" 이벤트를 추가 기록
+  - TEST_DRY_RUN 경로도 is_test=True POSITION 이벤트를 기록
+  - 기존 주문/DB/알림/리턴 흐름은 변경하지 않음
+  - 대시보드 /api/position/current 의 STRICT 조회 입력을 충족하도록 최소 이벤트만 추가
+
 PATCH NOTES — 2026-03-06 (TRADE-GRADE)
 - DECISION 이벤트 연결(STRICT):
   - NO_ENTRY / ENTRY 의사결정 이벤트를 bt_events 에 기록
@@ -26,7 +33,7 @@ PATCH NOTES — 2026-03-04 (TRADE-GRADE)
 - Invariant Guard 연결(STRICT):
   - ENTER 흐름에서 meta/signal 수학 무결성(0..1/finite/필수키)을 execute() 초기에 검증
   - notional/qty/slippage/spread 등 실행 수학값을 hard_risk_guard_check 이전에 재검증
-  - 위반 시 폴백 없이 즉시 OrderFailed로 중단
+  - 위반 시 폴백 없이 즉시 OrderFailed 로 중단
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
 - ENV 직접 접근 제거(SSOT 준수):
@@ -65,6 +72,10 @@ PATCH NOTES — 2026-03-02 (FIX)
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-07:
+  1) POSITION 이벤트 기록 누락 수정
+     - 실제 체결/TEST_DRY_RUN 양쪽 경로에 POSITION 이벤트 기록 추가
+  2) 기존 주문/DB/알림/리턴 기능 변경 없음
 - 2026-03-06:
   1) 보호주문 검증 연동 강화
      - order_executor 의 TP/SL 실가시성 검증 결과를 execution_engine 에서 필수 필드로 재검증
@@ -425,6 +436,112 @@ def _emit_decision_event_strict(
         qty=(float(position_qty) if position_qty is not None else None),
         reason=reason_code_s,
         extra_json=payload,
+    )
+
+
+def _emit_position_event_strict(
+    *,
+    symbol: str,
+    regime: str,
+    direction: str,
+    signal_source: str,
+    entry_price: float,
+    position_qty: float,
+    leverage: float,
+    tp_pct: float,
+    sl_pct: float,
+    allocation_ratio: float,
+    trade_id: Optional[int],
+    entry_order_id: Optional[str],
+    tp_order_id: Optional[str],
+    sl_order_id: Optional[str],
+    exchange_position_side: str,
+    remaining_qty: float,
+    realized_pnl_usdt: float,
+    reconciliation_status: str,
+    entry_ts: datetime,
+    entry_client_order_id: str,
+    reason: str,
+    is_test: bool = False,
+) -> None:
+    symbol_s = _require_nonempty_str(symbol, "position.symbol").upper()
+    regime_s = _require_nonempty_str(regime, "position.regime")
+    direction_s = _require_nonempty_str(direction, "position.direction").upper()
+    signal_source_s = _require_nonempty_str(signal_source, "position.signal_source")
+    exchange_position_side_s = _require_nonempty_str(
+        exchange_position_side,
+        "position.exchange_position_side",
+    ).upper()
+    reconciliation_status_s = _require_nonempty_str(
+        reconciliation_status,
+        "position.reconciliation_status",
+    ).upper()
+    reason_s = _require_nonempty_str(reason, "position.reason")
+    entry_client_order_id_s = _require_nonempty_str(
+        entry_client_order_id,
+        "position.entry_client_order_id",
+    )
+
+    if direction_s not in ("LONG", "SHORT"):
+        raise OrderFailed("position.direction must be LONG or SHORT (STRICT)")
+    if exchange_position_side_s not in ("BOTH", "LONG", "SHORT"):
+        raise OrderFailed("position.exchange_position_side must be BOTH/LONG/SHORT (STRICT)")
+    if not isinstance(entry_ts, datetime) or entry_ts.tzinfo is None or entry_ts.tzinfo.utcoffset(entry_ts) is None:
+        raise OrderFailed("position.entry_ts must be tz-aware datetime (STRICT)")
+
+    entry_price_f = float(_as_float(entry_price, "position.entry_price", min_value=0.0))
+    position_qty_f = float(_as_float(position_qty, "position.position_qty", min_value=0.0))
+    leverage_f = float(_as_float(leverage, "position.leverage", min_value=1.0))
+    tp_pct_f = float(_as_float(tp_pct, "position.tp_pct", min_value=0.0, max_value=1.0))
+    sl_pct_f = float(_as_float(sl_pct, "position.sl_pct", min_value=0.0, max_value=1.0))
+    allocation_ratio_f = float(
+        _as_float(
+            allocation_ratio,
+            "position.allocation_ratio",
+            min_value=0.0,
+            max_value=1.0,
+        )
+    )
+    remaining_qty_f = float(_as_float(remaining_qty, "position.remaining_qty", min_value=0.0))
+    realized_pnl_usdt_f = float(_as_float(realized_pnl_usdt, "position.realized_pnl_usdt"))
+
+    if entry_price_f <= 0:
+        raise OrderFailed("position.entry_price must be > 0 (STRICT)")
+    if position_qty_f <= 0:
+        raise OrderFailed("position.position_qty must be > 0 (STRICT)")
+    if remaining_qty_f <= 0:
+        raise OrderFailed("position.remaining_qty must be > 0 (STRICT)")
+
+    extra_json: Dict[str, Any] = {
+        "state": "OPEN",
+        "signal_source": signal_source_s,
+        "trade_id": (int(trade_id) if trade_id is not None else None),
+        "entry_order_id": (entry_order_id.strip() if isinstance(entry_order_id, str) and entry_order_id.strip() else None),
+        "tp_order_id": (tp_order_id.strip() if isinstance(tp_order_id, str) and tp_order_id.strip() else None),
+        "sl_order_id": (sl_order_id.strip() if isinstance(sl_order_id, str) and sl_order_id.strip() else None),
+        "entry_client_order_id": entry_client_order_id_s,
+        "exchange_position_side": exchange_position_side_s,
+        "remaining_qty": remaining_qty_f,
+        "realized_pnl_usdt": realized_pnl_usdt_f,
+        "reconciliation_status": reconciliation_status_s,
+        "entry_ts": entry_ts.astimezone(timezone.utc).isoformat(),
+    }
+
+    log_event(
+        "POSITION",
+        symbol=symbol_s,
+        regime=regime_s,
+        source="execution_engine.position",
+        side=direction_s,
+        price=entry_price_f,
+        qty=position_qty_f,
+        leverage=leverage_f,
+        tp_pct=tp_pct_f,
+        sl_pct=sl_pct_f,
+        risk_pct=allocation_ratio_f,
+        reason=reason_s,
+        extra_json=extra_json,
+        is_test=bool(is_test),
     )
 
 
@@ -1430,6 +1547,31 @@ class ExecutionEngine:
                     last_synced_at=entry_ts_dt_sim,
                 )
 
+                _emit_position_event_strict(
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    entry_price=float(entry_price_sim),
+                    position_qty=float(entry_qty_sim),
+                    leverage=float(leverage),
+                    tp_pct=float(tp_pct),
+                    sl_pct=float(sl_pct),
+                    allocation_ratio=float(allocation_ratio),
+                    trade_id=int(trade_id),
+                    entry_order_id=None,
+                    tp_order_id=None,
+                    sl_order_id=None,
+                    exchange_position_side="BOTH",
+                    remaining_qty=float(entry_qty_sim),
+                    realized_pnl_usdt=0.0,
+                    reconciliation_status="TEST_DRY_RUN",
+                    entry_ts=entry_ts_dt_sim,
+                    entry_client_order_id=str(entry_client_order_id),
+                    reason="position_opened_simulated",
+                    is_test=True,
+                )
+
                 snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price_sim))
 
                 record_trade_snapshot(
@@ -1629,6 +1771,31 @@ class ExecutionEngine:
             )
 
             setattr(trade, "id", int(trade_id))
+
+            _emit_position_event_strict(
+                symbol=symbol,
+                regime=regime,
+                direction=direction,
+                signal_source=signal_source,
+                entry_price=float(entry_price),
+                position_qty=float(entry_qty),
+                leverage=float(leverage),
+                tp_pct=float(tp_pct),
+                sl_pct=float(sl_pct),
+                allocation_ratio=float(allocation_ratio),
+                trade_id=int(trade_id),
+                entry_order_id=str(entry_order_id),
+                tp_order_id=str(tp_order_id),
+                sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
+                exchange_position_side=str(pos_side),
+                remaining_qty=float(remaining_qty),
+                realized_pnl_usdt=float(realized_pnl_usdt),
+                reconciliation_status="PROTECTION_VERIFIED",
+                entry_ts=entry_ts_dt,
+                entry_client_order_id=str(entry_client_order_id),
+                reason="position_opened",
+                is_test=False,
+            )
 
             snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price))
 

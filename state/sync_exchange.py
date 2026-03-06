@@ -23,6 +23,13 @@ sync_exchange.py (Binance USDT-M Futures 전용, 거래소 상태 동기화 + DB
 - TP/SL 보호 주문은 reduceOnly=True 또는 closePosition=True +
   (STOP_MARKET / TAKE_PROFIT_MARKET)로 운영한다.
 
+PATCH NOTES — 2026-03-07
+--------------------------------------------------------
+- POSITION 이벤트 기록 보강(STRICT):
+  - 거래소 ↔ DB 정합 성공 후 bt_events 에 event_type="POSITION" 을 추가 기록
+  - 엔진 재시작/복구 직후에도 대시보드 /api/position/current 가 읽을 수 있는 기준 이벤트를 남긴다
+  - 기존 정합/복구/메모리 Trade 재구성 로직은 변경하지 않음
+
 PATCH NOTES — 2026-03-02
 --------------------------------------------------------
 - execution/sync_exchange.py 위치 금지 → state/sync_exchange.py 로 고정
@@ -37,6 +44,10 @@ PATCH NOTES — 2026-03-02
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-07:
+  1) POSITION 이벤트 기록 추가
+     - sync 성공 직후 source="sync_exchange" POSITION 이벤트 저장
+  2) 기존 정합/복구 기능 변경 없음
 - 2026-03-06:
   1) 거래소 포지션 집계 로직 강화
      - 동일 방향 다중 row를 live[0]로 선택하지 않고 전체 합산
@@ -50,7 +61,6 @@ PATCH NOTES — 2026-03-02
 - 2026-03-06:
   1) 보호주문 정합 강화
      - TP, SL 둘 다 필수 보호 주문으로 강제
-     - 거래소 보호주문 누락 시 즉시 MISMATCH 상태 기록 후 예외
   2) reconciliation_status 정합 변경
      - OK → PROTECTION_VERIFIED 로 승격
   3) DB/메모리 정합 강화
@@ -64,6 +74,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from events.signals_logger import log_event
 from execution.exchange_api import fetch_open_orders, fetch_open_positions
 from infra.telelog import log, send_tg
 from state.db_core import SessionLocal
@@ -205,6 +216,86 @@ def _set_db_mismatch_and_commit(session, db_trade: TradeORM, *, status: str) -> 
     db_trade.last_synced_at = _utc_now()
     session.add(db_trade)
     session.commit()
+
+
+def _emit_position_sync_event_strict(
+    *,
+    symbol: str,
+    db_trade: TradeORM,
+    pos_dir: str,
+    abs_qty: float,
+    entry_price: float,
+    tp_price: Optional[float],
+    sl_price: Optional[float],
+) -> None:
+    symbol_s = _normalize_symbol(symbol)
+    pos_dir_s = _require_nonempty_str(pos_dir, "pos_dir").upper()
+    if pos_dir_s not in ("LONG", "SHORT"):
+        raise RuntimeError(f"invalid pos_dir (STRICT): {pos_dir_s!r}")
+
+    if abs_qty <= 0:
+        raise RuntimeError("abs_qty must be > 0 (STRICT)")
+    if entry_price <= 0:
+        raise RuntimeError("entry_price must be > 0 (STRICT)")
+
+    regime = _require_nonempty_str(db_trade.regime_at_entry, "bt_trades.regime_at_entry")
+    strategy = _require_nonempty_str(db_trade.strategy, "bt_trades.strategy")
+    exchange_position_side = _normalize_position_side_raw(
+        db_trade.exchange_position_side,
+        default_both=True,
+    )
+    reconciliation_status = _require_nonempty_str(
+        db_trade.reconciliation_status,
+        "bt_trades.reconciliation_status",
+    ).upper()
+    remaining_qty = _safe_float_strict(db_trade.remaining_qty, "bt_trades.remaining_qty")
+    if remaining_qty <= 0:
+        raise RuntimeError("bt_trades.remaining_qty must be > 0 (STRICT)")
+
+    realized_pnl_usdt = 0.0
+    if db_trade.realized_pnl_usdt is not None:
+        realized_pnl_usdt = _safe_float_strict(
+            db_trade.realized_pnl_usdt,
+            "bt_trades.realized_pnl_usdt",
+        )
+
+    leverage = _safe_positive_int_strict(db_trade.leverage, "bt_trades.leverage")
+    tp_pct = _safe_float_strict(db_trade.tp_pct, "bt_trades.tp_pct")
+    sl_pct = _safe_float_strict(db_trade.sl_pct, "bt_trades.sl_pct")
+    risk_pct = _safe_float_strict(db_trade.risk_pct, "bt_trades.risk_pct")
+    entry_ts = _require_tz_aware_datetime(db_trade.entry_ts, "bt_trades.entry_ts")
+
+    extra_json: Dict[str, Any] = {
+        "state": "OPEN",
+        "strategy": strategy,
+        "trade_id": int(db_trade.id),
+        "entry_order_id": (str(db_trade.entry_order_id) if db_trade.entry_order_id is not None else None),
+        "tp_order_id": (str(db_trade.tp_order_id) if db_trade.tp_order_id is not None else None),
+        "sl_order_id": (str(db_trade.sl_order_id) if db_trade.sl_order_id is not None else None),
+        "exchange_position_side": exchange_position_side,
+        "remaining_qty": float(remaining_qty),
+        "realized_pnl_usdt": float(realized_pnl_usdt),
+        "reconciliation_status": reconciliation_status,
+        "entry_ts": entry_ts.astimezone(timezone.utc).isoformat(),
+        "tp_price": (float(tp_price) if tp_price is not None else None),
+        "sl_price": (float(sl_price) if sl_price is not None else None),
+    }
+
+    log_event(
+        "POSITION",
+        symbol=symbol_s,
+        regime=regime,
+        source="sync_exchange",
+        side=pos_dir_s,
+        price=float(entry_price),
+        qty=float(abs_qty),
+        leverage=float(leverage),
+        tp_pct=float(tp_pct),
+        sl_pct=float(sl_pct),
+        risk_pct=float(risk_pct),
+        reason="position_synced",
+        extra_json=extra_json,
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -557,6 +648,16 @@ def sync_open_trades_from_exchange(
             sl_id=sl_id,
         )
         session.commit()
+
+        _emit_position_sync_event_strict(
+            symbol=sym,
+            db_trade=db_open,
+            pos_dir=pos_dir,
+            abs_qty=abs_qty,
+            entry_price=entry_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+        )
 
         rebuilt = _build_mem_trade_strict(
             db_trade=db_open,

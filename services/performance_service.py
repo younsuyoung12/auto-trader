@@ -36,8 +36,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - gross_loss_abs_usdt = 0 인 경우 profit_factor는 정의되지 않으므로 None 반환.
 - peak_equity <= 0 인 구간의 drawdown_pct는 정의되지 않으므로 None 반환.
 
+PATCH NOTES — 2026-03-07 (TRADE-GRADE)
+--------------------------------------------------------
+- v_trades_prod 스키마/데이터 진단 강화
+  1) information_schema 기준 필수 컬럼(id / exit_ts / pnl_usdt) 존재 검증 추가
+  2) "뷰 자체가 비었는지" vs "행은 있는데 종료거래(exit_ts IS NOT NULL)가 없는지"를 구분해서 즉시 예외
+  3) 최근 N일 daily pnl 부재 시에도 전체 종료거래 존재 여부를 먼저 검증하여 원인 메시지 명확화
+- 기존 계산 로직(summary / equity / drawdown / daily pnl)은 변경하지 않음
+
 변경 이력
 --------------------------------------------------------
+- 2026-03-07:
+  1) v_trades_prod 스키마 검증 추가
+  2) 종료거래 부재 원인 메시지 세분화
+  3) 기존 성과 계산 기능 변경 없음
 - 2026-03-06:
   1) 신규 생성: 성과 분석 서비스 추가
   2) summary / equity curve / drawdown curve / daily pnl 계산 기능 추가
@@ -50,10 +62,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+
+_REQUIRED_V_TRADES_PROD_COLUMNS: Set[str] = {"id", "exit_ts", "pnl_usdt"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,9 +183,50 @@ def _normalize_closed_trade_row(row: Mapping[str, Any]) -> ClosedTradePoint:
     )
 
 
+def _assert_v_trades_prod_required_columns(db: Session) -> None:
+    if db is None:
+        raise RuntimeError("db session is required (STRICT)")
+
+    sql = text(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'v_trades_prod'
+          AND table_schema = ANY(current_schemas(false))
+        """
+    )
+    rows = db.execute(sql).mappings().all()
+    if not rows:
+        raise RuntimeError("v_trades_prod schema not found in current_schemas(false) (STRICT)")
+
+    present = {str(row.get("column_name", "")).strip() for row in rows}
+    missing = sorted(_REQUIRED_V_TRADES_PROD_COLUMNS - present)
+    if missing:
+        raise RuntimeError(f"v_trades_prod missing required columns (STRICT): {missing}")
+
+
+def _count_v_trades_prod_rows(db: Session) -> int:
+    sql = text("SELECT COUNT(*) AS cnt FROM v_trades_prod")
+    row = db.execute(sql).mappings().one()
+    cnt_raw = row.get("cnt")
+    if cnt_raw is None:
+        raise RuntimeError("COUNT(*) from v_trades_prod returned NULL (STRICT)")
+    if isinstance(cnt_raw, bool):
+        raise RuntimeError("COUNT(*) from v_trades_prod must be int, bool not allowed (STRICT)")
+    try:
+        cnt = int(cnt_raw)
+    except Exception as exc:
+        raise RuntimeError(f"COUNT(*) from v_trades_prod must be int (STRICT): {exc}") from exc
+    if cnt < 0:
+        raise RuntimeError("COUNT(*) from v_trades_prod must be >= 0 (STRICT)")
+    return cnt
+
+
 def _fetch_closed_trades(db: Session) -> List[ClosedTradePoint]:
     if db is None:
         raise RuntimeError("db session is required (STRICT)")
+
+    _assert_v_trades_prod_required_columns(db)
 
     sql = text(
         """
@@ -185,7 +241,10 @@ def _fetch_closed_trades(db: Session) -> List[ClosedTradePoint]:
     )
     rows = db.execute(sql).mappings().all()
     if not rows:
-        raise RuntimeError("closed trade not found in v_trades_prod (STRICT)")
+        total_rows = _count_v_trades_prod_rows(db)
+        if total_rows <= 0:
+            raise RuntimeError("v_trades_prod is empty (STRICT)")
+        raise RuntimeError("v_trades_prod has rows but no closed trades with exit_ts IS NOT NULL (STRICT)")
 
     out: List[ClosedTradePoint] = []
     for row in rows:
@@ -330,6 +389,8 @@ def get_daily_pnl_series(db: Session, *, days: int = 30) -> List[Dict[str, Any]]
         raise RuntimeError("db session is required (STRICT)")
 
     normalized_days = _require_int(days, "days")
+    _assert_v_trades_prod_required_columns(db)
+
     sql = text(
         """
         SELECT
@@ -345,7 +406,10 @@ def get_daily_pnl_series(db: Session, *, days: int = 30) -> List[Dict[str, Any]]
     )
     rows = db.execute(sql, {"days": normalized_days}).mappings().all()
     if not rows:
-        raise RuntimeError("daily pnl series not found (STRICT)")
+        closed_trades = _fetch_closed_trades(db)
+        if not closed_trades:
+            raise RuntimeError("daily pnl series not found because closed trades do not exist (STRICT)")
+        raise RuntimeError(f"daily pnl series not found in last {normalized_days} days (STRICT)")
 
     out: List[Dict[str, Any]] = []
     for row in rows:

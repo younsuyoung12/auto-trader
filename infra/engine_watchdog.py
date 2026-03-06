@@ -32,8 +32,18 @@ STRICT 정책
   - 이상 감지 시: DB 이벤트 기록 + (옵션) on_fatal 콜백 호출(엔진 SAFE_STOP 트리거용).
   - 모듈 자체 오류 시: watchdog_internal_error 기록 후 on_fatal 호출.
 
+PATCH NOTES — 2026-03-07 (TRADE-GRADE)
+- WATCHDOG source 필드 보강(STRICT):
+  - bt_events 기록 시 source="engine_watchdog" 를 명시적으로 저장
+  - 대시보드 system_monitor 의 STRICT source 검증 통과 목적
+  - 기존 Watchdog 판정/루프/콜백/DB 기록 흐름은 변경하지 않음
+
 변경 이력
 --------------------------------------------------------
+- 2026-03-07:
+  1) WATCHDOG 이벤트 source 공란 저장 문제 수정
+     - _safe_event() 에서 source="engine_watchdog" 명시
+  2) 기존 기능 변경 없음
 - 2026-03-06:
   1) 신규 생성: 런타임 엔진 진단(Watchdog) 스레드 추가
   2) bt_events 로 저장하여 대시보드에서 “지속 감시” 가능하게 설계
@@ -162,7 +172,8 @@ def _safe_event(symbol: str, reason: str, extra: Dict[str, Any]) -> None:
     log_event(
         event_type="WATCHDOG",
         symbol=str(symbol),
-        side="CLOSE",   # ← 추가 (STRICT 요구)
+        source="engine_watchdog",
+        side="CLOSE",
         reason=str(reason),
         extra_json=dict(extra),
     )
@@ -210,7 +221,6 @@ def _check_ws_klines_strict(
         if not isinstance(buf, list):
             raise RuntimeError(f"ws kline buffer invalid type (STRICT): tf={tf} type={type(buf).__name__}")
         if len(buf) < min_buf:
-            # len 부족 자체가 “WS delay / not ready”에 해당
             lens[tf] = int(len(buf))
             last_ts[tf] = int(buf[-1][0]) if buf else 0
             ages[tf] = int(now_ms - last_ts[tf]) if last_ts[tf] > 0 else -1
@@ -226,13 +236,10 @@ def _check_ws_klines_strict(
             raise RuntimeError(f"kline rollback detected (STRICT): tf={tf} prev={prev} now={ts_ms}")
         last_seen[tf] = int(ts_ms)
 
-        # staleness: (interval_ms + delay_ms)
         allowed = _interval_ms(tf) + delay_ms
         if ages[tf] < 0:
             raise RuntimeError(f"kline ts in future (STRICT): tf={tf} age_ms={ages[tf]}")
         if ages[tf] > allowed:
-            # stale 자체는 “엔진 차단 사유”로 기록
-            # (여기서 즉시 예외로 올려도 되지만, reason을 명확히 남기기 위해 상위에서 처리)
             pass
 
     return lens, last_ts, ages
@@ -247,22 +254,18 @@ def _check_orderbook_strict(
     if not isinstance(ob, dict) or not ob:
         return False, None, None
 
-    # ts 추출(STRICT)
     ts_ms: Optional[int] = None
     if ob.get("exchTs") is not None:
         ts_ms = _positive_int(ob.get("exchTs"), "orderbook.exchTs")
     elif ob.get("ts") is not None:
         ts_ms = _positive_int(ob.get("ts"), "orderbook.ts")
 
-    # 무결성 검사
     try:
-        # require_ts: ts_ms가 있으면 True로 강제, 없으면 False로라도 구조검증
         validate_orderbook_strict(ob, symbol=str(symbol), require_ts=bool(ts_ms))
     except DataIntegrityError:
         return False, ts_ms, None
 
     if ts_ms is None:
-        # ts 자체가 없으면 “지연 측정 불가”이므로 fail로 취급
         return False, None, None
 
     age = _now_ms() - int(ts_ms)
@@ -326,7 +329,6 @@ def start_watchdog(
     if not sym:
         raise RuntimeError("symbol is required (STRICT)")
 
-    # 설정값(SSOT) — 기본값 사용 시 반드시 로그로 가시화
     interval_sec = getattr(settings, "engine_watchdog_interval_sec", None)
     if interval_sec is None:
         interval_sec = 5.0
@@ -340,7 +342,6 @@ def start_watchdog(
         raise RuntimeError("settings.ws_min_kline_buffer missing (STRICT)")
     min_buf_i = _positive_int(min_buf, "settings.ws_min_kline_buffer")
 
-    # kline delay 허용치(sec)
     max_kline_delay_sec = getattr(settings, "ws_max_kline_delay_sec", None)
     if max_kline_delay_sec is None:
         max_kline_delay_sec = 120.0
@@ -349,28 +350,24 @@ def start_watchdog(
     if max_kline_delay_sec_f <= 0:
         raise RuntimeError("ws_max_kline_delay_sec must be > 0 (STRICT)")
 
-    # orderbook age(ms)
     max_ob_age_ms = getattr(settings, "max_orderbook_age_ms", None)
     if max_ob_age_ms is None:
         max_ob_age_ms = 3000
         log(f"[WATCHDOG][DEFAULT] settings.max_orderbook_age_ms missing -> using {max_ob_age_ms}ms")
     max_ob_age_ms_i = _positive_int(max_ob_age_ms, "settings.max_orderbook_age_ms")
 
-    # DB ping(ms)
     max_db_ping_ms = getattr(settings, "engine_watchdog_max_db_ping_ms", None)
     if max_db_ping_ms is None:
         max_db_ping_ms = 1500
         log(f"[WATCHDOG][DEFAULT] settings.engine_watchdog_max_db_ping_ms missing -> using {max_db_ping_ms}ms")
     max_db_ping_ms_i = _positive_int(max_db_ping_ms, "settings.engine_watchdog_max_db_ping_ms")
 
-    # 이벤트 저장 최소 간격(같은 상태 반복 기록 제한)
     emit_min_sec = getattr(settings, "engine_watchdog_emit_min_sec", None)
     if emit_min_sec is None:
         emit_min_sec = 30
         log(f"[WATCHDOG][DEFAULT] settings.engine_watchdog_emit_min_sec missing -> using {emit_min_sec}s")
     emit_min_sec_i = _positive_int(emit_min_sec, "settings.engine_watchdog_emit_min_sec")
 
-    # 필수 TF
     tfs_raw = getattr(settings, "ws_subscribe_tfs", None)
     if not isinstance(tfs_raw, (list, tuple)) or not tfs_raw:
         raise RuntimeError("settings.ws_subscribe_tfs must be list-like and non-empty (STRICT)")
@@ -392,7 +389,6 @@ def start_watchdog(
                 t_loop0 = time.perf_counter()
                 checked_ms = _now_ms()
 
-                # 1) WS klines
                 lens, last_ts, ages = _check_ws_klines_strict(
                     symbol=sym,
                     tfs=tfs,
@@ -401,7 +397,6 @@ def start_watchdog(
                     last_seen=last_seen,
                 )
 
-                # staleness 판단: interval_ms + delay
                 delay_ms = int(max_kline_delay_sec_f * 1000.0)
                 stale_tfs = []
                 for tf in tfs:
@@ -413,17 +408,14 @@ def start_watchdog(
                     if age < 0 or age > allowed:
                         stale_tfs.append(tf)
 
-                # 2) Orderbook
                 ob_ok, ob_ts, ob_age = _check_orderbook_strict(symbol=sym, max_age_ms=max_ob_age_ms_i)
 
-                # 3) DB ping
                 db_ok, db_ms = _check_db_ping_strict(max_ping_ms=max_db_ping_ms_i)
 
                 loop_ms = int((time.perf_counter() - t_loop0) * 1000.0)
                 if loop_ms < 0:
                     loop_ms = 0
 
-                # 상태 결정
                 ok = (not stale_tfs) and ob_ok and db_ok
                 reason = None
                 detail: Dict[str, Any] = {
@@ -449,7 +441,7 @@ def start_watchdog(
                     if stale_tfs:
                         reason = "ws_kline_stale"
                     elif not ob_ok:
-                        reason = "ws_orderbook_stale"  # 포함: ts 없음/무결성 실패/age 초과
+                        reason = "ws_orderbook_stale"
                     elif not db_ok:
                         reason = "db_lag"
                     else:
@@ -472,23 +464,16 @@ def start_watchdog(
                 )
                 _LAST_SNAPSHOT = snap
 
-                # DB 이벤트 기록(상태 변동 또는 일정 간격)
                 key = f"{reason}|stale={','.join(stale_tfs)}|ob={int(ob_ok)}|db={int(db_ok)}"
                 if _should_emit(key, min_interval_sec=emit_min_sec_i):
                     _safe_event(sym, reason, detail)
 
-                # 치명 조건(옵션): rollback 같은 건 위에서 예외로 터진다.
-                # 여기서는 on_fatal은 “상태 기반”으로도 호출할 수 있게 한다.
-                # (원하면 엔진에서 SAFE_STOP 기준을 reason별로 다르게 둘 수 있다)
                 if (not ok) and on_fatal is not None:
-                    # 즉시 STOP을 원할지 여부는 엔진 정책(on_fatal)에서 결정.
                     on_fatal(str(reason), dict(detail))
 
-                # sleep
                 stop_evt.wait(timeout=float(interval_sec_f))
 
         except Exception as e:
-            # watchdog 자체 오류는 치명(진단기 불능) → DB 기록 + on_fatal
             msg = f"[WATCHDOG][FATAL] {type(e).__name__}: {str(e)[:240]}"
             log(msg)
             try:
@@ -498,7 +483,6 @@ def start_watchdog(
                     {"error_type": type(e).__name__, "error": str(e)[:500]},
                 )
             except Exception as e2:
-                # 이벤트 기록조차 실패하면, 마지막 수단으로 로그만 남긴다(여기서 더 진행 불가).
                 log(f"[WATCHDOG][FATAL][EVENT_WRITE_FAIL] {type(e2).__name__}: {e2}")
             if on_fatal is not None:
                 on_fatal("watchdog_internal_error", {"error_type": type(e).__name__, "error": str(e)})
