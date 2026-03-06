@@ -26,6 +26,17 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
      - TRADER_DB_URL 미설정 시 즉시 예외
      - sqlite 금지
      - Postgres 스킴만 허용(postgres:// 는 postgresql:// 로 정규화)
+
+- 2026-03-06 (TRADE-GRADE)
+  1) SQLAlchemy connection pool 명시화:
+     - pool_size=5
+     - max_overflow=5
+     - pool_timeout=30
+     - pool_recycle=1800
+     - pool_pre_ping=True
+  2) 운영 안정성 강화:
+     - DB 연결 재사용을 통해 불필요한 connect/disconnect 빈도 완화
+     - 죽은 연결 감지 및 재생성 안정화
 ========================================================
 """
 
@@ -128,8 +139,13 @@ if not _url_l.startswith(_ALLOWED_PREFIXES):
     )
 
 # SQLAlchemy Engine / Session (스키마 변경은 여기서 하지 않는다)
+# TRADE-GRADE: Render/AWS 운영 안정성을 위해 pool 설정을 명시한다.
 engine = create_engine(
     _url,
+    pool_size=5,
+    max_overflow=5,
+    pool_timeout=30,
+    pool_recycle=1800,
     pool_pre_ping=True,
     future=True,
 )
