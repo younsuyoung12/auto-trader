@@ -1262,6 +1262,11 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
 
     engine_scores = _build_engine_scores_strict(sym, timeframes, pattern_features, pattern_summary, orderbook)
 
+    result: Dict[str, Any] = dict(base)
+    result["engine_scores"] = engine_scores
+    entry_score = float(engine_scores["total"]["score"]) / 100.0
+    result["entry_score"] = entry_score
+
     # Microstructure (STRICT: required)
     micro_period, micro_lookback, micro_ttl = _load_microstructure_config(sym)
     try:

@@ -248,6 +248,18 @@ def evaluate_entry_flow_strict(
     settings: Any,
 ) -> EntryFlowDecision:
     f = _require_mapping(features, "features")
+   
+    if "entry_score" not in f:
+        raise RuntimeError("features.entry_score missing (STRICT)")
+
+    if "trend_strength" not in f:
+        raise RuntimeError("features.trend_strength missing (STRICT)")
+
+    if "spread" not in f:
+        raise RuntimeError("features.spread missing (STRICT)")
+
+    if "orderbook_imbalance" not in f:
+        raise RuntimeError("features.orderbook_imbalance missing (STRICT)")
     if settings is None:
         raise RuntimeError("settings is required (STRICT)")
 
