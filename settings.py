@@ -14,6 +14,24 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-06 (TRADE-GRADE):
+  1) 실전 운영 기본값 정비:
+     - allocation_ratio / risk_pct 기본값 1.0 → 0.35
+     - max_spread_pct 기본값 0.0008 → 0.0015
+     - slippage_block_pct 기본값 0.3 → 0.002
+     - max_exec_latency_ms 기본값 400 ↔ 2500 불일치 제거 → 2500으로 통일
+  2) Drift Detector 설정 SSOT 수용:
+     - drift_allocation_abs_jump
+     - drift_allocation_spike_ratio
+     - drift_multiplier_abs_jump
+     - drift_micro_abs_jump
+     - drift_stable_regime_steps
+  3) run_bot_ws 운영 파라미터 SSOT 확장:
+     - reconcile_confirm_n
+     - ws_klines_stale_sec
+  4) STRICT 검증 추가:
+     - spread/slippage/drift 관련 범위 검증 추가
+
 - 2026-03-04 (TRADE-GRADE):
   1) OpenAI 설정 SSOT 필드 추가:
      - openai_api_key / openai_model / openai_max_tokens / openai_temperature / openai_max_latency_sec
@@ -72,7 +90,7 @@ class Settings:
     interval: str = "5m"
 
     # Futures config
-    leverage: int = 1  # ✅ 전액 배분형 전제: 기본 1
+    leverage: int = 1  # 전액 배분형 전제였으나, 기본 allocation은 실전형으로 조정
     isolated: bool = True
     margin_mode: str = "ISOLATED"
     futures_position_mode: str = "ONEWAY"
@@ -87,10 +105,10 @@ class Settings:
     price_tick: float = 0.1
 
     # Strategy / sizing
-    # ✅ canonical: allocation_ratio(0~1) = 계좌 투입 비율
-    allocation_ratio: float = 1.0
-    # ✅ legacy alias (호환): 의미는 allocation_ratio와 동일하게 강제
-    risk_pct: float = 1.0
+    # canonical: allocation_ratio(0~1) = 계좌 투입 비율
+    allocation_ratio: float = 0.35
+    # legacy alias (호환): 의미는 allocation_ratio와 동일하게 강제
+    risk_pct: float = 0.35
 
     # Default TP/SL (signal이 이 값을 override 가능)
     tp_pct: float = 0.006
@@ -109,7 +127,7 @@ class Settings:
     # Entry/exit cadence
     entry_cooldown_sec: float = 8.0
     cooldown_after_close: float = 3.0
-    min_entry_score_for_gpt: float = 28
+    min_entry_score_for_gpt: float = 28.0
     gpt_entry_cooldown_sec: float = 10.0
 
     # GPT safety (legacy fields kept)
@@ -121,9 +139,7 @@ class Settings:
     # ─────────────────────────────────────────────
     # OpenAI (SSOT) — TRADE-GRADE
     # ─────────────────────────────────────────────
-    # NOTE: OPENAI_API_KEY는 반드시 존재해야 한다(Preflight에서 강제).
     openai_api_key: str = ""
-    # NOTE: 모델은 반드시 명시되어야 한다(OPENAI_MODEL 또는 alias env로 설정).
     openai_model: str = ""
     openai_max_tokens: int = 1500
     openai_temperature: float = 0.2
@@ -157,14 +173,14 @@ class Settings:
     ws_combined_base: str = "wss://fstream.binance.com/stream?streams="
     ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-    # PRE-FLIGHT WS bootstrap timeout
-    preflight_ws_wait_sec = 60
+    preflight_ws_wait_sec: int = 60
     ws_min_kline_buffer: int = 60
     ws_max_kline_delay_sec: float = 120.0
     ws_orderbook_max_delay_sec: float = 10.0
     ws_log_enabled: bool = False
     ws_log_interval_sec: int = 60
     ws_stale_reset_sec: float = 600.0
+    ws_klines_stale_sec: float = 180.0
 
     # WS bootstrap/backfill (run_bot_ws)
     ws_backfill_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
@@ -176,9 +192,9 @@ class Settings:
     md_store_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
 
     # Guards (entry_guards_ws)
-    max_spread_pct: float = 0.0008
+    max_spread_pct: float = 0.0015
     max_spread_abs: float = 0.0
-    min_entry_volume_ratio: float = 0.3
+    min_entry_volume_ratio: float = 0.15
     max_price_jump_pct: float = 0.003
     max_5m_delay_ms: int = 10 * 60 * 1000
     max_orderbook_age_ms: int = 3000
@@ -207,16 +223,24 @@ class Settings:
     sigterm_grace_sec: int = 30
     allow_start_without_leverage_setup: bool = False
 
-    # 10점 근접(최소 변경) 운영 파라미터
+    # 운영 파라미터
     async_worker_threads: int = 1
     async_worker_queue_size: int = 2000
     reconcile_interval_sec: int = 30
+    reconcile_confirm_n: int = 3
     force_close_on_desync: bool = False
     max_signal_latency_ms: int = 200
-    max_exec_latency_ms: int = 400
+    max_exec_latency_ms: int = 2500
 
     # run_bot_ws: exchange state resync
     position_resync_sec: float = 20.0
+
+    # Drift detector (SSOT)
+    drift_allocation_abs_jump: float = 0.45
+    drift_allocation_spike_ratio: float = 3.0
+    drift_multiplier_abs_jump: float = 0.50
+    drift_micro_abs_jump: float = 40.0
+    drift_stable_regime_steps: int = 100
 
     # Exchange endpoints
     binance_futures_base: str = "https://fapi.binance.com"
@@ -232,24 +256,23 @@ class Settings:
     hard_liquidation_distance_pct_min: float = 0.0
 
     # Slippage / protection
-    slippage_block_pct: float = 0.3
+    # fraction 기준: 0.002 = 0.2%
+    slippage_block_pct: float = 0.002
     slippage_stop_engine: bool = False
     protection_mode_enabled: bool = True
 
-    # 9점대 운영형 실행/멱등성/체결 확정
+    # 실행/멱등성/체결 확정
     require_deterministic_client_order_id: bool = True
     entry_fill_wait_sec: float = 2.0
     max_entry_slippage_pct: Optional[float] = None  # None이면 비활성
 
-    # ─────────────────────────────────────────────
     # TEST controls (TRADE-GRADE)
-    # ─────────────────────────────────────────────
     test_dry_run: bool = False
     test_bypass_guards: bool = False
     test_force_enter: bool = False
     test_fake_available_usdt: float = 0.0
 
-    preflight_ws_wait_sec = 60
+
 # Backward-compatible alias for legacy type hints
 BotSettings = Settings
 
@@ -502,25 +525,65 @@ def _validate_settings(s: Settings) -> None:
     if not (0.0 <= s.hard_liquidation_distance_pct_min <= 100.0):
         raise ValueError("hard_liquidation_distance_pct_min must be within 0..100")
 
+    if not (0.0 <= float(s.max_spread_pct) <= 1.0):
+        raise ValueError("max_spread_pct must be within 0..1 (fraction)")
+    if float(s.max_spread_abs) < 0:
+        raise ValueError("max_spread_abs must be >= 0")
+    if float(s.min_entry_volume_ratio) < 0:
+        raise ValueError("min_entry_volume_ratio must be >= 0")
+    if not (0.0 <= float(s.max_price_jump_pct) <= 1.0):
+        raise ValueError("max_price_jump_pct must be within 0..1 (fraction)")
+    if s.max_5m_delay_ms < 1:
+        raise ValueError("max_5m_delay_ms must be >= 1")
+    if s.max_orderbook_age_ms < 1:
+        raise ValueError("max_orderbook_age_ms must be >= 1")
+    if float(s.min_bbo_notional_usdt) < 0:
+        raise ValueError("min_bbo_notional_usdt must be >= 0")
+
+    if float(s.depth_imbalance_min_notional) < 0:
+        raise ValueError("depth_imbalance_min_notional must be >= 0")
+    if float(s.depth_imbalance_min_ratio) <= 0:
+        raise ValueError("depth_imbalance_min_ratio must be > 0")
+
+    if not (0.0 <= float(s.price_deviation_max_pct) <= 1.0):
+        raise ValueError("price_deviation_max_pct must be within 0..1 (fraction)")
+
     if s.slippage_block_pct < 0:
         raise ValueError("slippage_block_pct must be >= 0")
-
+    if s.slippage_block_pct > 1.0:
+        raise ValueError("slippage_block_pct must be <= 1.0 (fraction)")
     if s.sigterm_grace_sec <= 0:
         raise ValueError("sigterm_grace_sec must be > 0")
 
-    # 10점 근접(최소 변경) 운영 파라미터
+    # 운영 파라미터
     if s.async_worker_threads < 1:
         raise ValueError("async_worker_threads must be >= 1")
     if s.async_worker_queue_size < 1:
         raise ValueError("async_worker_queue_size must be >= 1")
     if s.reconcile_interval_sec < 1:
         raise ValueError("reconcile_interval_sec must be >= 1")
+    if s.reconcile_confirm_n < 1:
+        raise ValueError("reconcile_confirm_n must be >= 1")
     if s.max_signal_latency_ms < 1:
         raise ValueError("max_signal_latency_ms must be >= 1")
     if s.max_exec_latency_ms < 1:
         raise ValueError("max_exec_latency_ms must be >= 1")
 
     # WS bootstrap/store
+    if s.preflight_ws_wait_sec < 1:
+        raise ValueError("preflight_ws_wait_sec must be >= 1")
+    if s.ws_min_kline_buffer < 1:
+        raise ValueError("ws_min_kline_buffer must be >= 1")
+    if s.ws_max_kline_delay_sec <= 0:
+        raise ValueError("ws_max_kline_delay_sec must be > 0")
+    if s.ws_orderbook_max_delay_sec <= 0:
+        raise ValueError("ws_orderbook_max_delay_sec must be > 0")
+    if s.ws_log_interval_sec < 1:
+        raise ValueError("ws_log_interval_sec must be >= 1")
+    if s.ws_stale_reset_sec <= 0:
+        raise ValueError("ws_stale_reset_sec must be > 0")
+    if s.ws_klines_stale_sec <= 30:
+        raise ValueError("ws_klines_stale_sec must be > 30")
     if s.ws_backfill_limit < 1:
         raise ValueError("ws_backfill_limit must be >= 1")
     if s.md_store_flush_sec <= 0:
@@ -530,7 +593,19 @@ def _validate_settings(s: Settings) -> None:
     if s.position_resync_sec <= 0:
         raise ValueError("position_resync_sec must be > 0")
 
-    # 9점대 운영형
+    # Drift detector
+    if not (0.0 < float(s.drift_allocation_abs_jump) <= 1.0):
+        raise ValueError("drift_allocation_abs_jump must be within (0,1]")
+    if float(s.drift_allocation_spike_ratio) <= 1.0:
+        raise ValueError("drift_allocation_spike_ratio must be > 1.0")
+    if not (0.0 < float(s.drift_multiplier_abs_jump) <= 1.0):
+        raise ValueError("drift_multiplier_abs_jump must be within (0,1]")
+    if not (0.0 < float(s.drift_micro_abs_jump) <= 100.0):
+        raise ValueError("drift_micro_abs_jump must be within (0,100]")
+    if s.drift_stable_regime_steps < 2:
+        raise ValueError("drift_stable_regime_steps must be >= 2")
+
+    # 실행/멱등성
     if not isinstance(s.require_deterministic_client_order_id, bool):
         raise ValueError("require_deterministic_client_order_id must be bool")
 
@@ -554,10 +629,14 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("openai_max_tokens must be within 1..4096")
     if not (0.0 <= float(s.openai_temperature) <= 2.0):
         raise ValueError("openai_temperature must be within 0..2")
-    if not (isinstance(s.openai_max_latency_sec, (int, float)) and math.isfinite(float(s.openai_max_latency_sec)) and float(s.openai_max_latency_sec) > 0):
+    if not (
+        isinstance(s.openai_max_latency_sec, (int, float))
+        and math.isfinite(float(s.openai_max_latency_sec))
+        and float(s.openai_max_latency_sec) > 0
+    ):
         raise ValueError("openai_max_latency_sec must be finite > 0")
 
-    # TEST controls (TRADE-GRADE) — 운영 사고 방지
+    # TEST controls (TRADE-GRADE)
     if s.test_bypass_guards and not s.test_dry_run:
         raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
     if s.test_force_enter and not s.test_dry_run:
@@ -599,12 +678,12 @@ def load_settings() -> Settings:
     min_qty = _as_float("MIN_QTY", 0.001)
     price_tick = _as_float("PRICE_TICK", 0.1)
 
-    # ✅ allocation_ratio: ALLOCATION_RATIO 우선, 없으면 RISK_PCT(호환)
+    # allocation_ratio: ALLOCATION_RATIO 우선, 없으면 RISK_PCT(호환)
     alloc_env = _as_float_opt("ALLOCATION_RATIO")
     risk_env = _as_float_opt("RISK_PCT")
 
     if alloc_env is None and risk_env is None:
-        allocation_ratio = 1.0
+        allocation_ratio = 0.35
     elif alloc_env is not None:
         allocation_ratio = float(alloc_env)
         if risk_env is not None and abs(float(risk_env) - allocation_ratio) > 1e-12:
@@ -625,10 +704,10 @@ def load_settings() -> Settings:
     max_sl_pct = _as_float("MAX_SL_PCT", 0.015)
     max_trade_qty = _as_float("MAX_TRADE_QTY", 1.0)
 
-    entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 5.0)
+    entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 8.0)
     cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
 
-    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 28)
+    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 28.0)
     gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 10.0)
 
     gpt_daily_call_limit = _as_int("GPT_DAILY_CALL_LIMIT", 2000)
@@ -636,7 +715,7 @@ def load_settings() -> Settings:
     gpt_min_confidence = _as_float("GPT_MIN_CONFIDENCE", 0.6)
     gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
 
-    # OpenAI (SSOT) — env alias 지원(동일 의미 필드 매핑)
+    # OpenAI (SSOT) — env alias 지원
     openai_api_key = _as_str("OPENAI_API_KEY", "")
     openai_model = (
         _as_str_opt("OPENAI_MODEL")
@@ -669,23 +748,25 @@ def load_settings() -> Settings:
 
     ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_min_kline_buffer = 120
+    preflight_ws_wait_sec = _as_int("PREFLIGHT_WS_WAIT_SEC", 60)
+    ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 60)
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_orderbook_max_delay_sec = _as_float("WS_ORDERBOOK_MAX_DELAY_SEC", 10.0)
     ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)
     ws_log_interval_sec = _as_int("WS_LOG_INTERVAL_SEC", 60)
     ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
+    ws_klines_stale_sec = _as_float("WS_KLINES_STALE_SEC", 180.0)
 
     ws_backfill_tfs = _as_csv_list("WS_BACKFILL_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_backfill_limit = 500
+    ws_backfill_limit = _as_int("WS_BACKFILL_LIMIT", 500)
 
     md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 5.0)
     ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 5.0)
     md_store_tfs = _as_csv_list("MD_STORE_TFS", ["1m", "5m", "15m"])
 
-    max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0008)
+    max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0015)
     max_spread_abs = _as_float("MAX_SPREAD_ABS", 0.0)
-    min_entry_volume_ratio = _as_float("MIN_ENTRY_VOLUME_RATIO", 0.3)
+    min_entry_volume_ratio = _as_float("MIN_ENTRY_VOLUME_RATIO", 0.15)
     max_price_jump_pct = _as_float("MAX_PRICE_JUMP_PCT", 0.003)
 
     max_5m_delay_ms = _as_int("MAX_5M_DELAY_MS", 10 * 60 * 1000)
@@ -703,7 +784,6 @@ def load_settings() -> Settings:
     session_spread_mult_eu = _as_float("SESSION_SPREAD_MULT_EU", 1.1)
     session_spread_mult_us = _as_float("SESSION_SPREAD_MULT_US", 1.2)
 
-    # ✅ 누락되었던 env 매핑 보완
     session_jump_mult_asia = _as_float("SESSION_JUMP_MULT_ASIA", 1.0)
     session_jump_mult_eu = _as_float("SESSION_JUMP_MULT_EU", 1.1)
     session_jump_mult_us = _as_float("SESSION_JUMP_MULT_US", 1.2)
@@ -715,15 +795,21 @@ def load_settings() -> Settings:
     sigterm_grace_sec = _as_int("SIGTERM_GRACE_SEC", 30)
     allow_start_without_leverage_setup = _as_bool("ALLOW_START_WITHOUT_LEVERAGE_SETUP", False)
 
-    # 10점 근접(최소 변경) 운영 파라미터
     async_worker_threads = _as_int("ASYNC_WORKER_THREADS", 1)
     async_worker_queue_size = _as_int("ASYNC_WORKER_QUEUE_SIZE", 2000)
     reconcile_interval_sec = _as_int("RECONCILE_INTERVAL_SEC", 30)
+    reconcile_confirm_n = _as_int("RECONCILE_CONFIRM_N", 3)
     force_close_on_desync = _as_bool("FORCE_CLOSE_ON_DESYNC", False)
     max_signal_latency_ms = _as_int("MAX_SIGNAL_LATENCY_MS", 200)
-    max_exec_latency_ms = 2500
+    max_exec_latency_ms = _as_int("MAX_EXEC_LATENCY_MS", 2500)
 
     position_resync_sec = _as_float("POSITION_RESYNC_SEC", 20.0)
+
+    drift_allocation_abs_jump = _as_float("DRIFT_ALLOCATION_ABS_JUMP", 0.45)
+    drift_allocation_spike_ratio = _as_float("DRIFT_ALLOCATION_SPIKE_RATIO", 3.0)
+    drift_multiplier_abs_jump = _as_float("DRIFT_MULTIPLIER_ABS_JUMP", 0.50)
+    drift_micro_abs_jump = _as_float("DRIFT_MICRO_ABS_JUMP", 40.0)
+    drift_stable_regime_steps = _as_int("DRIFT_STABLE_REGIME_STEPS", 100)
 
     binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
     binance_recv_window = recv_window_ms
@@ -734,7 +820,7 @@ def load_settings() -> Settings:
     hard_position_value_pct_cap = _as_float("HARD_POSITION_VALUE_PCT_CAP", 100.0)
     hard_liquidation_distance_pct_min = _as_float("HARD_LIQUIDATION_DISTANCE_PCT_MIN", 0.0)
 
-    slippage_block_pct = _as_float("SLIPPAGE_BLOCK_PCT", 0.3)
+    slippage_block_pct = _as_float("SLIPPAGE_BLOCK_PCT", 0.002)
     slippage_stop_engine = _as_bool("SLIPPAGE_STOP_ENGINE", False)
     protection_mode_enabled = _as_bool("PROTECTION_MODE_ENABLED", True)
 
@@ -800,12 +886,14 @@ def load_settings() -> Settings:
         ws_combined_base=ws_combined_base,
         ws_subscribe_tfs=ws_subscribe_tfs,
         ws_required_tfs=ws_required_tfs,
+        preflight_ws_wait_sec=preflight_ws_wait_sec,
         ws_min_kline_buffer=ws_min_kline_buffer,
         ws_max_kline_delay_sec=ws_max_kline_delay_sec,
         ws_orderbook_max_delay_sec=ws_orderbook_max_delay_sec,
         ws_log_enabled=ws_log_enabled,
         ws_log_interval_sec=ws_log_interval_sec,
         ws_stale_reset_sec=ws_stale_reset_sec,
+        ws_klines_stale_sec=ws_klines_stale_sec,
         ws_backfill_tfs=ws_backfill_tfs,
         ws_backfill_limit=ws_backfill_limit,
         md_store_flush_sec=md_store_flush_sec,
@@ -837,10 +925,16 @@ def load_settings() -> Settings:
         async_worker_threads=async_worker_threads,
         async_worker_queue_size=async_worker_queue_size,
         reconcile_interval_sec=reconcile_interval_sec,
+        reconcile_confirm_n=reconcile_confirm_n,
         force_close_on_desync=force_close_on_desync,
         max_signal_latency_ms=max_signal_latency_ms,
         max_exec_latency_ms=max_exec_latency_ms,
         position_resync_sec=position_resync_sec,
+        drift_allocation_abs_jump=drift_allocation_abs_jump,
+        drift_allocation_spike_ratio=drift_allocation_spike_ratio,
+        drift_multiplier_abs_jump=drift_multiplier_abs_jump,
+        drift_micro_abs_jump=drift_micro_abs_jump,
+        drift_stable_regime_steps=drift_stable_regime_steps,
         binance_futures_base=binance_futures_base,
         binance_recv_window=binance_recv_window,
         binance_http_timeout_sec=binance_http_timeout_sec,

@@ -21,44 +21,23 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
-- 2026-03-03 (TRADE-GRADE):
-  1) DB 접근 단일화:
-     - _dsn_strict() 삭제
-     - psycopg2 직접 연결 기반 bootstrap 삭제
-     - get_session + SQL(text) 기반 bootstrap으로 교체
-  2) DB DSN 폴백 제거:
-     - TRADER_DB_URL / DATABASE_URL 폴백 경로 제거(환경 직접 접근 제거)
-  3) market_data_store thread STRICT화:
-     - 루프 내부 예외 삼키기(로그 후 계속) 제거
-     - 치명 오류 시 SAFE_STOP_REQUESTED=True + TG 알림 + 예외 재-raise
-     - orderbook ts_ms now() 폴백 제거(필수 키 없으면 즉시 예외)
-  4) “조용한 default” 최소화:
-     - ws_backfill_tfs 미설정 시 required로 채우되, 명시 로그로 가시화
-
-- 2026-03-04 (TRADE-GRADE):
-  1) Data Integrity Guard 연결:
-     - WS 오더북/캔들 버퍼를 data_integrity_guard로 STRICT 검증
-     - timestamp rollback / 미래 timestamp / bestAsk<=bestBid 즉시 차단(치명)
-  2) Invariant Guard 연결:
-     - RiskPhysics 출력 및 Signal 입력을 invariant_guard로 STRICT 검증
-  3) Drift Detector 연결:
-     - allocation/multiplier/regime/micro_score_risk 급변 감지 시 SAFE_STOP + 예외 전파
-  4) SAFE_STOP 발생 오류는 “예외 전파”로 엔진 종료(조용한 복구 금지)
-
-- 2026-03-04 (TRADE-GRADE, 추가):
-  1) 메인 루프 예외 처리 구조 정비:
-     - catch-all 예외 후 sleep/continue(사실상 복구) 제거
-     - 미분류 예외는 SAFE_STOP + TG + 예외 전파로 종료(조용한 실패 금지)
-  2) WS Liveness Guard 강화:
-     - 1m 캔들 최신성(staleness) 가드 추가(기본값 사용 시 명시 로그)
-     - 연속 실패 N회 시 SAFE_STOP + 예외 전파
-  3) Balance/Equity 조회 내구성(명시적 정책):
-     - 단발 실패는 경고/스킵(로그+TG)로 처리하되,
-       연속 실패 N회 시 SAFE_STOP + 예외 전파
-  4) DESYNC 콜백은 확정(desync_confirmed=True) 시 즉시 SAFE_STOP + 예외 전파
-  5) 연속 손실 하드스탑 연결:
-     - settings.hard_consecutive_losses_limit(ENV: HARD_CONSECUTIVE_LOSSES_LIMIT) >= 1 인 경우
-       CLOSE 후 CONSEC_LOSSES가 limit 이상이면 SAFE_STOP + TG 알림 후 엔진 종료(신규 진입 차단)
+- 2026-03-06 (TRADE-GRADE):
+  1) Drift Detector 설정을 settings.py SSOT로 연결
+     - drift_allocation_abs_jump
+     - drift_allocation_spike_ratio
+     - drift_multiplier_abs_jump
+     - drift_micro_abs_jump
+     - drift_stable_regime_steps
+  2) run_bot_ws 주요 운영값을 settings.py SSOT로 직접 사용
+     - ws_klines_stale_sec
+     - reconcile_confirm_n
+     - max_signal_latency_ms
+     - max_exec_latency_ms
+     - position_resync_sec
+     - poll_fills_sec
+     - entry_cooldown_sec
+  3) 기본값 fallback/log 최소화:
+     - settings에 존재하는 값은 코드 내부 기본값으로 덮지 않음
 
 - 2026-03-05 (TRADE-GRADE):
   1) FIX: entry market_data candles_5m/candles_5m_raw 정규화
@@ -178,7 +157,7 @@ CONSEC_LOSSES: int = 0
 SAFE_STOP_REQUESTED: bool = False
 LAST_EXCHANGE_SYNC_TS: float = 0.0
 
-SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(getattr(SET, "signal_analysis_interval_sec", 60) or 60)
+SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(SET.signal_analysis_interval_sec)
 LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
@@ -350,14 +329,10 @@ def _verify_required_tfs_or_die(name: str, configured_tfs: List[str], required_t
 
 
 def _verify_ws_boot_configuration_or_die() -> None:
-    ws_subscribe_tfs = _parse_tfs(getattr(SET, "ws_subscribe_tfs", None))
+    ws_subscribe_tfs = _parse_tfs(SET.ws_subscribe_tfs)
     _verify_required_tfs_or_die("ws_subscribe_tfs", ws_subscribe_tfs, ENTRY_REQUIRED_TFS)
 
-    ws_backfill_tfs = _parse_tfs(getattr(SET, "ws_backfill_tfs", None))
-    if not ws_backfill_tfs:
-        # TRADE-GRADE: silent default 금지 → 명시 로그
-        ws_backfill_tfs = list(ENTRY_REQUIRED_TFS)
-        log(f"[BOOT][DEFAULT] ws_backfill_tfs missing -> using required={ws_backfill_tfs}")
+    ws_backfill_tfs = _parse_tfs(SET.ws_backfill_tfs)
     _verify_required_tfs_or_die("ws_backfill_tfs", ws_backfill_tfs, ENTRY_REQUIRED_TFS)
 
 
@@ -431,15 +406,7 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
     """
     global _WS_LIVENESS_CONSEC_FAILS, SAFE_STOP_REQUESTED
 
-    # 기본값은 명시 로그로 가시화한다(조용한 default 금지)
-    stale_sec = getattr(SET, "ws_klines_stale_sec", None)
-    if stale_sec is None:
-        # 1m openTime이 60초 동안 고정될 수 있으므로, 여유를 충분히 둔다.
-        stale_sec = 180.0
-        # 부팅 이후 1회만 찍히도록(과도 로그 방지) START_TS 기반
-        if now_ts - START_TS < 30:
-            log(f"[BOOT][DEFAULT] ws_klines_stale_sec missing -> using {stale_sec}s")
-    stale_sec_f = float(stale_sec)
+    stale_sec_f = float(SET.ws_klines_stale_sec)
     if stale_sec_f <= 30:
         raise RuntimeError("settings.ws_klines_stale_sec must be > 30 sec (STRICT)")
 
@@ -453,14 +420,12 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
         now_ms = int(float(now_ts) * 1000.0)
         age_ms = now_ms - int(t_ms)
         if age_ms < 0:
-            # 미래 ts는 데이터 무결성 위반
             _WS_LIVENESS_CONSEC_FAILS += 1
             log(f"[WS_LIVENESS][FAIL] future kline ts detected age_ms={age_ms} consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
         elif age_ms > int(stale_sec_f * 1000.0):
             _WS_LIVENESS_CONSEC_FAILS += 1
             log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
         else:
-            # 정상 회복
             if _WS_LIVENESS_CONSEC_FAILS != 0:
                 log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
             _WS_LIVENESS_CONSEC_FAILS = 0
@@ -481,11 +446,9 @@ def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
     if not isinstance(ob, dict):
         return "orderbook missing (ws_get_orderbook returned non-dict/None)"
 
-    # STRICT: 무결성 검증(단, ws_get_orderbook는 ts가 없을 수 있어 require_ts=False)
     try:
         validate_orderbook_strict(ob, symbol=str(symbol), require_ts=False)
     except DataIntegrityError as e:
-        # readiness 차단 사유로 반환(명시적 SKIP)
         return f"orderbook integrity fail: {e}"
 
     bids = ob.get("bids")
@@ -519,7 +482,6 @@ def _validate_klines_for_entry(symbol: str) -> Optional[str]:
         if len(buf) < min_len:
             return f"kline buffer 부족: {iv} need={min_len} got={len(buf)}"
 
-        # STRICT: kline 무결성(rollback/future/ohlcv 관계식)
         try:
             validate_kline_series_strict(buf, name=f"ws_kline[{iv}]", min_len=min_len)
         except DataIntegrityError as e:
@@ -546,14 +508,12 @@ def _get_equity_current_usdt_strict() -> float:
     - 폴백/None→0 치환 금지: test_dry_run인데 fake<=0이면 즉시 예외.
     """
 
-    # TEST MODE (STRICT)
-    if bool(getattr(SET, "test_dry_run", False)):
-        fake = float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0)
+    if bool(SET.test_dry_run):
+        fake = float(SET.test_fake_available_usdt)
         if not math.isfinite(fake) or fake <= 0.0:
             raise RuntimeError("test_fake_available_usdt invalid (STRICT)")
         return float(fake)
 
-    # LIVE MODE (STRICT)
     row = get_balance_detail("USDT")
     if not isinstance(row, dict):
         raise RuntimeError("get_balance_detail('USDT') returned non-dict")
@@ -689,7 +649,7 @@ def _load_closed_trades_bootstrap(symbol: str, limit: int = 50) -> list[dict[str
 # WS 부트스트랩/스토어
 # ─────────────────────────────
 def _backfill_ws_kline_history(symbol: str) -> None:
-    intervals = _parse_tfs(getattr(SET, "ws_backfill_tfs", None)) or list(ENTRY_REQUIRED_TFS)
+    intervals = _parse_tfs(SET.ws_backfill_tfs)
     _verify_required_tfs_or_die("ws_backfill_tfs", intervals, ENTRY_REQUIRED_TFS)
 
     limit = int(SET.ws_backfill_limit)
@@ -722,9 +682,9 @@ def _start_market_data_store_thread() -> None:
     - SAFE_STOP_REQUESTED=True 로 신규 진입을 차단하고, 예외를 재-raise 하여 스레드를 종료한다.
     """
     symbol = SET.symbol
-    flush_sec = float(getattr(SET, "md_store_flush_sec", 5) or 5)
-    ob_interval_sec = float(getattr(SET, "ob_store_interval_sec", 5) or 5)
-    store_tfs = _parse_tfs(getattr(SET, "md_store_tfs", None)) or ["1m", "5m", "15m"]
+    flush_sec = float(SET.md_store_flush_sec)
+    ob_interval_sec = float(SET.ob_store_interval_sec)
+    store_tfs = _parse_tfs(SET.md_store_tfs)
 
     last_candle_ts: Dict[str, int] = {iv: 0 for iv in store_tfs}
     last_ob_ts: float = 0.0
@@ -754,7 +714,6 @@ def _start_market_data_store_thread() -> None:
                     if not new_rows:
                         continue
 
-                    # STRICT: 저장 전 kline 무결성(rollback은 upstream에서 차단되어야 하지만, 여기서도 형식/finite 체크)
                     try:
                         validate_kline_series_strict(new_rows, name=f"md_store.ws_kline[{iv}]", min_len=1)
                     except DataIntegrityError as e:
@@ -796,7 +755,6 @@ def _start_market_data_store_thread() -> None:
                         time.sleep(flush_sec)
                         continue
 
-                    # STRICT: ts_ms 폴백 금지
                     if "exchTs" in ob and ob.get("exchTs") is not None:
                         ts_ms = _require_int_ms(ob.get("exchTs"), "orderbook.exchTs")
                     elif "ts" in ob and ob.get("ts") is not None:
@@ -804,7 +762,6 @@ def _start_market_data_store_thread() -> None:
                     else:
                         raise RuntimeError("[MD-STORE] orderbook missing exchTs/ts (STRICT)")
 
-                    # STRICT: orderbook 무결성(ask>bid 등)
                     try:
                         validate_orderbook_strict(ob, symbol=str(symbol), require_ts=True)
                     except DataIntegrityError as e:
@@ -886,15 +843,12 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         "market_features": market_features,
     }
 
-    # 🔧 candle 구조 정규화 (STRICT)
     def _normalize_candles(arr: Any, *, name: str) -> Any:
-        # arr가 없거나 비어있으면 그대로 두고, 아래 STRICT 검증이 잡게 한다.
         if not isinstance(arr, list) or not arr:
             return arr
 
         fixed: list[tuple[int, float, float, float, float, float]] = []
         for i, it in enumerate(arr):
-            # tuple/list candle
             if isinstance(it, (list, tuple)):
                 if len(it) >= 6:
                     ts, o, h, l, c, v = it[0], it[1], it[2], it[3], it[4], it[5]
@@ -906,7 +860,6 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
                     continue
                 raise RuntimeError(f"{name}[{i}] invalid candle tuple len<{5} (STRICT): len={len(it)}")
 
-            # Candle-like object
             if all(hasattr(it, a) for a in ("ts", "open", "high", "low", "close")):
                 fixed.append(
                     (
@@ -927,10 +880,9 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     out["candles_5m"] = _normalize_candles(out.get("candles_5m"), name="candles_5m")
     out["candles_5m_raw"] = _normalize_candles(out.get("candles_5m_raw"), name="candles_5m_raw")
 
-    # STRICT: 번들 무결성(캔들/필수키/finite/형태)
     validate_entry_market_data_bundle_strict(out)
-
     return out
+
 
 # ─────────────────────────────
 # Reconcile Guard (OPEN_TRADES ↔ Exchange)
@@ -957,7 +909,6 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
             live.append(r)
 
     if not live:
-        # "포지션 없음"은 정상 상태 표현이다(폴백이 아니라 명시적 상태).
         return {"symbol": sym, "positionAmt": "0", "entryPrice": "0"}
 
     if len(live) != 1:
@@ -972,7 +923,6 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
 def _get_local_position_snapshot(symbol: str) -> Dict[str, Any]:
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not OPEN_TRADES:
-        # "로컬 포지션 없음"은 정상 상태 표현.
         return {"symbol": sym, "position_amt": "0", "entry_price": "0"}
 
     if len(OPEN_TRADES) != 1:
@@ -1019,7 +969,6 @@ def _on_reconcile_desync(result: ReconcileResult) -> None:
     SAFE_STOP_REQUESTED = True
 
     if not bool(getattr(result, "desync_confirmed", True)):
-        # 이 콜백은 confirmed에서만 호출되어야 한다.
         raise RuntimeError("on_desync called but desync_confirmed is False (STRICT)")
 
     msg = f"⛔ DESYNC 확정: {result.symbol} issues={len(result.issues)} (신규 진입 차단, 종료)"
@@ -1028,7 +977,7 @@ def _on_reconcile_desync(result: ReconcileResult) -> None:
         log(f"[DESYNC] {it.code} | {it.message} | {it.details}")
     _maybe_send_error_tg("DESYNC_CONFIRMED", msg, cooldown_sec=60)
 
-    if bool(getattr(SET, "force_close_on_desync", False)):
+    if bool(SET.force_close_on_desync):
         try:
             n = close_all_positions_market(result.symbol)
             log(f"[DESYNC] force close submitted count={n}")
@@ -1051,9 +1000,9 @@ def _sigterm(*_: Any) -> None:
 
     if SIGTERM_REQUESTED_AT is None:
         SIGTERM_REQUESTED_AT = now
-        grace = float(getattr(SET, "sigterm_grace_sec", 30.0) or 30.0)
+        grace = float(SET.sigterm_grace_sec)
         if grace <= 0:
-            grace = 30.0
+            raise RuntimeError("settings.sigterm_grace_sec must be > 0 (STRICT)")
         SIGTERM_DEADLINE_TS = now + grace
 
         msg = f"🧯 SIGTERM 수신: 신규 진입 중단, 포지션 정리 후 종료 시도 (grace={int(grace)}s)"
@@ -1081,14 +1030,14 @@ def main() -> None:
     global _BALANCE_CONSEC_FAILS, _EQUITY_CONSEC_FAILS
 
     start_async_worker(
-        num_threads=int(getattr(SET, "async_worker_threads", 1) or 1),
-        max_queue_size=int(getattr(SET, "async_worker_queue_size", 2000) or 2000),
+        num_threads=int(SET.async_worker_threads),
+        max_queue_size=int(SET.async_worker_queue_size),
         thread_name_prefix="async-io",
     )
 
     _verify_ws_boot_configuration_or_die()
 
-    if bool(getattr(SET, "ws_enabled", True)):
+    if bool(SET.ws_enabled):
         _backfill_ws_kline_history(SET.symbol)
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
@@ -1109,13 +1058,12 @@ def main() -> None:
         return
 
     try:
-        set_leverage_and_mode(SET.symbol, int(getattr(SET, "leverage", 1) or 1), bool(getattr(SET, "isolated", True)))
+        set_leverage_and_mode(SET.symbol, int(SET.leverage), bool(SET.isolated))
     except Exception as e:
-        allow = bool(getattr(SET, "allow_start_without_leverage_setup", False))
+        allow = bool(SET.allow_start_without_leverage_setup)
         msg = f"❗ 레버리지/마진 설정 실패: {e}"
         log(msg)
         if allow:
-            # 운영 정책(명시 설정)에 따른 허용. 조용한 진행 금지 -> TG로 가시화.
             _safe_send_tg(msg + "\n⚠ allow_start_without_leverage_setup=True 이므로 계속 진행합니다.")
         else:
             _safe_send_tg(msg + "\n⛔ 기본 정책에 따라 중단합니다.")
@@ -1129,28 +1077,18 @@ def main() -> None:
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     LAST_EXCHANGE_SYNC_TS = time.time()
 
-    # TRADE-GRADE: reconcile confirm N (단발 mismatch 과민 정지 방지)
-    confirm_n = getattr(SET, "reconcile_confirm_n", None)
-    if confirm_n is None:
-        confirm_n = 3
-        log(f"[BOOT][DEFAULT] reconcile_confirm_n missing -> using {confirm_n}")
-    confirm_n_i = int(confirm_n)
+    confirm_n_i = int(SET.reconcile_confirm_n)
     if confirm_n_i < 1:
         raise RuntimeError("settings.reconcile_confirm_n must be >= 1 (STRICT)")
 
-    # NEW: hard consecutive losses limit (0 = disabled)
-    hard_consec_limit = getattr(SET, "hard_consecutive_losses_limit", None)
-    if hard_consec_limit is None:
-        hard_consec_limit = 0
-        log(f"[BOOT][DEFAULT] hard_consecutive_losses_limit missing -> using {hard_consec_limit} (disabled)")
-    hard_consec_limit_i = int(hard_consec_limit)
+    hard_consec_limit_i = int(SET.hard_consecutive_losses_limit)
     if hard_consec_limit_i < 0:
         raise RuntimeError("settings.hard_consecutive_losses_limit must be >= 0 (STRICT)")
 
     reconcile_engine = ReconcileEngine(
         ReconcileConfig(
             symbol=str(SET.symbol),
-            interval_sec=int(getattr(SET, "reconcile_interval_sec", 30) or 30),
+            interval_sec=int(SET.reconcile_interval_sec),
             desync_confirm_n=int(confirm_n_i),
         ),
         fetch_exchange_position=_fetch_exchange_position_snapshot,
@@ -1163,16 +1101,16 @@ def main() -> None:
     regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
     ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
 
-    # NEW: Drift detector (기관형 안전장치)
     drift_detector = DriftDetector(
         DriftDetectorConfig(
-            allocation_abs_jump=0.45,
-            allocation_spike_ratio=3.0,
-            multiplier_abs_jump=0.50,
-            micro_abs_jump=40
+            allocation_abs_jump=float(SET.drift_allocation_abs_jump),
+            allocation_spike_ratio=float(SET.drift_allocation_spike_ratio),
+            multiplier_abs_jump=float(SET.drift_multiplier_abs_jump),
+            micro_abs_jump=float(SET.drift_micro_abs_jump),
+            stable_regime_steps=int(SET.drift_stable_regime_steps),
         )
     )
-    # ── DB bootstrap (STRICT) ──
+
     persisted_peak = _load_equity_peak_bootstrap(SET.symbol)
     if persisted_peak is not None:
         log(f"[BOOT] persisted equity_peak_usdt loaded: {persisted_peak:.4f}")
@@ -1191,19 +1129,18 @@ def main() -> None:
     for r in reversed(boot_rows):
         CLOSED_TRADES_CACHE.appendleft(r)
 
-    position_resync_sec = float(getattr(SET, "position_resync_sec", 20) or 20)
+    position_resync_sec = float(SET.position_resync_sec)
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
 
-    max_signal_latency_ms = float(getattr(SET, "max_signal_latency_ms", 200) or 200)
-    max_exec_latency_ms = float(getattr(SET, "max_exec_latency_ms", 400) or 400)
+    max_signal_latency_ms = float(SET.max_signal_latency_ms)
+    max_exec_latency_ms = float(SET.max_exec_latency_ms)
 
     while RUNNING:
         try:
             now = time.time()
 
-            # WS liveness guard (WS enabled일 때만)
-            if bool(getattr(SET, "ws_enabled", True)):
+            if bool(SET.ws_enabled):
                 _ws_liveness_guard_or_raise(SET.symbol, now)
 
             if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS and not _SIGTERM_DEADLINE_HANDLED:
@@ -1217,18 +1154,15 @@ def main() -> None:
                 except Exception as e:
                     log(f"[SIGTERM] force close failed: {type(e).__name__}: {e}")
                     _safe_send_tg(f"❌ SIGTERM 강제 정리 실패: {e}")
-                    # SIGTERM deadline 이후 강제정리 실패는 치명
                     SAFE_STOP_REQUESTED = True
                     raise
 
-            # reconcile: confirmed이면 콜백이 예외를 raise 하여 즉시 종료한다.
             reconcile_engine.run_if_due(now_ts=now)
 
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
                 LAST_EXCHANGE_SYNC_TS = now
 
-            # balance ping: 단발 실패 허용(명시), 연속 실패는 HARD_STOP
             if now - last_balance_log >= 60:
                 try:
                     get_available_usdt()
@@ -1244,7 +1178,7 @@ def main() -> None:
                 finally:
                     last_balance_log = now
 
-            if now - last_fill_check >= float(getattr(SET, "poll_fills_sec", 3.0) or 3.0):
+            if now - last_fill_check >= float(SET.poll_fills_sec):
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
                 for closed in closed_list:
                     t: Trade = closed["trade"]
@@ -1302,7 +1236,6 @@ def main() -> None:
                         pnl=pnl,
                     )
 
-                    # NEW: consecutive loss hard-stop (policy-level SAFE_STOP)
                     if hard_consec_limit_i > 0 and CONSEC_LOSSES >= hard_consec_limit_i:
                         SAFE_STOP_REQUESTED = True
                         msg = (
@@ -1342,12 +1275,11 @@ def main() -> None:
                 _safe_send_tg("🛑 포지션 0 확인. 자동매매를 종료합니다.")
                 return
 
-            entry_cooldown_sec = float(getattr(SET, "entry_cooldown_sec", 20) or 20)
+            entry_cooldown_sec = float(SET.entry_cooldown_sec)
             if now - LAST_ENTRY_GPT_CALL_TS < entry_cooldown_sec:
                 interruptible_sleep(1)
                 continue
 
-            # equity: 단발 실패는 SKIP(명시), 연속 실패는 HARD_STOP
             try:
                 equity_current_usdt = _get_equity_current_usdt_strict()
                 _EQUITY_CONSEC_FAILS = 0
@@ -1376,7 +1308,6 @@ def main() -> None:
                 interruptible_sleep(1)
                 continue
 
-            # STRICT: 번들 무결성 재검증(치명)
             try:
                 validate_entry_market_data_bundle_strict(market_data)
             except DataIntegrityError as e:
@@ -1410,7 +1341,6 @@ def main() -> None:
             )
             persisted_peak = float(max(float(persisted_peak or 0.0), float(account_state.equity_peak_usdt)))
 
-            # ── 후보 신호 생성(로컬 결정) + latency guard ──
             t0 = time.perf_counter()
             cand = _decide_entry_candidate_strict(market_data)
             dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -1430,7 +1360,6 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
-            # ── microstructure + heatmap ──
             micro = (mf or {}).get("microstructure") if isinstance(mf, dict) else None
             if not isinstance(micro, dict):
                 raise RuntimeError("market_features.microstructure missing (STRICT)")
@@ -1465,7 +1394,6 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
-            # NEW: Drift detector (치명)
             try:
                 drift_detector.update_and_check(
                     DriftSnapshot(
@@ -1483,7 +1411,6 @@ def main() -> None:
                 _maybe_send_error_tg("DRIFT", msg, cooldown_sec=60)
                 raise RuntimeError(msg) from e
 
-            # NEW: Invariant guard (signal-level)
             try:
                 validate_signal_invariants_strict(
                     SignalInvariantInputs(
@@ -1565,7 +1492,6 @@ def main() -> None:
             interruptible_sleep(10)
 
         except Exception as e:
-            # TRADE-GRADE: 미분류 예외는 조용히 복구하지 않는다.
             SAFE_STOP_REQUESTED = True
 
             tb = traceback.format_exc()
@@ -1583,14 +1509,12 @@ def main() -> None:
                 reason=str(e),
             )
 
-            # STRICT: 예외 전파로 엔진 종료
             raise
 
     return
 
 
 if __name__ == "__main__":
-    # STRICT: run_bot_ws 직접 실행 금지 → preflight 엔트리로 강제
     from core.run_bot_preflight import run_preflight
 
     run_preflight(preflight_only=False)
