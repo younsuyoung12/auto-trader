@@ -625,7 +625,7 @@ def load_settings() -> Settings:
     max_sl_pct = _as_float("MAX_SL_PCT", 0.015)
     max_trade_qty = _as_float("MAX_TRADE_QTY", 1.0)
 
-    entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 1.0)
+    entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 5.0)
     cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
 
     min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 28)
