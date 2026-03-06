@@ -284,7 +284,14 @@ class Settings:
     test_bypass_guards: bool = False
     test_force_enter: bool = False
     test_fake_available_usdt: float = 0.0
-
+    
+    # Redis cache (Dashboard)
+    redis_url: str = "redis://localhost:6379/0"
+    dashboard_cache_prefix: str = "auto_trader_dashboard"
+    dashboard_cache_ttl_sec: int = 5
+    redis_socket_timeout_sec: float = 1.0
+    redis_socket_connect_timeout_sec: float = 1.0
+    redis_health_check_interval_sec: int = 30
 
 # Backward-compatible alias for legacy type hints
 BotSettings = Settings
@@ -840,6 +847,13 @@ def load_settings() -> Settings:
     require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
     entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
     max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
+    # Redis cache
+    redis_url = _as_str("REDIS_URL", "redis://localhost:6379/0")
+    dashboard_cache_prefix = _as_str("DASHBOARD_CACHE_PREFIX", "auto_trader_dashboard")
+    dashboard_cache_ttl_sec = _as_int("DASHBOARD_CACHE_TTL_SEC", 5)
+    redis_socket_timeout_sec = _as_float("REDIS_SOCKET_TIMEOUT_SEC", 1.0)
+    redis_socket_connect_timeout_sec = _as_float("REDIS_SOCKET_CONNECT_TIMEOUT_SEC", 1.0)
+    redis_health_check_interval_sec = _as_int("REDIS_HEALTH_CHECK_INTERVAL_SEC", 30)
 
     # TEST controls (TRADE-GRADE) — settings에서만 읽는다.
     test_dry_run = _as_bool("TEST_DRY_RUN", False)
@@ -848,6 +862,12 @@ def load_settings() -> Settings:
     test_fake_available_usdt = _as_float("TEST_FAKE_AVAILABLE_USDT", 0.0)
 
     s = Settings(
+        redis_url=redis_url,
+        dashboard_cache_prefix=dashboard_cache_prefix,
+        dashboard_cache_ttl_sec=dashboard_cache_ttl_sec,
+        redis_socket_timeout_sec=redis_socket_timeout_sec,
+        redis_socket_connect_timeout_sec=redis_socket_connect_timeout_sec,
+        redis_health_check_interval_sec=redis_health_check_interval_sec,
         api_key=api_key,
         api_secret=api_secret,
         symbol=symbol,

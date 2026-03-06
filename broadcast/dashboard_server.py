@@ -36,6 +36,13 @@ STRICT · NO-FALLBACK
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-07:
+  1) Redis 캐시 연동 추가(STRICT)
+     - dashboard_server startup 시 settings(SSOT) 기반 Redis 초기화
+     - 비용 큰 조회 API에 짧은 TTL 캐시 적용
+     - 캐시 miss 시 기존 DB 조회 로직 그대로 수행 후 캐시 저장
+  2) 기존 API 경로/응답 구조/실시간 엔진 진단 API 동작 변경 없음
+
 - 2026-03-01:
   1) recent trades 라벨 매핑을 is_auto/strategy 기준으로 수정
   2) EntryScore API에 include_test 옵션 추가
@@ -58,7 +65,7 @@ STRICT · NO-FALLBACK
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,6 +86,14 @@ from broadcast.dashboard_metrics import (
     get_summary,
 )
 from broadcast.dashboard_ws import dashboard_ws_endpoint
+from infra.cache import (
+    get_cache_json,
+    init_cache_from_settings,
+    is_cache_initialized,
+    make_cache_key,
+    ping_cache,
+    set_cache_json,
+)
 from services.decision_service import get_latest_decision, get_recent_decisions
 from services.error_monitor import (
     get_latest_error_event,
@@ -86,11 +101,11 @@ from services.error_monitor import (
     get_recent_error_events,
 )
 from services.performance_service import (
+    get_daily_pnl_series,
     get_drawdown_curve,
     get_equity_curve,
     get_performance_bundle,
     get_performance_summary,
-    get_daily_pnl_series,
 )
 from services.position_service import (
     get_latest_position,
@@ -98,6 +113,7 @@ from services.position_service import (
     get_recent_positions,
 )
 from services.system_monitor import get_latest_watchdog_snapshot, get_system_status_snapshot
+from settings import load_settings
 
 # OPTIONAL: 엔진이 같은 런타임에 있으면 WS 버퍼 상태까지 제공 가능
 try:
@@ -112,6 +128,8 @@ except Exception:  # pragma: no cover
 # FastAPI App
 # =====================================================
 
+_SETTINGS = load_settings()
+
 app = FastAPI(title="Binance Auto Trader Dashboard")
 templates = Jinja2Templates(directory="templates")
 
@@ -122,6 +140,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _startup_init_cache() -> None:
+    init_cache_from_settings(_SETTINGS)
+    ping_cache()
 
 
 # =====================================================
@@ -168,6 +192,28 @@ def _normalize_optional_event_type(event_type: Optional[str]) -> Optional[str]:
     return _require_nonempty_str(event_type, "event_type").upper()
 
 
+def _cache_token_bool(value: bool) -> str:
+    return "1" if bool(value) else "0"
+
+
+def _cached_json(
+    *,
+    key_parts: Tuple[str, ...],
+    builder: Callable[[], Any],
+) -> Any:
+    if not is_cache_initialized():
+        raise RuntimeError("Redis cache is not initialized (STRICT)")
+
+    key = make_cache_key(*key_parts)
+    cached = get_cache_json(key)
+    if cached is not None:
+        return cached
+
+    data = builder()
+    set_cache_json(key, data)
+    return data
+
+
 # =====================================================
 # Pages
 # =====================================================
@@ -207,6 +253,7 @@ def health_check(db: Session = Depends(get_db)) -> Dict[str, Any]:
     return {
         "status": "ok",
         "db_latency_ms": _db_latency_ms(db),
+        "cache_ok": ping_cache(),
     }
 
 
@@ -216,7 +263,10 @@ def health_check(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 @app.get("/api/summary")
 def api_summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    return get_summary(db)
+    return _cached_json(
+        key_parts=("dashboard", "summary"),
+        builder=lambda: get_summary(db),
+    )
 
 
 @app.get("/api/daily-pnl")
@@ -225,7 +275,10 @@ def api_daily_pnl(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_days = _require_positive_int(days, "days", max_value=365)
-    return {"days": normalized_days, "items": get_daily_pnl(db, days=normalized_days)}
+    return _cached_json(
+        key_parts=("dashboard", "daily-pnl", f"days-{normalized_days}"),
+        builder=lambda: {"days": normalized_days, "items": get_daily_pnl(db, days=normalized_days)},
+    )
 
 
 # =====================================================
@@ -283,31 +336,38 @@ def api_recent_trades(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=500)
-    trades: List[Dict[str, Any]] = get_recent_trades(db, limit=normalized_limit)
 
-    enriched: List[Dict[str, Any]] = []
-    for t in trades:
-        pnl = float(t.get("pnl_usdt") or 0.0)
-        is_auto = bool(t.get("is_auto"))
-        strategy = t.get("strategy")
-        side = t.get("side")
-        close_reason = t.get("close_reason")
+    def _build() -> Dict[str, Any]:
+        trades: List[Dict[str, Any]] = get_recent_trades(db, limit=normalized_limit)
 
-        item = dict(t)
-        item.update(
-            {
-                "trade_type": _map_trade_type(is_auto),
-                "regime_label": _map_regime_label(strategy),
-                "side_label": _map_side_label(side),
-                "close_reason_label": _map_close_reason_label(close_reason),
-                "is_profit": pnl > 0,
-                "is_loss": pnl < 0,
-                "is_breakeven": pnl == 0,
-            }
-        )
-        enriched.append(item)
+        enriched: List[Dict[str, Any]] = []
+        for t in trades:
+            pnl = float(t.get("pnl_usdt") or 0.0)
+            is_auto = bool(t.get("is_auto"))
+            strategy = t.get("strategy")
+            side = t.get("side")
+            close_reason = t.get("close_reason")
 
-    return {"limit": normalized_limit, "items": enriched}
+            item = dict(t)
+            item.update(
+                {
+                    "trade_type": _map_trade_type(is_auto),
+                    "regime_label": _map_regime_label(strategy),
+                    "side_label": _map_side_label(side),
+                    "close_reason_label": _map_close_reason_label(close_reason),
+                    "is_profit": pnl > 0,
+                    "is_loss": pnl < 0,
+                    "is_breakeven": pnl == 0,
+                }
+            )
+            enriched.append(item)
+
+        return {"limit": normalized_limit, "items": enriched}
+
+    return _cached_json(
+        key_parts=("trades", "recent", f"limit-{normalized_limit}"),
+        builder=_build,
+    )
 
 
 # =====================================================
@@ -321,15 +381,28 @@ def api_recent_entry_scores(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=1000)
-    scores = get_recent_entry_scores(db, limit=normalized_limit, include_test=bool(include_test))
-    labels, counts = build_entry_score_hist(scores)
-    return {
-        "limit": normalized_limit,
-        "include_test": bool(include_test),
-        "items": scores,
-        "hist_labels": labels,
-        "hist_counts": counts,
-    }
+    include_test_b = bool(include_test)
+
+    def _build() -> Dict[str, Any]:
+        scores = get_recent_entry_scores(db, limit=normalized_limit, include_test=include_test_b)
+        labels, counts = build_entry_score_hist(scores)
+        return {
+            "limit": normalized_limit,
+            "include_test": include_test_b,
+            "items": scores,
+            "hist_labels": labels,
+            "hist_counts": counts,
+        }
+
+    return _cached_json(
+        key_parts=(
+            "entry-scores",
+            "recent",
+            f"limit-{normalized_limit}",
+            f"test-{_cache_token_bool(include_test_b)}",
+        ),
+        builder=_build,
+    )
 
 
 # =====================================================
@@ -344,11 +417,19 @@ def api_skip_reasons(
 ) -> Dict[str, Any]:
     normalized_days = _require_positive_int(days, "days", max_value=365)
     normalized_limit = _require_positive_int(limit, "limit", max_value=100)
-    return {
-        "days": normalized_days,
-        "limit": normalized_limit,
-        "items": events_skip_reason_top(db, days=normalized_days, limit=normalized_limit),
-    }
+    return _cached_json(
+        key_parts=(
+            "events",
+            "skip-reasons",
+            f"days-{normalized_days}",
+            f"limit-{normalized_limit}",
+        ),
+        builder=lambda: {
+            "days": normalized_days,
+            "limit": normalized_limit,
+            "items": events_skip_reason_top(db, days=normalized_days, limit=normalized_limit),
+        },
+    )
 
 
 @app.get("/api/events/skip-hourly")
@@ -357,7 +438,10 @@ def api_skip_hourly(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_days = _require_positive_int(days, "days", max_value=365)
-    return {"days": normalized_days, "items": events_skip_hourly(db, days=normalized_days)}
+    return _cached_json(
+        key_parts=("events", "skip-hourly", f"days-{normalized_days}"),
+        builder=lambda: {"days": normalized_days, "items": events_skip_hourly(db, days=normalized_days)},
+    )
 
 
 @app.get("/api/events/recent")
@@ -368,11 +452,20 @@ def api_events_recent(
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=1000)
     normalized_event_type = _normalize_optional_event_type(event_type)
-    return {
-        "limit": normalized_limit,
-        "event_type": normalized_event_type,
-        "items": events_recent(db, limit=normalized_limit, event_type=normalized_event_type),
-    }
+    event_type_part = normalized_event_type if normalized_event_type is not None else "all"
+    return _cached_json(
+        key_parts=(
+            "events",
+            "recent",
+            f"limit-{normalized_limit}",
+            f"type-{event_type_part}",
+        ),
+        builder=lambda: {
+            "limit": normalized_limit,
+            "event_type": normalized_event_type,
+            "items": events_recent(db, limit=normalized_limit, event_type=normalized_event_type),
+        },
+    )
 
 
 # =====================================================
@@ -384,7 +477,11 @@ def api_decision_latest(
     include_test: bool = False,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    return get_latest_decision(db, include_test=bool(include_test))
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=("decision", "latest", f"test-{_cache_token_bool(include_test_b)}"),
+        builder=lambda: get_latest_decision(db, include_test=include_test_b),
+    )
 
 
 @app.get("/api/decision/recent")
@@ -394,11 +491,20 @@ def api_decision_recent(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=500)
-    return {
-        "limit": normalized_limit,
-        "include_test": bool(include_test),
-        "items": get_recent_decisions(db, limit=normalized_limit, include_test=bool(include_test)),
-    }
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=(
+            "decision",
+            "recent",
+            f"limit-{normalized_limit}",
+            f"test-{_cache_token_bool(include_test_b)}",
+        ),
+        builder=lambda: {
+            "limit": normalized_limit,
+            "include_test": include_test_b,
+            "items": get_recent_decisions(db, limit=normalized_limit, include_test=include_test_b),
+        },
+    )
 
 
 # =====================================================
@@ -412,7 +518,21 @@ def api_errors_latest(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_event_type = _normalize_optional_event_type(event_type)
-    return get_latest_error_event(db, event_type=normalized_event_type, include_test=bool(include_test))
+    event_type_part = normalized_event_type if normalized_event_type is not None else "all"
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=(
+            "errors",
+            "latest",
+            f"type-{event_type_part}",
+            f"test-{_cache_token_bool(include_test_b)}",
+        ),
+        builder=lambda: get_latest_error_event(
+            db,
+            event_type=normalized_event_type,
+            include_test=include_test_b,
+        ),
+    )
 
 
 @app.get("/api/errors/recent")
@@ -424,17 +544,28 @@ def api_errors_recent(
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=1000)
     normalized_event_type = _normalize_optional_event_type(event_type)
-    return {
-        "limit": normalized_limit,
-        "event_type": normalized_event_type,
-        "include_test": bool(include_test),
-        "items": get_recent_error_events(
-            db,
-            limit=normalized_limit,
-            event_type=normalized_event_type,
-            include_test=bool(include_test),
+    event_type_part = normalized_event_type if normalized_event_type is not None else "all"
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=(
+            "errors",
+            "recent",
+            f"limit-{normalized_limit}",
+            f"type-{event_type_part}",
+            f"test-{_cache_token_bool(include_test_b)}",
         ),
-    }
+        builder=lambda: {
+            "limit": normalized_limit,
+            "event_type": normalized_event_type,
+            "include_test": include_test_b,
+            "items": get_recent_error_events(
+                db,
+                limit=normalized_limit,
+                event_type=normalized_event_type,
+                include_test=include_test_b,
+            ),
+        },
+    )
 
 
 @app.get("/api/errors/counts")
@@ -444,11 +575,24 @@ def api_errors_counts(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_minutes = _require_positive_int(minutes, "minutes", max_value=1440)
-    return {
-        "minutes": normalized_minutes,
-        "include_test": bool(include_test),
-        "items": get_recent_error_counts(db, minutes=normalized_minutes, include_test=bool(include_test)),
-    }
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=(
+            "errors",
+            "counts",
+            f"minutes-{normalized_minutes}",
+            f"test-{_cache_token_bool(include_test_b)}",
+        ),
+        builder=lambda: {
+            "minutes": normalized_minutes,
+            "include_test": include_test_b,
+            "items": get_recent_error_counts(
+                db,
+                minutes=normalized_minutes,
+                include_test=include_test_b,
+            ),
+        },
+    )
 
 
 # =====================================================
@@ -460,7 +604,11 @@ def api_position_current(
     include_test: bool = False,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    return get_open_position(db, include_test=bool(include_test))
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=("position", "current", f"test-{_cache_token_bool(include_test_b)}"),
+        builder=lambda: get_open_position(db, include_test=include_test_b),
+    )
 
 
 @app.get("/api/position/latest")
@@ -468,7 +616,11 @@ def api_position_latest(
     include_test: bool = False,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    return get_latest_position(db, include_test=bool(include_test))
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=("position", "latest", f"test-{_cache_token_bool(include_test_b)}"),
+        builder=lambda: get_latest_position(db, include_test=include_test_b),
+    )
 
 
 @app.get("/api/position/recent")
@@ -478,11 +630,20 @@ def api_position_recent(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=500)
-    return {
-        "limit": normalized_limit,
-        "include_test": bool(include_test),
-        "items": get_recent_positions(db, limit=normalized_limit, include_test=bool(include_test)),
-    }
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=(
+            "position",
+            "recent",
+            f"limit-{normalized_limit}",
+            f"test-{_cache_token_bool(include_test_b)}",
+        ),
+        builder=lambda: {
+            "limit": normalized_limit,
+            "include_test": include_test_b,
+            "items": get_recent_positions(db, limit=normalized_limit, include_test=include_test_b),
+        },
+    )
 
 
 # =====================================================
@@ -491,7 +652,10 @@ def api_position_recent(
 
 @app.get("/api/performance/summary")
 def api_performance_summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    return get_performance_summary(db)
+    return _cached_json(
+        key_parts=("performance", "summary"),
+        builder=lambda: get_performance_summary(db),
+    )
 
 
 @app.get("/api/performance/equity-curve")
@@ -500,7 +664,10 @@ def api_performance_equity_curve(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=5000)
-    return {"limit": normalized_limit, "items": get_equity_curve(db, limit=normalized_limit)}
+    return _cached_json(
+        key_parts=("performance", "equity-curve", f"limit-{normalized_limit}"),
+        builder=lambda: {"limit": normalized_limit, "items": get_equity_curve(db, limit=normalized_limit)},
+    )
 
 
 @app.get("/api/performance/drawdown-curve")
@@ -509,7 +676,10 @@ def api_performance_drawdown_curve(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_limit = _require_positive_int(limit, "limit", max_value=5000)
-    return {"limit": normalized_limit, "items": get_drawdown_curve(db, limit=normalized_limit)}
+    return _cached_json(
+        key_parts=("performance", "drawdown-curve", f"limit-{normalized_limit}"),
+        builder=lambda: {"limit": normalized_limit, "items": get_drawdown_curve(db, limit=normalized_limit)},
+    )
 
 
 @app.get("/api/performance/daily-pnl")
@@ -518,7 +688,10 @@ def api_performance_daily_pnl(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_days = _require_positive_int(days, "days", max_value=365)
-    return {"days": normalized_days, "items": get_daily_pnl_series(db, days=normalized_days)}
+    return _cached_json(
+        key_parts=("performance", "daily-pnl", f"days-{normalized_days}"),
+        builder=lambda: {"days": normalized_days, "items": get_daily_pnl_series(db, days=normalized_days)},
+    )
 
 
 @app.get("/api/performance/bundle")
@@ -529,7 +702,19 @@ def api_performance_bundle(
 ) -> Dict[str, Any]:
     normalized_curve_limit = _require_positive_int(curve_limit, "curve_limit", max_value=5000)
     normalized_daily_days = _require_positive_int(daily_days, "daily_days", max_value=365)
-    return get_performance_bundle(db, curve_limit=normalized_curve_limit, daily_days=normalized_daily_days)
+    return _cached_json(
+        key_parts=(
+            "performance",
+            "bundle",
+            f"curve-{normalized_curve_limit}",
+            f"days-{normalized_daily_days}",
+        ),
+        builder=lambda: get_performance_bundle(
+            db,
+            curve_limit=normalized_curve_limit,
+            daily_days=normalized_daily_days,
+        ),
+    )
 
 
 # =====================================================
@@ -543,10 +728,19 @@ def api_system_status(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_minutes = _require_positive_int(error_window_minutes, "error_window_minutes", max_value=1440)
-    return get_system_status_snapshot(
-        db,
-        include_test=bool(include_test),
-        error_window_minutes=normalized_minutes,
+    include_test_b = bool(include_test)
+    return _cached_json(
+        key_parts=(
+            "system",
+            "status",
+            f"test-{_cache_token_bool(include_test_b)}",
+            f"minutes-{normalized_minutes}",
+        ),
+        builder=lambda: get_system_status_snapshot(
+            db,
+            include_test=include_test_b,
+            error_window_minutes=normalized_minutes,
+        ),
     )
 
 
