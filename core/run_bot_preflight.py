@@ -20,6 +20,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-06:
+  1) 엔진 preflight 경로에서 entry_flow 직접 호출 제거
+  2) unified_features에서 execution_engine 필수 decision meta를 엄격 추출하도록 보강
+  3) preflight/runtime 구조 일치화
 - 2026-03-04:
   1) 운영형 Preflight Runner(B-모드)로 강화:
      - RegimeEngine/RiskPhysics/EvHeatmap/DriftDetector/Invariant까지 포함한 시뮬레이션 수행
@@ -280,18 +284,12 @@ def _stage_binance_private_api_strict() -> None:
     _ = _finite(bal.get("availableBalance"), "balance.availableBalance")
     _ = _finite(bal.get("crossUnPnl"), "balance.crossUnPnl")
 
-    # TEST MODE (TRADE-GRADE)
     if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
-
         eq_cur = float(_finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt"))
-
         if eq_cur <= 0:
             raise PreflightError("settings.test_fake_available_usdt must be > 0 in test_dry_run (STRICT)")
-
     else:
-
         eq_cur = float(_finite(bal.get("availableBalance"), "balance.availableBalance"))
-
         if eq_cur <= 0:
             raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
 
@@ -338,15 +336,12 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
     limit = SET.ws_backfill_limit
 
     for tf in ("1m", "5m", "15m", "1h", "4h"):
-
         rows = fetch_klines_rest(symbol, tf, limit=limit)
-
         _validate_kline_rows_strict(
             rows,
             name=f"REST_KLINES_{tf}",
             min_len=200,
-        ) 
-       
+        )
         backfill_klines_from_rest(symbol, tf, rows)
 
     start_ws_loop(symbol)
@@ -373,14 +368,12 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
             raise PreflightError("WS not ready within deadline (STRICT)")
         time.sleep(0.5)
 
-    # WS 무결성(원시) 1회 검증
     ob = ws_get_orderbook(symbol, limit=5)
     try:
         validate_orderbook_strict(ob, symbol=symbol, require_ts=False)
     except DataIntegrityError as e:
         raise PreflightError(f"WS orderbook integrity fail (STRICT): {e}") from e
 
-    # 필수 TF 버퍼 무결성 검증
     for iv, need in ENTRY_REQUIRED_KLINES_MIN.items():
         buf = ws_get_klines_with_volume(symbol, iv, limit=need)
         try:
@@ -416,7 +409,6 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
 
 
 def _stage_unified_features_strict(boot: PreflightBoot) -> Dict[str, Any]:
-    # market_features_ws 자체도 한번 검증
     try:
         mf = build_entry_features_ws(boot.symbol)
     except FeatureBuildError as e:
@@ -432,7 +424,6 @@ def _stage_unified_features_strict(boot: PreflightBoot) -> Dict[str, Any]:
     if not isinstance(uf, dict) or not uf:
         raise PreflightError("unified_features empty/invalid (STRICT)")
 
-    # 최소 핵심 키
     if "engine_scores" not in uf or not isinstance(uf.get("engine_scores"), dict):
         raise PreflightError("unified_features.engine_scores missing/invalid (STRICT)")
     if "microstructure" not in uf or not isinstance(uf.get("microstructure"), dict):
@@ -448,8 +439,71 @@ def _stage_unified_features_strict(boot: PreflightBoot) -> Dict[str, Any]:
     return uf
 
 
+def _extract_preflight_decision_meta_strict(uf: Dict[str, Any]) -> Dict[str, float]:
+    """
+    STRICT:
+    - preflight에서도 runtime과 동일하게 entry_flow를 통하지 않고
+      execution_engine이 요구하는 decision meta만 unified_features에서 직접 추출한다.
+    """
+    if not isinstance(uf, dict) or not uf:
+        raise PreflightError("unified_features is required (STRICT)")
+
+    engine_scores = uf.get("engine_scores")
+    if not isinstance(engine_scores, dict) or not engine_scores:
+        raise PreflightError("unified_features.engine_scores missing/invalid (STRICT)")
+
+    total = engine_scores.get("total")
+    if not isinstance(total, dict) or "score" not in total:
+        raise PreflightError("unified_features.engine_scores.total.score missing (STRICT)")
+
+    trend_4h = engine_scores.get("trend_4h")
+    if not isinstance(trend_4h, dict) or not trend_4h:
+        raise PreflightError("unified_features.engine_scores.trend_4h missing/invalid (STRICT)")
+
+    trend_components = trend_4h.get("components")
+    if not isinstance(trend_components, dict) or not trend_components:
+        raise PreflightError("unified_features.engine_scores.trend_4h.components missing/invalid (STRICT)")
+    if "trend_strength" not in trend_components:
+        raise PreflightError("unified_features.engine_scores.trend_4h.components.trend_strength missing (STRICT)")
+
+    orderbook = uf.get("orderbook")
+    if not isinstance(orderbook, dict) or not orderbook:
+        raise PreflightError("unified_features.orderbook missing/invalid (STRICT)")
+    if "spread_pct" not in orderbook:
+        raise PreflightError("unified_features.orderbook.spread_pct missing (STRICT)")
+    if "depth_imbalance" not in orderbook:
+        raise PreflightError("unified_features.orderbook.depth_imbalance missing (STRICT)")
+
+    entry_score_threshold = _finite(getattr(SET, "entry_score_threshold", None), "settings.entry_score_threshold")
+    total_score_pct = _finite(total.get("score"), "unified_features.engine_scores.total.score")
+    trend_strength = _finite(
+        trend_components.get("trend_strength"),
+        "unified_features.engine_scores.trend_4h.components.trend_strength",
+    )
+    spread = _finite(orderbook.get("spread_pct"), "unified_features.orderbook.spread_pct")
+    orderbook_imbalance = _finite(orderbook.get("depth_imbalance"), "unified_features.orderbook.depth_imbalance")
+
+    if total_score_pct < 0.0 or total_score_pct > 100.0:
+        raise PreflightError("unified_features.engine_scores.total.score out of range 0..100 (STRICT)")
+    if trend_strength < 0.0 or trend_strength > 1.0:
+        raise PreflightError("trend_strength out of range 0..1 (STRICT)")
+    if spread < 0.0:
+        raise PreflightError("spread must be >= 0 (STRICT)")
+    if orderbook_imbalance < -1.0 or orderbook_imbalance > 1.0:
+        raise PreflightError("orderbook_imbalance out of range -1..1 (STRICT)")
+    if entry_score_threshold < 0.0:
+        raise PreflightError("settings.entry_score_threshold must be >= 0 (STRICT)")
+
+    return {
+        "entry_score": float(total_score_pct) / 100.0,
+        "trend_strength": float(trend_strength),
+        "spread": float(spread),
+        "orderbook_imbalance": float(orderbook_imbalance),
+        "entry_score_threshold": float(entry_score_threshold),
+    }
+
+
 def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -> Signal:
-    # extract values
     total_score = float(_finite(uf["engine_scores"]["total"]["score"], "engine_total_score"))
     micro = uf.get("microstructure")
     if not isinstance(micro, dict) or "micro_score_risk" not in micro:
@@ -458,7 +512,6 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     if micro_score_risk < 0 or micro_score_risk > 100:
         raise PreflightError(f"micro_score_risk out of range (STRICT): {micro_score_risk}")
 
-    # RegimeEngine은 히스토리가 필요하므로, Preflight 시나리오로 동일값을 최소 히스토리만큼 주입(명시 규칙)
     regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
     for _ in range(60):
         regime_engine.update(total_score)
@@ -469,7 +522,6 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     if float(regime_decision.allocation) < 0.0 or float(regime_decision.allocation) > 1.0:
         raise PreflightError("regime_decision.allocation out of range 0..1 (STRICT)")
 
-    # Heatmap key / cell (샘플 부족은 정상: 엔진이 기본값으로 처리)
     ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
     hk: HeatmapKey = ev_heatmap.build_key(
         regime_band=str(regime_decision.band),
@@ -478,16 +530,12 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     )
     cell = ev_heatmap.get_cell_status(hk)
 
-    # Equity (현 시점 잔고 기반) + peak는 DB에 없으면 current로(명시 규칙: bootstrap)
     bal = get_balance_detail("USDT")
     if not isinstance(bal, dict) or not bal:
         raise PreflightError("get_balance_detail('USDT') returned invalid (STRICT)")
     if "availableBalance" not in bal or "crossUnPnl" not in bal:
         raise PreflightError("balance detail missing keys (STRICT)")
 
-    # TEST MODE (TRADE-GRADE):
-    # - test_dry_run=True AND test_fake_available_usdt>0 인 경우, 실계좌 잔고가 0이어도 Preflight 파이프라인을 통과시킨다.
-    # - 단, 테스트 잔고는 반드시 finite & >0 이어야 한다.
     if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
         eq_cur = float(_finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt"))
         if eq_cur <= 0:
@@ -497,7 +545,6 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         if eq_cur <= 0:
             raise PreflightError("equity_current_usdt must be > 0 (STRICT)")
 
-    # peak from DB snapshots (optional)
     eq_peak = eq_cur
     with get_session() as session:
         v = session.execute(
@@ -521,7 +568,6 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     if not math.isfinite(dd_pct) or dd_pct < 0.0 or dd_pct > 100.0:
         raise PreflightError(f"dd_pct invalid (STRICT): {dd_pct}")
 
-    # RiskPhysics
     risk_physics = RiskPhysicsEngine(policy=RiskPhysicsPolicy(max_allocation=1.0))
     tp_pct = float(_finite(getattr(SET, "tp_pct", None), "settings.tp_pct"))
     sl_pct = float(_finite(getattr(SET, "sl_pct", None), "settings.sl_pct"))
@@ -542,7 +588,6 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     if not math.isfinite(float(rp.effective_risk_pct)) or float(rp.effective_risk_pct) < 0.0 or float(rp.effective_risk_pct) > 1.0:
         raise PreflightError(f"risk_physics effective_risk_pct out of range (STRICT): {rp.effective_risk_pct}")
 
-    # Drift detector (단일 샘플: history 부족으로 판정은 안하지만 입력 검증은 수행)
     drift = DriftDetector(DriftDetectorConfig())
     try:
         drift.update_and_check(
@@ -557,7 +602,6 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     except DriftDetectedError as e:
         raise PreflightError(f"drift detected (STRICT): {e}") from e
 
-    # Invariant guard (signal-level)
     try:
         validate_signal_invariants_strict(
             SignalInvariantInputs(
@@ -575,6 +619,8 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         )
     except InvariantViolation as e:
         raise PreflightError(f"invariant violation (STRICT): {e}") from e
+
+    decision_meta = _extract_preflight_decision_meta_strict(uf)
 
     meta = {
         "symbol": boot.symbol,
@@ -600,33 +646,24 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         "ev_cell_n": int(cell.n),
         "auto_blocked": bool(rp.auto_blocked),
         "auto_risk_multiplier": float(rp.auto_risk_multiplier),
+        "entry_score": float(decision_meta["entry_score"]),
+        "trend_strength": float(decision_meta["trend_strength"]),
+        "spread": float(decision_meta["spread"]),
+        "orderbook_imbalance": float(decision_meta["orderbook_imbalance"]),
+        "entry_score_threshold": float(decision_meta["entry_score_threshold"]),
     }
 
-    from strategy.entry_flow import build_entry_signal_strict
-    features = dict(uf)
-
-    features.update({
-        "symbol": boot.symbol,
-        "regime": "PREFLIGHT",
-        "signal_source": "PREFLIGHT",
-        "signal_ts_ms": boot.signal_ts_ms,
-        "direction": "LONG",
-        "last_price": boot.last_price,
-        "candles_5m": boot.candles_5m,
-        "candles_5m_raw": boot.candles_5m_raw,
-        "equity_current_usdt": eq_cur,
-        "equity_peak_usdt": eq_peak,
-        "dd_pct": dd_pct,
-    })
-    # REQUIRED by entry_flow
-    features["entry_score"] = float(uf["engine_scores"]["total"]["score"]) / 100.0
-    features["trend_strength"] = float(uf["engine_scores"]["trend_4h"]["components"]["trend_strength"])
-    features["spread"] = float(uf["orderbook"]["spread_pct"])
-    features["orderbook_imbalance"] = float(uf["orderbook"]["depth_imbalance"]) 
-    return build_entry_signal_strict(
-        features=features,
-        settings=SET
+    return Signal(
+        action="ENTER",
+        direction="LONG",
+        tp_pct=float(tp_pct),
+        sl_pct=float(sl_pct),
+        risk_pct=float(rp.effective_risk_pct) if float(rp.effective_risk_pct) > 0 else 0.01,
+        reason="PREFLIGHT_PIPELINE",
+        guard_adjustments={},
+        meta=meta,
     )
+
 
 def _stage_gpt_contract_ping_strict() -> None:
     system_prompt = (
@@ -781,7 +818,6 @@ def run_preflight(*, preflight_only: bool) -> None:
     def _noop(*args: Any, **kwargs: Any) -> None:
         return None
 
-    # preflight에서 WS loop는 이미 시작했다. backfill 및 ws loop 재시작만 막는다.
     rb.start_async_worker = _noop  # type: ignore[attr-defined]
     rb._backfill_ws_kline_history = _noop  # type: ignore[attr-defined]
     rb.start_ws_loop = _noop  # type: ignore[attr-defined]

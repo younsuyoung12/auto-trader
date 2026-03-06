@@ -39,6 +39,14 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
   3) 기본값 fallback/log 최소화:
      - settings에 존재하는 값은 코드 내부 기본값으로 덮지 않음
 
+- 2026-03-06 (PATCH):
+  1) 엔진 런타임 경로에서 entry_flow 직접 호출 제거
+  2) unified_features → execution_engine 연결을 유지하면서
+     execution_engine이 요구하는 decision meta(entry_score/trend_strength/spread/orderbook_imbalance)를
+     run_bot_ws에서 엄격 추출해 주입
+  3) 기존 자동매매 구조(WS → unified_features → risk_physics → execution_engine) 복구
+  4) 기존 주문/리스크/드리프트/리컨실/로그/SAFE_STOP 로직 유지
+
 - 2026-03-05 (TRADE-GRADE):
   1) FIX: entry market_data candles_5m/candles_5m_raw 정규화
      - get_trading_signal이 Candle 객체 / 5튜플 / 6튜플을 혼합 반환할 수 있으므로,
@@ -107,8 +115,6 @@ from strategy.signal import Signal
 from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
 from sync.reconcile_engine import ReconcileConfig, ReconcileEngine, ReconcileResult
-
-from strategy.entry_flow import build_entry_signal_strict
 
 # ─────────────────────────────
 # NEW: Integrity / Invariant / Drift
@@ -234,6 +240,80 @@ def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[fl
     return float(tp), float(sl)
 
 
+def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], settings: Any) -> Dict[str, float]:
+    """
+    STRICT:
+    - entry_flow를 엔진 경로에서 호출하지 않는다.
+    - 대신 execution_engine이 decision 이벤트 생성에 요구하는 최소 결정 메타를
+      unified_features에서 엄격하게 추출한다.
+    """
+    if not isinstance(market_features, dict) or not market_features:
+        raise RuntimeError("market_features is required (STRICT)")
+
+    engine_scores = market_features.get("engine_scores")
+    if not isinstance(engine_scores, dict) or not engine_scores:
+        raise RuntimeError("market_features.engine_scores is required (STRICT)")
+
+    total = engine_scores.get("total")
+    if not isinstance(total, dict) or "score" not in total:
+        raise RuntimeError("market_features.engine_scores.total.score is required (STRICT)")
+
+    trend_4h = engine_scores.get("trend_4h")
+    if not isinstance(trend_4h, dict) or not trend_4h:
+        raise RuntimeError("market_features.engine_scores.trend_4h is required (STRICT)")
+
+    trend_components = trend_4h.get("components")
+    if not isinstance(trend_components, dict) or not trend_components:
+        raise RuntimeError("market_features.engine_scores.trend_4h.components is required (STRICT)")
+    if "trend_strength" not in trend_components:
+        raise RuntimeError("market_features.engine_scores.trend_4h.components.trend_strength is required (STRICT)")
+
+    orderbook = market_features.get("orderbook")
+    if not isinstance(orderbook, dict) or not orderbook:
+        raise RuntimeError("market_features.orderbook is required (STRICT)")
+    if "spread_pct" not in orderbook:
+        raise RuntimeError("market_features.orderbook.spread_pct is required (STRICT)")
+    if "depth_imbalance" not in orderbook:
+        raise RuntimeError("market_features.orderbook.depth_imbalance is required (STRICT)")
+
+    total_score_pct = _as_float(
+        total.get("score"),
+        "market_features.engine_scores.total.score",
+        min_value=0.0,
+        max_value=100.0,
+    )
+    trend_strength = _as_float(
+        trend_components.get("trend_strength"),
+        "market_features.engine_scores.trend_4h.components.trend_strength",
+        min_value=0.0,
+        max_value=1.0,
+    )
+    spread = _as_float(
+        orderbook.get("spread_pct"),
+        "market_features.orderbook.spread_pct",
+        min_value=0.0,
+    )
+    orderbook_imbalance = _as_float(
+        orderbook.get("depth_imbalance"),
+        "market_features.orderbook.depth_imbalance",
+        min_value=-1.0,
+        max_value=1.0,
+    )
+    entry_score_threshold = _as_float(
+        getattr(settings, "entry_score_threshold", None),
+        "settings.entry_score_threshold",
+        min_value=0.0,
+    )
+
+    return {
+        "entry_score": float(total_score_pct) / 100.0,
+        "trend_strength": float(trend_strength),
+        "spread": float(spread),
+        "orderbook_imbalance": float(orderbook_imbalance),
+        "entry_score_threshold": float(entry_score_threshold),
+    }
+
+
 def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidate:
     """
     STRICT:
@@ -265,6 +345,26 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidat
     if last_price <= 0:
         raise RuntimeError("market_data.last_price must be > 0 (STRICT)")
 
+    entry_score = _as_float(market_data.get("entry_score"), "market_data.entry_score", min_value=0.0, max_value=1.0)
+    trend_strength = _as_float(
+        market_data.get("trend_strength"),
+        "market_data.trend_strength",
+        min_value=0.0,
+        max_value=1.0,
+    )
+    spread = _as_float(market_data.get("spread"), "market_data.spread", min_value=0.0)
+    orderbook_imbalance = _as_float(
+        market_data.get("orderbook_imbalance"),
+        "market_data.orderbook_imbalance",
+        min_value=-1.0,
+        max_value=1.0,
+    )
+    entry_score_threshold = _as_float(
+        market_data.get("entry_score_threshold"),
+        "market_data.entry_score_threshold",
+        min_value=0.0,
+    )
+
     meta = {
         "symbol": symbol,
         "regime": str(market_data.get("regime") or "").strip() or str(market_data.get("signal_source") or "").strip(),
@@ -274,6 +374,11 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidat
         "candles_5m": market_data.get("candles_5m"),
         "candles_5m_raw": market_data.get("candles_5m_raw"),
         "extra": extra if isinstance(extra, dict) else None,
+        "entry_score": float(entry_score),
+        "trend_strength": float(trend_strength),
+        "spread": float(spread),
+        "orderbook_imbalance": float(orderbook_imbalance),
+        "entry_score_threshold": float(entry_score_threshold),
     }
 
     return EntryCandidate(
@@ -817,40 +922,12 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         _maybe_send_entry_block_tg(f"WS_NOT_READY:{symbol}:{prereq_reason}", msg, cooldown_sec=60)
         return None
 
-    try:
-        market_features = build_unified_features(symbol)
-    except (UnifiedFeaturesError, FeatureBuildError) as e:
-        msg = f"[SKIP][FEATURE_BUILD_FAIL] entry blocked: {symbol} ({e})"
-        log(msg)
-        _maybe_send_entry_block_tg(f"FEATURE_BUILD_FAIL:{symbol}:{type(e).__name__}", msg, cooldown_sec=60)
-        return None
-    # NEW: entry decision
-    signal = build_entry_signal_strict(
-        features=market_features,
-        settings=SET
-    )
-
-
-
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
 
     lp = _as_float(last_price, "last_price", min_value=0.0)
     if lp <= 0:
         raise RuntimeError("last_price must be > 0 (STRICT)")
-
-    out = {
-        "symbol": symbol,
-        "direction": direction,
-        "signal_source": signal_source_s,
-        "regime": signal_source_s,
-        "signal_ts_ms": int(ts_ms),
-        "candles_5m": candles_5m,
-        "candles_5m_raw": candles_5m_raw,
-        "last_price": float(lp),
-        "extra": extra,
-        "market_features": market_features,
-    }
 
     def _normalize_candles(arr: Any, *, name: str) -> Any:
         if not isinstance(arr, list) or not arr:
@@ -867,7 +944,7 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
                     ts, o, h, l, c = it[0], it[1], it[2], it[3], it[4]
                     fixed.append((int(ts), float(o), float(h), float(l), float(c), 0.0))
                     continue
-                raise RuntimeError(f"{name}[{i}] invalid candle tuple len<{5} (STRICT): len={len(it)}")
+                raise RuntimeError(f"{name}[{i}] invalid candle tuple len<5 (STRICT): len={len(it)}")
 
             if all(hasattr(it, a) for a in ("ts", "open", "high", "low", "close")):
                 fixed.append(
@@ -886,8 +963,36 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
 
         return fixed
 
-    out["candles_5m"] = _normalize_candles(out.get("candles_5m"), name="candles_5m")
-    out["candles_5m_raw"] = _normalize_candles(out.get("candles_5m_raw"), name="candles_5m_raw")
+    candles_5m_norm = _normalize_candles(candles_5m, name="candles_5m")
+    candles_5m_raw_norm = _normalize_candles(candles_5m_raw, name="candles_5m_raw")
+
+    try:
+        market_features = build_unified_features(symbol)
+    except (UnifiedFeaturesError, FeatureBuildError) as e:
+        msg = f"[SKIP][FEATURE_BUILD_FAIL] entry blocked: {symbol} ({e})"
+        log(msg)
+        _maybe_send_entry_block_tg(f"FEATURE_BUILD_FAIL:{symbol}:{type(e).__name__}", msg, cooldown_sec=60)
+        return None
+
+    decision_meta = _extract_runtime_decision_meta_strict(market_features, settings)
+
+    out = {
+        "symbol": symbol,
+        "direction": direction,
+        "signal_source": signal_source_s,
+        "regime": signal_source_s,
+        "signal_ts_ms": int(ts_ms),
+        "candles_5m": candles_5m_norm,
+        "candles_5m_raw": candles_5m_raw_norm,
+        "last_price": float(lp),
+        "extra": extra,
+        "market_features": market_features,
+        "entry_score": float(decision_meta["entry_score"]),
+        "trend_strength": float(decision_meta["trend_strength"]),
+        "spread": float(decision_meta["spread"]),
+        "orderbook_imbalance": float(decision_meta["orderbook_imbalance"]),
+        "entry_score_threshold": float(decision_meta["entry_score_threshold"]),
+    }
 
     validate_entry_market_data_bundle_strict(out)
     return out
