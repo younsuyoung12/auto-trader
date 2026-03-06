@@ -145,6 +145,19 @@ class Settings:
     openai_temperature: float = 0.2
     openai_max_latency_sec: float = 12.0
 
+    # =========================
+    # ENTRY FLOW SETTINGS
+    # =========================
+
+    entry_score_threshold = 0.55
+    entry_tp_pct = 0.01
+    entry_sl_pct = 0.005
+    entry_risk_pct = 0.02
+
+    entry_max_spread_pct = 0.002
+    entry_min_trend_strength = 0.2
+    entry_min_abs_orderbook_imbalance = 0.05
+
     # Notifications
     unrealized_notify_sec: int = 1800
 
