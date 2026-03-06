@@ -11,6 +11,11 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-06:
+  1) record_funding_rate를 현재 bt_funding_rates 스키마와 정합화
+  2) FundingRate ORM에 없는 mark_price 직접 저장 제거
+  3) 기존 mark_price 인자는 유지하되 raw_json으로 영속화
+  4) raw_json 인자 추가(기존 호출 호환 유지)
 - 2026-03-01: bt_trades 실제 스키마 정합
   - open: entry_ts/entry_price/qty/is_auto/... 기록, trade_id 반환
   - close: exit_ts/exit_price/pnl_usdt/... 업데이트, trade_id 반환
@@ -642,18 +647,28 @@ def record_funding_rate(
     ts: datetime,
     rate: float,
     mark_price: Optional[float] = None,
+    raw_json: Optional[dict[str, Any]] = None,
 ) -> None:
     sym = _require_nonempty_str(symbol, "symbol").upper()
     ts_dt = _require_tzaware_dt(ts, "ts")
     rate_val = _require_number(rate, "rate")
     mp = _opt_float(mark_price, "mark_price") if mark_price is not None else None
+    rj = _opt_json_dict(raw_json, "raw_json")
+
+    payload: Optional[dict[str, Any]]
+    if rj is None and mp is None:
+        payload = None
+    else:
+        payload = dict(rj) if rj is not None else {}
+        if mp is not None:
+            payload["mark_price"] = float(mp)
 
     with get_session() as session:
         fr = FundingRate(
             symbol=sym,
             ts=ts_dt,
             rate=rate_val,
-            mark_price=mp,
+            raw_json=payload,
             created_at=_utc_now(),
         )
         session.add(fr)
