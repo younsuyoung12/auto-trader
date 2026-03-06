@@ -62,6 +62,18 @@ PATCH NOTES — 2026-03-02 (UPGRADE)
 PATCH NOTES — 2026-03-02 (FIX)
 - Pylance "Trade is not defined" 해결:
   - from state.trader_state import Trade 추가
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-06:
+  1) 보호주문 검증 연동 강화
+     - order_executor 의 TP/SL 실가시성 검증 결과를 execution_engine 에서 필수 필드로 재검증
+  2) TP 주문 필수화
+     - ENTER 성공 후 trade.tp_order_id 누락 시 즉시 예외
+  3) reconciliation_status 승격
+     - 보호주문 검증 완료 상태를 PROTECTION_VERIFIED 로 영속화
+  4) 보호주문 검증 완료 이벤트 추가
+     - PROTECTION_VERIFIED 이벤트를 bt_events 에 기록
 ========================================================
 """
 
@@ -78,7 +90,10 @@ from events.signals_logger import log_event, log_signal, log_skip_event
 from execution.exchange_api import get_available_usdt, get_balance_detail, req
 from execution.execution_quality_engine import ExecutionQualityError, build_execution_quality_snapshot_obj
 from execution.exceptions import OrderFailed, StateViolation
-from execution.order_executor import open_position_with_tp_sl
+from execution.order_executor import (
+    ProtectionOrderVerificationError,
+    open_position_with_tp_sl,
+)
 from execution.order_state import OrderState
 from execution.risk_manager import hard_risk_guard_check
 from infra.async_worker import submit as submit_async
@@ -98,7 +113,7 @@ from state.db_writer import (
 )
 from state.trader_state import Trade
 
-from execution.invariant_guard import (  # noqa: E402
+from execution.invariant_guard import (
     ExecutionInvariantInputs,
     InvariantViolation,
     SignalInvariantInputs,
@@ -115,6 +130,7 @@ logger = logging.getLogger(__name__)
 _EXECUTION_LOCK: Lock = Lock()
 
 _ALLOWED_DECISION_ACTIONS = ("ENTRY", "NO_ENTRY", "HOLD", "EXIT")
+_ALLOWED_RECONCILIATION_STATUSES = ("ENTRY_FILLED", "PROTECTION_VERIFIED")
 
 
 def _as_bool_strict(v: Any, name: str) -> bool:
@@ -567,7 +583,7 @@ def _require_trade_exec_fields(
     trade: Any,
     *,
     soft_mode: bool,
-) -> Tuple[str, Optional[str], Optional[str], str, float, float]:
+) -> Tuple[str, str, Optional[str], str, float, float, str]:
     entry_order_id = getattr(trade, "entry_order_id", None)
     tp_order_id = getattr(trade, "tp_order_id", None)
     sl_order_id = getattr(trade, "sl_order_id", None)
@@ -575,8 +591,8 @@ def _require_trade_exec_fields(
     if not isinstance(entry_order_id, str) or not entry_order_id.strip():
         raise OrderFailed("trade.entry_order_id is required (STRICT)")
 
-    if tp_order_id is not None and (not isinstance(tp_order_id, str) or not tp_order_id.strip()):
-        raise OrderFailed("trade.tp_order_id must be str or None (STRICT)")
+    if not isinstance(tp_order_id, str) or not tp_order_id.strip():
+        raise OrderFailed("trade.tp_order_id is required (STRICT)")
 
     if sl_order_id is not None and (not isinstance(sl_order_id, str) or not sl_order_id.strip()):
         raise OrderFailed("trade.sl_order_id must be str or None (STRICT)")
@@ -589,24 +605,38 @@ def _require_trade_exec_fields(
     if not isinstance(exchange_position_side, str) or not exchange_position_side.strip():
         raise OrderFailed("trade.exchange_position_side is required (STRICT)")
     exchange_position_side = exchange_position_side.strip().upper()
+    if exchange_position_side not in ("BOTH", "LONG", "SHORT"):
+        raise OrderFailed("trade.exchange_position_side must be BOTH/LONG/SHORT (STRICT)")
 
     remaining_qty = getattr(trade, "remaining_qty", None)
     if remaining_qty is None:
         raise OrderFailed("trade.remaining_qty is required (STRICT)")
     remaining_qty_f = _as_float(remaining_qty, "trade.remaining_qty", min_value=0.0)
+    if remaining_qty_f <= 0:
+        raise OrderFailed("trade.remaining_qty must be > 0 (STRICT)")
 
     realized_pnl_usdt = getattr(trade, "realized_pnl_usdt", None)
     if realized_pnl_usdt is None:
         raise OrderFailed("trade.realized_pnl_usdt is required (STRICT)")
     realized_pnl_usdt_f = _as_float(realized_pnl_usdt, "trade.realized_pnl_usdt")
 
+    reconciliation_status = getattr(trade, "reconciliation_status", None)
+    if not isinstance(reconciliation_status, str) or not reconciliation_status.strip():
+        raise OrderFailed("trade.reconciliation_status is required (STRICT)")
+    reconciliation_status = reconciliation_status.strip().upper()
+    if reconciliation_status not in _ALLOWED_RECONCILIATION_STATUSES:
+        raise OrderFailed(
+            f"trade.reconciliation_status unexpected (STRICT): {reconciliation_status!r}"
+        )
+
     return (
         entry_order_id.strip(),
-        (tp_order_id.strip() if isinstance(tp_order_id, str) else None),
+        tp_order_id.strip(),
         (sl_order_id.strip() if isinstance(sl_order_id, str) else None),
         exchange_position_side,
         float(remaining_qty_f),
         float(realized_pnl_usdt_f),
+        reconciliation_status,
     )
 
 
@@ -923,7 +953,6 @@ class ExecutionEngine:
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
 
-            # NEW: Invariant Guard (signal/meta) — execute() 진입 시점 검증
             try:
                 validate_signal_from_meta_strict(meta)
                 validate_signal_invariants_strict(
@@ -1152,7 +1181,6 @@ class ExecutionEngine:
             if price_for_qty <= 0:
                 raise OrderFailed("price_for_qty must be > 0 (STRICT)")
 
-            # slippage 계산 (fraction) — 이후 invariant로 재검증
             slippage_pct_for_invariant = abs(float(entry_price_hint) - float(last_price)) / float(last_price)
 
             slippage_block_pct = _as_float(getattr(self.settings, "slippage_block_pct"), "settings.slippage_block_pct", min_value=0.0)
@@ -1217,7 +1245,6 @@ class ExecutionEngine:
             if qty_raw <= 0:
                 raise OrderFailed("qty_raw must be > 0 (STRICT)")
 
-            # NEW: Invariant Guard (execution-level) — slippage 포함 재검증
             try:
                 validate_execution_invariants_strict(
                     ExecutionInvariantInputs(
@@ -1460,26 +1487,56 @@ class ExecutionEngine:
                 _submit_tg_nonblocking(send_tg, f"[TEST_DRY_RUN] DB recorded + closed: {symbol} {direction} trade_id={trade_id}", label="send_tg")
                 return None
 
-            trade = open_position_with_tp_sl(
-                settings=self.settings,
-                symbol=symbol,
-                side_open=side_open,
-                qty=float(qty_raw),
-                entry_price_hint=float(entry_price_hint),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                source=str(signal_source),
-                soft_mode=bool(soft_mode),
-                sl_floor_ratio=sl_floor_ratio,
-                entry_client_order_id=str(entry_client_order_id),
-            )
+            try:
+                trade = open_position_with_tp_sl(
+                    settings=self.settings,
+                    symbol=symbol,
+                    side_open=side_open,
+                    qty=float(qty_raw),
+                    entry_price_hint=float(entry_price_hint),
+                    tp_pct=float(tp_pct),
+                    sl_pct=float(sl_pct),
+                    source=str(signal_source),
+                    soft_mode=bool(soft_mode),
+                    sl_floor_ratio=sl_floor_ratio,
+                    entry_client_order_id=str(entry_client_order_id),
+                )
+            except ProtectionOrderVerificationError as e:
+                log_event(
+                    "ERROR",
+                    symbol=symbol,
+                    regime=regime,
+                    source="execution_engine",
+                    side=direction,
+                    price=float(entry_price_hint),
+                    qty=float(qty_raw),
+                    leverage=float(leverage),
+                    tp_pct=float(tp_pct),
+                    sl_pct=float(sl_pct),
+                    risk_pct=float(allocation_ratio),
+                    reason="protection_order_verification_failed",
+                    extra_json={
+                        "signal_source": signal_source,
+                        "entry_client_order_id": entry_client_order_id,
+                        "error": str(e)[:240],
+                    },
+                )
+                raise
             if trade is None:
                 raise OrderFailed("open_position_with_tp_sl returned None (STRICT)")
 
             state = OrderState.FILLED
             setattr(trade, "order_state", state.value)
 
-            entry_order_id, tp_order_id, sl_order_id, pos_side, remaining_qty, realized_pnl_usdt = _require_trade_exec_fields(trade, soft_mode=bool(soft_mode))
+            (
+                entry_order_id,
+                tp_order_id,
+                sl_order_id,
+                pos_side,
+                remaining_qty,
+                realized_pnl_usdt,
+                reconciliation_status,
+            ) = _require_trade_exec_fields(trade, soft_mode=bool(soft_mode))
 
             entry_price = getattr(trade, "entry", getattr(trade, "entry_price", None))
             if entry_price is None:
@@ -1494,6 +1551,34 @@ class ExecutionEngine:
             entry_ts_dt = getattr(trade, "entry_ts", None)
             if not isinstance(entry_ts_dt, datetime) or entry_ts_dt.tzinfo is None or entry_ts_dt.tzinfo.utcoffset(entry_ts_dt) is None:
                 raise OrderFailed("trade.entry_ts (tz-aware datetime) is required (STRICT)")
+
+            if reconciliation_status != "PROTECTION_VERIFIED":
+                raise OrderFailed(
+                    f"trade.reconciliation_status must be PROTECTION_VERIFIED after ENTRY (STRICT), got={reconciliation_status!r}"
+                )
+
+            log_event(
+                "PROTECTION_VERIFIED",
+                symbol=symbol,
+                regime=regime,
+                source="execution_engine",
+                side=direction,
+                price=float(entry_price),
+                qty=float(entry_qty),
+                leverage=float(leverage),
+                tp_pct=float(tp_pct),
+                sl_pct=float(sl_pct),
+                risk_pct=float(allocation_ratio),
+                reason="protection_orders_verified",
+                extra_json={
+                    "signal_source": signal_source,
+                    "entry_order_id": entry_order_id,
+                    "tp_order_id": tp_order_id,
+                    "sl_order_id": sl_order_id,
+                    "entry_client_order_id": entry_client_order_id,
+                    "exchange_position_side": pos_side,
+                },
+            )
 
             log_event(
                 "on_entry_filled",
@@ -1513,6 +1598,9 @@ class ExecutionEngine:
 
             now_sync = datetime.now(timezone.utc)
 
+            setattr(trade, "reconciliation_status", "PROTECTION_VERIFIED")
+            setattr(trade, "last_synced_at", now_sync)
+
             trade_id = record_trade_open_returning_id(
                 symbol=symbol,
                 side=str(side_open),
@@ -1531,12 +1619,12 @@ class ExecutionEngine:
                 sl_pct=float(sl_pct),
                 note=f"reason={str(signal.reason or '')[:180]}",
                 entry_order_id=str(entry_order_id),
-                tp_order_id=(str(tp_order_id) if tp_order_id is not None else None),
+                tp_order_id=str(tp_order_id),
                 sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
                 exchange_position_side=str(pos_side),
                 remaining_qty=float(remaining_qty),
                 realized_pnl_usdt=float(realized_pnl_usdt),
-                reconciliation_status="OK",
+                reconciliation_status="PROTECTION_VERIFIED",
                 last_synced_at=now_sync,
             )
 

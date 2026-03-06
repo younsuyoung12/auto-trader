@@ -33,6 +33,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   4) 설정 의존성 명시:
      - slippage_max_ticks / slippage_max_notional_pct / stop_on_heavy_slippage / max_tp_sl_reset_failures
        가 Settings에 존재해야 함(없으면 즉시 예외)
+- 2026-03-06:
+  1) account websocket(USER DATA STREAM) 포지션 스냅샷 연동
+     - slippage / close 판단에서 account_ws 스냅샷을 사용
+  2) "첫 번째 row 선택" 제거
+     - position 선택은 trade 방향 + position_side 기준 유일성 강제
+  3) 부분청산/완전청산 판단 입력을 account_ws 실시간 스냅샷 기준으로 정합 강화
 ========================================================
 """
 
@@ -44,9 +50,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from execution.exchange_api import fetch_open_positions, req
 from execution.exceptions import OrderFailed, StateViolation, SyncMismatch
 from execution.state_machine import TradeEvent, TradeLifecycleState, apply_event, get_state
+from execution.exchange_api import req
+from infra.account_ws import get_account_positions_snapshot
 from infra.async_worker import submit as submit_async
 from infra.telelog import log, send_tg
 from settings import load_settings
@@ -125,6 +132,22 @@ def _dt_to_epoch_ms_utc(dt: datetime) -> int:
     return ms
 
 
+def _normalize_symbol(v: Any, name: str) -> str:
+    s = _require_nonempty_str(v, name).replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        raise OrderFailed(f"{name} normalized empty (STRICT)")
+    return s
+
+
+def _normalize_position_side(v: Any, name: str) -> str:
+    s = str(v or "").upper().strip()
+    if not s:
+        raise OrderFailed(f"{name} is required (STRICT)")
+    if s not in ("BOTH", "LONG", "SHORT"):
+        raise OrderFailed(f"{name} must be BOTH/LONG/SHORT (STRICT), got={s!r}")
+    return s
+
+
 # ─────────────────────────────────────────────────────────────
 # Trade (in-memory)
 # ─────────────────────────────────────────────────────────────
@@ -179,7 +202,6 @@ class Trade:
         if int(self.leverage) < 1:
             raise OrderFailed("trade.leverage must be >= 1 (STRICT)")
 
-        # legacy alias sync (허용)
         if self.entry_price > 0 and self.entry == 0:
             self.entry = float(self.entry_price)
         if self.entry > 0 and self.entry_price == 0:
@@ -203,7 +225,6 @@ class Trade:
         if self.last_synced_at.tzinfo is None or self.last_synced_at.tzinfo.utcoffset(self.last_synced_at) is None:
             raise OrderFailed("trade.last_synced_at must be timezone-aware (STRICT)")
 
-        # 상태머신: 열린 트레이드는 ENTERED여야 한다.
         st = get_state(self)
         if self.is_open and st != TradeLifecycleState.ENTERED:
             raise StateViolation(f"open Trade must be ENTERED, got {st.value}")
@@ -259,6 +280,92 @@ class TraderState:
 
 
 # ─────────────────────────────────────────────────────────────
+# Account WS Position Snapshot (STRICT)
+# ─────────────────────────────────────────────────────────────
+def _fetch_account_position_rows_strict(symbol: str) -> List[Dict[str, Any]]:
+    sym = _normalize_symbol(symbol, "symbol")
+    rows = get_account_positions_snapshot(sym)
+    if not isinstance(rows, list):
+        raise OrderFailed("account ws positions snapshot must be list (STRICT)")
+    if not rows:
+        raise OrderFailed(f"account ws position snapshot empty: symbol={sym} (STRICT)")
+
+    out: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise OrderFailed(f"account ws position row[{i}] must be dict (STRICT)")
+        row_sym = _normalize_symbol(row.get("symbol"), f"account_ws.position[{i}].symbol")
+        if row_sym != sym:
+            raise OrderFailed(
+                f"account ws position symbol mismatch (STRICT): got={row_sym} expected={sym}"
+            )
+
+        pos_side = _normalize_position_side(row.get("position_side"), f"account_ws.position[{i}].position_side")
+        pos_amt = _require_float(row.get("position_amt"), f"account_ws.position[{i}].position_amt")
+        entry_price = _require_float(row.get("entry_price"), f"account_ws.position[{i}].entry_price")
+        _ = _require_float(row.get("unrealized_pnl"), f"account_ws.position[{i}].unrealized_pnl")
+        _ = _require_nonempty_str(row.get("margin_type"), f"account_ws.position[{i}].margin_type")
+
+        if abs(pos_amt) > 1e-12 and entry_price <= 0:
+            raise OrderFailed("live account ws position entry_price must be > 0 (STRICT)")
+
+        out.append(
+            {
+                "symbol": row_sym,
+                "position_side": pos_side,
+                "position_amt": float(pos_amt),
+                "entry_price": float(entry_price),
+                "unrealized_pnl": float(row["unrealized_pnl"]),
+                "margin_type": str(row["margin_type"]).upper(),
+                "event_time_ms": _require_int(row.get("event_time_ms"), f"account_ws.position[{i}].event_time_ms"),
+                "transaction_time_ms": _require_int(
+                    row.get("transaction_time_ms"),
+                    f"account_ws.position[{i}].transaction_time_ms",
+                ),
+            }
+        )
+
+    return out
+
+
+def _trade_direction_strict(trade: Trade) -> str:
+    side = str(trade.side or "").upper().strip()
+    if side in ("BUY", "LONG"):
+        return "LONG"
+    if side in ("SELL", "SHORT"):
+        return "SHORT"
+    raise CloseSummaryError(f"invalid trade.side: {side!r} (STRICT)")
+
+
+def _pick_position_row_for_trade(rows: List[Dict[str, Any]], trade: Trade) -> Dict[str, Any]:
+    if not rows:
+        raise CloseSummaryError("position rows empty (STRICT)")
+
+    wanted = _trade_direction_strict(trade)
+
+    matches = [r for r in rows if str(r.get("position_side") or "").upper() == wanted]
+    if len(matches) == 1:
+        row = matches[0]
+    elif len(matches) > 1:
+        raise CloseSummaryError("multiple position rows match position_side (ambiguous) (STRICT)")
+    else:
+        both = [r for r in rows if str(r.get("position_side") or "").upper() == "BOTH"]
+        if len(both) == 1:
+            row = both[0]
+        elif len(both) > 1:
+            raise CloseSummaryError("multiple BOTH position rows (ambiguous) (STRICT)")
+        else:
+            raise CloseSummaryError("cannot select position row for trade (STRICT)")
+
+    pos_amt = _float_strict(row.get("position_amt"), "position.position_amt")
+    if wanted == "LONG" and pos_amt < 0:
+        raise CloseSummaryError("selected position row direction mismatch: expected LONG (STRICT)")
+    if wanted == "SHORT" and pos_amt > 0:
+        raise CloseSummaryError("selected position row direction mismatch: expected SHORT (STRICT)")
+    return row
+
+
+# ─────────────────────────────────────────────────────────────
 # Slippage (legacy 유지)
 # ─────────────────────────────────────────────────────────────
 def evaluate_slippage(
@@ -303,7 +410,7 @@ def evaluate_slippage(
 def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
     from execution.order_executor import close_position_market, get_symbol_filters
 
-    sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
+    sym = _normalize_symbol(trade.symbol, "trade.symbol")
     expected_entry = _require_float(entry_price, "entry_price")
 
     filters = get_symbol_filters(sym)
@@ -321,7 +428,6 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
     if tick_size <= 0:
         raise OrderFailed(f"tick_size must be > 0: symbol={sym}, value={tick_size} (STRICT)")
 
-    # STRICT: settings에 존재해야 한다(ENV 폴백 금지)
     if not hasattr(SET, "slippage_max_ticks"):
         raise OrderFailed("settings.slippage_max_ticks missing (STRICT)")
     if not hasattr(SET, "slippage_max_notional_pct"):
@@ -333,20 +439,12 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
     max_notional_pct = float(getattr(SET, "slippage_max_notional_pct"))
     stop_on_heavy = bool(getattr(SET, "stop_on_heavy_slippage"))
 
-    positions = fetch_open_positions(sym)
-    if not isinstance(positions, list):
-        raise OrderFailed("fetch_open_positions returned non-list (STRICT)")
+    pos_rows = _fetch_account_position_rows_strict(sym)
+    pos_row = _pick_position_row_for_trade(pos_rows, trade)
 
-    pos = None
-    for p in positions:
-        if isinstance(p, dict) and str(p.get("symbol", "")).upper() == sym.upper():
-            pos = p
-            break
-    if pos is None:
-        raise OrderFailed(f"open position not found for slippage check: symbol={sym} (STRICT)")
-
-    actual_entry_raw = pos.get("entryPrice") or pos.get("avgEntryPrice") or pos.get("entry_price")
-    actual_entry = _require_float(actual_entry_raw, "actual_entry_price")
+    actual_entry = _require_float(pos_row.get("entry_price"), "actual_entry_price")
+    if actual_entry <= 0:
+        raise OrderFailed("actual_entry_price must be > 0 (STRICT)")
 
     ok, reason = evaluate_slippage(
         expected_entry=expected_entry,
@@ -375,7 +473,7 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
         elif side_u == "SHORT":
             side_u = "SELL"
         _submit_tg_nonblocking("🛑 설정(stop_on_heavy_slippage=True)에 따라 즉시 시장가로 포지션을 정리합니다.")
-        close_position_market(symbol=sym, side=side_u, qty=float(trade.qty))
+        close_position_market(symbol=sym, side_open=side_u, qty=float(trade.qty))
 
     return False
 
@@ -412,26 +510,6 @@ def _int_strict(v: Any, name: str) -> int:
         raise CloseSummaryError(f"{name} must be int: {e} (STRICT)") from e
 
 
-def _fetch_position_risk_rows_strict(symbol: str) -> List[Dict[str, Any]]:
-    sym = _require_nonempty_str(symbol, "symbol").upper()
-    data = req("GET", "/fapi/v2/positionRisk", params={"symbol": sym}, private=True)
-    if not isinstance(data, list):
-        raise CloseSummaryError("positionRisk response must be list (STRICT)")
-    out: List[Dict[str, Any]] = [r for r in data if isinstance(r, dict) and str(r.get("symbol") or "").upper() == sym]
-    if not out:
-        raise CloseSummaryError("positionRisk returned empty (STRICT)")
-    return out
-
-
-def _trade_direction_strict(trade: Trade) -> str:
-    side = str(trade.side or "").upper().strip()
-    if side in ("BUY", "LONG"):
-        return "LONG"
-    if side in ("SELL", "SHORT"):
-        return "SHORT"
-    raise CloseSummaryError(f"invalid trade.side: {side!r} (STRICT)")
-
-
 def _trade_entry_side_db(trade: Trade) -> str:
     side = str(trade.side or "").upper().strip()
     if side in ("BUY", "SELL"):
@@ -450,27 +528,6 @@ def _close_side_for_trade(trade: Trade) -> str:
     if side_u in ("SELL", "SHORT"):
         return "BUY"
     raise CloseSummaryError(f"invalid trade.side: {side_u!r} (STRICT)")
-
-
-def _pick_position_row_for_trade(rows: List[Dict[str, Any]], trade: Trade) -> Dict[str, Any]:
-    if not rows:
-        raise CloseSummaryError("positionRisk rows empty (STRICT)")
-
-    wanted = _trade_direction_strict(trade)
-
-    matches = [r for r in rows if str(r.get("positionSide") or "").upper() == wanted]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise CloseSummaryError("multiple positionRisk rows match positionSide (ambiguous) (STRICT)")
-
-    both = [r for r in rows if str(r.get("positionSide") or "").upper() in ("BOTH", "")]
-    if len(both) == 1:
-        return both[0]
-    if len(both) > 1:
-        raise CloseSummaryError("multiple positionRisk rows for BOTH (ambiguous) (STRICT)")
-
-    raise CloseSummaryError("cannot select positionRisk row for trade (STRICT)")
 
 
 def _fetch_order_strict(symbol: str, order_id: str) -> Dict[str, Any]:
@@ -553,7 +610,7 @@ def _summarize_user_trades_for_order(trades: List[Dict[str, Any]], *, order_id: 
         "pnl": float(pnl_net),
         "fee": float(fee_usdt_sum),
         "realizedPnl": float(realized_sum),
-        "close_time": int(last_time_ms),  # STRICT: 필수
+        "close_time": int(last_time_ms),
     }
     return out
 
@@ -611,11 +668,6 @@ def build_close_summary_strict(
     now_ms: Optional[int] = None,
     lookback_sec: int = 6 * 3600,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    STRICT:
-    - now_ms는 '관측 시각'으로만 사용(윈도우 생성용).
-    - 거래소 order/userTrades에 close time이 없으면 예외(임의 보정 금지).
-    """
     sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
     observed_at_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     if observed_at_ms <= 0:
@@ -817,16 +869,15 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
 
     t = open_trades[0]
 
-    # 상태머신: ENTERED만 허용
     if get_state(t) != TradeLifecycleState.ENTERED:
         raise StateViolation(f"check_closes requires ENTERED state, got {get_state(t).value}")
 
     symbol = _require_nonempty_str(t.symbol, "open_trades[0].symbol").upper()
 
-    pos_rows = _fetch_position_risk_rows_strict(symbol)
+    pos_rows = _fetch_account_position_rows_strict(symbol)
     row = _pick_position_row_for_trade(pos_rows, t)
 
-    pos_qty = _float_strict(row.get("positionAmt"), "positionRisk.positionAmt")
+    pos_qty = _float_strict(row.get("position_amt"), "position.position_amt")
     abs_qty = abs(pos_qty)
 
     eps = 1e-12
@@ -835,7 +886,6 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
     if prev_remaining <= 0:
         raise CloseSummaryError("trade.remaining_qty must be > 0 (STRICT)")
 
-    # 부분청산: 포지션이 남아있는데 수량이 줄었다
     if abs_qty > eps and abs_qty < prev_remaining - eps:
         delta = prev_remaining - abs_qty
 
@@ -868,7 +918,6 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
 
         return [t], []
 
-    # 완전 청산: positionAmt = 0
     if abs_qty < eps:
         reason, summary = build_close_summary_strict(t)
 
@@ -876,7 +925,6 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
         if t.id <= 0:
             t.id = int(trade_id)
 
-        # 상태 전이 (SYNC 기반 확정)
         apply_event(t, TradeEvent.SYNC_SET_CLOSED, reason="exchange_position_zero")
 
         t.is_open = False
@@ -891,7 +939,6 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
 
         return [], [{"trade": t, "reason": reason, "summary": summary}]
 
-    # 변화 없음
     return [t], []
 
 

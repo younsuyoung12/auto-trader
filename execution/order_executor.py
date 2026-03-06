@@ -43,6 +43,17 @@ PATCH NOTES — 2026-03-02
 - Trade 객체 생성 시(레거시 호환) Trade 시그니처에 존재하는 필드만 주입(호환성 유지)
   - entry_order_id/tp_order_id/sl_order_id/exchange_position_side/remaining_qty/realized_pnl_usdt 등
 - STRICT 유지: 누락/불일치/실패 시 즉시 예외 또는 명시적 실패 처리(추정/폴백 금지)
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-06:
+  1) TP/SL 보호주문 가시성 검증 추가
+     - ENTRY 후 TP/SL 주문이 실제로 거래소에 존재하는지 polling 검증
+     - orderId / clientOrderId / side / type / positionSide / reduceOnly|closePosition / status 엄격 확인
+  2) 보호주문 검증 실패 시 무보호 포지션 방지
+     - close_all_positions_market()로 즉시 정리 시도 후 예외 전파
+  3) 보호주문 검증 전용 예외 추가
+     - ProtectionOrderVerificationError
 ========================================================
 """
 
@@ -58,12 +69,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, getcontext
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from execution.exchange_api import (
     fetch_open_positions,
     get_exchange_info,
     get_open_orders,
+    get_order,
+    get_order_by_client_id,
     get_position,
     req,
     set_leverage,
@@ -87,6 +100,10 @@ _FILTER_CACHE_TTL_SEC: int = 1800  # 30 minutes
 _IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
 _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
 
+# Protection order verification
+_PROTECTION_VERIFY_WAIT_SEC: float = 3.0
+_PROTECTION_VERIFY_POLL_SEC: float = 0.2
+
 
 # ---------------------------------------------------------------------------
 # Exceptions (TRADE-GRADE)
@@ -105,6 +122,10 @@ class PartialFillError(OrderExecutionError):
 
 class PositionVerificationError(OrderExecutionError):
     """Raised when exchange position does not reflect expected execution (STRICT)."""
+
+
+class ProtectionOrderVerificationError(OrderExecutionError):
+    """Raised when TP/SL protection orders are missing or invalid (STRICT)."""
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +345,6 @@ def _make_trade_strict(**kwargs: Any) -> Trade:
     """
     allowed = _trade_ctor_supported_fields()
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
-    # STRICT: 필수 필드 누락/오타 등은 Trade ctor에서 예외로 터져야 한다.
     return Trade(**filtered)  # type: ignore[arg-type]
 
 
@@ -579,6 +599,21 @@ def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional
         if not isinstance(o, dict):
             raise RuntimeError("openOrders contains non-dict (STRICT)")
         if str(o.get("clientOrderId", "")).strip() == client_order_id:
+            return o
+    return None
+
+
+def _find_open_order_by_id(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+    orders = get_open_orders(symbol)
+    if not isinstance(orders, list):
+        raise RuntimeError("get_open_orders returned non-list")
+    for o in orders:
+        if not isinstance(o, dict):
+            raise RuntimeError("openOrders contains non-dict (STRICT)")
+        oid = o.get("orderId")
+        if oid is None:
+            raise RuntimeError("openOrders row missing orderId (STRICT)")
+        if str(oid).strip() == str(order_id).strip():
             return o
     return None
 
@@ -1020,7 +1055,6 @@ def _wait_order_filled_strict(
             if exec_qty <= 0:
                 raise OrderExecutionError("FILLED but executedQty <= 0 (STRICT)")
 
-            # executedQty mismatch: 허용 오차는 step의 절반(실전 표현 오차 방지)
             diff = _decimal_abs(exec_qty - expected_qty)
             tol = qty_step / Decimal("2")
             if diff > tol:
@@ -1036,7 +1070,6 @@ def _wait_order_filled_strict(
                 f"order not FILLED within {max_wait_sec}s (status={last_status})"
             )
 
-        # NEW/PARTIALLY_FILLED 등: 짧게 대기
         time.sleep(0.2)
 
 
@@ -1075,13 +1108,10 @@ def _verify_position_reflects_execution_strict(
         amt = _require_decimal(pos.get("positionAmt"), name="position.positionAmt")
         last_amt = amt
 
-        # 방향 확인
         if side_u == "BUY":
             if amt <= 0:
-                # 아직 반영 안 됐을 수 있으니 deadline 전까지 재시도
                 pass
             else:
-                # 수량 반영 확인(최소 executed_qty - step)
                 if _decimal_abs(amt) + qty_step < executed_qty:
                     raise PositionVerificationError(
                         f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
@@ -1102,6 +1132,192 @@ def _verify_position_reflects_execution_strict(
                 f"position not reflecting execution within {max_wait_sec}s (last_positionAmt={_d_to_str(last_amt) if last_amt is not None else 'None'})"
             )
         time.sleep(0.2)
+
+
+# ---------------------------------------------------------------------------
+# Protection order verification (TRADE-GRADE)
+# ---------------------------------------------------------------------------
+def _normalize_order_status_strict(v: Any) -> str:
+    s = str(v or "").upper().strip()
+    if not s:
+        raise ProtectionOrderVerificationError("order.status is missing (STRICT)")
+    return s
+
+
+def _fetch_order_visibility_snapshot_strict(
+    *,
+    symbol: str,
+    order_id: Optional[str],
+    client_order_id: Optional[str],
+    timeout_sec: int,
+) -> Optional[Dict[str, Any]]:
+    sym = _normalize_symbol(symbol)
+
+    if order_id is not None and str(order_id).strip():
+        open_row = _find_open_order_by_id(sym, str(order_id))
+        if open_row is not None:
+            return open_row
+
+        try:
+            row = get_order(sym, str(order_id))
+        except Exception as e:
+            if not _is_order_not_found(e):
+                raise
+        else:
+            if not isinstance(row, dict):
+                raise ProtectionOrderVerificationError("get_order returned non-dict (STRICT)")
+            return row
+
+    if client_order_id is not None and str(client_order_id).strip():
+        open_row_by_client = _find_open_order_by_client_id(sym, str(client_order_id))
+        if open_row_by_client is not None:
+            return open_row_by_client
+
+        try:
+            row2 = get_order_by_client_id(sym, str(client_order_id))
+        except Exception as e:
+            if not _is_order_not_found(e):
+                raise
+        else:
+            if not isinstance(row2, dict):
+                raise ProtectionOrderVerificationError("get_order_by_client_id returned non-dict (STRICT)")
+            return row2
+
+    _ = timeout_sec
+    return None
+
+
+def _validate_protection_order_shape_strict(
+    *,
+    order: Dict[str, Any],
+    symbol: str,
+    expected_side: str,
+    expected_type: str,
+    expected_position_side: str,
+    expected_client_order_id: Optional[str],
+) -> str:
+    if not isinstance(order, dict):
+        raise ProtectionOrderVerificationError("protection order must be dict (STRICT)")
+
+    order_symbol = _normalize_symbol(order.get("symbol", ""))
+    if order_symbol != _normalize_symbol(symbol):
+        raise ProtectionOrderVerificationError(
+            f"protection order symbol mismatch (STRICT): got={order_symbol} expected={symbol}"
+        )
+
+    order_id = order.get("orderId")
+    if order_id is None or not str(order_id).strip():
+        raise ProtectionOrderVerificationError("protection order missing orderId (STRICT)")
+
+    side = str(order.get("side") or "").upper().strip()
+    if side != _normalize_side(expected_side):
+        raise ProtectionOrderVerificationError(
+            f"protection order side mismatch (STRICT): got={side} expected={_normalize_side(expected_side)}"
+        )
+
+    order_type = str(order.get("type") or "").upper().strip()
+    if order_type != str(expected_type).upper().strip():
+        raise ProtectionOrderVerificationError(
+            f"protection order type mismatch (STRICT): got={order_type} expected={str(expected_type).upper().strip()}"
+        )
+
+    status = _normalize_order_status_strict(order.get("status"))
+    if status in {"CANCELED", "EXPIRED", "REJECTED"}:
+        raise ProtectionOrderVerificationError(
+            f"protection order terminal status (STRICT): orderId={order_id} status={status}"
+        )
+    if status not in {"NEW", "PARTIALLY_FILLED"}:
+        raise ProtectionOrderVerificationError(
+            f"unexpected protection order status (STRICT): orderId={order_id} status={status}"
+        )
+
+    position_side = str(order.get("positionSide") or "").upper().strip() or "BOTH"
+    if position_side != _normalize_position_side(expected_position_side):
+        raise ProtectionOrderVerificationError(
+            f"protection order positionSide mismatch (STRICT): got={position_side} expected={_normalize_position_side(expected_position_side)}"
+        )
+
+    reduce_only = bool(order.get("reduceOnly", False))
+    close_position = bool(order.get("closePosition", False))
+    if not reduce_only and not close_position:
+        raise ProtectionOrderVerificationError("protection order must be reduceOnly or closePosition (STRICT)")
+
+    if expected_client_order_id is not None:
+        cid = str(order.get("clientOrderId") or "").strip()
+        if cid != str(expected_client_order_id).strip():
+            raise ProtectionOrderVerificationError(
+                f"protection order clientOrderId mismatch (STRICT): got={cid!r} expected={str(expected_client_order_id).strip()!r}"
+            )
+
+    return str(order_id).strip()
+
+
+def _wait_protection_orders_visible_strict(
+    *,
+    symbol: str,
+    close_side: str,
+    position_side: str,
+    tp_order_id: Optional[str],
+    sl_order_id: Optional[str],
+    tp_client_order_id: Optional[str],
+    sl_client_order_id: Optional[str],
+    soft_mode: bool,
+    settings: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    timeout_sec = _require_timeout_sec(settings)
+    deadline = time.time() + min(float(timeout_sec), _PROTECTION_VERIFY_WAIT_SEC)
+
+    tp_verified_id: Optional[str] = None
+    sl_verified_id: Optional[str] = None
+
+    while True:
+        if tp_order_id is not None:
+            tp_row = _fetch_order_visibility_snapshot_strict(
+                symbol=symbol,
+                order_id=tp_order_id,
+                client_order_id=tp_client_order_id,
+                timeout_sec=timeout_sec,
+            )
+            if tp_row is not None:
+                tp_verified_id = _validate_protection_order_shape_strict(
+                    order=tp_row,
+                    symbol=symbol,
+                    expected_side=close_side,
+                    expected_type="TAKE_PROFIT_MARKET",
+                    expected_position_side=position_side,
+                    expected_client_order_id=tp_client_order_id,
+                )
+
+        if not soft_mode and sl_order_id is not None:
+            sl_row = _fetch_order_visibility_snapshot_strict(
+                symbol=symbol,
+                order_id=sl_order_id,
+                client_order_id=sl_client_order_id,
+                timeout_sec=timeout_sec,
+            )
+            if sl_row is not None:
+                sl_verified_id = _validate_protection_order_shape_strict(
+                    order=sl_row,
+                    symbol=symbol,
+                    expected_side=close_side,
+                    expected_type="STOP_MARKET",
+                    expected_position_side=position_side,
+                    expected_client_order_id=sl_client_order_id,
+                )
+
+        tp_ok = (tp_order_id is None) or (tp_verified_id is not None)
+        sl_ok = bool(soft_mode) or ((sl_order_id is None) is False and sl_verified_id is not None)
+
+        if tp_ok and sl_ok:
+            return tp_verified_id, (None if soft_mode else sl_verified_id)
+
+        if time.time() >= deadline:
+            raise ProtectionOrderVerificationError(
+                "protection orders not visible within deadline "
+                f"(tp_visible={tp_verified_id is not None}, sl_visible={sl_verified_id is not None}, soft_mode={bool(soft_mode)})"
+            )
+
+        time.sleep(_PROTECTION_VERIFY_POLL_SEC)
 
 
 # ---------------------------------------------------------------------------
@@ -1240,7 +1456,6 @@ def open_position_with_tp_sl(
             client_order_id=entry_cid,
         )
     except Exception as e:
-        # STRICT: 이벤트 기록 후 예외 전파(삼키기 금지) + stack trace
         logger.exception(
             "entry order failed (symbol=%s side=%s qty=%s source=%s)",
             sym,
@@ -1273,7 +1488,7 @@ def open_position_with_tp_sl(
         qty_step=filt.market_step,
         max_wait_sec=max_wait,
     )
-    _ = od  # reserved for future diagnostics
+    _ = od
 
     if entry_price <= 0 or not math.isfinite(entry_price):
         raise OrderExecutionError("entry_price resolved invalid (<=0 or non-finite)")
@@ -1381,6 +1596,8 @@ def open_position_with_tp_sl(
                 sl_price = floor_price
 
     # 6) TP/SL 설치 (체결 수량을 그대로 사용)
+    close_side = "SELL" if open_side == "BUY" else "BUY"
+
     try:
         tp_order_id, sl_order_id = set_tp_sl(
             symbol=sym,
@@ -1411,25 +1628,63 @@ def open_position_with_tp_sl(
             },
         )
 
-        if bool(soft_mode):
-            # STRICT: soft_mode라도 실패는 실패. 포지션을 방치하지 않는다.
-            try:
-                close_position_market(sym, open_side, float(expected_qty_f))
-            except Exception as e2:
-                logger.exception("force close after TP failure failed (symbol=%s)", sym)
-                raise OrderExecutionError("force close after TP failure failed") from e2
-            raise OrderExecutionError("tp set failed (soft_mode)")
-
-        # STRICT: TP/SL 세팅 실패 시 포지션 방치 금지 -> 강제 청산 후 예외
         try:
-            close_position_market(sym, open_side, float(expected_qty_f))
+            close_all_positions_market(sym)
         except Exception as e2:
             logger.exception("force close after TP/SL failure also failed (symbol=%s)", sym)
             raise OrderExecutionError("force close after TP/SL failure failed") from e2
+
         raise OrderExecutionError("tp/sl set failed") from e
 
+    if tp_order_id is None or not str(tp_order_id).strip():
+        raise OrderExecutionError("TP order_id is missing after set_tp_sl (STRICT)")
     if not bool(soft_mode) and (sl_order_id is None or not str(sl_order_id).strip()):
         raise OrderExecutionError("soft_mode=False but SL order_id is missing (STRICT)")
+
+    # 7) 보호주문 실제 존재 검증
+    try:
+        tp_verified_id, sl_verified_id = _wait_protection_orders_visible_strict(
+            symbol=sym,
+            close_side=close_side,
+            position_side="BOTH",
+            tp_order_id=str(tp_order_id),
+            sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
+            tp_client_order_id=tp_cid,
+            sl_client_order_id=(sl_cid if sl_order_id is not None else None),
+            soft_mode=bool(soft_mode),
+            settings=settings,
+        )
+    except Exception as e:
+        logger.exception("protection order verification failed (symbol=%s soft_mode=%s)", sym, bool(soft_mode))
+        log_event(
+            event_type="ERROR",
+            symbol=sym,
+            regime=source,
+            side=_event_side_from_open_side(open_side),
+            reason="protection_order_verification_failed",
+            extra_json={
+                "err": str(e),
+                "soft_mode": bool(soft_mode),
+                "qty": float(expected_qty_f),
+                "entry_order_id": entry_order_id,
+                "tp_order_id": tp_order_id,
+                "sl_order_id": sl_order_id,
+                "tp_clientOrderId": tp_cid,
+                "sl_clientOrderId": (sl_cid if sl_order_id is not None else None),
+                "entry_clientOrderId": entry_cid,
+            },
+        )
+
+        try:
+            close_all_positions_market(sym)
+        except Exception as e2:
+            logger.exception("force close after protection verification failure also failed (symbol=%s)", sym)
+            raise OrderExecutionError("force close after protection verification failure failed") from e2
+
+        raise ProtectionOrderVerificationError("protection order verification failed") from e
+
+    tp_order_id = tp_verified_id
+    sl_order_id = sl_verified_id
 
     log_event(
         event_type="TP_SL_SET",
@@ -1448,7 +1703,7 @@ def open_position_with_tp_sl(
             "tp_order_id": tp_order_id,
             "sl_order_id": sl_order_id,
             "tp_clientOrderId": tp_cid,
-            "sl_clientOrderId": sl_cid,
+            "sl_clientOrderId": (sl_cid if sl_order_id is not None else None),
             "entry_order_id": entry_order_id,
             "entry_clientOrderId": entry_cid,
         },
@@ -1482,7 +1737,6 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     open_side = _normalize_side(side_open)
     close_side = "SELL" if open_side == "BUY" else "BUY"
 
-    # TRADE-GRADE: close 수량도 필터 기반 라운딩으로 확정
     ensure_trading_settings(sym, SET)
     filt = get_symbol_filters(sym)
     expected_qty_dec, _, _ = _round_qty_and_price(
@@ -1509,7 +1763,6 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     if order_id is None:
         raise OrderExecutionError("close response missing orderId (STRICT)")
 
-    # FILLED 확인(체결가 계산용)
     _, _, avg_px = _wait_order_filled_strict(
         symbol=sym,
         order_id=str(order_id),

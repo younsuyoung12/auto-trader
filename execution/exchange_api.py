@@ -31,7 +31,6 @@ PATCH NOTES — 2026-03-04 (TRADE-GRADE)
 - 예외 전파 구조 정비
   - URL(서명 포함) 노출 금지 유지
   - 모든 실패는 Custom Exception(RuntimeError 계열)로 즉시 전파
-========================================================
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
 --------------------------------------------------------
@@ -55,6 +54,19 @@ PATCH NOTES — 2026-03-02 (PATCH)
   - get_order(symbol, order_id): /fapi/v1/order by orderId
   - get_order_by_client_id(symbol, client_order_id): /fapi/v1/order by origClientOrderId
   - get_user_trades(symbol, order_id=None, start_time_ms=None, end_time_ms=None, limit=1000)
+
+변경 이력
+--------------------------------------------------------
+- 2026-03-06:
+  1) USER DATA STREAM listenKey 전용 API 추가
+     - create_user_data_listen_key()
+     - keepalive_user_data_listen_key()
+     - close_user_data_listen_key()
+  2) listenKey API는 API-KEY only 흐름으로 분리
+     - signature/timestamp 없이 전용 요청 함수로 처리
+  3) get_position() STRICT 강화
+     - rows[0] 선택 제거
+     - one-way 기준 유일 position row 선택 로직 추가
 ========================================================
 """
 
@@ -63,6 +75,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass
@@ -71,7 +84,7 @@ from urllib.parse import urlencode
 
 import requests
 
-from execution.retry_policy import execute_with_retry  # STRICT (no fallback)
+from execution.retry_policy import execute_with_retry
 from settings import load_settings
 
 logger = logging.getLogger(__name__)
@@ -126,15 +139,16 @@ _SESSION.headers.update(
 _SERVER_TIME_OFFSET_MS: int = 0
 _TIME_SYNCED: bool = False
 _LAST_TIME_SYNC_AT: float = 0.0
-_TIME_SYNC_TTL_SEC: int = 60  # resync at most once per minute (safe for -1021)
+_TIME_SYNC_TTL_SEC: int = 60
 
-# TIME state lock (TRADE-GRADE: thread-safe)
+# TIME state lock
 _TIME_STATE_LOCK = threading.Lock()
 _TIME_SYNC_LOCK = threading.Lock()
 
 # Allowed endpoints
 _ALLOWED_PUBLIC_PREFIXES: Tuple[str, ...] = ("/fapi/", "/futures/data/")
 _ALLOWED_PRIVATE_PREFIX: str = "/fapi/"
+_ALLOWED_APIKEY_ONLY_PATHS: Tuple[str, ...] = ("/fapi/v1/listenKey",)
 
 # -----------------------------------------------------------------------------#
 # Circuit breaker (TRADE-GRADE)
@@ -143,10 +157,10 @@ _CB_LOCK = threading.Lock()
 _CB_FAILURES: int = 0
 _CB_OPEN_UNTIL_TS: float = 0.0
 
-_CB_FAIL_THRESHOLD: int = 6          # consecutive failures to open
-_CB_OPEN_SEC: float = 12.0           # circuit open duration (seconds)
-_CB_MAX_OPEN_SEC: float = 60.0       # cap
-_CB_BYPASS_PATHS: Tuple[str, ...] = ("/fapi/v1/time",)  # allow recovery
+_CB_FAIL_THRESHOLD: int = 6
+_CB_OPEN_SEC: float = 12.0
+_CB_MAX_OPEN_SEC: float = 60.0
+_CB_BYPASS_PATHS: Tuple[str, ...] = ("/fapi/v1/time",)
 
 
 def _cb_is_open(now: float) -> bool:
@@ -167,12 +181,10 @@ def _cb_on_failure(*, reason: str) -> None:
     with _CB_LOCK:
         _CB_FAILURES += 1
         if _CB_FAILURES >= _CB_FAIL_THRESHOLD:
-            # Exponential-ish open duration based on failure count
             extra = float(_CB_FAILURES - _CB_FAIL_THRESHOLD)
             open_sec = min(_CB_MAX_OPEN_SEC, _CB_OPEN_SEC * (1.0 + extra / 2.0))
             _CB_OPEN_UNTIL_TS = max(_CB_OPEN_UNTIL_TS, now + open_sec)
 
-    # 민감정보 없이 이유만 로깅
     logger.warning("circuit failure recorded (failures=%s, reason=%s)", _CB_FAILURES, reason)
 
 
@@ -192,7 +204,6 @@ def _sleep_backoff(policy: _NetRetryPolicy, attempt_idx: int, *, reason: str) ->
     if delay > policy.max_delay_sec:
         delay = policy.max_delay_sec
 
-    # time-based jitter (no random)
     frac = time.time() % 1.0
     delay = delay + min(policy.jitter_sec, frac * policy.jitter_sec)
 
@@ -201,7 +212,6 @@ def _sleep_backoff(policy: _NetRetryPolicy, attempt_idx: int, *, reason: str) ->
 
 
 def _timeout_tuple(timeout_sec: int) -> Tuple[float, float]:
-    # connect/read timeout 분리 (요청 signature 노출 없음)
     if not isinstance(timeout_sec, int) or timeout_sec <= 0:
         raise ValueError("timeout_sec must be positive int")
     connect = 3.5 if timeout_sec >= 4 else max(1.0, float(timeout_sec) * 0.7)
@@ -227,7 +237,6 @@ def _set_time_state(*, offset_ms: int) -> None:
 
 
 def _ts_ms() -> int:
-    # atomic read of offset
     offset, _, _ = _get_time_state()
     return _local_ts_ms() + int(offset)
 
@@ -236,7 +245,6 @@ def _ts_ms() -> int:
 # Internal helpers (STRICT)
 # -----------------------------------------------------------------------------#
 def _normalize_symbol(symbol: str) -> str:
-    """Normalize symbol to Binance format (e.g., BTCUSDT)."""
     s = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not s:
         raise ValueError("symbol is empty")
@@ -244,7 +252,6 @@ def _normalize_symbol(symbol: str) -> str:
 
 
 def _normalize_margin_type(value: Any) -> str:
-    """Normalize marginType from Binance positionRisk to 'ISOLATED' or 'CROSSED'."""
     v = str(value).strip().upper()
     if not v:
         raise RuntimeError("positionRisk.marginType is missing/empty")
@@ -255,6 +262,15 @@ def _normalize_margin_type(value: Any) -> str:
         return "CROSSED"
 
     raise RuntimeError(f"positionRisk.marginType unexpected value: {value!r}")
+
+
+def _normalize_position_side(value: Any) -> str:
+    v = str(value or "").strip().upper()
+    if not v:
+        return "BOTH"
+    if v not in {"BOTH", "LONG", "SHORT"}:
+        raise RuntimeError(f"positionRisk.positionSide unexpected value: {value!r}")
+    return v
 
 
 def _coerce_params(params: Optional[Mapping[str, Any]]) -> List[Tuple[str, str]]:
@@ -304,7 +320,7 @@ def _require_float(name: str, v: Any) -> float:
         fv = float(v)
     except Exception as e:
         raise ValueError(f"{name} must be float (got={v!r})") from e
-    if fv != fv or fv in (float("inf"), float("-inf")):
+    if not math.isfinite(fv):
         raise ValueError(f"{name} must be finite (got={fv})")
     return fv
 
@@ -324,7 +340,6 @@ def _validate_period(period: str) -> str:
     p = str(period).strip()
     if not p:
         raise ValueError("period is empty")
-    # Binance futures data endpoints accepted values (common)
     allowed = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
     if p not in allowed:
         raise ValueError(f"period must be one of {sorted(allowed)} (got={p!r})")
@@ -332,16 +347,6 @@ def _validate_period(period: str) -> str:
 
 
 def sync_server_time() -> int:
-    """Sync Binance server time and return offset in milliseconds.
-
-    Calls GET /fapi/v1/time, computes server-local offset using midpoint
-    to reduce RTT skew.
-
-    TRADE-GRADE:
-    - time sync는 단일 in-flight를 보장한다(_TIME_SYNC_LOCK).
-    - circuit breaker가 열려 있어도 /fapi/v1/time 은 bypass로 복구 가능해야 한다.
-    """
-    # 단일 in-flight 보장
     with _TIME_SYNC_LOCK:
         t0 = time.time()
         data = req("GET", "/fapi/v1/time", private=False)
@@ -365,9 +370,7 @@ def sync_server_time_offset() -> int:
 
 
 def _ensure_time_sync(force: bool = False) -> None:
-    # state 확인은 락으로 안전하게
-    offset, synced, last_ts = _get_time_state()
-    _ = offset  # unused (kept for clarity)
+    _, synced, last_ts = _get_time_state()
 
     if force or (not synced) or (time.time() - float(last_ts) > _TIME_SYNC_TTL_SEC):
         sync_server_time()
@@ -386,10 +389,6 @@ def _parse_error_payload(resp: requests.Response) -> Dict[str, Any]:
         return {"message": (resp.text or "").strip()[:300]}
 
 
-def _is_transient_http(status_code: int) -> bool:
-    return status_code in (429, 502, 503, 504)
-
-
 def _request_with_resilience(
     *,
     method: str,
@@ -399,17 +398,8 @@ def _request_with_resilience(
     timeout: Tuple[float, float],
     policy: _NetRetryPolicy,
 ) -> requests.Response:
-    """
-    TRADE-GRADE request wrapper.
-
-    - execute_with_retry는 유지한다(기존 복구 로직 호환).
-    - 추가로 HTTP 5xx/429/Timeout에 대해 제한된 재시도를 수행한다.
-    - silent retry 금지: backoff는 로그로 남긴다(서명/URL 노출 금지).
-    - circuit breaker 적용(단, bypass path는 제외).
-    """
     now = time.time()
     if path_for_logs not in _CB_BYPASS_PATHS and _cb_is_open(now):
-        # STRICT: 회로가 열려있으면 즉시 예외
         with _CB_LOCK:
             remain = max(0.0, _CB_OPEN_UNTIL_TS - now)
         raise RuntimeError(f"circuit_open (path={path_for_logs}, retry_after_sec={remain:.1f})")
@@ -421,7 +411,6 @@ def _request_with_resilience(
             return _SESSION.request(method, url, headers=headers or None, timeout=timeout)
 
         try:
-            # 기존 정책 유지(예: -1021 1회 재시도 등)
             resp = execute_with_retry(_do)
         except requests.Timeout as e:
             last_exc = e
@@ -438,7 +427,6 @@ def _request_with_resilience(
             _sleep_backoff(policy, attempt, reason=f"request_exception:{e.__class__.__name__}:{path_for_logs}")
             continue
         except Exception as e:
-            # execute_with_retry 내부에서 다른 예외가 나면 폴백 없이 실패
             raise RuntimeError(f"{method} {path_for_logs} -> unexpected error: {e.__class__.__name__}") from e
 
         sc = int(getattr(resp, "status_code", 0) or 0)
@@ -447,12 +435,10 @@ def _request_with_resilience(
             _cb_on_success()
             return resp
 
-        # 오류 페이로드(민감정보 없음)
         err = _parse_error_payload(resp)
         code = err.get("code")
         msg = err.get("msg") or err.get("message")
 
-        # -1021 timestamp error: 강제 time sync 후 재시도(제한)
         if isinstance(code, int) and int(code) == -1021:
             _cb_on_failure(reason=f"binance_-1021:{path_for_logs}")
             if attempt >= policy.max_attempts - 1:
@@ -462,7 +448,6 @@ def _request_with_resilience(
             _sleep_backoff(policy, attempt, reason=f"-1021:{path_for_logs}")
             continue
 
-        # 429 rate limit: Retry-After 우선, 없으면 backoff
         if sc == 429:
             _cb_on_failure(reason=f"http_429:{path_for_logs}")
             if attempt >= policy.max_attempts - 1:
@@ -481,7 +466,6 @@ def _request_with_resilience(
                 _sleep_backoff(policy, attempt, reason=f"http_429:{path_for_logs}")
             continue
 
-        # 5xx transient retry
         if sc in (502, 503, 504):
             _cb_on_failure(reason=f"http_{sc}:{path_for_logs}")
             if attempt >= policy.max_attempts - 1:
@@ -489,7 +473,6 @@ def _request_with_resilience(
             _sleep_backoff(policy, attempt, reason=f"http_{sc}:{path_for_logs}")
             continue
 
-        # 기타: 즉시 실패(폴백/재시도 남발 금지)
         _cb_on_failure(reason=f"http_{sc}:{path_for_logs}")
         raise RuntimeError(f"{method} {path_for_logs} -> HTTP {sc}, code={code}, msg={msg}")
 
@@ -498,28 +481,61 @@ def _request_with_resilience(
     raise RuntimeError(f"{method} {path_for_logs} -> request failed after retries (unknown)")
 
 
+def _req_api_key_only(
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
+) -> Any:
+    m = str(method).upper().strip()
+    if m not in {"POST", "PUT", "DELETE", "GET"}:
+        raise ValueError(f"unsupported http method: {method!r}")
+
+    p = str(path).strip()
+    if not p.startswith("/"):
+        p = "/" + p
+
+    if p not in _ALLOWED_APIKEY_ONLY_PATHS:
+        raise ValueError(f"api-key-only endpoint not allowed (STRICT): {p}")
+
+    if not isinstance(timeout_sec, int) or timeout_sec <= 0:
+        raise ValueError("timeout_sec must be positive int")
+
+    query = _encode_query(params or None)
+    url = f"{BASE_URL}{p}" + (f"?{query}" if query else "")
+    timeout = _timeout_tuple(timeout_sec)
+
+    resp = _request_with_resilience(
+        method=m,
+        url=url,
+        path_for_logs=p,
+        headers={"X-MBX-APIKEY": _API_KEY},
+        timeout=timeout,
+        policy=_NetRetryPolicy(),
+    )
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"{m} {p} -> invalid json: {e.__class__.__name__}") from None
+
+    if isinstance(data, dict) and isinstance(data.get("code"), int) and int(data["code"]) < 0:
+        raise RuntimeError(f"{m} {p} -> binance code={data.get('code')}, msg={data.get('msg')}")
+
+    return data
+
+
 def req(
     method: str,
     path: str,
     params: Optional[Dict[str, Any]] = None,
-    body: Optional[Dict[str, Any]] = None,  # compatibility placeholder (unused)
+    body: Optional[Dict[str, Any]] = None,
     *,
     private: bool = True,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
 ) -> Any:
-    """Common REST request function with public/private support.
-
-    Public:
-        - No signature, no API key required.
-
-    Private:
-        - Adds timestamp/recvWindow, signs query, sends X-MBX-APIKEY header.
-
-    STRICT endpoint policy:
-        - private=True: only /fapi/*
-        - private=False: /fapi/* and /futures/data/* allowed
-    """
-    _ = body  # explicitly unused
+    _ = body
 
     m = str(method).upper().strip()
     if m not in {"GET", "POST", "PUT", "DELETE"}:
@@ -560,28 +576,23 @@ def req(
     resp = _request_with_resilience(
         method=m,
         url=url,
-        path_for_logs=p,  # URL(서명 포함) 대신 path만 사용
+        path_for_logs=p,
         headers=headers or None,
         timeout=timeout,
         policy=_NetRetryPolicy(),
     )
 
-    # status code는 wrapper에서 200만 통과
     try:
         data = resp.json()
     except Exception as e:
-        # 200인데 JSON 파싱 실패: 즉시 예외(폴백 금지)
         raise RuntimeError(f"{m} {p} -> invalid json: {e.__class__.__name__}") from None
 
-    # 일부 엔드포인트는 200에도 code/msg 형태로 에러를 담을 수 있음
     if isinstance(data, dict) and isinstance(data.get("code"), int) and int(data["code"]) < 0:
         code = data.get("code")
         msg = data.get("msg")
-        # -1021이면 여기서도 복구 시도(제한적으로)
         if int(code) == -1021 and private:
             logger.warning("%s %s -> 200 payload has -1021, forcing time sync then re-request once", m, p)
             _ensure_time_sync(force=True)
-            # 1회만 추가 재요청(무한 루프 금지)
             resp2 = _request_with_resilience(
                 method=m,
                 url=url,
@@ -604,12 +615,46 @@ def req(
 
 
 def assert_one_way_mode() -> None:
-    """Ensure account is in One-way mode. Raises RuntimeError if account is in Hedge mode."""
     data = req("GET", "/fapi/v1/positionSide/dual", private=True)
     if not isinstance(data, dict):
         raise RuntimeError("positionSide/dual unexpected response")
     if data.get("dualSidePosition") is True:
         raise RuntimeError("Account is in HEDGE mode. Switch Binance Futures to ONE-WAY mode.")
+
+
+# -----------------------------------------------------------------------------#
+# USER DATA STREAM listenKey (API-KEY only)
+# -----------------------------------------------------------------------------#
+def create_user_data_listen_key() -> str:
+    data = _req_api_key_only("POST", "/fapi/v1/listenKey")
+    if not isinstance(data, dict):
+        raise RuntimeError("POST /fapi/v1/listenKey -> unexpected response shape")
+    lk = data.get("listenKey")
+    if not isinstance(lk, str) or not lk.strip():
+        raise RuntimeError("POST /fapi/v1/listenKey -> listenKey missing/empty (STRICT)")
+    return lk.strip()
+
+
+def keepalive_user_data_listen_key(listen_key: str) -> None:
+    lk = str(listen_key).strip()
+    if not lk:
+        raise ValueError("listen_key is empty")
+    data = _req_api_key_only("PUT", "/fapi/v1/listenKey", {"listenKey": lk})
+    if not isinstance(data, dict):
+        raise RuntimeError("PUT /fapi/v1/listenKey -> unexpected response shape")
+    if "listenKey" in data:
+        lk2 = data.get("listenKey")
+        if not isinstance(lk2, str) or not lk2.strip():
+            raise RuntimeError("PUT /fapi/v1/listenKey -> invalid listenKey in response (STRICT)")
+
+
+def close_user_data_listen_key(listen_key: str) -> None:
+    lk = str(listen_key).strip()
+    if not lk:
+        raise ValueError("listen_key is empty")
+    data = _req_api_key_only("DELETE", "/fapi/v1/listenKey", {"listenKey": lk})
+    if not isinstance(data, dict):
+        raise RuntimeError("DELETE /fapi/v1/listenKey -> unexpected response shape")
 
 
 # -----------------------------------------------------------------------------#
@@ -627,7 +672,6 @@ def get_exchange_info(symbol: Optional[str] = None) -> Dict[str, Any]:
 
 
 def get_premium_index(symbol: str) -> Dict[str, Any]:
-    """Public: premium index (mark/index + funding info) via /fapi/v1/premiumIndex."""
     s = _normalize_symbol(symbol)
     data = req("GET", "/fapi/v1/premiumIndex", {"symbol": s}, private=False)
     if not isinstance(data, dict) or not data:
@@ -636,7 +680,6 @@ def get_premium_index(symbol: str) -> Dict[str, Any]:
 
 
 def get_current_funding_rate(symbol: str) -> float:
-    """Public: current funding rate from premiumIndex.lastFundingRate."""
     d = get_premium_index(symbol)
     if "lastFundingRate" not in d:
         raise RuntimeError("premiumIndex.lastFundingRate missing")
@@ -650,7 +693,6 @@ def get_funding_rate_history(
     end_time_ms: Optional[int] = None,
     limit: int = 1000,
 ) -> List[Dict[str, Any]]:
-    """Public: funding rate history via /fapi/v1/fundingRate."""
     s = _normalize_symbol(symbol)
     if not isinstance(limit, int) or limit <= 0 or limit > 1000:
         raise ValueError("limit must be int in [1, 1000]")
@@ -674,7 +716,6 @@ def get_funding_rate_history(
 
 
 def get_open_interest(symbol: str) -> float:
-    """Public: current open interest via /fapi/v1/openInterest."""
     s = _normalize_symbol(symbol)
     data = req("GET", "/fapi/v1/openInterest", {"symbol": s}, private=False)
     if not isinstance(data, dict) or "openInterest" not in data:
@@ -690,7 +731,6 @@ def get_open_interest_hist(
     end_time_ms: Optional[int] = None,
     limit: int = 30,
 ) -> List[Dict[str, Any]]:
-    """Public: open interest history via /futures/data/openInterestHist."""
     s = _normalize_symbol(symbol)
     p = _validate_period(period)
     if not isinstance(limit, int) or limit <= 0 or limit > 500:
@@ -722,7 +762,6 @@ def get_global_long_short_account_ratio(
     end_time_ms: Optional[int] = None,
     limit: int = 30,
 ) -> List[Dict[str, Any]]:
-    """Public: global long/short account ratio via /futures/data/globalLongShortAccountRatio."""
     s = _normalize_symbol(symbol)
     p = _validate_period(period)
     if not isinstance(limit, int) or limit <= 0 or limit > 500:
@@ -754,7 +793,6 @@ def get_top_long_short_account_ratio(
     end_time_ms: Optional[int] = None,
     limit: int = 30,
 ) -> List[Dict[str, Any]]:
-    """Public: top long/short account ratio via /futures/data/topLongShortAccountRatio."""
     s = _normalize_symbol(symbol)
     p = _validate_period(period)
     if not isinstance(limit, int) or limit <= 0 or limit > 500:
@@ -786,7 +824,6 @@ def get_top_long_short_position_ratio(
     end_time_ms: Optional[int] = None,
     limit: int = 30,
 ) -> List[Dict[str, Any]]:
-    """Public: top long/short position ratio via /futures/data/topLongShortPositionRatio."""
     s = _normalize_symbol(symbol)
     p = _validate_period(period)
     if not isinstance(limit, int) or limit <= 0 or limit > 500:
@@ -879,12 +916,58 @@ def fetch_open_positions(symbol: Optional[str] = None) -> List[Dict[str, Any]]:
     return open_rows
 
 
+def _select_position_row_one_way_strict(rows: List[Dict[str, Any]], symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    sym_rows: List[Dict[str, Any]] = []
+
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"positionRisk[{i}] is not dict (STRICT)")
+        row_sym = _normalize_symbol(str(row.get("symbol", "")))
+        if row_sym == sym:
+            sym_rows.append(row)
+
+    if not sym_rows:
+        raise RuntimeError(f"position not found for symbol={sym}")
+
+    live_rows: List[Dict[str, Any]] = []
+    dirs: set[str] = set()
+    pos_sides: set[str] = set()
+
+    for row in sym_rows:
+        if "positionAmt" not in row:
+            raise RuntimeError("positionRisk.positionAmt is missing (STRICT)")
+        amt = _require_float("positionRisk.positionAmt", row["positionAmt"])
+        ps = _normalize_position_side(row.get("positionSide"))
+        pos_sides.add(ps)
+
+        if amt != 0.0:
+            live_rows.append(row)
+            row_dir = ps if ps in {"LONG", "SHORT"} else ("LONG" if amt > 0 else "SHORT")
+            dirs.add(row_dir)
+
+    if live_rows:
+        if len(dirs) != 1:
+            raise RuntimeError(f"ambiguous live position directions (STRICT): {sorted(list(dirs))}")
+        if "BOTH" in pos_sides and len(pos_sides) > 1:
+            raise RuntimeError(f"ambiguous live positionSide topology (STRICT): {sorted(list(pos_sides))}")
+        if len(live_rows) != 1:
+            raise RuntimeError(f"multiple live position rows found in one-way mode (STRICT): n={len(live_rows)}")
+        return live_rows[0]
+
+    both_zero = [r for r in sym_rows if _normalize_position_side(r.get("positionSide")) == "BOTH"]
+    if len(both_zero) == 1:
+        return both_zero[0]
+    if len(sym_rows) == 1:
+        return sym_rows[0]
+
+    raise RuntimeError(f"ambiguous zero-position rows for symbol={sym} (STRICT): n={len(sym_rows)}")
+
+
 def get_position(symbol: str) -> Dict[str, Any]:
     s = _normalize_symbol(symbol)
     rows = _fetch_position_risk_raw(s)
-    if not rows:
-        raise RuntimeError(f"position not found for symbol={s}")
-    return rows[0]
+    return _select_position_row_one_way_strict(rows, s)
 
 
 def get_open_orders(symbol: str) -> List[Dict[str, Any]]:
@@ -1022,14 +1105,14 @@ def set_leverage_and_mode(symbol: str, leverage: int, isolated: bool = True) -> 
 
 
 __all__ = [
-    # core
     "req",
     "sync_server_time",
     "sync_server_time_offset",
     "assert_one_way_mode",
-    # exchange
+    "create_user_data_listen_key",
+    "keepalive_user_data_listen_key",
+    "close_user_data_listen_key",
     "get_exchange_info",
-    # microstructure (public)
     "get_premium_index",
     "get_current_funding_rate",
     "get_funding_rate_history",
@@ -1038,7 +1121,6 @@ __all__ = [
     "get_global_long_short_account_ratio",
     "get_top_long_short_account_ratio",
     "get_top_long_short_position_ratio",
-    # account/positions/orders
     "get_balance",
     "get_balance_detail",
     "get_available_usdt",
@@ -1050,7 +1132,6 @@ __all__ = [
     "get_order_by_client_id",
     "get_user_trades",
     "cancel_order",
-    # settings
     "set_leverage",
     "set_margin_mode",
     "set_leverage_and_mode",

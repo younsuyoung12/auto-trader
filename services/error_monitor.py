@@ -23,7 +23,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 절대 원칙 (STRICT · NO-FALLBACK)
 --------------------------------------------------------
-- ERROR / WATCHDOG 이벤트가 없으면 즉시 예외.
+- "이벤트가 없음" 자체는 정상 상태로 취급한다.
+  - latest: None
+  - recent list: []
+  - counts: {"ERROR": 0, "WATCHDOG": 0}
 - extra_json은 dict 또는 null 만 허용한다.
 - 필수 컬럼 누락 시 즉시 예외.
 - 숫자형 필드는 finite float/int 아니면 즉시 예외.
@@ -35,12 +38,21 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   1) 신규 생성: ERROR / WATCHDOG 이벤트 조회 서비스 추가
   2) 최신 이벤트 / 최근 이벤트 목록 / 최근 건수 조회 기능 추가
   3) 대시보드용 엄격 스키마 정규화 추가
+- 2026-03-06:
+  1) "이벤트 없음"을 정상 상태로 분리
+     - get_latest_error_event() -> None 허용
+     - get_recent_error_events() -> [] 반환
+     - get_recent_error_counts() -> zero-count dict 반환
+  2) 선택 문자열(regime/source/side) null-equivalent 정규화 추가
+     - null 또는 blank string -> None
+     - 비문자열 타입은 즉시 예외
+  3) 대시보드 500 원인이던 과잉 STRICT 제거
+     - 데이터 부재와 데이터 손상을 구분
 ========================================================
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -110,7 +122,7 @@ def _optional_nonempty_str(value: Any, name: str) -> Optional[str]:
         raise RuntimeError(f"{name} must be str or null (STRICT), got={type(value).__name__}")
     s = value.strip()
     if not s:
-        raise RuntimeError(f"{name} must not be blank when provided (STRICT)")
+        return None
     return s
 
 
@@ -118,6 +130,8 @@ def _to_iso(value: Any, name: str) -> str:
     if value is None:
         raise RuntimeError(f"{name} is required (STRICT)")
     if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise RuntimeError(f"{name} must be timezone-aware datetime (STRICT)")
         return value.isoformat()
     if isinstance(value, str):
         s = value.strip()
@@ -147,6 +161,13 @@ def _require_limit(value: Any) -> int:
     if limit > 1000:
         raise RuntimeError("limit must be <= 1000 (STRICT)")
     return limit
+
+
+def _require_minutes(value: Any) -> int:
+    minutes = _require_int(value, "minutes")
+    if minutes > 10080:
+        raise RuntimeError("minutes must be <= 10080 (STRICT)")
+    return minutes
 
 
 def _normalize_row(row: Mapping[str, Any]) -> ErrorEventRecord:
@@ -245,12 +266,7 @@ def _fetch_event_rows(
             "event_type": normalized_event_type,
         }
 
-    rows = db.execute(sql, params).mappings().all()
-    if not rows:
-        if normalized_event_type is None:
-            raise RuntimeError("ERROR/WATCHDOG event not found (STRICT)")
-        raise RuntimeError(f"{normalized_event_type} event not found (STRICT)")
-    return rows
+    return db.execute(sql, params).mappings().all()
 
 
 def get_latest_error_event(
@@ -258,8 +274,10 @@ def get_latest_error_event(
     *,
     event_type: Optional[str] = None,
     include_test: bool = False,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     rows = _fetch_event_rows(db, limit=1, include_test=include_test, event_type=event_type)
+    if not rows:
+        return None
     return _normalize_row(rows[0]).to_dict()
 
 
@@ -286,7 +304,7 @@ def get_recent_error_counts(
     if db is None:
         raise RuntimeError("db session is required (STRICT)")
 
-    normalized_minutes = _require_int(minutes, "minutes")
+    normalized_minutes = _require_minutes(minutes)
     sql = text(
         """
         SELECT
@@ -308,10 +326,11 @@ def get_recent_error_counts(
         },
     ).mappings().all()
 
-    if not rows:
-        raise RuntimeError("ERROR/WATCHDOG recent counts not found (STRICT)")
+    out: Dict[str, int] = {
+        "ERROR": 0,
+        "WATCHDOG": 0,
+    }
 
-    out: Dict[str, int] = {}
     for row in rows:
         event_type = _require_event_type(row.get("event_type"))
         n_raw = row.get("n")

@@ -51,6 +51,20 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
   1) FIX: entry market_data candles_5m/candles_5m_raw 정규화
      - get_trading_signal이 Candle 객체 / 5튜플 / 6튜플을 혼합 반환할 수 있으므로,
        _build_entry_market_data에서 항상 6튜플(OHLCV)로 통일 후 STRICT 검증 수행
+
+- 2026-03-06:
+  1) account websocket(USER DATA STREAM) 시작/준비 단계 추가
+  2) account websocket 연결 상태 가드 추가
+  3) 엔진 부팅 시 market ws + account ws 이중 websocket 구조로 정합 강화
+
+- 2026-03-06:
+  1) 보호주문 감시 가드 추가
+     - OPEN_TRADES 보유 중 TP/SL 보호주문 존재 여부를 account_ws + REST로 교차 검증
+  2) 보호주문 누락 시 SAFE_STOP 강화
+     - 보호주문 미존재 시 즉시 SAFE_STOP
+     - force_close_on_desync=True 이면 강제청산 제출 후 종료
+  3) 보호주문/포지션 상태 오판 방지
+     - 실제 거래소 포지션이 열려 있는 경우에만 보호주문 누락을 치명으로 판정
 ============================================================
 """
 
@@ -99,6 +113,11 @@ from infra.market_data_ws import (
     get_orderbook as ws_get_orderbook,
     start_ws_loop,
 )
+from infra.account_ws import (
+    get_account_protection_orders_snapshot,
+    get_account_ws_status,
+    start_account_ws_loop,
+)
 from infra.market_data_store import save_candles_bulk_from_ws, save_orderbook_from_ws
 from infra.market_data_rest import fetch_klines_rest, KlineRestError
 
@@ -116,30 +135,24 @@ from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
 from sync.reconcile_engine import ReconcileConfig, ReconcileEngine, ReconcileResult
 
-# ─────────────────────────────
-# NEW: Integrity / Invariant / Drift
-# ─────────────────────────────
-from infra.data_integrity_guard import (  # noqa: E402
+from infra.data_integrity_guard import (
     DataIntegrityError,
     validate_entry_market_data_bundle_strict,
     validate_kline_series_strict,
     validate_orderbook_strict,
 )
-from execution.invariant_guard import (  # noqa: E402
+from execution.invariant_guard import (
     InvariantViolation,
     SignalInvariantInputs,
     validate_signal_invariants_strict,
 )
-from infra.drift_detector import (  # noqa: E402
+from infra.drift_detector import (
     DriftDetectedError,
     DriftDetector,
     DriftDetectorConfig,
     DriftSnapshot,
 )
 
-# ─────────────────────────────
-# 전역 상태
-# ─────────────────────────────
 SET = load_settings()
 START_TS: float = time.time()
 RUNNING: bool = True
@@ -169,25 +182,22 @@ SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(SET.signal_analysis_interval_sec)
 LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
-# ─────────────────────────────
-# TRADE-GRADE counters / thresholds (explicit, no silent retry)
-# ─────────────────────────────
 _BALANCE_CONSEC_FAILS: int = 0
 _EQUITY_CONSEC_FAILS: int = 0
 _WS_LIVENESS_CONSEC_FAILS: int = 0
+_ACCOUNT_WS_CONSEC_FAILS: int = 0
 
 _BALANCE_FAIL_HARDSTOP_N: int = 3
 _EQUITY_FAIL_HARDSTOP_N: int = 3
 _WS_LIVENESS_FAIL_HARDSTOP_N: int = 3
+_ACCOUNT_WS_FAIL_HARDSTOP_N: int = 3
+_ACCOUNT_WS_READY_TIMEOUT_SEC: float = 20.0
 
 
-# ─────────────────────────────
-# Entry Candidate (local, STRICT)
-# ─────────────────────────────
 @dataclass(frozen=True, slots=True)
 class EntryCandidate:
-    action: str  # "ENTER" or "SKIP"
-    direction: str  # LONG/SHORT
+    action: str
+    direction: str
     tp_pct: float
     sl_pct: float
     reason: str
@@ -241,12 +251,6 @@ def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[fl
 
 
 def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], settings: Any) -> Dict[str, float]:
-    """
-    STRICT:
-    - entry_flow를 엔진 경로에서 호출하지 않는다.
-    - 대신 execution_engine이 decision 이벤트 생성에 요구하는 최소 결정 메타를
-      unified_features에서 엄격하게 추출한다.
-    """
     if not isinstance(market_features, dict) or not market_features:
         raise RuntimeError("market_features is required (STRICT)")
 
@@ -315,12 +319,6 @@ def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], setti
 
 
 def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidate:
-    """
-    STRICT:
-    - 이 함수는 '결정 후보'만 만든다(규칙 기반).
-    - 실제 allocation/risk multiplier/차단은 risk_physics 단계에서 수행한다.
-    - GPT 호출 없음(지연/비용/불확실성 제거).
-    """
     if not isinstance(market_data, dict) or not market_data:
         raise RuntimeError("market_data is required (STRICT)")
 
@@ -392,15 +390,7 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidat
     )
 
 
-# ─────────────────────────────
-# 기본 유틸
-# ─────────────────────────────
 def _safe_send_tg(msg: str) -> None:
-    """
-    STRICT:
-    - 텔레그램 실패는 엔진을 죽이면 안 된다(유틸 보호).
-    - 단, 메인 루프 블로킹을 막기 위해 async_worker 큐로 위임한다.
-    """
     try:
         ok = submit_async(send_tg, msg, critical=False, label="send_tg")
         if not ok:
@@ -502,15 +492,261 @@ def _normalize_direction_for_events_strict(v: Any) -> str:
     raise RuntimeError(f"invalid trade side for events: {v!r}")
 
 
-# ─────────────────────────────
-# WS Liveness Guard (TRADE-GRADE)
-# ─────────────────────────────
+def _wait_account_ws_ready_or_raise(timeout_sec: float) -> None:
+    timeout_f = float(timeout_sec)
+    if not math.isfinite(timeout_f) or timeout_f <= 0:
+        raise RuntimeError("account ws ready timeout must be finite > 0 (STRICT)")
+
+    deadline = time.time() + timeout_f
+    while True:
+        st = get_account_ws_status()
+        if bool(st.get("running")) and bool(st.get("connected")) and bool(st.get("listen_key_active")):
+            log("[ACCOUNT_WS] ready")
+            return
+
+        if time.time() >= deadline:
+            raise RuntimeError(
+                "account ws not ready within deadline (STRICT): "
+                f"running={st.get('running')} connected={st.get('connected')} listen_key_active={st.get('listen_key_active')}"
+            )
+        time.sleep(0.5)
+
+
+def _account_ws_connected_guard_or_raise() -> None:
+    global _ACCOUNT_WS_CONSEC_FAILS, SAFE_STOP_REQUESTED
+
+    st = get_account_ws_status()
+    ok = bool(st.get("running")) and bool(st.get("connected")) and bool(st.get("listen_key_active"))
+
+    if ok:
+        if _ACCOUNT_WS_CONSEC_FAILS != 0:
+            log(f"[ACCOUNT_WS][RECOVER] consecutive={_ACCOUNT_WS_CONSEC_FAILS} -> 0")
+        _ACCOUNT_WS_CONSEC_FAILS = 0
+        return
+
+    _ACCOUNT_WS_CONSEC_FAILS += 1
+    log(
+        "[ACCOUNT_WS][FAIL] "
+        f"running={st.get('running')} connected={st.get('connected')} "
+        f"listen_key_active={st.get('listen_key_active')} "
+        f"consecutive={_ACCOUNT_WS_CONSEC_FAILS}/{_ACCOUNT_WS_FAIL_HARDSTOP_N}"
+    )
+
+    if _ACCOUNT_WS_CONSEC_FAILS >= _ACCOUNT_WS_FAIL_HARDSTOP_N:
+        SAFE_STOP_REQUESTED = True
+        msg = (
+            "[SAFE_STOP][ACCOUNT_WS] account websocket disconnected or invalid "
+            f"consecutive={_ACCOUNT_WS_CONSEC_FAILS}"
+        )
+        log(msg)
+        _maybe_send_error_tg("ACCOUNT_WS", msg, cooldown_sec=60)
+        raise RuntimeError(msg)
+
+
+def _normalize_position_side_guard(v: Any, name: str) -> str:
+    s = str(v or "").upper().strip()
+    if s not in ("BOTH", "LONG", "SHORT"):
+        raise RuntimeError(f"{name} must be BOTH/LONG/SHORT (STRICT), got={s!r}")
+    return s
+
+
+def _position_side_compatible(expected_position_side: str, order_position_side: str) -> bool:
+    exp = _normalize_position_side_guard(expected_position_side, "expected_position_side")
+    got = _normalize_position_side_guard(order_position_side, "order_position_side")
+
+    if exp in ("LONG", "SHORT") and got in ("LONG", "SHORT"):
+        return got == exp
+    if exp == "BOTH":
+        return got == "BOTH"
+    if exp in ("LONG", "SHORT") and got == "BOTH":
+        return True
+    return False
+
+
+def _exchange_position_is_open_strict(symbol: str) -> bool:
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    rows = fetch_open_positions(sym)
+    if not isinstance(rows, list):
+        raise RuntimeError("fetch_open_positions returned non-list (STRICT)")
+
+    for r in rows:
+        if not isinstance(r, dict):
+            raise RuntimeError("fetch_open_positions contains non-dict row (STRICT)")
+        if str(r.get("symbol") or "").upper().strip() != sym:
+            continue
+        if "positionAmt" not in r:
+            raise RuntimeError("positionRisk.positionAmt missing (STRICT)")
+        try:
+            amt = float(r["positionAmt"])
+        except Exception as e:
+            raise RuntimeError(f"positionAmt parse failed (STRICT): {e}") from e
+        if abs(amt) > 1e-12:
+            return True
+    return False
+
+
+def _is_rest_protection_order_row_strict(order: Dict[str, Any], *, symbol: str, expected_position_side: str) -> bool:
+    if not isinstance(order, dict):
+        raise RuntimeError("open order row must be dict (STRICT)")
+
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    row_symbol = str(order.get("symbol") or "").upper().strip()
+    if row_symbol != sym:
+        return False
+
+    order_type = str(order.get("type") or "").upper().strip()
+    if order_type not in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT", "STOP_MARKET", "STOP"):
+        return False
+
+    reduce_only = bool(order.get("reduceOnly", False))
+    close_position = bool(order.get("closePosition", False))
+    if not reduce_only and not close_position:
+        return False
+
+    row_ps = str(order.get("positionSide") or "").upper().strip() or "BOTH"
+    return _position_side_compatible(expected_position_side, row_ps)
+
+
+def _has_account_ws_protection_order_strict(symbol: str, order_id: str, expected_position_side: str) -> bool:
+    rows = get_account_protection_orders_snapshot(symbol, limit=200)
+    if not isinstance(rows, list):
+        raise RuntimeError("get_account_protection_orders_snapshot returned non-list (STRICT)")
+
+    wanted = str(order_id).strip()
+    if not wanted:
+        raise RuntimeError("order_id is empty (STRICT)")
+
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("account protection order row must be dict (STRICT)")
+        oid = str(row.get("order_id") or "").strip()
+        if oid != wanted:
+            continue
+
+        row_ps = str(row.get("position_side") or "").upper().strip()
+        if not row_ps:
+            raise RuntimeError("account protection order missing position_side (STRICT)")
+        if not _position_side_compatible(expected_position_side, row_ps):
+            raise RuntimeError(
+                f"account protection order positionSide mismatch (STRICT): order_id={wanted} row_ps={row_ps} expected={expected_position_side}"
+            )
+        return True
+
+    return False
+
+
+def _has_rest_protection_order_strict(symbol: str, order_id: str, expected_position_side: str) -> bool:
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    wanted = str(order_id).strip()
+    if not wanted:
+        raise RuntimeError("order_id is empty (STRICT)")
+
+    orders = fetch_open_orders(sym)
+    if not isinstance(orders, list):
+        raise RuntimeError("fetch_open_orders returned non-list (STRICT)")
+
+    for row in orders:
+        if not isinstance(row, dict):
+            raise RuntimeError("fetch_open_orders contains non-dict row (STRICT)")
+        oid = row.get("orderId")
+        if oid is None:
+            raise RuntimeError("openOrders row missing orderId (STRICT)")
+        if str(oid).strip() != wanted:
+            continue
+
+        if not _is_rest_protection_order_row_strict(row, symbol=sym, expected_position_side=expected_position_side):
+            raise RuntimeError(
+                f"open order exists but is not valid protection order (STRICT): order_id={wanted}"
+            )
+        return True
+
+    return False
+
+
+def _protection_orders_guard_or_raise() -> None:
+    global SAFE_STOP_REQUESTED
+
+    if not OPEN_TRADES:
+        return
+
+    if len(OPEN_TRADES) != 1:
+        raise RuntimeError(f"OPEN_TRADES must be <= 1 in one-way mode (STRICT), got={len(OPEN_TRADES)}")
+
+    trade = OPEN_TRADES[0]
+    symbol = str(trade.symbol).replace("-", "").replace("/", "").upper().strip()
+    if not symbol:
+        raise RuntimeError("trade.symbol is empty (STRICT)")
+
+    # 실제 거래소 포지션이 열려 있을 때만 보호주문 누락을 치명으로 본다.
+    if not _exchange_position_is_open_strict(symbol):
+        return
+
+    expected_position_side = _normalize_position_side_guard(
+        getattr(trade, "exchange_position_side", None),
+        "trade.exchange_position_side",
+    )
+
+    tp_order_id = str(getattr(trade, "tp_order_id", "") or "").strip()
+    sl_order_id = str(getattr(trade, "sl_order_id", "") or "").strip()
+
+    missing_fields: List[str] = []
+    if not tp_order_id:
+        missing_fields.append("tp_order_id")
+    if not sl_order_id:
+        missing_fields.append("sl_order_id")
+
+    if missing_fields:
+        SAFE_STOP_REQUESTED = True
+        msg = f"[SAFE_STOP][PROTECTION_MISSING] trade missing protection ids: {missing_fields} symbol={symbol}"
+        log(msg)
+        _maybe_send_error_tg("PROTECTION_MISSING", msg, cooldown_sec=60)
+        if bool(SET.force_close_on_desync):
+            try:
+                n = close_all_positions_market(symbol)
+                log(f"[PROTECTION_MISSING] force close submitted count={n}")
+                _safe_send_tg(f"🧯 보호주문 누락 강제정리 제출: {symbol} count={n}")
+            except Exception as e:
+                log(f"[PROTECTION_MISSING] force close failed: {type(e).__name__}: {e}")
+                _safe_send_tg(f"❌ 보호주문 누락 강제정리 실패: {e}")
+                raise RuntimeError(f"protection order force close failed: {type(e).__name__}: {e}") from e
+        raise RuntimeError(msg)
+
+    tp_ok = _has_account_ws_protection_order_strict(symbol, tp_order_id, expected_position_side)
+    sl_ok = _has_account_ws_protection_order_strict(symbol, sl_order_id, expected_position_side)
+
+    if not tp_ok:
+        tp_ok = _has_rest_protection_order_strict(symbol, tp_order_id, expected_position_side)
+    if not sl_ok:
+        sl_ok = _has_rest_protection_order_strict(symbol, sl_order_id, expected_position_side)
+
+    if tp_ok and sl_ok:
+        return
+
+    SAFE_STOP_REQUESTED = True
+    missing_runtime: List[str] = []
+    if not tp_ok:
+        missing_runtime.append(f"TP({tp_order_id})")
+    if not sl_ok:
+        missing_runtime.append(f"SL({sl_order_id})")
+
+    msg = f"[SAFE_STOP][PROTECTION_ORDERS_MISSING] symbol={symbol} missing={missing_runtime}"
+    log(msg)
+    _maybe_send_error_tg("PROTECTION_ORDERS_MISSING", msg, cooldown_sec=60)
+
+    if bool(SET.force_close_on_desync):
+        try:
+            n = close_all_positions_market(symbol)
+            log(f"[PROTECTION_ORDERS_MISSING] force close submitted count={n}")
+            _safe_send_tg(f"🧯 보호주문 미존재 강제정리 제출: {symbol} count={n}")
+        except Exception as e:
+            log(f"[PROTECTION_ORDERS_MISSING] force close failed: {type(e).__name__}: {e}")
+            _safe_send_tg(f"❌ 보호주문 미존재 강제정리 실패: {e}")
+            raise RuntimeError(f"protection order force close failed: {type(e).__name__}: {e}") from e
+
+    raise RuntimeError(msg)
+
+
 def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
-    """
-    TRADE-GRADE:
-    - 1m 캔들의 openTime이 과도하게 과거이면 WS 갱신이 멈춘 것으로 간주한다.
-    - 단발 실패는 경고로 누적하고, N회 연속 실패 시 SAFE_STOP + 예외 전파한다.
-    """
     global _WS_LIVENESS_CONSEC_FAILS, SAFE_STOP_REQUESTED
 
     stale_sec_f = float(SET.ws_klines_stale_sec)
@@ -545,9 +781,6 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
         raise RuntimeError(msg)
 
 
-# ─────────────────────────────
-# WS 준비 체크
-# ─────────────────────────────
 def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
     ob = ws_get_orderbook(symbol, limit=5)
     if not isinstance(ob, dict):
@@ -608,13 +841,6 @@ def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
 
 
 def _get_equity_current_usdt_strict() -> float:
-    """
-    STRICT · TRADE-GRADE
-    - TEST_DRY_RUN 모드에서는 settings.test_fake_available_usdt 를 equity로 사용한다.
-    - LIVE 모드에서는 Binance balance detail로 equity를 계산한다.
-    - 폴백/None→0 치환 금지: test_dry_run인데 fake<=0이면 즉시 예외.
-    """
-
     if bool(SET.test_dry_run):
         fake = float(SET.test_fake_available_usdt)
         if not math.isfinite(fake) or fake <= 0.0:
@@ -666,11 +892,6 @@ def _get_equity_current_usdt_strict() -> float:
 
 
 def _load_equity_peak_bootstrap(symbol: str) -> Optional[float]:
-    """
-    STRICT:
-    - psycopg2 직접 연결 금지
-    - db_core(get_session) 경유
-    """
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not sym:
         raise RuntimeError("symbol is empty (STRICT)")
@@ -697,12 +918,6 @@ def _load_equity_peak_bootstrap(symbol: str) -> Optional[float]:
 
 
 def _load_closed_trades_bootstrap(symbol: str, limit: int = 50) -> list[dict[str, Any]]:
-    """
-    STRICT:
-    - psycopg2 직접 연결 금지
-    - db_core(get_session) 경유
-    - exit_ts는 datetime(tz-aware)이어야 한다(무결성)
-    """
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not sym:
         raise RuntimeError("symbol is empty (STRICT)")
@@ -752,9 +967,6 @@ def _load_closed_trades_bootstrap(symbol: str, limit: int = 50) -> list[dict[str
     return rows
 
 
-# ─────────────────────────────
-# WS 부트스트랩/스토어
-# ─────────────────────────────
 def _backfill_ws_kline_history(symbol: str) -> None:
     intervals = _parse_tfs(SET.ws_backfill_tfs)
     _verify_required_tfs_or_die("ws_backfill_tfs", intervals, ENTRY_REQUIRED_TFS)
@@ -783,11 +995,6 @@ def _backfill_ws_kline_history(symbol: str) -> None:
 
 
 def _start_market_data_store_thread() -> None:
-    """
-    TRADE-GRADE:
-    - DB 저장 루프에서 오류가 나면 '조용히 계속' 하지 않는다.
-    - SAFE_STOP_REQUESTED=True 로 신규 진입을 차단하고, 예외를 재-raise 하여 스레드를 종료한다.
-    """
     symbol = SET.symbol
     flush_sec = float(SET.md_store_flush_sec)
     ob_interval_sec = float(SET.ob_store_interval_sec)
@@ -890,9 +1097,6 @@ def _start_market_data_store_thread() -> None:
     log("[MD-STORE] background store thread started")
 
 
-# ─────────────────────────────
-# ENTRY market_data builder
-# ─────────────────────────────
 def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Dict[str, Any]]:
     signal_ctx = get_trading_signal(settings=settings, last_close_ts=last_close_ts)
     if signal_ctx is None:
@@ -998,9 +1202,6 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
     return out
 
 
-# ─────────────────────────────
-# Reconcile Guard (OPEN_TRADES ↔ Exchange)
-# ─────────────────────────────
 def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     rows = fetch_open_positions(sym)
@@ -1074,11 +1275,6 @@ def _fetch_exchange_open_orders_snapshot(symbol: str) -> List[Dict[str, Any]]:
 
 
 def _on_reconcile_desync(result: ReconcileResult) -> None:
-    """
-    TRADE-GRADE:
-    - DESYNC 확정 시 즉시 SAFE_STOP + 예외 전파(조용한 진행 금지)
-    - 강제정리 옵션이 켜져 있으면 제출 시도, 실패하면 그 또한 예외 전파(치명)
-    """
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
 
@@ -1104,9 +1300,6 @@ def _on_reconcile_desync(result: ReconcileResult) -> None:
     raise RuntimeError("DESYNC confirmed (STRICT): engine must stop")
 
 
-# ─────────────────────────────
-# SIGTERM / SAFE STOP
-# ─────────────────────────────
 def _sigterm(*_: Any) -> None:
     global SAFE_STOP_REQUESTED, SIGTERM_REQUESTED_AT, SIGTERM_DEADLINE_TS, _SIGTERM_NOTICE_SENT
     SAFE_STOP_REQUESTED = True
@@ -1135,9 +1328,6 @@ def _on_safe_stop() -> None:
     _safe_send_tg("🛑 텔레그램 '종료' 요청: 포지션 정리 후 종료합니다.")
 
 
-# ─────────────────────────────
-# main
-# ─────────────────────────────
 def main() -> None:
     global RUNNING, OPEN_TRADES, LAST_CLOSE_TS, CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
@@ -1182,6 +1372,15 @@ def main() -> None:
         else:
             _safe_send_tg(msg + "\n⛔ 기본 정책에 따라 중단합니다.")
             return
+
+    try:
+        start_account_ws_loop()
+        _wait_account_ws_ready_or_raise(_ACCOUNT_WS_READY_TIMEOUT_SEC)
+    except Exception as e:
+        msg = f"❗ Account WS 시작 실패: {type(e).__name__}: {e}"
+        log(msg)
+        _safe_send_tg(msg)
+        return
 
     _safe_send_tg("✅ Binance USDT-M Futures 자동매매(WS 버전)를 시작합니다.")
 
@@ -1257,6 +1456,11 @@ def main() -> None:
             if bool(SET.ws_enabled):
                 _ws_liveness_guard_or_raise(SET.symbol, now)
 
+            _account_ws_connected_guard_or_raise()
+
+            if OPEN_TRADES:
+                _protection_orders_guard_or_raise()
+
             if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS and not _SIGTERM_DEADLINE_HANDLED:
                 _SIGTERM_DEADLINE_HANDLED = True
                 log("[SIGTERM] grace deadline reached. force close attempt starts.")
@@ -1308,13 +1512,13 @@ def main() -> None:
 
                     if "pnl" not in summary:
                         raise RuntimeError("close summary missing pnl (STRICT)")
-                    pnl = float(summary["pnl"])
 
                     if "avg_price" not in summary or summary["avg_price"] is None:
                         raise RuntimeError("close summary missing avg_price (STRICT)")
                     if "qty" not in summary or summary["qty"] is None:
                         raise RuntimeError("close summary missing qty (STRICT)")
 
+                    pnl = float(summary["pnl"])
                     avg_price = float(summary["avg_price"])
                     qty = float(summary["qty"])
 
