@@ -108,6 +108,8 @@ from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
 from sync.reconcile_engine import ReconcileConfig, ReconcileEngine, ReconcileResult
 
+from strategy.entry_flow import build_entry_signal_strict
+
 # ─────────────────────────────
 # NEW: Integrity / Invariant / Drift
 # ─────────────────────────────
@@ -822,6 +824,13 @@ def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Di
         log(msg)
         _maybe_send_entry_block_tg(f"FEATURE_BUILD_FAIL:{symbol}:{type(e).__name__}", msg, cooldown_sec=60)
         return None
+    # NEW: entry decision
+    signal = build_entry_signal_strict(
+        features=market_features,
+        settings=SET
+    )
+
+
 
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
