@@ -34,6 +34,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - open / terminal status 구분
      - 보호주문 판별용 reduce_only / close_position / order_type / position_side 유지
   3) run_bot_ws / sync_exchange 보호주문 검증 연동 준비
+- 2026-03-07:
+  1) stop_account_ws_loop() 문법 수정
+     - global 선언을 함수 최상단으로 이동
+     - Python SyntaxError(name used prior to global declaration) 제거
 ========================================================
 """
 
@@ -661,6 +665,8 @@ def _keepalive_loop(stop_event: threading.Event, listen_key: str) -> None:
 
 
 def _run_account_ws_loop(stop_event: threading.Event) -> None:
+    global _CURRENT_WS
+
     retry_wait = _RECONNECT_MIN_SEC
 
     _set_status(running=True, connected=False, listen_key_active=False, started_at_ms=_now_ms())
@@ -687,7 +693,6 @@ def _run_account_ws_loop(stop_event: threading.Event) -> None:
             )
 
             with _THREAD_LOCK:
-                global _CURRENT_WS
                 _CURRENT_WS = ws
 
             keepalive_thread = threading.Thread(
@@ -763,6 +768,8 @@ def start_account_ws_loop() -> None:
 
 
 def stop_account_ws_loop() -> None:
+    global _THREAD, _STOP_EVENT, _CURRENT_WS
+
     with _THREAD_LOCK:
         stop_event = _STOP_EVENT
         ws = _CURRENT_WS
@@ -782,7 +789,6 @@ def stop_account_ws_loop() -> None:
     thread.join(timeout=5.0)
 
     with _THREAD_LOCK:
-        global _THREAD, _STOP_EVENT, _CURRENT_WS
         _THREAD = None
         _STOP_EVENT = None
         _CURRENT_WS = None
