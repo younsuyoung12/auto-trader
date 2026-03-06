@@ -41,7 +41,9 @@ STRICT · NO-FALLBACK
      - dashboard_server startup 시 settings(SSOT) 기반 Redis 초기화
      - 비용 큰 조회 API에 짧은 TTL 캐시 적용
      - 캐시 miss 시 기존 DB 조회 로직 그대로 수행 후 캐시 저장
-  2) 기존 API 경로/응답 구조/실시간 엔진 진단 API 동작 변경 없음
+  2) 엔진 WS 상태 조회를 메모리 기반이 아닌 DB 스냅샷 기반으로 변경
+     - 분리 배포 구조(AWS engine / Render dashboard) 정합성 확보
+     - bt_candles / bt_orderbook_snapshots 기준으로 ws-status 계산
 
 - 2026-03-01:
   1) recent trades 라벨 매핑을 is_auto/strategy 기준으로 수정
@@ -65,6 +67,7 @@ STRICT · NO-FALLBACK
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Query, Request, WebSocket
@@ -114,14 +117,6 @@ from services.position_service import (
 )
 from services.system_monitor import get_latest_watchdog_snapshot, get_system_status_snapshot
 from settings import load_settings
-
-# OPTIONAL: 엔진이 같은 런타임에 있으면 WS 버퍼 상태까지 제공 가능
-try:
-    from infra.market_data_ws import get_klines_with_volume as ws_get_klines_with_volume
-    from infra.market_data_ws import get_orderbook as ws_get_orderbook
-except Exception:  # pragma: no cover
-    ws_get_klines_with_volume = None  # type: ignore[assignment]
-    ws_get_orderbook = None  # type: ignore[assignment]
 
 
 # =====================================================
@@ -179,6 +174,14 @@ def _require_nonempty_str(value: Any, name: str) -> str:
     return s
 
 
+def _require_dict(value: Any, name: str) -> Dict[str, Any]:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
+    return dict(value)
+
+
 def _normalize_symbol(symbol: Any) -> str:
     s = _require_nonempty_str(symbol, "symbol").replace("-", "").replace("/", "").upper()
     if not s:
@@ -194,6 +197,17 @@ def _normalize_optional_event_type(event_type: Optional[str]) -> Optional[str]:
 
 def _cache_token_bool(value: bool) -> str:
     return "1" if bool(value) else "0"
+
+
+def _datetime_to_epoch_ms_strict(value: Any, name: str) -> int:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if not isinstance(value, datetime):
+        raise RuntimeError(f"{name} must be datetime (STRICT), got={type(value).__name__}")
+    dt = value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000.0)
 
 
 def _cached_json(
@@ -823,18 +837,119 @@ def _count_recent_events_strict(db: Session, *, minutes: int, event_type: str) -
     return iv
 
 
-def _ws_status(symbol: str, *, min_buf: int, tfs: List[str]) -> Dict[str, Any]:
-    if ws_get_klines_with_volume is None or ws_get_orderbook is None:
-        return {
-            "available": False,
-            "reason": "market_data_ws not importable in dashboard runtime",
-        }
+def _fetch_recent_candle_buffer_len_strict(
+    db: Session,
+    *,
+    symbol: str,
+    timeframe: str,
+    row_limit: int,
+) -> int:
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_tf = _require_nonempty_str(timeframe, "timeframe")
+    normalized_limit = _require_positive_int(row_limit, "row_limit", max_value=100000)
 
+    sql = text(
+        """
+        SELECT COUNT(*) AS n
+        FROM (
+            SELECT ts
+            FROM bt_candles
+            WHERE symbol = :symbol
+              AND timeframe = :timeframe
+            ORDER BY ts DESC
+            LIMIT :row_limit
+        ) q
+        """
+    )
+    row = db.execute(
+        sql,
+        {
+            "symbol": normalized_symbol,
+            "timeframe": normalized_tf,
+            "row_limit": normalized_limit,
+        },
+    ).mappings().one_or_none()
+
+    if row is None:
+        raise RuntimeError("recent candle buffer row not found (STRICT)")
+
+    n = row.get("n")
+    if n is None:
+        raise RuntimeError("recent candle buffer len is required (STRICT)")
+    if isinstance(n, bool):
+        raise RuntimeError("recent candle buffer len must be int (STRICT)")
+    try:
+        iv = int(n)
+    except Exception as exc:
+        raise RuntimeError(f"recent candle buffer len must be int (STRICT): {exc}") from exc
+    if iv < 0:
+        raise RuntimeError("recent candle buffer len must be >= 0 (STRICT)")
+    return iv
+
+
+def _fetch_latest_orderbook_snapshot_strict(
+    db: Session,
+    *,
+    symbol: str,
+) -> Optional[Dict[str, Any]]:
+    normalized_symbol = _normalize_symbol(symbol)
+
+    sql = text(
+        """
+        SELECT
+            symbol,
+            ts,
+            best_bid,
+            best_ask,
+            bids_raw,
+            asks_raw
+        FROM bt_orderbook_snapshots
+        WHERE symbol = :symbol
+        ORDER BY ts DESC
+        LIMIT 1
+        """
+    )
+    row = db.execute(sql, {"symbol": normalized_symbol}).mappings().one_or_none()
+    if row is None:
+        return None
+
+    ts_value = row.get("ts")
+    ts_ms = _datetime_to_epoch_ms_strict(ts_value, "orderbook.ts")
+
+    bids_raw = row.get("bids_raw")
+    asks_raw = row.get("asks_raw")
+
+    bids_list = bids_raw if isinstance(bids_raw, list) else None
+    asks_list = asks_raw if isinstance(asks_raw, list) else None
+
+    best_bid = row.get("best_bid")
+    best_ask = row.get("best_ask")
+
+    return {
+        "symbol": normalized_symbol,
+        "ts": ts_ms,
+        "bestBid": float(best_bid) if best_bid is not None else None,
+        "bestAsk": float(best_ask) if best_ask is not None else None,
+        "bids_len": len(bids_list) if bids_list is not None else None,
+        "asks_len": len(asks_list) if asks_list is not None else None,
+        "has_bids": bool(bids_list),
+        "has_asks": bool(asks_list),
+    }
+
+
+def _ws_status(
+    db: Session,
+    symbol: str,
+    *,
+    min_buf: int,
+    tfs: List[str],
+) -> Dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_min_buf = _require_positive_int(min_buf, "min_buf", max_value=100000)
 
     out: Dict[str, Any] = {
         "available": True,
+        "source": "database",
         "symbol": normalized_symbol,
         "min_buf": normalized_min_buf,
         "tfs": list(tfs),
@@ -843,52 +958,29 @@ def _ws_status(symbol: str, *, min_buf: int, tfs: List[str]) -> Dict[str, Any]:
 
     for tf in tfs:
         tf_name = _require_nonempty_str(tf, "tf")
-        try:
-            buf = ws_get_klines_with_volume(normalized_symbol, tf_name, limit=normalized_min_buf)
-        except Exception as exc:
-            out["buffers"][tf_name] = {
-                "ok": False,
-                "len": None,
-                "error": type(exc).__name__,
-            }
-            continue
-
-        if not isinstance(buf, list):
-            out["buffers"][tf_name] = {
-                "ok": False,
-                "len": None,
-                "error": "non-list",
-            }
-            continue
-
+        buf_len = _fetch_recent_candle_buffer_len_strict(
+            db,
+            symbol=normalized_symbol,
+            timeframe=tf_name,
+            row_limit=normalized_min_buf,
+        )
         out["buffers"][tf_name] = {
-            "ok": len(buf) >= normalized_min_buf,
-            "len": len(buf),
+            "ok": buf_len >= normalized_min_buf,
+            "len": buf_len,
         }
 
-    try:
-        ob = ws_get_orderbook(normalized_symbol, limit=5)
-    except Exception as exc:
-        out["orderbook"] = {"ok": False, "error": type(exc).__name__}
+    ob = _fetch_latest_orderbook_snapshot_strict(db, symbol=normalized_symbol)
+    if ob is None:
+        out["orderbook"] = {"ok": False, "error": "not_found"}
         return out
-
-    if not isinstance(ob, dict) or not ob:
-        out["orderbook"] = {"ok": False, "error": "empty/non-dict"}
-        return out
-
-    bids = ob.get("bids") or []
-    asks = ob.get("asks") or []
-    best_bid = ob.get("bestBid")
-    best_ask = ob.get("bestAsk")
-    ts = ob.get("ts") or ob.get("exchTs")
 
     out["orderbook"] = {
-        "ok": bool(bids) and bool(asks),
-        "bestBid": best_bid,
-        "bestAsk": best_ask,
-        "ts": ts,
-        "bids_len": len(bids) if isinstance(bids, list) else None,
-        "asks_len": len(asks) if isinstance(asks, list) else None,
+        "ok": bool(ob["has_bids"]) and bool(ob["has_asks"]),
+        "bestBid": ob["bestBid"],
+        "bestAsk": ob["bestAsk"],
+        "ts": ob["ts"],
+        "bids_len": ob["bids_len"],
+        "asks_len": ob["asks_len"],
     }
     return out
 
@@ -897,9 +989,10 @@ def _ws_status(symbol: str, *, min_buf: int, tfs: List[str]) -> Dict[str, Any]:
 def api_engine_ws_status(
     symbol: str = Query(default="BTCUSDT"),
     min_buf: int = Query(default=300, ge=1, le=100000),
+    db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     tfs = ["1m", "5m", "15m", "1h", "4h"]
-    return _ws_status(symbol, min_buf=min_buf, tfs=tfs)
+    return _ws_status(db, symbol, min_buf=min_buf, tfs=tfs)
 
 
 @app.get("/api/engine/latency")
@@ -919,6 +1012,7 @@ def api_engine_health(
     recent_errors = _count_recent_events_strict(db, minutes=10, event_type="ERROR")
     recent_skips = _count_recent_events_strict(db, minutes=10, event_type="SKIP")
     latest_watchdog = get_latest_watchdog_snapshot(db, include_test=False)
+    latest_watchdog = _require_dict(latest_watchdog, "latest_watchdog")
     watchdog_reason = _require_nonempty_str(latest_watchdog.get("reason"), "latest_watchdog.reason")
 
     status, reasons = _engine_status_from_signals(
@@ -936,6 +1030,6 @@ def api_engine_health(
         "recent_errors": int(recent_errors),
         "recent_skips": int(recent_skips),
         "latest_watchdog": latest_watchdog,
-        "ws_status": _ws_status(normalized_symbol, min_buf=300, tfs=["1m", "5m", "15m", "1h", "4h"]),
+        "ws_status": _ws_status(db, normalized_symbol, min_buf=300, tfs=["1m", "5m", "15m", "1h", "4h"]),
         "ts_ms": int(time.time() * 1000),
     }
