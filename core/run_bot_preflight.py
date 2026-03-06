@@ -602,17 +602,31 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         "auto_risk_multiplier": float(rp.auto_risk_multiplier),
     }
 
-    return Signal(
-        action="ENTER",
-        direction="LONG",
-        tp_pct=float(tp_pct),
-        sl_pct=float(sl_pct),
-        risk_pct=float(rp.effective_risk_pct) if float(rp.effective_risk_pct) > 0 else 0.01,
-        reason="PREFLIGHT_PIPELINE",
-        guard_adjustments={},
-        meta=meta,
-    )
+    from strategy.entry_flow import build_entry_signal_strict
+    features = dict(uf)
 
+    features.update({
+        "symbol": boot.symbol,
+        "regime": "PREFLIGHT",
+        "signal_source": "PREFLIGHT",
+        "signal_ts_ms": boot.signal_ts_ms,
+        "direction": "LONG",
+        "last_price": boot.last_price,
+        "candles_5m": boot.candles_5m,
+        "candles_5m_raw": boot.candles_5m_raw,
+        "equity_current_usdt": eq_cur,
+        "equity_peak_usdt": eq_peak,
+        "dd_pct": dd_pct,
+    })
+    # REQUIRED by entry_flow
+    features["entry_score"] = float(uf["engine_scores"]["total"]["score"]) / 100.0
+    features["trend_strength"] = float(uf["engine_scores"]["trend_4h"]["components"]["trend_strength"])
+    features["spread"] = float(uf["orderbook"]["spread_pct"])
+    features["orderbook_imbalance"] = float(uf["orderbook"]["depth_imbalance"]) 
+    return build_entry_signal_strict(
+        features=features,
+        settings=SET
+    )
 
 def _stage_gpt_contract_ping_strict() -> None:
     system_prompt = (
