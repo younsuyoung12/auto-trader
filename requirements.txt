@@ -1,7 +1,7 @@
 requests==2.*
 websocket-client==1.*
 python-dotenv==1.*
-
+psutil>=5.9
 google-api-python-client==2.*
 google-auth==2.*
 google-auth-httplib2==0.*

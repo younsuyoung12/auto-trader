@@ -5,9 +5,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 설계 원칙
+--------------------------------------------------------
 - “조용한 실패” 금지: API 실패/JSON 파싱 실패/네트워크 오류는 화면에 명시적으로 표시한다.
 - 기존 값 유지(묵시적 폴백) 금지: 실패 시 해당 위젯은 ERROR 상태로 전환한다.
 - 민감정보 노출 금지: 화면/콘솔에 키/토큰/DB URL 등 출력 금지.
+- 모바일 접속 차단: PC 전용 대시보드만 허용한다.
+- Polling 금지: 실시간 갱신은 WebSocket만 사용한다.
+- 초기 화면 구성용 1회성 REST 조회는 허용한다.
 
 변경 이력
 --------------------------------------------------------
@@ -15,6 +19,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   1) fetch 실패를 silent return 하지 않고, UI에 ERROR 배너/위젯별 오류 표시 추가
   2) fetch timeout(AbortController) 추가
   3) 마지막 업데이트 표기를 KST(Asia/Seoul) 기준으로 고정
+
+- 2026-03-06:
+  1) 미국 트레이딩 데스크 스타일의 기관급 대시보드 UI로 전면 개편
+  2) PC 전용 차단 레이어/팝업 추가
+  3) WebSocket 실시간 엔진 상태/의사결정/에러/포지션 스트림 연결
+  4) 엔진 상태 / 현재 포지션 / 의사결정 이유 / 실시간 에러 / 최근 거래 / 전략 분석 / 성과 분석 패널 추가
 ========================================================
 -->
 
@@ -22,162 +32,740 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 <html lang="ko">
 <head>
   <meta charset="UTF-8" />
-  <title>Binance Auto Trader 대시보드</title>
+  <title>Binance Auto Trader 기관형 대시보드</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { background: radial-gradient(circle at top, #111827 0, #020617 55%); }
-    .glass-card { background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(18px); border: 1px solid rgba(148, 163, 184, 0.2); }
-    .metric-label { font-size: 0.78rem; letter-spacing: 0.08em; }
+    :root {
+      --bg-0: #020617;
+      --bg-1: #0b1220;
+      --bg-2: #111827;
+      --line: rgba(148, 163, 184, 0.18);
+      --line-2: rgba(148, 163, 184, 0.08);
+      --text-0: #f8fafc;
+      --text-1: #cbd5e1;
+      --text-2: #94a3b8;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --fatal: #ef4444;
+      --info: #38bdf8;
+      --accent: #6366f1;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      background:
+        radial-gradient(circle at top left, rgba(99, 102, 241, 0.16), transparent 28%),
+        radial-gradient(circle at top right, rgba(16, 185, 129, 0.10), transparent 26%),
+        linear-gradient(180deg, #071120 0%, #030712 58%, #020617 100%);
+      color: var(--text-0);
+    }
+
+    .glass-card {
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.93), rgba(9, 15, 28, 0.95));
+      backdrop-filter: blur(18px);
+      border: 1px solid var(--line);
+      box-shadow:
+        0 12px 30px rgba(2, 6, 23, 0.35),
+        inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    }
+
+    .section-title {
+      font-size: 0.96rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: #f8fafc;
+    }
+
+    .metric-label {
+      font-size: 0.74rem;
+      font-weight: 600;
+      color: var(--text-2);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .metric-value {
+      font-size: 1.35rem;
+      font-weight: 700;
+      color: var(--text-0);
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      border-radius: 999px;
+      padding: 0.32rem 0.7rem;
+      font-size: 0.76rem;
+      font-weight: 700;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }
+
+    .status-ok {
+      background: rgba(16, 185, 129, 0.12);
+      color: #6ee7b7;
+      border-color: rgba(16, 185, 129, 0.22);
+    }
+
+    .status-warning {
+      background: rgba(245, 158, 11, 0.12);
+      color: #fcd34d;
+      border-color: rgba(245, 158, 11, 0.24);
+    }
+
+    .status-fatal {
+      background: rgba(239, 68, 68, 0.12);
+      color: #fda4af;
+      border-color: rgba(239, 68, 68, 0.24);
+    }
+
+    .status-neutral {
+      background: rgba(148, 163, 184, 0.10);
+      color: #cbd5e1;
+      border-color: rgba(148, 163, 184, 0.18);
+    }
+
+    .tiny-dot {
+      width: 0.48rem;
+      height: 0.48rem;
+      border-radius: 999px;
+      display: inline-block;
+    }
+
+    .tiny-dot-ok { background: var(--ok); }
+    .tiny-dot-warning { background: var(--warn); }
+    .tiny-dot-fatal { background: var(--fatal); }
+    .tiny-dot-neutral { background: #64748b; }
+
+    .nav-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.42rem;
+      padding: 0.65rem 0.88rem;
+      border-radius: 0.85rem;
+      font-size: 0.84rem;
+      color: var(--text-1);
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(148, 163, 184, 0.10);
+    }
+
+    .nav-link:hover {
+      color: #ffffff;
+      border-color: rgba(99, 102, 241, 0.28);
+      background: rgba(30, 41, 59, 0.78);
+    }
+
+    .table-shell {
+      border: 1px solid var(--line-2);
+      border-radius: 1rem;
+      overflow: hidden;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    thead {
+      background: rgba(15, 23, 42, 0.85);
+    }
+
+    thead th {
+      font-size: 0.74rem;
+      font-weight: 700;
+      color: var(--text-2);
+      padding: 0.8rem 0.9rem;
+      text-align: left;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+    }
+
+    tbody td {
+      font-size: 0.82rem;
+      color: var(--text-1);
+      padding: 0.82rem 0.9rem;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+      vertical-align: top;
+    }
+
+    tbody tr:hover {
+      background: rgba(30, 41, 59, 0.32);
+    }
+
+    .mini-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.8rem;
+      padding: 0.62rem 0;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+      font-size: 0.84rem;
+    }
+
+    .mini-row:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+
+    .mini-row:first-child {
+      padding-top: 0;
+    }
+
+    .value-positive { color: #34d399; }
+    .value-negative { color: #fb7185; }
+    .value-neutral { color: #cbd5e1; }
+
+    .panel-error {
+      color: #fda4af;
+      font-size: 0.78rem;
+      margin-top: 0.55rem;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    .reason-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.36rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      background: rgba(30, 41, 59, 0.82);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      color: #dbeafe;
+    }
+
+    .desktop-blocker {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+      background: rgba(2, 6, 23, 0.94);
+      backdrop-filter: blur(12px);
+    }
+
+    .desktop-blocker.show {
+      display: flex;
+    }
+
+    .desktop-blocker-card {
+      max-width: 28rem;
+      width: 100%;
+      border-radius: 1.5rem;
+      padding: 1.5rem;
+      border: 1px solid rgba(248, 113, 113, 0.18);
+      background: linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(9, 15, 28, 0.98));
+      box-shadow: 0 16px 40px rgba(2, 6, 23, 0.55);
+    }
+
+    .sticky-top {
+      position: sticky;
+      top: 0;
+      z-index: 30;
+      backdrop-filter: blur(10px);
+      background: rgba(2, 6, 23, 0.68);
+      border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    }
+
+    .scroll-thin::-webkit-scrollbar {
+      height: 8px;
+      width: 8px;
+    }
+
+    .scroll-thin::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.18);
+      border-radius: 999px;
+    }
+
+    .chart-wrap {
+      position: relative;
+      height: 18rem;
+    }
+
+    @media (max-width: 1023px) {
+      body { overflow: hidden; }
+    }
   </style>
 </head>
-<body class="min-h-screen text-slate-100">
-  <div class="max-w-6xl mx-auto px-4 py-6 md:py-10">
-
-    <header class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-4">
-      <div>
-        <h1 class="text-2xl md:text-3xl font-semibold tracking-tight text-white">
-          Binance Auto Trader 대시보드
-        </h1>
-        <p class="text-sm md:text-base text-slate-400 mt-1">
-          성과 + 진입 품질 + “왜 진입이 막혔는지(SKIP)”까지 분석합니다.
-        </p>
+<body class="min-h-screen">
+  <div id="desktop-blocker" class="desktop-blocker">
+    <div class="desktop-blocker-card">
+      <div class="text-lg font-bold text-white">PC 전용 대시보드입니다</div>
+      <div class="mt-2 text-sm text-slate-300 leading-6">
+        모바일에서는 지원하지 않습니다.<br />
+        데스크톱 또는 노트북 브라우저에서 접속해 주세요.
       </div>
-      <div class="flex flex-col items-start md:items-end gap-1 text-xs md:text-sm text-slate-400">
-        <span id="last-updated-label">마지막 업데이트: -</span>
-        <button id="refresh-btn"
-          class="inline-flex items-center gap-1 rounded-full bg-slate-800/70 hover:bg-slate-700 px-3 py-1.5 text-xs font-medium text-slate-100 border border-slate-600/60">
-          <span>새로고침</span>
-        </button>
+      <div class="mt-4 rounded-xl border border-rose-500/20 bg-rose-950/30 px-4 py-3 text-sm text-rose-200">
+        PC 전용 대시보드입니다
       </div>
-    </header>
+    </div>
+  </div>
 
-    <!-- Global error banner (STRICT: silent failure 금지) -->
-    <div id="error-banner" class="hidden mb-4 rounded-xl border border-rose-500/40 bg-rose-950/30 px-4 py-3">
+  <div class="sticky-top">
+    <div class="max-w-[1680px] mx-auto px-4 py-3">
+      <div class="flex flex-col xl:flex-row xl:items-center xl:justify-between gap-3">
+        <div class="flex items-center gap-3">
+          <div class="h-10 w-10 rounded-2xl bg-indigo-500/15 border border-indigo-400/20 flex items-center justify-center text-indigo-300 font-bold">
+            BT
+          </div>
+          <div>
+            <div class="text-xl font-bold tracking-tight text-white">기관형 트레이딩 대시보드</div>
+            <div class="text-xs text-slate-400">엔진 상태 · 포지션 · 의사결정 · 에러 · 전략 · 성과</div>
+          </div>
+        </div>
+
+        <div class="flex flex-col md:flex-row md:items-center gap-2 md:gap-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <a class="nav-link" href="#섹션-엔진">엔진 상태</a>
+            <a class="nav-link" href="#섹션-포지션">현재 포지션</a>
+            <a class="nav-link" href="#섹션-의사결정">의사결정 이유</a>
+            <a class="nav-link" href="#섹션-실시간에러">실시간 에러</a>
+            <a class="nav-link" href="#섹션-최근거래">최근 거래</a>
+            <a class="nav-link" href="#섹션-전략">전략 분석</a>
+            <a class="nav-link" href="#섹션-성과">성과 분석</a>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <span id="ws-status-chip" class="status-chip status-neutral">
+              <span class="tiny-dot tiny-dot-neutral"></span>
+              WebSocket 대기
+            </span>
+            <button
+              id="refresh-btn"
+              class="inline-flex items-center gap-1 rounded-xl bg-slate-800/80 hover:bg-slate-700 px-3 py-2 text-xs font-semibold text-slate-100 border border-slate-600/50"
+            >
+              새로고침
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-3 flex flex-col md:flex-row md:items-center md:justify-between gap-2 text-xs text-slate-400">
+        <div class="flex items-center gap-3">
+          <span id="last-updated-label">마지막 업데이트: -</span>
+          <span id="ws-last-message-label">실시간 수신: -</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="status-chip status-neutral" id="engine-top-status">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            엔진 상태 대기
+          </span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="max-w-[1680px] mx-auto px-4 py-6">
+    <div id="error-banner" class="hidden mb-5 rounded-2xl border border-rose-500/30 bg-rose-950/30 px-4 py-4">
       <div class="flex items-start justify-between gap-3">
         <div>
-          <div class="text-sm font-semibold text-rose-200">데이터 로딩 실패</div>
-          <div id="error-banner-msg" class="text-xs text-rose-200/80 mt-1 break-words"></div>
+          <div class="text-sm font-bold text-rose-200">데이터 로딩 실패</div>
+          <div id="error-banner-msg" class="mt-1 text-xs text-rose-200/80 break-words"></div>
         </div>
-        <button id="error-banner-close"
-          class="text-xs text-rose-200/80 hover:text-rose-100 underline underline-offset-2">
+        <button
+          id="error-banner-close"
+          class="text-xs text-rose-200/80 hover:text-rose-100 underline underline-offset-2"
+        >
           닫기
         </button>
       </div>
     </div>
 
-    <section class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
-      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
-        <div class="metric-label text-slate-400 uppercase mb-1">총 거래 횟수</div>
-        <div id="summary-total-trades" class="text-xl md:text-2xl font-semibold text-white">-</div>
+    <!-- 상단 핵심 지표 -->
+    <section class="grid grid-cols-2 xl:grid-cols-6 gap-3 md:gap-4 mb-6">
+      <div class="glass-card rounded-2xl p-4">
+        <div class="metric-label">총 거래 횟수</div>
+        <div id="summary-total-trades" class="metric-value mt-2">-</div>
       </div>
-
-      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
-        <div class="metric-label text-slate-400 uppercase mb-1">승률</div>
-        <div id="summary-win-rate" class="text-xl md:text-2xl font-semibold text-emerald-400">-</div>
-        <div id="summary-win-loss" class="text-xs md:text-sm text-slate-400 mt-1">-</div>
+      <div class="glass-card rounded-2xl p-4">
+        <div class="metric-label">승률</div>
+        <div id="summary-win-rate" class="metric-value mt-2">-</div>
+        <div id="summary-win-loss" class="text-xs text-slate-400 mt-2">-</div>
       </div>
-
-      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
-        <div class="metric-label text-slate-400 uppercase mb-1">총 수익(USDT)</div>
-        <div id="summary-total-pnl" class="text-xl md:text-2xl font-semibold">-</div>
+      <div class="glass-card rounded-2xl p-4">
+        <div class="metric-label">총 수익</div>
+        <div id="summary-total-pnl" class="metric-value mt-2">-</div>
       </div>
-
-      <div class="glass-card rounded-2xl p-3 md:p-4 shadow-lg">
-        <div class="metric-label text-slate-400 uppercase mb-1">거래당 평균 수익</div>
-        <div id="summary-avg-pnl" class="text-xl md:text-2xl font-semibold text-white">-</div>
+      <div class="glass-card rounded-2xl p-4">
+        <div class="metric-label">평균 수익</div>
+        <div id="summary-avg-pnl" class="metric-value mt-2">-</div>
+      </div>
+      <div class="glass-card rounded-2xl p-4">
+        <div class="metric-label">Profit Factor</div>
+        <div id="summary-profit-factor" class="metric-value mt-2">-</div>
+      </div>
+      <div class="glass-card rounded-2xl p-4">
+        <div class="metric-label">최대 드로우다운</div>
+        <div id="summary-max-dd" class="metric-value mt-2">-</div>
       </div>
     </section>
 
-    <section class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-      <div class="glass-card rounded-2xl p-4 shadow-lg">
-        <div class="flex items-center justify-between mb-2">
-          <h2 class="text-sm md:text-base font-semibold text-white">최근 30일 일별 손익</h2>
-          <span class="text-xs text-slate-400">USDT</span>
+    <!-- 엔진 상태 + 포지션 + 의사결정 -->
+    <section class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
+      <div id="섹션-엔진" class="glass-card rounded-2xl p-4 xl:col-span-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="section-title">엔진 상태</h2>
+          <span id="engine-status-chip" class="status-chip status-neutral">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            대기
+          </span>
         </div>
-        <div class="h-48 md:h-60">
-          <canvas id="dailyPnlChart"></canvas>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">DB 지연</div>
+            <div id="engine-db-latency" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">최근 에러</div>
+            <div id="engine-recent-errors" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">최근 SKIP</div>
+            <div id="engine-recent-skips" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">Watchdog</div>
+            <div id="engine-watchdog-reason" class="mt-2 text-sm font-bold break-words">-</div>
+          </div>
         </div>
-        <div id="dailyPnlError" class="hidden mt-2 text-xs text-rose-300"></div>
+
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/40 p-3">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-semibold">실시간 버퍼 / 오더북</div>
+            <div id="engine-ws-available" class="text-xs text-slate-400">-</div>
+          </div>
+          <div id="engine-buffers-box" class="space-y-2 text-sm"></div>
+          <div class="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-300">
+            <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 p-2">
+              <div class="text-slate-400">Best Bid</div>
+              <div id="engine-best-bid" class="mt-1 font-semibold mono">-</div>
+            </div>
+            <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 p-2">
+              <div class="text-slate-400">Best Ask</div>
+              <div id="engine-best-ask" class="mt-1 font-semibold mono">-</div>
+            </div>
+          </div>
+          <div id="engineError" class="panel-error hidden"></div>
+        </div>
       </div>
 
-      <div class="glass-card rounded-2xl p-4 shadow-lg">
+      <div id="섹션-포지션" class="glass-card rounded-2xl p-4 xl:col-span-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="section-title">현재 포지션</h2>
+          <span id="position-status-chip" class="status-chip status-neutral">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            대기
+          </span>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">심볼</div>
+            <div id="position-symbol" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">방향</div>
+            <div id="position-side" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">진입가</div>
+            <div id="position-entry-price" class="mt-2 text-sm font-bold mono">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">현재가</div>
+            <div id="position-current-price" class="mt-2 text-sm font-bold mono">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">손익</div>
+            <div id="position-pnl" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">레버리지</div>
+            <div id="position-leverage" class="mt-2 text-lg font-bold">-</div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div class="rounded-xl border border-slate-800/60 bg-slate-950/40 p-3">
+            <div class="metric-label">수량</div>
+            <div id="position-qty" class="mt-2 text-sm font-semibold mono">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-800/60 bg-slate-950/40 p-3">
+            <div class="metric-label">청산가</div>
+            <div id="position-liquidation" class="mt-2 text-sm font-semibold mono">-</div>
+          </div>
+        </div>
+
+        <div id="positionError" class="panel-error hidden"></div>
+      </div>
+
+      <div id="섹션-의사결정" class="glass-card rounded-2xl p-4 xl:col-span-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="section-title">의사결정 이유</h2>
+          <span id="decision-action-chip" class="status-chip status-neutral">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            대기
+          </span>
+        </div>
+
+        <div class="rounded-2xl border border-slate-700/60 bg-slate-950/40 p-3 mb-3">
+          <div class="text-xs text-slate-400">결정 요약</div>
+          <div id="decision-summary" class="mt-2 text-sm font-semibold text-white leading-6">-</div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-3">
+          <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 p-3">
+            <div class="metric-label">EntryScore</div>
+            <div id="decision-entry-score" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 p-3">
+            <div class="metric-label">ExitScore / 기준</div>
+            <div id="decision-exit-score" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 p-3">
+            <div class="metric-label">TrendStrength</div>
+            <div id="decision-trend-strength" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-800/60 bg-slate-900/50 p-3">
+            <div class="metric-label">Spread</div>
+            <div id="decision-spread" class="mt-2 text-lg font-bold">-</div>
+          </div>
+        </div>
+
+        <div class="rounded-2xl border border-slate-800/60 bg-slate-950/40 p-3">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-semibold">판단 근거</div>
+            <div id="decision-orderbook" class="text-xs text-slate-400">오더북: -</div>
+          </div>
+          <div id="decision-reasons-box" class="flex flex-wrap gap-2"></div>
+        </div>
+
+        <div id="decisionError" class="panel-error hidden"></div>
+      </div>
+    </section>
+
+    <!-- 실시간 에러 + 최근 거래 -->
+    <section class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
+      <div id="섹션-실시간에러" class="glass-card rounded-2xl p-4 xl:col-span-5">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="section-title">실시간 에러</h2>
+          <span class="status-chip status-neutral" id="error-panel-chip">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            모니터링
+          </span>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-3">
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">최근 ERROR</div>
+            <div id="error-count-error" class="mt-2 text-lg font-bold">-</div>
+          </div>
+          <div class="rounded-xl border border-slate-700/60 bg-slate-900/40 p-3">
+            <div class="metric-label">최근 WATCHDOG</div>
+            <div id="error-count-watchdog" class="mt-2 text-lg font-bold">-</div>
+          </div>
+        </div>
+
+        <div class="table-shell overflow-auto scroll-thin max-h-[28rem]">
+          <table>
+            <thead>
+              <tr>
+                <th>시간</th>
+                <th>종류</th>
+                <th>사유</th>
+                <th>심볼</th>
+              </tr>
+            </thead>
+            <tbody id="error-table-body">
+              <tr><td colspan="4" class="text-slate-400">로딩 중...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="errorMonitorError" class="panel-error hidden"></div>
+      </div>
+
+      <div id="섹션-최근거래" class="glass-card rounded-2xl p-4 xl:col-span-7">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="section-title">최근 거래</h2>
+          <span class="text-xs text-slate-400">최근 30건</span>
+        </div>
+
+        <div class="table-shell overflow-auto scroll-thin max-h-[34rem]">
+          <table>
+            <thead>
+              <tr>
+                <th>시간</th>
+                <th>종류</th>
+                <th>체결</th>
+                <th>전략</th>
+                <th>청산 사유</th>
+                <th>손익</th>
+              </tr>
+            </thead>
+            <tbody id="trades-table-body">
+              <tr><td colspan="6" class="text-slate-400">로딩 중...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="tradesError" class="panel-error hidden"></div>
+      </div>
+    </section>
+
+    <!-- 전략 분석 -->
+    <section id="섹션-전략" class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
+      <div class="glass-card rounded-2xl p-4 xl:col-span-4">
         <div class="flex items-center justify-between mb-2">
-          <h2 class="text-sm md:text-base font-semibold text-white">최근 진입 점수 분포</h2>
+          <h2 class="section-title">진입 점수 분포</h2>
           <span class="text-xs text-slate-400">EntryScore</span>
         </div>
-        <div class="h-48 md:h-60">
+        <div class="chart-wrap">
           <canvas id="entryScoreHistChart"></canvas>
         </div>
-        <div id="entryScoreError" class="hidden mt-2 text-xs text-rose-300"></div>
-        <div class="mt-2 text-xs text-slate-400">
-          운영 데이터가 아직 적으면 비어 있을 수 있습니다. (필요 시 API에 include_test=true 사용)
+        <div id="entryScoreError" class="panel-error hidden"></div>
+      </div>
+
+      <div class="glass-card rounded-2xl p-4 xl:col-span-4">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="section-title">SKIP 원인 TOP</h2>
+          <span class="text-xs text-slate-400">최근 7일</span>
         </div>
+        <div id="skipReasonsBox" class="space-y-1 text-sm text-slate-200 min-h-[18rem]"></div>
+        <div id="skipReasonsError" class="panel-error hidden"></div>
+      </div>
+
+      <div class="glass-card rounded-2xl p-4 xl:col-span-4">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="section-title">시간대별 SKIP</h2>
+          <span class="text-xs text-slate-400">최근 7일</span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="skipHourlyChart"></canvas>
+        </div>
+        <div id="skipHourlyError" class="panel-error hidden"></div>
       </div>
     </section>
 
-    <!-- SKIP 분석 -->
-    <section class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-10">
-      <div class="glass-card rounded-2xl p-4 shadow-lg">
+    <!-- 성과 분석 -->
+    <section id="섹션-성과" class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-8">
+      <div class="glass-card rounded-2xl p-4 xl:col-span-6">
         <div class="flex items-center justify-between mb-2">
-          <h2 class="text-sm md:text-base font-semibold text-white">SKIP 원인 TOP</h2>
-          <span class="text-xs text-slate-400">최근 7일</span>
+          <h2 class="section-title">일별 손익</h2>
+          <span class="text-xs text-slate-400">최근 30일</span>
         </div>
-        <div id="skipReasonsBox" class="text-xs md:text-sm text-slate-200 space-y-2"></div>
-        <div id="skipReasonsError" class="hidden mt-2 text-xs text-rose-300"></div>
+        <div class="chart-wrap">
+          <canvas id="dailyPnlChart"></canvas>
+        </div>
+        <div id="dailyPnlError" class="panel-error hidden"></div>
       </div>
 
-      <div class="glass-card rounded-2xl p-4 shadow-lg">
+      <div class="glass-card rounded-2xl p-4 xl:col-span-6">
         <div class="flex items-center justify-between mb-2">
-          <h2 class="text-sm md:text-base font-semibold text-white">시간대별 SKIP 횟수(KST)</h2>
-          <span class="text-xs text-slate-400">최근 7일</span>
+          <h2 class="section-title">Equity Curve</h2>
+          <span class="text-xs text-slate-400">누적 손익</span>
         </div>
-        <div class="h-48 md:h-60">
-          <canvas id="skipHourlyChart"></canvas>
+        <div class="chart-wrap">
+          <canvas id="equityCurveChart"></canvas>
         </div>
-        <div id="skipHourlyError" class="hidden mt-2 text-xs text-rose-300"></div>
+        <div id="equityCurveError" class="panel-error hidden"></div>
+      </div>
+
+      <div class="glass-card rounded-2xl p-4 xl:col-span-12">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="section-title">Drawdown Curve</h2>
+          <span class="text-xs text-slate-400">최대 낙폭 추적</span>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="drawdownChart"></canvas>
+        </div>
+        <div id="drawdownError" class="panel-error hidden"></div>
       </div>
     </section>
   </div>
 
   <script>
-    // ─────────────────────────────────────────────
-    // STRICT helpers (silent failure 금지)
-    // ─────────────────────────────────────────────
     const $ = (id) => document.getElementById(id);
 
-    const showBannerError = (msg) => {
+    let ws = null;
+    let dailyPnlChart = null;
+    let entryScoreHistChart = null;
+    let skipHourlyChart = null;
+    let equityCurveChart = null;
+    let drawdownChart = null;
+
+    const state = {
+      decision: null,
+      position: null,
+      engine: null,
+      errorCounts: null,
+      recentErrors: [],
+      recentTrades: [],
+    };
+
+    function isMobileBlocked() {
+      const ua = navigator.userAgent || "";
+      const isMobileUA =
+        /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+      const isSmallViewport = window.innerWidth < 1024;
+      return isMobileUA || isSmallViewport;
+    }
+
+    function enforceDesktopOnly() {
+      const blocked = isMobileBlocked();
+      const blocker = $("desktop-blocker");
+      if (blocked) {
+        blocker.classList.add("show");
+        try {
+          alert("PC 전용 대시보드입니다");
+        } catch (_) {}
+        return false;
+      }
+      blocker.classList.remove("show");
+      return true;
+    }
+
+    function showBannerError(msg) {
       $("error-banner-msg").textContent = String(msg || "알 수 없는 오류");
       $("error-banner").classList.remove("hidden");
-    };
+    }
 
-    const hideBannerError = () => {
+    function hideBannerError() {
       $("error-banner").classList.add("hidden");
       $("error-banner-msg").textContent = "";
-    };
+    }
 
-    const setWidgetError = (elemId, msg) => {
+    function setWidgetError(elemId, msg) {
       const el = $(elemId);
       if (!el) return;
       el.textContent = String(msg || "ERROR");
       el.classList.remove("hidden");
-    };
+    }
 
-    const clearWidgetError = (elemId) => {
+    function clearWidgetError(elemId) {
       const el = $(elemId);
       if (!el) return;
       el.classList.add("hidden");
       el.textContent = "";
-    };
+    }
 
-    const fetchJsonStrict = async (url, label, timeoutMs = 8000) => {
+    async function fetchJsonStrict(url, label, timeoutMs = 8000) {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), timeoutMs);
 
       let res;
       try {
-        res = await fetch(url, { signal: controller.signal });
+        res = await fetch(url, { signal: controller.signal, cache: "no-store" });
       } catch (e) {
         clearTimeout(t);
         throw new Error(`${label}: fetch failed (${e && e.name ? e.name : "ERR"})`);
@@ -192,7 +780,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       let data;
       try {
         data = await res.json();
-      } catch (e) {
+      } catch (_) {
         throw new Error(`${label}: invalid JSON`);
       }
 
@@ -200,22 +788,33 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         throw new Error(`${label}: JSON root invalid`);
       }
       return data;
-    };
+    }
 
-    const fmtNumber = (v, digits = 2) => {
+    function fmtNumber(v, digits = 2) {
       const num = Number(v);
       if (Number.isNaN(num)) return "ERR";
-      return num.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
-    };
+      return num.toLocaleString("en-US", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
+      });
+    }
 
-    const fmtPnlWithSign = (v, digits = 2) => {
+    function fmtSigned(v, digits = 2) {
       const num = Number(v);
       if (Number.isNaN(num)) return "ERR";
-      const s = num.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+      const s = num.toLocaleString("en-US", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits
+      });
       return num > 0 ? `+${s}` : s;
-    };
+    }
 
-    const setLastUpdatedKST = () => {
+    function fmtMaybe(v, digits = 2) {
+      if (v === null || v === undefined) return "-";
+      return fmtNumber(v, digits);
+    }
+
+    function setLastUpdatedKST() {
       const now = new Date();
       const fmt = new Intl.DateTimeFormat("ko-KR", {
         timeZone: "Asia/Seoul",
@@ -224,77 +823,451 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         day: "2-digit",
         hour: "2-digit",
         minute: "2-digit",
+        second: "2-digit",
         hour12: false
       });
-      const parts = fmt.formatToParts(now).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-      const yyyy = parts.year;
-      const mm = parts.month;
-      const dd = parts.day;
-      const hh = parts.hour;
-      const mi = parts.minute;
-      $("last-updated-label").textContent = `마지막 업데이트: ${yyyy}-${mm}-${dd} ${hh}:${mi} (KST)`;
-    };
+      const parts = fmt.formatToParts(now).reduce((acc, p) => {
+        acc[p.type] = p.value;
+        return acc;
+      }, {});
+      $("last-updated-label").textContent =
+        `마지막 업데이트: ${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} (KST)`;
+    }
 
-    let dailyPnlChart = null;
-    let entryScoreHistChart = null;
-    let skipHourlyChart = null;
+    function setWsLastMessage(tsMs) {
+      if (!tsMs) {
+        $("ws-last-message-label").textContent = "실시간 수신: -";
+        return;
+      }
+      const d = new Date(Number(tsMs));
+      if (Number.isNaN(d.getTime())) {
+        $("ws-last-message-label").textContent = "실시간 수신: ERR";
+        return;
+      }
+      const fmt = new Intl.DateTimeFormat("ko-KR", {
+        timeZone: "Asia/Seoul",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      });
+      $("ws-last-message-label").textContent = `실시간 수신: ${fmt.format(d)} (KST)`;
+    }
+
+    function applyStatusChip(el, statusText) {
+      const chip = typeof el === "string" ? $(el) : el;
+      if (!chip) return;
+
+      let cls = "status-neutral";
+      let dot = "tiny-dot-neutral";
+      const s = String(statusText || "").toUpperCase();
+
+      if (s.includes("OK") || s === "OPEN" || s === "CONNECTED" || s === "ENTRY" || s === "HOLD") {
+        cls = "status-ok";
+        dot = "tiny-dot-ok";
+      } else if (s.includes("WARNING") || s.includes("WARN")) {
+        cls = "status-warning";
+        dot = "tiny-dot-warning";
+      } else if (s.includes("FATAL") || s.includes("ERROR") || s.includes("EXIT") || s.includes("NO_ENTRY") || s.includes("CLOSED") || s.includes("FLAT")) {
+        cls = "status-fatal";
+        dot = "tiny-dot-fatal";
+      }
+
+      chip.className = `status-chip ${cls}`;
+      chip.innerHTML = `<span class="tiny-dot ${dot}"></span>${statusText || "-"}`;
+    }
+
+    function applyValueColor(el, num) {
+      if (!el) return;
+      const n = Number(num);
+      if (Number.isNaN(n)) {
+        el.classList.remove("value-positive", "value-negative", "value-neutral");
+        return;
+      }
+      el.classList.remove("value-positive", "value-negative", "value-neutral");
+      if (n > 0) el.classList.add("value-positive");
+      else if (n < 0) el.classList.add("value-negative");
+      else el.classList.add("value-neutral");
+    }
+
+    function createOrUpdateChart(existing, canvasId, type, labels, data, datasetLabel) {
+      const canvas = $(canvasId);
+      if (!canvas) throw new Error(`${canvasId}: canvas missing`);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error(`${canvasId}: context missing`);
+
+      if (existing) existing.destroy();
+
+      return new Chart(ctx, {
+        type,
+        data: {
+          labels,
+          datasets: [
+            {
+              label: datasetLabel,
+              data,
+              borderWidth: 2,
+              tension: 0.25,
+              fill: type === "line"
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          plugins: {
+            legend: {
+              display: false
+            }
+          },
+          scales: {
+            x: {
+              ticks: { color: "#94a3b8", maxTicksLimit: 10 },
+              grid: { color: "rgba(148,163,184,0.08)" }
+            },
+            y: {
+              ticks: { color: "#94a3b8" },
+              grid: { color: "rgba(148,163,184,0.08)" }
+            }
+          }
+        }
+      });
+    }
+
+    function renderSummary(data, perfSummary) {
+      $("summary-total-trades").textContent = fmtNumber(data.total_trades, 0);
+      $("summary-win-rate").textContent = `${fmtNumber(data.win_rate_pct, 1)}%`;
+      $("summary-win-loss").textContent =
+        `이긴 ${fmtNumber(data.wins, 0)} / 진 ${fmtNumber(data.losses, 0)} / 본전 ${fmtNumber(data.breakevens, 0)}`;
+
+      const totalPnlEl = $("summary-total-pnl");
+      totalPnlEl.textContent = fmtSigned(data.total_pnl_usdt, 2);
+      applyValueColor(totalPnlEl, data.total_pnl_usdt);
+
+      const avgPnlEl = $("summary-avg-pnl");
+      avgPnlEl.textContent = fmtSigned(data.avg_pnl_usdt, 2);
+      applyValueColor(avgPnlEl, data.avg_pnl_usdt);
+
+      $("summary-profit-factor").textContent = perfSummary && perfSummary.profit_factor !== null
+        ? fmtNumber(perfSummary.profit_factor, 2)
+        : "-";
+
+      const ddText = perfSummary
+        ? `${fmtMaybe(perfSummary.max_drawdown_usdt, 2)} USDT / ${perfSummary.max_drawdown_pct !== null ? fmtNumber(perfSummary.max_drawdown_pct, 2) + "%" : "-"}`
+        : "-";
+      $("summary-max-dd").textContent = ddText;
+    }
+
+    function renderEngineStatus(data) {
+      state.engine = data;
+      applyStatusChip("engine-status-chip", data.status || "대기");
+      applyStatusChip("engine-top-status", data.status || "대기");
+
+      $("engine-db-latency").textContent = `${fmtMaybe(data.db_latency_ms, 0)} ms`;
+      $("engine-recent-errors").textContent = fmtMaybe(data.recent_errors, 0);
+      $("engine-recent-skips").textContent = fmtMaybe(data.recent_skips, 0);
+      $("engine-watchdog-reason").textContent =
+        data.latest_watchdog && data.latest_watchdog.reason ? String(data.latest_watchdog.reason) : "-";
+
+      const wsStatus = data.ws_status;
+      if (!wsStatus || typeof wsStatus !== "object") {
+        throw new Error("engine_status: ws_status invalid");
+      }
+
+      $("engine-ws-available").textContent = wsStatus.available ? "사용 가능" : "사용 불가";
+      $("engine-best-bid").textContent =
+        wsStatus.orderbook && wsStatus.orderbook.bestBid !== undefined && wsStatus.orderbook.bestBid !== null
+          ? fmtMaybe(wsStatus.orderbook.bestBid, 4)
+          : "-";
+      $("engine-best-ask").textContent =
+        wsStatus.orderbook && wsStatus.orderbook.bestAsk !== undefined && wsStatus.orderbook.bestAsk !== null
+          ? fmtMaybe(wsStatus.orderbook.bestAsk, 4)
+          : "-";
+
+      const buffersBox = $("engine-buffers-box");
+      buffersBox.innerHTML = "";
+
+      const buffers = wsStatus.buffers;
+      if (!buffers || typeof buffers !== "object") {
+        throw new Error("engine_status: buffers invalid");
+      }
+
+      Object.entries(buffers).forEach(([tf, v]) => {
+        const ok = !!(v && v.ok);
+        const len = v && v.len !== undefined && v.len !== null ? String(v.len) : "ERR";
+        const div = document.createElement("div");
+        div.className = "mini-row";
+        div.innerHTML = `
+          <div class="flex items-center gap-2">
+            <span class="tiny-dot ${ok ? "tiny-dot-ok" : "tiny-dot-fatal"}"></span>
+            <span>${tf} 버퍼</span>
+          </div>
+          <div class="${ok ? "value-positive" : "value-negative"} mono">${len}</div>
+        `;
+        buffersBox.appendChild(div);
+      });
+    }
+
+    function renderPosition(data) {
+      state.position = data;
+      const status = data.status || "대기";
+      applyStatusChip("position-status-chip", status);
+
+      $("position-symbol").textContent = data.symbol || "-";
+      $("position-side").textContent = data.side || "-";
+      $("position-entry-price").textContent = data.entry_price !== undefined ? fmtMaybe(data.entry_price, 4) : "-";
+      $("position-current-price").textContent = data.current_price !== undefined ? fmtMaybe(data.current_price, 4) : "-";
+
+      const pnlEl = $("position-pnl");
+      pnlEl.textContent = `${fmtSigned(data.pnl_usdt, 2)} USDT / ${fmtSigned(data.pnl_pct, 2)}%`;
+      applyValueColor(pnlEl, data.pnl_usdt);
+
+      $("position-leverage").textContent = data.leverage !== undefined ? `${fmtMaybe(data.leverage, 1)}x` : "-";
+      $("position-qty").textContent = data.quantity !== undefined ? fmtMaybe(data.quantity, 6) : "-";
+      $("position-liquidation").textContent =
+        data.liquidation_price !== null && data.liquidation_price !== undefined
+          ? fmtMaybe(data.liquidation_price, 4)
+          : "-";
+    }
+
+    function renderDecision(data) {
+      state.decision = data;
+
+      const action = data.action || "대기";
+      applyStatusChip("decision-action-chip", action);
+
+      $("decision-summary").textContent = data.summary || "-";
+      $("decision-entry-score").textContent = data.entry_score !== undefined ? fmtMaybe(data.entry_score, 3) : "-";
+
+      const exitScoreText =
+        data.exit_score !== undefined && data.exit_score !== null
+          ? `${fmtMaybe(data.exit_score, 3)} / ${data.threshold !== undefined && data.threshold !== null ? fmtMaybe(data.threshold, 3) : "-"}`
+          : data.threshold !== undefined && data.threshold !== null
+            ? `- / ${fmtMaybe(data.threshold, 3)}`
+            : "-";
+      $("decision-exit-score").textContent = exitScoreText;
+      $("decision-trend-strength").textContent = data.trend_strength !== undefined ? fmtMaybe(data.trend_strength, 3) : "-";
+      $("decision-spread").textContent = data.spread !== undefined ? fmtMaybe(data.spread, 6) : "-";
+      $("decision-orderbook").textContent =
+        `오더북: ${data.orderbook_imbalance !== undefined ? fmtMaybe(data.orderbook_imbalance, 3) : "-"}`;
+
+      const reasonsBox = $("decision-reasons-box");
+      reasonsBox.innerHTML = "";
+      const reasons = Array.isArray(data.reasons) ? data.reasons : [];
+      if (!reasons.length) {
+        const span = document.createElement("span");
+        span.className = "reason-pill";
+        span.textContent = "근거 없음";
+        reasonsBox.appendChild(span);
+      } else {
+        reasons.forEach((r) => {
+          const span = document.createElement("span");
+          span.className = "reason-pill";
+          span.textContent = String(r);
+          reasonsBox.appendChild(span);
+        });
+      }
+    }
+
+    function renderErrorCounts(items) {
+      state.errorCounts = items;
+      $("error-count-error").textContent = fmtMaybe(items.ERROR ?? 0, 0);
+      $("error-count-watchdog").textContent = fmtMaybe(items.WATCHDOG ?? 0, 0);
+
+      const total = Number(items.ERROR ?? 0) + Number(items.WATCHDOG ?? 0);
+      if (total > 0) applyStatusChip("error-panel-chip", "이상 감시 중");
+      else applyStatusChip("error-panel-chip", "정상 감시 중");
+    }
+
+    function renderErrorsTable(items) {
+      state.recentErrors = Array.isArray(items) ? items.slice(0, 100) : [];
+      const body = $("error-table-body");
+      body.innerHTML = "";
+
+      if (!state.recentErrors.length) {
+        body.innerHTML = `<tr><td colspan="4" class="text-slate-400">표시할 에러 이벤트가 없습니다.</td></tr>`;
+        return;
+      }
+
+      state.recentErrors.forEach((item) => {
+        const tr = document.createElement("tr");
+        const type = String(item.event_type || "-");
+        const reason = String(item.reason || "-");
+        const symbol = String(item.symbol || "-");
+        const ts = String(item.ts_utc || "-");
+        tr.innerHTML = `
+          <td class="mono text-xs">${ts}</td>
+          <td>${type}</td>
+          <td class="max-w-[22rem] break-words">${reason}</td>
+          <td>${symbol}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }
+
+    function prependLiveError(item) {
+      if (!item || typeof item !== "object") return;
+      state.recentErrors.unshift(item);
+      state.recentErrors = state.recentErrors.slice(0, 100);
+      renderErrorsTable(state.recentErrors);
+    }
+
+    function renderTradesTable(items) {
+      state.recentTrades = Array.isArray(items) ? items.slice(0, 100) : [];
+      const body = $("trades-table-body");
+      body.innerHTML = "";
+
+      if (!state.recentTrades.length) {
+        body.innerHTML = `<tr><td colspan="6" class="text-slate-400">표시할 거래가 없습니다.</td></tr>`;
+        return;
+      }
+
+      state.recentTrades.forEach((item) => {
+        const pnl = Number(item.pnl_usdt || 0);
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="mono text-xs">${item.exit_ts || item.entry_ts || "-"}</td>
+          <td>${item.trade_type || "-"} / ${item.side_label || "-"}</td>
+          <td class="mono text-xs">${item.entry_price !== undefined ? fmtMaybe(item.entry_price, 4) : "-"} → ${item.exit_price !== undefined && item.exit_price !== null ? fmtMaybe(item.exit_price, 4) : "-"}</td>
+          <td>${item.regime_label || "-"} / ${item.strategy || "-"}</td>
+          <td>${item.close_reason_label || "-"}</td>
+          <td class="${pnl > 0 ? "value-positive" : pnl < 0 ? "value-negative" : "value-neutral"} mono">${fmtSigned(pnl, 2)}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }
+
+    function prependLiveTrade(item) {
+      if (!item || typeof item !== "object") return;
+      state.recentTrades.unshift(item);
+      state.recentTrades = state.recentTrades.slice(0, 100);
+      renderTradesTable(state.recentTrades);
+    }
+
+    function renderSkipReasons(items) {
+      const box = $("skipReasonsBox");
+      box.innerHTML = "";
+      if (!Array.isArray(items) || !items.length) {
+        box.innerHTML = `<div class="text-slate-400 text-sm">표시할 SKIP 데이터가 없습니다.</div>`;
+        return;
+      }
+
+      items.forEach((it) => {
+        const reason = String(it.reason || "");
+        const n = Number(it.n);
+        if (!reason || Number.isNaN(n)) throw new Error("skipReasons invalid item");
+        const div = document.createElement("div");
+        div.className = "mini-row";
+        div.innerHTML = `
+          <div class="truncate max-w-[80%]">${reason}</div>
+          <div class="mono">${fmtMaybe(n, 0)}</div>
+        `;
+        box.appendChild(div);
+      });
+    }
 
     async function loadSummary() {
-      clearWidgetError("summaryError");
       try {
-        const data = await fetchJsonStrict("/api/summary", "summary");
-
-        $("summary-total-trades").textContent = fmtNumber(data.total_trades, 0);
-        $("summary-win-rate").textContent = fmtNumber(data.win_rate_pct, 1) + "%";
-        $("summary-win-loss").textContent =
-          `이긴 ${fmtNumber(data.wins,0)} / 진 ${fmtNumber(data.losses,0)} / 본전 ${fmtNumber(data.breakevens,0)}`;
-
-        const totalPnlElem = $("summary-total-pnl");
-        const totalPnl = Number(data.total_pnl_usdt);
-        if (Number.isNaN(totalPnl)) throw new Error("summary: total_pnl_usdt invalid");
-
-        totalPnlElem.textContent = fmtPnlWithSign(totalPnl, 2);
-        totalPnlElem.className = "text-xl md:text-2xl font-semibold " +
-          (totalPnl > 0 ? "text-emerald-400" : totalPnl < 0 ? "text-rose-400" : "text-slate-300");
-
-        const avgPnl = Number(data.avg_pnl_usdt);
-        if (Number.isNaN(avgPnl)) throw new Error("summary: avg_pnl_usdt invalid");
-        $("summary-avg-pnl").textContent = fmtPnlWithSign(avgPnl, 2);
+        const [summary, perfSummary] = await Promise.all([
+          fetchJsonStrict("/api/summary", "summary"),
+          fetchJsonStrict("/api/performance/summary", "performance-summary")
+        ]);
+        renderSummary(summary, perfSummary);
       } catch (e) {
         showBannerError(e.message || String(e));
-        // STRICT: 위젯에 명시적 오류 표시
         $("summary-total-trades").textContent = "ERR";
         $("summary-win-rate").textContent = "ERR";
         $("summary-win-loss").textContent = "ERR";
         $("summary-total-pnl").textContent = "ERR";
         $("summary-avg-pnl").textContent = "ERR";
+        $("summary-profit-factor").textContent = "ERR";
+        $("summary-max-dd").textContent = "ERR";
       }
     }
 
     async function loadDailyPnlChart() {
       clearWidgetError("dailyPnlError");
       try {
-        const data = await fetchJsonStrict("/api/daily-pnl?days=30", "daily-pnl");
+        const data = await fetchJsonStrict("/api/performance/daily-pnl?days=30", "daily-pnl");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("daily-pnl: items invalid");
 
-        const labels = items.map(x => String(x.date));
-        const pnls = items.map(x => {
+        const labels = items.map((x) => String(x.date));
+        const pnls = items.map((x) => {
           const v = Number(x.pnl_usdt);
           if (Number.isNaN(v)) throw new Error("daily-pnl: pnl_usdt invalid");
           return v;
         });
 
-        const ctx = $("dailyPnlChart").getContext("2d");
-        if (dailyPnlChart) dailyPnlChart.destroy();
-
-        dailyPnlChart = new Chart(ctx, {
-          type: "line",
-          data: { labels, datasets: [{ label: "Daily PnL", data: pnls, borderWidth: 2, tension: 0.3, fill: true }] },
-          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-        });
+        dailyPnlChart = createOrUpdateChart(
+          dailyPnlChart,
+          "dailyPnlChart",
+          "line",
+          labels,
+          pnls,
+          "일별 손익"
+        );
       } catch (e) {
         setWidgetError("dailyPnlError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function loadEquityCurveChart() {
+      clearWidgetError("equityCurveError");
+      try {
+        const data = await fetchJsonStrict("/api/performance/equity-curve?limit=500", "equity-curve");
+        const items = Array.isArray(data.items) ? data.items : null;
+        if (!items) throw new Error("equity-curve: items invalid");
+
+        const labels = items.map((x) => String(x.exit_ts || ""));
+        const values = items.map((x) => {
+          const v = Number(x.equity_usdt);
+          if (Number.isNaN(v)) throw new Error("equity-curve: equity_usdt invalid");
+          return v;
+        });
+
+        equityCurveChart = createOrUpdateChart(
+          equityCurveChart,
+          "equityCurveChart",
+          "line",
+          labels,
+          values,
+          "누적 손익"
+        );
+      } catch (e) {
+        setWidgetError("equityCurveError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function loadDrawdownChart() {
+      clearWidgetError("drawdownError");
+      try {
+        const data = await fetchJsonStrict("/api/performance/drawdown-curve?limit=500", "drawdown-curve");
+        const items = Array.isArray(data.items) ? data.items : null;
+        if (!items) throw new Error("drawdown-curve: items invalid");
+
+        const labels = items.map((x) => String(x.exit_ts || ""));
+        const values = items.map((x) => {
+          const v = x.drawdown_pct === null || x.drawdown_pct === undefined ? 0 : Number(x.drawdown_pct);
+          if (Number.isNaN(v)) throw new Error("drawdown-curve: drawdown_pct invalid");
+          return v;
+        });
+
+        drawdownChart = createOrUpdateChart(
+          drawdownChart,
+          "drawdownChart",
+          "line",
+          labels,
+          values,
+          "드로우다운"
+        );
+      } catch (e) {
+        setWidgetError("drawdownError", `ERROR: ${e.message || String(e)}`);
         showBannerError(e.message || String(e));
       }
     }
@@ -308,14 +1281,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         if (!labels || !counts) throw new Error("entry-scores: histogram invalid");
         if (labels.length !== counts.length) throw new Error("entry-scores: histogram length mismatch");
 
-        const ctx = $("entryScoreHistChart").getContext("2d");
-        if (entryScoreHistChart) entryScoreHistChart.destroy();
-
-        entryScoreHistChart = new Chart(ctx, {
-          type: "bar",
-          data: { labels, datasets: [{ label: "count", data: counts, borderWidth: 1 }] },
-          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-        });
+        entryScoreHistChart = createOrUpdateChart(
+          entryScoreHistChart,
+          "entryScoreHistChart",
+          "bar",
+          labels,
+          counts,
+          "진입 점수 분포"
+        );
       } catch (e) {
         setWidgetError("entryScoreError", `ERROR: ${e.message || String(e)}`);
         showBannerError(e.message || String(e));
@@ -328,22 +1301,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         const data = await fetchJsonStrict("/api/events/skip-reasons?days=7&limit=15", "skip-reasons");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("skip-reasons: items invalid");
-
-        const box = $("skipReasonsBox");
-        box.innerHTML = "";
-
-        for (const it of items) {
-          if (!it || typeof it !== "object") throw new Error("skip-reasons: item invalid");
-          const reason = String(it.reason ?? "");
-          const n = Number(it.n);
-          if (!reason) throw new Error("skip-reasons: reason empty");
-          if (Number.isNaN(n)) throw new Error("skip-reasons: n invalid");
-
-          const div = document.createElement("div");
-          div.className = "flex justify-between border-b border-slate-800/60 pb-1";
-          div.innerHTML = `<span class="truncate max-w-[70%]">${reason}</span><span>${n}</span>`;
-          box.appendChild(div);
-        }
+        renderSkipReasons(items);
       } catch (e) {
         setWidgetError("skipReasonsError", `ERROR: ${e.message || String(e)}`);
         showBannerError(e.message || String(e));
@@ -357,43 +1315,236 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("skip-hourly: items invalid");
 
-        const labels = items.map(x => String(x.hour_kst));
-        const vals = items.map(x => {
+        const labels = items.map((x) => String(x.hour_kst));
+        const vals = items.map((x) => {
           const v = Number(x.n);
           if (Number.isNaN(v)) throw new Error("skip-hourly: n invalid");
           return v;
         });
 
-        const ctx = $("skipHourlyChart").getContext("2d");
-        if (skipHourlyChart) skipHourlyChart.destroy();
-
-        skipHourlyChart = new Chart(ctx, {
-          type: "bar",
-          data: { labels, datasets: [{ label: "skip_count", data: vals, borderWidth: 1 }] },
-          options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
-        });
+        skipHourlyChart = createOrUpdateChart(
+          skipHourlyChart,
+          "skipHourlyChart",
+          "bar",
+          labels,
+          vals,
+          "시간대별 SKIP"
+        );
       } catch (e) {
         setWidgetError("skipHourlyError", `ERROR: ${e.message || String(e)}`);
         showBannerError(e.message || String(e));
       }
     }
 
+    async function loadEngineStatus() {
+      clearWidgetError("engineError");
+      try {
+        const data = await fetchJsonStrict("/api/engine/status", "engine-status");
+        renderEngineStatus(data);
+      } catch (e) {
+        setWidgetError("engineError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function loadPosition() {
+      clearWidgetError("positionError");
+      try {
+        const data = await fetchJsonStrict("/api/position/current", "position-current");
+        renderPosition(data);
+      } catch (e) {
+        setWidgetError("positionError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function loadDecision() {
+      clearWidgetError("decisionError");
+      try {
+        const data = await fetchJsonStrict("/api/decision/latest", "decision-latest");
+        renderDecision(data);
+      } catch (e) {
+        setWidgetError("decisionError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function loadErrors() {
+      clearWidgetError("errorMonitorError");
+      try {
+        const [counts, recent] = await Promise.all([
+          fetchJsonStrict("/api/errors/counts?minutes=10", "errors-counts"),
+          fetchJsonStrict("/api/errors/recent?limit=50", "errors-recent")
+        ]);
+
+        if (!counts.items || typeof counts.items !== "object") {
+          throw new Error("errors-counts: items invalid");
+        }
+        if (!Array.isArray(recent.items)) {
+          throw new Error("errors-recent: items invalid");
+        }
+
+        renderErrorCounts(counts.items);
+        renderErrorsTable(recent.items);
+      } catch (e) {
+        setWidgetError("errorMonitorError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function loadTrades() {
+      clearWidgetError("tradesError");
+      try {
+        const data = await fetchJsonStrict("/api/trades/recent?limit=30", "trades-recent");
+        if (!Array.isArray(data.items)) throw new Error("trades-recent: items invalid");
+        renderTradesTable(data.items);
+      } catch (e) {
+        setWidgetError("tradesError", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    function connectDashboardWebSocket() {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${protocol}//${window.location.host}/ws/dashboard`;
+
+      if (ws) {
+        try { ws.close(); } catch (_) {}
+      }
+
+      applyStatusChip("ws-status-chip", "WebSocket 연결 중");
+
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        applyStatusChip("ws-status-chip", "WebSocket 연결됨");
+        try {
+          ws.send(JSON.stringify({ op: "snapshot" }));
+        } catch (e) {
+          showBannerError(`websocket snapshot request failed: ${e.message || String(e)}`);
+        }
+      };
+
+      ws.onmessage = (event) => {
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch (_) {
+          showBannerError("websocket: invalid JSON");
+          return;
+        }
+
+        if (!data || typeof data !== "object") {
+          showBannerError("websocket: invalid payload");
+          return;
+        }
+
+        setWsLastMessage(data.ts_ms || (data.payload && data.payload.ts_ms) || null);
+        setLastUpdatedKST();
+
+        if (data.type === "system") {
+          const eventName = String(data.event || "");
+          if (eventName === "snapshot") {
+            const items = data.payload && Array.isArray(data.payload.items) ? data.payload.items : null;
+            if (!items) {
+              showBannerError("websocket snapshot: items invalid");
+              return;
+            }
+            items.forEach(applyLiveEnvelope);
+          } else if (eventName === "pong") {
+            // no-op
+          }
+          return;
+        }
+
+        applyLiveEnvelope(data);
+      };
+
+      ws.onerror = () => {
+        applyStatusChip("ws-status-chip", "WebSocket 오류");
+      };
+
+      ws.onclose = () => {
+        applyStatusChip("ws-status-chip", "WebSocket 종료");
+      };
+    }
+
+    function applyLiveEnvelope(envelope) {
+      if (!envelope || typeof envelope !== "object") {
+        showBannerError("websocket envelope invalid");
+        return;
+      }
+
+      const type = String(envelope.type || "");
+      const payload = envelope.payload;
+      if (!type || !payload || typeof payload !== "object") {
+        showBannerError("websocket payload invalid");
+        return;
+      }
+
+      switch (type) {
+        case "engine_status":
+          renderEngineStatus(payload);
+          break;
+        case "decision":
+          renderDecision(payload);
+          break;
+        case "position":
+          renderPosition(payload);
+          break;
+        case "error":
+        case "watchdog":
+          prependLiveError({
+            ts_utc: payload.ts_utc || new Date().toISOString(),
+            event_type: type === "error" ? "ERROR" : "WATCHDOG",
+            reason: payload.reason || payload.summary || type,
+            symbol: payload.symbol || "-"
+          });
+          break;
+        case "trade":
+          prependLiveTrade(payload);
+          break;
+        default:
+          showBannerError(`websocket: unsupported type ${type}`);
+          break;
+      }
+    }
+
     async function loadAll() {
-      // STRICT: 이전 에러를 숨기지 않고, 새 로딩 시작 시 배너만 초기화
       hideBannerError();
 
-      await loadSummary();
-      await loadDailyPnlChart();
-      await loadEntryScoreHist();
-      await loadSkipReasons();
-      await loadSkipHourly();
+      await Promise.all([
+        loadSummary(),
+        loadDailyPnlChart(),
+        loadEquityCurveChart(),
+        loadDrawdownChart(),
+        loadEntryScoreHist(),
+        loadSkipReasons(),
+        loadSkipHourly(),
+        loadEngineStatus(),
+        loadPosition(),
+        loadDecision(),
+        loadErrors(),
+        loadTrades()
+      ]);
+
+      connectDashboardWebSocket();
       setLastUpdatedKST();
     }
 
-    window.addEventListener("DOMContentLoaded", () => {
-      loadAll();
-      $("refresh-btn").addEventListener("click", () => loadAll());
+    window.addEventListener("resize", () => {
+      enforceDesktopOnly();
+    });
+
+    window.addEventListener("DOMContentLoaded", async () => {
+      if (!enforceDesktopOnly()) return;
+
+      $("refresh-btn").addEventListener("click", () => {
+        loadAll();
+      });
       $("error-banner-close").addEventListener("click", () => hideBannerError());
+
+      await loadAll();
     });
   </script>
 </body>

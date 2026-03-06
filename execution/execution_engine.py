@@ -16,6 +16,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
 - 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
 
+PATCH NOTES — 2026-03-06 (TRADE-GRADE)
+- DECISION 이벤트 연결(STRICT):
+  - NO_ENTRY / ENTRY 의사결정 이벤트를 bt_events 에 기록
+  - 대시보드 "왜 진입 안하는지 / 왜 진입했는지" 패널용 payload 엄격 생성
+  - 필수 결정 지표(entry_score / trend_strength / spread / orderbook_imbalance) 누락 시 즉시 예외
+
 PATCH NOTES — 2026-03-04 (TRADE-GRADE)
 - Invariant Guard 연결(STRICT):
   - ENTER 흐름에서 meta/signal 수학 무결성(0..1/finite/필수키)을 execute() 초기에 검증
@@ -66,7 +72,7 @@ import math
 import time
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from events.signals_logger import log_event, log_signal, log_skip_event
 from execution.exchange_api import get_available_usdt, get_balance_detail, req
@@ -90,9 +96,8 @@ from state.db_writer import (
     record_trade_open_returning_id,
     record_trade_snapshot,
 )
-from state.trader_state import Trade  # ✅ FIX: Trade 타입 import
+from state.trader_state import Trade
 
-# NEW: Invariant Guard (TRADE-GRADE)
 from execution.invariant_guard import (  # noqa: E402
     ExecutionInvariantInputs,
     InvariantViolation,
@@ -108,6 +113,8 @@ logger = logging.getLogger(__name__)
 # Global single execution lock (STRICT)
 # ============================================================
 _EXECUTION_LOCK: Lock = Lock()
+
+_ALLOWED_DECISION_ACTIONS = ("ENTRY", "NO_ENTRY", "HOLD", "EXIT")
 
 
 def _as_bool_strict(v: Any, name: str) -> bool:
@@ -154,6 +161,38 @@ def _opt_float_strict(value: Any, name: str) -> Optional[float]:
     return float(_as_float(value, name))
 
 
+def _require_nonempty_str(value: Any, name: str) -> str:
+    if value is None:
+        raise OrderFailed(f"{name} is required (STRICT)")
+    if not isinstance(value, str):
+        raise OrderFailed(f"{name} must be str (STRICT)")
+    s = value.strip()
+    if not s:
+        raise OrderFailed(f"{name} must not be empty (STRICT)")
+    return s
+
+
+def _require_str_list(values: Any, name: str) -> List[str]:
+    if values is None:
+        raise OrderFailed(f"{name} is required (STRICT)")
+    if not isinstance(values, list):
+        raise OrderFailed(f"{name} must be list[str] (STRICT)")
+    if not values:
+        raise OrderFailed(f"{name} must not be empty (STRICT)")
+
+    out: List[str] = []
+    for idx, item in enumerate(values):
+        out.append(_require_nonempty_str(item, f"{name}[{idx}]"))
+    return out
+
+
+def _normalize_decision_action(action: str) -> str:
+    a = _require_nonempty_str(action, "decision.action").upper()
+    if a not in _ALLOWED_DECISION_ACTIONS:
+        raise OrderFailed(f"unsupported decision action (STRICT): {a}")
+    return a
+
+
 def _meta_pick_first(meta: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
     """
     STRICT:
@@ -163,6 +202,214 @@ def _meta_pick_first(meta: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
         if k in meta:
             return meta[k]
     return None
+
+
+def _require_meta_numeric_from_keys(
+    meta: Dict[str, Any],
+    keys: Tuple[str, ...],
+    name: str,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    raw = _meta_pick_first(meta, keys)
+    if raw is None:
+        raise OrderFailed(f"{name} is required (STRICT)")
+    return float(_as_float(raw, name, min_value=min_value, max_value=max_value))
+
+
+def _optional_meta_numeric_from_keys(
+    meta: Dict[str, Any],
+    keys: Tuple[str, ...],
+    name: str,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> Optional[float]:
+    raw = _meta_pick_first(meta, keys)
+    if raw is None:
+        return None
+    return float(_as_float(raw, name, min_value=min_value, max_value=max_value))
+
+
+def _calculate_exit_prices_strict(
+    *,
+    direction: str,
+    entry_price: float,
+    tp_pct: float,
+    sl_pct: float,
+) -> Tuple[float, float]:
+    if entry_price <= 0:
+        raise OrderFailed("entry_price must be > 0 (STRICT)")
+    if tp_pct <= 0:
+        raise OrderFailed("tp_pct must be > 0 (STRICT)")
+    if sl_pct <= 0:
+        raise OrderFailed("sl_pct must be > 0 (STRICT)")
+
+    d = _require_nonempty_str(direction, "direction").upper()
+    if d == "LONG":
+        target_price = entry_price * (1.0 + tp_pct)
+        stop_price = entry_price * (1.0 - sl_pct)
+    elif d == "SHORT":
+        target_price = entry_price * (1.0 - tp_pct)
+        stop_price = entry_price * (1.0 + sl_pct)
+    else:
+        raise OrderFailed("direction must be LONG or SHORT (STRICT)")
+
+    if target_price <= 0 or stop_price <= 0:
+        raise OrderFailed("calculated target/stop price invalid (STRICT)")
+    return float(target_price), float(stop_price)
+
+
+def _build_decision_payload_strict(
+    *,
+    meta: Dict[str, Any],
+    action: str,
+    summary: str,
+    reasons: List[str],
+    signal_source: str,
+    current_price: float,
+    direction: str,
+    spread_snapshot: Optional[float],
+    position_qty: Optional[float],
+    entry_price: Optional[float] = None,
+    tp_pct: Optional[float] = None,
+    sl_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    normalized_action = _normalize_decision_action(action)
+    summary_s = _require_nonempty_str(summary, "decision.summary")
+    reasons_l = _require_str_list(reasons, "decision.reasons")
+    signal_source_s = _require_nonempty_str(signal_source, "decision.signal_source")
+
+    current_price_f = float(_as_float(current_price, "decision.current_price", min_value=0.0))
+    if current_price_f <= 0:
+        raise OrderFailed("decision.current_price must be > 0 (STRICT)")
+
+    entry_score = _require_meta_numeric_from_keys(
+        meta,
+        ("entry_score", "entryScore", "engine_total", "engine_total_score", "engine_total_score_v2"),
+        "decision.entry_score",
+    )
+    trend_strength = _require_meta_numeric_from_keys(
+        meta,
+        ("trend_strength", "trend_score", "trendScore", "trend_strength_1m"),
+        "decision.trend_strength",
+    )
+    orderbook_imbalance = _require_meta_numeric_from_keys(
+        meta,
+        ("orderbook_imbalance", "depth_ratio", "depth_imbalance", "orderbookImbalance"),
+        "decision.orderbook_imbalance",
+    )
+
+    if spread_snapshot is not None:
+        spread = float(_as_float(spread_snapshot, "decision.spread_snapshot", min_value=0.0))
+    else:
+        spread = _require_meta_numeric_from_keys(
+            meta,
+            ("spread", "spread_pct", "current_spread_pct"),
+            "decision.spread",
+            min_value=0.0,
+        )
+
+    threshold = _optional_meta_numeric_from_keys(
+        meta,
+        ("entry_score_threshold", "decision_threshold", "entry_threshold"),
+        "decision.threshold",
+    )
+    exit_score = _optional_meta_numeric_from_keys(
+        meta,
+        ("exit_score", "exitScore"),
+        "decision.exit_score",
+    )
+
+    regime = _meta_pick_first(meta, ("regime",))
+    regime_s = _require_nonempty_str(regime, "meta.regime") if regime is not None else None
+
+    payload: Dict[str, Any] = {
+        "action": normalized_action,
+        "summary": summary_s,
+        "reasons": reasons_l,
+        "entry_score": float(entry_score),
+        "trend_strength": float(trend_strength),
+        "spread": float(spread),
+        "orderbook_imbalance": float(orderbook_imbalance),
+        "current_price": float(current_price_f),
+        "signal_source": signal_source_s,
+        "side": _require_nonempty_str(direction, "direction").upper(),
+        "regime": regime_s,
+    }
+
+    if threshold is not None:
+        payload["threshold"] = float(threshold)
+    if exit_score is not None:
+        payload["exit_score"] = float(exit_score)
+    if position_qty is not None:
+        payload["position_qty"] = float(_as_float(position_qty, "decision.position_qty", min_value=0.0))
+    if entry_price is not None:
+        entry_price_f = float(_as_float(entry_price, "decision.entry_price", min_value=0.0))
+        if entry_price_f <= 0:
+            raise OrderFailed("decision.entry_price must be > 0 (STRICT)")
+        payload["entry_price"] = entry_price_f
+
+        if tp_pct is not None and sl_pct is not None:
+            target_price, stop_price = _calculate_exit_prices_strict(
+                direction=direction,
+                entry_price=entry_price_f,
+                tp_pct=float(_as_float(tp_pct, "decision.tp_pct", min_value=0.0)),
+                sl_pct=float(_as_float(sl_pct, "decision.sl_pct", min_value=0.0)),
+            )
+            payload["target_price"] = target_price
+            payload["stop_price"] = stop_price
+
+    return payload
+
+
+def _emit_decision_event_strict(
+    *,
+    meta: Dict[str, Any],
+    symbol: str,
+    regime: str,
+    direction: str,
+    signal_source: str,
+    action: str,
+    reason_code: str,
+    summary: str,
+    reasons: List[str],
+    current_price: float,
+    spread_snapshot: Optional[float],
+    position_qty: Optional[float],
+    entry_price: Optional[float] = None,
+    tp_pct: Optional[float] = None,
+    sl_pct: Optional[float] = None,
+) -> None:
+    reason_code_s = _require_nonempty_str(reason_code, "decision.reason_code")
+
+    payload = _build_decision_payload_strict(
+        meta=meta,
+        action=action,
+        summary=summary,
+        reasons=reasons,
+        signal_source=signal_source,
+        current_price=current_price,
+        direction=direction,
+        spread_snapshot=spread_snapshot,
+        position_qty=position_qty,
+        entry_price=entry_price,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+    )
+
+    log_event(
+        "DECISION",
+        symbol=symbol,
+        regime=regime,
+        source="execution_engine.decision",
+        side=direction,
+        price=float(current_price),
+        qty=(float(position_qty) if position_qty is not None else None),
+        reason=reason_code_s,
+        extra_json=payload,
+    )
 
 
 def _require_meta_equity(meta: Dict[str, Any]) -> tuple[float, float, float]:
@@ -471,11 +718,14 @@ def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float,
     gpt_tags = _meta_optional_list(meta, "gpt_tags")
     gpt_confidence_penalty = _meta_optional(meta, "gpt_confidence_penalty")
     if gpt_confidence_penalty is not None:
-        gpt_confidence_penalty = _as_float(gpt_confidence_penalty, "meta.gpt_confidence_penalty", min_value=0.0, max_value=1.0)
+        gpt_confidence_penalty = _as_float(meta.get("gpt_confidence_penalty"), "meta.gpt_confidence_penalty", min_value=0.0, max_value=1.0)
     gpt_suggested_risk_multiplier = _meta_optional(meta, "gpt_suggested_risk_multiplier")
     if gpt_suggested_risk_multiplier is not None:
         gpt_suggested_risk_multiplier = _as_float(
-            gpt_suggested_risk_multiplier, "meta.gpt_suggested_risk_multiplier", min_value=0.0, max_value=1.0
+            gpt_suggested_risk_multiplier,
+            "meta.gpt_suggested_risk_multiplier",
+            min_value=0.0,
+            max_value=1.0,
         )
     gpt_rationale_short = _meta_optional_str(meta, "gpt_rationale_short")
 
@@ -640,7 +890,26 @@ class ExecutionEngine:
             if direction not in ("LONG", "SHORT"):
                 raise ValueError("signal.direction must be LONG or SHORT")
 
+            last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
+            if last_price <= 0:
+                raise OrderFailed("meta.last_price must be > 0 (STRICT)")
+
             if action == "SKIP":
+                _emit_decision_event_strict(
+                    meta=meta,
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    action="NO_ENTRY",
+                    reason_code=str(signal.reason or "signal_skip"),
+                    summary="전략 레이어에서 진입하지 않기로 결정",
+                    reasons=[str(signal.reason or "signal_skip")],
+                    current_price=float(last_price),
+                    spread_snapshot=None,
+                    position_qty=None,
+                )
+
                 msg = f"[SKIP] {symbol} {direction} reason={signal.reason}"
                 logger.info(msg)
                 log_skip_event(
@@ -653,10 +922,6 @@ class ExecutionEngine:
                 )
                 _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
                 return None
-
-            last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
-            if last_price <= 0:
-                raise OrderFailed("meta.last_price must be > 0 (STRICT)")
 
             # NEW: Invariant Guard (signal/meta) — execute() 진입 시점 검증
             try:
@@ -696,6 +961,21 @@ class ExecutionEngine:
                 latest_ts=float(signal_ts_ms),
             )
             if not manual_ok:
+                _emit_decision_event_strict(
+                    meta=meta,
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    action="NO_ENTRY",
+                    reason_code="manual_guard_blocked",
+                    summary="수동 포지션 가드로 진입 차단",
+                    reasons=["manual_guard_blocked"],
+                    current_price=float(last_price),
+                    spread_snapshot=None,
+                    position_qty=None,
+                )
+
                 msg = f"[SKIP] manual_guard_blocked: {symbol}"
                 logger.warning(msg)
                 log_skip_event(
@@ -744,6 +1024,21 @@ class ExecutionEngine:
                 direction=direction,
             )
             if not vol_ok:
+                _emit_decision_event_strict(
+                    meta=meta,
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    action="NO_ENTRY",
+                    reason_code="volume_guard_blocked",
+                    summary="거래량 가드로 진입 차단",
+                    reasons=["volume_guard_blocked"],
+                    current_price=float(last_price),
+                    spread_snapshot=None,
+                    position_qty=None,
+                )
+
                 msg = f"[SKIP] volume_guard_blocked: {symbol}"
                 logger.info(msg)
                 log_skip_event(
@@ -768,6 +1063,21 @@ class ExecutionEngine:
                 direction=direction,
             )
             if not price_ok:
+                _emit_decision_event_strict(
+                    meta=meta,
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    action="NO_ENTRY",
+                    reason_code="price_jump_guard_blocked",
+                    summary="가격 점프 가드로 진입 차단",
+                    reasons=["price_jump_guard_blocked"],
+                    current_price=float(last_price),
+                    spread_snapshot=None,
+                    position_qty=None,
+                )
+
                 msg = f"[SKIP] price_jump_guard_blocked: {symbol}"
                 logger.info(msg)
                 log_skip_event(
@@ -789,7 +1099,31 @@ class ExecutionEngine:
                 signal_source=signal_source,
                 direction=direction,
             )
+            spread_pct_snapshot: Optional[float] = None
+            if best_bid is not None and best_ask is not None:
+                bb_tmp = float(best_bid)
+                ba_tmp = float(best_ask)
+                if bb_tmp > 0 and ba_tmp > 0 and ba_tmp > bb_tmp:
+                    mid_tmp = (bb_tmp + ba_tmp) / 2.0
+                    if mid_tmp > 0:
+                        spread_pct_snapshot = (ba_tmp - bb_tmp) / mid_tmp
+
             if not spread_ok:
+                _emit_decision_event_strict(
+                    meta=meta,
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    action="NO_ENTRY",
+                    reason_code="spread_guard_blocked",
+                    summary="스프레드 가드로 진입 차단",
+                    reasons=["spread_guard_blocked"],
+                    current_price=float(last_price),
+                    spread_snapshot=spread_pct_snapshot,
+                    position_qty=None,
+                )
+
                 msg = f"[SKIP] spread_guard_blocked: {symbol}"
                 logger.info(msg)
                 log_skip_event(
@@ -818,15 +1152,6 @@ class ExecutionEngine:
             if price_for_qty <= 0:
                 raise OrderFailed("price_for_qty must be > 0 (STRICT)")
 
-            spread_pct_snapshot: Optional[float] = None
-            if best_bid is not None and best_ask is not None:
-                bb = float(best_bid)
-                ba = float(best_ask)
-                if bb > 0 and ba > 0 and ba > bb:
-                    mid = (bb + ba) / 2.0
-                    if mid > 0:
-                        spread_pct_snapshot = (ba - bb) / mid
-
             # slippage 계산 (fraction) — 이후 invariant로 재검증
             slippage_pct_for_invariant = abs(float(entry_price_hint) - float(last_price)) / float(last_price)
 
@@ -836,6 +1161,21 @@ class ExecutionEngine:
             if slippage_block_pct > 0:
                 slippage_pct = slippage_pct_for_invariant
                 if slippage_pct > slippage_block_pct:
+                    _emit_decision_event_strict(
+                        meta=meta,
+                        symbol=symbol,
+                        regime=regime,
+                        direction=direction,
+                        signal_source=signal_source,
+                        action="NO_ENTRY",
+                        reason_code="slippage_block",
+                        summary="슬리피지 기준 초과로 진입 차단",
+                        reasons=["slippage_block"],
+                        current_price=float(last_price),
+                        spread_snapshot=spread_pct_snapshot,
+                        position_qty=None,
+                    )
+
                     msg = f"[SKIP] {symbol} {direction} slippage_block slippage_pct={slippage_pct}"
                     logger.warning(msg)
                     log_skip_event(
@@ -906,6 +1246,21 @@ class ExecutionEngine:
                 available_usdt=float(avail_usdt),
             )
             if not ok:
+                _emit_decision_event_strict(
+                    meta=meta,
+                    symbol=symbol,
+                    regime=regime,
+                    direction=direction,
+                    signal_source=signal_source,
+                    action="NO_ENTRY",
+                    reason_code=str(guard_reason),
+                    summary="하드 리스크 가드로 진입 차단",
+                    reasons=[str(guard_reason)],
+                    current_price=float(last_price),
+                    spread_snapshot=spread_pct_snapshot,
+                    position_qty=None,
+                )
+
                 msg = f"[SKIP] hard_risk_guard_blocked: {guard_reason}"
                 logger.warning("%s extra=%s", msg, guard_extra)
                 log_skip_event(
@@ -928,6 +1283,24 @@ class ExecutionEngine:
                 soft_mode = bool(extra.get("soft_mode") or extra.get("soft") or False)
                 if extra.get("sl_floor_ratio") is not None:
                     sl_floor_ratio = _as_float(extra.get("sl_floor_ratio"), "extra.sl_floor_ratio", min_value=0.0)
+
+            _emit_decision_event_strict(
+                meta=meta,
+                symbol=symbol,
+                regime=regime,
+                direction=direction,
+                signal_source=signal_source,
+                action="ENTRY",
+                reason_code="entry_submit",
+                summary="모든 가드 통과로 진입 실행",
+                reasons=["guards_passed", "entry_submit"],
+                current_price=float(entry_price_hint),
+                spread_snapshot=spread_pct_snapshot,
+                position_qty=float(qty_raw),
+                entry_price=float(entry_price_hint),
+                tp_pct=float(tp_pct),
+                sl_pct=float(sl_pct),
+            )
 
             log_event(
                 "on_entry_submitted",

@@ -1,26 +1,27 @@
-# broadcast/dashboard_server.py
 """
 ========================================================
 FILE: broadcast/dashboard_server.py
-PRODUCTION DASHBOARD SERVER
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 역할
 --------------------------------------------------------
 Auto-Trader 대시보드 API 서버.
 - Trades / EntryScore / Events 분석
+- Decision / Error / Position / Performance / System 분석
 - Engine Watchdog(실시간 진단) API 제공
+- Dashboard WebSocket 엔드포인트 제공
 
-Engine Watchdog API (대시보드 Polling 권장: 1~2초)
+Engine API
 --------------------------------------------------------
 - /api/engine/health
-  * DB latency / 최근 ERROR·SKIP / 주문·포지션 상태(가능 시) / 엔진 상태 요약
-
+- /api/engine/status
 - /api/engine/ws-status
-  * WS kline buffer 길이(각 TF) / orderbook 존재 / bestBid/bestAsk / ob_age_ms
-
 - /api/engine/latency
-  * 최근 N분 간 이벤트 기반 latency(있다면) + DB query latency(항상)
+
+WebSocket
+--------------------------------------------------------
+- /ws/dashboard
 
 상태 분류
 --------------------------------------------------------
@@ -30,6 +31,8 @@ STRICT · NO-FALLBACK
 --------------------------------------------------------
 - DB 조회 실패/스키마 불일치 등은 즉시 예외(대시보드 healthz도 fail-fast)
 - 민감정보(DB URL/키 등)는 출력 금지
+- 잘못된 query parameter 는 즉시 예외
+- 조용한 continue / 자동 보정 금지
 
 변경 이력
 --------------------------------------------------------
@@ -46,6 +49,9 @@ STRICT · NO-FALLBACK
      - /api/engine/health
      - /api/engine/ws-status
      - /api/engine/latency
+  2) Dashboard WebSocket 엔드포인트 추가:
+     - /ws/dashboard
+  3) Decision / Error / Position / Performance / System API 추가
 ========================================================
 """
 
@@ -54,7 +60,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -72,6 +78,26 @@ from broadcast.dashboard_metrics import (
     get_recent_trades,
     get_summary,
 )
+from broadcast.dashboard_ws import dashboard_ws_endpoint
+from services.decision_service import get_latest_decision, get_recent_decisions
+from services.error_monitor import (
+    get_latest_error_event,
+    get_recent_error_counts,
+    get_recent_error_events,
+)
+from services.performance_service import (
+    get_drawdown_curve,
+    get_equity_curve,
+    get_performance_bundle,
+    get_performance_summary,
+    get_daily_pnl_series,
+)
+from services.position_service import (
+    get_latest_position,
+    get_open_position,
+    get_recent_positions,
+)
+from services.system_monitor import get_latest_watchdog_snapshot, get_system_status_snapshot
 
 # OPTIONAL: 엔진이 같은 런타임에 있으면 WS 버퍼 상태까지 제공 가능
 try:
@@ -99,6 +125,50 @@ app.add_middleware(
 
 
 # =====================================================
+# Strict helpers
+# =====================================================
+
+def _require_positive_int(value: Any, name: str, *, max_value: Optional[int] = None) -> int:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be int, bool not allowed (STRICT)")
+    try:
+        iv = int(value)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
+    if iv <= 0:
+        raise RuntimeError(f"{name} must be > 0 (STRICT)")
+    if max_value is not None and iv > max_value:
+        raise RuntimeError(f"{name} must be <= {max_value} (STRICT)")
+    return iv
+
+
+def _require_nonempty_str(value: Any, name: str) -> str:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} must be str (STRICT), got={type(value).__name__}")
+    s = value.strip()
+    if not s:
+        raise RuntimeError(f"{name} must not be empty (STRICT)")
+    return s
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    s = _require_nonempty_str(symbol, "symbol").replace("-", "").replace("/", "").upper()
+    if not s:
+        raise RuntimeError("symbol normalized empty (STRICT)")
+    return s
+
+
+def _normalize_optional_event_type(event_type: Optional[str]) -> Optional[str]:
+    if event_type is None:
+        return None
+    return _require_nonempty_str(event_type, "event_type").upper()
+
+
+# =====================================================
 # Pages
 # =====================================================
 
@@ -109,13 +179,27 @@ def dashboard_page(request: Request) -> HTMLResponse:
 
 
 # =====================================================
+# WebSocket
+# =====================================================
+
+@app.websocket("/ws/dashboard")
+async def ws_dashboard(websocket: WebSocket) -> None:
+    await dashboard_ws_endpoint(websocket)
+
+
+# =====================================================
 # Base health
 # =====================================================
 
 def _db_latency_ms(db: Session) -> int:
     t0 = time.perf_counter()
-    db.execute(text("SELECT 1"))
-    return int((time.perf_counter() - t0) * 1000)
+    result = db.execute(text("SELECT 1")).scalar()
+    if result != 1:
+        raise RuntimeError("SELECT 1 failed (STRICT)")
+    latency_ms = int((time.perf_counter() - t0) * 1000.0)
+    if latency_ms < 0:
+        raise RuntimeError("db latency must be >= 0 (STRICT)")
+    return latency_ms
 
 
 @app.get("/healthz")
@@ -127,7 +211,7 @@ def health_check(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 
 # =====================================================
-# Summary / PnL
+# Summary / PnL (legacy compatibility)
 # =====================================================
 
 @app.get("/api/summary")
@@ -136,8 +220,12 @@ def api_summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 
 @app.get("/api/daily-pnl")
-def api_daily_pnl(days: int = 30, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    return {"days": days, "items": get_daily_pnl(db, days=days)}
+def api_daily_pnl(
+    days: int = Query(default=30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_days = _require_positive_int(days, "days", max_value=365)
+    return {"days": normalized_days, "items": get_daily_pnl(db, days=normalized_days)}
 
 
 # =====================================================
@@ -148,7 +236,7 @@ def _map_trade_type(is_auto: bool) -> str:
     return "자동" if is_auto else "수동"
 
 
-def _map_regime_label(strategy: str | None) -> str:
+def _map_regime_label(strategy: Optional[str]) -> str:
     if not strategy:
         return "기타"
     s = strategy.upper()
@@ -161,7 +249,7 @@ def _map_regime_label(strategy: str | None) -> str:
     return "기타"
 
 
-def _map_side_label(side: str | None) -> str:
+def _map_side_label(side: Optional[str]) -> str:
     if not side:
         return ""
     s = side.upper()
@@ -172,7 +260,7 @@ def _map_side_label(side: str | None) -> str:
     return s
 
 
-def _map_close_reason_label(reason: str | None) -> str:
+def _map_close_reason_label(reason: Optional[str]) -> str:
     if not reason:
         return "기타"
     r = reason.lower()
@@ -190,8 +278,12 @@ def _map_close_reason_label(reason: str | None) -> str:
 # =====================================================
 
 @app.get("/api/trades/recent")
-def api_recent_trades(limit: int = 50, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    trades: List[Dict[str, Any]] = get_recent_trades(db, limit=limit)
+def api_recent_trades(
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=500)
+    trades: List[Dict[str, Any]] = get_recent_trades(db, limit=normalized_limit)
 
     enriched: List[Dict[str, Any]] = []
     for t in trades:
@@ -215,7 +307,7 @@ def api_recent_trades(limit: int = 50, db: Session = Depends(get_db)) -> Dict[st
         )
         enriched.append(item)
 
-    return {"limit": limit, "items": enriched}
+    return {"limit": normalized_limit, "items": enriched}
 
 
 # =====================================================
@@ -224,13 +316,20 @@ def api_recent_trades(limit: int = 50, db: Session = Depends(get_db)) -> Dict[st
 
 @app.get("/api/entry-scores/recent")
 def api_recent_entry_scores(
-    limit: int = 300,
+    limit: int = Query(default=300, ge=1, le=1000),
     include_test: bool = False,
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    scores = get_recent_entry_scores(db, limit=limit, include_test=include_test)
+    normalized_limit = _require_positive_int(limit, "limit", max_value=1000)
+    scores = get_recent_entry_scores(db, limit=normalized_limit, include_test=bool(include_test))
     labels, counts = build_entry_score_hist(scores)
-    return {"limit": limit, "include_test": include_test, "items": scores, "hist_labels": labels, "hist_counts": counts}
+    return {
+        "limit": normalized_limit,
+        "include_test": bool(include_test),
+        "items": scores,
+        "hist_labels": labels,
+        "hist_counts": counts,
+    }
 
 
 # =====================================================
@@ -238,22 +337,221 @@ def api_recent_entry_scores(
 # =====================================================
 
 @app.get("/api/events/skip-reasons")
-def api_skip_reasons(days: int = 7, limit: int = 15, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    return {"days": days, "limit": limit, "items": events_skip_reason_top(db, days=days, limit=limit)}
+def api_skip_reasons(
+    days: int = Query(default=7, ge=1, le=365),
+    limit: int = Query(default=15, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_days = _require_positive_int(days, "days", max_value=365)
+    normalized_limit = _require_positive_int(limit, "limit", max_value=100)
+    return {
+        "days": normalized_days,
+        "limit": normalized_limit,
+        "items": events_skip_reason_top(db, days=normalized_days, limit=normalized_limit),
+    }
 
 
 @app.get("/api/events/skip-hourly")
-def api_skip_hourly(days: int = 7, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    return {"days": days, "items": events_skip_hourly(db, days=days)}
+def api_skip_hourly(
+    days: int = Query(default=7, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_days = _require_positive_int(days, "days", max_value=365)
+    return {"days": normalized_days, "items": events_skip_hourly(db, days=normalized_days)}
 
 
 @app.get("/api/events/recent")
-def api_events_recent(limit: int = 200, event_type: str | None = None, db: Session = Depends(get_db)) -> Dict[str, Any]:
-    return {"limit": limit, "event_type": event_type, "items": events_recent(db, limit=limit, event_type=event_type)}
+def api_events_recent(
+    limit: int = Query(default=200, ge=1, le=1000),
+    event_type: Optional[str] = None,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=1000)
+    normalized_event_type = _normalize_optional_event_type(event_type)
+    return {
+        "limit": normalized_limit,
+        "event_type": normalized_event_type,
+        "items": events_recent(db, limit=normalized_limit, event_type=normalized_event_type),
+    }
 
 
 # =====================================================
-# Engine Watchdog (Dashboard polling)
+# Decision
+# =====================================================
+
+@app.get("/api/decision/latest")
+def api_decision_latest(
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    return get_latest_decision(db, include_test=bool(include_test))
+
+
+@app.get("/api/decision/recent")
+def api_decision_recent(
+    limit: int = Query(default=50, ge=1, le=500),
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=500)
+    return {
+        "limit": normalized_limit,
+        "include_test": bool(include_test),
+        "items": get_recent_decisions(db, limit=normalized_limit, include_test=bool(include_test)),
+    }
+
+
+# =====================================================
+# Error monitor
+# =====================================================
+
+@app.get("/api/errors/latest")
+def api_errors_latest(
+    event_type: Optional[str] = None,
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_event_type = _normalize_optional_event_type(event_type)
+    return get_latest_error_event(db, event_type=normalized_event_type, include_test=bool(include_test))
+
+
+@app.get("/api/errors/recent")
+def api_errors_recent(
+    limit: int = Query(default=100, ge=1, le=1000),
+    event_type: Optional[str] = None,
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=1000)
+    normalized_event_type = _normalize_optional_event_type(event_type)
+    return {
+        "limit": normalized_limit,
+        "event_type": normalized_event_type,
+        "include_test": bool(include_test),
+        "items": get_recent_error_events(
+            db,
+            limit=normalized_limit,
+            event_type=normalized_event_type,
+            include_test=bool(include_test),
+        ),
+    }
+
+
+@app.get("/api/errors/counts")
+def api_errors_counts(
+    minutes: int = Query(default=10, ge=1, le=1440),
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_minutes = _require_positive_int(minutes, "minutes", max_value=1440)
+    return {
+        "minutes": normalized_minutes,
+        "include_test": bool(include_test),
+        "items": get_recent_error_counts(db, minutes=normalized_minutes, include_test=bool(include_test)),
+    }
+
+
+# =====================================================
+# Position
+# =====================================================
+
+@app.get("/api/position/current")
+def api_position_current(
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    return get_open_position(db, include_test=bool(include_test))
+
+
+@app.get("/api/position/latest")
+def api_position_latest(
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    return get_latest_position(db, include_test=bool(include_test))
+
+
+@app.get("/api/position/recent")
+def api_position_recent(
+    limit: int = Query(default=50, ge=1, le=500),
+    include_test: bool = False,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=500)
+    return {
+        "limit": normalized_limit,
+        "include_test": bool(include_test),
+        "items": get_recent_positions(db, limit=normalized_limit, include_test=bool(include_test)),
+    }
+
+
+# =====================================================
+# Performance
+# =====================================================
+
+@app.get("/api/performance/summary")
+def api_performance_summary(db: Session = Depends(get_db)) -> Dict[str, Any]:
+    return get_performance_summary(db)
+
+
+@app.get("/api/performance/equity-curve")
+def api_performance_equity_curve(
+    limit: int = Query(default=1000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=5000)
+    return {"limit": normalized_limit, "items": get_equity_curve(db, limit=normalized_limit)}
+
+
+@app.get("/api/performance/drawdown-curve")
+def api_performance_drawdown_curve(
+    limit: int = Query(default=1000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_limit = _require_positive_int(limit, "limit", max_value=5000)
+    return {"limit": normalized_limit, "items": get_drawdown_curve(db, limit=normalized_limit)}
+
+
+@app.get("/api/performance/daily-pnl")
+def api_performance_daily_pnl(
+    days: int = Query(default=30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_days = _require_positive_int(days, "days", max_value=365)
+    return {"days": normalized_days, "items": get_daily_pnl_series(db, days=normalized_days)}
+
+
+@app.get("/api/performance/bundle")
+def api_performance_bundle(
+    curve_limit: int = Query(default=1000, ge=1, le=5000),
+    daily_days: int = Query(default=30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_curve_limit = _require_positive_int(curve_limit, "curve_limit", max_value=5000)
+    normalized_daily_days = _require_positive_int(daily_days, "daily_days", max_value=365)
+    return get_performance_bundle(db, curve_limit=normalized_curve_limit, daily_days=normalized_daily_days)
+
+
+# =====================================================
+# System monitor
+# =====================================================
+
+@app.get("/api/system/status")
+def api_system_status(
+    include_test: bool = False,
+    error_window_minutes: int = Query(default=10, ge=1, le=1440),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized_minutes = _require_positive_int(error_window_minutes, "error_window_minutes", max_value=1440)
+    return get_system_status_snapshot(
+        db,
+        include_test=bool(include_test),
+        error_window_minutes=normalized_minutes,
+    )
+
+
+# =====================================================
+# Engine Watchdog / Health
 # =====================================================
 
 def _engine_status_from_signals(
@@ -261,12 +559,8 @@ def _engine_status_from_signals(
     db_latency_ms: int,
     recent_errors: int,
     recent_skips: int,
+    latest_watchdog_reason: str,
 ) -> Tuple[str, List[str]]:
-    """
-    매우 단순/안전한 상태 판정.
-    - FATAL: DB latency 과도 or 최근 ERROR 급증
-    - WARNING: skip 과도 or db 느림
-    """
     reasons: List[str] = []
 
     if db_latency_ms >= 3000:
@@ -276,56 +570,112 @@ def _engine_status_from_signals(
     if recent_skips >= 20:
         reasons.append(f"recent_skips_high:{recent_skips}")
 
-    if db_latency_ms >= 3000 or recent_errors >= 3:
+    watchdog_reason = _require_nonempty_str(latest_watchdog_reason, "latest_watchdog_reason")
+    if watchdog_reason != "ok":
+        reasons.append(f"watchdog:{watchdog_reason}")
+
+    fatal_watchdog_reasons = {"db_lag", "watchdog_internal_error"}
+    warning_watchdog_reasons = {
+        "ws_kline_stale",
+        "ws_orderbook_stale",
+        "orderbook_integrity_fail",
+        "kline_rollback",
+    }
+
+    if db_latency_ms >= 3000 or recent_errors >= 3 or watchdog_reason in fatal_watchdog_reasons:
         return "ENGINE_FATAL", reasons
-    if db_latency_ms >= 1200 or recent_skips >= 20:
+
+    if db_latency_ms >= 1200 or recent_skips >= 20 or watchdog_reason in warning_watchdog_reasons:
         return "ENGINE_WARNING", reasons
+
     return "ENGINE_OK", reasons
 
 
-def _count_recent_events(db: Session, *, minutes: int, event_type: str) -> int:
-    """
-    bt_events 구조를 가정한다.
-    - created_at 또는 ts 컬럼명이 다르면 dashboard_metrics 쪽을 기준으로 맞춰야 한다.
-    여기서는 SQL을 최소로 사용한다.
-    """
-    # created_at이 없다면 ts_utc/ts_ms 등으로 바뀌었을 수 있음.
-    # 현재 프로젝트에서 dashboard_metrics/events_recent가 동작하므로,
-    # 여기서는 events_recent로 안전하게 카운트한다.
-    items = events_recent(db, limit=500, event_type=event_type)
-    if not isinstance(items, list):
-        return 0
-    # events_recent가 이미 최신순으로 반환한다고 가정하고, minutes 필터는 간단히 생략(대신 limit을 보수적으로).
-    # 엄밀히 하려면 events_recent를 minutes 파라미터 지원하도록 확장하는 것이 정석.
-    return len(items)
+def _count_recent_events_strict(db: Session, *, minutes: int, event_type: str) -> int:
+    normalized_minutes = _require_positive_int(minutes, "minutes", max_value=1440)
+    normalized_event_type = _require_nonempty_str(event_type, "event_type").upper()
+
+    sql = text(
+        """
+        SELECT COUNT(*) AS n
+        FROM bt_events
+        WHERE event_type = :event_type
+          AND ts_utc >= now() - (:minutes * INTERVAL '1 minute')
+          AND is_test = FALSE
+        """
+    )
+    row = db.execute(
+        sql,
+        {
+            "event_type": normalized_event_type,
+            "minutes": normalized_minutes,
+        },
+    ).mappings().one_or_none()
+
+    if row is None:
+        raise RuntimeError("recent event count row not found (STRICT)")
+
+    n = row.get("n")
+    if n is None:
+        raise RuntimeError("recent event count is required (STRICT)")
+    if isinstance(n, bool):
+        raise RuntimeError("recent event count must be int (STRICT)")
+    try:
+        iv = int(n)
+    except Exception as exc:
+        raise RuntimeError(f"recent event count must be int (STRICT): {exc}") from exc
+    if iv < 0:
+        raise RuntimeError("recent event count must be >= 0 (STRICT)")
+    return iv
 
 
 def _ws_status(symbol: str, *, min_buf: int, tfs: List[str]) -> Dict[str, Any]:
-    """
-    엔진 런타임에 infra.market_data_ws가 import 가능할 때만 동작.
-    """
     if ws_get_klines_with_volume is None or ws_get_orderbook is None:
-        return {"available": False, "reason": "market_data_ws not importable in dashboard runtime"}
+        return {
+            "available": False,
+            "reason": "market_data_ws not importable in dashboard runtime",
+        }
 
-    out: Dict[str, Any] = {"available": True, "symbol": symbol, "min_buf": int(min_buf), "tfs": list(tfs), "buffers": {}}
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_min_buf = _require_positive_int(min_buf, "min_buf", max_value=100000)
+
+    out: Dict[str, Any] = {
+        "available": True,
+        "symbol": normalized_symbol,
+        "min_buf": normalized_min_buf,
+        "tfs": list(tfs),
+        "buffers": {},
+    }
 
     for tf in tfs:
+        tf_name = _require_nonempty_str(tf, "tf")
         try:
-            buf = ws_get_klines_with_volume(symbol, tf, limit=int(min_buf))
-        except Exception as e:
-            out["buffers"][tf] = {"ok": False, "len": None, "error": f"{type(e).__name__}"}
+            buf = ws_get_klines_with_volume(normalized_symbol, tf_name, limit=normalized_min_buf)
+        except Exception as exc:
+            out["buffers"][tf_name] = {
+                "ok": False,
+                "len": None,
+                "error": type(exc).__name__,
+            }
             continue
 
         if not isinstance(buf, list):
-            out["buffers"][tf] = {"ok": False, "len": None, "error": "non-list"}
+            out["buffers"][tf_name] = {
+                "ok": False,
+                "len": None,
+                "error": "non-list",
+            }
             continue
 
-        out["buffers"][tf] = {"ok": len(buf) >= int(min_buf), "len": len(buf)}
+        out["buffers"][tf_name] = {
+            "ok": len(buf) >= normalized_min_buf,
+            "len": len(buf),
+        }
 
     try:
-        ob = ws_get_orderbook(symbol, limit=5)
-    except Exception as e:
-        out["orderbook"] = {"ok": False, "error": f"{type(e).__name__}"}
+        ob = ws_get_orderbook(normalized_symbol, limit=5)
+    except Exception as exc:
+        out["orderbook"] = {"ok": False, "error": type(exc).__name__}
         return out
 
     if not isinstance(ob, dict) or not ob:
@@ -351,47 +701,47 @@ def _ws_status(symbol: str, *, min_buf: int, tfs: List[str]) -> Dict[str, Any]:
 
 @app.get("/api/engine/ws-status")
 def api_engine_ws_status(
-    symbol: str = "BTCUSDT",
-    min_buf: int = 300,
-    db: Session = Depends(get_db),
+    symbol: str = Query(default="BTCUSDT"),
+    min_buf: int = Query(default=300, ge=1, le=100000),
 ) -> Dict[str, Any]:
-    # TF 목록은 settings를 직접 import하지 않고, dashboard 환경에서만 최소 파라미터로 받는다.
-    # 운영에서는 dashboard 페이지에서 symbol/min_buf만 지정하면 된다.
     tfs = ["1m", "5m", "15m", "1h", "4h"]
-    return _ws_status(symbol, min_buf=int(min_buf), tfs=tfs)
+    return _ws_status(symbol, min_buf=min_buf, tfs=tfs)
 
 
 @app.get("/api/engine/latency")
 def api_engine_latency(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    # 현재 서버 입장에서 확정 가능한 것은 DB latency 뿐이다.
-    # WS/전략 latency는 엔진이 bt_events에 남기거나 별도 health 테이블로 남겨야 정확해진다.
     db_ms = _db_latency_ms(db)
     return {"db_latency_ms": db_ms}
 
 
 @app.get("/api/engine/health")
+@app.get("/api/engine/status")
 def api_engine_health(
-    symbol: str = "BTCUSDT",
+    symbol: str = Query(default="BTCUSDT"),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
+    normalized_symbol = _normalize_symbol(symbol)
     db_ms = _db_latency_ms(db)
-
-    # 최근 이벤트 카운트(보수적으로)
-    recent_errors = _count_recent_events(db, minutes=10, event_type="ERROR")
-    recent_skips = _count_recent_events(db, minutes=10, event_type="SKIP")
+    recent_errors = _count_recent_events_strict(db, minutes=10, event_type="ERROR")
+    recent_skips = _count_recent_events_strict(db, minutes=10, event_type="SKIP")
+    latest_watchdog = get_latest_watchdog_snapshot(db, include_test=False)
+    watchdog_reason = _require_nonempty_str(latest_watchdog.get("reason"), "latest_watchdog.reason")
 
     status, reasons = _engine_status_from_signals(
         db_latency_ms=db_ms,
         recent_errors=recent_errors,
         recent_skips=recent_skips,
+        latest_watchdog_reason=watchdog_reason,
     )
 
     return {
         "status": status,
         "reasons": reasons,
+        "symbol": normalized_symbol,
         "db_latency_ms": db_ms,
         "recent_errors": int(recent_errors),
         "recent_skips": int(recent_skips),
-        "ws_status": _ws_status(symbol, min_buf=300, tfs=["1m", "5m", "15m", "1h", "4h"]),
+        "latest_watchdog": latest_watchdog,
+        "ws_status": _ws_status(normalized_symbol, min_buf=300, tfs=["1m", "5m", "15m", "1h", "4h"]),
         "ts_ms": int(time.time() * 1000),
     }
