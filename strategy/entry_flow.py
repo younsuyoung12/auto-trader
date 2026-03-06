@@ -380,6 +380,10 @@ def build_entry_signal_strict(
         "dynamic_allocation_ratio": float(entry_risk_pct),
         "decision_action": decision.action,
     }
+    meta["entry_score"] = float(decision.entry_score)
+    meta["trend_strength"] = float(decision.trend_strength)
+    meta["orderbook_imbalance"] = float(decision.orderbook_imbalance)
+    meta["spread"] = float(decision.spread)
 
     if micro_score_risk is not None:
         meta["micro_score_risk"] = float(micro_score_risk)
