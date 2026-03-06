@@ -667,7 +667,6 @@ def record_funding_rate(
         fr = FundingRate(
             symbol=sym,
             ts=ts_dt,
-            rate=rate_val,
             raw_json=payload,
             created_at=_utc_now(),
         )
