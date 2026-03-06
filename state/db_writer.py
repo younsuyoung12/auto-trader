@@ -667,7 +667,7 @@ def record_funding_rate(
         fr = FundingRate(
             symbol=sym,
             ts=ts_dt,
-            raw_json=payload,
+            rate=rate_val,
             created_at=_utc_now(),
         )
         session.add(fr)
