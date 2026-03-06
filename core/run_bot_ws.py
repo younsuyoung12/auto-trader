@@ -1164,8 +1164,14 @@ def main() -> None:
     ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
 
     # NEW: Drift detector (기관형 안전장치)
-    drift_detector = DriftDetector(DriftDetectorConfig())
-
+    drift_detector = DriftDetector(
+        DriftDetectorConfig(
+            allocation_abs_jump=0.45,
+            allocation_spike_ratio=3.0,
+            multiplier_abs_jump=0.50,
+            micro_abs_jump=40
+        )
+    )
     # ── DB bootstrap (STRICT) ──
     persisted_peak = _load_equity_peak_bootstrap(SET.symbol)
     if persisted_peak is not None:

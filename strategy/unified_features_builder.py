@@ -30,6 +30,31 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-06 TRADE-GRADE UPGRADE:
+  1) Engine scoring system upgraded to institutional multi-factor model.
+  2) Added regime engines:
+     - volatility_regime
+     - volume_regime
+     - liquidity_regime
+  3) Total engine score now combines:
+     - trend
+     - momentum
+     - structure
+     - timing
+     - orderbook
+     - volatility
+     - volume
+     - liquidity
+  4) This improves detection of:
+     - trend markets
+     - range markets
+     - volatility expansions
+     - liquidity sweeps
+     - volume spikes
+  5) Used by:
+     - run_bot_ws
+     - risk_physics_engine
+     - execution_engine
 - 2026-03-05:
   1) FIX(TRADE-GRADE): 4h.regime missing/invalid로 unified_features가 크래시하던 문제 수정
      - 4h.regime 누락 시 neutral trend_strength=0.5 적용
@@ -125,10 +150,13 @@ _PATTERN_ITEM_KEYS: Tuple[str, ...] = (
 # engine_scores.total 가중치 (합=1.0)
 _TOTAL_WEIGHTS: Dict[str, float] = {
     "trend_4h": 0.15,
-    "momentum_1h": 0.20,
-    "structure_15m": 0.20,
-    "timing_5m": 0.20,
-    "orderbook_micro": 0.25,
+    "momentum_1h": 0.15,
+    "structure_15m": 0.15,
+    "timing_5m": 0.15,
+    "orderbook_micro": 0.15,
+    "volatility_regime": 0.10,
+    "volume_regime": 0.10,
+    "liquidity_regime": 0.05,
 }
 
 _INDICATOR_KEEP_KEYS: Tuple[str, ...] = (
@@ -609,6 +637,172 @@ def _atr_pct_change_from_ohlcv(
     return change_pct
 
 
+def _mean_strict(symbol: str, stage: str, values: Sequence[float], name: str) -> float:
+    if not values:
+        _fail_unified(symbol, stage, f"{name} is empty")
+    total = 0.0
+    for i, v in enumerate(values):
+        fv = _require_float(symbol, stage, v, f"{name}[{i}]")
+        total += fv
+    out = total / float(len(values))
+    if not math.isfinite(out):
+        _fail_unified(symbol, stage, f"{name} mean is not finite")
+    return out
+
+
+def _score_volatility_regime(symbol: str, tf15m: Dict[str, Any], ohlcv20: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
+    stage = "engine_scores.volatility_regime"
+
+    if len(ohlcv20) < 20:
+        _fail_unified(symbol, stage, f"need >=20 candles for volatility_regime (got={len(ohlcv20)})")
+
+    indicators = _require_dict(symbol, stage, tf15m.get("indicators"), "15m.indicators")
+    atr_pct = _require_pct_0_100(symbol, stage, indicators.get("atr_pct"), "15m.indicators.atr_pct")
+
+    highs = [x[2] for x in ohlcv20]
+    lows = [x[3] for x in ohlcv20]
+    closes = [x[4] for x in ohlcv20]
+
+    tr: List[float] = []
+    for i in range(len(ohlcv20)):
+        if i == 0:
+            tr.append(highs[i] - lows[i])
+        else:
+            tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+
+    recent_tr = _mean_strict(symbol, stage, tr[-5:], "volatility.recent_tr")
+    prev_tr = _mean_strict(symbol, stage, tr[-10:-5], "volatility.prev_tr")
+    if prev_tr <= 0.0:
+        _fail_unified(symbol, stage, f"volatility.prev_tr must be > 0 (got={prev_tr})")
+
+    atr_expansion = recent_tr / prev_tr
+
+    recent_range_pct = _mean_strict(
+        symbol,
+        stage,
+        [((h - l) / c) * 100.0 for h, l, c in zip(highs[-5:], lows[-5:], closes[-5:])],
+        "volatility.recent_range_pct",
+    )
+    prev_range_pct = _mean_strict(
+        symbol,
+        stage,
+        [((h - l) / c) * 100.0 for h, l, c in zip(highs[-10:-5], lows[-10:-5], closes[-10:-5])],
+        "volatility.prev_range_pct",
+    )
+    if prev_range_pct <= 0.0:
+        _fail_unified(symbol, stage, f"volatility.prev_range_pct must be > 0 (got={prev_range_pct})")
+
+    range_expansion = recent_range_pct / prev_range_pct
+
+    comp_atr_pct = _clamp((atr_pct / 1.50) * 40.0, 0.0, 40.0)
+    comp_atr_expansion = _clamp((max(atr_expansion - 1.0, 0.0) / 0.80) * 30.0, 0.0, 30.0)
+    comp_range_expansion = _clamp((max(range_expansion - 1.0, 0.0) / 0.80) * 30.0, 0.0, 30.0)
+
+    score = _clamp(comp_atr_pct + comp_atr_expansion + comp_range_expansion, 0.0, 100.0)
+
+    return {
+        "score": score,
+        "components": {
+            "atr_pct": atr_pct,
+            "atr_expansion": atr_expansion,
+            "recent_range_pct": recent_range_pct,
+            "prev_range_pct": prev_range_pct,
+            "range_expansion": range_expansion,
+            "score_atr_pct": comp_atr_pct,
+            "score_atr_expansion": comp_atr_expansion,
+            "score_range_expansion": comp_range_expansion,
+        },
+    }
+
+
+def _score_volume_regime(symbol: str, ohlcv20: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
+    stage = "engine_scores.volume_regime"
+
+    if len(ohlcv20) < 20:
+        _fail_unified(symbol, stage, f"need >=20 candles for volume_regime (got={len(ohlcv20)})")
+
+    volumes = [x[5] for x in ohlcv20]
+    recent_vol = _mean_strict(symbol, stage, volumes[-5:], "volume.recent_vol")
+    base_vol = _mean_strict(symbol, stage, volumes[-20:-5], "volume.base_vol")
+    if base_vol <= 0.0:
+        _fail_unified(symbol, stage, f"volume.base_vol must be > 0 (got={base_vol})")
+
+    volume_ratio = recent_vol / base_vol
+    volume_spike_ratio = max(volumes[-5:]) / base_vol
+
+    comp_ratio = _clamp((max(volume_ratio - 1.0, 0.0) / 2.0) * 60.0, 0.0, 60.0)
+    comp_spike = _clamp((max(volume_spike_ratio - 1.0, 0.0) / 3.0) * 40.0, 0.0, 40.0)
+
+    score = _clamp(comp_ratio + comp_spike, 0.0, 100.0)
+
+    return {
+        "score": score,
+        "components": {
+            "recent_vol": recent_vol,
+            "base_vol": base_vol,
+            "volume_ratio": volume_ratio,
+            "volume_spike_ratio": volume_spike_ratio,
+            "score_ratio": comp_ratio,
+            "score_spike": comp_spike,
+        },
+    }
+
+
+def _score_liquidity_regime(symbol: str, ohlcv20: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
+    stage = "engine_scores.liquidity_regime"
+
+    if len(ohlcv20) < 20:
+        _fail_unified(symbol, stage, f"need >=20 candles for liquidity_regime (got={len(ohlcv20)})")
+
+    body_ratios: List[float] = []
+    wick_ratios: List[float] = []
+    stop_hunt_count = 0
+
+    for i, (_, o, h, l, c, _) in enumerate(ohlcv20[-10:]):
+        candle_stage = f"{stage}.last10[{i}]"
+        rng = h - l
+        if rng <= 0.0:
+            _fail_unified(symbol, candle_stage, f"range must be > 0 (got={rng})")
+
+        body = abs(c - o)
+        body_ratio = body / rng
+        wick_ratio = max(0.0, 1.0 - body_ratio)
+
+        if not math.isfinite(body_ratio) or not math.isfinite(wick_ratio):
+            _fail_unified(symbol, candle_stage, "body_ratio/wick_ratio must be finite")
+
+        body_ratios.append(body_ratio)
+        wick_ratios.append(wick_ratio)
+
+        if wick_ratio >= 0.65 and body_ratio <= 0.25:
+            stop_hunt_count += 1
+
+    avg_body_ratio = _mean_strict(symbol, stage, body_ratios, "liquidity.avg_body_ratio")
+    avg_wick_ratio = _mean_strict(symbol, stage, wick_ratios, "liquidity.avg_wick_ratio")
+    stop_hunt_ratio = stop_hunt_count / 10.0
+
+    if stop_hunt_ratio < 0.0 or stop_hunt_ratio > 1.0:
+        _fail_unified(symbol, stage, f"stop_hunt_ratio out of range [0,1] (got={stop_hunt_ratio})")
+
+    comp_body = _clamp(avg_body_ratio * 100.0 * 0.50, 0.0, 50.0)
+    comp_wick = _clamp((1.0 - avg_wick_ratio) * 100.0 * 0.30, 0.0, 30.0)
+    comp_stop_hunt = _clamp((1.0 - stop_hunt_ratio) * 20.0, 0.0, 20.0)
+
+    score = _clamp(comp_body + comp_wick + comp_stop_hunt, 0.0, 100.0)
+
+    return {
+        "score": score,
+        "components": {
+            "avg_body_ratio": avg_body_ratio,
+            "avg_wick_ratio": avg_wick_ratio,
+            "stop_hunt_ratio": stop_hunt_ratio,
+            "score_body": comp_body,
+            "score_wick": comp_wick,
+            "score_stop_hunt": comp_stop_hunt,
+        },
+    }
+
+
 def _score_trend_4h(symbol: str, tf4h: Dict[str, Any], ohlcv60: List[Tuple[int, float, float, float, float, float]]) -> Dict[str, Any]:
     stage = "engine_scores.trend_4h"
 
@@ -650,11 +844,6 @@ def _score_trend_4h(symbol: str, tf4h: Dict[str, Any], ohlcv60: List[Tuple[int, 
     elif price < ema_slow and ema_fast < ema_slow and structure_bias <= 0:
         direction = "SHORT"
 
-    # ─────────────────────────────────────────────
-    # FIX(2026-03-05): 4h.regime missing → neutral
-    # - regime가 dict가 아니면 neutral trend_strength=0.5 사용
-    # - regime가 dict인데 trend_strength가 누락/비정상이면 기존대로 즉시 예외(STRICT)
-    # ─────────────────────────────────────────────
     regime = tf4h.get("regime")
     regime_missing = not isinstance(regime, dict)
 
@@ -925,11 +1114,14 @@ def _build_engine_scores_strict(
     tf15 = _require_dict(symbol, "engine_scores", timeframes.get("15m"), "timeframes['15m']")
     ohlcv15 = _parse_ohlcv_rows(symbol, "engine_scores", tf15.get("raw_ohlcv_last20"), min_len=20, name="15m.raw_ohlcv_last20")
     structure_15m = _score_structure_15m(symbol, tf15, ohlcv15)
+    volatility_regime = _score_volatility_regime(symbol, tf15, ohlcv15)
 
     tf5 = _require_dict(symbol, "engine_scores", timeframes.get("5m"), "timeframes['5m']")
     ohlcv5 = _parse_ohlcv_rows(symbol, "engine_scores", tf5.get("raw_ohlcv_last20"), min_len=20, name="5m.raw_ohlcv_last20")
     pf5 = _require_dict(symbol, "engine_scores", pattern_features.get("5m"), "pattern_features['5m']")
     timing_5m = _score_timing_5m(symbol, tf5, ohlcv5, pattern_summary, pf5)
+    volume_regime = _score_volume_regime(symbol, ohlcv5)
+    liquidity_regime = _score_liquidity_regime(symbol, ohlcv5)
 
     orderbook_micro = _score_orderbook_micro(symbol, orderbook)
 
@@ -940,6 +1132,9 @@ def _build_engine_scores_strict(
         + float(structure_15m["score"]) * w["structure_15m"]
         + float(timing_5m["score"]) * w["timing_5m"]
         + float(orderbook_micro["score"]) * w["orderbook_micro"]
+        + float(volatility_regime["score"]) * w["volatility_regime"]
+        + float(volume_regime["score"]) * w["volume_regime"]
+        + float(liquidity_regime["score"]) * w["liquidity_regime"]
     )
     total_score = _clamp(total_score, 0.0, 100.0)
 
@@ -949,6 +1144,9 @@ def _build_engine_scores_strict(
         "structure_15m": structure_15m,
         "timing_5m": timing_5m,
         "orderbook_micro": orderbook_micro,
+        "volatility_regime": volatility_regime,
+        "volume_regime": volume_regime,
+        "liquidity_regime": liquidity_regime,
         "total": {"score": total_score, "weights": dict(w)},
     }
 
@@ -1081,9 +1279,6 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(microstructure, dict) or not microstructure:
         _fail_unified(sym, "microstructure", "microstructure snapshot must be non-empty dict (STRICT)")
 
-    # NEW: Invariant Guard(최소) — micro_score_risk + settings(tp/sl) 기반 검증
-    # NOTE: unified_features는 아직 '최종 매매 신호'가 아니므로 risk_pct는 더미(상수)로만 검증한다.
-    #       실제 risk_pct는 run_bot_ws → risk_physics → execution_engine에서 다시 STRICT 검증된다.
     if "micro_score_risk" not in microstructure:
         _fail_unified(sym, "microstructure", "micro_score_risk missing (STRICT)")
     msr = _require_float(sym, "microstructure", microstructure.get("micro_score_risk"), "micro_score_risk")
