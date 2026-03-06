@@ -40,14 +40,21 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-06:
+  1) funding_current 계산 직후 bt_funding_rates DB 기록 로직 추가
+  2) state.db_writer.record_funding_rate 호출용 STRICT 어댑터 추가
+  3) record_funding_rate 시그니처 차이(ts_ms/ts, funding_rate/rate 등) 명시 처리
+  4) 기존 계산/캐시/DI/z-score 로직 변경 없음
 - 2026-03-03:
   1) 신규 생성: Funding/OI/LSR 수집 + z-score + DI + micro_score 산출(STRICT)
 ========================================================
 """
 
+import inspect
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution.exchange_api import (
@@ -57,6 +64,7 @@ from execution.exchange_api import (
     get_open_interest,
     get_open_interest_hist,
 )
+from state.db_writer import record_funding_rate
 
 # -----------------------------------------------------------------------------
 # Constants / Policy
@@ -103,6 +111,10 @@ _CACHE: Dict[Tuple[str, str, int], Tuple[float, MicrostructureSnapshot]] = {}
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _fail(stage: str, reason: str, exc: Optional[BaseException] = None) -> None:
@@ -259,6 +271,63 @@ def _compute_micro_score_risk(distortion_index: float) -> float:
     return score
 
 
+def _persist_funding_rate_strict(symbol: str, funding_rate: float) -> None:
+    """
+    state.db_writer.record_funding_rate 시그니처 차이를 명시적으로 검사해
+    지원 가능한 인자만 전달한다.
+    - 숨은 폴백 금지: 필요한 인자를 구성할 수 없으면 즉시 예외
+    """
+    s = _require_symbol(symbol)
+    rate = _require_float("funding.persist.rate", funding_rate)
+    ts_ms = _now_ms()
+    ts_dt = _utc_now()
+    payload = {
+        "source": "premiumIndex",
+        "engine": "microstructure_engine",
+        "symbol": s,
+        "ts_ms": ts_ms,
+        "funding_rate": rate,
+    }
+
+    try:
+        sig = inspect.signature(record_funding_rate)
+    except Exception as e:
+        _fail("funding.persist", "record_funding_rate signature inspect failed", e)
+
+    params = sig.parameters
+    kwargs: Dict[str, Any] = {}
+
+    if "symbol" in params:
+        kwargs["symbol"] = s
+    else:
+        _fail("funding.persist", "record_funding_rate missing required param: symbol")
+
+    if "funding_rate" in params:
+        kwargs["funding_rate"] = rate
+    elif "rate" in params:
+        kwargs["rate"] = rate
+    else:
+        _fail("funding.persist", "record_funding_rate missing funding rate param (funding_rate/rate)")
+
+    if "ts_ms" in params:
+        kwargs["ts_ms"] = ts_ms
+    elif "ts" in params:
+        kwargs["ts"] = ts_dt
+
+    if "raw_json" in params:
+        kwargs["raw_json"] = payload
+    elif "payload" in params:
+        kwargs["payload"] = payload
+    elif "extra_json" in params:
+        kwargs["extra_json"] = payload
+
+    try:
+        record_funding_rate(**kwargs)
+    except Exception as e:
+        keys = ",".join(sorted(kwargs.keys()))
+        _fail("funding.persist", f"record_funding_rate failed (kwargs={keys})", e)
+
+
 def build_microstructure_snapshot(
     symbol: str,
     *,
@@ -325,6 +394,8 @@ def build_microstructure_snapshot_obj(
 
     # --- Funding ---
     funding_current = _require_float("funding_rate", get_current_funding_rate(s))
+    _persist_funding_rate_strict(s, funding_current)
+
     funding_hist_rows = get_funding_rate_history(s, limit=max(lb, 2))
     funding_series = _extract_funding_series(s, funding_hist_rows, lookback=min(lb, len(funding_hist_rows)))
     funding_z = _zscore_strict(funding_current, funding_series, stage="funding.z")

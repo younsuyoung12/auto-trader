@@ -402,9 +402,8 @@ class FundingRate(Base):
     symbol = Column(String(32), nullable=False, index=True)
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
-    rate = Column(Numeric(24, 8), nullable=False)
-    mark_price = Column(Numeric(24, 8), nullable=True)
-
+    rate = Column("funding_rate", Numeric(24, 8), nullable=False)
+    
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
