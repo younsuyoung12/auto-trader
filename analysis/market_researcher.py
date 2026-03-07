@@ -8,20 +8,26 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 역할:
 - Binance USDⓈ-M Futures 공개 시장 데이터를 해석해 외부 시장 분석 리포트를 생성한다.
 - 내부 DB 분석과 분리된 "외부 시장 분석(Market Research)" 레이어를 담당한다.
+- AWS에서 단독 실행 시 market_features / trade_context_snapshots 를 주기적으로 적재한다.
 - 주문/포지션/리스크 실행 로직에는 관여하지 않는다.
 
 절대 원칙:
 - STRICT · NO-FALLBACK
 - settings.py(SSOT) 외 환경변수 직접 접근 금지
+- state/db_core.py 외 DB 직접 연결 금지
 - print() 금지 / logging 사용
 - 데이터 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
 - Binance 공개 시장 데이터만 사용
+- 예외 삼키기 금지
+- DB 적재 실패 시 즉시 예외 전파
 
 변경 이력:
 2026-03-07
 - 신규 생성
 - Binance 외부 시장 구조 분석기 추가
+- AWS 실행용 DB 적재 루프 추가
+- market_features / trade_context_snapshots 적재 기능 추가
 ========================================================
 """
 
@@ -29,10 +35,13 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from statistics import pstdev
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
+
+from sqlalchemy import text
 
 from analysis.binance_market_fetcher import (
     BinanceForceOrder,
@@ -41,6 +50,8 @@ from analysis.binance_market_fetcher import (
     BinanceMarketSnapshot,
     BinanceRatioPoint,
 )
+from settings import SETTINGS
+from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -83,9 +94,59 @@ class MarketResearchReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class PersistableMarketFeature:
+    ts_ms: int
+    symbol: str
+    timeframe: str
+    close_price: Decimal
+    spread_bps: Decimal
+    orderbook_imbalance: Decimal
+    pattern_score: Decimal
+    volatility_score: Decimal
+    trend_score: Decimal
+    market_regime: str
+    liquidity_score: Decimal
+
+
+@dataclass(frozen=True)
+class PersistableTradeContext:
+    ts_ms: int
+    symbol: str
+    price: Decimal
+    spread_bps: Decimal
+    pattern_score: Decimal
+    market_regime: str
+    orderbook_imbalance: Decimal
+    funding_rate: Decimal
+    open_interest: Decimal
+    long_short_ratio: Decimal
+
+
+@dataclass(frozen=True)
+class ResearchSyncResult:
+    symbol: str
+    ts_ms: int
+    timeframe: str
+    market_features_inserted: bool
+    trade_context_inserted: bool
+    market_regime: str
+    trend_score: Decimal
+    volatility_score: Decimal
+    liquidity_score: Decimal
+    pattern_score: Decimal
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class MarketResearcher:
     """
     Binance 공개 선물 데이터를 기반으로 외부 시장 구조 분석 수행.
+
+    기능:
+    1) 외부 시장 분석 리포트 생성
+    2) AWS worker 모드에서 market_features / trade_context_snapshots 적재
 
     출력:
     - 정량 지표
@@ -96,6 +157,13 @@ class MarketResearcher:
 
     def __init__(self) -> None:
         self._fetcher = BinanceMarketFetcher()
+
+        self._symbol = self._require_str_setting("ANALYST_MARKET_SYMBOL")
+        self._db_market_timeframe = self._require_str_setting("ANALYST_DB_MARKET_TIMEFRAME")
+        self._worker_interval_sec = self._require_int_setting("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC")
+
+        if self._worker_interval_sec <= 0:
+            raise RuntimeError("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC must be > 0")
 
     # ========================================================
     # Public API
@@ -116,6 +184,357 @@ class MarketResearcher:
     def build_prompt_context(self) -> Dict[str, Any]:
         report = self.run()
         return report.dashboard_payload
+
+    def sync_once(self) -> ResearchSyncResult:
+        report = self.run()
+        market_feature = self._build_persistable_market_feature(report)
+        trade_context = self._build_persistable_trade_context(report, market_feature.pattern_score)
+
+        with get_session() as session:
+            self._require_table_exists_or_raise(session, "market_features")
+            self._require_table_exists_or_raise(session, "trade_context_snapshots")
+
+            market_features_inserted = self._upsert_market_feature(session, market_feature)
+            trade_context_inserted = self._upsert_trade_context_snapshot(session, trade_context)
+            session.commit()
+
+        result = ResearchSyncResult(
+            symbol=market_feature.symbol,
+            ts_ms=market_feature.ts_ms,
+            timeframe=market_feature.timeframe,
+            market_features_inserted=market_features_inserted,
+            trade_context_inserted=trade_context_inserted,
+            market_regime=market_feature.market_regime,
+            trend_score=market_feature.trend_score,
+            volatility_score=market_feature.volatility_score,
+            liquidity_score=market_feature.liquidity_score,
+            pattern_score=market_feature.pattern_score,
+        )
+
+        logger.info(
+            "Market research sync completed: symbol=%s ts_ms=%s timeframe=%s mf_inserted=%s tc_inserted=%s regime=%s",
+            result.symbol,
+            result.ts_ms,
+            result.timeframe,
+            result.market_features_inserted,
+            result.trade_context_inserted,
+            result.market_regime,
+        )
+        return result
+
+    def run_forever(self) -> None:
+        logger.info(
+            "Market research worker started: symbol=%s timeframe=%s interval_sec=%s",
+            self._symbol,
+            self._db_market_timeframe,
+            self._worker_interval_sec,
+        )
+
+        while True:
+            t0 = time.time()
+            self.sync_once()
+            elapsed = time.time() - t0
+            sleep_sec = self._worker_interval_sec - elapsed
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+    # ========================================================
+    # Persistence builders
+    # ========================================================
+
+    def _build_persistable_market_feature(
+        self,
+        report: MarketResearchReport,
+    ) -> PersistableMarketFeature:
+        trend_score = self._build_trend_score(report)
+        volatility_score = self._build_volatility_score(report)
+        liquidity_score = self._build_liquidity_score(report)
+        pattern_score = self._build_pattern_score(
+            report=report,
+            trend_score=trend_score,
+            volatility_score=volatility_score,
+            liquidity_score=liquidity_score,
+        )
+        market_regime = self._normalize_regime_for_db(report.market_regime)
+
+        return PersistableMarketFeature(
+            ts_ms=report.as_of_ms,
+            symbol=report.symbol,
+            timeframe=self._db_market_timeframe,
+            close_price=report.price,
+            spread_bps=report.spread_bps,
+            orderbook_imbalance=report.orderbook_imbalance,
+            pattern_score=pattern_score,
+            volatility_score=volatility_score,
+            trend_score=trend_score,
+            market_regime=market_regime,
+            liquidity_score=liquidity_score,
+        )
+
+    def _build_persistable_trade_context(
+        self,
+        report: MarketResearchReport,
+        pattern_score: Decimal,
+    ) -> PersistableTradeContext:
+        return PersistableTradeContext(
+            ts_ms=report.as_of_ms,
+            symbol=report.symbol,
+            price=report.price,
+            spread_bps=report.spread_bps,
+            pattern_score=pattern_score,
+            market_regime=self._normalize_regime_for_db(report.market_regime),
+            orderbook_imbalance=report.orderbook_imbalance,
+            funding_rate=report.funding_rate,
+            open_interest=report.open_interest,
+            long_short_ratio=report.global_long_short_ratio,
+        )
+
+    # ========================================================
+    # DB persistence
+    # ========================================================
+
+    def _require_table_exists_or_raise(self, session: Any, table_name: str) -> None:
+        if not isinstance(table_name, str) or not table_name.strip():
+            raise RuntimeError("table_name must be non-empty")
+
+        row = session.execute(
+            text("SELECT to_regclass(:name) AS regname"),
+            {"name": table_name.strip()},
+        ).mappings().one_or_none()
+
+        if row is None or row.get("regname") is None:
+            raise RuntimeError(f"Required table not found: {table_name}")
+
+    def _upsert_market_feature(
+        self,
+        session: Any,
+        item: PersistableMarketFeature,
+    ) -> bool:
+        existing = session.execute(
+            text(
+                """
+                SELECT 1
+                FROM market_features
+                WHERE symbol = :symbol
+                  AND timeframe = :timeframe
+                  AND ts_ms = :ts_ms
+                LIMIT 1
+                """
+            ),
+            {
+                "symbol": item.symbol,
+                "timeframe": item.timeframe,
+                "ts_ms": item.ts_ms,
+            },
+        ).scalar_one_or_none()
+
+        if existing is not None:
+            return False
+
+        session.execute(
+            text(
+                """
+                INSERT INTO market_features (
+                    ts_ms,
+                    symbol,
+                    timeframe,
+                    close_price,
+                    spread_bps,
+                    orderbook_imbalance,
+                    pattern_score,
+                    volatility_score,
+                    trend_score,
+                    market_regime,
+                    liquidity_score
+                )
+                VALUES (
+                    :ts_ms,
+                    :symbol,
+                    :timeframe,
+                    :close_price,
+                    :spread_bps,
+                    :orderbook_imbalance,
+                    :pattern_score,
+                    :volatility_score,
+                    :trend_score,
+                    :market_regime,
+                    :liquidity_score
+                )
+                """
+            ),
+            {
+                "ts_ms": item.ts_ms,
+                "symbol": item.symbol,
+                "timeframe": item.timeframe,
+                "close_price": item.close_price,
+                "spread_bps": item.spread_bps,
+                "orderbook_imbalance": item.orderbook_imbalance,
+                "pattern_score": item.pattern_score,
+                "volatility_score": item.volatility_score,
+                "trend_score": item.trend_score,
+                "market_regime": item.market_regime,
+                "liquidity_score": item.liquidity_score,
+            },
+        )
+        return True
+
+    def _upsert_trade_context_snapshot(
+        self,
+        session: Any,
+        item: PersistableTradeContext,
+    ) -> bool:
+        existing = session.execute(
+            text(
+                """
+                SELECT 1
+                FROM trade_context_snapshots
+                WHERE symbol = :symbol
+                  AND ts_ms = :ts_ms
+                LIMIT 1
+                """
+            ),
+            {
+                "symbol": item.symbol,
+                "ts_ms": item.ts_ms,
+            },
+        ).scalar_one_or_none()
+
+        if existing is not None:
+            return False
+
+        session.execute(
+            text(
+                """
+                INSERT INTO trade_context_snapshots (
+                    ts_ms,
+                    symbol,
+                    price,
+                    spread_bps,
+                    pattern_score,
+                    market_regime,
+                    orderbook_imbalance,
+                    funding_rate,
+                    open_interest,
+                    long_short_ratio
+                )
+                VALUES (
+                    :ts_ms,
+                    :symbol,
+                    :price,
+                    :spread_bps,
+                    :pattern_score,
+                    :market_regime,
+                    :orderbook_imbalance,
+                    :funding_rate,
+                    :open_interest,
+                    :long_short_ratio
+                )
+                """
+            ),
+            {
+                "ts_ms": item.ts_ms,
+                "symbol": item.symbol,
+                "price": item.price,
+                "spread_bps": item.spread_bps,
+                "pattern_score": item.pattern_score,
+                "market_regime": item.market_regime,
+                "orderbook_imbalance": item.orderbook_imbalance,
+                "funding_rate": item.funding_rate,
+                "open_interest": item.open_interest,
+                "long_short_ratio": item.long_short_ratio,
+            },
+        )
+        return True
+
+    # ========================================================
+    # Internal score builders for DB
+    # ========================================================
+
+    def _build_trend_score(self, report: MarketResearchReport) -> Decimal:
+        price_component = self._clamp(
+            report.price_change_pct / Decimal("3.0"),
+            Decimal("-1"),
+            Decimal("1"),
+        )
+        funding_component = self._clamp(
+            report.funding_rate / Decimal("0.0015"),
+            Decimal("-1"),
+            Decimal("1"),
+        )
+        oi_component = self._clamp(
+            report.open_interest_change_pct / Decimal("10.0"),
+            Decimal("-1"),
+            Decimal("1"),
+        )
+
+        score = (
+            price_component * Decimal("0.60")
+            + funding_component * Decimal("0.15")
+            + oi_component * Decimal("0.25")
+        )
+        return self._clamp(score, Decimal("-1"), Decimal("1"))
+
+    def _build_volatility_score(self, report: MarketResearchReport) -> Decimal:
+        score = report.realized_volatility_pct / Decimal("3.0")
+        return self._clamp(score, Decimal("0"), Decimal("1"))
+
+    def _build_liquidity_score(self, report: MarketResearchReport) -> Decimal:
+        if report.spread_bps < Decimal("0"):
+            raise RuntimeError("spread_bps must be >= 0")
+        raw = Decimal("1") - (report.spread_bps / Decimal("10.0"))
+        return self._clamp(raw, Decimal("0"), Decimal("1"))
+
+    def _build_pattern_score(
+        self,
+        *,
+        report: MarketResearchReport,
+        trend_score: Decimal,
+        volatility_score: Decimal,
+        liquidity_score: Decimal,
+    ) -> Decimal:
+        range_width = report.resistance_price - report.support_price
+        if range_width <= Decimal("0"):
+            raise RuntimeError("resistance_price must be > support_price")
+
+        location = (report.price - report.support_price) / range_width
+        location_clamped = self._clamp(location, Decimal("0"), Decimal("1"))
+        center_bonus = Decimal("1") - (abs(location_clamped - Decimal("0.5")) * Decimal("2"))
+        center_bonus = self._clamp(center_bonus, Decimal("0"), Decimal("1"))
+
+        imbalance_penalty = self._clamp(abs(report.orderbook_imbalance), Decimal("0"), Decimal("1"))
+        trend_strength = self._clamp(abs(trend_score), Decimal("0"), Decimal("1"))
+        volatility_penalty = self._clamp(volatility_score, Decimal("0"), Decimal("1"))
+
+        score = (
+            trend_strength * Decimal("0.45")
+            + liquidity_score * Decimal("0.20")
+            + center_bonus * Decimal("0.20")
+            + (Decimal("1") - imbalance_penalty) * Decimal("0.10")
+            + (Decimal("1") - volatility_penalty) * Decimal("0.05")
+        )
+        return self._clamp(score, Decimal("0"), Decimal("1"))
+
+    def _normalize_regime_for_db(self, regime: str) -> str:
+        normalized = regime.strip().lower()
+        mapping = {
+            "trend_expansion": "TREND_EXPANSION",
+            "squeeze": "SQUEEZE",
+            "range": "RANGE",
+            "crowded_directional": "CROWDED_DIRECTIONAL",
+            "transitional": "TRANSITIONAL",
+        }
+        if normalized not in mapping:
+            raise RuntimeError(f"Unexpected market_regime for DB normalization: {regime}")
+        return mapping[normalized]
+
+    def _clamp(self, value: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
+        if lower > upper:
+            raise RuntimeError("Invalid clamp bounds")
+        if value < lower:
+            return lower
+        if value > upper:
+            return upper
+        return value
 
     # ========================================================
     # Core analysis
@@ -770,8 +1189,24 @@ class MarketResearcher:
         return self._map_or_raise(mapping, value, "liquidation_pressure")
 
     # ========================================================
-    # Utility
+    # Settings / utility
     # ========================================================
+
+    def _require_str_setting(self, name: str) -> str:
+        value = getattr(SETTINGS, name, None)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"Missing or invalid required setting: {name}")
+        return value.strip()
+
+    def _require_int_setting(self, name: str) -> int:
+        value = getattr(SETTINGS, name, None)
+        if isinstance(value, bool):
+            raise RuntimeError(f"Invalid bool value for integer setting: {name}")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Missing or invalid required int setting: {name}") from exc
+        return parsed
 
     def _fmt_decimal(self, value: Decimal, scale: int) -> str:
         if scale < 0:
@@ -782,3 +1217,12 @@ class MarketResearcher:
         if value not in mapping:
             raise RuntimeError(f"Unexpected {field_name} value: {value}")
         return mapping[value]
+
+
+def main() -> None:
+    researcher = MarketResearcher()
+    researcher.run_forever()
+
+
+if __name__ == "__main__":
+    main()
