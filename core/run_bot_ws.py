@@ -1069,6 +1069,27 @@ def main() -> None:
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
 
+    # -----------------------------------------
+    # Market Research Worker (external market)
+    # -----------------------------------------
+    try:
+        researcher = MarketResearcher()
+
+        def _research_loop():
+           researcher.run_forever()
+
+        threading.Thread(
+            target=_research_loop,
+            name="market-researcher",
+            daemon=True,
+        ).start()
+
+        log("[BOOT] market_researcher thread started")
+
+    except Exception as e:
+        log(f"[BOOT][FATAL] market_researcher start failed: {e}")
+        raise
+
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     LAST_EXCHANGE_SYNC_TS = time.time()
 
