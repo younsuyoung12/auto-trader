@@ -375,7 +375,7 @@ class Settings:
     analyst_event_lookback_limit: int = 300
     analyst_include_external_market: bool = True
 
-    analyst_auto_report_market_interval_sec: int = 300
+    analyst_auto_report_market_interval_sec: int = 60
     analyst_auto_report_system_interval_sec: int = 1800
     analyst_auto_report_persist: bool = True
     analyst_auto_report_notify: bool = False
