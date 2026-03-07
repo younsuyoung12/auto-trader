@@ -1,54 +1,77 @@
 """
 ========================================================
-state/db_writer.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+FILE: state/db_writer.py
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 설계 원칙:
 - Render Postgres(TRADER_DB_URL)만 사용한다.
 - DB 쓰기 실패 시 예외를 반드시 전파한다.
 - 폴백/조용한 return 금지.
 - 입력값은 fail-fast 검증한다.
+- bt_trades / bt_trade_snapshots / bt_trade_exit_snapshots 쓰기 경로는
+  ORM 매핑과 실제 저장 필드를 엄격히 정합시킨다.
+- 분석 호환 필드(status/opened_ts_ms/closed_ts_ms/realized_pnl/exit_reason)는
+  저장 시점에 즉시 기록한다. 사후 보정/백필에 의존하지 않는다.
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-07 (TRADE-GRADE, STRICT WRITE-PATH FIX)
+  1) bt_trades 분석 호환 필드 저장 보강:
+     - OPEN 시 즉시 기록:
+       * opened_ts_ms
+       * status="OPEN"
+     - CLOSE 시 즉시 기록:
+       * closed_ts_ms
+       * status="CLOSED"
+       * realized_pnl
+       * exit_reason
+  2) TradeORM 분석 호환 필드 매핑 검증 추가:
+     - ORM 모델에 컬럼 매핑이 없으면 즉시 예외
+     - 조용한 속성 부착/비영속 상태 금지
+  3) timestamp(ms)는 timezone-aware datetime으로부터 엄격 변환:
+     - tz-naive 금지
+     - 0 이하 epoch 금지
+
 - 2026-03-06:
   1) record_funding_rate를 현재 bt_funding_rates 스키마와 정합화
   2) FundingRate ORM에 없는 mark_price 직접 저장 제거
   3) 기존 mark_price 인자는 유지하되 raw_json으로 영속화
   4) raw_json 인자 추가(기존 호출 호환 유지)
-- 2026-03-01: bt_trades 실제 스키마 정합
-  - open: entry_ts/entry_price/qty/is_auto/... 기록, trade_id 반환
-  - close: exit_ts/exit_price/pnl_usdt/... 업데이트, trade_id 반환
+
+- 2026-03-01:
+  1) bt_trades 실제 스키마 정합
+     - open: entry_ts/entry_price/qty/is_auto/... 기록, trade_id 반환
+     - close: exit_ts/exit_price/pnl_usdt/... 업데이트, trade_id 반환
 
 - 2026-03-02 (PATCH)
-  - bt_trade_snapshots에 DD 영속화 필드 저장 지원:
-    * equity_current_usdt
-    * equity_peak_usdt
-    * dd_pct
-  - STRICT:
-    - 값이 전달되면 반드시 finite/범위 검증
-    - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
+  1) bt_trade_snapshots에 DD 영속화 필드 저장 지원:
+     * equity_current_usdt
+     * equity_peak_usdt
+     * dd_pct
+  2) STRICT:
+     - 값이 전달되면 반드시 finite/범위 검증
+     - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
 
 - 2026-03-03 (PATCH)
-  - bt_trades 실행/복구 필드 영속화 지원(정합):
-    * entry_order_id / tp_order_id / sl_order_id
-    * exchange_position_side
-    * remaining_qty / realized_pnl_usdt
-    * reconciliation_status / last_synced_at
-  - STRICT:
-    - 위 필드가 전달되면 반드시 타입/길이/유효성 검증 후 저장
-    - 빈 문자열/NaN/inf/tz-naive datetime 허용 금지
+  1) bt_trades 실행/복구 필드 영속화 지원(정합):
+     * entry_order_id / tp_order_id / sl_order_id
+     * exchange_position_side
+     * remaining_qty / realized_pnl_usdt
+     * reconciliation_status / last_synced_at
+  2) STRICT:
+     - 위 필드가 전달되면 반드시 타입/길이/유효성 검증 후 저장
+     - 빈 문자열/NaN/inf/tz-naive datetime 허용 금지
 
 - 2026-03-03 (TRADE-GRADE)
-  - bt_trade_snapshots 분석형 필드(Decision/Micro/Exec/EV/AutoBlock) 저장 지원:
-    * decision_id / quant_decision_pre / quant_constraints / quant_final_decision
-    * gpt_severity / gpt_tags / gpt_confidence_penalty / gpt_suggested_risk_multiplier / gpt_rationale_short
-    * micro_* (funding/oi/lsr/z/DI/micro_score_risk)
-    * exec_* (expected/filled/slippage/adverse/score/post_prices)
-    * ev_cell_* / auto_block_* (차단/감쇠 근거)
-  - STRICT:
-    - 값이 전달되면 타입/범위/JSON 형태 검증 후 저장
-    - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
+  1) bt_trade_snapshots 분석형 필드(Decision/Micro/Exec/EV/AutoBlock) 저장 지원:
+     * decision_id / quant_decision_pre / quant_constraints / quant_final_decision
+     * gpt_severity / gpt_tags / gpt_confidence_penalty / gpt_suggested_risk_multiplier / gpt_rationale_short
+     * micro_* (funding/oi/lsr/z/DI/micro_score_risk)
+     * exec_* (expected/filled/slippage/adverse/score/post_prices)
+     * ev_cell_* / auto_block_* (차단/감쇠 근거)
+  2) STRICT:
+     - 값이 전달되면 타입/범위/JSON 형태 검증 후 저장
+     - ORM 모델에 컬럼 매핑이 없으면 즉시 예외(조용히 무시 금지)
 ========================================================
 """
 
@@ -118,6 +141,14 @@ def _require_positive_int(v: Any, name: str) -> int:
     if iv <= 0:
         raise ValueError(f"{name} must be > 0")
     return iv
+
+
+def _require_epoch_ms_from_dt(v: Any, name: str) -> int:
+    dt = _require_tzaware_dt(v, name)
+    ms = int(dt.timestamp() * 1000)
+    if ms <= 0:
+        raise ValueError(f"{name} epoch ms must be > 0")
+    return ms
 
 
 def _opt_float(v: Any, name: str) -> Optional[float]:
@@ -192,8 +223,19 @@ def _opt_json_list(v: Any, name: str) -> Optional[list]:
     return v
 
 
+def _require_model_field(model_cls: Any, field: str, *, model_name: str) -> None:
+    if not hasattr(model_cls, field):
+        raise RuntimeError(f"{model_name} model missing {field} mapping (db_models mismatch)")
+
+
+def _setattr_model_strict(row: Any, field: str, value: Any, *, model_name: str) -> None:
+    if not hasattr(type(row), field):
+        raise RuntimeError(f"{model_name} model missing {field} mapping (db_models mismatch)")
+    setattr(row, field, value)
+
+
 def _setattr_strict(row: Any, field: str, value: Any) -> None:
-    if not hasattr(row, field):
+    if not hasattr(type(row), field):
         raise RuntimeError(f"TradeSnapshot model missing {field} mapping (db_models mismatch)")
     setattr(row, field, value)
 
@@ -236,6 +278,7 @@ def record_trade_open_returning_id(
     q = _require_positive(qty, "qty")
     ep = _require_positive(entry_price, "entry_price")
     ets = _require_tzaware_dt(entry_ts, "entry_ts")
+    opened_ts_ms = _require_epoch_ms_from_dt(ets, "entry_ts")
 
     eoid = _opt_nonempty_str_maxlen(entry_order_id, "entry_order_id", max_len=64)
     tpid = _opt_nonempty_str_maxlen(tp_order_id, "tp_order_id", max_len=64)
@@ -246,6 +289,9 @@ def record_trade_open_returning_id(
     rpnl = _opt_float(realized_pnl_usdt, "realized_pnl_usdt")
     rstat = _opt_nonempty_str_maxlen(reconciliation_status, "reconciliation_status", max_len=32)
     lsync = _opt_tzaware_dt(last_synced_at, "last_synced_at")
+
+    _require_model_field(TradeORM, "opened_ts_ms", model_name="TradeORM")
+    _require_model_field(TradeORM, "status", model_name="TradeORM")
 
     now = _utc_now()
 
@@ -267,6 +313,8 @@ def record_trade_open_returning_id(
             tp_pct=_opt_float(tp_pct, "tp_pct"),
             sl_pct=_opt_float(sl_pct, "sl_pct"),
             note=(str(note).strip()[:255] if note else None),
+            opened_ts_ms=int(opened_ts_ms),
+            status="OPEN",
             created_at=now,
             updated_at=now,
         )
@@ -312,8 +360,10 @@ def close_latest_open_trade_returning_id(
     sd = _require_nonempty_str(side, "side").upper()
     xp = _require_positive(exit_price, "exit_price")
     xts = _require_tzaware_dt(exit_ts, "exit_ts")
+    closed_ts_ms = _require_epoch_ms_from_dt(xts, "exit_ts")
     pnl_val = _require_number(pnl_usdt, "pnl_usdt")
     reason = _require_nonempty_str(close_reason, "close_reason")
+    exit_reason = str(reason).strip()[:64]
 
     now = _utc_now()
 
@@ -330,6 +380,11 @@ def close_latest_open_trade_returning_id(
         trade = q.first()
         if trade is None:
             raise RuntimeError(f"no open trade to close: symbol={sym}, side={sd}")
+
+        _setattr_model_strict(trade, "closed_ts_ms", int(closed_ts_ms), model_name="TradeORM")
+        _setattr_model_strict(trade, "status", "CLOSED", model_name="TradeORM")
+        _setattr_model_strict(trade, "realized_pnl", float(pnl_val), model_name="TradeORM")
+        _setattr_model_strict(trade, "exit_reason", exit_reason, model_name="TradeORM")
 
         trade.exit_price = float(xp)
         trade.exit_ts = xts
@@ -477,7 +532,6 @@ def record_trade_snapshot(
             raise RuntimeError(f"trade snapshot already exists: trade_id={tid}")
 
         if did is not None:
-            # UNIQUE(decision_id) 보조 검증(명확한 에러 메시지)
             dup = session.query(TradeSnapshot).filter(TradeSnapshot.decision_id == did).first()
             if dup is not None:
                 raise RuntimeError(f"decision_id already exists: decision_id={did}")
@@ -566,7 +620,6 @@ def record_trade_snapshot(
         if esc is not None:
             _setattr_strict(row, "exec_score", float(esc))
         if epost is not None:
-            # 최소 키 검증(존재 시)
             for k in ("t+1s", "t+3s", "t+5s"):
                 if k not in epost:
                     raise ValueError(f"exec_post_prices missing key: {k}")
