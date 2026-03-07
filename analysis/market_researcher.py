@@ -28,6 +28,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - Binance 외부 시장 구조 분석기 추가
 - AWS 실행용 DB 적재 루프 추가
 - market_features / trade_context_snapshots 적재 기능 추가
+- ratio endpoint(symbol 누락 응답) 직접 파싱 경로 추가
 ========================================================
 """
 
@@ -37,9 +38,9 @@ import logging
 import math
 import time
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from statistics import pstdev
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import text
 
@@ -162,15 +163,37 @@ class MarketResearcher:
         self._db_market_timeframe = self._require_str_setting("ANALYST_DB_MARKET_TIMEFRAME")
         self._worker_interval_sec = self._require_int_setting("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC")
 
+        self._kline_interval = self._require_str_setting("ANALYST_KLINE_INTERVAL")
+        self._kline_limit = self._require_int_setting("ANALYST_KLINE_LIMIT")
+        self._ratio_period = self._require_str_setting("ANALYST_RATIO_PERIOD")
+        self._ratio_limit = self._require_int_setting("ANALYST_RATIO_LIMIT")
+        self._depth_limit = self._require_int_setting("ANALYST_DEPTH_LIMIT")
+        self._funding_limit = self._require_int_setting("ANALYST_FUNDING_LIMIT")
+        self._force_order_limit = self._require_int_setting("ANALYST_FORCE_ORDER_LIMIT")
+
         if self._worker_interval_sec <= 0:
             raise RuntimeError("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC must be > 0")
+        if self._kline_limit <= 0:
+            raise RuntimeError("ANALYST_KLINE_LIMIT must be > 0")
+        if self._ratio_limit <= 0:
+            raise RuntimeError("ANALYST_RATIO_LIMIT must be > 0")
+        if self._depth_limit <= 0:
+            raise RuntimeError("ANALYST_DEPTH_LIMIT must be > 0")
+        if self._funding_limit <= 0:
+            raise RuntimeError("ANALYST_FUNDING_LIMIT must be > 0")
+        if self._force_order_limit <= 0:
+            raise RuntimeError("ANALYST_FORCE_ORDER_LIMIT must be > 0")
+        if self._db_market_timeframe != self._kline_interval:
+            raise RuntimeError(
+                "ANALYST_DB_MARKET_TIMEFRAME must match ANALYST_KLINE_INTERVAL (STRICT)"
+            )
 
     # ========================================================
     # Public API
     # ========================================================
 
     def run(self) -> MarketResearchReport:
-        snapshot = self._fetcher.fetch_market_snapshot()
+        snapshot = self._fetch_market_snapshot_strict()
         report = self._build_report(snapshot)
         logger.info(
             "Market research completed: symbol=%s trend=%s regime=%s conviction=%s",
@@ -237,6 +260,182 @@ class MarketResearcher:
             sleep_sec = self._worker_interval_sec - elapsed
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
+
+    # ========================================================
+    # Snapshot fetch (strict / symbol fallback)
+    # ========================================================
+
+    def _fetch_market_snapshot_strict(self) -> BinanceMarketSnapshot:
+        server_time_ms, local_time_ms, drift_ms = self._fetcher.fetch_server_time_or_raise()
+
+        premium_index = self._fetcher.fetch_premium_index(self._symbol)
+        book_ticker = self._fetcher.fetch_book_ticker(self._symbol)
+        depth = self._fetcher.fetch_depth(self._symbol, self._depth_limit)
+        open_interest = self._fetcher.fetch_open_interest(self._symbol)
+        klines = self._fetcher.fetch_klines(
+            symbol=self._symbol,
+            interval=self._kline_interval,
+            limit=self._kline_limit,
+        )
+        funding_rates = self._fetcher.fetch_funding_rate_history(
+            symbol=self._symbol,
+            limit=self._funding_limit,
+        )
+        open_interest_history = self._fetcher.fetch_open_interest_history(
+            symbol=self._symbol,
+            period=self._ratio_period,
+            limit=self._ratio_limit,
+        )
+        global_ratio = self._fetch_ratio_series_with_symbol_fallback(
+            path="/futures/data/globalLongShortAccountRatio",
+            symbol=self._symbol,
+            period=self._ratio_period,
+            limit=self._ratio_limit,
+            endpoint_name="/futures/data/globalLongShortAccountRatio",
+            ratio_keys=("longShortRatio",),
+            long_keys=("longAccount",),
+            short_keys=("shortAccount",),
+        )
+        top_ratio = self._fetch_ratio_series_with_symbol_fallback(
+            path="/futures/data/topLongShortPositionRatio",
+            symbol=self._symbol,
+            period=self._ratio_period,
+            limit=self._ratio_limit,
+            endpoint_name="/futures/data/topLongShortPositionRatio",
+            ratio_keys=("longShortRatio",),
+            long_keys=("longAccount",),
+            short_keys=("shortAccount",),
+        )
+        taker_ratio = self._fetch_ratio_series_with_symbol_fallback(
+            path="/futures/data/takerlongshortRatio",
+            symbol=self._symbol,
+            period=self._ratio_period,
+            limit=self._ratio_limit,
+            endpoint_name="/futures/data/takerlongshortRatio",
+            ratio_keys=("longShortRatio", "buySellRatio"),
+            long_keys=("longAccount", "buyVol"),
+            short_keys=("shortAccount", "sellVol"),
+        )
+        force_orders = self._fetcher.fetch_force_orders(
+            symbol=self._symbol,
+            limit=self._force_order_limit,
+        )
+
+        return BinanceMarketSnapshot(
+            symbol=self._symbol,
+            server_time_ms=server_time_ms,
+            local_time_ms=local_time_ms,
+            drift_ms=drift_ms,
+            premium_index=premium_index,
+            book_ticker=book_ticker,
+            depth=depth,
+            open_interest=open_interest,
+            klines=klines,
+            funding_rates=funding_rates,
+            open_interest_history=open_interest_history,
+            global_long_short_account_ratio=global_ratio,
+            top_long_short_position_ratio=top_ratio,
+            taker_long_short_ratio=taker_ratio,
+            force_orders=force_orders,
+        )
+
+    def _fetch_ratio_series_with_symbol_fallback(
+        self,
+        *,
+        path: str,
+        symbol: str,
+        period: str,
+        limit: int,
+        endpoint_name: str,
+        ratio_keys: Sequence[str],
+        long_keys: Sequence[str],
+        short_keys: Sequence[str],
+    ) -> List[BinanceRatioPoint]:
+        request_json = getattr(self._fetcher, "_request_json", None)
+        if request_json is None or not callable(request_json):
+            raise RuntimeError("BinanceMarketFetcher._request_json is unavailable (STRICT)")
+
+        payload = request_json(
+            "GET",
+            path,
+            params={"symbol": symbol, "period": period, "limit": limit},
+        )
+
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Binance {endpoint_name} response is not a list")
+        if not payload:
+            raise RuntimeError(f"Binance {endpoint_name} response is empty")
+
+        result: List[BinanceRatioPoint] = []
+        for row in payload:
+            if not isinstance(row, Mapping):
+                raise RuntimeError(f"Binance {endpoint_name} row is not an object")
+
+            symbol_value = row.get("symbol")
+            if isinstance(symbol_value, str) and symbol_value.strip():
+                normalized_symbol = symbol_value.strip()
+            else:
+                normalized_symbol = symbol
+
+            ratio_value = self._extract_required_decimal_from_keys(
+                row=row,
+                keys=ratio_keys,
+                field_name=f"{endpoint_name}.ratio",
+            )
+            long_value = self._extract_optional_decimal_from_keys(
+                row=row,
+                keys=long_keys,
+            )
+            short_value = self._extract_optional_decimal_from_keys(
+                row=row,
+                keys=short_keys,
+            )
+            timestamp_ms = self._require_int_from_mapping(row, "timestamp", endpoint_name)
+
+            result.append(
+                BinanceRatioPoint(
+                    symbol=normalized_symbol,
+                    long_short_ratio=ratio_value,
+                    long_account=long_value,
+                    short_account=short_value,
+                    timestamp_ms=timestamp_ms,
+                )
+            )
+
+        return result
+
+    def _extract_required_decimal_from_keys(
+        self,
+        *,
+        row: Mapping[str, Any],
+        keys: Sequence[str],
+        field_name: str,
+    ) -> Decimal:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return self._to_decimal(row[key], field_name)
+        raise RuntimeError(f"Missing required decimal field from candidates: {field_name}")
+
+    def _extract_optional_decimal_from_keys(
+        self,
+        *,
+        row: Mapping[str, Any],
+        keys: Sequence[str],
+    ) -> Optional[Decimal]:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return self._to_decimal(row[key], key)
+        return None
+
+    def _require_int_from_mapping(
+        self,
+        row: Mapping[str, Any],
+        key: str,
+        endpoint_name: str,
+    ) -> int:
+        if key not in row:
+            raise RuntimeError(f"Missing required int field: {endpoint_name}.{key}")
+        return self._to_int(row[key], f"{endpoint_name}.{key}")
 
     # ========================================================
     # Persistence builders
@@ -545,7 +744,10 @@ class MarketResearcher:
         if len(klines) < 5:
             raise RuntimeError("At least 5 klines are required for market research")
 
-        price = klines[-1].close_price
+        latest_kline = klines[-1]
+        as_of_ms = latest_kline.open_time_ms
+
+        price = latest_kline.close_price
         if price <= Decimal("0"):
             raise RuntimeError("Last close price must be > 0")
 
@@ -634,6 +836,7 @@ class MarketResearcher:
 
         dashboard_payload = self._build_dashboard_payload(
             snapshot=snapshot,
+            as_of_ms=as_of_ms,
             price=price,
             mark_price=mark_price,
             index_price=index_price,
@@ -666,7 +869,7 @@ class MarketResearcher:
 
         return MarketResearchReport(
             symbol=snapshot.symbol,
-            as_of_ms=snapshot.server_time_ms,
+            as_of_ms=as_of_ms,
             price=price,
             mark_price=mark_price,
             index_price=index_price,
@@ -1026,7 +1229,9 @@ class MarketResearcher:
 
     def _build_dashboard_payload(
         self,
+        *,
         snapshot: BinanceMarketSnapshot,
+        as_of_ms: int,
         price: Decimal,
         mark_price: Decimal,
         index_price: Decimal,
@@ -1058,7 +1263,8 @@ class MarketResearcher:
     ) -> Dict[str, Any]:
         return {
             "symbol": snapshot.symbol,
-            "as_of_ms": snapshot.server_time_ms,
+            "as_of_ms": as_of_ms,
+            "server_time_ms": snapshot.server_time_ms,
             "server_drift_ms": snapshot.drift_ms,
             "market_structure": {
                 "trend": trend,
@@ -1217,6 +1423,26 @@ class MarketResearcher:
         if value not in mapping:
             raise RuntimeError(f"Unexpected {field_name} value: {value}")
         return mapping[value]
+
+    def _to_decimal(self, value: Any, field_name: str) -> Decimal:
+        if isinstance(value, bool):
+            raise RuntimeError(f"Invalid decimal field type for {field_name}: bool")
+        try:
+            dec = Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Invalid decimal field for {field_name}") from exc
+        if not dec.is_finite():
+            raise RuntimeError(f"Non-finite decimal field for {field_name}")
+        return dec
+
+    def _to_int(self, value: Any, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise RuntimeError(f"Invalid int field type for {field_name}: bool")
+        try:
+            ivalue = int(value)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"Invalid int field for {field_name}") from exc
+        return ivalue
 
 
 def main() -> None:
