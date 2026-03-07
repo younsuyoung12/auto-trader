@@ -955,7 +955,7 @@ def load_settings() -> Settings:
 
     md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 5.0)
     ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 5.0)
-    md_store_tfs = _as_csv_list("MD_STORE_TFS", ["1m", "5m", "15m"])
+    md_store_tfs = _as_csv_list("MD_STORE_TFS", ["1m", "5m", "15m", "1h", "4h"])
 
     max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0015)
     max_spread_abs = _as_float("MAX_SPREAD_ABS", 0.0)
