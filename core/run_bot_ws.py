@@ -194,9 +194,6 @@ _ACCOUNT_WS_FAIL_HARDSTOP_N: int = 3
 _ACCOUNT_WS_READY_TIMEOUT_SEC: float = 20.0
 
 
-@dataclass(frozen=True, slots=True)
-
-
 def _as_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
     if isinstance(v, bool):
         raise RuntimeError(f"{name} must be numeric (bool not allowed)")
