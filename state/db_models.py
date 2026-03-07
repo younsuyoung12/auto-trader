@@ -1,6 +1,7 @@
 """
 ========================================================
 FILE: state/db_models.py
+AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 설계 원칙:
@@ -11,9 +12,28 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - import 시점에 스키마 생성/변경을 수행하지 않는다.
 - 레거시 호환: 일부 모듈이 `Trade` ORM 심벌을 기대하므로 `Trade = TradeORM` alias를 제공한다.
 - 폴백 금지: 누락/불일치/모호성은 추정으로 메우지 않는다(즉시 예외/중단).
+- AI Trading Intelligence System용 분석 테이블/컬럼은 모두 additive 변경만 수행한다.
+- 구성 불변 규칙: 런타임 중 전략 설정 변경을 전제로 하는 스키마는 두지 않는다.
+- 데이터 무결성 규칙: 핵심 식별자/가격/수량/시간 정합성은 저장 레이어와 스키마 레벨에서 함께 강제한다.
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-07:
+  1) AI Trading Intelligence System 지원용 market_features 테이블 추가
+  2) trade_context_snapshots 테이블 추가
+  3) bt_trades 호환 분석 컬럼 추가
+     - status
+     - opened_ts_ms
+     - closed_ts_ms
+     - realized_pnl
+     - exit_reason
+  4) bt_trade_snapshots 분석 컬럼 추가
+     - ts_ms
+     - spread_bps
+     - pattern_score
+     - market_regime
+     - orderbook_imbalance
+     - volatility_score
 - 2026-03-04:
   1) 모듈 docstring 위치 정합화(문서/정적분석 인식 보장): docstring을 파일 최상단으로 이동
   2) 헤더 표기 TRADE-GRADE로 정합(정책 문서와 일치)
@@ -34,7 +54,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -194,7 +216,7 @@ class EntryScore(Base):
 
 
 # ─────────────────────────────────────────────
-# bt_trades (실제 DB 스키마 1:1 정합)
+# bt_trades (실제 DB 스키마 1:1 정합 + 분석 호환 컬럼)
 # ─────────────────────────────────────────────
 class TradeORM(Base):
     __tablename__ = "bt_trades"
@@ -252,8 +274,19 @@ class TradeORM(Base):
     reconciliation_status = Column(String(32), nullable=True)  # OK / MISMATCH / RECOVERED / ERROR
     last_synced_at = Column(DateTime(timezone=True), nullable=True)
 
+    # ─────────────────────────────────────────
+    # Analysis Compatibility Fields (AI Trading Intelligence)
+    # ─────────────────────────────────────────
+    status = Column(String(32), nullable=True, index=True)
+    opened_ts_ms = Column(BigInteger, nullable=True, index=True)
+    closed_ts_ms = Column(BigInteger, nullable=True, index=True)
+    realized_pnl = Column(Numeric(24, 8), nullable=True)
+    exit_reason = Column(String(64), nullable=True)
+
     __table_args__ = (
         Index("ix_bt_trades_symbol_entry_ts", "symbol", "entry_ts"),
+        Index("ix_bt_trades_symbol_closed_ts_ms", "symbol", "closed_ts_ms"),
+        CheckConstraint("qty > 0", name="ck_bt_trades_qty_gt_zero"),
     )
 
 
@@ -261,7 +294,7 @@ Trade = TradeORM
 
 
 # ─────────────────────────────────────────────
-# bt_trade_snapshots (진입 스냅샷)
+# bt_trade_snapshots (진입 스냅샷 + 분석 호환 컬럼)
 # ─────────────────────────────────────────────
 class TradeSnapshot(Base):
     __tablename__ = "bt_trade_snapshots"
@@ -356,10 +389,21 @@ class TradeSnapshot(Base):
     auto_risk_multiplier = Column(Float, nullable=True)
     auto_block_reasons = Column(JSONB, nullable=True)
 
+    # ─────────────────────────────────────────
+    # Analysis Compatibility Fields (AI Trading Intelligence)
+    # ─────────────────────────────────────────
+    ts_ms = Column(BigInteger, nullable=True, index=True)
+    spread_bps = Column(Numeric(24, 8), nullable=True)
+    pattern_score = Column(Numeric(24, 8), nullable=True)
+    market_regime = Column(String(32), nullable=True)
+    orderbook_imbalance = Column(Numeric(24, 8), nullable=True)
+    volatility_score = Column(Numeric(24, 8), nullable=True)
+
     __table_args__ = (
         Index("ux_bt_trade_snapshots_tradeid", "trade_id", unique=True),
         Index("ux_bt_trade_snapshots_decision_id", "decision_id", unique=True),
         Index("ix_bt_trade_snapshots_symbol_entryts", "symbol", "entry_ts"),
+        Index("ix_bt_trade_snapshots_symbol_ts_ms", "symbol", "ts_ms"),
     )
 
 
@@ -393,6 +437,78 @@ class TradeExitSnapshot(Base):
 
 
 # ─────────────────────────────────────────────
+# market_features
+# AI Trading Intelligence 내부 시장 분석용 피처 저장소
+# ─────────────────────────────────────────────
+class MarketFeature(Base):
+    __tablename__ = "market_features"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    ts_ms = Column(BigInteger, nullable=False, index=True)
+    symbol = Column(String(32), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False, index=True)
+
+    close_price = Column(Numeric(24, 8), nullable=False)
+    spread_bps = Column(Numeric(24, 8), nullable=False)
+    orderbook_imbalance = Column(Numeric(24, 8), nullable=False)
+
+    pattern_score = Column(Numeric(24, 8), nullable=False)
+    volatility_score = Column(Numeric(24, 8), nullable=False)
+    trend_score = Column(Numeric(24, 8), nullable=False)
+    liquidity_score = Column(Numeric(24, 8), nullable=False)
+
+    market_regime = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    __table_args__ = (
+        Index("ux_market_features_symbol_tf_tsms", "symbol", "timeframe", "ts_ms", unique=True),
+        CheckConstraint("ts_ms > 0", name="ck_market_features_ts_ms_gt_zero"),
+        CheckConstraint("close_price > 0", name="ck_market_features_close_price_gt_zero"),
+        CheckConstraint("spread_bps >= 0", name="ck_market_features_spread_bps_ge_zero"),
+    )
+
+
+# ─────────────────────────────────────────────
+# trade_context_snapshots
+# 거래 시점 컨텍스트 스냅샷
+# ─────────────────────────────────────────────
+class TradeContextSnapshot(Base):
+    __tablename__ = "trade_context_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    trade_id = Column(Integer, ForeignKey("bt_trades.id", ondelete="CASCADE"), nullable=True, index=True)
+
+    ts_ms = Column(BigInteger, nullable=False, index=True)
+    symbol = Column(String(32), nullable=False, index=True)
+
+    price = Column(Numeric(24, 8), nullable=False)
+    spread_bps = Column(Numeric(24, 8), nullable=False)
+    pattern_score = Column(Numeric(24, 8), nullable=False)
+    market_regime = Column(String(32), nullable=False)
+    orderbook_imbalance = Column(Numeric(24, 8), nullable=False)
+
+    funding_rate = Column(Numeric(24, 12), nullable=True)
+    open_interest = Column(Numeric(36, 8), nullable=True)
+    long_short_ratio = Column(Numeric(24, 8), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+
+    __table_args__ = (
+        Index("ix_trade_context_symbol_tsms", "symbol", "ts_ms"),
+        Index("ix_trade_context_trade_id_tsms", "trade_id", "ts_ms"),
+        CheckConstraint("ts_ms > 0", name="ck_trade_context_ts_ms_gt_zero"),
+        CheckConstraint("price > 0", name="ck_trade_context_price_gt_zero"),
+        CheckConstraint("spread_bps >= 0", name="ck_trade_context_spread_bps_ge_zero"),
+        CheckConstraint(
+            "(long_short_ratio IS NULL) OR (long_short_ratio > 0)",
+            name="ck_trade_context_long_short_ratio_gt_zero_when_present",
+        ),
+    )
+
+
+# ─────────────────────────────────────────────
 # bt_funding_rates
 # ─────────────────────────────────────────────
 class FundingRate(Base):
@@ -403,7 +519,7 @@ class FundingRate(Base):
     ts = Column(DateTime(timezone=True), nullable=False, index=True)
 
     rate = Column("funding_rate", Numeric(24, 8), nullable=False)
-    
+
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
@@ -443,6 +559,8 @@ __all__ = [
     "Trade",
     "TradeSnapshot",
     "TradeExitSnapshot",
+    "MarketFeature",
+    "TradeContextSnapshot",
     "FundingRate",
     "ExternalEvent",
 ]

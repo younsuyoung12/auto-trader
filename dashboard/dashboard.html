@@ -1,6 +1,7 @@
 <!--
 ========================================================
 FILE: templates/dashboard.html
+AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
@@ -12,14 +13,22 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 모바일 접속 차단: PC 전용 대시보드만 허용한다.
 - Polling 금지: 실시간 갱신은 WebSocket만 사용한다.
 - 초기 화면 구성용 1회성 REST 조회는 허용한다.
+- 기존 기능 삭제 금지. 기존 위젯/차트/테이블/실시간 반영 기능은 유지하고,
+  AI 분석 검색 UI만 추가한다.
+- /api/engine/ws-status 와 /api/engine/health 는 엔진 메모리가 아니라
+  DB 스냅샷 기준으로 동작한다.
 
 변경 이력
 --------------------------------------------------------
 - 2026-03-07:
-  1) 대비가 강한 프리미엄 카드형 UI로 재개편
-  2) 모든 주요 박스에 명확한 테두리/그림자/강조색 적용
-  3) 전문 용어를 쉬운 한국어로 정리
+  1) 대비가 강한 프리미엄 카드형 UI 유지
+  2) 모든 주요 박스에 명확한 테두리/그림자/강조색 적용 유지
+  3) 전문 용어를 쉬운 한국어로 정리 유지
   4) SKIP 사유를 쉬운 한국어로 매핑하는 프론트 로직 유지
+  5) AI 분석 검색 섹션 추가
+     - 통합 분석(/api/quant-analysis)
+     - 외부 시장 분석(/api/market-analysis)
+  6) 상단 메뉴 가독성 개선
 ========================================================
 -->
 
@@ -190,6 +199,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       border-color: rgba(255, 255, 255, 0.18);
     }
 
+    .nav-link.ai-link {
+      background: rgba(37, 99, 235, 0.18);
+      border-color: rgba(96, 165, 250, 0.26);
+      color: #eff6ff;
+    }
+
+    .nav-link.ai-link:hover {
+      background: rgba(37, 99, 235, 0.28);
+      border-color: rgba(147, 197, 253, 0.34);
+      color: #ffffff;
+    }
+
     .table-shell {
       border: 1px solid var(--line);
       border-radius: 1rem;
@@ -258,6 +279,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       font-size: 0.78rem;
       margin-top: 0.55rem;
       font-weight: 800;
+      white-space: pre-wrap;
+      word-break: break-word;
     }
 
     .mono {
@@ -385,8 +408,360 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       box-shadow: 0 4px 14px rgba(37, 99, 235, 0.26);
     }
 
+    /* AI 섹션 */
+    .ai-section-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .ai-card {
+      position: relative;
+      background: linear-gradient(180deg, rgba(255,255,255,0.98), rgba(248,250,252,0.96));
+      border: 1px solid rgba(15,23,42,0.12);
+      border-radius: 1.15rem;
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+
+    .ai-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto 0;
+      height: 3px;
+      background: linear-gradient(90deg, rgba(37,99,235,0.9), rgba(2,132,199,0.8), rgba(15,118,110,0.8));
+    }
+
+    .ai-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 1rem 1rem 0.75rem 1rem;
+    }
+
+    .ai-card-title {
+      font-size: 1rem;
+      font-weight: 900;
+      color: var(--text-0);
+      margin: 0;
+    }
+
+    .ai-card-desc {
+      margin-top: 0.28rem;
+      font-size: 0.82rem;
+      line-height: 1.55;
+      color: var(--text-2);
+    }
+
+    .ai-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.38rem 0.62rem;
+      border-radius: 999px;
+      font-size: 0.71rem;
+      font-weight: 900;
+      background: rgba(37,99,235,0.10);
+      color: #1d4ed8;
+      border: 1px solid rgba(37,99,235,0.16);
+      white-space: nowrap;
+    }
+
+    .ai-card-body {
+      padding: 0 1rem 1rem 1rem;
+    }
+
+    .ai-label {
+      display: block;
+      font-size: 0.75rem;
+      font-weight: 900;
+      color: var(--text-2);
+      margin-bottom: 0.4rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .ai-textarea {
+      width: 100%;
+      min-height: 6.4rem;
+      padding: 0.9rem 1rem;
+      resize: vertical;
+      border-radius: 0.95rem;
+      border: 1px solid rgba(15,23,42,0.12);
+      background: rgba(255,255,255,0.92);
+      color: var(--text-0);
+      font-size: 0.92rem;
+      line-height: 1.6;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.4);
+    }
+
+    .ai-textarea:focus {
+      outline: none;
+      border-color: rgba(37,99,235,0.40);
+      box-shadow: 0 0 0 4px rgba(37,99,235,0.08);
+    }
+
+    .ai-quick-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.75rem;
+    }
+
+    .ai-quick-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.46rem 0.72rem;
+      border-radius: 999px;
+      border: 1px solid rgba(15,23,42,0.10);
+      background: rgba(255,255,255,0.92);
+      color: var(--text-1);
+      font-size: 0.76rem;
+      font-weight: 800;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .ai-quick-btn:hover {
+      background: rgba(239,246,255,0.92);
+      border-color: rgba(37,99,235,0.20);
+      color: #1d4ed8;
+    }
+
+    .ai-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.8rem;
+      margin-top: 0.85rem;
+      flex-wrap: wrap;
+    }
+
+    .ai-helper {
+      font-size: 0.78rem;
+      color: var(--text-2);
+      line-height: 1.45;
+    }
+
+    .ai-check-wrap {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.82rem;
+      color: var(--text-1);
+      font-weight: 700;
+    }
+
+    .ai-check-wrap input {
+      width: 0.95rem;
+      height: 0.95rem;
+    }
+
+    .ai-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      padding: 0.72rem 1rem;
+      border-radius: 0.95rem;
+      font-size: 0.85rem;
+      font-weight: 900;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      border: 1px solid transparent;
+    }
+
+    .ai-btn-primary {
+      background: linear-gradient(180deg, rgba(37,99,235,0.98), rgba(29,78,216,0.96));
+      color: #ffffff;
+      box-shadow: 0 10px 20px rgba(37,99,235,0.20);
+    }
+
+    .ai-btn-primary:hover {
+      filter: brightness(1.03);
+      box-shadow: 0 14px 26px rgba(37,99,235,0.24);
+    }
+
+    .ai-btn-secondary {
+      background: linear-gradient(180deg, rgba(15,23,42,0.98), rgba(30,41,59,0.96));
+      color: #ffffff;
+      box-shadow: 0 10px 20px rgba(15,23,42,0.18);
+    }
+
+    .ai-btn-secondary:hover {
+      filter: brightness(1.03);
+      box-shadow: 0 14px 26px rgba(15,23,42,0.22);
+    }
+
+    .ai-result {
+      margin-top: 1rem;
+      padding: 1rem;
+      border-radius: 1rem;
+      border: 1px solid rgba(15,23,42,0.10);
+      background: linear-gradient(180deg, rgba(248,250,252,0.96), rgba(255,255,255,0.96));
+      box-shadow: var(--shadow-soft);
+    }
+
+    .ai-result-top {
+      display: grid;
+      grid-template-columns: 1.5fr 0.8fr;
+      gap: 1rem;
+      margin-bottom: 0.9rem;
+    }
+
+    .ai-result-label {
+      font-size: 0.74rem;
+      font-weight: 900;
+      color: var(--text-2);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.32rem;
+    }
+
+    .ai-answer {
+      font-size: 0.95rem;
+      line-height: 1.72;
+      font-weight: 700;
+      color: var(--text-0);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .ai-mini-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.7rem;
+    }
+
+    .ai-mini-box {
+      padding: 0.8rem 0.85rem;
+      border-radius: 0.9rem;
+      border: 1px solid rgba(15,23,42,0.08);
+      background: rgba(255,255,255,0.90);
+    }
+
+    .ai-mini-box-label {
+      font-size: 0.72rem;
+      font-weight: 900;
+      color: var(--text-2);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .ai-mini-box-value {
+      margin-top: 0.36rem;
+      font-size: 0.95rem;
+      font-weight: 900;
+      color: var(--text-0);
+      word-break: break-word;
+    }
+
+    .ai-detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.9rem;
+      margin-top: 0.9rem;
+    }
+
+    .ai-detail-box {
+      padding: 0.9rem;
+      border-radius: 0.95rem;
+      border: 1px solid rgba(15,23,42,0.08);
+      background: rgba(255,255,255,0.88);
+    }
+
+    .ai-detail-title {
+      font-size: 0.82rem;
+      font-weight: 900;
+      color: var(--text-0);
+      margin-bottom: 0.55rem;
+    }
+
+    .ai-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.45rem;
+    }
+
+    .ai-list li {
+      position: relative;
+      padding-left: 0.95rem;
+      font-size: 0.86rem;
+      color: var(--text-1);
+      line-height: 1.55;
+    }
+
+    .ai-list li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0.56rem;
+      width: 0.42rem;
+      height: 0.42rem;
+      border-radius: 999px;
+      background: linear-gradient(180deg, #2563eb, #0f766e);
+      box-shadow: 0 0 0 4px rgba(37,99,235,0.08);
+    }
+
+    .ai-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-top: 0.6rem;
+    }
+
+    .ai-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0.42rem 0.68rem;
+      border-radius: 999px;
+      border: 1px solid rgba(37,99,235,0.14);
+      background: rgba(37,99,235,0.08);
+      color: #1d4ed8;
+      font-size: 0.74rem;
+      font-weight: 800;
+    }
+
+    .ai-loading {
+      margin-top: 0.85rem;
+      padding: 0.8rem 0.9rem;
+      border-radius: 0.9rem;
+      border: 1px solid rgba(15,23,42,0.08);
+      background: rgba(255,255,255,0.86);
+      font-size: 0.84rem;
+      font-weight: 800;
+      color: var(--text-1);
+    }
+
+    .muted-note {
+      font-size: 0.76rem;
+      color: var(--text-2);
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1279px) {
+      .ai-section-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
     @media (max-width: 1023px) {
       body { overflow: hidden; }
+    }
+
+    @media (max-width: 900px) {
+      .ai-result-top,
+      .ai-detail-grid,
+      .ai-mini-grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
@@ -413,12 +788,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           </div>
           <div>
             <div class="text-xl font-bold tracking-tight header-title">트레이딩 대시보드</div>
-            <div class="text-xs header-subtitle">엔진 상태 · 현재 보유 · 판단 이유 · 문제 · 진입 분석 · 수익 분석</div>
+            <div class="text-xs header-subtitle">
+              AI 분석 · 엔진 상태 · 현재 보유 · 판단 이유 · 문제 · 진입 분석 · 수익 분석
+            </div>
           </div>
         </div>
 
         <div class="flex flex-col md:flex-row md:items-center gap-2 md:gap-3">
           <div class="flex flex-wrap items-center gap-2">
+            <a class="nav-link ai-link" href="#섹션-AI">AI 분석</a>
             <a class="nav-link" href="#섹션-엔진">핵심 상태</a>
             <a class="nav-link" href="#섹션-포지션">현재 보유</a>
             <a class="nav-link" href="#섹션-의사결정">판단 이유</a>
@@ -436,6 +814,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
             <button
               id="refresh-btn"
               class="inline-flex items-center gap-1 rounded-xl bg-white text-slate-900 hover:bg-slate-100 px-3 py-2 text-xs font-semibold border border-white/30 shadow-sm"
+              type="button"
             >
               새로고침
             </button>
@@ -455,6 +834,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           </span>
         </div>
       </div>
+
+      <div class="mt-2 text-[11px] header-meta">
+        `/api/engine/ws-status`와 `/api/engine/health`는 엔진 메모리가 아니라 DB 스냅샷을 기준으로 동작합니다.
+      </div>
     </div>
   </div>
 
@@ -468,11 +851,184 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <button
           id="error-banner-close"
           class="text-xs text-rose-700/80 hover:text-rose-700 underline underline-offset-2"
+          type="button"
         >
           닫기
         </button>
       </div>
     </div>
+
+    <!-- AI 분석 섹션 (추가) -->
+    <section id="섹션-AI" class="mb-6">
+      <div class="section-headline">
+        <span class="bar"></span>
+        <div>
+          <h2 class="section-title">AI 분석 검색</h2>
+          <div class="text-xs text-slate-500 mt-1">
+            내부 DB 분석 + 외부 시장 분석을 질문형으로 조회합니다.
+          </div>
+        </div>
+      </div>
+
+      <div class="ai-section-grid">
+        <!-- 통합 분석 -->
+        <div class="ai-card">
+          <div class="ai-card-head">
+            <div>
+              <h3 class="ai-card-title">통합 분석</h3>
+              <div class="ai-card-desc">
+                내부 거래 데이터 + 최근 시장 상태 + 외부 Binance 시장 구조를 함께 분석합니다.
+              </div>
+            </div>
+            <span class="ai-badge">/api/quant-analysis</span>
+          </div>
+
+          <div class="ai-card-body">
+            <label for="quant-question" class="ai-label">질문</label>
+            <textarea
+              id="quant-question"
+              class="ai-textarea"
+              placeholder="예) 왜 최근에 진입을 잘 안 했는지 쉽게 설명해줘"
+            ></textarea>
+
+            <div class="ai-quick-list">
+              <button type="button" class="ai-quick-btn" data-target="quant-question" data-question="왜 최근에 진입을 잘 안 했는지 알려줘">왜 진입 안 했어</button>
+              <button type="button" class="ai-quick-btn" data-target="quant-question" data-question="최근 손실 원인과 해결 방향을 알려줘">왜 손실났어</button>
+              <button type="button" class="ai-quick-btn" data-target="quant-question" data-question="최근 거래 성능과 문제점을 알려줘">최근 거래 분석</button>
+              <button type="button" class="ai-quick-btn" data-target="quant-question" data-question="현재 내부 상태와 외부 시장을 함께 보고 지금 분위기를 설명해줘">지금 분위기</button>
+            </div>
+
+            <div class="ai-row">
+              <label class="ai-check-wrap">
+                <input id="quant-include-external" type="checkbox" checked />
+                <span>외부 시장 분석 포함</span>
+              </label>
+              <button id="quant-search-btn" class="ai-btn ai-btn-primary" type="button">통합 분석 실행</button>
+            </div>
+
+            <div class="muted-note mt-3">
+              거래 관련 질문, 진입/손실 이유, 내부 상태와 외부 시장을 함께 묻는 질문에 적합합니다.
+            </div>
+
+            <div id="quant-analysis-loading" class="ai-loading hidden">분석 중...</div>
+            <div id="quant-analysis-error" class="panel-error hidden"></div>
+
+            <div id="quant-analysis-result" class="ai-result hidden">
+              <div class="ai-result-top">
+                <div>
+                  <div class="ai-result-label">AI 답변</div>
+                  <div id="quant-analysis-answer" class="ai-answer">-</div>
+                </div>
+
+                <div class="ai-mini-grid">
+                  <div class="ai-mini-box">
+                    <div class="ai-mini-box-label">범위</div>
+                    <div id="quant-analysis-scope" class="ai-mini-box-value">-</div>
+                  </div>
+                  <div class="ai-mini-box">
+                    <div class="ai-mini-box-label">신뢰도</div>
+                    <div id="quant-analysis-confidence" class="ai-mini-box-value">-</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="ai-detail-grid">
+                <div class="ai-detail-box">
+                  <div class="ai-detail-title">원인</div>
+                  <ul id="quant-analysis-causes" class="ai-list"></ul>
+                </div>
+                <div class="ai-detail-box">
+                  <div class="ai-detail-title">해결 방향</div>
+                  <ul id="quant-analysis-recommendations" class="ai-list"></ul>
+                </div>
+              </div>
+
+              <div class="ai-detail-box mt-3">
+                <div class="ai-detail-title">분석에 사용한 입력</div>
+                <div id="quant-analysis-used-inputs" class="ai-tags"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 외부 시장 분석 -->
+        <div class="ai-card">
+          <div class="ai-card-head">
+            <div>
+              <h3 class="ai-card-title">외부 시장 분석</h3>
+              <div class="ai-card-desc">
+                현재 Binance 기준 비트코인 선물 시장 분위기와 구조를 분석합니다.
+              </div>
+            </div>
+            <span class="ai-badge">/api/market-analysis</span>
+          </div>
+
+          <div class="ai-card-body">
+            <label for="market-question" class="ai-label">질문</label>
+            <textarea
+              id="market-question"
+              class="ai-textarea"
+              placeholder="예) 지금 비트코인 선물 시장 분위기를 쉽게 알려줘"
+            ></textarea>
+
+            <div class="ai-quick-list">
+              <button type="button" class="ai-quick-btn" data-target="market-question" data-question="지금 비트코인 선물 시장 분위기를 쉽게 설명해줘">시장 분위기</button>
+              <button type="button" class="ai-quick-btn" data-target="market-question" data-question="현재 추세, 변동성, 유동성을 알려줘">추세/변동성</button>
+              <button type="button" class="ai-quick-btn" data-target="market-question" data-question="지금 롱이 많은지 숏이 많은지 알려줘">롱/숏 쏠림</button>
+              <button type="button" class="ai-quick-btn" data-target="market-question" data-question="현재 중요한 지지와 저항을 알려줘">지지/저항</button>
+            </div>
+
+            <div class="ai-row">
+              <div class="ai-helper">외부 시장 전용 분석</div>
+              <button id="market-search-btn" class="ai-btn ai-btn-secondary" type="button">시장 분석 실행</button>
+            </div>
+
+            <div class="muted-note mt-3">
+              현재 비트코인 선물 시장 분위기, 추세, 변동성, 롱/숏 쏠림 분석에 적합합니다.
+            </div>
+
+            <div id="market-analysis-loading" class="ai-loading hidden">분석 중...</div>
+            <div id="market-analysis-error" class="panel-error hidden"></div>
+
+            <div id="market-analysis-result" class="ai-result hidden">
+              <div class="ai-result-top">
+                <div>
+                  <div class="ai-result-label">AI 답변</div>
+                  <div id="market-analysis-answer" class="ai-answer">-</div>
+                </div>
+
+                <div class="ai-mini-grid">
+                  <div class="ai-mini-box">
+                    <div class="ai-mini-box-label">범위</div>
+                    <div id="market-analysis-scope" class="ai-mini-box-value">-</div>
+                  </div>
+                  <div class="ai-mini-box">
+                    <div class="ai-mini-box-label">신뢰도</div>
+                    <div id="market-analysis-confidence" class="ai-mini-box-value">-</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="ai-detail-grid">
+                <div class="ai-detail-box">
+                  <div class="ai-detail-title">핵심 원인 / 포인트</div>
+                  <ul id="market-analysis-causes" class="ai-list"></ul>
+                </div>
+                <div class="ai-detail-box">
+                  <div class="ai-detail-title">시사점 / 대응 방향</div>
+                  <ul id="market-analysis-recommendations" class="ai-list"></ul>
+                </div>
+              </div>
+
+              <div class="ai-detail-box mt-3">
+                <div class="ai-detail-title">분석에 사용한 입력</div>
+                <div id="market-analysis-used-inputs" class="ai-tags"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <!-- 상단 핵심 지표 -->
     <section class="grid grid-cols-2 xl:grid-cols-6 gap-3 md:gap-4 mb-6">
@@ -829,13 +1385,32 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     let equityCurveChart = null;
     let drawdownChart = null;
 
+    const API = {
+      summary: "/api/summary",
+      performanceSummary: "/api/performance/summary",
+      dailyPnl: "/api/performance/daily-pnl?days=30",
+      equityCurve: "/api/performance/equity-curve?limit=500",
+      drawdownCurve: "/api/performance/drawdown-curve?limit=500",
+      entryScores: "/api/entry-scores/recent?limit=300",
+      skipReasons: "/api/events/skip-reasons?days=7&limit=15",
+      skipHourly: "/api/events/skip-hourly?days=7",
+      engineStatus: "/api/engine/status",
+      positionCurrent: "/api/position/current",
+      decisionLatest: "/api/decision/latest",
+      errorCounts: "/api/errors/counts?minutes=10",
+      errorsRecent: "/api/errors/recent?limit=50",
+      tradesRecent: "/api/trades/recent?limit=30",
+      quantAnalysis: "/api/quant-analysis",
+      marketAnalysis: "/api/market-analysis"
+    };
+
     const state = {
       decision: null,
       position: null,
       engine: null,
       errorCounts: null,
       recentErrors: [],
-      recentTrades: [],
+      recentTrades: []
     };
 
     function isMobileBlocked() {
@@ -884,13 +1459,28 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       el.textContent = "";
     }
 
-    async function fetchJsonStrict(url, label, timeoutMs = 8000) {
+    function showEl(id) {
+      const el = $(id);
+      if (!el) return;
+      el.classList.remove("hidden");
+    }
+
+    function hideEl(id) {
+      const el = $(id);
+      if (!el) return;
+      el.classList.add("hidden");
+    }
+
+    async function fetchJsonStrict(url, label, timeoutMs = 15000) {
       const controller = new AbortController();
       const t = setTimeout(() => controller.abort(), timeoutMs);
 
       let res;
       try {
-        res = await fetch(url, { signal: controller.signal, cache: "no-store" });
+        res = await fetch(url, {
+          signal: controller.signal,
+          cache: "no-store"
+        });
       } catch (e) {
         clearTimeout(t);
         throw new Error(`${label}: 요청 실패 (${e && e.name ? e.name : "ERR"})`);
@@ -912,6 +1502,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       if (data === null || typeof data !== "object") {
         throw new Error(`${label}: 응답 구조 오류`);
       }
+
       return data;
     }
 
@@ -989,13 +1580,29 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       let dot = "tiny-dot-neutral";
       const s = String(statusText || "").toUpperCase();
 
-      if (s.includes("OK") || s === "OPEN" || s === "CONNECTED" || s === "ENTRY" || s === "HOLD") {
+      if (
+        s.includes("OK") ||
+        s === "OPEN" ||
+        s === "CONNECTED" ||
+        s === "ENTRY" ||
+        s === "HOLD" ||
+        s === "QUANT_ANALYSIS" ||
+        s === "MARKET_ANALYSIS"
+      ) {
         cls = "status-ok";
         dot = "tiny-dot-ok";
       } else if (s.includes("WARNING") || s.includes("WARN")) {
         cls = "status-warning";
         dot = "tiny-dot-warning";
-      } else if (s.includes("FATAL") || s.includes("ERROR") || s.includes("EXIT") || s.includes("NO_ENTRY") || s.includes("CLOSED") || s.includes("FLAT")) {
+      } else if (
+        s.includes("FATAL") ||
+        s.includes("ERROR") ||
+        s.includes("EXIT") ||
+        s.includes("NO_ENTRY") ||
+        s.includes("CLOSED") ||
+        s.includes("FLAT") ||
+        s.includes("OUT_OF_SCOPE")
+      ) {
         cls = "status-fatal";
         dot = "tiny-dot-fatal";
       }
@@ -1044,7 +1651,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         ["recent_skips_high", "최근 진입 안 함이 많음"],
         ["db_latency_ms_high", "DB 지연 시간이 큼"],
         ["position event not found", "현재 보유 기록을 찾지 못함"],
-        ["all trades were filtered as test trades", "테스트 거래만 있어서 실거래 데이터가 없음"]
+        ["all trades were filtered as test trades", "테스트 거래만 있어서 실거래 데이터가 없음"],
+        ["range_market_entry", "박스권에서 진입해 손실 발생"],
+        ["weak_pattern_entry", "패턴 점수가 낮은 상태에서 진입"],
+        ["wide_spread_entry", "매수·매도 차이가 큰 상태에서 진입"],
+        ["depth_imbalance_entry", "호가창 불균형 상태에서 진입"],
+        ["high_volatility_entry", "변동성이 큰 상태에서 진입"],
+        ["unclassified_loss_context", "손실 원인을 분류하지 못함"],
+        ["dashboard_query", "대시보드 AI 질의"],
+        ["market_query", "외부 시장 AI 질의"],
+        ["market_report", "자동 시장 분석 리포트"],
+        ["system_report", "자동 시스템 분석 리포트"]
       ];
 
       for (const [key, label] of reasonMap) {
@@ -1087,6 +1704,27 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     function normalizeWatchdogReason(reason) {
       return normalizeReasonText(reason);
+    }
+
+    function normalizeAiScope(scope) {
+      const s = String(scope || "").trim();
+      if (!s) return "-";
+      const map = {
+        quant_analysis: "내부 거래 분석",
+        market_analysis: "외부 시장 분석",
+        mixed: "통합 분석",
+        out_of_scope: "범위 밖 질문"
+      };
+      return map[s] || s;
+    }
+
+    function normalizeUsedInputTag(input) {
+      const map = {
+        internal_market_summary: "내부 시장 요약",
+        trade_summary: "거래 요약",
+        external_market_summary: "외부 시장 요약"
+      };
+      return map[input] || input;
     }
 
     function createOrUpdateChart(existing, canvasId, type, labels, data, datasetLabel) {
@@ -1160,8 +1798,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         : "-";
 
       const ddText = perfSummary
-        ? `${fmtMaybe(perfSummary.max_drawdown_usdt, 2)} USDT / ${perfSummary.max_drawdown_pct !== null ? fmtNumber(perfSummary.max_drawdown_pct, 2) + "%" : "-"}`
-        : "-";
+        ? `${fmtMaybe(perfSummary.max_drawdown_usdt, 2)} USDT / ${perfSummary.max_drawdown_pct !== null ? fmtNumber(perfSummary.max_drawdown_pct, 2) + "%" : "-"}` : "-";
       $("summary-max-dd").textContent = ddText;
     }
 
@@ -1185,7 +1822,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         throw new Error("engine_status: ws_status invalid");
       }
 
-      const sourceLabel = wsStatus.source === "database" ? "DB 기준 확인" : (wsStatus.available ? "확인 가능" : "확인 불가");
+      const sourceLabel = wsStatus.source === "database"
+        ? "DB 기준 확인"
+        : (wsStatus.available ? "확인 가능" : "확인 불가");
       $("engine-ws-available").textContent = sourceLabel;
 
       $("engine-best-bid").textContent =
@@ -1254,8 +1893,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
       const exitScoreText =
         data.exit_score !== undefined && data.exit_score !== null
-          ? `${fmtMaybe(data.exit_score, 3)} / ${data.threshold !== undefined && data.threshold !== null ? fmtMaybe(data.threshold, 3) : "-"}`
-          : data.threshold !== undefined && data.threshold !== null
+          ? `${fmtMaybe(data.exit_score, 3)} / ${data.threshold !== undefined && data.threshold !== null ? fmtMaybe(data.threshold, 3) : "-"}` :
+          data.threshold !== undefined && data.threshold !== null
             ? `- / ${fmtMaybe(data.threshold, 3)}`
             : "-";
       $("decision-exit-score").textContent = exitScoreText;
@@ -1381,11 +2020,127 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       });
     }
 
+    function renderAiList(targetId, items) {
+      const box = $(targetId);
+      if (!box) return;
+      box.innerHTML = "";
+
+      if (!Array.isArray(items) || !items.length) {
+        const li = document.createElement("li");
+        li.textContent = "없음";
+        box.appendChild(li);
+        return;
+      }
+
+      items.forEach((item) => {
+        const li = document.createElement("li");
+        li.textContent = String(item || "-");
+        box.appendChild(li);
+      });
+    }
+
+    function renderAiTags(targetId, items) {
+      const box = $(targetId);
+      if (!box) return;
+      box.innerHTML = "";
+
+      if (!Array.isArray(items) || !items.length) {
+        const span = document.createElement("span");
+        span.className = "ai-tag";
+        span.textContent = "없음";
+        box.appendChild(span);
+        return;
+      }
+
+      items.forEach((item) => {
+        const span = document.createElement("span");
+        span.className = "ai-tag";
+        span.textContent = normalizeUsedInputTag(item);
+        box.appendChild(span);
+      });
+    }
+
+    function renderAiAnalysis(prefix, data) {
+      if (!data || typeof data !== "object") {
+        throw new Error("AI 분석 응답 구조 오류");
+      }
+
+      const answer = typeof data.answer_ko === "string" ? data.answer_ko : null;
+      const scope = typeof data.scope === "string" ? data.scope : null;
+      const confidence = data.confidence;
+
+      if (!answer || !scope) {
+        throw new Error("AI 분석 핵심 필드 누락");
+      }
+
+      $(`${prefix}-analysis-answer`).textContent = answer;
+      $(`${prefix}-analysis-scope`).textContent = normalizeAiScope(scope);
+      $(`${prefix}-analysis-confidence`).textContent =
+        typeof confidence === "number" ? `${fmtNumber(confidence * 100, 1)}%` : "-";
+
+      renderAiList(`${prefix}-analysis-causes`, data.root_causes);
+      renderAiList(`${prefix}-analysis-recommendations`, data.recommendations);
+      renderAiTags(`${prefix}-analysis-used-inputs`, data.used_inputs);
+
+      hideEl(`${prefix}-analysis-loading`);
+      hideEl(`${prefix}-analysis-error`);
+      showEl(`${prefix}-analysis-result`);
+    }
+
+    async function requestQuantAnalysis() {
+      const question = $("quant-question").value.trim();
+      const includeExternal = $("quant-include-external").checked;
+
+      hideEl("quant-analysis-result");
+      clearWidgetError("quant-analysis-error");
+      showEl("quant-analysis-loading");
+
+      if (!question) {
+        hideEl("quant-analysis-loading");
+        setWidgetError("quant-analysis-error", "질문을 입력해 주세요.");
+        return;
+      }
+
+      try {
+        const url = `${API.quantAnalysis}?question=${encodeURIComponent(question)}&include_external_market=${includeExternal ? "true" : "false"}`;
+        const data = await fetchJsonStrict(url, "통합 분석", 30000);
+        renderAiAnalysis("quant", data);
+      } catch (e) {
+        hideEl("quant-analysis-loading");
+        setWidgetError("quant-analysis-error", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
+    async function requestMarketAnalysis() {
+      const question = $("market-question").value.trim();
+
+      hideEl("market-analysis-result");
+      clearWidgetError("market-analysis-error");
+      showEl("market-analysis-loading");
+
+      if (!question) {
+        hideEl("market-analysis-loading");
+        setWidgetError("market-analysis-error", "질문을 입력해 주세요.");
+        return;
+      }
+
+      try {
+        const url = `${API.marketAnalysis}?question=${encodeURIComponent(question)}`;
+        const data = await fetchJsonStrict(url, "외부 시장 분석", 30000);
+        renderAiAnalysis("market", data);
+      } catch (e) {
+        hideEl("market-analysis-loading");
+        setWidgetError("market-analysis-error", `ERROR: ${e.message || String(e)}`);
+        showBannerError(e.message || String(e));
+      }
+    }
+
     async function loadSummary() {
       try {
         const [summary, perfSummary] = await Promise.all([
-          fetchJsonStrict("/api/summary", "요약"),
-          fetchJsonStrict("/api/performance/summary", "성과 요약")
+          fetchJsonStrict(API.summary, "요약"),
+          fetchJsonStrict(API.performanceSummary, "성과 요약")
         ]);
         renderSummary(summary, perfSummary);
       } catch (e) {
@@ -1403,7 +2158,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadDailyPnlChart() {
       clearWidgetError("dailyPnlError");
       try {
-        const data = await fetchJsonStrict("/api/performance/daily-pnl?days=30", "일별 손익");
+        const data = await fetchJsonStrict(API.dailyPnl, "일별 손익");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("일별 손익: items invalid");
 
@@ -1431,7 +2186,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadEquityCurveChart() {
       clearWidgetError("equityCurveError");
       try {
-        const data = await fetchJsonStrict("/api/performance/equity-curve?limit=500", "누적 손익 흐름");
+        const data = await fetchJsonStrict(API.equityCurve, "누적 손익 흐름");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("누적 손익 흐름: items invalid");
 
@@ -1459,7 +2214,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadDrawdownChart() {
       clearWidgetError("drawdownError");
       try {
-        const data = await fetchJsonStrict("/api/performance/drawdown-curve?limit=500", "하락폭 흐름");
+        const data = await fetchJsonStrict(API.drawdownCurve, "하락폭 흐름");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("하락폭 흐름: items invalid");
 
@@ -1487,7 +2242,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadEntryScoreHist() {
       clearWidgetError("entryScoreError");
       try {
-        const data = await fetchJsonStrict("/api/entry-scores/recent?limit=300", "진입 점수 분포");
+        const data = await fetchJsonStrict(API.entryScores, "진입 점수 분포");
         const labels = Array.isArray(data.hist_labels) ? data.hist_labels : null;
         const counts = Array.isArray(data.hist_counts) ? data.hist_counts : null;
         if (!labels || !counts) throw new Error("진입 점수 분포: histogram invalid");
@@ -1510,7 +2265,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadSkipReasons() {
       clearWidgetError("skipReasonsError");
       try {
-        const data = await fetchJsonStrict("/api/events/skip-reasons?days=7&limit=15", "진입 안 한 이유");
+        const data = await fetchJsonStrict(API.skipReasons, "진입 안 한 이유");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("진입 안 한 이유: items invalid");
         renderSkipReasons(items);
@@ -1523,7 +2278,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadSkipHourly() {
       clearWidgetError("skipHourlyError");
       try {
-        const data = await fetchJsonStrict("/api/events/skip-hourly?days=7", "시간대별 진입 안 함");
+        const data = await fetchJsonStrict(API.skipHourly, "시간대별 진입 안 함");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("시간대별 진입 안 함: items invalid");
 
@@ -1551,7 +2306,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadEngineStatus() {
       clearWidgetError("engineError");
       try {
-        const data = await fetchJsonStrict("/api/engine/status", "핵심 상태");
+        const data = await fetchJsonStrict(API.engineStatus, "핵심 상태");
         renderEngineStatus(data);
       } catch (e) {
         setWidgetError("engineError", `ERROR: ${e.message || String(e)}`);
@@ -1562,7 +2317,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadPosition() {
       clearWidgetError("positionError");
       try {
-        const data = await fetchJsonStrict("/api/position/current", "현재 보유");
+        const data = await fetchJsonStrict(API.positionCurrent, "현재 보유");
         renderPosition(data);
       } catch (e) {
         setWidgetError("positionError", `ERROR: ${e.message || String(e)}`);
@@ -1573,7 +2328,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadDecision() {
       clearWidgetError("decisionError");
       try {
-        const data = await fetchJsonStrict("/api/decision/latest", "판단 이유");
+        const data = await fetchJsonStrict(API.decisionLatest, "판단 이유");
         renderDecision(data);
       } catch (e) {
         setWidgetError("decisionError", `ERROR: ${e.message || String(e)}`);
@@ -1585,8 +2340,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       clearWidgetError("errorMonitorError");
       try {
         const [counts, recent] = await Promise.all([
-          fetchJsonStrict("/api/errors/counts?minutes=10", "문제 개수"),
-          fetchJsonStrict("/api/errors/recent?limit=50", "최근 문제")
+          fetchJsonStrict(API.errorCounts, "문제 개수"),
+          fetchJsonStrict(API.errorsRecent, "최근 문제")
         ]);
 
         if (!counts.items || typeof counts.items !== "object") {
@@ -1607,7 +2362,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadTrades() {
       clearWidgetError("tradesError");
       try {
-        const data = await fetchJsonStrict("/api/trades/recent?limit=30", "최근 거래");
+        const data = await fetchJsonStrict(API.tradesRecent, "최근 거래");
         if (!Array.isArray(data.items)) throw new Error("최근 거래: items invalid");
         renderTradesTable(data.items);
       } catch (e) {
@@ -1722,6 +2477,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       }
     }
 
+    function bindQuickQuestionButtons() {
+      document.querySelectorAll(".ai-quick-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const targetId = btn.getAttribute("data-target");
+          const question = btn.getAttribute("data-question") || "";
+          const target = targetId ? $(targetId) : null;
+          if (!target) return;
+          target.value = question;
+          target.focus();
+        });
+      });
+    }
+
     async function loadAll() {
       hideBannerError();
 
@@ -1754,14 +2522,35 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       $("refresh-btn").addEventListener("click", () => {
         loadAll();
       });
+
       $("error-banner-close").addEventListener("click", () => hideBannerError());
+
+      $("quant-search-btn").addEventListener("click", async () => {
+        await requestQuantAnalysis();
+      });
+
+      $("market-search-btn").addEventListener("click", async () => {
+        await requestMarketAnalysis();
+      });
+
+      $("quant-question").addEventListener("keydown", async (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+          e.preventDefault();
+          await requestQuantAnalysis();
+        }
+      });
+
+      $("market-question").addEventListener("keydown", async (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+          e.preventDefault();
+          await requestMarketAnalysis();
+        }
+      });
+
+      bindQuickQuestionButtons();
 
       await loadAll();
     });
   </script>
 </body>
 </html>
-
-여기 까지가? 정신차려 최종 코드 다시 줘 제대로 كاملة 해서  한글로 좀   메뉴도좀보기 편하게 해줘
-
-`/api/engine/ws-status`와 `/api/engine/health`가 더 이상 엔진 메모리를 보지 않고 DB 스냅샷을 기준으로 동작합니다.

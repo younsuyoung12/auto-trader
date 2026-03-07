@@ -2,6 +2,7 @@
 """
 ========================================================
 FILE: settings.py
+AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
@@ -11,9 +12,47 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 잘못된 설정은 즉시 예외(Fail-Fast).
 - 민감정보(API key/secret, DB URL 등) 로그 금지.
 - 테스트 토글은 settings에서만 읽는다(다른 모듈의 os.getenv 직접 접근 금지).
+- 구성 불변 규칙:
+  - Settings는 런타임 불변(frozen) 객체로 제공한다.
+  - 설정 변경은 명시적 재시작/재배포를 통해서만 반영한다.
+- 분석/대시보드/외부 시장 분석 설정도 본 파일에서만 로드한다.
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-07 (AI TRADING INTELLIGENCE):
+  1) AI Quant Analyst / AI Market Analyst 설정 추가
+     - analyst_market_symbol
+     - analyst_db_market_timeframe
+     - analyst_db_market_lookback_limit
+     - analyst_pattern_entry_threshold
+     - analyst_spread_guard_bps
+     - analyst_imbalance_guard_abs
+     - analyst_trade_lookback_limit
+     - analyst_event_lookback_limit
+     - analyst_include_external_market
+     - analyst_auto_report_market_interval_sec
+     - analyst_auto_report_system_interval_sec
+     - analyst_auto_report_persist
+     - analyst_auto_report_notify
+     - analyst_openai_model
+     - analyst_openai_timeout_sec
+     - analyst_openai_max_output_tokens
+     - analyst_openai_temperature
+     - analyst_openai_reasoning_effort
+  2) Binance 외부 시장 분석 설정 추가
+     - binance_futures_base_url
+     - analyst_kline_interval
+     - analyst_kline_limit
+     - analyst_http_timeout_sec
+     - analyst_ratio_period
+     - analyst_ratio_limit
+     - analyst_depth_limit
+     - analyst_funding_limit
+     - analyst_force_order_limit
+     - analyst_max_server_drift_ms
+  3) SETTINGS singleton 추가
+  4) frozen dataclass 적용(구성 불변 규칙)
+  5) 대문자 alias 접근 지원(__getattr__)
 - 2026-03-06 (TRADE-GRADE):
   1) 실전 운영 기본값 정비:
      - allocation_ratio / risk_pct 기본값 1.0 → 0.35
@@ -31,7 +70,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - ws_klines_stale_sec
   4) STRICT 검증 추가:
      - spread/slippage/drift 관련 범위 검증 추가
-
 - 2026-03-04 (TRADE-GRADE):
   1) OpenAI 설정 SSOT 필드 추가:
      - openai_api_key / openai_model / openai_max_tokens / openai_temperature / openai_max_latency_sec
@@ -42,7 +80,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   3) STRICT 검증 추가:
      - openai_api_key / openai_model 누락 시 즉시 예외
      - openai_max_tokens 범위, temperature 범위, max_latency_sec > 0 검증
-
 - 2026-03-03 (TRADE-GRADE):
   1) 테스트 토글을 settings로 공식화(SSOT):
      - test_dry_run / test_bypass_guards / test_force_enter / test_fake_available_usdt 추가
@@ -54,7 +91,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - position_resync_sec
   4) 누락된 env 매핑 보완:
      - session_jump_mult_* env 로딩 추가
-
 ========================================================
 """
 
@@ -74,10 +110,53 @@ logger = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Alias map for strict uppercase access compatibility
+# ---------------------------------------------------------------------
+_SETTINGS_ALIAS_MAP: Dict[str, str] = {
+    # 기존 OpenAI
+    "OPENAI_API_KEY": "openai_api_key",
+    "OPENAI_MODEL": "openai_model",
+    "OPENAI_MAX_TOKENS": "openai_max_tokens",
+    "OPENAI_TEMPERATURE": "openai_temperature",
+    "OPENAI_MAX_LATENCY_SEC": "openai_max_latency_sec",
+    # AI analyst
+    "ANALYST_MARKET_SYMBOL": "analyst_market_symbol",
+    "ANALYST_DB_MARKET_TIMEFRAME": "analyst_db_market_timeframe",
+    "ANALYST_DB_MARKET_LOOKBACK_LIMIT": "analyst_db_market_lookback_limit",
+    "ANALYST_PATTERN_ENTRY_THRESHOLD": "analyst_pattern_entry_threshold",
+    "ANALYST_SPREAD_GUARD_BPS": "analyst_spread_guard_bps",
+    "ANALYST_IMBALANCE_GUARD_ABS": "analyst_imbalance_guard_abs",
+    "ANALYST_TRADE_LOOKBACK_LIMIT": "analyst_trade_lookback_limit",
+    "ANALYST_EVENT_LOOKBACK_LIMIT": "analyst_event_lookback_limit",
+    "ANALYST_INCLUDE_EXTERNAL_MARKET": "analyst_include_external_market",
+    "ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC": "analyst_auto_report_market_interval_sec",
+    "ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC": "analyst_auto_report_system_interval_sec",
+    "ANALYST_AUTO_REPORT_PERSIST": "analyst_auto_report_persist",
+    "ANALYST_AUTO_REPORT_NOTIFY": "analyst_auto_report_notify",
+    "ANALYST_OPENAI_MODEL": "analyst_openai_model",
+    "ANALYST_OPENAI_TIMEOUT_SEC": "analyst_openai_timeout_sec",
+    "ANALYST_OPENAI_MAX_OUTPUT_TOKENS": "analyst_openai_max_output_tokens",
+    "ANALYST_OPENAI_TEMPERATURE": "analyst_openai_temperature",
+    "ANALYST_OPENAI_REASONING_EFFORT": "analyst_openai_reasoning_effort",
+    # Binance market fetcher
+    "BINANCE_FUTURES_BASE_URL": "binance_futures_base_url",
+    "ANALYST_KLINE_INTERVAL": "analyst_kline_interval",
+    "ANALYST_KLINE_LIMIT": "analyst_kline_limit",
+    "ANALYST_HTTP_TIMEOUT_SEC": "analyst_http_timeout_sec",
+    "ANALYST_RATIO_PERIOD": "analyst_ratio_period",
+    "ANALYST_RATIO_LIMIT": "analyst_ratio_limit",
+    "ANALYST_DEPTH_LIMIT": "analyst_depth_limit",
+    "ANALYST_FUNDING_LIMIT": "analyst_funding_limit",
+    "ANALYST_FORCE_ORDER_LIMIT": "analyst_force_order_limit",
+    "ANALYST_MAX_SERVER_DRIFT_MS": "analyst_max_server_drift_ms",
+}
+
+
+# ---------------------------------------------------------------------
 # Dataclasses
-# -----------------------------------------------------------------------------
-@dataclass(slots=True)
+# ---------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Runtime settings for the trading engine (Binance USDT-M Futures)."""
 
@@ -90,7 +169,7 @@ class Settings:
     interval: str = "5m"
 
     # Futures config
-    leverage: int = 1  # 전액 배분형 전제였으나, 기본 allocation은 실전형으로 조정
+    leverage: int = 1
     isolated: bool = True
     margin_mode: str = "ISOLATED"
     futures_position_mode: str = "ONEWAY"
@@ -105,22 +184,20 @@ class Settings:
     price_tick: float = 0.1
 
     # Strategy / sizing
-    # canonical: allocation_ratio(0~1) = 계좌 투입 비율
     allocation_ratio: float = 0.35
-    # legacy alias (호환): 의미는 allocation_ratio와 동일하게 강제
     risk_pct: float = 0.35
 
-    # Default TP/SL (signal이 이 값을 override 가능)
+    # Default TP/SL
     tp_pct: float = 0.006
     sl_pct: float = 0.003
 
-    # TP/SL bounds (signal 값 가드)
+    # TP/SL bounds
     tp_pct_min: float = 0.0005
     tp_pct_max: float = 0.05
     sl_pct_min: float = 0.0005
-    sl_pct_max: float = 0.05  # legacy max_sl_pct와 별개(운영형 가드)
+    sl_pct_max: float = 0.05
 
-    # Legacy (kept)
+    # Legacy
     max_sl_pct: float = 0.015
     max_trade_qty: float = 1.0
 
@@ -136,27 +213,21 @@ class Settings:
     gpt_min_confidence: float = 0.6
     gpt_reject_if_over_pnl_pct: float = 0.02
 
-    # ─────────────────────────────────────────────
-    # OpenAI (SSOT) — TRADE-GRADE
-    # ─────────────────────────────────────────────
+    # OpenAI (engine)
     openai_api_key: str = ""
     openai_model: str = ""
     openai_max_tokens: int = 1500
     openai_temperature: float = 0.2
     openai_max_latency_sec: float = 12.0
 
-    # =========================
-    # ENTRY FLOW SETTINGS
-    # =========================
-
-    entry_score_threshold = 0.55
-    entry_tp_pct = 0.01
-    entry_sl_pct = 0.005
-    entry_risk_pct = 0.02
-
-    entry_max_spread_pct = 0.002
-    entry_min_trend_strength = 0.2
-    entry_min_abs_orderbook_imbalance = 0.05
+    # Entry flow
+    entry_score_threshold: float = 0.55
+    entry_tp_pct: float = 0.01
+    entry_sl_pct: float = 0.005
+    entry_risk_pct: float = 0.02
+    entry_max_spread_pct: float = 0.002
+    entry_min_trend_strength: float = 0.2
+    entry_min_abs_orderbook_imbalance: float = 0.05
 
     # Notifications
     unrealized_notify_sec: int = 1800
@@ -195,16 +266,16 @@ class Settings:
     ws_stale_reset_sec: float = 600.0
     ws_klines_stale_sec: float = 180.0
 
-    # WS bootstrap/backfill (run_bot_ws)
+    # WS bootstrap/backfill
     ws_backfill_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     ws_backfill_limit: int = 500
 
-    # Market-data store worker settings (run_bot_ws)
+    # Market-data store worker settings
     md_store_flush_sec: float = 5.0
     ob_store_interval_sec: float = 5.0
     md_store_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
 
-    # Guards (entry_guards_ws)
+    # Guards
     max_spread_pct: float = 0.0015
     max_spread_abs: float = 0.0
     min_entry_volume_ratio: float = 0.15
@@ -245,10 +316,10 @@ class Settings:
     max_signal_latency_ms: int = 200
     max_exec_latency_ms: int = 2500
 
-    # run_bot_ws: exchange state resync
+    # run_bot_ws
     position_resync_sec: float = 20.0
 
-    # Drift detector (SSOT)
+    # Drift detector
     drift_allocation_abs_jump: float = 0.45
     drift_allocation_spike_ratio: float = 3.0
     drift_multiplier_abs_jump: float = 0.50
@@ -257,6 +328,7 @@ class Settings:
 
     # Exchange endpoints
     binance_futures_base: str = "https://fapi.binance.com"
+    binance_futures_base_url: str = "https://fapi.binance.com"
 
     # Legacy aliases
     binance_recv_window: int = 5000
@@ -269,7 +341,6 @@ class Settings:
     hard_liquidation_distance_pct_min: float = 0.0
 
     # Slippage / protection
-    # fraction 기준: 0.002 = 0.2%
     slippage_block_pct: float = 0.002
     slippage_stop_engine: bool = False
     protection_mode_enabled: bool = True
@@ -277,14 +348,14 @@ class Settings:
     # 실행/멱등성/체결 확정
     require_deterministic_client_order_id: bool = True
     entry_fill_wait_sec: float = 2.0
-    max_entry_slippage_pct: Optional[float] = None  # None이면 비활성
+    max_entry_slippage_pct: Optional[float] = None
 
-    # TEST controls (TRADE-GRADE)
+    # TEST controls
     test_dry_run: bool = False
     test_bypass_guards: bool = False
     test_force_enter: bool = False
     test_fake_available_usdt: float = 0.0
-    
+
     # Redis cache (Dashboard)
     redis_url: str = "redis://localhost:6379/0"
     dashboard_cache_prefix: str = "auto_trader_dashboard"
@@ -293,19 +364,58 @@ class Settings:
     redis_socket_connect_timeout_sec: float = 1.0
     redis_health_check_interval_sec: int = 30
 
+    # AI Trading Intelligence
+    analyst_market_symbol: str = "BTCUSDT"
+    analyst_db_market_timeframe: str = "5m"
+    analyst_db_market_lookback_limit: int = 60
+    analyst_pattern_entry_threshold: float = 0.55
+    analyst_spread_guard_bps: float = 15.0
+    analyst_imbalance_guard_abs: float = 0.60
+    analyst_trade_lookback_limit: int = 30
+    analyst_event_lookback_limit: int = 300
+    analyst_include_external_market: bool = True
+
+    analyst_auto_report_market_interval_sec: int = 300
+    analyst_auto_report_system_interval_sec: int = 1800
+    analyst_auto_report_persist: bool = True
+    analyst_auto_report_notify: bool = False
+
+    analyst_openai_model: str = ""
+    analyst_openai_timeout_sec: float = 15.0
+    analyst_openai_max_output_tokens: int = 1200
+    analyst_openai_temperature: float = 0.1
+    analyst_openai_reasoning_effort: Optional[str] = None
+
+    analyst_kline_interval: str = "5m"
+    analyst_kline_limit: int = 120
+    analyst_http_timeout_sec: float = 10.0
+    analyst_ratio_period: str = "5m"
+    analyst_ratio_limit: int = 30
+    analyst_depth_limit: int = 20
+    analyst_funding_limit: int = 10
+    analyst_force_order_limit: int = 50
+    analyst_max_server_drift_ms: int = 5000
+
+    def __getattr__(self, name: str) -> object:
+        alias = _SETTINGS_ALIAS_MAP.get(name)
+        if alias is not None:
+            return object.__getattribute__(self, alias)
+        raise AttributeError(name)
+
+
 # Backward-compatible alias for legacy type hints
 BotSettings = Settings
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class PatternStrengthSettings:
     """Optional pattern-strength overrides used by pattern_detection."""
     pattern_strengths: Dict[str, float] = field(default_factory=dict)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Optional .env loader (no external deps)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def _strip_inline_comment(s: str) -> str:
     out: list[str] = []
     in_single = False
@@ -361,7 +471,6 @@ def _load_env_file_into_environ(dotenv_path: Path) -> None:
         if not key:
             raise ValueError(f"invalid .env line (empty key): {raw_line}")
 
-        # env 우선권: 이미 존재하면 덮어쓰지 않는다.
         if key in os.environ:
             continue
 
@@ -389,9 +498,9 @@ def _try_load_local_dotenv() -> None:
             return
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Type conversion helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def _get_env(key: str) -> Optional[str]:
     v = os.environ.get(key)
     if v is None:
@@ -471,9 +580,15 @@ def _as_csv_list(key: str, default: List[str]) -> List[str]:
     return out if out else list(default)
 
 
-# -----------------------------------------------------------------------------
-# Validation
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------
+def _validate_supported_ratio_period(period: str) -> None:
+    supported = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+    if period not in supported:
+        raise ValueError(f"analyst_ratio_period must be one of {sorted(supported)}")
+
+
 def _validate_settings(s: Settings) -> None:
     if not s.api_key or not s.api_secret:
         raise RuntimeError("missing Binance credentials (BINANCE_API_KEY / BINANCE_API_SECRET)")
@@ -504,22 +619,17 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("price_tick must be > 0")
 
     mm = str(s.margin_mode or "").strip().upper()
-    if mm in {"CROSS", "CROSSED"}:
-        mm = "CROSSED"
     if mm not in {"ISOLATED", "CROSSED"}:
         raise ValueError("margin_mode must be ISOLATED or CROSSED")
 
-    # Allocation Mode: allocation_ratio(0~1] 강제
     if not (0.0 < float(s.allocation_ratio) <= 1.0):
         raise ValueError("allocation_ratio must be within (0,1]")
 
-    # Legacy alias도 같은 범위 + 값 일치 강제(스케일 충돌 방지)
     if not (0.0 < float(s.risk_pct) <= 1.0):
         raise ValueError("risk_pct must be within (0,1] (legacy alias)")
     if abs(float(s.risk_pct) - float(s.allocation_ratio)) > 1e-12:
         raise ValueError("risk_pct must equal allocation_ratio (do not set them differently)")
 
-    # TP/SL bounds
     for name, v in [
         ("tp_pct_min", s.tp_pct_min),
         ("tp_pct_max", s.tp_pct_max),
@@ -575,7 +685,6 @@ def _validate_settings(s: Settings) -> None:
     if s.sigterm_grace_sec <= 0:
         raise ValueError("sigterm_grace_sec must be > 0")
 
-    # 운영 파라미터
     if s.async_worker_threads < 1:
         raise ValueError("async_worker_threads must be >= 1")
     if s.async_worker_queue_size < 1:
@@ -589,7 +698,6 @@ def _validate_settings(s: Settings) -> None:
     if s.max_exec_latency_ms < 1:
         raise ValueError("max_exec_latency_ms must be >= 1")
 
-    # WS bootstrap/store
     if s.preflight_ws_wait_sec < 1:
         raise ValueError("preflight_ws_wait_sec must be >= 1")
     if s.ws_min_kline_buffer < 1:
@@ -613,7 +721,6 @@ def _validate_settings(s: Settings) -> None:
     if s.position_resync_sec <= 0:
         raise ValueError("position_resync_sec must be > 0")
 
-    # Drift detector
     if not (0.0 < float(s.drift_allocation_abs_jump) <= 1.0):
         raise ValueError("drift_allocation_abs_jump must be within (0,1]")
     if float(s.drift_allocation_spike_ratio) <= 1.0:
@@ -625,7 +732,6 @@ def _validate_settings(s: Settings) -> None:
     if s.drift_stable_regime_steps < 2:
         raise ValueError("drift_stable_regime_steps must be >= 2")
 
-    # 실행/멱등성
     if not isinstance(s.require_deterministic_client_order_id, bool):
         raise ValueError("require_deterministic_client_order_id must be bool")
 
@@ -640,7 +746,6 @@ def _validate_settings(s: Settings) -> None:
         if float(s.max_entry_slippage_pct) < 0:
             raise ValueError("max_entry_slippage_pct must be >= 0")
 
-    # OpenAI (SSOT) — STRICT
     if not str(s.openai_api_key or "").strip():
         raise RuntimeError("missing OpenAI key (OPENAI_API_KEY)")
     if not str(s.openai_model or "").strip():
@@ -656,7 +761,6 @@ def _validate_settings(s: Settings) -> None:
     ):
         raise ValueError("openai_max_latency_sec must be finite > 0")
 
-    # TEST controls (TRADE-GRADE)
     if s.test_bypass_guards and not s.test_dry_run:
         raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
     if s.test_force_enter and not s.test_dry_run:
@@ -666,10 +770,82 @@ def _validate_settings(s: Settings) -> None:
     if float(s.test_fake_available_usdt) < 0:
         raise ValueError("test_fake_available_usdt must be >= 0 (STRICT)")
 
+    if not str(s.redis_url or "").strip():
+        raise RuntimeError("redis_url is required (STRICT)")
+    if not str(s.dashboard_cache_prefix or "").strip():
+        raise RuntimeError("dashboard_cache_prefix is required (STRICT)")
+    if s.dashboard_cache_ttl_sec < 1:
+        raise ValueError("dashboard_cache_ttl_sec must be >= 1")
+    if s.redis_socket_timeout_sec <= 0:
+        raise ValueError("redis_socket_timeout_sec must be > 0")
+    if s.redis_socket_connect_timeout_sec <= 0:
+        raise ValueError("redis_socket_connect_timeout_sec must be > 0")
+    if s.redis_health_check_interval_sec < 1:
+        raise ValueError("redis_health_check_interval_sec must be >= 1")
 
-# -----------------------------------------------------------------------------
+    # AI Trading Intelligence validations
+    analyst_symbol = str(s.analyst_market_symbol or "").strip().upper()
+    if not analyst_symbol:
+        raise ValueError("analyst_market_symbol is empty")
+    if any(ch.isspace() for ch in analyst_symbol):
+        raise ValueError("analyst_market_symbol contains whitespace")
+
+    if not str(s.analyst_db_market_timeframe or "").strip():
+        raise ValueError("analyst_db_market_timeframe is empty")
+    if s.analyst_db_market_lookback_limit < 5:
+        raise ValueError("analyst_db_market_lookback_limit must be >= 5")
+    if s.analyst_trade_lookback_limit < 5:
+        raise ValueError("analyst_trade_lookback_limit must be >= 5")
+    if s.analyst_event_lookback_limit < 1:
+        raise ValueError("analyst_event_lookback_limit must be >= 1")
+    if s.analyst_pattern_entry_threshold <= 0:
+        raise ValueError("analyst_pattern_entry_threshold must be > 0")
+    if s.analyst_spread_guard_bps <= 0:
+        raise ValueError("analyst_spread_guard_bps must be > 0")
+    if s.analyst_imbalance_guard_abs <= 0:
+        raise ValueError("analyst_imbalance_guard_abs must be > 0")
+
+    if not str(s.analyst_openai_model or "").strip():
+        raise ValueError("analyst_openai_model is empty")
+    if s.analyst_openai_timeout_sec <= 0:
+        raise ValueError("analyst_openai_timeout_sec must be > 0")
+    if not (1 <= s.analyst_openai_max_output_tokens <= 8192):
+        raise ValueError("analyst_openai_max_output_tokens must be within 1..8192")
+    if not (0.0 <= float(s.analyst_openai_temperature) <= 2.0):
+        raise ValueError("analyst_openai_temperature must be within 0..2")
+    if s.analyst_openai_reasoning_effort is not None:
+        if s.analyst_openai_reasoning_effort not in {"low", "medium", "high"}:
+            raise ValueError("analyst_openai_reasoning_effort must be one of low/medium/high")
+
+    if s.analyst_auto_report_market_interval_sec < 1:
+        raise ValueError("analyst_auto_report_market_interval_sec must be >= 1")
+    if s.analyst_auto_report_system_interval_sec < 1:
+        raise ValueError("analyst_auto_report_system_interval_sec must be >= 1")
+
+    if not str(s.binance_futures_base_url or "").strip():
+        raise ValueError("binance_futures_base_url is empty")
+    if not str(s.analyst_kline_interval or "").strip():
+        raise ValueError("analyst_kline_interval is empty")
+    if s.analyst_kline_limit < 1:
+        raise ValueError("analyst_kline_limit must be >= 1")
+    if s.analyst_http_timeout_sec <= 0:
+        raise ValueError("analyst_http_timeout_sec must be > 0")
+    _validate_supported_ratio_period(s.analyst_ratio_period)
+    if s.analyst_ratio_limit < 1:
+        raise ValueError("analyst_ratio_limit must be >= 1")
+    if s.analyst_depth_limit < 1:
+        raise ValueError("analyst_depth_limit must be >= 1")
+    if s.analyst_funding_limit < 1:
+        raise ValueError("analyst_funding_limit must be >= 1")
+    if s.analyst_force_order_limit < 1:
+        raise ValueError("analyst_force_order_limit must be >= 1")
+    if s.analyst_max_server_drift_ms < 0:
+        raise ValueError("analyst_max_server_drift_ms must be >= 0")
+
+
+# ---------------------------------------------------------------------
 # Public loader
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 def load_settings() -> Settings:
     """Load and validate Settings (env-first, optional .env, then defaults)."""
     _try_load_local_dotenv()
@@ -698,7 +874,6 @@ def load_settings() -> Settings:
     min_qty = _as_float("MIN_QTY", 0.001)
     price_tick = _as_float("PRICE_TICK", 0.1)
 
-    # allocation_ratio: ALLOCATION_RATIO 우선, 없으면 RISK_PCT(호환)
     alloc_env = _as_float_opt("ALLOCATION_RATIO")
     risk_env = _as_float_opt("RISK_PCT")
 
@@ -726,7 +901,6 @@ def load_settings() -> Settings:
 
     entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 8.0)
     cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
-
     min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 28.0)
     gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 10.0)
 
@@ -735,7 +909,6 @@ def load_settings() -> Settings:
     gpt_min_confidence = _as_float("GPT_MIN_CONFIDENCE", 0.6)
     gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
 
-    # OpenAI (SSOT) — env alias 지원
     openai_api_key = _as_str("OPENAI_API_KEY", "")
     openai_model = (
         _as_str_opt("OPENAI_MODEL")
@@ -832,6 +1005,7 @@ def load_settings() -> Settings:
     drift_stable_regime_steps = _as_int("DRIFT_STABLE_REGIME_STEPS", 100)
 
     binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
+    binance_futures_base_url = _as_str("BINANCE_FUTURES_BASE_URL", binance_futures_base)
     binance_recv_window = recv_window_ms
     binance_http_timeout_sec = request_timeout_sec
 
@@ -847,7 +1021,7 @@ def load_settings() -> Settings:
     require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
     entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
     max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
-    # Redis cache
+
     redis_url = _as_str("REDIS_URL", "redis://localhost:6379/0")
     dashboard_cache_prefix = _as_str("DASHBOARD_CACHE_PREFIX", "auto_trader_dashboard")
     dashboard_cache_ttl_sec = _as_int("DASHBOARD_CACHE_TTL_SEC", 5)
@@ -855,19 +1029,47 @@ def load_settings() -> Settings:
     redis_socket_connect_timeout_sec = _as_float("REDIS_SOCKET_CONNECT_TIMEOUT_SEC", 1.0)
     redis_health_check_interval_sec = _as_int("REDIS_HEALTH_CHECK_INTERVAL_SEC", 30)
 
-    # TEST controls (TRADE-GRADE) — settings에서만 읽는다.
     test_dry_run = _as_bool("TEST_DRY_RUN", False)
     test_bypass_guards = _as_bool("TEST_BYPASS_GUARDS", False)
     test_force_enter = _as_bool("TEST_FORCE_ENTER", False)
     test_fake_available_usdt = _as_float("TEST_FAKE_AVAILABLE_USDT", 0.0)
 
+    # AI Trading Intelligence
+    analyst_market_symbol = _as_str("ANALYST_MARKET_SYMBOL", symbol).upper().replace("-", "")
+    analyst_db_market_timeframe = _as_str("ANALYST_DB_MARKET_TIMEFRAME", interval)
+    analyst_db_market_lookback_limit = _as_int("ANALYST_DB_MARKET_LOOKBACK_LIMIT", 60)
+    analyst_pattern_entry_threshold = _as_float("ANALYST_PATTERN_ENTRY_THRESHOLD", 0.55)
+    analyst_spread_guard_bps = _as_float("ANALYST_SPREAD_GUARD_BPS", 15.0)
+    analyst_imbalance_guard_abs = _as_float("ANALYST_IMBALANCE_GUARD_ABS", 0.60)
+    analyst_trade_lookback_limit = _as_int("ANALYST_TRADE_LOOKBACK_LIMIT", 30)
+    analyst_event_lookback_limit = _as_int("ANALYST_EVENT_LOOKBACK_LIMIT", 300)
+    analyst_include_external_market = _as_bool("ANALYST_INCLUDE_EXTERNAL_MARKET", True)
+
+    analyst_auto_report_market_interval_sec = _as_int("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC", 300)
+    analyst_auto_report_system_interval_sec = _as_int("ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC", 1800)
+    analyst_auto_report_persist = _as_bool("ANALYST_AUTO_REPORT_PERSIST", True)
+    analyst_auto_report_notify = _as_bool("ANALYST_AUTO_REPORT_NOTIFY", False)
+
+    analyst_openai_model = _as_str(
+        "ANALYST_OPENAI_MODEL",
+        openai_model,
+    )
+    analyst_openai_timeout_sec = _as_float("ANALYST_OPENAI_TIMEOUT_SEC", 15.0)
+    analyst_openai_max_output_tokens = _as_int("ANALYST_OPENAI_MAX_OUTPUT_TOKENS", 1200)
+    analyst_openai_temperature = _as_float("ANALYST_OPENAI_TEMPERATURE", 0.1)
+    analyst_openai_reasoning_effort = _as_str_opt("ANALYST_OPENAI_REASONING_EFFORT")
+
+    analyst_kline_interval = _as_str("ANALYST_KLINE_INTERVAL", "5m")
+    analyst_kline_limit = _as_int("ANALYST_KLINE_LIMIT", 120)
+    analyst_http_timeout_sec = _as_float("ANALYST_HTTP_TIMEOUT_SEC", 10.0)
+    analyst_ratio_period = _as_str("ANALYST_RATIO_PERIOD", "5m")
+    analyst_ratio_limit = _as_int("ANALYST_RATIO_LIMIT", 30)
+    analyst_depth_limit = _as_int("ANALYST_DEPTH_LIMIT", 20)
+    analyst_funding_limit = _as_int("ANALYST_FUNDING_LIMIT", 10)
+    analyst_force_order_limit = _as_int("ANALYST_FORCE_ORDER_LIMIT", 50)
+    analyst_max_server_drift_ms = _as_int("ANALYST_MAX_SERVER_DRIFT_MS", 5000)
+
     s = Settings(
-        redis_url=redis_url,
-        dashboard_cache_prefix=dashboard_cache_prefix,
-        dashboard_cache_ttl_sec=dashboard_cache_ttl_sec,
-        redis_socket_timeout_sec=redis_socket_timeout_sec,
-        redis_socket_connect_timeout_sec=redis_socket_connect_timeout_sec,
-        redis_health_check_interval_sec=redis_health_check_interval_sec,
         api_key=api_key,
         api_secret=api_secret,
         symbol=symbol,
@@ -969,6 +1171,7 @@ def load_settings() -> Settings:
         drift_micro_abs_jump=drift_micro_abs_jump,
         drift_stable_regime_steps=drift_stable_regime_steps,
         binance_futures_base=binance_futures_base,
+        binance_futures_base_url=binance_futures_base_url,
         binance_recv_window=binance_recv_window,
         binance_http_timeout_sec=binance_http_timeout_sec,
         hard_daily_loss_limit_usdt=hard_daily_loss_limit_usdt,
@@ -985,16 +1188,53 @@ def load_settings() -> Settings:
         test_bypass_guards=test_bypass_guards,
         test_force_enter=test_force_enter,
         test_fake_available_usdt=test_fake_available_usdt,
+        redis_url=redis_url,
+        dashboard_cache_prefix=dashboard_cache_prefix,
+        dashboard_cache_ttl_sec=dashboard_cache_ttl_sec,
+        redis_socket_timeout_sec=redis_socket_timeout_sec,
+        redis_socket_connect_timeout_sec=redis_socket_connect_timeout_sec,
+        redis_health_check_interval_sec=redis_health_check_interval_sec,
+        analyst_market_symbol=analyst_market_symbol,
+        analyst_db_market_timeframe=analyst_db_market_timeframe,
+        analyst_db_market_lookback_limit=analyst_db_market_lookback_limit,
+        analyst_pattern_entry_threshold=analyst_pattern_entry_threshold,
+        analyst_spread_guard_bps=analyst_spread_guard_bps,
+        analyst_imbalance_guard_abs=analyst_imbalance_guard_abs,
+        analyst_trade_lookback_limit=analyst_trade_lookback_limit,
+        analyst_event_lookback_limit=analyst_event_lookback_limit,
+        analyst_include_external_market=analyst_include_external_market,
+        analyst_auto_report_market_interval_sec=analyst_auto_report_market_interval_sec,
+        analyst_auto_report_system_interval_sec=analyst_auto_report_system_interval_sec,
+        analyst_auto_report_persist=analyst_auto_report_persist,
+        analyst_auto_report_notify=analyst_auto_report_notify,
+        analyst_openai_model=analyst_openai_model,
+        analyst_openai_timeout_sec=analyst_openai_timeout_sec,
+        analyst_openai_max_output_tokens=analyst_openai_max_output_tokens,
+        analyst_openai_temperature=analyst_openai_temperature,
+        analyst_openai_reasoning_effort=analyst_openai_reasoning_effort,
+        analyst_kline_interval=analyst_kline_interval,
+        analyst_kline_limit=analyst_kline_limit,
+        analyst_http_timeout_sec=analyst_http_timeout_sec,
+        analyst_ratio_period=analyst_ratio_period,
+        analyst_ratio_limit=analyst_ratio_limit,
+        analyst_depth_limit=analyst_depth_limit,
+        analyst_funding_limit=analyst_funding_limit,
+        analyst_force_order_limit=analyst_force_order_limit,
+        analyst_max_server_drift_ms=analyst_max_server_drift_ms,
     )
 
     _validate_settings(s)
     return s
 
 
+SETTINGS = load_settings()
+
+
 __all__ = [
     "Settings",
     "BotSettings",
     "PatternStrengthSettings",
+    "SETTINGS",
     "load_settings",
     "KST",
 ]

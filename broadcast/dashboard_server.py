@@ -1,6 +1,7 @@
 """
 ========================================================
 FILE: broadcast/dashboard_server.py
+AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
@@ -11,6 +12,7 @@ Auto-Trader 대시보드 API 서버.
 - Decision / Error / Position / Performance / System 분석
 - Engine Watchdog(실시간 진단) API 제공
 - Dashboard WebSocket 엔드포인트 제공
+- AI Quant Analyst / AI Market Analyst 검색 API 제공
 
 Engine API
 --------------------------------------------------------
@@ -18,6 +20,11 @@ Engine API
 - /api/engine/status
 - /api/engine/ws-status
 - /api/engine/latency
+
+AI Analysis API
+--------------------------------------------------------
+- /api/quant-analysis
+- /api/market-analysis
 
 WebSocket
 --------------------------------------------------------
@@ -33,6 +40,8 @@ STRICT · NO-FALLBACK
 - 민감정보(DB URL/키 등)는 출력 금지
 - 잘못된 query parameter 는 즉시 예외
 - 조용한 continue / 자동 보정 금지
+- 런타임 설정 변경 금지(구성 불변 규칙)
+- 입력/출력 데이터 무결성 검증 실패 시 즉시 예외
 
 변경 이력
 --------------------------------------------------------
@@ -44,15 +53,12 @@ STRICT · NO-FALLBACK
   2) 엔진 WS 상태 조회를 메모리 기반이 아닌 DB 스냅샷 기반으로 변경
      - 분리 배포 구조(AWS engine / Render dashboard) 정합성 확보
      - bt_candles / bt_orderbook_snapshots 기준으로 ws-status 계산
-
-- 2026-03-01:
-  1) recent trades 라벨 매핑을 is_auto/strategy 기준으로 수정
-  2) EntryScore API에 include_test 옵션 추가
-  3) bt_events 기반 이벤트 분석 API 추가:
-     - /api/events/skip-reasons
-     - /api/events/skip-hourly
-     - /api/events/recent
-
+  3) AI Trading Intelligence 엔드포인트 추가
+     - /api/quant-analysis
+     - /api/market-analysis
+  4) dashboard template/static 경로를 dashboard/* 구조로 정합화
+  5) 분석 결과 bt_events 기록 연동
+     - event_type='QUANT_ANALYSIS'
 - 2026-03-06:
   1) Engine Watchdog API 추가:
      - /api/engine/health
@@ -61,11 +67,20 @@ STRICT · NO-FALLBACK
   2) Dashboard WebSocket 엔드포인트 추가:
      - /ws/dashboard
   3) Decision / Error / Position / Performance / System API 추가
+- 2026-03-01:
+  1) recent trades 라벨 매핑을 is_auto/strategy 기준으로 수정
+  2) EntryScore API에 include_test 옵션 추가
+  3) bt_events 기반 이벤트 분석 API 추가:
+     - /api/events/skip-reasons
+     - /api/events/skip-hourly
+     - /api/events/recent
 ========================================================
 """
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -73,10 +88,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fastapi import Depends, FastAPI, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from analysis.quant_analyst import QuantAnalyst
 from broadcast.dashboard_db import get_db
 from broadcast.dashboard_metrics import (
     build_entry_score_hist,
@@ -89,6 +106,7 @@ from broadcast.dashboard_metrics import (
     get_summary,
 )
 from broadcast.dashboard_ws import dashboard_ws_endpoint
+from events.event_store import record_quant_analysis_event_db
 from infra.cache import (
     get_cache_json,
     init_cache_from_settings,
@@ -118,15 +136,20 @@ from services.position_service import (
 from services.system_monitor import get_latest_watchdog_snapshot, get_system_status_snapshot
 from settings import load_settings
 
+logger = logging.getLogger(__name__)
+
 
 # =====================================================
 # FastAPI App
 # =====================================================
 
 _SETTINGS = load_settings()
+_QUANT_ANALYST = QuantAnalyst()
 
 app = FastAPI(title="Binance Auto Trader Dashboard")
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory="dashboard/templates")
+
+app.mount("/dashboard/static", StaticFiles(directory="dashboard/static"), name="dashboard-static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -228,6 +251,63 @@ def _cached_json(
     return data
 
 
+def _require_question(value: Any) -> str:
+    q = _require_nonempty_str(value, "question")
+    if len(q) > 2000:
+        raise RuntimeError("question must be <= 2000 chars (STRICT)")
+    return q
+
+
+def _question_hash(question: str) -> str:
+    q = _require_question(question)
+    return hashlib.sha256(q.encode("utf-8")).hexdigest()[:24]
+
+
+def _extract_market_regime_from_analysis_payload(payload: Dict[str, Any]) -> Optional[str]:
+    market_cards = payload.get("market_cards")
+    if not isinstance(market_cards, dict):
+        return None
+
+    internal_market = market_cards.get("internal_market")
+    if isinstance(internal_market, dict):
+        regime = internal_market.get("market_regime")
+        if isinstance(regime, str) and regime.strip():
+            return regime.strip()
+
+    external_market = market_cards.get("external_market")
+    if isinstance(external_market, dict):
+        regime = external_market.get("market_regime")
+        if isinstance(regime, str) and regime.strip():
+            return regime.strip()
+
+    return None
+
+
+def _persist_analysis_event(
+    *,
+    report_type: str,
+    payload: Dict[str, Any],
+    question: str,
+) -> None:
+    normalized_report_type = _require_nonempty_str(report_type, "report_type")
+    normalized_question = _require_question(question)
+    normalized_payload = _require_dict(payload, "payload")
+
+    symbol = _normalize_symbol(normalized_payload.get("symbol"))
+    regime = _extract_market_regime_from_analysis_payload(normalized_payload)
+
+    reason = f"{normalized_report_type}:{normalized_question}"
+    record_quant_analysis_event_db(
+        ts_utc=datetime.now(timezone.utc),
+        symbol=symbol,
+        report_type=normalized_report_type,
+        reason=reason,
+        analysis_payload=normalized_payload,
+        regime=regime,
+        is_test=False,
+    )
+
+
 # =====================================================
 # Pages
 # =====================================================
@@ -269,6 +349,71 @@ def health_check(db: Session = Depends(get_db)) -> Dict[str, Any]:
         "db_latency_ms": _db_latency_ms(db),
         "cache_ok": ping_cache(),
     }
+
+
+# =====================================================
+# AI Trading Intelligence
+# =====================================================
+
+@app.get("/api/quant-analysis")
+def api_quant_analysis(
+    question: str = Query(...),
+    include_external_market: bool = Query(default=True),
+) -> Dict[str, Any]:
+    normalized_question = _require_question(question)
+    include_external_market_b = bool(include_external_market)
+
+    def _build() -> Dict[str, Any]:
+        result = _QUANT_ANALYST.analyze(
+            question=normalized_question,
+            include_external_market=include_external_market_b,
+        )
+        payload = result.dashboard_payload
+        _persist_analysis_event(
+            report_type="dashboard_query",
+            payload=payload,
+            question=normalized_question,
+        )
+        return payload
+
+    return _cached_json(
+        key_parts=(
+            "ai",
+            "quant-analysis",
+            f"q-{_question_hash(normalized_question)}",
+            f"ext-{_cache_token_bool(include_external_market_b)}",
+        ),
+        builder=_build,
+    )
+
+
+@app.get("/api/market-analysis")
+def api_market_analysis(
+    question: str = Query(...),
+) -> Dict[str, Any]:
+    normalized_question = _require_question(question)
+
+    def _build() -> Dict[str, Any]:
+        result = _QUANT_ANALYST.analyze(
+            question=normalized_question,
+            include_external_market=True,
+        )
+        payload = result.dashboard_payload
+        _persist_analysis_event(
+            report_type="market_query",
+            payload=payload,
+            question=normalized_question,
+        )
+        return payload
+
+    return _cached_json(
+        key_parts=(
+            "ai",
+            "market-analysis",
+            f"q-{_question_hash(normalized_question)}",
+        ),
+        builder=_build,
+    )
 
 
 # =====================================================
