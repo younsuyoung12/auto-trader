@@ -316,11 +316,15 @@ class MarketResearcher:
             long_keys=("longAccount", "buyVol"),
             short_keys=("shortAccount", "sellVol"),
         )
-        force_orders = self._fetcher.fetch_force_orders(
-            symbol=self._symbol,
-            limit=self._force_order_limit,
-        )
-
+        try:
+           force_orders = self._fetcher.fetch_force_orders(
+               symbol=self._symbol,
+               limit=self._force_order_limit,
+            )
+        except Exception as e:
+            logger.warning("force_orders unavailable: %s", e)
+            force_orders = []
+               
         return BinanceMarketSnapshot(
             symbol=self._symbol,
             server_time_ms=server_time_ms,
