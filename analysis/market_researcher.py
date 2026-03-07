@@ -10,6 +10,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 내부 DB 분석과 분리된 "외부 시장 분석(Market Research)" 레이어를 담당한다.
 - AWS에서 단독 실행 시 market_features / trade_context_snapshots 를 주기적으로 적재한다.
 - 주문/포지션/리스크 실행 로직에는 관여하지 않는다.
+- 추가 외부 소스(파생상품/뉴스/거시/심리/온체인)를 결합해 전문 애널리스트형 외부시장 요약을 생성한다.
 
 절대 원칙:
 - STRICT · NO-FALLBACK
@@ -18,7 +19,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - print() 금지 / logging 사용
 - 데이터 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
-- Binance 공개 시장 데이터만 사용
+- 공개 시장 데이터만 사용
 - 예외 삼키기 금지
 - DB 적재 실패 시 즉시 예외 전파
 
@@ -29,6 +30,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - AWS 실행용 DB 적재 루프 추가
 - market_features / trade_context_snapshots 적재 기능 추가
 - ratio endpoint(symbol 누락 응답) 직접 파싱 경로 추가
+
+2026-03-08 (PATCH)
+1) derivatives/news/macro/sentiment/onchain fetcher 연동
+2) MarketResearchReport 에 외부 인텔리전스 섹션 5종 추가
+3) key_signals / analyst_summary_ko / dashboard_payload 에 외부 인텔리전스 요약 반영
+4) 기존 Binance 기반 핵심 지표/DB 적재 구조는 유지
 ========================================================
 """
 
@@ -51,6 +58,11 @@ from analysis.binance_market_fetcher import (
     BinanceMarketSnapshot,
     BinanceRatioPoint,
 )
+from analysis.crypto_news_fetcher import CryptoNewsFetcher, CryptoNewsSnapshot
+from analysis.derivatives_market_fetcher import DerivativesMarketFetcher, DerivativesMarketSnapshot
+from analysis.macro_market_fetcher import MacroMarketFetcher, MacroMarketSnapshot
+from analysis.onchain_fetcher import OnchainFetcher, OnchainSnapshot
+from analysis.sentiment_fetcher import SentimentFetcher, SentimentSnapshot
 from settings import SETTINGS
 from state.db_core import get_session
 
@@ -90,6 +102,13 @@ class MarketResearchReport:
     key_signals: List[str]
     analyst_summary_ko: str
     dashboard_payload: Dict[str, Any]
+
+    # 확장 외부 인텔리전스
+    derivatives_summary: Dict[str, Any]
+    macro_summary: Dict[str, Any]
+    news_summary: Dict[str, Any]
+    sentiment_summary: Dict[str, Any]
+    onchain_summary: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -143,7 +162,7 @@ class ResearchSyncResult:
 
 class MarketResearcher:
     """
-    Binance 공개 선물 데이터를 기반으로 외부 시장 구조 분석 수행.
+    공개 외부 시장 데이터를 기반으로 외부 시장 구조 분석 수행.
 
     기능:
     1) 외부 시장 분석 리포트 생성
@@ -158,6 +177,11 @@ class MarketResearcher:
 
     def __init__(self) -> None:
         self._fetcher = BinanceMarketFetcher()
+        self._derivatives_fetcher = DerivativesMarketFetcher()
+        self._news_fetcher = CryptoNewsFetcher()
+        self._macro_fetcher = MacroMarketFetcher()
+        self._sentiment_fetcher = SentimentFetcher()
+        self._onchain_fetcher = OnchainFetcher()
 
         self._symbol = self._require_str_setting("ANALYST_MARKET_SYMBOL")
         self._db_market_timeframe = self._require_str_setting("ANALYST_DB_MARKET_TIMEFRAME")
@@ -194,7 +218,20 @@ class MarketResearcher:
 
     def run(self) -> MarketResearchReport:
         snapshot = self._fetch_market_snapshot_strict()
-        report = self._build_report(snapshot)
+        derivatives_snapshot = self._derivatives_fetcher.fetch()
+        news_snapshot = self._news_fetcher.fetch()
+        macro_snapshot = self._macro_fetcher.fetch()
+        sentiment_snapshot = self._sentiment_fetcher.fetch()
+        onchain_snapshot = self._onchain_fetcher.fetch()
+
+        report = self._build_report(
+            snapshot=snapshot,
+            derivatives_snapshot=derivatives_snapshot,
+            news_snapshot=news_snapshot,
+            macro_snapshot=macro_snapshot,
+            sentiment_snapshot=sentiment_snapshot,
+            onchain_snapshot=onchain_snapshot,
+        )
         logger.info(
             "Market research completed: symbol=%s trend=%s regime=%s conviction=%s",
             report.symbol,
@@ -316,15 +353,16 @@ class MarketResearcher:
             long_keys=("longAccount", "buyVol"),
             short_keys=("shortAccount", "sellVol"),
         )
+
         try:
-           force_orders = self._fetcher.fetch_force_orders(
-               symbol=self._symbol,
-               limit=self._force_order_limit,
+            force_orders = self._fetcher.fetch_force_orders(
+                symbol=self._symbol,
+                limit=self._force_order_limit,
             )
         except Exception as e:
             logger.warning("force_orders unavailable: %s", e)
             force_orders = []
-               
+
         return BinanceMarketSnapshot(
             symbol=self._symbol,
             server_time_ms=server_time_ms,
@@ -743,13 +781,29 @@ class MarketResearcher:
     # Core analysis
     # ========================================================
 
-    def _build_report(self, snapshot: BinanceMarketSnapshot) -> MarketResearchReport:
+    def _build_report(
+        self,
+        *,
+        snapshot: BinanceMarketSnapshot,
+        derivatives_snapshot: DerivativesMarketSnapshot,
+        news_snapshot: CryptoNewsSnapshot,
+        macro_snapshot: MacroMarketSnapshot,
+        sentiment_snapshot: SentimentSnapshot,
+        onchain_snapshot: OnchainSnapshot,
+    ) -> MarketResearchReport:
         klines = snapshot.klines
         if len(klines) < 5:
             raise RuntimeError("At least 5 klines are required for market research")
 
         latest_kline = klines[-1]
-        as_of_ms = latest_kline.open_time_ms
+        as_of_ms = max(
+            latest_kline.open_time_ms,
+            derivatives_snapshot.as_of_ms,
+            news_snapshot.as_of_ms,
+            macro_snapshot.as_of_ms,
+            sentiment_snapshot.as_of_ms,
+            onchain_snapshot.as_of_ms,
+        )
 
         price = latest_kline.close_price
         if price <= Decimal("0"):
@@ -796,12 +850,22 @@ class MarketResearcher:
             support=support_price,
             resistance=resistance_price,
         )
+
+        external_conviction_votes = self._calc_external_conviction_votes(
+            derivatives_snapshot=derivatives_snapshot,
+            news_snapshot=news_snapshot,
+            macro_snapshot=macro_snapshot,
+            sentiment_snapshot=sentiment_snapshot,
+            onchain_snapshot=onchain_snapshot,
+        )
+
         conviction = self._classify_conviction(
             trend=trend,
             volatility=volatility,
             liquidity=liquidity,
             market_regime=market_regime,
             open_interest_trend=open_interest_trend,
+            external_conviction_votes=external_conviction_votes,
         )
 
         key_signals = self._build_key_signals(
@@ -818,6 +882,11 @@ class MarketResearcher:
             support=support_price,
             resistance=resistance_price,
             price=price,
+            derivatives_snapshot=derivatives_snapshot,
+            news_snapshot=news_snapshot,
+            macro_snapshot=macro_snapshot,
+            sentiment_snapshot=sentiment_snapshot,
+            onchain_snapshot=onchain_snapshot,
         )
 
         analyst_summary_ko = self._build_korean_summary(
@@ -836,7 +905,18 @@ class MarketResearcher:
             price_change_pct=price_change_pct,
             realized_volatility_pct=realized_volatility_pct,
             spread_bps=spread_bps,
+            derivatives_snapshot=derivatives_snapshot,
+            news_snapshot=news_snapshot,
+            macro_snapshot=macro_snapshot,
+            sentiment_snapshot=sentiment_snapshot,
+            onchain_snapshot=onchain_snapshot,
         )
+
+        derivatives_summary = derivatives_snapshot.dashboard_payload
+        news_summary = news_snapshot.dashboard_payload
+        macro_summary = macro_snapshot.dashboard_payload
+        sentiment_summary = sentiment_snapshot.dashboard_payload
+        onchain_summary = onchain_snapshot.dashboard_payload
 
         dashboard_payload = self._build_dashboard_payload(
             snapshot=snapshot,
@@ -869,6 +949,11 @@ class MarketResearcher:
             conviction=conviction,
             key_signals=key_signals,
             analyst_summary_ko=analyst_summary_ko,
+            derivatives_summary=derivatives_summary,
+            news_summary=news_summary,
+            macro_summary=macro_summary,
+            sentiment_summary=sentiment_summary,
+            onchain_summary=onchain_summary,
         )
 
         return MarketResearchReport(
@@ -903,6 +988,11 @@ class MarketResearcher:
             key_signals=key_signals,
             analyst_summary_ko=analyst_summary_ko,
             dashboard_payload=dashboard_payload,
+            derivatives_summary=derivatives_summary,
+            macro_summary=macro_summary,
+            news_summary=news_summary,
+            sentiment_summary=sentiment_summary,
+            onchain_summary=onchain_summary,
         )
 
     # ========================================================
@@ -995,6 +1085,30 @@ class MarketResearcher:
                 raise RuntimeError(f"Unexpected force order side: {item.side}")
 
         return long_liq, short_liq
+
+    def _calc_external_conviction_votes(
+        self,
+        *,
+        derivatives_snapshot: DerivativesMarketSnapshot,
+        news_snapshot: CryptoNewsSnapshot,
+        macro_snapshot: MacroMarketSnapshot,
+        sentiment_snapshot: SentimentSnapshot,
+        onchain_snapshot: OnchainSnapshot,
+    ) -> int:
+        votes = 0
+
+        if derivatives_snapshot.cross_exchange_crowding_bias in {"long_crowded", "short_crowded", "deleveraging"}:
+            votes += 1
+        if news_snapshot.sentiment_bias in {"bullish", "bearish"}:
+            votes += 1
+        if macro_snapshot.cross_asset_bias in {"crypto_supportive", "crypto_headwind", "defensive_rotation"}:
+            votes += 1
+        if sentiment_snapshot.sentiment_regime in {"extreme_greed", "extreme_fear"}:
+            votes += 1
+        if onchain_snapshot.network_regime in {"network_strengthening", "network_softening"}:
+            votes += 1
+
+        return votes
 
     # ========================================================
     # Classification rules
@@ -1120,11 +1234,13 @@ class MarketResearcher:
 
     def _classify_conviction(
         self,
+        *,
         trend: str,
         volatility: str,
         liquidity: str,
         market_regime: str,
         open_interest_trend: str,
+        external_conviction_votes: int,
     ) -> str:
         strong_conditions = 0
 
@@ -1139,9 +1255,11 @@ class MarketResearcher:
         if open_interest_trend in {"rising", "rising_strong"}:
             strong_conditions += 1
 
-        if strong_conditions >= 4:
+        strong_conditions += external_conviction_votes
+
+        if strong_conditions >= 6:
             return "high"
-        if strong_conditions >= 2:
+        if strong_conditions >= 3:
             return "medium"
         return "low"
 
@@ -1151,6 +1269,7 @@ class MarketResearcher:
 
     def _build_key_signals(
         self,
+        *,
         trend: str,
         volatility: str,
         liquidity: str,
@@ -1164,6 +1283,11 @@ class MarketResearcher:
         support: Decimal,
         resistance: Decimal,
         price: Decimal,
+        derivatives_snapshot: DerivativesMarketSnapshot,
+        news_snapshot: CryptoNewsSnapshot,
+        macro_snapshot: MacroMarketSnapshot,
+        sentiment_snapshot: SentimentSnapshot,
+        onchain_snapshot: OnchainSnapshot,
     ) -> List[str]:
         signals: List[str] = []
 
@@ -1181,10 +1305,20 @@ class MarketResearcher:
         signals.append(f"resistance={self._fmt_decimal(resistance, 2)}")
         signals.append(f"last_price={self._fmt_decimal(price, 2)}")
 
+        signals.extend([
+            f"derivatives_bias={derivatives_snapshot.cross_exchange_crowding_bias}",
+            f"macro_bias={macro_snapshot.cross_asset_bias}",
+            f"news_bias={news_snapshot.sentiment_bias}",
+            f"sentiment_regime={sentiment_snapshot.sentiment_regime}",
+            f"onchain_network={onchain_snapshot.network_regime}",
+            f"onchain_congestion={onchain_snapshot.congestion_regime}",
+        ])
+
         return signals
 
     def _build_korean_summary(
         self,
+        *,
         symbol: str,
         price: Decimal,
         trend: str,
@@ -1200,6 +1334,11 @@ class MarketResearcher:
         price_change_pct: Decimal,
         realized_volatility_pct: Decimal,
         spread_bps: Decimal,
+        derivatives_snapshot: DerivativesMarketSnapshot,
+        news_snapshot: CryptoNewsSnapshot,
+        macro_snapshot: MacroMarketSnapshot,
+        sentiment_snapshot: SentimentSnapshot,
+        onchain_snapshot: OnchainSnapshot,
     ) -> str:
         parts: List[str] = []
 
@@ -1227,6 +1366,13 @@ class MarketResearcher:
         parts.append(
             f"실현 변동성은 {self._fmt_decimal(realized_volatility_pct, 2)}%, "
             f"호가 스프레드는 {self._fmt_decimal(spread_bps, 2)} bps 수준입니다."
+        )
+        parts.append(
+            f"추가 외부 신호로는 파생시장은 {self._ko_derivatives_bias(derivatives_snapshot.cross_exchange_crowding_bias)}, "
+            f"거시는 {self._ko_macro_bias(macro_snapshot.cross_asset_bias)}, "
+            f"뉴스 심리는 {self._ko_news_bias(news_snapshot.sentiment_bias)}, "
+            f"공포탐욕은 {self._ko_sentiment_regime(sentiment_snapshot.sentiment_regime)}, "
+            f"온체인은 {self._ko_onchain(onchain_snapshot.network_regime, onchain_snapshot.congestion_regime)} 입니다."
         )
 
         return " ".join(parts)
@@ -1264,6 +1410,11 @@ class MarketResearcher:
         conviction: str,
         key_signals: List[str],
         analyst_summary_ko: str,
+        derivatives_summary: Dict[str, Any],
+        news_summary: Dict[str, Any],
+        macro_summary: Dict[str, Any],
+        sentiment_summary: Dict[str, Any],
+        onchain_summary: Dict[str, Any],
     ) -> Dict[str, Any]:
         return {
             "symbol": snapshot.symbol,
@@ -1307,6 +1458,13 @@ class MarketResearcher:
             },
             "risk_metrics": {
                 "realized_volatility_pct": self._fmt_decimal(realized_volatility_pct, 4),
+            },
+            "external_intelligence": {
+                "derivatives_summary": derivatives_summary,
+                "news_summary": news_summary,
+                "macro_summary": macro_summary,
+                "sentiment_summary": sentiment_summary,
+                "onchain_summary": onchain_summary,
             },
             "key_signals": key_signals,
             "analyst_summary_ko": analyst_summary_ko,
@@ -1397,6 +1555,59 @@ class MarketResearcher:
             "none": "청산 압력 미미",
         }
         return self._map_or_raise(mapping, value, "liquidation_pressure")
+
+    def _ko_derivatives_bias(self, value: str) -> str:
+        mapping = {
+            "long_crowded": "롱 과밀 상태",
+            "short_crowded": "숏 과밀 상태",
+            "deleveraging": "디레버리징 흐름",
+            "mixed": "혼합 구조",
+        }
+        return self._map_or_raise(mapping, value, "derivatives_bias")
+
+    def _ko_macro_bias(self, value: str) -> str:
+        mapping = {
+            "crypto_supportive": "크립토 우호적 거시 환경",
+            "crypto_headwind": "크립토 비우호적 거시 환경",
+            "defensive_rotation": "방어 자산 선호 회전",
+            "mixed": "혼합 거시 환경",
+        }
+        return self._map_or_raise(mapping, value, "macro_bias")
+
+    def _ko_news_bias(self, value: str) -> str:
+        mapping = {
+            "bullish": "우호적",
+            "bearish": "부정적",
+            "mixed": "혼합",
+        }
+        return self._map_or_raise(mapping, value, "news_bias")
+
+    def _ko_sentiment_regime(self, value: str) -> str:
+        mapping = {
+            "extreme_greed": "극단적 탐욕",
+            "greed": "탐욕",
+            "neutral": "중립",
+            "fear": "공포",
+            "extreme_fear": "극단적 공포",
+        }
+        return self._map_or_raise(mapping, value, "sentiment_regime")
+
+    def _ko_onchain(self, network_regime: str, congestion_regime: str) -> str:
+        network_map = {
+            "network_strengthening": "네트워크 강화",
+            "network_softening": "네트워크 둔화",
+            "network_mixed": "네트워크 혼합",
+        }
+        congestion_map = {
+            "congested": "혼잡",
+            "normal": "정상",
+            "light": "한산",
+        }
+        if network_regime not in network_map:
+            raise RuntimeError(f"Unexpected onchain network_regime: {network_regime}")
+        if congestion_regime not in congestion_map:
+            raise RuntimeError(f"Unexpected onchain congestion_regime: {congestion_regime}")
+        return f"{network_map[network_regime]} / {congestion_map[congestion_regime]}"
 
     # ========================================================
     # Settings / utility

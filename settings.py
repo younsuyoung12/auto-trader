@@ -1,4 +1,3 @@
-# settings.py
 """
 ========================================================
 FILE: settings.py
@@ -19,6 +18,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-08 (PATCH 2):
+  1) 외부시장 인텔리전스용 Alpha Vantage 설정 추가
+     - alphavantage_api_key
+  2) ENV 매핑 추가:
+     - ALPHAVANTAGE_API_KEY → alphavantage_api_key
+  3) STRICT 검증 추가:
+     - alphavantage_api_key 누락 시 즉시 예외
+- 2026-03-08 (PATCH):
+  1) Trader OpenAI 설정 로딩과 Analyst OpenAI 설정 로딩을 구조적으로 분리
+  2) OPENAI_* / OPENAI_TRADER_* / OPENAI_SUPERVISOR_* legacy alias 충돌 시 즉시 예외 처리
+  3) analyst_openai_* 기본값과 load_settings() 기본값 불일치 제거
+  4) analyst_openai_model 이 trader openai_model 을 암묵 상속하던 결합 제거
+  5) Settings flat 필드는 유지하여 기존 호출부 호환성 보존
 - 2026-03-07 (AI TRADING INTELLIGENCE):
   1) AI Quant Analyst / AI Market Analyst 설정 추가
      - analyst_market_symbol
@@ -102,11 +114,11 @@ import os
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Korea Standard Time (UTC+9) - (외부 모듈에서 사용할 수 있어 유지)
+# Korea Standard Time (UTC+9)
 KST = timezone(timedelta(hours=9))
 
 
@@ -114,12 +126,21 @@ KST = timezone(timedelta(hours=9))
 # Alias map for strict uppercase access compatibility
 # ---------------------------------------------------------------------
 _SETTINGS_ALIAS_MAP: Dict[str, str] = {
-    # 기존 OpenAI
+    # 기존 OpenAI / Trader OpenAI
     "OPENAI_API_KEY": "openai_api_key",
     "OPENAI_MODEL": "openai_model",
+    "OPENAI_TRADER_MODEL": "openai_model",
+    "OPENAI_SUPERVISOR_MODEL": "openai_model",
     "OPENAI_MAX_TOKENS": "openai_max_tokens",
+    "OPENAI_TRADER_MAX_TOKENS": "openai_max_tokens",
     "OPENAI_TEMPERATURE": "openai_temperature",
+    "OPENAI_TRADER_TEMPERATURE": "openai_temperature",
+    "OPENAI_SUPERVISOR_TEMPERATURE": "openai_temperature",
     "OPENAI_MAX_LATENCY_SEC": "openai_max_latency_sec",
+    "OPENAI_TRADER_MAX_LATENCY_SEC": "openai_max_latency_sec",
+    "OPENAI_TRADER_MAX_LATENCY": "openai_max_latency_sec",
+    # External intelligence
+    "ALPHAVANTAGE_API_KEY": "alphavantage_api_key",
     # AI analyst
     "ANALYST_MARKET_SYMBOL": "analyst_market_symbol",
     "ANALYST_DB_MARKET_TIMEFRAME": "analyst_db_market_timeframe",
@@ -160,7 +181,7 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
 class Settings:
     """Runtime settings for the trading engine (Binance USDT-M Futures)."""
 
-    # Binance credentials (exchange_api.py expects these names)
+    # Binance credentials
     api_key: str = ""
     api_secret: str = ""
 
@@ -178,7 +199,7 @@ class Settings:
     recv_window_ms: int = 5000
     request_timeout_sec: int = 10
 
-    # Symbol filters (legacy; 실제 필터는 exchangeInfo로 확정)
+    # Symbol filters
     qty_step: float = 0.001
     min_qty: float = 0.001
     price_tick: float = 0.1
@@ -207,18 +228,21 @@ class Settings:
     min_entry_score_for_gpt: float = 28.0
     gpt_entry_cooldown_sec: float = 10.0
 
-    # GPT safety (legacy fields kept)
+    # GPT safety
     gpt_daily_call_limit: int = 2000
     gpt_max_risk_pct: float = 0.02
     gpt_min_confidence: float = 0.6
     gpt_reject_if_over_pnl_pct: float = 0.02
 
-    # OpenAI (engine)
+    # OpenAI (Trader engine)
     openai_api_key: str = ""
     openai_model: str = ""
     openai_max_tokens: int = 1500
     openai_temperature: float = 0.2
     openai_max_latency_sec: float = 12.0
+
+    # External intelligence
+    alphavantage_api_key: str = ""
 
     # Entry flow
     entry_score_threshold: float = 0.55
@@ -380,8 +404,8 @@ class Settings:
     analyst_auto_report_persist: bool = True
     analyst_auto_report_notify: bool = False
 
-    analyst_openai_model: str = ""
-    analyst_openai_timeout_sec: float = 15.0
+    analyst_openai_model: str = "gpt-5-mini"
+    analyst_openai_timeout_sec: float = 120.0
     analyst_openai_max_output_tokens: int = 1200
     analyst_openai_temperature: float = 0.1
     analyst_openai_reasoning_effort: Optional[str] = None
@@ -580,6 +604,118 @@ def _as_csv_list(key: str, default: List[str]) -> List[str]:
     return out if out else list(default)
 
 
+def _resolve_unique_env_value(keys: List[str], label: str) -> Optional[str]:
+    hits: List[tuple[str, str]] = []
+
+    for key in keys:
+        value = _get_env(key)
+        if value is not None:
+            hits.append((key, value))
+
+    if not hits:
+        return None
+
+    distinct = {value for _, value in hits}
+    if len(distinct) > 1:
+        detail = ", ".join(f"{key}={value}" for key, value in hits)
+        raise RuntimeError(f"Conflicting environment values for {label}: {detail}")
+
+    return hits[0][1]
+
+
+def _resolve_str_env(keys: List[str], *, default: str, label: str) -> str:
+    value = _resolve_unique_env_value(keys, label)
+    return value if value is not None else default
+
+
+def _resolve_str_opt_env(keys: List[str], *, label: str) -> Optional[str]:
+    return _resolve_unique_env_value(keys, label)
+
+
+def _resolve_int_env(keys: List[str], *, default: int, label: str) -> int:
+    raw = _resolve_unique_env_value(keys, label)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        key_list = ", ".join(keys)
+        raise ValueError(f"invalid int for {label} from keys [{key_list}]") from None
+
+
+def _resolve_float_env(keys: List[str], *, default: float, label: str) -> float:
+    raw = _resolve_unique_env_value(keys, label)
+    if raw is None:
+        return default
+    try:
+        parsed = float(raw)
+    except Exception:
+        key_list = ", ".join(keys)
+        raise ValueError(f"invalid float for {label} from keys [{key_list}]") from None
+
+    if not math.isfinite(parsed):
+        raise RuntimeError(f"non-finite float for {label}")
+
+    return parsed
+
+
+# ---------------------------------------------------------------------
+# Structured role loaders
+# ---------------------------------------------------------------------
+def _load_trader_openai_settings() -> Dict[str, Any]:
+    return {
+        "openai_model": _resolve_str_env(
+            ["OPENAI_TRADER_MODEL", "OPENAI_MODEL", "OPENAI_SUPERVISOR_MODEL"],
+            default="",
+            label="trader_openai_model",
+        ),
+        "openai_max_tokens": _resolve_int_env(
+            ["OPENAI_TRADER_MAX_TOKENS", "OPENAI_MAX_TOKENS"],
+            default=1500,
+            label="trader_openai_max_tokens",
+        ),
+        "openai_temperature": _resolve_float_env(
+            ["OPENAI_TRADER_TEMPERATURE", "OPENAI_TEMPERATURE", "OPENAI_SUPERVISOR_TEMPERATURE"],
+            default=0.2,
+            label="trader_openai_temperature",
+        ),
+        "openai_max_latency_sec": _resolve_float_env(
+            ["OPENAI_TRADER_MAX_LATENCY_SEC", "OPENAI_TRADER_MAX_LATENCY", "OPENAI_MAX_LATENCY_SEC"],
+            default=12.0,
+            label="trader_openai_max_latency_sec",
+        ),
+    }
+
+
+def _load_analyst_openai_settings() -> Dict[str, Any]:
+    return {
+        "analyst_openai_model": _resolve_str_env(
+            ["ANALYST_OPENAI_MODEL"],
+            default="gpt-5-mini",
+            label="analyst_openai_model",
+        ),
+        "analyst_openai_timeout_sec": _resolve_float_env(
+            ["ANALYST_OPENAI_TIMEOUT_SEC"],
+            default=120.0,
+            label="analyst_openai_timeout_sec",
+        ),
+        "analyst_openai_max_output_tokens": _resolve_int_env(
+            ["ANALYST_OPENAI_MAX_OUTPUT_TOKENS"],
+            default=1200,
+            label="analyst_openai_max_output_tokens",
+        ),
+        "analyst_openai_temperature": _resolve_float_env(
+            ["ANALYST_OPENAI_TEMPERATURE"],
+            default=0.1,
+            label="analyst_openai_temperature",
+        ),
+        "analyst_openai_reasoning_effort": _resolve_str_opt_env(
+            ["ANALYST_OPENAI_REASONING_EFFORT"],
+            label="analyst_openai_reasoning_effort",
+        ),
+    }
+
+
 # ---------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------
@@ -761,6 +897,9 @@ def _validate_settings(s: Settings) -> None:
     ):
         raise ValueError("openai_max_latency_sec must be finite > 0")
 
+    if not str(s.alphavantage_api_key or "").strip():
+        raise RuntimeError("missing Alpha Vantage key (ALPHAVANTAGE_API_KEY)")
+
     if s.test_bypass_guards and not s.test_dry_run:
         raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
     if s.test_force_enter and not s.test_dry_run:
@@ -910,15 +1049,12 @@ def load_settings() -> Settings:
     gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
 
     openai_api_key = _as_str("OPENAI_API_KEY", "")
-    openai_model = (
-        _as_str_opt("OPENAI_MODEL")
-        or _as_str_opt("OPENAI_TRADER_MODEL")
-        or _as_str_opt("OPENAI_SUPERVISOR_MODEL")
-        or ""
-    )
-    openai_max_tokens = _as_int("OPENAI_MAX_TOKENS", _as_int("OPENAI_TRADER_MAX_TOKENS", 512))
-    openai_temperature = _as_float("OPENAI_TEMPERATURE", _as_float("OPENAI_SUPERVISOR_TEMPERATURE", 0.2))
-    openai_max_latency_sec = _as_float("OPENAI_MAX_LATENCY_SEC", _as_float("OPENAI_TRADER_MAX_LATENCY", 12.0))
+    alphavantage_api_key = _as_str("ALPHAVANTAGE_API_KEY", "")
+    trader_openai = _load_trader_openai_settings()
+    openai_model = str(trader_openai["openai_model"])
+    openai_max_tokens = int(trader_openai["openai_max_tokens"])
+    openai_temperature = float(trader_openai["openai_temperature"])
+    openai_max_latency_sec = float(trader_openai["openai_max_latency_sec"])
 
     unrealized_notify_sec = _as_int("UNREALIZED_NOTIFY_SEC", 1800)
     enable_exit_gpt = _as_bool("ENABLE_EXIT_GPT", True)
@@ -1050,14 +1186,12 @@ def load_settings() -> Settings:
     analyst_auto_report_persist = _as_bool("ANALYST_AUTO_REPORT_PERSIST", True)
     analyst_auto_report_notify = _as_bool("ANALYST_AUTO_REPORT_NOTIFY", False)
 
-    analyst_openai_model = _as_str(
-        "ANALYST_OPENAI_MODEL",
-        openai_model,
-    )
-    analyst_openai_timeout_sec = _as_float("ANALYST_OPENAI_TIMEOUT_SEC", 15.0)
-    analyst_openai_max_output_tokens = _as_int("ANALYST_OPENAI_MAX_OUTPUT_TOKENS", 1200)
-    analyst_openai_temperature = _as_float("ANALYST_OPENAI_TEMPERATURE", 0.1)
-    analyst_openai_reasoning_effort = _as_str_opt("ANALYST_OPENAI_REASONING_EFFORT")
+    analyst_openai = _load_analyst_openai_settings()
+    analyst_openai_model = str(analyst_openai["analyst_openai_model"])
+    analyst_openai_timeout_sec = float(analyst_openai["analyst_openai_timeout_sec"])
+    analyst_openai_max_output_tokens = int(analyst_openai["analyst_openai_max_output_tokens"])
+    analyst_openai_temperature = float(analyst_openai["analyst_openai_temperature"])
+    analyst_openai_reasoning_effort = analyst_openai["analyst_openai_reasoning_effort"]
 
     analyst_kline_interval = _as_str("ANALYST_KLINE_INTERVAL", "5m")
     analyst_kline_limit = _as_int("ANALYST_KLINE_LIMIT", 300)
@@ -1106,6 +1240,7 @@ def load_settings() -> Settings:
         openai_max_tokens=openai_max_tokens,
         openai_temperature=openai_temperature,
         openai_max_latency_sec=openai_max_latency_sec,
+        alphavantage_api_key=alphavantage_api_key,
         unrealized_notify_sec=unrealized_notify_sec,
         enable_exit_gpt=enable_exit_gpt,
         poll_fills_sec=poll_fills_sec,

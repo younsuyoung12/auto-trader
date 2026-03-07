@@ -28,10 +28,24 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2026-03-07
 - 신규 생성
 - DB 기반 거래 분석기 추가
+
+2026-03-08 (PATCH)
+1) bt_events 실제 스키마(ts_utc / created_at) 기준으로 event_ts_ms SQL 정규화 추가
+2) bt_events 에 top-level trade_id 가 없는 구조를 반영해 extra_json.trade_id → trade_id SQL 정규화 추가
+3) bt_events 로딩을 SELECT * 에서 명시 컬럼 + canonical alias 방식으로 변경
+4) EventRecord 파서는 정규화된 DB adapter 출력(event_ts_ms / trade_id)을 우선 해석하도록 유지/보강
+
+2026-03-08 (PATCH 2)
+1) bt_trade_snapshots 로딩을 SELECT * 에서 명시 컬럼 + canonical alias 방식으로 변경
+2) bt_trade_snapshots.ts_ms → snapshot_ts_ms SQL alias 정규화 추가
+3) Snapshot parser 는 snapshot_ts_ms 를 최우선으로 해석하도록 보강
+4) DB 스키마 변경 없이 analyzer 입력 스키마만 정규화하도록 구조 고정
 ========================================================
 """
 
 from __future__ import annotations
+
+print("DEBUG TRADE_ANALYZER FILE:", __file__)
 
 import json
 import logging
@@ -227,7 +241,38 @@ class TradeAnalyzer:
     def _load_recent_events(self, symbol: str, limit: int) -> List[EventRecord]:
         sql = text(
             """
-            SELECT *
+            SELECT
+                id,
+                symbol,
+                event_type,
+                regime,
+                source,
+                side,
+                price,
+                qty,
+                leverage,
+                tp_pct,
+                sl_pct,
+                risk_pct,
+                pnl_pct,
+                reason,
+                extra_json,
+                is_test,
+                ts_utc,
+                created_at,
+                (
+                    EXTRACT(
+                        EPOCH FROM COALESCE(ts_utc, created_at)
+                    ) * 1000
+                )::bigint AS event_ts_ms,
+                CASE
+                    WHEN extra_json IS NOT NULL
+                         AND extra_json ? 'trade_id'
+                         AND NULLIF(BTRIM(extra_json ->> 'trade_id'), '') IS NOT NULL
+                         AND (extra_json ->> 'trade_id') ~ '^[0-9]+$'
+                    THEN (extra_json ->> 'trade_id')::bigint
+                    ELSE NULL
+                END AS trade_id
             FROM bt_events
             WHERE symbol = :symbol
             ORDER BY id DESC
@@ -261,7 +306,15 @@ class TradeAnalyzer:
         sql = (
             text(
                 """
-                SELECT *
+                SELECT
+                    id,
+                    trade_id,
+                    ts_ms AS snapshot_ts_ms,
+                    spread_bps,
+                    pattern_score,
+                    market_regime,
+                    orderbook_imbalance,
+                    volatility_score
                 FROM bt_trade_snapshots
                 WHERE trade_id IN :trade_ids
                 ORDER BY trade_id ASC, id ASC
@@ -760,7 +813,7 @@ class TradeAnalyzer:
             event_id=self._pick_int(row, ["id", "event_id"], field_name="event_id"),
             ts_ms=self._pick_int(
                 row,
-                ["ts_ms", "created_ts_ms", "created_at_ms", "event_ts_ms"],
+                ["event_ts_ms", "ts_ms", "created_ts_ms", "created_at_ms"],
                 field_name="event_ts_ms",
             ),
             symbol=self._pick_str(row, ["symbol"], field_name="symbol"),
@@ -785,7 +838,7 @@ class TradeAnalyzer:
         )
         ts_ms = self._pick_int(
             row,
-            ["ts_ms", "created_ts_ms", "created_at_ms", "snapshot_ts_ms"],
+            ["snapshot_ts_ms", "ts_ms", "created_ts_ms", "created_at_ms"],
             field_name="snapshot_ts_ms",
         )
         spread_bps = self._pick_decimal(
@@ -1062,3 +1115,13 @@ class TradeAnalyzer:
         if value is None:
             return None
         return self._fmt_decimal(value, scale)
+
+
+__all__ = [
+    "TradeAnalyzer",
+    "TradeAnalyzerSummary",
+    "TradeRecord",
+    "EventRecord",
+    "TradeSnapshotRecord",
+    "SidePerformance",
+]

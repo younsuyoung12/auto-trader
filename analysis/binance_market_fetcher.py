@@ -22,6 +22,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2026-03-07
 - 신규 생성
 - Binance 외부 시장 분석용 fetcher 추가
+
+2026-03-07 (PATCH)
+1) /fapi/v1/allForceOrders 제거
+2) Binance 공개 REST 정책과 충돌하는 force orders 수집 경로 정리
+3) 공개 REST snapshot 수집에서 force orders를 네트워크 호출 대상에서 제외
+4) force orders는 공개 REST 미지원 사실을 명시적으로 로깅하고 빈 리스트 반환
+
+2026-03-08 (PATCH)
+1) ratio 계열 endpoint 응답에서 symbol 필드를 요청 symbol 기준으로 정합화
+2) openInterestHist 응답 파싱/누적 구조 오류 수정
+3) ratio/openInterestHist timestamp 유효성 검증 추가
+4) takerlongshortRatio 응답 스키마(buySellRatio/buyVol/sellVol) 전용 파서 추가
 ========================================================
 """
 
@@ -31,7 +43,7 @@ import logging
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence
 
 import requests
 
@@ -163,6 +175,12 @@ class BinanceMarketFetcher:
     - 공개 REST endpoint만 사용한다.
     - 인증/서명/계정 데이터는 다루지 않는다.
     - STRICT 정책상 필수 설정 누락, 응답 손상, 타입 불일치는 즉시 예외 처리한다.
+
+    force_orders 정책:
+    - Binance 공개 REST 기준으로 liquidation / force order 조회용 유지되는 endpoint가 없다.
+    - /fapi/v1/allForceOrders 는 유지 중단된 경로다.
+    - /fapi/v1/forceOrders 는 USER_DATA 이므로 본 fetcher 정책과 충돌한다.
+    - 따라서 본 fetcher는 force_orders 필드를 유지하되, 공개 REST 스냅샷에서는 빈 리스트로 반환한다.
     """
 
     def __init__(self) -> None:
@@ -195,6 +213,7 @@ class BinanceMarketFetcher:
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "auto-trader/ai-market-analyst"})
+        self._force_orders_public_rest_unavailable_logged = False
 
     # ========================================================
     # Public API
@@ -217,7 +236,8 @@ class BinanceMarketFetcher:
         - klines
         - funding history
         - long/short ratios
-        - force orders (recent liquidation-like forced orders)
+        - force orders
+          * 공개 REST 미지원으로 인해 본 fetcher에서는 빈 리스트로 반환
         """
         server_time_ms, local_time_ms, drift_ms = self.fetch_server_time_or_raise()
 
@@ -423,7 +443,7 @@ class BinanceMarketFetcher:
                 raise RuntimeError("Binance fundingRate row is not an object")
             result.append(
                 BinanceFundingRatePoint(
-                    symbol=self._parse_str(row, "symbol"),
+                    symbol=symbol,
                     funding_rate=self._parse_decimal(row, "fundingRate"),
                     funding_time_ms=self._parse_int(row, "fundingTime"),
                     mark_price=self._parse_optional_decimal(row, "markPrice"),
@@ -451,14 +471,20 @@ class BinanceMarketFetcher:
         for row in payload:
             if not isinstance(row, Mapping):
                 raise RuntimeError("Binance openInterestHist row is not an object")
+
+            ts = self._parse_int(row, "timestamp")
+            if ts <= 0:
+                raise RuntimeError("Invalid timestamp from Binance openInterestHist")
+
             result.append(
                 BinanceOpenInterestHistPoint(
-                    symbol=self._parse_str(row, "symbol"),
+                    symbol=symbol,
                     sum_open_interest=self._parse_decimal(row, "sumOpenInterest"),
                     sum_open_interest_value=self._parse_decimal(row, "sumOpenInterestValue"),
-                    timestamp_ms=self._parse_int(row, "timestamp"),
+                    timestamp_ms=ts,
                 )
             )
+
         return result
 
     def fetch_global_long_short_account_ratio(
@@ -472,9 +498,10 @@ class BinanceMarketFetcher:
             "/futures/data/globalLongShortAccountRatio",
             params={"symbol": symbol, "period": period, "limit": limit},
         )
-        return self._parse_ratio_series(
+        return self._parse_standard_ratio_series(
             payload=payload,
             endpoint="/futures/data/globalLongShortAccountRatio",
+            symbol=symbol,
         )
 
     def fetch_top_long_short_position_ratio(
@@ -488,9 +515,10 @@ class BinanceMarketFetcher:
             "/futures/data/topLongShortPositionRatio",
             params={"symbol": symbol, "period": period, "limit": limit},
         )
-        return self._parse_ratio_series(
+        return self._parse_standard_ratio_series(
             payload=payload,
             endpoint="/futures/data/topLongShortPositionRatio",
+            symbol=symbol,
         )
 
     def fetch_taker_long_short_ratio(
@@ -504,43 +532,35 @@ class BinanceMarketFetcher:
             "/futures/data/takerlongshortRatio",
             params={"symbol": symbol, "period": period, "limit": limit},
         )
-        return self._parse_ratio_series(
+        return self._parse_taker_ratio_series(
             payload=payload,
             endpoint="/futures/data/takerlongshortRatio",
+            symbol=symbol,
         )
 
     def fetch_force_orders(self, symbol: str, limit: int) -> List[BinanceForceOrder]:
         """
-        최근 강제 청산/강제 주문 계열 데이터를 가져온다.
+        force orders / liquidation orders 수집.
 
-        빈 리스트는 "최근 window 내 이벤트 없음"으로 간주할 수 있으므로
-        여기서는 빈 응답을 예외로 보지 않는다.
+        중요:
+        - 본 fetcher는 "공개 REST만 사용"이 절대 원칙이다.
+        - Binance 공개 REST 기준으로 liquidation / force orders 를 안정적으로 조회할
+          유지되는 endpoint가 없다.
+        - /fapi/v1/allForceOrders 는 유지 중단된 경로다.
+        - /fapi/v1/forceOrders 는 USER_DATA 이므로 정책 위반이다.
+
+        따라서:
+        - 네트워크 호출을 수행하지 않는다.
+        - 사실 기반으로 빈 리스트를 반환한다.
+        - 이 필드는 "공개 REST transport 에서는 미수집" 상태를 의미한다.
         """
-        payload = self._request_json(
-            "GET",
-            "/fapi/v1/allForceOrders",
-            params={"symbol": symbol, "limit": limit},
-        )
-        if not isinstance(payload, list):
-            raise RuntimeError("Binance /fapi/v1/allForceOrders response is not a list")
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise RuntimeError("symbol must be a non-empty string")
+        if limit <= 0:
+            raise RuntimeError("limit must be > 0 for force orders")
 
-        result: List[BinanceForceOrder] = []
-        for row in payload:
-            if not isinstance(row, Mapping):
-                raise RuntimeError("Binance allForceOrders row is not an object")
-            result.append(
-                BinanceForceOrder(
-                    symbol=self._parse_str(row, "symbol"),
-                    side=self._parse_str(row, "side"),
-                    price=self._parse_decimal(row, "price"),
-                    average_price=self._parse_decimal(row, "avgPrice"),
-                    quantity=self._parse_decimal(row, "origQty"),
-                    filled_quantity=self._parse_decimal(row, "executedQty"),
-                    status=self._parse_str(row, "status"),
-                    time_ms=self._parse_int(row, "time"),
-                )
-            )
-        return result
+        self._log_force_orders_public_rest_unavailable_once(symbol=symbol, limit=limit)
+        return []
 
     # ========================================================
     # Internal helpers
@@ -583,7 +603,12 @@ class BinanceMarketFetcher:
             logger.error("Binance response JSON decode failed: path=%s", path)
             raise RuntimeError(f"Binance response JSON decode failed: path={path}") from exc
 
-    def _parse_ratio_series(self, payload: Any, endpoint: str) -> List[BinanceRatioPoint]:
+    def _parse_standard_ratio_series(
+        self,
+        payload: Any,
+        endpoint: str,
+        symbol: str,
+    ) -> List[BinanceRatioPoint]:
         if not isinstance(payload, list):
             raise RuntimeError(f"Binance {endpoint} response is not a list")
         if not payload:
@@ -593,13 +618,49 @@ class BinanceMarketFetcher:
         for row in payload:
             if not isinstance(row, Mapping):
                 raise RuntimeError(f"Binance {endpoint} row is not an object")
+
+            ts = self._parse_int(row, "timestamp")
+            if ts <= 0:
+                raise RuntimeError(f"Invalid timestamp from Binance ratio endpoint: {endpoint}")
+
             result.append(
                 BinanceRatioPoint(
-                    symbol=self._parse_str(row, "symbol"),
+                    symbol=symbol,
                     long_short_ratio=self._parse_decimal(row, "longShortRatio"),
                     long_account=self._parse_optional_decimal(row, "longAccount"),
                     short_account=self._parse_optional_decimal(row, "shortAccount"),
-                    timestamp_ms=self._parse_int(row, "timestamp"),
+                    timestamp_ms=ts,
+                )
+            )
+        return result
+
+    def _parse_taker_ratio_series(
+        self,
+        payload: Any,
+        endpoint: str,
+        symbol: str,
+    ) -> List[BinanceRatioPoint]:
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Binance {endpoint} response is not a list")
+        if not payload:
+            raise RuntimeError(f"Binance {endpoint} response is empty")
+
+        result: List[BinanceRatioPoint] = []
+        for row in payload:
+            if not isinstance(row, Mapping):
+                raise RuntimeError(f"Binance {endpoint} row is not an object")
+
+            ts = self._parse_int(row, "timestamp")
+            if ts <= 0:
+                raise RuntimeError(f"Invalid timestamp from Binance taker ratio endpoint: {endpoint}")
+
+            result.append(
+                BinanceRatioPoint(
+                    symbol=symbol,
+                    long_short_ratio=self._parse_decimal(row, "buySellRatio"),
+                    long_account=self._parse_optional_decimal(row, "buyVol"),
+                    short_account=self._parse_optional_decimal(row, "sellVol"),
+                    timestamp_ms=ts,
                 )
             )
         return result
@@ -638,7 +699,12 @@ class BinanceMarketFetcher:
         taker_buy_base_volume = self._to_decimal(row[9], "kline_taker_buy_base_volume")
         taker_buy_quote_volume = self._to_decimal(row[10], "kline_taker_buy_quote_volume")
 
-        if open_price <= Decimal("0") or high_price <= Decimal("0") or low_price <= Decimal("0") or close_price <= Decimal("0"):
+        if (
+            open_price <= Decimal("0")
+            or high_price <= Decimal("0")
+            or low_price <= Decimal("0")
+            or close_price <= Decimal("0")
+        ):
             raise RuntimeError("Binance kline contains non-positive price")
         if trade_count < 0:
             raise RuntimeError("Binance kline trade_count must be >= 0")
@@ -739,3 +805,14 @@ class BinanceMarketFetcher:
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Missing or invalid required float setting: {name}") from exc
         return parsed
+
+    def _log_force_orders_public_rest_unavailable_once(self, symbol: str, limit: int) -> None:
+        if self._force_orders_public_rest_unavailable_logged:
+            return
+        logger.warning(
+            "force_orders not collected in public REST mode: "
+            "symbol=%s limit=%s reason=Binance public REST endpoint unavailable_or_policy_conflict",
+            symbol,
+            limit,
+        )
+        self._force_orders_public_rest_unavailable_logged = True

@@ -27,6 +27,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - market-analysis 전용 순수 외부시장 분석 경로 추가
 - 입력 사용 검증을 실제 제공된 분석 컨텍스트 기준으로 강화
 - 대시보드 payload 생성 로직을 분석 범위별(optional card) 구조로 확장
+
+2026-03-07 (PATCH)
+1) 분석 객체 to_dict() 결과가 빈 mapping 이면 즉시 예외 처리하도록 강화
+2) market-only 스코프에서 generic GPT analyze()를 무조건 호출하지 않도록 분기 추가
+3) GPT 엔진의 scope별 메서드 계약 검증 로직 추가
+4) gpt_result / dashboard_payload / 최종 응답 무결성 검증 추가
 ========================================================
 """
 
@@ -35,7 +41,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from analysis.gpt_analyst_engine import GptAnalystEngine, GptAnalystResult
 from analysis.market_analyzer import InternalMarketSummary, MarketAnalyzer
@@ -163,24 +169,29 @@ class QuantAnalyst:
         if include_external_market:
             external_market_summary_obj = self._market_researcher.run()
 
-        internal_market_summary = (
-            internal_market_summary_obj.to_dict()
-            if internal_market_summary_obj is not None
-            else None
+        internal_market_summary = self._object_to_non_empty_mapping_or_none(
+            obj=internal_market_summary_obj,
+            field_name="internal_market_summary",
         )
-        trade_summary = trade_summary_obj.to_dict() if trade_summary_obj is not None else None
-        external_market_summary = (
-            external_market_summary_obj.to_dict()
-            if external_market_summary_obj is not None
-            else None
+        trade_summary = self._object_to_non_empty_mapping_or_none(
+            obj=trade_summary_obj,
+            field_name="trade_summary",
+        )
+        external_market_summary = self._object_to_non_empty_mapping_or_none(
+            obj=external_market_summary_obj,
+            field_name="external_market_summary",
         )
 
-        gpt_result_obj = self._gpt_engine.analyze(
+        gpt_result_obj = self._dispatch_gpt_analysis_or_raise(
             question=normalized_question,
+            include_internal_market=include_internal_market,
+            include_trade_analysis=include_trade_analysis,
+            include_external_market=include_external_market,
             internal_market_summary=internal_market_summary,
             trade_summary=trade_summary,
             external_market_summary=external_market_summary,
         )
+        self._validate_gpt_result_or_raise(gpt_result_obj)
 
         self._validate_used_inputs(
             gpt_result=gpt_result_obj,
@@ -198,6 +209,9 @@ class QuantAnalyst:
             external_market_summary_obj=external_market_summary_obj,
             gpt_result_obj=gpt_result_obj,
         )
+        self._validate_dashboard_payload_or_raise(dashboard_payload)
+
+        gpt_result_dict = self._gpt_result_to_non_empty_mapping_or_raise(gpt_result_obj)
 
         result = QuantAnalystResponse(
             symbol=self._symbol,
@@ -206,9 +220,10 @@ class QuantAnalyst:
             internal_market_summary=internal_market_summary,
             trade_summary=trade_summary,
             external_market_summary=external_market_summary,
-            gpt_result=gpt_result_obj.to_dict(),
+            gpt_result=gpt_result_dict,
             dashboard_payload=dashboard_payload,
         )
+        self._validate_response_or_raise(result)
 
         logger.info(
             (
@@ -223,6 +238,106 @@ class QuantAnalyst:
             gpt_result_obj.scope,
             gpt_result_obj.confidence,
         )
+        return result
+
+    def _dispatch_gpt_analysis_or_raise(
+        self,
+        *,
+        question: str,
+        include_internal_market: bool,
+        include_trade_analysis: bool,
+        include_external_market: bool,
+        internal_market_summary: Optional[Dict[str, Any]],
+        trade_summary: Optional[Dict[str, Any]],
+        external_market_summary: Optional[Dict[str, Any]],
+    ) -> GptAnalystResult:
+        self._validate_scope_input_contract_or_raise(
+            include_internal_market=include_internal_market,
+            include_trade_analysis=include_trade_analysis,
+            include_external_market=include_external_market,
+            internal_market_summary=internal_market_summary,
+            trade_summary=trade_summary,
+            external_market_summary=external_market_summary,
+        )
+
+        is_market_only_scope = (
+            include_internal_market is False
+            and include_trade_analysis is False
+            and include_external_market is True
+        )
+
+        if is_market_only_scope:
+            return self._dispatch_market_only_gpt_analysis_or_raise(
+                question=question,
+                external_market_summary=external_market_summary,
+            )
+
+        return self._dispatch_generic_gpt_analysis_or_raise(
+            question=question,
+            internal_market_summary=internal_market_summary,
+            trade_summary=trade_summary,
+            external_market_summary=external_market_summary,
+        )
+
+    def _dispatch_market_only_gpt_analysis_or_raise(
+        self,
+        *,
+        question: str,
+        external_market_summary: Optional[Dict[str, Any]],
+    ) -> GptAnalystResult:
+        if external_market_summary is None:
+            raise RuntimeError(
+                "external_market_summary is required for market-only GPT analysis"
+            )
+
+        candidates = (
+            "analyze_market_only",
+            "analyze_external_market_only",
+        )
+
+        for method_name in candidates:
+            method = getattr(self._gpt_engine, method_name, None)
+            if method is None:
+                continue
+            if not callable(method):
+                raise RuntimeError(
+                    f"GptAnalystEngine.{method_name} exists but is not callable"
+                )
+            result = method(
+                question=question,
+                external_market_summary=external_market_summary,
+            )
+            if not isinstance(result, GptAnalystResult):
+                raise RuntimeError(
+                    f"GptAnalystEngine.{method_name} must return GptAnalystResult"
+                )
+            return result
+
+        raise RuntimeError(
+            "GptAnalystEngine does not support market-only scope. "
+            "Required: analyze_market_only(...) or analyze_external_market_only(...)."
+        )
+
+    def _dispatch_generic_gpt_analysis_or_raise(
+        self,
+        *,
+        question: str,
+        internal_market_summary: Optional[Dict[str, Any]],
+        trade_summary: Optional[Dict[str, Any]],
+        external_market_summary: Optional[Dict[str, Any]],
+    ) -> GptAnalystResult:
+        analyze_method = getattr(self._gpt_engine, "analyze", None)
+        if analyze_method is None or not callable(analyze_method):
+            raise RuntimeError("GptAnalystEngine.analyze must exist and be callable")
+
+        result = analyze_method(
+            question=question,
+            internal_market_summary=internal_market_summary,
+            trade_summary=trade_summary,
+            external_market_summary=external_market_summary,
+        )
+        if not isinstance(result, GptAnalystResult):
+            raise RuntimeError("GptAnalystEngine.analyze must return GptAnalystResult")
         return result
 
     # ========================================================
@@ -294,6 +409,63 @@ class QuantAnalyst:
         ):
             raise RuntimeError("At least one analysis input must be enabled")
 
+    def _validate_scope_input_contract_or_raise(
+        self,
+        *,
+        include_internal_market: bool,
+        include_trade_analysis: bool,
+        include_external_market: bool,
+        internal_market_summary: Optional[Dict[str, Any]],
+        trade_summary: Optional[Dict[str, Any]],
+        external_market_summary: Optional[Dict[str, Any]],
+    ) -> None:
+        if include_internal_market and internal_market_summary is None:
+            raise RuntimeError(
+                "include_internal_market=True but internal_market_summary is missing"
+            )
+        if (not include_internal_market) and internal_market_summary is not None:
+            raise RuntimeError(
+                "include_internal_market=False but internal_market_summary was provided"
+            )
+
+        if include_trade_analysis and trade_summary is None:
+            raise RuntimeError(
+                "include_trade_analysis=True but trade_summary is missing"
+            )
+        if (not include_trade_analysis) and trade_summary is not None:
+            raise RuntimeError(
+                "include_trade_analysis=False but trade_summary was provided"
+            )
+
+        if include_external_market and external_market_summary is None:
+            raise RuntimeError(
+                "include_external_market=True but external_market_summary is missing"
+            )
+        if (not include_external_market) and external_market_summary is not None:
+            raise RuntimeError(
+                "include_external_market=False but external_market_summary was provided"
+            )
+
+    def _validate_gpt_result_or_raise(self, gpt_result: GptAnalystResult) -> None:
+        if not isinstance(gpt_result.scope, str) or not gpt_result.scope.strip():
+            raise RuntimeError("gpt_result.scope must be a non-empty string")
+        if isinstance(gpt_result.confidence, bool):
+            raise RuntimeError("gpt_result.confidence invalid bool type")
+        try:
+            confidence = float(gpt_result.confidence)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("gpt_result.confidence must be float-like") from exc
+        if confidence < 0.0 or confidence > 1.0:
+            raise RuntimeError("gpt_result.confidence must be between 0 and 1")
+        if not isinstance(gpt_result.answer_ko, str) or not gpt_result.answer_ko.strip():
+            raise RuntimeError("gpt_result.answer_ko must be a non-empty string")
+        if not isinstance(gpt_result.root_causes, list):
+            raise RuntimeError("gpt_result.root_causes must be a list")
+        if not isinstance(gpt_result.recommendations, list):
+            raise RuntimeError("gpt_result.recommendations must be a list")
+        if not isinstance(gpt_result.used_inputs, list):
+            raise RuntimeError("gpt_result.used_inputs must be a list")
+
     def _build_provided_inputs_set(
         self,
         *,
@@ -313,6 +485,37 @@ class QuantAnalyst:
             provided_inputs.add("external_market_summary")
 
         return provided_inputs
+
+    def _object_to_non_empty_mapping_or_none(
+        self,
+        *,
+        obj: Any,
+        field_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        if obj is None:
+            return None
+
+        to_dict_method = getattr(obj, "to_dict", None)
+        if to_dict_method is None or not callable(to_dict_method):
+            raise RuntimeError(f"{field_name} object must provide callable to_dict()")
+
+        data = to_dict_method()
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError(f"{field_name} must be a non-empty mapping")
+        return data
+
+    def _gpt_result_to_non_empty_mapping_or_raise(
+        self,
+        gpt_result_obj: GptAnalystResult,
+    ) -> Dict[str, Any]:
+        to_dict_method = getattr(gpt_result_obj, "to_dict", None)
+        if to_dict_method is None or not callable(to_dict_method):
+            raise RuntimeError("GptAnalystResult must provide callable to_dict()")
+
+        data = to_dict_method()
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError("GptAnalystResult.to_dict() must return a non-empty mapping")
+        return data
 
     # ========================================================
     # Dashboard payload
@@ -448,6 +651,58 @@ class QuantAnalyst:
             "used_inputs": list(gpt_result_obj.used_inputs),
             "market_cards": market_cards,
         }
+
+    def _validate_dashboard_payload_or_raise(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            raise RuntimeError("dashboard_payload must be a non-empty mapping")
+
+        required_keys = (
+            "symbol",
+            "question",
+            "generated_ts_ms",
+            "analysis_as_of_ts_ms",
+            "scope",
+            "confidence",
+            "answer_ko",
+            "root_causes",
+            "recommendations",
+            "used_inputs",
+            "market_cards",
+        )
+        for key in required_keys:
+            if key not in payload:
+                raise RuntimeError(f"dashboard_payload missing required key: {key}")
+
+        if not isinstance(payload["symbol"], str) or not payload["symbol"].strip():
+            raise RuntimeError("dashboard_payload.symbol must be a non-empty string")
+        if not isinstance(payload["question"], str) or not payload["question"].strip():
+            raise RuntimeError("dashboard_payload.question must be a non-empty string")
+        if not isinstance(payload["scope"], str) or not payload["scope"].strip():
+            raise RuntimeError("dashboard_payload.scope must be a non-empty string")
+        if not isinstance(payload["answer_ko"], str) or not payload["answer_ko"].strip():
+            raise RuntimeError("dashboard_payload.answer_ko must be a non-empty string")
+        if not isinstance(payload["root_causes"], list):
+            raise RuntimeError("dashboard_payload.root_causes must be a list")
+        if not isinstance(payload["recommendations"], list):
+            raise RuntimeError("dashboard_payload.recommendations must be a list")
+        if not isinstance(payload["used_inputs"], list):
+            raise RuntimeError("dashboard_payload.used_inputs must be a list")
+        if not isinstance(payload["market_cards"], dict) or not payload["market_cards"]:
+            raise RuntimeError("dashboard_payload.market_cards must be a non-empty mapping")
+
+    def _validate_response_or_raise(self, result: QuantAnalystResponse) -> None:
+        data = result.to_dict()
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError("QuantAnalystResponse.to_dict() must return a non-empty mapping")
+        if not isinstance(result.symbol, str) or not result.symbol.strip():
+            raise RuntimeError("QuantAnalystResponse.symbol must be a non-empty string")
+        if not isinstance(result.question, str) or not result.question.strip():
+            raise RuntimeError("QuantAnalystResponse.question must be a non-empty string")
+        if result.generated_ts_ms <= 0:
+            raise RuntimeError("QuantAnalystResponse.generated_ts_ms must be > 0")
+        if not isinstance(result.gpt_result, dict) or not result.gpt_result:
+            raise RuntimeError("QuantAnalystResponse.gpt_result must be a non-empty mapping")
+        self._validate_dashboard_payload_or_raise(result.dashboard_payload)
 
     # ========================================================
     # Settings helpers

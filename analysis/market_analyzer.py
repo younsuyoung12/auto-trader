@@ -27,6 +27,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2026-03-07
 - 신규 생성
 - DB 기반 내부 시장 분석기 추가
+
+2026-03-07 (PATCH)
+1) internal market summary / dashboard payload 무결성 검증 추가
+2) market_features 시계열 정합성(symbol/timeframe/가격/스프레드) 검증 강화
+3) trade_context_snapshots 최신 행 필수값 검증 강화
+4) build_prompt_context 에서 빈 dict / 필수 키 누락 즉시 예외 처리
 ========================================================
 """
 
@@ -151,17 +157,22 @@ class MarketAnalyzer:
             market_features=market_features,
             latest_context=latest_context,
         )
+        self._validate_summary_or_raise(summary)
         logger.info(
-            "Internal market analysis completed: symbol=%s timeframe=%s regime=%s trend=%s",
+            "Internal market analysis completed: symbol=%s timeframe=%s regime=%s trend=%s as_of_ms=%s",
             summary.symbol,
             summary.timeframe,
             summary.market_regime,
             summary.trend,
+            summary.as_of_ms,
         )
         return summary
 
     def build_prompt_context(self) -> Dict[str, Any]:
-        return self.run().dashboard_payload
+        summary = self.run()
+        payload = summary.dashboard_payload
+        self._validate_dashboard_payload_or_raise(payload)
+        return payload
 
     # ========================================================
     # DB Load
@@ -218,6 +229,11 @@ class MarketAnalyzer:
                 f"Insufficient market_features rows: required>=5, got={len(points_sorted)}"
             )
 
+        self._validate_market_feature_points_or_raise(
+            rows=points_sorted,
+            expected_symbol=symbol,
+            expected_timeframe=timeframe,
+        )
         self._validate_time_order(points_sorted)
         return points_sorted
 
@@ -248,7 +264,9 @@ class MarketAnalyzer:
         if row is None:
             raise RuntimeError(f"No trade_context_snapshots row found for symbol={symbol}")
 
-        return self._parse_trade_context_row(row)
+        context = self._parse_trade_context_row(row)
+        self._validate_trade_context_point_or_raise(context, expected_symbol=symbol)
+        return context
 
     # ========================================================
     # Core Analysis
@@ -259,6 +277,9 @@ class MarketAnalyzer:
         market_features: Sequence[MarketFeaturePoint],
         latest_context: TradeContextPoint,
     ) -> InternalMarketSummary:
+        if not market_features:
+            raise RuntimeError("market_features must not be empty")
+
         latest_feature = market_features[-1]
         first_feature = market_features[0]
 
@@ -324,6 +345,9 @@ class MarketAnalyzer:
             long_short_ratio=latest_context.long_short_ratio,
         )
 
+        if not isinstance(analyst_summary_ko, str) or not analyst_summary_ko.strip():
+            raise RuntimeError("analyst_summary_ko must be a non-empty string")
+
         dashboard_payload = self._build_dashboard_payload(
             symbol=latest_feature.symbol,
             timeframe=latest_feature.timeframe,
@@ -349,8 +373,9 @@ class MarketAnalyzer:
             long_short_ratio=latest_context.long_short_ratio,
             analyst_summary_ko=analyst_summary_ko,
         )
+        self._validate_dashboard_payload_or_raise(dashboard_payload)
 
-        return InternalMarketSummary(
+        summary = InternalMarketSummary(
             symbol=latest_feature.symbol,
             timeframe=latest_feature.timeframe,
             as_of_ms=latest_feature.ts_ms,
@@ -376,6 +401,7 @@ class MarketAnalyzer:
             analyst_summary_ko=analyst_summary_ko,
             dashboard_payload=dashboard_payload,
         )
+        return summary
 
     # ========================================================
     # Parsing
@@ -448,19 +474,13 @@ class MarketAnalyzer:
         blockers: List[str] = []
 
         if latest_pattern_score < self._pattern_entry_threshold:
-            blockers.append(
-                "pattern_score_below_threshold"
-            )
+            blockers.append("pattern_score_below_threshold")
 
         if latest_spread_bps > self._spread_guard_bps:
-            blockers.append(
-                "spread_guard_blocked"
-            )
+            blockers.append("spread_guard_blocked")
 
         if abs(latest_orderbook_imbalance) > self._imbalance_guard_abs:
-            blockers.append(
-                "depth_imbalance_guard"
-            )
+            blockers.append("depth_imbalance_guard")
 
         if not blockers:
             blockers.append("none")
@@ -527,7 +547,10 @@ class MarketAnalyzer:
         else:
             parts.append(f"현재 진입 차단 요인은 {', '.join(entry_blockers)} 입니다.")
 
-        return " ".join(parts)
+        summary = " ".join(parts)
+        if not summary.strip():
+            raise RuntimeError("Korean analyst summary must not be empty")
+        return summary
 
     def _build_dashboard_payload(
         self,
@@ -561,7 +584,7 @@ class MarketAnalyzer:
             "long_short_ratio": self._fmt_decimal_optional(long_short_ratio, 4),
         }
 
-        return {
+        payload = {
             "symbol": symbol,
             "timeframe": timeframe,
             "as_of_ms": as_of_ms,
@@ -594,6 +617,7 @@ class MarketAnalyzer:
             "entry_blockers": list(entry_blockers),
             "analyst_summary_ko": analyst_summary_ko,
         }
+        return payload
 
     # ========================================================
     # Validation / Math helpers
@@ -605,6 +629,126 @@ class MarketAnalyzer:
             if prev is not None and row.ts_ms <= prev:
                 raise RuntimeError("market_features ts_ms must be strictly increasing")
             prev = row.ts_ms
+
+    def _validate_market_feature_points_or_raise(
+        self,
+        rows: Sequence[MarketFeaturePoint],
+        expected_symbol: str,
+        expected_timeframe: str,
+    ) -> None:
+        if not rows:
+            raise RuntimeError("market_features rows must not be empty")
+
+        for idx, row in enumerate(rows):
+            if row.symbol != expected_symbol:
+                raise RuntimeError(
+                    f"market_features symbol mismatch at index={idx}: expected={expected_symbol}, got={row.symbol}"
+                )
+            if row.timeframe != expected_timeframe:
+                raise RuntimeError(
+                    f"market_features timeframe mismatch at index={idx}: expected={expected_timeframe}, got={row.timeframe}"
+                )
+            if row.ts_ms <= 0:
+                raise RuntimeError(f"market_features ts_ms must be > 0 at index={idx}")
+            if row.close_price <= Decimal("0"):
+                raise RuntimeError(f"market_features close_price must be > 0 at index={idx}")
+            if row.spread_bps < Decimal("0"):
+                raise RuntimeError(f"market_features spread_bps must be >= 0 at index={idx}")
+            if not row.market_regime.strip():
+                raise RuntimeError(f"market_features market_regime must be non-empty at index={idx}")
+
+    def _validate_trade_context_point_or_raise(
+        self,
+        row: TradeContextPoint,
+        expected_symbol: str,
+    ) -> None:
+        if row.symbol != expected_symbol:
+            raise RuntimeError(
+                f"trade_context_snapshots symbol mismatch: expected={expected_symbol}, got={row.symbol}"
+            )
+        if row.ts_ms <= 0:
+            raise RuntimeError("trade_context_snapshots ts_ms must be > 0")
+        if row.price <= Decimal("0"):
+            raise RuntimeError("trade_context_snapshots price must be > 0")
+        if row.spread_bps < Decimal("0"):
+            raise RuntimeError("trade_context_snapshots spread_bps must be >= 0")
+        if not row.market_regime.strip():
+            raise RuntimeError("trade_context_snapshots market_regime must be non-empty")
+
+    def _validate_summary_or_raise(self, summary: InternalMarketSummary) -> None:
+        data = summary.to_dict()
+        if not isinstance(data, dict) or not data:
+            raise RuntimeError("InternalMarketSummary.to_dict() must return a non-empty mapping")
+        if summary.as_of_ms <= 0:
+            raise RuntimeError("InternalMarketSummary.as_of_ms must be > 0")
+        if summary.latest_close_price <= Decimal("0"):
+            raise RuntimeError("InternalMarketSummary.latest_close_price must be > 0")
+        if summary.avg_spread_bps < Decimal("0"):
+            raise RuntimeError("InternalMarketSummary.avg_spread_bps must be >= 0")
+        if summary.latest_spread_bps < Decimal("0"):
+            raise RuntimeError("InternalMarketSummary.latest_spread_bps must be >= 0")
+        if not isinstance(summary.entry_blockers, list) or not summary.entry_blockers:
+            raise RuntimeError("InternalMarketSummary.entry_blockers must be a non-empty list")
+        if not isinstance(summary.analyst_summary_ko, str) or not summary.analyst_summary_ko.strip():
+            raise RuntimeError("InternalMarketSummary.analyst_summary_ko must be a non-empty string")
+        self._validate_dashboard_payload_or_raise(summary.dashboard_payload)
+
+    def _validate_dashboard_payload_or_raise(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or not payload:
+            raise RuntimeError("dashboard_payload must be a non-empty mapping")
+
+        required_top_keys = (
+            "symbol",
+            "timeframe",
+            "as_of_ms",
+            "market_structure",
+            "price_context",
+            "microstructure",
+            "pattern_context",
+            "scores",
+            "derivatives",
+            "entry_blockers",
+            "analyst_summary_ko",
+        )
+        for key in required_top_keys:
+            if key not in payload:
+                raise RuntimeError(f"dashboard_payload missing required key: {key}")
+
+        symbol = payload["symbol"]
+        timeframe = payload["timeframe"]
+        as_of_ms = payload["as_of_ms"]
+        entry_blockers = payload["entry_blockers"]
+        analyst_summary_ko = payload["analyst_summary_ko"]
+
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise RuntimeError("dashboard_payload.symbol must be a non-empty string")
+        if not isinstance(timeframe, str) or not timeframe.strip():
+            raise RuntimeError("dashboard_payload.timeframe must be a non-empty string")
+        if isinstance(as_of_ms, bool):
+            raise RuntimeError("dashboard_payload.as_of_ms invalid bool type")
+        try:
+            as_of_ms_int = int(as_of_ms)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("dashboard_payload.as_of_ms must be int-like") from exc
+        if as_of_ms_int <= 0:
+            raise RuntimeError("dashboard_payload.as_of_ms must be > 0")
+        if not isinstance(entry_blockers, list) or not entry_blockers:
+            raise RuntimeError("dashboard_payload.entry_blockers must be a non-empty list")
+        if not isinstance(analyst_summary_ko, str) or not analyst_summary_ko.strip():
+            raise RuntimeError("dashboard_payload.analyst_summary_ko must be a non-empty string")
+
+        nested_mapping_keys = (
+            "market_structure",
+            "price_context",
+            "microstructure",
+            "pattern_context",
+            "scores",
+            "derivatives",
+        )
+        for key in nested_mapping_keys:
+            value = payload[key]
+            if not isinstance(value, Mapping) or not value:
+                raise RuntimeError(f"dashboard_payload.{key} must be a non-empty mapping")
 
     def _calc_price_change_pct(self, first_price: Decimal, last_price: Decimal) -> Decimal:
         if first_price <= Decimal("0") or last_price <= Decimal("0"):
