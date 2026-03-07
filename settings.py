@@ -375,7 +375,7 @@ class Settings:
     analyst_event_lookback_limit: int = 300
     analyst_include_external_market: bool = True
 
-    analyst_auto_report_market_interval_sec: int = 60
+    analyst_auto_report_market_interval_sec: int = 30
     analyst_auto_report_system_interval_sec: int = 1800
     analyst_auto_report_persist: bool = True
     analyst_auto_report_notify: bool = False
@@ -1045,7 +1045,7 @@ def load_settings() -> Settings:
     analyst_event_lookback_limit = _as_int("ANALYST_EVENT_LOOKBACK_LIMIT", 300)
     analyst_include_external_market = _as_bool("ANALYST_INCLUDE_EXTERNAL_MARKET", True)
 
-    analyst_auto_report_market_interval_sec = _as_int("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC", 300)
+    analyst_auto_report_market_interval_sec = _as_int("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC", 30)
     analyst_auto_report_system_interval_sec = _as_int("ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC", 1800)
     analyst_auto_report_persist = _as_bool("ANALYST_AUTO_REPORT_PERSIST", True)
     analyst_auto_report_notify = _as_bool("ANALYST_AUTO_REPORT_NOTIFY", False)
