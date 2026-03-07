@@ -59,6 +59,9 @@ STRICT · NO-FALLBACK
   4) dashboard template/static 경로를 dashboard/* 구조로 정합화
   5) 분석 결과 bt_events 기록 연동
      - event_type='QUANT_ANALYSIS'
+  6) /api/market-analysis를 순수 외부시장 분석 경로로 분리
+     - QuantAnalyst.analyze_market_only() 사용
+     - TradeAnalyzer / 내부 DB 거래 분석 비의존화
 - 2026-03-06:
   1) Engine Watchdog API 추가:
      - /api/engine/health
@@ -394,9 +397,8 @@ def api_market_analysis(
     normalized_question = _require_question(question)
 
     def _build() -> Dict[str, Any]:
-        result = _QUANT_ANALYST.analyze(
+        result = _QUANT_ANALYST.analyze_market_only(
             question=normalized_question,
-            include_external_market=True,
         )
         payload = result.dashboard_payload
         _persist_analysis_event(
