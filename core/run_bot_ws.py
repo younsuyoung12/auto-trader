@@ -124,12 +124,12 @@ from infra.market_data_rest import fetch_klines_rest, KlineRestError
 import infra.data_health_monitor as data_health_monitor
 from infra.data_health_monitor import start_health_monitor
 
-from infra.market_features_ws import get_trading_signal, FeatureBuildError
-from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
 from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder, AccountStateNotReadyError
 from execution.risk_physics_engine import RiskPhysicsEngine, RiskPhysicsPolicy
 from strategy.signal import Signal
+from analysis.market_researcher import MarketResearcher
+from core.entry_pipeline import EntryCandidate, _build_entry_market_data, _decide_entry_candidate_strict
 
 from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
@@ -195,14 +195,6 @@ _ACCOUNT_WS_READY_TIMEOUT_SEC: float = 20.0
 
 
 @dataclass(frozen=True, slots=True)
-class EntryCandidate:
-    action: str
-    direction: str
-    tp_pct: float
-    sl_pct: float
-    reason: str
-    meta: Dict[str, Any]
-    guard_adjustments: Dict[str, float]
 
 
 def _as_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
@@ -233,161 +225,10 @@ def _require_int_ms(v: Any, name: str) -> int:
     return iv
 
 
-def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
-    tp = _as_float(getattr(settings, "tp_pct", None), "settings.tp_pct", min_value=0.0, max_value=1.0)
-    sl = _as_float(getattr(settings, "sl_pct", None), "settings.sl_pct", min_value=0.0, max_value=1.0)
-
-    if isinstance(extra, dict):
-        if extra.get("tp_pct") is not None:
-            tp = _as_float(extra.get("tp_pct"), "extra.tp_pct", min_value=0.0, max_value=1.0)
-        if extra.get("sl_pct") is not None:
-            sl = _as_float(extra.get("sl_pct"), "extra.sl_pct", min_value=0.0, max_value=1.0)
-
-    if tp <= 0.0:
-        raise RuntimeError("tp_pct must be > 0 (STRICT)")
-    if sl <= 0.0:
-        raise RuntimeError("sl_pct must be > 0 (STRICT)")
-    return float(tp), float(sl)
 
 
-def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], settings: Any) -> Dict[str, float]:
-    if not isinstance(market_features, dict) or not market_features:
-        raise RuntimeError("market_features is required (STRICT)")
-
-    engine_scores = market_features.get("engine_scores")
-    if not isinstance(engine_scores, dict) or not engine_scores:
-        raise RuntimeError("market_features.engine_scores is required (STRICT)")
-
-    total = engine_scores.get("total")
-    if not isinstance(total, dict) or "score" not in total:
-        raise RuntimeError("market_features.engine_scores.total.score is required (STRICT)")
-
-    trend_4h = engine_scores.get("trend_4h")
-    if not isinstance(trend_4h, dict) or not trend_4h:
-        raise RuntimeError("market_features.engine_scores.trend_4h is required (STRICT)")
-
-    trend_components = trend_4h.get("components")
-    if not isinstance(trend_components, dict) or not trend_components:
-        raise RuntimeError("market_features.engine_scores.trend_4h.components is required (STRICT)")
-    if "trend_strength" not in trend_components:
-        raise RuntimeError("market_features.engine_scores.trend_4h.components.trend_strength is required (STRICT)")
-
-    orderbook = market_features.get("orderbook")
-    if not isinstance(orderbook, dict) or not orderbook:
-        raise RuntimeError("market_features.orderbook is required (STRICT)")
-    if "spread_pct" not in orderbook:
-        raise RuntimeError("market_features.orderbook.spread_pct is required (STRICT)")
-    if "depth_imbalance" not in orderbook:
-        raise RuntimeError("market_features.orderbook.depth_imbalance is required (STRICT)")
-
-    total_score_pct = _as_float(
-        total.get("score"),
-        "market_features.engine_scores.total.score",
-        min_value=0.0,
-        max_value=100.0,
-    )
-    trend_strength = _as_float(
-        trend_components.get("trend_strength"),
-        "market_features.engine_scores.trend_4h.components.trend_strength",
-        min_value=0.0,
-        max_value=1.0,
-    )
-    spread = _as_float(
-        orderbook.get("spread_pct"),
-        "market_features.orderbook.spread_pct",
-        min_value=0.0,
-    )
-    orderbook_imbalance = _as_float(
-        orderbook.get("depth_imbalance"),
-        "market_features.orderbook.depth_imbalance",
-        min_value=-1.0,
-        max_value=1.0,
-    )
-    entry_score_threshold = _as_float(
-        getattr(settings, "entry_score_threshold", None),
-        "settings.entry_score_threshold",
-        min_value=0.0,
-    )
-
-    return {
-        "entry_score": float(total_score_pct) / 100.0,
-        "trend_strength": float(trend_strength),
-        "spread": float(spread),
-        "orderbook_imbalance": float(orderbook_imbalance),
-        "entry_score_threshold": float(entry_score_threshold),
-    }
 
 
-def _decide_entry_candidate_strict(market_data: Dict[str, Any]) -> EntryCandidate:
-    if not isinstance(market_data, dict) or not market_data:
-        raise RuntimeError("market_data is required (STRICT)")
-
-    symbol = str(market_data.get("symbol") or "").strip()
-    if not symbol:
-        raise RuntimeError("market_data.symbol is required (STRICT)")
-
-    direction = str(market_data.get("direction") or "").upper().strip()
-    if direction not in ("LONG", "SHORT"):
-        raise RuntimeError(f"market_data.direction invalid (STRICT): {direction!r}")
-
-    extra = market_data.get("extra")
-    tp_pct, sl_pct = _require_tp_sl_from_settings_or_extra(SET, extra)
-
-    if market_data.get("signal_ts_ms") is None:
-        raise RuntimeError("market_data.signal_ts_ms is required (STRICT)")
-    signal_ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
-
-    if market_data.get("last_price") is None:
-        raise RuntimeError("market_data.last_price is required (STRICT)")
-    last_price = _as_float(market_data.get("last_price"), "market_data.last_price", min_value=0.0)
-    if last_price <= 0:
-        raise RuntimeError("market_data.last_price must be > 0 (STRICT)")
-
-    entry_score = _as_float(market_data.get("entry_score"), "market_data.entry_score", min_value=0.0, max_value=1.0)
-    trend_strength = _as_float(
-        market_data.get("trend_strength"),
-        "market_data.trend_strength",
-        min_value=0.0,
-        max_value=1.0,
-    )
-    spread = _as_float(market_data.get("spread"), "market_data.spread", min_value=0.0)
-    orderbook_imbalance = _as_float(
-        market_data.get("orderbook_imbalance"),
-        "market_data.orderbook_imbalance",
-        min_value=-1.0,
-        max_value=1.0,
-    )
-    entry_score_threshold = _as_float(
-        market_data.get("entry_score_threshold"),
-        "market_data.entry_score_threshold",
-        min_value=0.0,
-    )
-
-    meta = {
-        "symbol": symbol,
-        "regime": str(market_data.get("regime") or "").strip() or str(market_data.get("signal_source") or "").strip(),
-        "signal_source": str(market_data.get("signal_source") or "").strip(),
-        "signal_ts_ms": int(signal_ts_ms),
-        "last_price": float(last_price),
-        "candles_5m": market_data.get("candles_5m"),
-        "candles_5m_raw": market_data.get("candles_5m_raw"),
-        "extra": extra if isinstance(extra, dict) else None,
-        "entry_score": float(entry_score),
-        "trend_strength": float(trend_strength),
-        "spread": float(spread),
-        "orderbook_imbalance": float(orderbook_imbalance),
-        "entry_score_threshold": float(entry_score_threshold),
-    }
-
-    return EntryCandidate(
-        action="ENTER",
-        direction=direction,
-        tp_pct=float(tp_pct),
-        sl_pct=float(sl_pct),
-        reason="ws_signal_candidate",
-        meta=meta,
-        guard_adjustments={},
-    )
 
 
 def _safe_send_tg(msg: str) -> None:
@@ -781,63 +622,10 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
         raise RuntimeError(msg)
 
 
-def _validate_orderbook_for_entry(symbol: str) -> Optional[str]:
-    ob = ws_get_orderbook(symbol, limit=5)
-    if not isinstance(ob, dict):
-        return "orderbook missing (ws_get_orderbook returned non-dict/None)"
-
-    try:
-        validate_orderbook_strict(ob, symbol=str(symbol), require_ts=False)
-    except DataIntegrityError as e:
-        return f"orderbook integrity fail: {e}"
-
-    bids = ob.get("bids")
-    asks = ob.get("asks")
-    if not isinstance(bids, list) or not bids:
-        return "orderbook bids empty"
-    if not isinstance(asks, list) or not asks:
-        return "orderbook asks empty"
-
-    best_bid = ob.get("bestBid")
-    best_ask = ob.get("bestAsk")
-
-    try:
-        bb = float(bids[0][0]) if best_bid is None else float(best_bid)
-        ba = float(asks[0][0]) if best_ask is None else float(best_ask)
-    except Exception:
-        return "orderbook bestBid/bestAsk invalid"
-
-    if bb <= 0 or ba <= 0:
-        return f"orderbook best prices invalid (bestBid={bb}, bestAsk={ba})"
-    if ba <= bb:
-        return f"orderbook crossed (bestAsk={ba} <= bestBid={bb})"
-    return None
 
 
-def _validate_klines_for_entry(symbol: str) -> Optional[str]:
-    for iv, min_len in ENTRY_REQUIRED_KLINES_MIN.items():
-        buf = ws_get_klines_with_volume(symbol, iv, limit=min_len)
-        if not isinstance(buf, list):
-            return f"kline buffer invalid type for {iv}"
-        if len(buf) < min_len:
-            return f"kline buffer 부족: {iv} need={min_len} got={len(buf)}"
-
-        try:
-            validate_kline_series_strict(buf, name=f"ws_kline[{iv}]", min_len=min_len)
-        except DataIntegrityError as e:
-            return f"kline integrity fail {iv}: {e}"
-
-    return None
 
 
-def _validate_ws_entry_prereqs(symbol: str) -> Optional[str]:
-    r = _validate_orderbook_for_entry(symbol)
-    if r:
-        return r
-    r = _validate_klines_for_entry(symbol)
-    if r:
-        return r
-    return None
 
 
 def _get_equity_current_usdt_strict() -> float:
@@ -1097,109 +885,6 @@ def _start_market_data_store_thread() -> None:
     log("[MD-STORE] background store thread started")
 
 
-def _build_entry_market_data(settings: Any, last_close_ts: float) -> Optional[Dict[str, Any]]:
-    signal_ctx = get_trading_signal(settings=settings, last_close_ts=last_close_ts)
-    if signal_ctx is None:
-        return None
-    if not isinstance(signal_ctx, (tuple, list)) or len(signal_ctx) != 7:
-        raise RuntimeError("get_trading_signal returned invalid tuple format")
-
-    chosen_signal, signal_source, latest_ts, candles_5m, candles_5m_raw, last_price, extra = signal_ctx
-
-    symbol = str(getattr(settings, "symbol", "")).strip()
-    if not symbol:
-        raise RuntimeError("settings.symbol is required")
-
-    direction = str(chosen_signal).upper().strip()
-    if direction not in ("LONG", "SHORT"):
-        raise RuntimeError(f"invalid chosen_signal: {chosen_signal!r}")
-
-    signal_source_s = str(signal_source).strip()
-    if not signal_source_s:
-        raise RuntimeError("signal_source is empty")
-
-    ts_ms = _require_int_ms(latest_ts, "latest_ts")
-    prereq_reason = _validate_ws_entry_prereqs(symbol)
-    if prereq_reason:
-        msg = f"[SKIP][WS_NOT_READY] entry blocked: {symbol} ({prereq_reason})"
-        log(msg)
-        _maybe_send_entry_block_tg(f"WS_NOT_READY:{symbol}:{prereq_reason}", msg, cooldown_sec=60)
-        return None
-
-    if extra is not None and not isinstance(extra, dict):
-        raise RuntimeError("extra must be dict or None")
-
-    lp = _as_float(last_price, "last_price", min_value=0.0)
-    if lp <= 0:
-        raise RuntimeError("last_price must be > 0 (STRICT)")
-
-    def _normalize_candles(arr: Any, *, name: str) -> Any:
-        if not isinstance(arr, list) or not arr:
-            return arr
-
-        fixed: list[tuple[int, float, float, float, float, float]] = []
-        for i, it in enumerate(arr):
-            if isinstance(it, (list, tuple)):
-                if len(it) >= 6:
-                    ts, o, h, l, c, v = it[0], it[1], it[2], it[3], it[4], it[5]
-                    fixed.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
-                    continue
-                if len(it) == 5:
-                    ts, o, h, l, c = it[0], it[1], it[2], it[3], it[4]
-                    fixed.append((int(ts), float(o), float(h), float(l), float(c), 0.0))
-                    continue
-                raise RuntimeError(f"{name}[{i}] invalid candle tuple len<5 (STRICT): len={len(it)}")
-
-            if all(hasattr(it, a) for a in ("ts", "open", "high", "low", "close")):
-                fixed.append(
-                    (
-                        int(getattr(it, "ts")),
-                        float(getattr(it, "open")),
-                        float(getattr(it, "high")),
-                        float(getattr(it, "low")),
-                        float(getattr(it, "close")),
-                        0.0,
-                    )
-                )
-                continue
-
-            raise RuntimeError(f"{name}[{i}] invalid candle type (STRICT): {type(it).__name__}")
-
-        return fixed
-
-    candles_5m_norm = _normalize_candles(candles_5m, name="candles_5m")
-    candles_5m_raw_norm = _normalize_candles(candles_5m_raw, name="candles_5m_raw")
-
-    try:
-        market_features = build_unified_features(symbol)
-    except (UnifiedFeaturesError, FeatureBuildError) as e:
-        msg = f"[SKIP][FEATURE_BUILD_FAIL] entry blocked: {symbol} ({e})"
-        log(msg)
-        _maybe_send_entry_block_tg(f"FEATURE_BUILD_FAIL:{symbol}:{type(e).__name__}", msg, cooldown_sec=60)
-        return None
-
-    decision_meta = _extract_runtime_decision_meta_strict(market_features, settings)
-
-    out = {
-        "symbol": symbol,
-        "direction": direction,
-        "signal_source": signal_source_s,
-        "regime": signal_source_s,
-        "signal_ts_ms": int(ts_ms),
-        "candles_5m": candles_5m_norm,
-        "candles_5m_raw": candles_5m_raw_norm,
-        "last_price": float(lp),
-        "extra": extra,
-        "market_features": market_features,
-        "entry_score": float(decision_meta["entry_score"]),
-        "trend_strength": float(decision_meta["trend_strength"]),
-        "spread": float(decision_meta["spread"]),
-        "orderbook_imbalance": float(decision_meta["orderbook_imbalance"]),
-        "entry_score_threshold": float(decision_meta["entry_score_threshold"]),
-    }
-
-    validate_entry_market_data_bundle_strict(out)
-    return out
 
 
 def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
@@ -1621,7 +1306,12 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
-            market_data = _build_entry_market_data(SET, LAST_CLOSE_TS)
+            market_data = _build_entry_market_data(
+                SET,
+                LAST_CLOSE_TS,
+                notify_entry_block_fn=_maybe_send_entry_block_tg,
+                log_fn=log,
+            )
             if market_data is None:
                 interruptible_sleep(1)
                 continue
@@ -1660,7 +1350,7 @@ def main() -> None:
             persisted_peak = float(max(float(persisted_peak or 0.0), float(account_state.equity_peak_usdt)))
 
             t0 = time.perf_counter()
-            cand = _decide_entry_candidate_strict(market_data)
+            cand = _decide_entry_candidate_strict(market_data, SET)
             dt_ms = (time.perf_counter() - t0) * 1000.0
             if dt_ms > max_signal_latency_ms:
                 SAFE_STOP_REQUESTED = True
