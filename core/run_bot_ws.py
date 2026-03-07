@@ -21,6 +21,15 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-07 (TRADE-GRADE PATCH):
+  1) 5m 캔들 단위 진입 게이트 추가
+     - 동일 signal_ts_ms(사실상 동일 5m 캔들)에서 중복 진입 평가 금지
+     - LONG/SHORT flip(같은 캔들 내 방향 뒤집힘) 근본 차단
+  2) signal_ts_ms rollback 방어 추가
+     - 이전에 처리한 캔들보다 과거 ts가 오면 즉시 예외
+  3) 기존 기능 삭제 없음
+     - entry_pipeline / execution_engine / risk / drift / reconcile / SAFE_STOP 흐름 유지
+
 - 2026-03-06 (TRADE-GRADE):
   1) Drift Detector 설정을 settings.py SSOT로 연결
      - drift_allocation_abs_jump
@@ -78,7 +87,6 @@ import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
@@ -182,6 +190,10 @@ SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(SET.signal_analysis_interval_sec)
 LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
+# TRADE-GRADE PATCH:
+# 같은 signal_ts_ms(실질적으로 동일 5m 캔들)에서는 진입 평가를 한 번만 수행한다.
+LAST_ENTRY_EVAL_SIGNAL_TS_MS: Optional[int] = None
+
 _BALANCE_CONSEC_FAILS: int = 0
 _EQUITY_CONSEC_FAILS: int = 0
 _WS_LIVENESS_CONSEC_FAILS: int = 0
@@ -222,10 +234,31 @@ def _require_int_ms(v: Any, name: str) -> int:
     return iv
 
 
+def _claim_entry_signal_ts_or_skip(signal_ts_ms: Any) -> bool:
+    """
+    TRADE-GRADE PATCH:
+    - 동일 signal_ts_ms(동일 5m 캔들 판단)에서는 진입 평가를 한 번만 수행한다.
+    - 과거 ts가 오면 rollback으로 간주하고 즉시 예외.
+    """
+    global LAST_ENTRY_EVAL_SIGNAL_TS_MS
 
+    current_ts = _require_int_ms(signal_ts_ms, "market_data.signal_ts_ms")
+    prev_ts = LAST_ENTRY_EVAL_SIGNAL_TS_MS
 
+    if prev_ts is None:
+        LAST_ENTRY_EVAL_SIGNAL_TS_MS = current_ts
+        return True
 
+    if current_ts < prev_ts:
+        raise RuntimeError(
+            f"entry signal ts rollback detected (STRICT): prev={prev_ts} now={current_ts}"
+        )
 
+    if current_ts == prev_ts:
+        return False
+
+    LAST_ENTRY_EVAL_SIGNAL_TS_MS = current_ts
+    return True
 
 
 def _safe_send_tg(msg: str) -> None:
@@ -619,12 +652,6 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
         raise RuntimeError(msg)
 
 
-
-
-
-
-
-
 def _get_equity_current_usdt_strict() -> float:
     if bool(SET.test_dry_run):
         fake = float(SET.test_fake_available_usdt)
@@ -882,8 +909,6 @@ def _start_market_data_store_thread() -> None:
     log("[MD-STORE] background store thread started")
 
 
-
-
 def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     rows = fetch_open_positions(sym)
@@ -1076,7 +1101,7 @@ def main() -> None:
         researcher = MarketResearcher()
 
         def _research_loop():
-           researcher.run_forever()
+            researcher.run_forever()
 
         threading.Thread(
             target=_research_loop,
@@ -1342,6 +1367,14 @@ def main() -> None:
                 log(msg)
                 _maybe_send_error_tg("DATA_INTEGRITY", msg, cooldown_sec=60)
                 raise RuntimeError(msg) from e
+
+            # =========================================================
+            # TRADE-GRADE PATCH:
+            # 동일 5m 캔들(signal_ts_ms 동일)에서는 진입 평가를 한 번만 수행한다.
+            # =========================================================
+            if not _claim_entry_signal_ts_or_skip(market_data.get("signal_ts_ms")):
+                interruptible_sleep(1)
+                continue
 
             mf = market_data.get("market_features")
             eng = (mf or {}).get("engine_scores") if isinstance(mf, dict) else None

@@ -271,9 +271,9 @@ class Settings:
     ws_backfill_limit: int = 500
 
     # Market-data store worker settings
-    md_store_flush_sec: float = 5.0
-    ob_store_interval_sec: float = 5.0
-    md_store_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m"])
+    md_store_flush_sec: float = 2.0
+    ob_store_interval_sec: float = 1.0
+    md_store_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
 
     # Guards
     max_spread_pct: float = 0.0015
@@ -387,7 +387,7 @@ class Settings:
     analyst_openai_reasoning_effort: Optional[str] = None
 
     analyst_kline_interval: str = "5m"
-    analyst_kline_limit: int = 120
+    analyst_kline_limit: int = 300
     analyst_http_timeout_sec: float = 10.0
     analyst_ratio_period: str = "5m"
     analyst_ratio_limit: int = 30
@@ -953,8 +953,8 @@ def load_settings() -> Settings:
     ws_backfill_tfs = _as_csv_list("WS_BACKFILL_TFS", ["1m", "5m", "15m", "1h", "4h"])
     ws_backfill_limit = _as_int("WS_BACKFILL_LIMIT", 500)
 
-    md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 5.0)
-    ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 5.0)
+    md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 2.0)
+    ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 1.0)
     md_store_tfs = _as_csv_list("MD_STORE_TFS", ["1m", "5m", "15m", "1h", "4h"])
 
     max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0015)
@@ -1060,7 +1060,7 @@ def load_settings() -> Settings:
     analyst_openai_reasoning_effort = _as_str_opt("ANALYST_OPENAI_REASONING_EFFORT")
 
     analyst_kline_interval = _as_str("ANALYST_KLINE_INTERVAL", "5m")
-    analyst_kline_limit = _as_int("ANALYST_KLINE_LIMIT", 120)
+    analyst_kline_limit = _as_int("ANALYST_KLINE_LIMIT", 300)
     analyst_http_timeout_sec = _as_float("ANALYST_HTTP_TIMEOUT_SEC", 10.0)
     analyst_ratio_period = _as_str("ANALYST_RATIO_PERIOD", "5m")
     analyst_ratio_limit = _as_int("ANALYST_RATIO_LIMIT", 30)
