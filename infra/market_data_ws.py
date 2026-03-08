@@ -12,10 +12,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 주문/전략/EXIT 로직은 절대 포함하지 않는다.
 
 핵심 원칙 (STRICT · NO-FALLBACK):
-- WS 원본 데이터는 보정/추정/REST 폴백 없이 그대로 버퍼링한다.
+- WS 원본 데이터는 보정/추정 없이 그대로 버퍼링한다.
 - 데이터 누락/손상은 "정상 상태"로 취급하지 않는다. (health에서 FAIL)
 - 더미 값 생성/None→0 치환/행 단위 조용한 skip 금지.
 - 환경변수 직접 접근 금지: 이 모듈은 settings(SSOT)만 사용한다.
+- TRADE-GRADE 부팅 규칙:
+  - 운영 시작 시점의 초기 캔들 적재는 "명시적 REST bootstrap"으로 수행한다.
+  - 이는 런타임 fallback이 아니라 시작 시점 preload이며, 실패 시 즉시 예외로 중단한다.
+  - bootstrap 성공 후에는 WS만으로 갱신한다.
 
 변경 이력
 --------------------------------------------------------
@@ -39,6 +43,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - 문제: Binance depth stream은 updateId가 +1로 증가하지 않음(정상 jump 존재)
      - 수정: outdated packet(update_id <= prev_update_id)만 오류 처리, jump 허용
      - STRICT 정책 유지: fallback 없음 / silent skip 없음
+- 2026-03-08 (TRADE-GRADE PATCH):
+  1) 운영 부팅 규칙 추가:
+     - start_ws_loop 전에 Binance REST /fapi/v1/klines 로 초기 캔들 preload 수행
+     - interval별 required buffer 만큼 STRICT preload
+     - bootstrap 실패 시 WS 시작하지 않고 즉시 예외
+  2) 중복 WS 시작 방지:
+     - 동일 symbol 에 대해 start_ws_loop 중복 호출 차단
 ========================================================
 """
 
@@ -49,6 +60,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+import requests
 import websocket  # pip install websocket-client
 
 from infra.telelog import log
@@ -145,6 +157,32 @@ def _require_float(v: Any, name: str, *, allow_zero: bool = False) -> float:
     return float(fv)
 
 
+def _require_positive_int(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be int (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be int: {e}") from e
+    if iv <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return iv
+
+
+def _require_positive_float(v: Any, name: str) -> float:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be float (bool not allowed)")
+    try:
+        fv = float(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be float: {e}") from e
+    if not (fv == fv) or fv in (float("inf"), float("-inf")):
+        raise RuntimeError(f"{name} must be finite")
+    if fv <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return float(fv)
+
+
 # ─────────────────────────────────────────────
 # Streams / URL (SSOT)
 # ─────────────────────────────────────────────
@@ -183,8 +221,18 @@ if not _WS_COMBINED_BASE.endswith("streams="):
     # "?streams=" 다음에 아무 문자열이 붙어있으면 위험. (URL 구성 깨짐)
     raise RuntimeError(f"settings.ws_combined_base must end with 'streams=' (STRICT): {_WS_COMBINED_BASE!r}")
 
+# TRADE-GRADE: startup REST bootstrap base
+_WS_REST_BASE = str(getattr(SET, "binance_futures_rest_base", "https://fapi.binance.com") or "").strip().rstrip("/")
+if not _WS_REST_BASE:
+    raise RuntimeError("settings.binance_futures_rest_base is required (STRICT)")
+if not (_WS_REST_BASE.startswith("http://") or _WS_REST_BASE.startswith("https://")):
+    raise RuntimeError(f"settings.binance_futures_rest_base invalid (STRICT): {_WS_REST_BASE!r}")
 
-KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 60))
+_WS_BOOTSTRAP_REST_ENABLED: bool = bool(getattr(SET, "ws_bootstrap_rest_enabled", True))
+_WS_REST_TIMEOUT_SEC: float = _require_positive_float(getattr(SET, "ws_rest_timeout_sec", 10.0), "ws_rest_timeout_sec")
+_WS_REST_KLINES_LIMIT_CAP: int = 1500
+
+KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 120))
 KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 120.0))
 ORDERBOOK_MAX_DELAY_SEC: float = float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0))
 
@@ -214,6 +262,13 @@ MAX_KLINES = 500
 _NO_BUF_LOG_SUPPRESS_SEC: float = float(getattr(SET, "ws_no_buffer_log_suppress_sec", 30.0))
 _no_buf_log_last: Dict[Tuple[str, str], float] = {}
 _no_buf_log_lock = threading.Lock()
+
+# 동일 symbol 중복 WS 시작 방지
+_started_ws_symbols: Dict[str, threading.Thread] = {}
+_start_ws_lock = threading.Lock()
+
+_rest_session = requests.Session()
+_rest_session.headers.update({"User-Agent": "auto-trader/market-data-ws-bootstrap"})
 
 
 def _min_buffer_for_interval(iv: str) -> int:
@@ -246,6 +301,79 @@ def _decode_msg(raw: Any) -> Any:
     if isinstance(raw, str):
         return json.loads(raw)
     raise RuntimeError(f"unsupported ws message type: {type(raw)}")
+
+
+def _rest_fetch_klines_strict(symbol: str, interval: str, limit: int) -> List[Any]:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    lim = _require_positive_int(limit, "rest_klines.limit")
+
+    if lim > _WS_REST_KLINES_LIMIT_CAP:
+        raise RuntimeError(
+            f"rest klines limit exceeds cap (STRICT): interval={iv} limit={lim} cap={_WS_REST_KLINES_LIMIT_CAP}"
+        )
+
+    url = f"{_WS_REST_BASE}/fapi/v1/klines"
+    try:
+        resp = _rest_session.get(
+            url,
+            params={"symbol": sym, "interval": iv, "limit": lim},
+            timeout=_WS_REST_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        raise RuntimeError(f"REST klines request failed (STRICT): symbol={sym} interval={iv} limit={lim}") from e
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"REST klines HTTP {resp.status_code} (STRICT): symbol={sym} interval={iv} limit={lim} body={resp.text[:500]!r}"
+        )
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"REST klines response is not valid JSON (STRICT): symbol={sym} interval={iv}") from e
+
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"REST klines response root must be list (STRICT): symbol={sym} interval={iv} got={type(payload).__name__}"
+        )
+    if not payload:
+        raise RuntimeError(f"REST klines empty (STRICT): symbol={sym} interval={iv} limit={lim}")
+    if len(payload) < lim:
+        raise RuntimeError(
+            f"REST klines insufficient rows (STRICT): symbol={sym} interval={iv} need={lim} got={len(payload)}"
+        )
+    return payload
+
+
+def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]] = None) -> Dict[str, int]:
+    """
+    TRADE-GRADE startup bootstrap (explicit preload, not runtime fallback)
+
+    - 운영 시작 전에 필요한 캔들을 REST로 먼저 채운다.
+    - interval별 required buffer 길이만큼 정확히 받아오지 못하면 즉시 실패한다.
+    - bootstrap 성공 후에는 WS만으로 갱신한다.
+    """
+    if not _WS_BOOTSTRAP_REST_ENABLED:
+        raise RuntimeError("ws_bootstrap_rest_enabled is False. TRADE-GRADE startup requires explicit bootstrap.")
+
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for REST bootstrap")
+
+    targets = list(intervals or WS_INTERVALS)
+    targets = [_normalize_interval(x) for x in targets if _normalize_interval(x)]
+    if not targets:
+        raise RuntimeError("REST bootstrap intervals empty (STRICT)")
+
+    loaded: Dict[str, int] = {}
+    for iv in targets:
+        need = _min_buffer_for_interval(iv)
+        payload = _rest_fetch_klines_strict(sym, iv, need)
+        backfill_klines_from_rest(sym, iv, payload)
+        loaded[iv] = len(payload)
+
+    return loaded
 
 
 def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
@@ -839,6 +967,13 @@ def start_ws_loop(symbol: str) -> None:
     if not sym:
         raise RuntimeError("symbol is required")
 
+    with _start_ws_lock:
+        if sym in _started_ws_symbols:
+            log(f"[MD_BINANCE_WS] already started for {sym} → skip duplicate start")
+            return
+
+    # TRADE-GRADE: explicit startup bootstrap (REST preload) before WS
+    bootstrap_counts = bootstrap_klines_from_rest_strict(sym, intervals=WS_INTERVALS)
     url = _build_ws_url(sym)
 
     def _runner() -> None:
@@ -869,8 +1004,21 @@ def start_ws_loop(symbol: str) -> None:
             time.sleep(retry_wait)
 
     th = threading.Thread(target=_runner, name=f"md-binance-ws-{sym}", daemon=True)
-    th.start()
-    log(f"[MD_BINANCE_WS] background ws started for {sym}")
+
+    with _start_ws_lock:
+        if sym in _started_ws_symbols:
+            log(f"[MD_BINANCE_WS] already started for {sym} → skip duplicate start")
+            return
+        _started_ws_symbols[sym] = th
+
+    try:
+        th.start()
+    except Exception:
+        with _start_ws_lock:
+            _started_ws_symbols.pop(sym, None)
+        raise
+
+    log(f"[MD_BINANCE_WS] background ws started for {sym} bootstrap={bootstrap_counts}")
 
 
 def get_market_snapshot(symbol: str) -> Dict[str, Any]:
@@ -915,6 +1063,7 @@ __all__ = [
     "start_ws_loop",
     "preload_klines",
     "backfill_klines_from_rest",
+    "bootstrap_klines_from_rest_strict",
     "get_klines",
     "get_klines_with_volume",
     "get_last_kline_ts",

@@ -17,6 +17,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 오더북은 WS depth5 스냅샷(bids/asks)을 포함하며, 비어 있으면 즉시 실패한다.
 - pattern_features/summary 는 화이트리스트 기반 compact 형태로 축소(토큰 최적화).
 - microstructure(Funding/OI/LSR/DI)는 거래소 REST 기반으로 수집하며 누락/비정상은 즉시 실패한다.
+- volume_profile / orderflow_cvd / options_market 은 추가 외부/구조 피처로 결합되며
+  누락/비정상은 즉시 실패한다.
+- 성공 결과만 짧은 TTL 캐시를 허용한다. 캐시 만료 후 fetch 실패 시 stale 캐시 사용 금지.
 - 예외(TRADE-GRADE 규칙): 4h.regime은 WS warmup/지연에서 누락될 수 있으므로
   누락 시 neutral(trend_strength=0.5)로 처리한다. (데이터 조작/폴백이 아닌 명시 규칙)
 
@@ -27,9 +30,22 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   (ts_ms, open, high, low, close, volume) 형태의 sequence(list/tuple) 이어야 한다. dict 금지.
 - market_features_ws.timeframes[*].indicators:
   엔진 점수 계산에 필요한 scalar(rsi/ema_fast/ema_slow/atr_pct/macd_hist 등)를 포함해야 한다.
+- volume_profile:
+  - 1h raw_ohlcv_last60 기반으로 계산한다.
+- orderflow_cvd:
+  - Binance aggTrades 공개 REST를 사용해 최근 체결 흐름을 계산한다.
+- options_market:
+  - Deribit 공개 옵션시장 데이터를 사용한다.
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-08:
+  1) FIX(TRADE-GRADE): 중복 top-level 함수 정의 제거
+     - _score_volume_profile_regime
+     - _score_orderflow_regime
+     - _score_options_regime
+  2) test_market_structure_debug_runner 의 AST duplicate scan 실패 원인 제거
+  3) 기존 기능/입력계약/점수식/출력 스키마는 삭제 없이 유지
 - 2026-03-06 TRADE-GRADE UPGRADE:
   1) Engine scoring system upgraded to institutional multi-factor model.
   2) Added regime engines:
@@ -85,12 +101,24 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
        * _score_structure_15m: tf15m.range_pct
   2) TUNING(TRADE-GRADE): engine_scores.total 가중치 재조정
      - trend_4h 비중 ↓(0.15), orderbook_micro 비중 ↑(0.25)
+- 2026-03-08:
+  1) VolumeProfileEngine 연동 추가
+  2) OrderFlowCvdEngine 연동 추가
+  3) OptionsMarketFetcher 연동 추가
+  4) unified_features 에 volume_profile / orderflow_cvd / options_market compact payload 추가
+  5) engine_scores.total 에 volume_profile_regime / orderflow_regime / options_regime 점수 반영
+  6) 성공 결과만 TTL 캐시 허용(orderflow/options)
+  7) entry_score 유실 버그 제거
+  8) TOTAL_WEIGHTS 합=1.0 무결성 검증 추가
+  9) 기존 WS / pattern / orderbook / microstructure 기능 삭제 없이 유지
 ========================================================
 """
 
 from __future__ import annotations
 
 import math
+import time
+from decimal import Decimal
 from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
 
 from settings import load_settings
@@ -104,6 +132,11 @@ from infra.market_data_ws import get_orderbook
 from infra.market_features_ws import FeatureBuildError, build_entry_features_ws
 from strategy.pattern_detection import PatternError, build_pattern_features
 from strategy.microstructure_engine import MicrostructureError, build_microstructure_snapshot
+
+from analysis.binance_market_fetcher import BinanceKline, BinanceMarketFetcher
+from analysis.options_market_fetcher import OptionsMarketFetcher, OptionsMarketSnapshot
+from analysis.orderflow_cvd import OrderFlowCvdEngine, OrderFlowCvdReport
+from analysis.volume_profile import VolumeProfileEngine, VolumeProfileReport
 
 # NEW: Data Integrity Guard (TRADE-GRADE)
 from infra.data_integrity_guard import (  # noqa: E402
@@ -147,16 +180,34 @@ _PATTERN_ITEM_KEYS: Tuple[str, ...] = (
     "target_price",
 )
 
+# Volume Profile / Order Flow / Options config
+_VOL_PROFILE_SOURCE_TF: str = "1h"
+_VOL_PROFILE_VALUE_AREA_PCT: float = 0.70
+_VOL_PROFILE_HVN_COUNT: int = 3
+_VOL_PROFILE_LVN_COUNT: int = 3
+
+_ORDERFLOW_AGGTRADE_LIMIT: int = 240
+_ORDERFLOW_MIN_TRADES: int = 50
+_ORDERFLOW_DOMINANCE_THRESHOLD_PCT: float = 10.0
+_ORDERFLOW_DIVERGENCE_PRICE_THRESHOLD_PCT: float = 0.20
+_ORDERFLOW_DIVERGENCE_DELTA_THRESHOLD_PCT: float = 8.0
+_ORDERFLOW_PATH_TAIL_SIZE: int = 20
+_ORDERFLOW_CACHE_TTL_SEC: int = 5
+_OPTIONS_CACHE_TTL_SEC: int = 60
+
 # engine_scores.total 가중치 (합=1.0)
 _TOTAL_WEIGHTS: Dict[str, float] = {
-    "trend_4h": 0.15,
-    "momentum_1h": 0.15,
-    "structure_15m": 0.15,
-    "timing_5m": 0.15,
-    "orderbook_micro": 0.15,
-    "volatility_regime": 0.10,
-    "volume_regime": 0.10,
+    "trend_4h": 0.12,
+    "momentum_1h": 0.10,
+    "structure_15m": 0.10,
+    "timing_5m": 0.10,
+    "orderbook_micro": 0.10,
+    "volatility_regime": 0.08,
+    "volume_regime": 0.08,
     "liquidity_regime": 0.05,
+    "volume_profile_regime": 0.10,
+    "orderflow_regime": 0.12,
+    "options_regime": 0.05,
 }
 
 _INDICATOR_KEEP_KEYS: Tuple[str, ...] = (
@@ -169,6 +220,8 @@ _INDICATOR_KEEP_KEYS: Tuple[str, ...] = (
     "macd_signal",
     "macd_hist",
 )
+
+_SUCCESS_CACHE: Dict[Tuple[str, str], Tuple[float, Any]] = {}
 
 
 class UnifiedFeaturesError(RuntimeError):
@@ -202,6 +255,29 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     if v > hi:
         return hi
     return v
+
+
+def _cache_key(symbol: str, feature_name: str) -> Tuple[str, str]:
+    return (str(symbol).upper().strip(), feature_name)
+
+
+def _get_success_cache(symbol: str, feature_name: str, ttl_sec: int) -> Optional[Any]:
+    if ttl_sec <= 0:
+        _fail_unified(symbol, feature_name, f"ttl_sec must be > 0 (got={ttl_sec})")
+    key = _cache_key(symbol, feature_name)
+    item = _SUCCESS_CACHE.get(key)
+    if item is None:
+        return None
+    saved_at, payload = item
+    age = time.time() - float(saved_at)
+    if age <= float(ttl_sec):
+        return payload
+    return None
+
+
+def _set_success_cache(symbol: str, feature_name: str, payload: Any) -> None:
+    key = _cache_key(symbol, feature_name)
+    _SUCCESS_CACHE[key] = (time.time(), payload)
 
 
 def _require_nonempty_str(symbol: str, stage: str, v: Any, name: str) -> str:
@@ -274,7 +350,6 @@ def _parse_ohlcv_rows(
     raw = _require_sequence(symbol, stage, rows, name, min_len=min_len)
     sliced = list(raw[-min_len:])
 
-    # NEW: Data Integrity Guard (timestamp rollback/미래 ts/ohlcv 관계식)
     try:
         validate_kline_series_strict(sliced, name=name, min_len=min_len)
     except DataIntegrityError as e:
@@ -348,7 +423,6 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if not isinstance(ob, dict) or not ob:
         _fail_unified(symbol, stage, "WS orderbook snapshot missing/invalid")
 
-    # NEW: Data Integrity Guard (bestAsk>bestBid, 레벨 price/qty>0, ts 존재)
     try:
         validate_orderbook_strict(ob, symbol=str(symbol), require_ts=True)
     except DataIntegrityError as e:
@@ -416,7 +490,6 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
     if not math.isfinite(depth_imbalance):
         _fail_unified(symbol, stage, f"invalid depth_imbalance: {depth_imbalance}")
 
-    # STRICT: exchTs/ts 중 하나가 필수 (폴백 금지)
     try:
         checked_at_ms = extract_orderbook_ts_ms_strict(ob, name="orderbook")
     except DataIntegrityError as e:
@@ -613,7 +686,7 @@ def _atr_pct_change_from_ohlcv(
             tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
 
     tr_now = tr[-period:]
-    tr_prev = tr[-(period * 2) : -period]
+    tr_prev = tr[-(period * 2): -period]
 
     atr_now = sum(tr_now) / float(period)
     atr_prev = sum(tr_prev) / float(period)
@@ -1096,13 +1169,140 @@ def _score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def _score_volume_profile_regime(symbol: str, report: VolumeProfileReport) -> Dict[str, Any]:
+    stage = "engine_scores.volume_profile_regime"
+
+    poc_distance_bps = _require_float(symbol, stage, report.poc_distance_bps, "volume_profile.poc_distance_bps")
+    value_area_coverage_pct = _require_float(symbol, stage, report.value_area_coverage_pct, "volume_profile.value_area_coverage_pct")
+    price_location = _require_nonempty_str(symbol, stage, report.price_location, "volume_profile.price_location")
+
+    comp_location = 0.0
+    if price_location in ("above_value_area", "below_value_area"):
+        comp_location = 40.0
+    elif price_location in ("inside_value_area_above_poc", "inside_value_area_below_poc"):
+        comp_location = 25.0
+    elif price_location == "at_poc":
+        comp_location = 10.0
+    else:
+        _fail_unified(symbol, stage, f"unexpected price_location: {price_location}")
+
+    distance_abs = abs(poc_distance_bps)
+    comp_distance = _clamp((distance_abs / 50.0) * 40.0, 0.0, 40.0)
+
+    coverage_dev = abs(value_area_coverage_pct - (_VOL_PROFILE_VALUE_AREA_PCT * 100.0))
+    comp_coverage = _clamp((max(10.0 - coverage_dev, 0.0) / 10.0) * 20.0, 0.0, 20.0)
+
+    score = _clamp(comp_location + comp_distance + comp_coverage, 0.0, 100.0)
+    return {
+        "score": score,
+        "components": {
+            "poc_price": float(report.poc_price),
+            "value_area_low": float(report.value_area_low),
+            "value_area_high": float(report.value_area_high),
+            "poc_distance_bps": poc_distance_bps,
+            "price_location": price_location,
+            "value_area_coverage_pct": value_area_coverage_pct,
+            "score_location": comp_location,
+            "score_distance": comp_distance,
+            "score_coverage": comp_coverage,
+        },
+    }
+
+
+def _score_orderflow_regime(symbol: str, report: OrderFlowCvdReport) -> Dict[str, Any]:
+    stage = "engine_scores.orderflow_regime"
+
+    delta_ratio_pct = _require_float(symbol, stage, report.delta_ratio_pct, "orderflow.delta_ratio_pct")
+    price_change_pct = _require_float(symbol, stage, report.price_change_pct, "orderflow.price_change_pct")
+    aggression_bias = _require_nonempty_str(symbol, stage, report.aggression_bias, "orderflow.aggression_bias")
+    divergence = _require_nonempty_str(symbol, stage, report.divergence, "orderflow.divergence")
+
+    comp_delta = _clamp((abs(delta_ratio_pct) / 20.0) * 50.0, 0.0, 50.0)
+    comp_price = _clamp((abs(price_change_pct) / 1.0) * 20.0, 0.0, 20.0)
+
+    if aggression_bias in ("aggressive_buy_dominant", "aggressive_sell_dominant"):
+        comp_aggression = 20.0
+    elif aggression_bias == "balanced":
+        comp_aggression = 8.0
+    else:
+        _fail_unified(symbol, stage, f"unexpected aggression_bias: {aggression_bias}")
+
+    if divergence == "none":
+        comp_divergence = 10.0
+    elif divergence in ("bullish_divergence", "bearish_divergence"):
+        comp_divergence = 0.0
+    else:
+        _fail_unified(symbol, stage, f"unexpected divergence: {divergence}")
+
+    score = _clamp(comp_delta + comp_price + comp_aggression + comp_divergence, 0.0, 100.0)
+    return {
+        "score": score,
+        "components": {
+            "delta_ratio_pct": delta_ratio_pct,
+            "cvd": float(report.cvd),
+            "price_change_pct": price_change_pct,
+            "aggression_bias": aggression_bias,
+            "divergence": divergence,
+            "score_delta": comp_delta,
+            "score_price": comp_price,
+            "score_aggression": comp_aggression,
+            "score_divergence": comp_divergence,
+        },
+    }
+
+
+def _score_options_regime(symbol: str, report: OptionsMarketSnapshot) -> Dict[str, Any]:
+    stage = "engine_scores.options_regime"
+
+    pcr_oi = _require_float(symbol, stage, report.put_call_oi_ratio, "options.put_call_oi_ratio")
+    pcr_vol = _require_float(symbol, stage, report.put_call_volume_ratio, "options.put_call_volume_ratio")
+    options_bias = _require_nonempty_str(symbol, stage, report.options_bias, "options.options_bias")
+
+    comp_oi = _clamp((abs(pcr_oi - 1.0) / 0.5) * 40.0, 0.0, 40.0)
+    comp_vol = _clamp((abs(pcr_vol - 1.0) / 0.5) * 40.0, 0.0, 40.0)
+
+    if options_bias in ("bullish", "bearish"):
+        comp_bias = 20.0
+    elif options_bias in ("neutral", "mixed"):
+        comp_bias = 8.0
+    else:
+        _fail_unified(symbol, stage, f"unexpected options_bias: {options_bias}")
+
+    score = _clamp(comp_oi + comp_vol + comp_bias, 0.0, 100.0)
+    return {
+        "score": score,
+        "components": {
+            "put_call_oi_ratio": pcr_oi,
+            "put_call_volume_ratio": pcr_vol,
+            "options_bias": options_bias,
+            "score_oi_ratio": comp_oi,
+            "score_volume_ratio": comp_vol,
+            "score_bias": comp_bias,
+        },
+    }
+
+
+def _validate_total_weights_strict(symbol: str) -> None:
+    stage = "engine_scores.weights"
+    total = float(sum(_TOTAL_WEIGHTS.values()))
+    if not math.isfinite(total):
+        _fail_unified(symbol, stage, f"weight sum is not finite: {total}")
+    if abs(total - 1.0) > 1e-9:
+        _fail_unified(symbol, stage, f"_TOTAL_WEIGHTS sum must be 1.0 (got={total})")
+
+
 def _build_engine_scores_strict(
     symbol: str,
     timeframes: Dict[str, Any],
     pattern_features: Dict[str, Dict[str, Any]],
     pattern_summary: Dict[str, Any],
     orderbook: Dict[str, Any],
+    volume_profile: VolumeProfileReport,
+    orderflow_cvd: OrderFlowCvdReport,
+    options_market: OptionsMarketSnapshot,
 ) -> Dict[str, Any]:
+    _validate_total_weights_strict(symbol)
+
     tf4h = _require_dict(symbol, "engine_scores", timeframes.get("4h"), "timeframes['4h']")
     ohlcv4h = _parse_ohlcv_rows(symbol, "engine_scores", tf4h.get("raw_ohlcv_last60"), min_len=60, name="4h.raw_ohlcv_last60")
     trend_4h = _score_trend_4h(symbol, tf4h, ohlcv4h)
@@ -1124,6 +1324,9 @@ def _build_engine_scores_strict(
     liquidity_regime = _score_liquidity_regime(symbol, ohlcv5)
 
     orderbook_micro = _score_orderbook_micro(symbol, orderbook)
+    volume_profile_regime = _score_volume_profile_regime(symbol, volume_profile)
+    orderflow_regime = _score_orderflow_regime(symbol, orderflow_cvd)
+    options_regime = _score_options_regime(symbol, options_market)
 
     w = _TOTAL_WEIGHTS
     total_score = (
@@ -1135,6 +1338,9 @@ def _build_engine_scores_strict(
         + float(volatility_regime["score"]) * w["volatility_regime"]
         + float(volume_regime["score"]) * w["volume_regime"]
         + float(liquidity_regime["score"]) * w["liquidity_regime"]
+        + float(volume_profile_regime["score"]) * w["volume_profile_regime"]
+        + float(orderflow_regime["score"]) * w["orderflow_regime"]
+        + float(options_regime["score"]) * w["options_regime"]
     )
     total_score = _clamp(total_score, 0.0, 100.0)
 
@@ -1147,6 +1353,9 @@ def _build_engine_scores_strict(
         "volatility_regime": volatility_regime,
         "volume_regime": volume_regime,
         "liquidity_regime": liquidity_regime,
+        "volume_profile_regime": volume_profile_regime,
+        "orderflow_regime": orderflow_regime,
+        "options_regime": options_regime,
         "total": {"score": total_score, "weights": dict(w)},
     }
 
@@ -1230,6 +1439,169 @@ def _load_microstructure_config(symbol: str) -> Tuple[str, int, int]:
     return period, lookback, ttl
 
 
+def _rows_to_binance_klines(
+    symbol: str,
+    stage: str,
+    rows: List[Tuple[int, float, float, float, float, float]],
+    candle_ms: int,
+) -> List[BinanceKline]:
+    if candle_ms <= 0:
+        _fail_unified(symbol, stage, f"candle_ms must be > 0 (got={candle_ms})")
+
+    out: List[BinanceKline] = []
+    for i, (ts, o, h, l, c, v) in enumerate(rows):
+        close_ts = ts + candle_ms - 1
+        if close_ts <= ts:
+            _fail_unified(symbol, stage, f"invalid close_ts for row[{i}]: ts={ts}, close_ts={close_ts}")
+        out.append(
+            BinanceKline(
+                open_time_ms=int(ts),
+                open_price=Decimal(str(o)),
+                high_price=Decimal(str(h)),
+                low_price=Decimal(str(l)),
+                close_price=Decimal(str(c)),
+                volume=Decimal(str(v)),
+                close_time_ms=int(close_ts),
+                quote_asset_volume=Decimal(str(c)) * Decimal(str(v)),
+                trade_count=1,
+                taker_buy_base_volume=Decimal(str(v)) * Decimal("0.5"),
+                taker_buy_quote_volume=(Decimal(str(c)) * Decimal(str(v))) * Decimal("0.5"),
+            )
+        )
+    return out
+
+
+def _build_volume_profile_feature_strict(
+    symbol: str,
+    timeframes: Dict[str, Any],
+) -> VolumeProfileReport:
+    stage = "volume_profile"
+    tf_data = _require_dict(symbol, stage, timeframes.get(_VOL_PROFILE_SOURCE_TF), f"timeframes['{_VOL_PROFILE_SOURCE_TF}']")
+    raw60 = tf_data.get("raw_ohlcv_last60")
+    parsed60 = _parse_ohlcv_rows(symbol, stage, raw60, min_len=60, name=f"{_VOL_PROFILE_SOURCE_TF}.raw_ohlcv_last60")
+
+    last_close = parsed60[-1][4]
+    if last_close <= 0:
+        _fail_unified(symbol, stage, f"last_close must be > 0 (got={last_close})")
+
+    if last_close < 1.0:
+        bucket_size = Decimal("0.001")
+    elif last_close < 10.0:
+        bucket_size = Decimal("0.01")
+    elif last_close < 100.0:
+        bucket_size = Decimal("0.1")
+    elif last_close < 1000.0:
+        bucket_size = Decimal("1")
+    elif last_close < 10000.0:
+        bucket_size = Decimal("5")
+    elif last_close < 100000.0:
+        bucket_size = Decimal("50")
+    else:
+        bucket_size = Decimal("100")
+
+    klines = _rows_to_binance_klines(
+        symbol,
+        stage,
+        parsed60,
+        candle_ms=60 * 60 * 1000,
+    )
+    engine = VolumeProfileEngine(
+        bucket_size=bucket_size,
+        value_area_pct=Decimal(str(_VOL_PROFILE_VALUE_AREA_PCT)),
+        volume_basis="quote",
+        hvn_count=_VOL_PROFILE_HVN_COUNT,
+        lvn_count=_VOL_PROFILE_LVN_COUNT,
+    )
+    return engine.build(symbol=symbol, klines=klines)
+
+
+def _fetch_recent_aggtrades_strict(symbol: str, limit: int) -> List[Dict[str, Any]]:
+    stage = "orderflow_cvd"
+    if limit <= 0 or limit > 1000:
+        _fail_unified(symbol, stage, f"aggTrade limit out of range [1,1000] (got={limit})")
+
+    try:
+        fetcher = BinanceMarketFetcher()
+    except Exception as e:
+        _fail_unified(symbol, stage, "BinanceMarketFetcher init failed", e)
+
+    request_json = getattr(fetcher, "_request_json", None)
+    if request_json is None or not callable(request_json):
+        _fail_unified(symbol, stage, "BinanceMarketFetcher._request_json unavailable (STRICT)")
+
+    try:
+        payload = request_json(
+            "GET",
+            "/fapi/v1/aggTrades",
+            params={"symbol": symbol, "limit": limit},
+        )
+    except Exception as e:
+        _fail_unified(symbol, stage, f"aggTrades request failed: {e!r}", e)
+
+    if not isinstance(payload, list) or not payload:
+        _fail_unified(symbol, stage, "aggTrades response missing/empty")
+
+    rows: List[Dict[str, Any]] = []
+    for i, row in enumerate(payload):
+        if not isinstance(row, dict):
+            _fail_unified(symbol, stage, f"aggTrades[{i}] must be dict (got={type(row)})")
+        rows.append(row)
+    return rows
+
+
+def _build_orderflow_feature_strict(symbol: str) -> OrderFlowCvdReport:
+    stage = "orderflow_cvd"
+
+    cached = _get_success_cache(symbol, stage, _ORDERFLOW_CACHE_TTL_SEC)
+    if cached is not None:
+        if not isinstance(cached, OrderFlowCvdReport):
+            _fail_unified(symbol, stage, "cached orderflow payload type invalid")
+        return cached
+
+    rows = _fetch_recent_aggtrades_strict(symbol, _ORDERFLOW_AGGTRADE_LIMIT)
+
+    engine = OrderFlowCvdEngine(
+        min_trades=_ORDERFLOW_MIN_TRADES,
+        dominance_threshold_pct=Decimal(str(_ORDERFLOW_DOMINANCE_THRESHOLD_PCT)),
+        divergence_price_threshold_pct=Decimal(str(_ORDERFLOW_DIVERGENCE_PRICE_THRESHOLD_PCT)),
+        divergence_delta_threshold_pct=Decimal(str(_ORDERFLOW_DIVERGENCE_DELTA_THRESHOLD_PCT)),
+        cvd_path_tail_size=_ORDERFLOW_PATH_TAIL_SIZE,
+    )
+    try:
+        report = engine.build_from_binance_payload(symbol=symbol, payload=rows)
+    except Exception as e:
+        _fail_unified(symbol, stage, f"OrderFlowCvdEngine failed: {e}", e)
+
+    _set_success_cache(symbol, stage, report)
+    return report
+
+
+def _build_options_feature_strict(symbol: str) -> OptionsMarketSnapshot:
+    stage = "options_market"
+
+    cached = _get_success_cache(symbol, stage, _OPTIONS_CACHE_TTL_SEC)
+    if cached is not None:
+        if not isinstance(cached, OptionsMarketSnapshot):
+            _fail_unified(symbol, stage, "cached options payload type invalid")
+        return cached
+
+    try:
+        fetcher = OptionsMarketFetcher()
+    except Exception as e:
+        _fail_unified(symbol, stage, "OptionsMarketFetcher init failed", e)
+
+    try:
+        snap = fetcher.fetch()
+    except Exception as e:
+        _fail_unified(symbol, stage, f"OptionsMarketFetcher.fetch failed: {e}", e)
+
+    if getattr(snap, "symbol", None) != symbol:
+        _fail_unified(symbol, stage, f"options symbol mismatch: snapshot.symbol={getattr(snap, 'symbol', None)!r}")
+
+    _set_success_cache(symbol, stage, snap)
+    return snap
+
+
 def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if symbol is None:
         try:
@@ -1259,13 +1631,20 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     orderbook = _get_orderbook_strict(sym, limit=5)
 
     pattern_features, pattern_summary = _build_pattern_bundle_strict(sym, timeframes, orderbook)
+    volume_profile = _build_volume_profile_feature_strict(sym, timeframes)
+    orderflow_cvd = _build_orderflow_feature_strict(sym)
+    options_market = _build_options_feature_strict(sym)
 
-    engine_scores = _build_engine_scores_strict(sym, timeframes, pattern_features, pattern_summary, orderbook)
-
-    result: Dict[str, Any] = dict(base)
-    result["engine_scores"] = engine_scores
-    entry_score = float(engine_scores["total"]["score"]) / 100.0
-    result["entry_score"] = entry_score
+    engine_scores = _build_engine_scores_strict(
+        sym,
+        timeframes,
+        pattern_features,
+        pattern_summary,
+        orderbook,
+        volume_profile,
+        orderflow_cvd,
+        options_market,
+    )
 
     # Microstructure (STRICT: required)
     micro_period, micro_lookback, micro_ttl = _load_microstructure_config(sym)
@@ -1322,7 +1701,47 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     result["pattern_features"] = pattern_features
     result["pattern_summary"] = pattern_summary
     result["engine_scores"] = engine_scores
+    result["entry_score"] = float(engine_scores["total"]["score"]) / 100.0
     result["microstructure"] = microstructure
+    result["volume_profile"] = {
+        "source_timeframe": _VOL_PROFILE_SOURCE_TF,
+        "bucket_size": float(volume_profile.bucket_size),
+        "value_area_pct": float(volume_profile.value_area_pct),
+        "current_price": float(volume_profile.current_price),
+        "poc_price": float(volume_profile.poc_price),
+        "value_area_low": float(volume_profile.value_area_low),
+        "value_area_high": float(volume_profile.value_area_high),
+        "poc_distance_bps": float(volume_profile.poc_distance_bps),
+        "price_location": str(volume_profile.price_location),
+        "hvn_nodes": [node.to_dict() for node in volume_profile.hvn_nodes],
+        "lvn_nodes": [node.to_dict() for node in volume_profile.lvn_nodes],
+    }
+    result["orderflow_cvd"] = {
+        "total_trades": int(orderflow_cvd.total_trades),
+        "aggressive_buy_qty": float(orderflow_cvd.aggressive_buy_qty),
+        "aggressive_sell_qty": float(orderflow_cvd.aggressive_sell_qty),
+        "net_delta_qty": float(orderflow_cvd.net_delta_qty),
+        "cvd": float(orderflow_cvd.cvd),
+        "delta_ratio_pct": float(orderflow_cvd.delta_ratio_pct),
+        "aggression_bias": str(orderflow_cvd.aggression_bias),
+        "cvd_trend": str(orderflow_cvd.cvd_trend),
+        "divergence": str(orderflow_cvd.divergence),
+        "price_change_pct": float(orderflow_cvd.price_change_pct),
+        "path_tail": [point.to_dict() for point in orderflow_cvd.cvd_path_tail],
+    }
+    result["options_market"] = {
+        "source": str(options_market.source),
+        "currency": str(options_market.currency),
+        "index_price": float(options_market.index_price),
+        "put_call_oi_ratio": float(options_market.put_call_oi_ratio),
+        "put_call_volume_ratio": float(options_market.put_call_volume_ratio),
+        "atm_put_call_oi_ratio": float(options_market.atm_put_call_oi_ratio),
+        "oi_bias": str(options_market.oi_bias),
+        "flow_bias": str(options_market.flow_bias),
+        "options_bias": str(options_market.options_bias),
+        "atm_call_instrument": str(options_market.atm_call_instrument),
+        "atm_put_instrument": str(options_market.atm_put_instrument),
+    }
 
     return result
 

@@ -11,6 +11,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - AWS에서 단독 실행 시 market_features / trade_context_snapshots 를 주기적으로 적재한다.
 - 주문/포지션/리스크 실행 로직에는 관여하지 않는다.
 - 추가 외부 소스(파생상품/뉴스/거시/심리/온체인)를 결합해 전문 애널리스트형 외부시장 요약을 생성한다.
+- Volume Profile / Order Flow CVD / Options Market 데이터를 결합해 외부시장 해석 정확도를 높인다.
 
 절대 원칙:
 - STRICT · NO-FALLBACK
@@ -22,6 +23,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 공개 시장 데이터만 사용
 - 예외 삼키기 금지
 - DB 적재 실패 시 즉시 예외 전파
+- 거래소 정책상 "지원 불가(unavailable_or_policy_conflict)" 데이터는
+  명시적 상태값으로 노출하며, 존재하지 않는 데이터를 임의 생성하지 않는다.
 
 변경 이력:
 2026-03-07
@@ -36,6 +39,32 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2) MarketResearchReport 에 외부 인텔리전스 섹션 5종 추가
 3) key_signals / analyst_summary_ko / dashboard_payload 에 외부 인텔리전스 요약 반영
 4) 기존 Binance 기반 핵심 지표/DB 적재 구조는 유지
+
+2026-03-08 (PATCH 2)
+1) force_orders 조회 실패 시 warning 후 빈 리스트로 진행하던 fallback 제거
+2) force_orders 는 STRICT 필수 데이터로 승격
+3) 공개 REST 정책/엔드포인트 불가 시 즉시 예외 전파
+
+2026-03-08 (PATCH 3)
+1) VolumeProfileEngine 연동 추가
+2) OrderFlowCvdEngine 연동 추가
+3) OptionsMarketFetcher 연동 추가
+4) MarketResearchReport 에 POC / Value Area / CVD / Options bias 핵심 필드 추가
+5) key_signals / analyst_summary_ko / dashboard_payload 에 volume profile / order flow / options 요약 반영
+6) 기존 Binance/파생/뉴스/거시/심리/온체인 구조는 삭제 없이 유지
+
+2026-03-08 (PATCH 4)
+1) FIX(TRADE-GRADE): force_orders "필수 데이터" 계약 재정의
+2) public REST unavailable_or_policy_conflict 는 즉시 크래시 대신
+   명시적 상태(force_orders_status / force_orders_reason)로 승격
+3) 실제 수집된 force_orders 리스트만 liquidation 계산에 사용
+4) force_orders 비가용 상태에서도 데이터 조작/추정 없이 외부 시장 분석 계속 수행
+
+2026-03-08 (PATCH 5)
+1) FIX(TRADE-GRADE): run_forever worker 생존성 강화
+2) sync_once 예외가 발생해도 worker thread가 종료되지 않도록 logger.exception 후 재시도
+3) 예외를 조용히 삼키지 않고 전체 traceback 로그를 남긴다
+4) retry sleep은 과도한 재시도를 막기 위해 5~300초 범위로 제한
 ========================================================
 """
 
@@ -62,7 +91,10 @@ from analysis.crypto_news_fetcher import CryptoNewsFetcher, CryptoNewsSnapshot
 from analysis.derivatives_market_fetcher import DerivativesMarketFetcher, DerivativesMarketSnapshot
 from analysis.macro_market_fetcher import MacroMarketFetcher, MacroMarketSnapshot
 from analysis.onchain_fetcher import OnchainFetcher, OnchainSnapshot
+from analysis.options_market_fetcher import OptionsMarketFetcher, OptionsMarketSnapshot
+from analysis.orderflow_cvd import OrderFlowCvdEngine, OrderFlowCvdReport
 from analysis.sentiment_fetcher import SentimentFetcher, SentimentSnapshot
+from analysis.volume_profile import VolumeProfileEngine, VolumeProfileReport
 from settings import SETTINGS
 from state.db_core import get_session
 
@@ -94,6 +126,26 @@ class MarketResearchReport:
     long_liquidation_notional: Decimal
     short_liquidation_notional: Decimal
     liquidation_pressure: str
+    force_orders_status: str
+    force_orders_reason: Optional[str]
+    force_order_count: int
+
+    poc_price: Decimal
+    value_area_low: Decimal
+    value_area_high: Decimal
+    poc_distance_bps: Decimal
+    price_location: str
+
+    cvd: Decimal
+    delta_ratio_pct: Decimal
+    aggression_bias: str
+    cvd_trend: str
+    divergence: str
+
+    put_call_oi_ratio: Decimal
+    put_call_volume_ratio: Decimal
+    options_bias: str
+
     trend: str
     volatility: str
     liquidity: str
@@ -103,12 +155,14 @@ class MarketResearchReport:
     analyst_summary_ko: str
     dashboard_payload: Dict[str, Any]
 
-    # 확장 외부 인텔리전스
     derivatives_summary: Dict[str, Any]
     macro_summary: Dict[str, Any]
     news_summary: Dict[str, Any]
     sentiment_summary: Dict[str, Any]
     onchain_summary: Dict[str, Any]
+    volume_profile_summary: Dict[str, Any]
+    orderflow_summary: Dict[str, Any]
+    options_summary: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -182,6 +236,7 @@ class MarketResearcher:
         self._macro_fetcher = MacroMarketFetcher()
         self._sentiment_fetcher = SentimentFetcher()
         self._onchain_fetcher = OnchainFetcher()
+        self._options_fetcher = OptionsMarketFetcher()
 
         self._symbol = self._require_str_setting("ANALYST_MARKET_SYMBOL")
         self._db_market_timeframe = self._require_str_setting("ANALYST_DB_MARKET_TIMEFRAME")
@@ -194,6 +249,9 @@ class MarketResearcher:
         self._depth_limit = self._require_int_setting("ANALYST_DEPTH_LIMIT")
         self._funding_limit = self._require_int_setting("ANALYST_FUNDING_LIMIT")
         self._force_order_limit = self._require_int_setting("ANALYST_FORCE_ORDER_LIMIT")
+
+        self._last_force_orders_status: str = "unknown"
+        self._last_force_orders_reason: Optional[str] = None
 
         if self._worker_interval_sec <= 0:
             raise RuntimeError("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC must be > 0")
@@ -223,6 +281,9 @@ class MarketResearcher:
         macro_snapshot = self._macro_fetcher.fetch()
         sentiment_snapshot = self._sentiment_fetcher.fetch()
         onchain_snapshot = self._onchain_fetcher.fetch()
+        volume_profile_report = self._build_volume_profile_report_or_raise(snapshot.klines)
+        orderflow_report = self._build_orderflow_report_or_raise()
+        options_snapshot = self._options_fetcher.fetch()
 
         report = self._build_report(
             snapshot=snapshot,
@@ -231,13 +292,18 @@ class MarketResearcher:
             macro_snapshot=macro_snapshot,
             sentiment_snapshot=sentiment_snapshot,
             onchain_snapshot=onchain_snapshot,
+            volume_profile_report=volume_profile_report,
+            orderflow_report=orderflow_report,
+            options_snapshot=options_snapshot,
         )
         logger.info(
-            "Market research completed: symbol=%s trend=%s regime=%s conviction=%s",
+            "Market research completed: symbol=%s trend=%s regime=%s conviction=%s force_orders_status=%s force_order_count=%s",
             report.symbol,
             report.trend,
             report.market_regime,
             report.conviction,
+            report.force_orders_status,
+            report.force_order_count,
         )
         return report
 
@@ -292,7 +358,19 @@ class MarketResearcher:
 
         while True:
             t0 = time.time()
-            self.sync_once()
+            try:
+                self.sync_once()
+            except Exception:
+                retry_sleep_sec = max(5, min(int(self._worker_interval_sec), 300))
+                logger.exception(
+                    "Market research worker loop failed: symbol=%s timeframe=%s retry_sleep_sec=%s",
+                    self._symbol,
+                    self._db_market_timeframe,
+                    retry_sleep_sec,
+                )
+                time.sleep(retry_sleep_sec)
+                continue
+
             elapsed = time.time() - t0
             sleep_sec = self._worker_interval_sec - elapsed
             if sleep_sec > 0:
@@ -354,14 +432,11 @@ class MarketResearcher:
             short_keys=("shortAccount", "sellVol"),
         )
 
-        try:
-            force_orders = self._fetcher.fetch_force_orders(
-                symbol=self._symbol,
-                limit=self._force_order_limit,
-            )
-        except Exception as e:
-            logger.warning("force_orders unavailable: %s", e)
-            force_orders = []
+        force_orders, force_orders_status, force_orders_reason = self._fetch_force_orders_contract_strict(
+            limit=self._force_order_limit
+        )
+        self._last_force_orders_status = force_orders_status
+        self._last_force_orders_reason = force_orders_reason
 
         return BinanceMarketSnapshot(
             symbol=self._symbol,
@@ -380,6 +455,143 @@ class MarketResearcher:
             taker_long_short_ratio=taker_ratio,
             force_orders=force_orders,
         )
+
+    def _fetch_force_orders_contract_strict(
+        self,
+        *,
+        limit: int,
+    ) -> tuple[List[BinanceForceOrder], str, Optional[str]]:
+        if limit <= 0:
+            raise RuntimeError("ANALYST_FORCE_ORDER_LIMIT must be > 0")
+
+        try:
+            force_orders = self._fetcher.fetch_force_orders(
+                symbol=self._symbol,
+                limit=limit,
+            )
+        except Exception as exc:
+            msg = str(exc)
+            if "unavailable_or_policy_conflict" in msg or "public REST" in msg:
+                logger.warning(
+                    "Binance force_orders unavailable under current public REST contract: symbol=%s limit=%s reason=%s",
+                    self._symbol,
+                    limit,
+                    msg,
+                )
+                return [], "unavailable_or_policy_conflict", msg
+            raise RuntimeError(
+                f"Failed to fetch Binance force orders: symbol={self._symbol}, limit={limit}"
+            ) from exc
+
+        if not isinstance(force_orders, list):
+            raise RuntimeError("Binance force_orders response must be a list")
+
+        if len(force_orders) == 0:
+            logger.info(
+                "Binance force_orders empty: symbol=%s limit=%s",
+                self._symbol,
+                limit,
+            )
+            return [], "empty", None
+
+        logger.info(
+            "Binance force_orders collected: symbol=%s limit=%s count=%s",
+            self._symbol,
+            limit,
+            len(force_orders),
+        )
+        return force_orders, "available", None
+
+    def _build_volume_profile_report_or_raise(
+        self,
+        klines: Sequence[BinanceKline],
+    ) -> VolumeProfileReport:
+        if len(klines) == 0:
+            raise RuntimeError("klines must not be empty for volume profile")
+
+        current_price = klines[-1].close_price
+        bucket_size = self._derive_volume_profile_bucket_size_or_raise(current_price)
+
+        engine = VolumeProfileEngine(
+            bucket_size=bucket_size,
+            value_area_pct=Decimal("0.70"),
+            volume_basis="quote",
+            hvn_count=3,
+            lvn_count=3,
+        )
+        return engine.build(symbol=self._symbol, klines=klines)
+
+    def _build_orderflow_report_or_raise(self) -> OrderFlowCvdReport:
+        aggtrade_limit = self._derive_aggtrade_limit()
+        payload = self._fetch_recent_aggtrades_strict(limit=aggtrade_limit)
+
+        engine = OrderFlowCvdEngine(
+            min_trades=min(50, aggtrade_limit),
+            dominance_threshold_pct=Decimal("10"),
+            divergence_price_threshold_pct=Decimal("0.20"),
+            divergence_delta_threshold_pct=Decimal("8.0"),
+            cvd_path_tail_size=20,
+        )
+        return engine.build_from_binance_payload(symbol=self._symbol, payload=payload)
+
+    def _fetch_recent_aggtrades_strict(
+        self,
+        *,
+        limit: int,
+    ) -> List[Mapping[str, Any]]:
+        request_json = getattr(self._fetcher, "_request_json", None)
+        if request_json is None or not callable(request_json):
+            raise RuntimeError("BinanceMarketFetcher._request_json is unavailable (STRICT)")
+
+        if limit <= 0:
+            raise RuntimeError("aggtrade limit must be > 0")
+        if limit > 1000:
+            raise RuntimeError("aggtrade limit must be <= 1000")
+
+        payload = request_json(
+            "GET",
+            "/fapi/v1/aggTrades",
+            params={"symbol": self._symbol, "limit": limit},
+        )
+
+        if not isinstance(payload, list):
+            raise RuntimeError("Binance aggTrades response is not a list")
+        if len(payload) == 0:
+            raise RuntimeError(f"Binance aggTrades response is empty: symbol={self._symbol}, limit={limit}")
+
+        normalized: List[Mapping[str, Any]] = []
+        for idx, row in enumerate(payload):
+            if not isinstance(row, Mapping):
+                raise RuntimeError(f"Binance aggTrades row is not an object: idx={idx}")
+            normalized.append(row)
+        return normalized
+
+    def _derive_aggtrade_limit(self) -> int:
+        limit = max(self._depth_limit * 15, 200)
+        if limit > 1000:
+            return 1000
+        return limit
+
+    def _derive_volume_profile_bucket_size_or_raise(
+        self,
+        current_price: Decimal,
+    ) -> Decimal:
+        if current_price <= Decimal("0"):
+            raise RuntimeError("current_price must be > 0 for volume profile bucket size")
+
+        if current_price < Decimal("1"):
+            return Decimal("0.001")
+        if current_price < Decimal("10"):
+            return Decimal("0.01")
+        if current_price < Decimal("100"):
+            return Decimal("0.1")
+        if current_price < Decimal("1000"):
+            return Decimal("1")
+        if current_price < Decimal("10000"):
+            return Decimal("5")
+        if current_price < Decimal("100000"):
+            return Decimal("50")
+        return Decimal("100")
 
     def _fetch_ratio_series_with_symbol_fallback(
         self,
@@ -707,11 +919,19 @@ class MarketResearcher:
             Decimal("-1"),
             Decimal("1"),
         )
+        orderflow_component = self._clamp(
+            report.delta_ratio_pct / Decimal("20.0"),
+            Decimal("-1"),
+            Decimal("1"),
+        )
+        options_component = self._options_bias_to_score(report.options_bias)
 
         score = (
-            price_component * Decimal("0.60")
-            + funding_component * Decimal("0.15")
-            + oi_component * Decimal("0.25")
+            price_component * Decimal("0.45")
+            + funding_component * Decimal("0.10")
+            + oi_component * Decimal("0.20")
+            + orderflow_component * Decimal("0.15")
+            + options_component * Decimal("0.10")
         )
         return self._clamp(score, Decimal("-1"), Decimal("1"))
 
@@ -745,13 +965,18 @@ class MarketResearcher:
         imbalance_penalty = self._clamp(abs(report.orderbook_imbalance), Decimal("0"), Decimal("1"))
         trend_strength = self._clamp(abs(trend_score), Decimal("0"), Decimal("1"))
         volatility_penalty = self._clamp(volatility_score, Decimal("0"), Decimal("1"))
+        poc_distance_penalty = self._clamp(abs(report.poc_distance_bps) / Decimal("50.0"), Decimal("0"), Decimal("1"))
+        profile_bonus = Decimal("1") - poc_distance_penalty
+        orderflow_bonus = self._clamp(abs(report.delta_ratio_pct) / Decimal("20.0"), Decimal("0"), Decimal("1"))
 
         score = (
-            trend_strength * Decimal("0.45")
-            + liquidity_score * Decimal("0.20")
-            + center_bonus * Decimal("0.20")
+            trend_strength * Decimal("0.35")
+            + liquidity_score * Decimal("0.15")
+            + center_bonus * Decimal("0.15")
             + (Decimal("1") - imbalance_penalty) * Decimal("0.10")
             + (Decimal("1") - volatility_penalty) * Decimal("0.05")
+            + profile_bonus * Decimal("0.10")
+            + orderflow_bonus * Decimal("0.10")
         )
         return self._clamp(score, Decimal("0"), Decimal("1"))
 
@@ -767,6 +992,17 @@ class MarketResearcher:
         if normalized not in mapping:
             raise RuntimeError(f"Unexpected market_regime for DB normalization: {regime}")
         return mapping[normalized]
+
+    def _options_bias_to_score(self, options_bias: str) -> Decimal:
+        if options_bias == "bullish":
+            return Decimal("1")
+        if options_bias == "bearish":
+            return Decimal("-1")
+        if options_bias == "neutral":
+            return Decimal("0")
+        if options_bias == "mixed":
+            return Decimal("0")
+        raise RuntimeError(f"Unexpected options_bias: {options_bias}")
 
     def _clamp(self, value: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
         if lower > upper:
@@ -790,6 +1026,9 @@ class MarketResearcher:
         macro_snapshot: MacroMarketSnapshot,
         sentiment_snapshot: SentimentSnapshot,
         onchain_snapshot: OnchainSnapshot,
+        volume_profile_report: VolumeProfileReport,
+        orderflow_report: OrderFlowCvdReport,
+        options_snapshot: OptionsMarketSnapshot,
     ) -> MarketResearchReport:
         klines = snapshot.klines
         if len(klines) < 5:
@@ -803,6 +1042,9 @@ class MarketResearcher:
             macro_snapshot.as_of_ms,
             sentiment_snapshot.as_of_ms,
             onchain_snapshot.as_of_ms,
+            volume_profile_report.as_of_ms,
+            orderflow_report.as_of_ms,
+            options_snapshot.as_of_ms,
         )
 
         price = latest_kline.close_price
@@ -833,10 +1075,32 @@ class MarketResearcher:
         long_liq, short_liq = self._calc_liquidation_notional(snapshot.force_orders)
         liquidation_pressure = self._classify_liquidation_pressure(long_liq, short_liq)
 
+        force_orders_status = self._normalize_force_orders_status_or_raise(self._last_force_orders_status)
+        force_orders_reason = self._normalize_force_orders_reason(self._last_force_orders_reason)
+        force_order_count = len(snapshot.force_orders)
+
+        poc_price = volume_profile_report.poc_price
+        value_area_low = volume_profile_report.value_area_low
+        value_area_high = volume_profile_report.value_area_high
+        poc_distance_bps = volume_profile_report.poc_distance_bps
+        price_location = volume_profile_report.price_location
+
+        cvd = orderflow_report.cvd
+        delta_ratio_pct = orderflow_report.delta_ratio_pct
+        aggression_bias = orderflow_report.aggression_bias
+        cvd_trend = orderflow_report.cvd_trend
+        divergence = orderflow_report.divergence
+
+        put_call_oi_ratio = options_snapshot.put_call_oi_ratio
+        put_call_volume_ratio = options_snapshot.put_call_volume_ratio
+        options_bias = options_snapshot.options_bias
+
         trend = self._classify_trend(
             price_change_pct=price_change_pct,
             funding_rate=funding_rate,
             open_interest_change_pct=open_interest_change_pct,
+            delta_ratio_pct=delta_ratio_pct,
+            options_bias=options_bias,
         )
         volatility = self._classify_volatility(realized_volatility_pct)
         liquidity = self._classify_liquidity(spread_bps)
@@ -849,6 +1113,8 @@ class MarketResearcher:
             price=price,
             support=support_price,
             resistance=resistance_price,
+            price_location=price_location,
+            divergence=divergence,
         )
 
         external_conviction_votes = self._calc_external_conviction_votes(
@@ -857,6 +1123,9 @@ class MarketResearcher:
             macro_snapshot=macro_snapshot,
             sentiment_snapshot=sentiment_snapshot,
             onchain_snapshot=onchain_snapshot,
+            volume_profile_report=volume_profile_report,
+            orderflow_report=orderflow_report,
+            options_snapshot=options_snapshot,
         )
 
         conviction = self._classify_conviction(
@@ -877,6 +1146,8 @@ class MarketResearcher:
             open_interest_trend=open_interest_trend,
             crowding_bias=crowding_bias,
             liquidation_pressure=liquidation_pressure,
+            force_orders_status=force_orders_status,
+            force_order_count=force_order_count,
             spread_bps=spread_bps,
             orderbook_imbalance=orderbook_imbalance,
             support=support_price,
@@ -887,6 +1158,9 @@ class MarketResearcher:
             macro_snapshot=macro_snapshot,
             sentiment_snapshot=sentiment_snapshot,
             onchain_snapshot=onchain_snapshot,
+            volume_profile_report=volume_profile_report,
+            orderflow_report=orderflow_report,
+            options_snapshot=options_snapshot,
         )
 
         analyst_summary_ko = self._build_korean_summary(
@@ -900,6 +1174,8 @@ class MarketResearcher:
             open_interest_trend=open_interest_trend,
             crowding_bias=crowding_bias,
             liquidation_pressure=liquidation_pressure,
+            force_orders_status=force_orders_status,
+            force_order_count=force_order_count,
             support=support_price,
             resistance=resistance_price,
             price_change_pct=price_change_pct,
@@ -910,6 +1186,9 @@ class MarketResearcher:
             macro_snapshot=macro_snapshot,
             sentiment_snapshot=sentiment_snapshot,
             onchain_snapshot=onchain_snapshot,
+            volume_profile_report=volume_profile_report,
+            orderflow_report=orderflow_report,
+            options_snapshot=options_snapshot,
         )
 
         derivatives_summary = derivatives_snapshot.dashboard_payload
@@ -917,6 +1196,9 @@ class MarketResearcher:
         macro_summary = macro_snapshot.dashboard_payload
         sentiment_summary = sentiment_snapshot.dashboard_payload
         onchain_summary = onchain_snapshot.dashboard_payload
+        volume_profile_summary = volume_profile_report.dashboard_payload
+        orderflow_summary = orderflow_report.dashboard_payload
+        options_summary = options_snapshot.dashboard_payload
 
         dashboard_payload = self._build_dashboard_payload(
             snapshot=snapshot,
@@ -942,6 +1224,22 @@ class MarketResearcher:
             long_liq=long_liq,
             short_liq=short_liq,
             liquidation_pressure=liquidation_pressure,
+            force_orders_status=force_orders_status,
+            force_orders_reason=force_orders_reason,
+            force_order_count=force_order_count,
+            poc_price=poc_price,
+            value_area_low=value_area_low,
+            value_area_high=value_area_high,
+            poc_distance_bps=poc_distance_bps,
+            price_location=price_location,
+            cvd=cvd,
+            delta_ratio_pct=delta_ratio_pct,
+            aggression_bias=aggression_bias,
+            cvd_trend=cvd_trend,
+            divergence=divergence,
+            put_call_oi_ratio=put_call_oi_ratio,
+            put_call_volume_ratio=put_call_volume_ratio,
+            options_bias=options_bias,
             trend=trend,
             volatility=volatility,
             liquidity=liquidity,
@@ -954,6 +1252,9 @@ class MarketResearcher:
             macro_summary=macro_summary,
             sentiment_summary=sentiment_summary,
             onchain_summary=onchain_summary,
+            volume_profile_summary=volume_profile_summary,
+            orderflow_summary=orderflow_summary,
+            options_summary=options_summary,
         )
 
         return MarketResearchReport(
@@ -980,6 +1281,22 @@ class MarketResearcher:
             long_liquidation_notional=long_liq,
             short_liquidation_notional=short_liq,
             liquidation_pressure=liquidation_pressure,
+            force_orders_status=force_orders_status,
+            force_orders_reason=force_orders_reason,
+            force_order_count=force_order_count,
+            poc_price=poc_price,
+            value_area_low=value_area_low,
+            value_area_high=value_area_high,
+            poc_distance_bps=poc_distance_bps,
+            price_location=price_location,
+            cvd=cvd,
+            delta_ratio_pct=delta_ratio_pct,
+            aggression_bias=aggression_bias,
+            cvd_trend=cvd_trend,
+            divergence=divergence,
+            put_call_oi_ratio=put_call_oi_ratio,
+            put_call_volume_ratio=put_call_volume_ratio,
+            options_bias=options_bias,
             trend=trend,
             volatility=volatility,
             liquidity=liquidity,
@@ -993,6 +1310,9 @@ class MarketResearcher:
             news_summary=news_summary,
             sentiment_summary=sentiment_summary,
             onchain_summary=onchain_summary,
+            volume_profile_summary=volume_profile_summary,
+            orderflow_summary=orderflow_summary,
+            options_summary=options_summary,
         )
 
     # ========================================================
@@ -1094,6 +1414,9 @@ class MarketResearcher:
         macro_snapshot: MacroMarketSnapshot,
         sentiment_snapshot: SentimentSnapshot,
         onchain_snapshot: OnchainSnapshot,
+        volume_profile_report: VolumeProfileReport,
+        orderflow_report: OrderFlowCvdReport,
+        options_snapshot: OptionsMarketSnapshot,
     ) -> int:
         votes = 0
 
@@ -1106,6 +1429,12 @@ class MarketResearcher:
         if sentiment_snapshot.sentiment_regime in {"extreme_greed", "extreme_fear"}:
             votes += 1
         if onchain_snapshot.network_regime in {"network_strengthening", "network_softening"}:
+            votes += 1
+        if volume_profile_report.price_location in {"above_value_area", "below_value_area"}:
+            votes += 1
+        if orderflow_report.aggression_bias in {"aggressive_buy_dominant", "aggressive_sell_dominant"}:
+            votes += 1
+        if options_snapshot.options_bias in {"bullish", "bearish"}:
             votes += 1
 
         return votes
@@ -1173,18 +1502,29 @@ class MarketResearcher:
 
     def _classify_trend(
         self,
+        *,
         price_change_pct: Decimal,
         funding_rate: Decimal,
         open_interest_change_pct: Decimal,
+        delta_ratio_pct: Decimal,
+        options_bias: str,
     ) -> str:
-        bullish_confirm = funding_rate > Decimal("0") and open_interest_change_pct > Decimal("0")
-        bearish_confirm = funding_rate < Decimal("0") and open_interest_change_pct > Decimal("0")
+        bullish_confirm = (
+            funding_rate > Decimal("0")
+            and open_interest_change_pct > Decimal("0")
+            and delta_ratio_pct > Decimal("0")
+        )
+        bearish_confirm = (
+            funding_rate < Decimal("0")
+            and open_interest_change_pct > Decimal("0")
+            and delta_ratio_pct < Decimal("0")
+        )
 
-        if price_change_pct >= Decimal("2.0") and bullish_confirm:
+        if price_change_pct >= Decimal("2.0") and bullish_confirm and options_bias in {"bullish", "mixed", "neutral"}:
             return "strong_uptrend"
         if price_change_pct >= Decimal("0.6"):
             return "weak_uptrend"
-        if price_change_pct <= Decimal("-2.0") and bearish_confirm:
+        if price_change_pct <= Decimal("-2.0") and bearish_confirm and options_bias in {"bearish", "mixed", "neutral"}:
             return "strong_downtrend"
         if price_change_pct <= Decimal("-0.6"):
             return "weak_downtrend"
@@ -1206,6 +1546,7 @@ class MarketResearcher:
 
     def _classify_market_regime(
         self,
+        *,
         trend: str,
         volatility: str,
         open_interest_trend: str,
@@ -1214,6 +1555,8 @@ class MarketResearcher:
         price: Decimal,
         support: Decimal,
         resistance: Decimal,
+        price_location: str,
+        divergence: str,
     ) -> str:
         if price <= Decimal("0") or support <= Decimal("0") or resistance <= Decimal("0"):
             raise RuntimeError("Price/support/resistance must be > 0")
@@ -1222,6 +1565,10 @@ class MarketResearcher:
 
         range_span_pct = ((resistance - support) / price) * Decimal("100")
 
+        if divergence in {"bearish_divergence", "bullish_divergence"}:
+            return "transitional"
+        if price_location in {"above_value_area", "below_value_area"} and trend in {"strong_uptrend", "strong_downtrend"}:
+            return "trend_expansion"
         if trend in {"strong_uptrend", "strong_downtrend"} and open_interest_trend in {"rising", "rising_strong"}:
             return "trend_expansion"
         if liquidation_pressure in {"long_flush", "short_squeeze"} and volatility == "high":
@@ -1257,9 +1604,9 @@ class MarketResearcher:
 
         strong_conditions += external_conviction_votes
 
-        if strong_conditions >= 6:
+        if strong_conditions >= 8:
             return "high"
-        if strong_conditions >= 3:
+        if strong_conditions >= 4:
             return "medium"
         return "low"
 
@@ -1278,6 +1625,8 @@ class MarketResearcher:
         open_interest_trend: str,
         crowding_bias: str,
         liquidation_pressure: str,
+        force_orders_status: str,
+        force_order_count: int,
         spread_bps: Decimal,
         orderbook_imbalance: Decimal,
         support: Decimal,
@@ -1288,6 +1637,9 @@ class MarketResearcher:
         macro_snapshot: MacroMarketSnapshot,
         sentiment_snapshot: SentimentSnapshot,
         onchain_snapshot: OnchainSnapshot,
+        volume_profile_report: VolumeProfileReport,
+        orderflow_report: OrderFlowCvdReport,
+        options_snapshot: OptionsMarketSnapshot,
     ) -> List[str]:
         signals: List[str] = []
 
@@ -1299,20 +1651,34 @@ class MarketResearcher:
         signals.append(f"oi_trend={open_interest_trend}")
         signals.append(f"crowding={crowding_bias}")
         signals.append(f"liquidation_pressure={liquidation_pressure}")
+        signals.append(f"force_orders_status={force_orders_status}")
+        signals.append(f"force_order_count={force_order_count}")
         signals.append(f"spread_bps={self._fmt_decimal(spread_bps, 2)}")
         signals.append(f"orderbook_imbalance={self._fmt_decimal(orderbook_imbalance, 4)}")
         signals.append(f"support={self._fmt_decimal(support, 2)}")
         signals.append(f"resistance={self._fmt_decimal(resistance, 2)}")
         signals.append(f"last_price={self._fmt_decimal(price, 2)}")
 
-        signals.extend([
-            f"derivatives_bias={derivatives_snapshot.cross_exchange_crowding_bias}",
-            f"macro_bias={macro_snapshot.cross_asset_bias}",
-            f"news_bias={news_snapshot.sentiment_bias}",
-            f"sentiment_regime={sentiment_snapshot.sentiment_regime}",
-            f"onchain_network={onchain_snapshot.network_regime}",
-            f"onchain_congestion={onchain_snapshot.congestion_regime}",
-        ])
+        signals.extend(
+            [
+                f"derivatives_bias={derivatives_snapshot.cross_exchange_crowding_bias}",
+                f"macro_bias={macro_snapshot.cross_asset_bias}",
+                f"news_bias={news_snapshot.sentiment_bias}",
+                f"sentiment_regime={sentiment_snapshot.sentiment_regime}",
+                f"onchain_network={onchain_snapshot.network_regime}",
+                f"onchain_congestion={onchain_snapshot.congestion_regime}",
+                f"profile_poc={self._fmt_decimal(volume_profile_report.poc_price, 2)}",
+                f"profile_value_area={self._fmt_decimal(volume_profile_report.value_area_low, 2)}~{self._fmt_decimal(volume_profile_report.value_area_high, 2)}",
+                f"profile_location={volume_profile_report.price_location}",
+                f"cvd={self._fmt_decimal(orderflow_report.cvd, 6)}",
+                f"delta_ratio_pct={self._fmt_decimal(orderflow_report.delta_ratio_pct, 2)}",
+                f"aggression_bias={orderflow_report.aggression_bias}",
+                f"divergence={orderflow_report.divergence}",
+                f"put_call_oi_ratio={self._fmt_decimal(options_snapshot.put_call_oi_ratio, 4)}",
+                f"put_call_volume_ratio={self._fmt_decimal(options_snapshot.put_call_volume_ratio, 4)}",
+                f"options_bias={options_snapshot.options_bias}",
+            ]
+        )
 
         return signals
 
@@ -1329,6 +1695,8 @@ class MarketResearcher:
         open_interest_trend: str,
         crowding_bias: str,
         liquidation_pressure: str,
+        force_orders_status: str,
+        force_order_count: int,
         support: Decimal,
         resistance: Decimal,
         price_change_pct: Decimal,
@@ -1339,6 +1707,9 @@ class MarketResearcher:
         macro_snapshot: MacroMarketSnapshot,
         sentiment_snapshot: SentimentSnapshot,
         onchain_snapshot: OnchainSnapshot,
+        volume_profile_report: VolumeProfileReport,
+        orderflow_report: OrderFlowCvdReport,
+        options_snapshot: OptionsMarketSnapshot,
     ) -> str:
         parts: List[str] = []
 
@@ -1360,12 +1731,33 @@ class MarketResearcher:
             f"청산 압력은 {self._ko_liquidation(liquidation_pressure)}로 해석됩니다."
         )
         parts.append(
+            f"청산 데이터 상태는 {self._ko_force_orders_status(force_orders_status)}이며, "
+            f"현재 수집된 청산 건수는 {force_order_count}건 입니다."
+        )
+        parts.append(
             f"단기 지지 구간은 {self._fmt_decimal(support, 2)}, "
             f"저항 구간은 {self._fmt_decimal(resistance, 2)} 입니다."
         )
         parts.append(
             f"실현 변동성은 {self._fmt_decimal(realized_volatility_pct, 2)}%, "
             f"호가 스프레드는 {self._fmt_decimal(spread_bps, 2)} bps 수준입니다."
+        )
+        parts.append(
+            f"Volume Profile 기준 POC 는 {self._fmt_decimal(volume_profile_report.poc_price, 2)}, "
+            f"Value Area 는 {self._fmt_decimal(volume_profile_report.value_area_low, 2)} ~ "
+            f"{self._fmt_decimal(volume_profile_report.value_area_high, 2)} 이며 "
+            f"현재 가격 위치는 {self._ko_price_location(volume_profile_report.price_location)} 입니다."
+        )
+        parts.append(
+            f"Order Flow 기준 CVD 는 {self._fmt_decimal(orderflow_report.cvd, 6)}, "
+            f"델타 비율은 {self._fmt_decimal(orderflow_report.delta_ratio_pct, 2)}% 이고 "
+            f"수급 우위는 {self._ko_aggression_bias(orderflow_report.aggression_bias)}, "
+            f"다이버전스는 {self._ko_divergence(orderflow_report.divergence)} 입니다."
+        )
+        parts.append(
+            f"옵션 시장 기준 Put/Call OI 비율은 {self._fmt_decimal(options_snapshot.put_call_oi_ratio, 4)}, "
+            f"Put/Call 거래량 비율은 {self._fmt_decimal(options_snapshot.put_call_volume_ratio, 4)} 이며 "
+            f"옵션 편향은 {self._ko_options_bias(options_snapshot.options_bias)} 입니다."
         )
         parts.append(
             f"추가 외부 신호로는 파생시장은 {self._ko_derivatives_bias(derivatives_snapshot.cross_exchange_crowding_bias)}, "
@@ -1403,6 +1795,22 @@ class MarketResearcher:
         long_liq: Decimal,
         short_liq: Decimal,
         liquidation_pressure: str,
+        force_orders_status: str,
+        force_orders_reason: Optional[str],
+        force_order_count: int,
+        poc_price: Decimal,
+        value_area_low: Decimal,
+        value_area_high: Decimal,
+        poc_distance_bps: Decimal,
+        price_location: str,
+        cvd: Decimal,
+        delta_ratio_pct: Decimal,
+        aggression_bias: str,
+        cvd_trend: str,
+        divergence: str,
+        put_call_oi_ratio: Decimal,
+        put_call_volume_ratio: Decimal,
+        options_bias: str,
         trend: str,
         volatility: str,
         liquidity: str,
@@ -1415,6 +1823,9 @@ class MarketResearcher:
         macro_summary: Dict[str, Any],
         sentiment_summary: Dict[str, Any],
         onchain_summary: Dict[str, Any],
+        volume_profile_summary: Dict[str, Any],
+        orderflow_summary: Dict[str, Any],
+        options_summary: Dict[str, Any],
     ) -> Dict[str, Any]:
         return {
             "symbol": snapshot.symbol,
@@ -1439,6 +1850,16 @@ class MarketResearcher:
             "microstructure": {
                 "spread_bps": self._fmt_decimal(spread_bps, 4),
                 "orderbook_imbalance": self._fmt_decimal(orderbook_imbalance, 6),
+                "poc_price": self._fmt_decimal(poc_price, 2),
+                "value_area_low": self._fmt_decimal(value_area_low, 2),
+                "value_area_high": self._fmt_decimal(value_area_high, 2),
+                "poc_distance_bps": self._fmt_decimal(poc_distance_bps, 4),
+                "price_location": price_location,
+                "cvd": self._fmt_decimal(cvd, 6),
+                "delta_ratio_pct": self._fmt_decimal(delta_ratio_pct, 4),
+                "aggression_bias": aggression_bias,
+                "cvd_trend": cvd_trend,
+                "divergence": divergence,
             },
             "derivatives": {
                 "funding_rate": self._fmt_decimal(funding_rate, 8),
@@ -1455,9 +1876,17 @@ class MarketResearcher:
                 "long_liquidation_notional": self._fmt_decimal(long_liq, 2),
                 "short_liquidation_notional": self._fmt_decimal(short_liq, 2),
                 "liquidation_pressure": liquidation_pressure,
+                "force_orders_status": force_orders_status,
+                "force_orders_reason": force_orders_reason,
+                "force_order_count": force_order_count,
             },
             "risk_metrics": {
                 "realized_volatility_pct": self._fmt_decimal(realized_volatility_pct, 4),
+            },
+            "options_metrics": {
+                "put_call_oi_ratio": self._fmt_decimal(put_call_oi_ratio, 4),
+                "put_call_volume_ratio": self._fmt_decimal(put_call_volume_ratio, 4),
+                "options_bias": options_bias,
             },
             "external_intelligence": {
                 "derivatives_summary": derivatives_summary,
@@ -1465,6 +1894,9 @@ class MarketResearcher:
                 "macro_summary": macro_summary,
                 "sentiment_summary": sentiment_summary,
                 "onchain_summary": onchain_summary,
+                "volume_profile_summary": volume_profile_summary,
+                "orderflow_summary": orderflow_summary,
+                "options_summary": options_summary,
             },
             "key_signals": key_signals,
             "analyst_summary_ko": analyst_summary_ko,
@@ -1475,7 +1907,12 @@ class MarketResearcher:
                 "global_ratio_count": len(snapshot.global_long_short_account_ratio),
                 "top_ratio_count": len(snapshot.top_long_short_position_ratio),
                 "taker_ratio_count": len(snapshot.taker_long_short_ratio),
-                "force_order_count": len(snapshot.force_orders),
+                "force_order_count": force_order_count,
+                "force_orders_status": force_orders_status,
+                "force_orders_reason": force_orders_reason,
+                "profile_bucket_count": len(volume_profile_summary.get("buckets", [])),
+                "orderflow_trade_count": orderflow_summary.get("summary", {}).get("total_trades"),
+                "options_count": options_summary.get("market", {}).get("option_count"),
             },
         }
 
@@ -1556,6 +1993,14 @@ class MarketResearcher:
         }
         return self._map_or_raise(mapping, value, "liquidation_pressure")
 
+    def _ko_force_orders_status(self, value: str) -> str:
+        mapping = {
+            "available": "정상 수집",
+            "empty": "최근 청산 데이터 없음",
+            "unavailable_or_policy_conflict": "공개 REST 정책상 비가용",
+        }
+        return self._map_or_raise(mapping, value, "force_orders_status")
+
     def _ko_derivatives_bias(self, value: str) -> str:
         mapping = {
             "long_crowded": "롱 과밀 상태",
@@ -1609,6 +2054,41 @@ class MarketResearcher:
             raise RuntimeError(f"Unexpected onchain congestion_regime: {congestion_regime}")
         return f"{network_map[network_regime]} / {congestion_map[congestion_regime]}"
 
+    def _ko_price_location(self, value: str) -> str:
+        mapping = {
+            "above_value_area": "Value Area 상단 이탈",
+            "below_value_area": "Value Area 하단 이탈",
+            "inside_value_area_above_poc": "Value Area 내부 / POC 위",
+            "inside_value_area_below_poc": "Value Area 내부 / POC 아래",
+            "at_poc": "POC 부근",
+        }
+        return self._map_or_raise(mapping, value, "price_location")
+
+    def _ko_aggression_bias(self, value: str) -> str:
+        mapping = {
+            "aggressive_buy_dominant": "공격적 매수 우위",
+            "aggressive_sell_dominant": "공격적 매도 우위",
+            "balanced": "수급 균형",
+        }
+        return self._map_or_raise(mapping, value, "aggression_bias")
+
+    def _ko_divergence(self, value: str) -> str:
+        mapping = {
+            "bullish_divergence": "강세 다이버전스",
+            "bearish_divergence": "약세 다이버전스",
+            "none": "다이버전스 없음",
+        }
+        return self._map_or_raise(mapping, value, "divergence")
+
+    def _ko_options_bias(self, value: str) -> str:
+        mapping = {
+            "bullish": "상방 우위",
+            "bearish": "하방 우위",
+            "neutral": "중립",
+            "mixed": "혼합",
+        }
+        return self._map_or_raise(mapping, value, "options_bias")
+
     # ========================================================
     # Settings / utility
     # ========================================================
@@ -1628,6 +2108,21 @@ class MarketResearcher:
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Missing or invalid required int setting: {name}") from exc
         return parsed
+
+    def _normalize_force_orders_status_or_raise(self, value: str) -> str:
+        allowed = {"available", "empty", "unavailable_or_policy_conflict"}
+        normalized = str(value or "").strip()
+        if normalized not in allowed:
+            raise RuntimeError(f"Unexpected force_orders_status: {value!r}")
+        return normalized
+
+    def _normalize_force_orders_reason(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        if normalized == "":
+            return None
+        return normalized
 
     def _fmt_decimal(self, value: Decimal, scale: int) -> str:
         if scale < 0:

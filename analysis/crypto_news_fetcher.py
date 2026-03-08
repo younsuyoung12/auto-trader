@@ -23,6 +23,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 1) 신규 생성
 2) Alpha Vantage NEWS_SENTIMENT 기반 BTC 뉴스 fetcher 추가
 3) headline / overall sentiment / source / published time strict 파싱 추가
+
+2026-03-08 (PATCH 2)
+1) FIX(TRADE-GRADE): Alpha Vantage NEWS_SENTIMENT 요청 파라미터를 최소 유효 계약으로 축소
+2) tickers 를 "CRYPTO:{base_asset}" 단일 필터로 고정
+3) topics / FOREX:USD 결합 제거
+4) 기존 Invalid inputs 오류 제거 목적
 ========================================================
 """
 
@@ -89,7 +95,7 @@ class CryptoNewsFetcher:
         self._session.headers.update({"User-Agent": "auto-trader/crypto-news-fetcher"})
 
         self._base_asset = self._extract_base_asset(self._symbol)
-        self._ticker_filter = f"CRYPTO:{self._base_asset},FOREX:USD"
+        self._ticker_filter = f"CRYPTO:{self._base_asset}"
 
     @property
     def symbol(self) -> str:
@@ -97,14 +103,7 @@ class CryptoNewsFetcher:
 
     def fetch(self) -> CryptoNewsSnapshot:
         payload = self._request_json(
-            params={
-                "function": "NEWS_SENTIMENT",
-                "tickers": self._ticker_filter,
-                "topics": "blockchain,financial_markets,economy_macro,economy_monetary",
-                "sort": "LATEST",
-                "limit": _NEWS_LIMIT,
-                "apikey": self._api_key,
-            }
+            params=self._build_news_request_params_strict()
         )
 
         feed = payload.get("feed")
@@ -178,6 +177,7 @@ class CryptoNewsFetcher:
         dashboard_payload = {
             "symbol": self._symbol,
             "as_of_ms": as_of_ms,
+            "ticker_filter": self._ticker_filter,
             "average_sentiment_score": self._fmt_decimal(average_sentiment_score, 6),
             "bullish_count": bullish_count,
             "bearish_count": bearish_count,
@@ -211,13 +211,26 @@ class CryptoNewsFetcher:
         )
 
         logger.info(
-            "Crypto news snapshot fetched: symbol=%s bias=%s avg_score=%s news_count=%s",
+            "Crypto news snapshot fetched: symbol=%s ticker_filter=%s bias=%s avg_score=%s news_count=%s",
             result.symbol,
+            self._ticker_filter,
             result.sentiment_bias,
             self._fmt_decimal(result.average_sentiment_score, 6),
             len(result.latest_news),
         )
         return result
+
+    def _build_news_request_params_strict(self) -> Dict[str, Any]:
+        if not self._ticker_filter.startswith("CRYPTO:"):
+            raise RuntimeError(f"Invalid Alpha Vantage ticker filter: {self._ticker_filter}")
+
+        return {
+            "function": "NEWS_SENTIMENT",
+            "tickers": self._ticker_filter,
+            "sort": "LATEST",
+            "limit": _NEWS_LIMIT,
+            "apikey": self._api_key,
+        }
 
     def _request_json(self, params: Mapping[str, Any]) -> Mapping[str, Any]:
         response = self._session.get(

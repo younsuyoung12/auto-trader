@@ -40,12 +40,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2) bt_trade_snapshots.ts_ms → snapshot_ts_ms SQL alias 정규화 추가
 3) Snapshot parser 는 snapshot_ts_ms 를 최우선으로 해석하도록 보강
 4) DB 스키마 변경 없이 analyzer 입력 스키마만 정규화하도록 구조 고정
+
+2026-03-08 (PATCH 3)
+1) import 시 실행되던 top-level print() 제거
+2) import side effect 제거
+3) STRICT · NO-FALLBACK · TRADE-GRADE 정책에 맞게 logging-only 원칙 유지
 ========================================================
 """
 
 from __future__ import annotations
-
-print("DEBUG TRADE_ANALYZER FILE:", __file__)
 
 import json
 import logging

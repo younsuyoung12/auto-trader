@@ -33,6 +33,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2) market-only 스코프에서 generic GPT analyze()를 무조건 호출하지 않도록 분기 추가
 3) GPT 엔진의 scope별 메서드 계약 검증 로직 추가
 4) gpt_result / dashboard_payload / 최종 응답 무결성 검증 추가
+
+2026-03-08 (PATCH 2)
+1) MarketResearchReport 확장 필드(volume profile / orderflow / options)를 dashboard payload에 반영
+2) external_market card 에 POC / Value Area / CVD / delta ratio / options bias 핵심 필드 추가
+3) external_market card 에 volume_profile_summary / orderflow_summary / options_summary nested payload 추가
+4) 기존 내부시장/거래분석/GPT 오케스트레이션 로직은 삭제 없이 유지
 ========================================================
 """
 
@@ -41,7 +47,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from analysis.gpt_analyst_engine import GptAnalystEngine, GptAnalystResult
 from analysis.market_analyzer import InternalMarketSummary, MarketAnalyzer
@@ -631,7 +637,27 @@ class QuantAnalyst:
                 "resistance_price": self._fmt_decimal(
                     external_market_summary_obj.resistance_price, 2
                 ),
+                "poc_price": self._fmt_decimal(external_market_summary_obj.poc_price, 2),
+                "value_area_low": self._fmt_decimal(external_market_summary_obj.value_area_low, 2),
+                "value_area_high": self._fmt_decimal(external_market_summary_obj.value_area_high, 2),
+                "poc_distance_bps": self._fmt_decimal(external_market_summary_obj.poc_distance_bps, 4),
+                "price_location": external_market_summary_obj.price_location,
+                "cvd": self._fmt_decimal(external_market_summary_obj.cvd, 6),
+                "delta_ratio_pct": self._fmt_decimal(external_market_summary_obj.delta_ratio_pct, 4),
+                "aggression_bias": external_market_summary_obj.aggression_bias,
+                "cvd_trend": external_market_summary_obj.cvd_trend,
+                "divergence": external_market_summary_obj.divergence,
+                "put_call_oi_ratio": self._fmt_decimal(
+                    external_market_summary_obj.put_call_oi_ratio, 4
+                ),
+                "put_call_volume_ratio": self._fmt_decimal(
+                    external_market_summary_obj.put_call_volume_ratio, 4
+                ),
+                "options_bias": external_market_summary_obj.options_bias,
                 "key_signals": list(external_market_summary_obj.key_signals),
+                "volume_profile_summary": dict(external_market_summary_obj.volume_profile_summary),
+                "orderflow_summary": dict(external_market_summary_obj.orderflow_summary),
+                "options_summary": dict(external_market_summary_obj.options_summary),
                 "summary_ko": external_market_summary_obj.analyst_summary_ko,
             }
 
@@ -752,7 +778,10 @@ class QuantAnalyst:
         return question.strip()
 
     def _now_ms(self) -> int:
-        return int(time.time() * 1000)
+        ts_ms = int(time.time() * 1000)
+        if ts_ms <= 0:
+            raise RuntimeError("generated timestamp must be > 0")
+        return ts_ms
 
     def _fmt_decimal(self, value: Any, scale: int) -> str:
         if scale < 0:

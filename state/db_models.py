@@ -18,6 +18,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-08:
+  1) Volume Profile / OrderFlow / Options 구조 피처 영속 컬럼 추가
+  2) 대상:
+     - bt_trade_snapshots
+     - market_features
+     - trade_context_snapshots
+  3) 추가 컬럼 예:
+     - poc_price / value_area_low / value_area_high / poc_distance_bps / price_location
+     - cvd / delta_ratio_pct / aggression_bias / divergence / orderflow_price_change_pct
+     - put_call_oi_ratio / put_call_volume_ratio / options_bias
+  4) 기존 테이블/컬럼 삭제 없음
+  5) nullable additive 확장만 수행
+
 - 2026-03-07:
   1) AI Trading Intelligence System 지원용 market_features 테이블 추가
   2) trade_context_snapshots 테이블 추가
@@ -399,6 +412,25 @@ class TradeSnapshot(Base):
     orderbook_imbalance = Column(Numeric(24, 8), nullable=True)
     volatility_score = Column(Numeric(24, 8), nullable=True)
 
+    # Volume Profile
+    vp_poc_price = Column(Numeric(24, 8), nullable=True)
+    vp_value_area_low = Column(Numeric(24, 8), nullable=True)
+    vp_value_area_high = Column(Numeric(24, 8), nullable=True)
+    vp_poc_distance_bps = Column(Numeric(24, 8), nullable=True)
+    vp_price_location = Column(String(32), nullable=True)
+
+    # Order Flow / CVD
+    of_cvd = Column(Numeric(36, 8), nullable=True)
+    of_delta_ratio_pct = Column(Numeric(24, 8), nullable=True)
+    of_aggression_bias = Column(String(32), nullable=True)
+    of_divergence = Column(String(32), nullable=True)
+    of_price_change_pct = Column(Numeric(24, 8), nullable=True)
+
+    # Options
+    opt_put_call_oi_ratio = Column(Numeric(24, 8), nullable=True)
+    opt_put_call_volume_ratio = Column(Numeric(24, 8), nullable=True)
+    opt_options_bias = Column(String(32), nullable=True)
+
     __table_args__ = (
         Index("ux_bt_trade_snapshots_tradeid", "trade_id", unique=True),
         Index("ux_bt_trade_snapshots_decision_id", "decision_id", unique=True),
@@ -459,6 +491,26 @@ class MarketFeature(Base):
     liquidity_score = Column(Numeric(24, 8), nullable=False)
 
     market_regime = Column(String(32), nullable=False)
+
+    # Volume Profile
+    poc_price = Column(Numeric(24, 8), nullable=True)
+    value_area_low = Column(Numeric(24, 8), nullable=True)
+    value_area_high = Column(Numeric(24, 8), nullable=True)
+    poc_distance_bps = Column(Numeric(24, 8), nullable=True)
+    price_location = Column(String(32), nullable=True)
+
+    # Order Flow / CVD
+    cvd = Column(Numeric(36, 8), nullable=True)
+    delta_ratio_pct = Column(Numeric(24, 8), nullable=True)
+    aggression_bias = Column(String(32), nullable=True)
+    divergence = Column(String(32), nullable=True)
+    orderflow_price_change_pct = Column(Numeric(24, 8), nullable=True)
+
+    # Options
+    put_call_oi_ratio = Column(Numeric(24, 8), nullable=True)
+    put_call_volume_ratio = Column(Numeric(24, 8), nullable=True)
+    options_bias = Column(String(32), nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
@@ -466,6 +518,20 @@ class MarketFeature(Base):
         CheckConstraint("ts_ms > 0", name="ck_market_features_ts_ms_gt_zero"),
         CheckConstraint("close_price > 0", name="ck_market_features_close_price_gt_zero"),
         CheckConstraint("spread_bps >= 0", name="ck_market_features_spread_bps_ge_zero"),
+        CheckConstraint("(poc_price IS NULL) OR (poc_price > 0)", name="ck_market_features_poc_price_gt_zero_when_present"),
+        CheckConstraint(
+            "((value_area_low IS NULL) AND (value_area_high IS NULL)) OR "
+            "((value_area_low IS NOT NULL) AND (value_area_high IS NOT NULL) AND (value_area_high >= value_area_low))",
+            name="ck_market_features_value_area_bounds_when_present",
+        ),
+        CheckConstraint(
+            "(put_call_oi_ratio IS NULL) OR (put_call_oi_ratio > 0)",
+            name="ck_market_features_put_call_oi_ratio_gt_zero_when_present",
+        ),
+        CheckConstraint(
+            "(put_call_volume_ratio IS NULL) OR (put_call_volume_ratio > 0)",
+            name="ck_market_features_put_call_volume_ratio_gt_zero_when_present",
+        ),
     )
 
 
@@ -493,6 +559,25 @@ class TradeContextSnapshot(Base):
     open_interest = Column(Numeric(36, 8), nullable=True)
     long_short_ratio = Column(Numeric(24, 8), nullable=True)
 
+    # Volume Profile
+    poc_price = Column(Numeric(24, 8), nullable=True)
+    value_area_low = Column(Numeric(24, 8), nullable=True)
+    value_area_high = Column(Numeric(24, 8), nullable=True)
+    poc_distance_bps = Column(Numeric(24, 8), nullable=True)
+    price_location = Column(String(32), nullable=True)
+
+    # Order Flow / CVD
+    cvd = Column(Numeric(36, 8), nullable=True)
+    delta_ratio_pct = Column(Numeric(24, 8), nullable=True)
+    aggression_bias = Column(String(32), nullable=True)
+    divergence = Column(String(32), nullable=True)
+    orderflow_price_change_pct = Column(Numeric(24, 8), nullable=True)
+
+    # Options
+    put_call_oi_ratio = Column(Numeric(24, 8), nullable=True)
+    put_call_volume_ratio = Column(Numeric(24, 8), nullable=True)
+    options_bias = Column(String(32), nullable=True)
+
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
@@ -504,6 +589,23 @@ class TradeContextSnapshot(Base):
         CheckConstraint(
             "(long_short_ratio IS NULL) OR (long_short_ratio > 0)",
             name="ck_trade_context_long_short_ratio_gt_zero_when_present",
+        ),
+        CheckConstraint(
+            "(poc_price IS NULL) OR (poc_price > 0)",
+            name="ck_trade_context_poc_price_gt_zero_when_present",
+        ),
+        CheckConstraint(
+            "((value_area_low IS NULL) AND (value_area_high IS NULL)) OR "
+            "((value_area_low IS NOT NULL) AND (value_area_high IS NOT NULL) AND (value_area_high >= value_area_low))",
+            name="ck_trade_context_value_area_bounds_when_present",
+        ),
+        CheckConstraint(
+            "(put_call_oi_ratio IS NULL) OR (put_call_oi_ratio > 0)",
+            name="ck_trade_context_put_call_oi_ratio_gt_zero_when_present",
+        ),
+        CheckConstraint(
+            "(put_call_volume_ratio IS NULL) OR (put_call_volume_ratio > 0)",
+            name="ck_trade_context_put_call_volume_ratio_gt_zero_when_present",
         ),
     )
 

@@ -18,9 +18,34 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-08:
+  1) FIX(TRADE-GRADE): duplicate top-level function 제거
+     - _require_tp_sl_from_settings_or_extra 중복 정의 제거
+  2) static_source_scan(AST duplicate scan) 실패 원인 제거
+  3) 기존 시그니처/기능/검증 규칙 삭제 없음
+
 - 2026-03-07:
   1) run_bot_ws.py 에서 진입 파이프라인 로직 분리
   2) EntryCandidate / WS 준비상태 검증 / unified_features 진입 후보 생성 분리
+
+- 2026-03-08:
+  1) unified_features 의 volume_profile / orderflow_cvd / options_market 필드 연동 추가
+  2) 진입 후보 생성 전 구조 피처 검증 강화
+     - volume_profile.price_location / poc_distance_bps
+     - orderflow_cvd.delta_ratio_pct / aggression_bias / divergence
+     - options_market.options_bias / put_call ratios
+  3) 방향 충돌 시 명시적 SKIP 처리 추가
+     - LONG:
+       * below_value_area
+       * aggressive_sell_dominant + 음수 delta
+       * bearish_divergence
+       * bearish options bias
+     - SHORT:
+       * above_value_area
+       * aggressive_buy_dominant + 양수 delta
+       * bullish_divergence
+       * bullish options bias
+  4) 기존 진입 파이프라인 구조/시그니처/기능 삭제 없음
 ============================================================
 """
 
@@ -28,14 +53,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from infra.market_data_ws import (
     get_klines_with_volume as ws_get_klines_with_volume,
     get_orderbook as ws_get_orderbook,
 )
-from infra.market_features_ws import get_trading_signal, FeatureBuildError
-from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
+from infra.market_features_ws import FeatureBuildError, get_trading_signal
+from strategy.unified_features_builder import UnifiedFeaturesError, build_unified_features
 from infra.data_integrity_guard import (
     DataIntegrityError,
     validate_entry_market_data_bundle_strict,
@@ -44,6 +69,10 @@ from infra.data_integrity_guard import (
 )
 
 ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 60, "5m": 60, "15m": 60, "1h": 60, "4h": 60}
+
+ORDERFLOW_BLOCK_DELTA_RATIO_PCT: float = 8.0
+OPTIONS_BEARISH_PCR_THRESHOLD: float = 1.20
+OPTIONS_BULLISH_PCR_THRESHOLD: float = 0.83
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +114,64 @@ def _require_int_ms(v: Any, name: str) -> int:
     return iv
 
 
+def _require_nonempty_str(v: Any, name: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        raise RuntimeError(f"{name} must be non-empty string (STRICT)")
+    return s
+
+
+def _normalize_price_location_strict(v: Any) -> str:
+    s = _require_nonempty_str(v, "volume_profile.price_location")
+    allowed = {
+        "above_value_area",
+        "below_value_area",
+        "inside_value_area_above_poc",
+        "inside_value_area_below_poc",
+        "at_poc",
+    }
+    if s not in allowed:
+        raise RuntimeError(f"invalid volume_profile.price_location (STRICT): {s!r}")
+    return s
+
+
+def _normalize_aggression_bias_strict(v: Any) -> str:
+    s = _require_nonempty_str(v, "orderflow_cvd.aggression_bias")
+    allowed = {
+        "aggressive_buy_dominant",
+        "aggressive_sell_dominant",
+        "balanced",
+    }
+    if s not in allowed:
+        raise RuntimeError(f"invalid orderflow_cvd.aggression_bias (STRICT): {s!r}")
+    return s
+
+
+def _normalize_divergence_strict(v: Any) -> str:
+    s = _require_nonempty_str(v, "orderflow_cvd.divergence")
+    allowed = {
+        "bullish_divergence",
+        "bearish_divergence",
+        "none",
+    }
+    if s not in allowed:
+        raise RuntimeError(f"invalid orderflow_cvd.divergence (STRICT): {s!r}")
+    return s
+
+
+def _normalize_options_bias_strict(v: Any) -> str:
+    s = _require_nonempty_str(v, "options_market.options_bias")
+    allowed = {
+        "bullish",
+        "bearish",
+        "neutral",
+        "mixed",
+    }
+    if s not in allowed:
+        raise RuntimeError(f"invalid options_market.options_bias (STRICT): {s!r}")
+    return s
+
+
 def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
     tp = _as_float(getattr(settings, "tp_pct", None), "settings.tp_pct", min_value=0.0, max_value=1.0)
     sl = _as_float(getattr(settings, "sl_pct", None), "settings.sl_pct", min_value=0.0, max_value=1.0)
@@ -102,7 +189,7 @@ def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[fl
     return float(tp), float(sl)
 
 
-def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], settings: Any) -> Dict[str, float]:
+def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], settings: Any) -> Dict[str, float | str]:
     if not isinstance(market_features, dict) or not market_features:
         raise RuntimeError("market_features is required (STRICT)")
 
@@ -131,6 +218,44 @@ def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], setti
         raise RuntimeError("market_features.orderbook.spread_pct is required (STRICT)")
     if "depth_imbalance" not in orderbook:
         raise RuntimeError("market_features.orderbook.depth_imbalance is required (STRICT)")
+
+    volume_profile = market_features.get("volume_profile")
+    if not isinstance(volume_profile, dict) or not volume_profile:
+        raise RuntimeError("market_features.volume_profile is required (STRICT)")
+    if "poc_price" not in volume_profile:
+        raise RuntimeError("market_features.volume_profile.poc_price is required (STRICT)")
+    if "value_area_low" not in volume_profile:
+        raise RuntimeError("market_features.volume_profile.value_area_low is required (STRICT)")
+    if "value_area_high" not in volume_profile:
+        raise RuntimeError("market_features.volume_profile.value_area_high is required (STRICT)")
+    if "poc_distance_bps" not in volume_profile:
+        raise RuntimeError("market_features.volume_profile.poc_distance_bps is required (STRICT)")
+    if "price_location" not in volume_profile:
+        raise RuntimeError("market_features.volume_profile.price_location is required (STRICT)")
+
+    orderflow_cvd = market_features.get("orderflow_cvd")
+    if not isinstance(orderflow_cvd, dict) or not orderflow_cvd:
+        raise RuntimeError("market_features.orderflow_cvd is required (STRICT)")
+    if "delta_ratio_pct" not in orderflow_cvd:
+        raise RuntimeError("market_features.orderflow_cvd.delta_ratio_pct is required (STRICT)")
+    if "aggression_bias" not in orderflow_cvd:
+        raise RuntimeError("market_features.orderflow_cvd.aggression_bias is required (STRICT)")
+    if "divergence" not in orderflow_cvd:
+        raise RuntimeError("market_features.orderflow_cvd.divergence is required (STRICT)")
+    if "cvd" not in orderflow_cvd:
+        raise RuntimeError("market_features.orderflow_cvd.cvd is required (STRICT)")
+    if "price_change_pct" not in orderflow_cvd:
+        raise RuntimeError("market_features.orderflow_cvd.price_change_pct is required (STRICT)")
+
+    options_market = market_features.get("options_market")
+    if not isinstance(options_market, dict) or not options_market:
+        raise RuntimeError("market_features.options_market is required (STRICT)")
+    if "put_call_oi_ratio" not in options_market:
+        raise RuntimeError("market_features.options_market.put_call_oi_ratio is required (STRICT)")
+    if "put_call_volume_ratio" not in options_market:
+        raise RuntimeError("market_features.options_market.put_call_volume_ratio is required (STRICT)")
+    if "options_bias" not in options_market:
+        raise RuntimeError("market_features.options_market.options_bias is required (STRICT)")
 
     total_score_pct = _as_float(
         total.get("score"),
@@ -161,13 +286,130 @@ def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], setti
         min_value=0.0,
     )
 
+    poc_price = _as_float(
+        volume_profile.get("poc_price"),
+        "market_features.volume_profile.poc_price",
+        min_value=0.0,
+    )
+    value_area_low = _as_float(
+        volume_profile.get("value_area_low"),
+        "market_features.volume_profile.value_area_low",
+        min_value=0.0,
+    )
+    value_area_high = _as_float(
+        volume_profile.get("value_area_high"),
+        "market_features.volume_profile.value_area_high",
+        min_value=0.0,
+    )
+    if value_area_high < value_area_low:
+        raise RuntimeError("market_features.volume_profile.value_area_high < value_area_low (STRICT)")
+    poc_distance_bps = _as_float(
+        volume_profile.get("poc_distance_bps"),
+        "market_features.volume_profile.poc_distance_bps",
+    )
+    price_location = _normalize_price_location_strict(volume_profile.get("price_location"))
+
+    delta_ratio_pct = _as_float(
+        orderflow_cvd.get("delta_ratio_pct"),
+        "market_features.orderflow_cvd.delta_ratio_pct",
+    )
+    aggression_bias = _normalize_aggression_bias_strict(orderflow_cvd.get("aggression_bias"))
+    divergence = _normalize_divergence_strict(orderflow_cvd.get("divergence"))
+    cvd = _as_float(
+        orderflow_cvd.get("cvd"),
+        "market_features.orderflow_cvd.cvd",
+    )
+    orderflow_price_change_pct = _as_float(
+        orderflow_cvd.get("price_change_pct"),
+        "market_features.orderflow_cvd.price_change_pct",
+    )
+
+    put_call_oi_ratio = _as_float(
+        options_market.get("put_call_oi_ratio"),
+        "market_features.options_market.put_call_oi_ratio",
+        min_value=0.0,
+    )
+    put_call_volume_ratio = _as_float(
+        options_market.get("put_call_volume_ratio"),
+        "market_features.options_market.put_call_volume_ratio",
+        min_value=0.0,
+    )
+    options_bias = _normalize_options_bias_strict(options_market.get("options_bias"))
+
     return {
         "entry_score": float(total_score_pct) / 100.0,
         "trend_strength": float(trend_strength),
         "spread": float(spread),
         "orderbook_imbalance": float(orderbook_imbalance),
         "entry_score_threshold": float(entry_score_threshold),
+        "poc_price": float(poc_price),
+        "value_area_low": float(value_area_low),
+        "value_area_high": float(value_area_high),
+        "poc_distance_bps": float(poc_distance_bps),
+        "price_location": price_location,
+        "delta_ratio_pct": float(delta_ratio_pct),
+        "aggression_bias": aggression_bias,
+        "divergence": divergence,
+        "cvd": float(cvd),
+        "orderflow_price_change_pct": float(orderflow_price_change_pct),
+        "put_call_oi_ratio": float(put_call_oi_ratio),
+        "put_call_volume_ratio": float(put_call_volume_ratio),
+        "options_bias": options_bias,
     }
+
+
+def _evaluate_structural_entry_conflict_strict(market_data: Dict[str, Any]) -> Optional[str]:
+    direction = str(market_data.get("direction") or "").upper().strip()
+    if direction not in ("LONG", "SHORT"):
+        raise RuntimeError(f"market_data.direction invalid for structural filter (STRICT): {direction!r}")
+
+    price_location = _normalize_price_location_strict(market_data.get("price_location"))
+    delta_ratio_pct = _as_float(
+        market_data.get("delta_ratio_pct"),
+        "market_data.delta_ratio_pct",
+    )
+    aggression_bias = _normalize_aggression_bias_strict(market_data.get("aggression_bias"))
+    divergence = _normalize_divergence_strict(market_data.get("divergence"))
+    options_bias = _normalize_options_bias_strict(market_data.get("options_bias"))
+    put_call_oi_ratio = _as_float(
+        market_data.get("put_call_oi_ratio"),
+        "market_data.put_call_oi_ratio",
+        min_value=0.0,
+    )
+    put_call_volume_ratio = _as_float(
+        market_data.get("put_call_volume_ratio"),
+        "market_data.put_call_volume_ratio",
+        min_value=0.0,
+    )
+
+    if direction == "LONG":
+        if price_location == "below_value_area":
+            return "volume_profile_below_value_area_long_block"
+        if aggression_bias == "aggressive_sell_dominant" and delta_ratio_pct <= -ORDERFLOW_BLOCK_DELTA_RATIO_PCT:
+            return "orderflow_sell_dominant_long_block"
+        if divergence == "bearish_divergence":
+            return "bearish_divergence_long_block"
+        if (
+            options_bias == "bearish"
+            and put_call_oi_ratio >= OPTIONS_BEARISH_PCR_THRESHOLD
+            and put_call_volume_ratio >= OPTIONS_BEARISH_PCR_THRESHOLD
+        ):
+            return "bearish_options_long_block"
+        return None
+
+    if price_location == "above_value_area":
+        return "volume_profile_above_value_area_short_block"
+    if aggression_bias == "aggressive_buy_dominant" and delta_ratio_pct >= ORDERFLOW_BLOCK_DELTA_RATIO_PCT:
+        return "orderflow_buy_dominant_short_block"
+    if divergence == "bullish_divergence":
+        return "bullish_divergence_short_block"
+    if (
+        options_bias == "bullish"
+        and put_call_oi_ratio <= OPTIONS_BULLISH_PCR_THRESHOLD
+        and put_call_volume_ratio <= OPTIONS_BULLISH_PCR_THRESHOLD
+    ):
+        return "bullish_options_short_block"
+    return None
 
 
 def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -> EntryCandidate:
@@ -215,6 +457,33 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -
         min_value=0.0,
     )
 
+    price_location = _normalize_price_location_strict(market_data.get("price_location"))
+    poc_price = _as_float(market_data.get("poc_price"), "market_data.poc_price", min_value=0.0)
+    value_area_low = _as_float(market_data.get("value_area_low"), "market_data.value_area_low", min_value=0.0)
+    value_area_high = _as_float(market_data.get("value_area_high"), "market_data.value_area_high", min_value=0.0)
+    poc_distance_bps = _as_float(market_data.get("poc_distance_bps"), "market_data.poc_distance_bps")
+
+    delta_ratio_pct = _as_float(market_data.get("delta_ratio_pct"), "market_data.delta_ratio_pct")
+    aggression_bias = _normalize_aggression_bias_strict(market_data.get("aggression_bias"))
+    divergence = _normalize_divergence_strict(market_data.get("divergence"))
+    cvd = _as_float(market_data.get("cvd"), "market_data.cvd")
+    orderflow_price_change_pct = _as_float(
+        market_data.get("orderflow_price_change_pct"),
+        "market_data.orderflow_price_change_pct",
+    )
+
+    put_call_oi_ratio = _as_float(
+        market_data.get("put_call_oi_ratio"),
+        "market_data.put_call_oi_ratio",
+        min_value=0.0,
+    )
+    put_call_volume_ratio = _as_float(
+        market_data.get("put_call_volume_ratio"),
+        "market_data.put_call_volume_ratio",
+        min_value=0.0,
+    )
+    options_bias = _normalize_options_bias_strict(market_data.get("options_bias"))
+
     meta = {
         "symbol": symbol,
         "regime": str(market_data.get("regime") or "").strip() or str(market_data.get("signal_source") or "").strip(),
@@ -229,6 +498,19 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -
         "spread": float(spread),
         "orderbook_imbalance": float(orderbook_imbalance),
         "entry_score_threshold": float(entry_score_threshold),
+        "poc_price": float(poc_price),
+        "value_area_low": float(value_area_low),
+        "value_area_high": float(value_area_high),
+        "poc_distance_bps": float(poc_distance_bps),
+        "price_location": price_location,
+        "delta_ratio_pct": float(delta_ratio_pct),
+        "aggression_bias": aggression_bias,
+        "divergence": divergence,
+        "cvd": float(cvd),
+        "orderflow_price_change_pct": float(orderflow_price_change_pct),
+        "put_call_oi_ratio": float(put_call_oi_ratio),
+        "put_call_volume_ratio": float(put_call_volume_ratio),
+        "options_bias": options_bias,
     }
 
     return EntryCandidate(
@@ -406,7 +688,34 @@ def _build_entry_market_data(
         "spread": float(decision_meta["spread"]),
         "orderbook_imbalance": float(decision_meta["orderbook_imbalance"]),
         "entry_score_threshold": float(decision_meta["entry_score_threshold"]),
+        "poc_price": float(decision_meta["poc_price"]),
+        "value_area_low": float(decision_meta["value_area_low"]),
+        "value_area_high": float(decision_meta["value_area_high"]),
+        "poc_distance_bps": float(decision_meta["poc_distance_bps"]),
+        "price_location": str(decision_meta["price_location"]),
+        "delta_ratio_pct": float(decision_meta["delta_ratio_pct"]),
+        "aggression_bias": str(decision_meta["aggression_bias"]),
+        "divergence": str(decision_meta["divergence"]),
+        "cvd": float(decision_meta["cvd"]),
+        "orderflow_price_change_pct": float(decision_meta["orderflow_price_change_pct"]),
+        "put_call_oi_ratio": float(decision_meta["put_call_oi_ratio"]),
+        "put_call_volume_ratio": float(decision_meta["put_call_volume_ratio"]),
+        "options_bias": str(decision_meta["options_bias"]),
     }
+
+    structural_block_reason = _evaluate_structural_entry_conflict_strict(out)
+    if structural_block_reason is not None:
+        msg = f"[SKIP][STRUCTURE_FILTER] entry blocked: {symbol} ({direction}) reason={structural_block_reason}"
+        log_fn(msg)
+        notify_entry_block_fn(f"STRUCTURE_FILTER:{symbol}:{structural_block_reason}", msg, 60)
+        return None
 
     validate_entry_market_data_bundle_strict(out)
     return out
+
+
+__all__ = [
+    "EntryCandidate",
+    "_build_entry_market_data",
+    "_decide_entry_candidate_strict",
+]

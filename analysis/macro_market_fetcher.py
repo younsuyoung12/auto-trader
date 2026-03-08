@@ -22,12 +22,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 1) 신규 생성
 2) Alpha Vantage GLOBAL_QUOTE 기반 cross-asset macro fetcher 추가
 3) SPY / QQQ / GLD / UUP 해석 로직 추가
+
+2026-03-08 (PATCH 2)
+1) FIX(TRADE-GRADE): Alpha Vantage 무료 키 burst limit 대응 pacing 추가
+2) GLOBAL_QUOTE 각 요청 전 최소 간격 sleep 강제
+3) "1 request per second" 제한 위반 가능성 제거
+4) 일일 quota(25/day) 초과는 기존대로 즉시 예외 전파
 ========================================================
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping
@@ -39,6 +46,7 @@ from settings import SETTINGS
 logger = logging.getLogger(__name__)
 
 _ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+_ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC = 1.25
 _MACRO_SYMBOLS = ("SPY", "QQQ", "GLD", "UUP")
 
 
@@ -142,6 +150,8 @@ class MacroMarketFetcher:
         return result
 
     def _fetch_global_quote(self, symbol: str) -> MacroAssetQuote:
+        self._sleep_before_alpha_vantage_request(symbol)
+
         response = self._session.get(
             _ALPHA_VANTAGE_BASE_URL,
             params={
@@ -190,6 +200,16 @@ class MacroMarketFetcher:
             change_pct=change_pct,
             latest_trading_day=latest_trading_day,
         )
+
+    def _sleep_before_alpha_vantage_request(self, symbol: str) -> None:
+        if _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC <= 0:
+            raise RuntimeError("Invalid Alpha Vantage request interval")
+        logger.info(
+            "Alpha Vantage pacing sleep before GLOBAL_QUOTE: symbol=%s sleep_sec=%.2f",
+            symbol,
+            _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC,
+        )
+        time.sleep(_ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC)
 
     def _classify_risk_regime(self, *, spy: MacroAssetQuote, qqq: MacroAssetQuote) -> str:
         if spy.change_pct > Decimal("0") and qqq.change_pct > Decimal("0"):
@@ -251,8 +271,6 @@ class MacroMarketFetcher:
         }
 
     def _now_ms(self) -> int:
-        import time
-
         return int(time.time() * 1000)
 
     def _to_decimal(self, value: Any, field_name: str) -> Decimal:
