@@ -74,6 +74,12 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
      - force_close_on_desync=True 이면 강제청산 제출 후 종료
   3) 보호주문/포지션 상태 오판 방지
      - 실제 거래소 포지션이 열려 있는 경우에만 보호주문 누락을 치명으로 판정
+
+- 2026-03-08 (TRADE-GRADE PATCH 2):
+  1) FIX(ROOT-CAUSE): 고정 10초 warmup 제거 → 실제 WS 준비 완료 게이트 추가
+  2) FIX(STRICT): entry required klines 최소 길이를 downstream EMA200 요구량과 정합화
+  3) FIX(BOOT): ws_backfill_limit가 부족해도 필수 최소 길이 이상으로 부팅 backfill 강제
+  4) FIX(STARTUP): market data ready 확인 후 health monitor 시작
 ============================================================
 """
 
@@ -166,7 +172,13 @@ START_TS: float = time.time()
 RUNNING: bool = True
 
 ENTRY_REQUIRED_TFS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
-ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 60, "5m": 60, "15m": 60, "1h": 60, "4h": 60}
+ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {
+    "1m": 120,
+    "5m": 200,
+    "15m": 200,
+    "1h": 200,
+    "4h": 200,
+}
 
 _LAST_ENTRY_BLOCK_TG_TS: float = 0.0
 _LAST_ENTRY_BLOCK_KEY: str = ""
@@ -303,6 +315,10 @@ def _verify_ws_boot_configuration_or_die() -> None:
     ws_backfill_tfs = _parse_tfs(SET.ws_backfill_tfs)
     _verify_required_tfs_or_die("ws_backfill_tfs", ws_backfill_tfs, ENTRY_REQUIRED_TFS)
 
+    backfill_limit = int(SET.ws_backfill_limit)
+    if backfill_limit <= 0:
+        raise RuntimeError("settings.ws_backfill_limit must be > 0 (STRICT)")
+
 
 def _maybe_send_entry_block_tg(key: str, msg: str, cooldown_sec: int = 60) -> None:
     global _LAST_ENTRY_BLOCK_TG_TS, _LAST_ENTRY_BLOCK_KEY
@@ -381,6 +397,58 @@ def _wait_account_ws_ready_or_raise(timeout_sec: float) -> None:
                 f"running={st.get('running')} connected={st.get('connected')} listen_key_active={st.get('listen_key_active')}"
             )
         time.sleep(0.5)
+
+
+def _wait_market_ws_ready_or_raise(symbol: str, timeout_sec: float) -> None:
+    timeout_f = float(timeout_sec)
+    if not math.isfinite(timeout_f) or timeout_f <= 0:
+        raise RuntimeError("market ws ready timeout must be finite > 0 (STRICT)")
+
+    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
+    if not sym:
+        raise RuntimeError("symbol is empty for market ws ready wait (STRICT)")
+
+    deadline = time.time() + timeout_f
+    last_progress_log_ts = 0.0
+
+    while True:
+        missing: List[str] = []
+
+        for iv in ENTRY_REQUIRED_TFS:
+            min_needed = ENTRY_REQUIRED_KLINES_MIN[iv]
+            buf = ws_get_klines_with_volume(sym, iv, limit=min_needed)
+            if not isinstance(buf, list):
+                raise RuntimeError(f"ws_get_klines_with_volume returned non-list (STRICT): interval={iv}")
+            got = len(buf)
+            if got < min_needed:
+                missing.append(f"{iv}:{got}/{min_needed}")
+
+        ob = ws_get_orderbook(sym, limit=1)
+        if not isinstance(ob, dict) or not ob:
+            missing.append("orderbook:missing")
+        else:
+            bids = ob.get("bids")
+            asks = ob.get("asks")
+            if not isinstance(bids, list) or not bids:
+                missing.append("orderbook:bids_empty")
+            if not isinstance(asks, list) or not asks:
+                missing.append("orderbook:asks_empty")
+
+        if not missing:
+            log(f"[BOOT] market ws ready: symbol={sym} requirements={ENTRY_REQUIRED_KLINES_MIN}")
+            return
+
+        now = time.time()
+        if now >= deadline:
+            raise RuntimeError(
+                f"market ws not ready within deadline (STRICT): symbol={sym} missing={missing}"
+            )
+
+        if (now - last_progress_log_ts) >= 5.0:
+            last_progress_log_ts = now
+            log(f"[BOOT] waiting market ws ready: symbol={sym} missing={missing}")
+
+        interruptible_sleep(0.25, tick=0.25)
 
 
 def _account_ws_connected_guard_or_raise() -> None:
@@ -783,14 +851,18 @@ def _backfill_ws_kline_history(symbol: str) -> None:
     intervals = _parse_tfs(SET.ws_backfill_tfs)
     _verify_required_tfs_or_die("ws_backfill_tfs", intervals, ENTRY_REQUIRED_TFS)
 
-    limit = int(SET.ws_backfill_limit)
+    configured_limit = int(SET.ws_backfill_limit)
 
     for iv in intervals:
         min_needed = ENTRY_REQUIRED_KLINES_MIN.get(iv, 1)
-        log(f"[BOOT] REST backfill start: symbol={symbol} interval={iv} limit={limit}")
+        fetch_limit = max(configured_limit, min_needed)
+        log(
+            f"[BOOT] REST backfill start: symbol={symbol} interval={iv} "
+            f"configured_limit={configured_limit} fetch_limit={fetch_limit} need={min_needed}"
+        )
 
         try:
-            rest_rows = fetch_klines_rest(symbol, iv, limit=limit)
+            rest_rows = fetch_klines_rest(symbol, iv, limit=fetch_limit)
         except KlineRestError as e:
             raise RuntimeError(f"REST backfill failed: symbol={symbol} interval={iv} err={e}") from e
 
@@ -1053,10 +1125,10 @@ def main() -> None:
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
 
-        log("[BOOT] warmup: waiting 10s before enabling data health gate...")
-        interruptible_sleep(10)
+        market_ws_ready_timeout_sec = max(30.0, float(SET.ws_klines_stale_sec))
+        _wait_market_ws_ready_or_raise(SET.symbol, market_ws_ready_timeout_sec)
+
         start_health_monitor()
-        interruptible_sleep(2)
 
         last_1m = ws_get_klines_with_volume(SET.symbol, "1m", limit=1)
         if last_1m:

@@ -50,6 +50,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - bootstrap 실패 시 WS 시작하지 않고 즉시 예외
   2) 중복 WS 시작 방지:
      - 동일 symbol 에 대해 start_ws_loop 중복 호출 차단
+- 2026-03-08 (TRADE-GRADE PATCH 2):
+  1) FIX(ROOT-CAUSE): downstream EMA200 요구량과 WS bootstrap/min-buffer 정책 정합화
+  2) FIX(STRICT): 5m / 15m / 1h / 4h interval에 최소 200개 캔들 강제
+  3) FIX(COMPAT): legacy get_klines() limit 미지정 시 지표 계산에 충분한 길이 반환
+  4) FIX(VALIDATION): MAX_KLINES 용량이 strict 최소 요구량보다 작으면 즉시 예외
 ========================================================
 """
 
@@ -58,7 +63,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import requests
 import websocket  # pip install websocket-client
@@ -183,6 +188,20 @@ def _require_positive_float(v: Any, name: str) -> float:
     return float(fv)
 
 
+def _require_interval_min_buffer_mapping(v: Any, name: str) -> Dict[str, int]:
+    if v is None:
+        return {}
+    if not isinstance(v, Mapping):
+        raise RuntimeError(f"{name} must be mapping[str,int] (STRICT)")
+    out: Dict[str, int] = {}
+    for raw_iv, raw_min in v.items():
+        iv = _normalize_interval(raw_iv)
+        if not iv:
+            raise RuntimeError(f"{name} contains empty/invalid interval key (STRICT)")
+        out[iv] = _require_positive_int(raw_min, f"{name}[{iv}]")
+    return out
+
+
 # ─────────────────────────────────────────────
 # Streams / URL (SSOT)
 # ─────────────────────────────────────────────
@@ -232,11 +251,38 @@ _WS_BOOTSTRAP_REST_ENABLED: bool = bool(getattr(SET, "ws_bootstrap_rest_enabled"
 _WS_REST_TIMEOUT_SEC: float = _require_positive_float(getattr(SET, "ws_rest_timeout_sec", 10.0), "ws_rest_timeout_sec")
 _WS_REST_KLINES_LIMIT_CAP: int = 1500
 
-KLINE_MIN_BUFFER: int = int(getattr(SET, "ws_min_kline_buffer", 120))
-KLINE_MAX_DELAY_SEC: float = float(getattr(SET, "ws_max_kline_delay_sec", 120.0))
-ORDERBOOK_MAX_DELAY_SEC: float = float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0))
+KLINE_MIN_BUFFER: int = _require_positive_int(getattr(SET, "ws_min_kline_buffer", 120), "ws_min_kline_buffer")
+KLINE_MAX_DELAY_SEC: float = _require_positive_float(getattr(SET, "ws_max_kline_delay_sec", 120.0), "ws_max_kline_delay_sec")
+ORDERBOOK_MAX_DELAY_SEC: float = _require_positive_float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0), "ws_orderbook_max_delay_sec")
 
-_LONG_TF_MIN_BUFFER_DEFAULT: int = int(getattr(SET, "ws_min_kline_buffer_long_tf", 2))
+_LONG_TF_MIN_BUFFER_DEFAULT: int = _require_positive_int(
+    getattr(SET, "ws_min_kline_buffer_long_tf", 2),
+    "ws_min_kline_buffer_long_tf",
+)
+
+# downstream regime/feature layer의 EMA200 요구량과 정합화하는 strict 최소 버퍼
+_BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = {
+    "5m": 200,
+    "15m": 200,
+    "1h": 200,
+    "4h": 200,
+}
+
+_SETTINGS_INTERVAL_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = _require_interval_min_buffer_mapping(
+    getattr(SET, "ws_min_kline_buffer_by_interval", None),
+    "ws_min_kline_buffer_by_interval",
+)
+
+_EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = dict(_BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL)
+for _iv, _min_buf in _SETTINGS_INTERVAL_MIN_BUFFER_BY_INTERVAL.items():
+    builtin_floor = _BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL.get(_iv)
+    if builtin_floor is not None and _min_buf < builtin_floor:
+        raise RuntimeError(
+            f"ws_min_kline_buffer_by_interval[{_iv}]={_min_buf} violates strict downstream requirement "
+            f"(need>={builtin_floor})"
+        )
+    prev = _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.get(_iv)
+    _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL[_iv] = max(_min_buf, prev or 0)
 
 _HEALTH_FAIL_LOG_SUPPRESS_SEC: float = float(getattr(SET, "ws_health_fail_log_suppress_sec", 10.0))
 _last_health_fail_log_ts: float = 0.0
@@ -259,6 +305,14 @@ _orderbook_lock = threading.Lock()
 
 MAX_KLINES = 500
 
+_max_required_buffer = max(
+    [KLINE_MIN_BUFFER, _LONG_TF_MIN_BUFFER_DEFAULT, *_EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.values()]
+)
+if MAX_KLINES < _max_required_buffer:
+    raise RuntimeError(
+        f"MAX_KLINES({MAX_KLINES}) must be >= strict required min buffer ({_max_required_buffer})"
+    )
+
 _NO_BUF_LOG_SUPPRESS_SEC: float = float(getattr(SET, "ws_no_buffer_log_suppress_sec", 30.0))
 _no_buf_log_last: Dict[Tuple[str, str], float] = {}
 _no_buf_log_lock = threading.Lock()
@@ -275,9 +329,19 @@ def _min_buffer_for_interval(iv: str) -> int:
     s = _normalize_interval(iv)
     if not s:
         return max(1, KLINE_MIN_BUFFER)
+
+    strict_min = _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.get(s)
+
     if s.endswith("d") or s.endswith("w") or s.endswith("M"):
-        return max(1, _LONG_TF_MIN_BUFFER_DEFAULT)
-    return max(1, KLINE_MIN_BUFFER)
+        base = max(1, _LONG_TF_MIN_BUFFER_DEFAULT)
+        if strict_min is not None:
+            return max(base, strict_min)
+        return base
+
+    base = max(1, KLINE_MIN_BUFFER)
+    if strict_min is not None:
+        return max(base, strict_min)
+    return base
 
 
 def _build_stream_names(symbol: str) -> List[str]:
@@ -731,8 +795,14 @@ def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List
 
 
 # 레거시 호환: (ts,o,h,l,c)
-def get_klines(symbol: str, interval: str, limit: int = 120) -> List[Tuple[int, float, float, float, float]]:
-    rows = get_klines_with_volume(symbol, interval, limit=limit)
+def get_klines(symbol: str, interval: str, limit: Optional[int] = None) -> List[Tuple[int, float, float, float, float]]:
+    if limit is None:
+        normalized_limit = max(300, _min_buffer_for_interval(interval))
+    else:
+        if limit <= 0:
+            raise ValueError("limit must be > 0")
+        normalized_limit = limit
+    rows = get_klines_with_volume(symbol, interval, limit=normalized_limit)
     return [(ts, o, h, l, c) for (ts, o, h, l, c, v) in rows]
 
 

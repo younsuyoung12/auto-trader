@@ -28,12 +28,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2) GLOBAL_QUOTE 각 요청 전 최소 간격 sleep 강제
 3) "1 request per second" 제한 위반 가능성 제거
 4) 일일 quota(25/day) 초과는 기존대로 즉시 예외 전파
+
+2026-03-08 (PATCH 3)
+1) FIX(ROOT-CAUSE): 프로세스 내 macro snapshot cache 추가
+2) FIX(TRADE-GRADE): 4-symbol 구조와 Alpha Vantage 무료 quota(25/day) 정합화
+3) FIX(CONCURRENCY): 동시 호출 시 중복 외부 요청 방지 lock 추가
+4) FIX(STRICT): stale cache fallback 금지, TTL 만료 후 fetch 실패 시 즉시 예외 전파
 ========================================================
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -47,7 +54,9 @@ logger = logging.getLogger(__name__)
 
 _ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC = 1.25
+_ALPHA_VANTAGE_FREE_DAILY_REQUEST_LIMIT = 25
 _MACRO_SYMBOLS = ("SPY", "QQQ", "GLD", "UUP")
+_SECONDS_PER_DAY = 86400
 
 
 @dataclass(frozen=True)
@@ -84,73 +93,129 @@ class MacroMarketFetcher:
     def __init__(self) -> None:
         self._timeout_sec = self._require_float_setting("ANALYST_HTTP_TIMEOUT_SEC")
         self._api_key = self._require_alpha_vantage_api_key()
+        self._cache_ttl_sec = self._build_required_cache_ttl_sec()
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "auto-trader/macro-market-fetcher"})
 
-    def fetch(self) -> MacroMarketSnapshot:
-        quotes = {symbol: self._fetch_global_quote(symbol) for symbol in _MACRO_SYMBOLS}
-
-        spy = quotes["SPY"]
-        qqq = quotes["QQQ"]
-        gld = quotes["GLD"]
-        uup = quotes["UUP"]
-
-        risk_regime = self._classify_risk_regime(spy=spy, qqq=qqq)
-        usd_regime = self._classify_usd_regime(uup=uup)
-        cross_asset_bias = self._classify_cross_asset_bias(
-            risk_regime=risk_regime,
-            usd_regime=usd_regime,
-            gld=gld,
-        )
-        key_signals = self._build_key_signals(
-            risk_regime=risk_regime,
-            usd_regime=usd_regime,
-            cross_asset_bias=cross_asset_bias,
-            spy=spy,
-            qqq=qqq,
-            gld=gld,
-            uup=uup,
-        )
-
-        as_of_ms = self._now_ms()
-        dashboard_payload = {
-            "as_of_ms": as_of_ms,
-            "risk_regime": risk_regime,
-            "usd_regime": usd_regime,
-            "cross_asset_bias": cross_asset_bias,
-            "assets": {
-                "SPY": self._quote_to_payload(spy),
-                "QQQ": self._quote_to_payload(qqq),
-                "GLD": self._quote_to_payload(gld),
-                "UUP": self._quote_to_payload(uup),
-            },
-            "key_signals": list(key_signals),
-        }
-
-        result = MacroMarketSnapshot(
-            as_of_ms=as_of_ms,
-            risk_regime=risk_regime,
-            usd_regime=usd_regime,
-            cross_asset_bias=cross_asset_bias,
-            spy=spy,
-            qqq=qqq,
-            gld=gld,
-            uup=uup,
-            key_signals=key_signals,
-            dashboard_payload=dashboard_payload,
-        )
+        self._state_lock = threading.RLock()
+        self._cached_snapshot: MacroMarketSnapshot | None = None
+        self._cached_snapshot_fetched_monotonic: float | None = None
+        self._last_alpha_vantage_request_monotonic: float | None = None
 
         logger.info(
-            "Macro market snapshot fetched: risk_regime=%s usd_regime=%s bias=%s",
-            result.risk_regime,
-            result.usd_regime,
-            result.cross_asset_bias,
+            "MacroMarketFetcher initialized: symbols=%s cache_ttl_sec=%s min_request_interval_sec=%.2f",
+            ",".join(_MACRO_SYMBOLS),
+            self._cache_ttl_sec,
+            _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC,
         )
-        return result
 
-    def _fetch_global_quote(self, symbol: str) -> MacroAssetQuote:
-        self._sleep_before_alpha_vantage_request(symbol)
+    def fetch(self) -> MacroMarketSnapshot:
+        with self._state_lock:
+            cached = self._get_fresh_cached_snapshot_locked()
+            if cached is not None:
+                age_sec = self._get_cached_snapshot_age_sec_locked()
+                if age_sec is None:
+                    raise RuntimeError("Cached macro snapshot age missing")
+                logger.info(
+                    "Macro market snapshot served from cache: age_sec=%.2f ttl_sec=%d",
+                    age_sec,
+                    self._cache_ttl_sec,
+                )
+                return cached
+
+            quotes = {symbol: self._fetch_global_quote_locked(symbol) for symbol in _MACRO_SYMBOLS}
+
+            spy = quotes["SPY"]
+            qqq = quotes["QQQ"]
+            gld = quotes["GLD"]
+            uup = quotes["UUP"]
+
+            risk_regime = self._classify_risk_regime(spy=spy, qqq=qqq)
+            usd_regime = self._classify_usd_regime(uup=uup)
+            cross_asset_bias = self._classify_cross_asset_bias(
+                risk_regime=risk_regime,
+                usd_regime=usd_regime,
+                gld=gld,
+            )
+            key_signals = self._build_key_signals(
+                risk_regime=risk_regime,
+                usd_regime=usd_regime,
+                cross_asset_bias=cross_asset_bias,
+                spy=spy,
+                qqq=qqq,
+                gld=gld,
+                uup=uup,
+            )
+
+            as_of_ms = self._now_ms()
+            dashboard_payload = {
+                "as_of_ms": as_of_ms,
+                "risk_regime": risk_regime,
+                "usd_regime": usd_regime,
+                "cross_asset_bias": cross_asset_bias,
+                "assets": {
+                    "SPY": self._quote_to_payload(spy),
+                    "QQQ": self._quote_to_payload(qqq),
+                    "GLD": self._quote_to_payload(gld),
+                    "UUP": self._quote_to_payload(uup),
+                },
+                "key_signals": list(key_signals),
+            }
+
+            result = MacroMarketSnapshot(
+                as_of_ms=as_of_ms,
+                risk_regime=risk_regime,
+                usd_regime=usd_regime,
+                cross_asset_bias=cross_asset_bias,
+                spy=spy,
+                qqq=qqq,
+                gld=gld,
+                uup=uup,
+                key_signals=key_signals,
+                dashboard_payload=dashboard_payload,
+            )
+
+            self._cached_snapshot = result
+            self._cached_snapshot_fetched_monotonic = time.monotonic()
+
+            logger.info(
+                "Macro market snapshot fetched from Alpha Vantage: risk_regime=%s usd_regime=%s bias=%s cache_ttl_sec=%d",
+                result.risk_regime,
+                result.usd_regime,
+                result.cross_asset_bias,
+                self._cache_ttl_sec,
+            )
+            return result
+
+    def _get_fresh_cached_snapshot_locked(self) -> MacroMarketSnapshot | None:
+        if self._cached_snapshot is None:
+            return None
+        if self._cached_snapshot_fetched_monotonic is None:
+            raise RuntimeError("Cached macro snapshot timestamp missing")
+
+        age_sec = time.monotonic() - self._cached_snapshot_fetched_monotonic
+        if age_sec < 0:
+            raise RuntimeError("Cached macro snapshot age must not be negative")
+        if age_sec >= self._cache_ttl_sec:
+            logger.info(
+                "Macro market snapshot cache expired: age_sec=%.2f ttl_sec=%d",
+                age_sec,
+                self._cache_ttl_sec,
+            )
+            return None
+        return self._cached_snapshot
+
+    def _get_cached_snapshot_age_sec_locked(self) -> float | None:
+        if self._cached_snapshot_fetched_monotonic is None:
+            return None
+        age_sec = time.monotonic() - self._cached_snapshot_fetched_monotonic
+        if age_sec < 0:
+            raise RuntimeError("Cached macro snapshot age must not be negative")
+        return age_sec
+
+    def _fetch_global_quote_locked(self, symbol: str) -> MacroAssetQuote:
+        self._sleep_before_alpha_vantage_request_locked(symbol)
 
         response = self._session.get(
             _ALPHA_VANTAGE_BASE_URL,
@@ -161,6 +226,8 @@ class MacroMarketFetcher:
             },
             timeout=self._timeout_sec,
         )
+        self._last_alpha_vantage_request_monotonic = time.monotonic()
+
         if response.status_code != 200:
             raise RuntimeError(f"Alpha Vantage macro request failed: symbol={symbol}, status={response.status_code}")
 
@@ -201,15 +268,58 @@ class MacroMarketFetcher:
             latest_trading_day=latest_trading_day,
         )
 
-    def _sleep_before_alpha_vantage_request(self, symbol: str) -> None:
+    def _sleep_before_alpha_vantage_request_locked(self, symbol: str) -> None:
         if _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC <= 0:
             raise RuntimeError("Invalid Alpha Vantage request interval")
+
+        if self._last_alpha_vantage_request_monotonic is None:
+            logger.info(
+                "Alpha Vantage pacing skip (first request): symbol=%s",
+                symbol,
+            )
+            return
+
+        elapsed_sec = time.monotonic() - self._last_alpha_vantage_request_monotonic
+        if elapsed_sec < 0:
+            raise RuntimeError("Alpha Vantage request elapsed time must not be negative")
+
+        remain_sec = _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC - elapsed_sec
+        if remain_sec <= 0:
+            logger.info(
+                "Alpha Vantage pacing skip: symbol=%s elapsed_sec=%.4f min_interval_sec=%.2f",
+                symbol,
+                elapsed_sec,
+                _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC,
+            )
+            return
+
         logger.info(
-            "Alpha Vantage pacing sleep before GLOBAL_QUOTE: symbol=%s sleep_sec=%.2f",
+            "Alpha Vantage pacing sleep before GLOBAL_QUOTE: symbol=%s sleep_sec=%.4f",
             symbol,
-            _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC,
+            remain_sec,
         )
-        time.sleep(_ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC)
+        time.sleep(remain_sec)
+
+    def _build_required_cache_ttl_sec(self) -> int:
+        symbol_count = len(_MACRO_SYMBOLS)
+        if symbol_count <= 0:
+            raise RuntimeError("Macro symbols must not be empty")
+        if _ALPHA_VANTAGE_FREE_DAILY_REQUEST_LIMIT <= 0:
+            raise RuntimeError("Alpha Vantage daily request limit must be positive")
+
+        snapshots_per_day = _ALPHA_VANTAGE_FREE_DAILY_REQUEST_LIMIT // symbol_count
+        if snapshots_per_day <= 0:
+            raise RuntimeError(
+                "Alpha Vantage daily request limit is insufficient for configured macro symbols"
+            )
+
+        ttl_sec = _SECONDS_PER_DAY // snapshots_per_day
+        if ttl_sec * snapshots_per_day < _SECONDS_PER_DAY:
+            ttl_sec += 1
+        if ttl_sec <= 0:
+            raise RuntimeError("Computed macro snapshot cache TTL must be positive")
+
+        return ttl_sec
 
     def _classify_risk_regime(self, *, spy: MacroAssetQuote, qqq: MacroAssetQuote) -> str:
         if spy.change_pct > Decimal("0") and qqq.change_pct > Decimal("0"):
