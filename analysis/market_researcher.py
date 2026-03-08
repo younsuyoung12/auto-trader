@@ -65,6 +65,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 2) sync_once 예외가 발생해도 worker thread가 종료되지 않도록 logger.exception 후 재시도
 3) 예외를 조용히 삼키지 않고 전체 traceback 로그를 남긴다
 4) retry sleep은 과도한 재시도를 막기 위해 5~300초 범위로 제한
+
+2026-03-08 (PATCH 6)
+1) FIX(ROOT-CAUSE): 저빈도 외부 인텔리전스(뉴스/거시/심리/온체인/옵션/파생) 재호출 구조를
+   source별 refresh/freshness 계약 기반 캐시 구조로 변경
+2) FIX(TRADE-GRADE): 최근 성공 스냅샷이 freshness 계약 안에 있을 때만 재사용
+   (임의 데이터 생성/조작 없음)
+3) FIX(RATE-LIMIT): Alpha Vantage daily quota 초과 시 다음 UTC 00:00까지
+   worker retry를 장주기 sleep으로 승격
+4) 기존 리포트/DB 적재/핵심 계산 구조 삭제 없음
 ========================================================
 """
 
@@ -74,9 +83,10 @@ import logging
 import math
 import time
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from statistics import pstdev
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import text
 
@@ -99,6 +109,36 @@ from settings import SETTINGS
 from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
+
+_EXTERNAL_SOURCE_POLICY: Dict[str, Dict[str, int]] = {
+    # 실시간성은 높지만 초단위는 불필요
+    "derivatives": {"refresh_sec": 300, "max_age_sec": 1800},
+    # 뉴스는 저빈도 소스. AlphaVantage 무료 quota(25/day) 정합
+    "news": {"refresh_sec": 3600, "max_age_sec": 86400},
+    # 거시 데이터는 더 저빈도
+    "macro": {"refresh_sec": 14400, "max_age_sec": 86400},
+    # 심리/온체인/옵션은 중저빈도
+    "sentiment": {"refresh_sec": 1800, "max_age_sec": 21600},
+    "onchain": {"refresh_sec": 1800, "max_age_sec": 21600},
+    "options": {"refresh_sec": 1800, "max_age_sec": 21600},
+}
+
+
+@dataclass(frozen=True)
+class ExternalSnapshotState:
+    name: str
+    refresh_sec: int
+    max_age_sec: int
+    snapshot: Any = None
+    last_success_ts: Optional[float] = None
+
+    def age_sec(self, now_ts: float) -> Optional[float]:
+        if self.last_success_ts is None:
+            return None
+        age = now_ts - self.last_success_ts
+        if age < 0:
+            raise RuntimeError(f"snapshot age became negative: source={self.name}")
+        return age
 
 
 @dataclass(frozen=True)
@@ -253,6 +293,8 @@ class MarketResearcher:
         self._last_force_orders_status: str = "unknown"
         self._last_force_orders_reason: Optional[str] = None
 
+        self._external_states: Dict[str, ExternalSnapshotState] = self._build_external_states_or_raise()
+
         if self._worker_interval_sec <= 0:
             raise RuntimeError("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC must be > 0")
         if self._kline_limit <= 0:
@@ -276,14 +318,34 @@ class MarketResearcher:
 
     def run(self) -> MarketResearchReport:
         snapshot = self._fetch_market_snapshot_strict()
-        derivatives_snapshot = self._derivatives_fetcher.fetch()
-        news_snapshot = self._news_fetcher.fetch()
-        macro_snapshot = self._macro_fetcher.fetch()
-        sentiment_snapshot = self._sentiment_fetcher.fetch()
-        onchain_snapshot = self._onchain_fetcher.fetch()
+
+        derivatives_snapshot = self._get_external_snapshot_strict(
+            source_name="derivatives",
+            fetch_fn=self._derivatives_fetcher.fetch,
+        )
+        news_snapshot = self._get_external_snapshot_strict(
+            source_name="news",
+            fetch_fn=self._news_fetcher.fetch,
+        )
+        macro_snapshot = self._get_external_snapshot_strict(
+            source_name="macro",
+            fetch_fn=self._macro_fetcher.fetch,
+        )
+        sentiment_snapshot = self._get_external_snapshot_strict(
+            source_name="sentiment",
+            fetch_fn=self._sentiment_fetcher.fetch,
+        )
+        onchain_snapshot = self._get_external_snapshot_strict(
+            source_name="onchain",
+            fetch_fn=self._onchain_fetcher.fetch,
+        )
+        options_snapshot = self._get_external_snapshot_strict(
+            source_name="options",
+            fetch_fn=self._options_fetcher.fetch,
+        )
+
         volume_profile_report = self._build_volume_profile_report_or_raise(snapshot.klines)
         orderflow_report = self._build_orderflow_report_or_raise()
-        options_snapshot = self._options_fetcher.fetch()
 
         report = self._build_report(
             snapshot=snapshot,
@@ -360,8 +422,8 @@ class MarketResearcher:
             t0 = time.time()
             try:
                 self.sync_once()
-            except Exception:
-                retry_sleep_sec = max(5, min(int(self._worker_interval_sec), 300))
+            except Exception as exc:
+                retry_sleep_sec = self._determine_retry_sleep_sec(exc)
                 logger.exception(
                     "Market research worker loop failed: symbol=%s timeframe=%s retry_sleep_sec=%s",
                     self._symbol,
@@ -375,6 +437,116 @@ class MarketResearcher:
             sleep_sec = self._worker_interval_sec - elapsed
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
+
+    # ========================================================
+    # External intelligence freshness contract
+    # ========================================================
+
+    def _build_external_states_or_raise(self) -> Dict[str, ExternalSnapshotState]:
+        states: Dict[str, ExternalSnapshotState] = {}
+        for source_name, policy in _EXTERNAL_SOURCE_POLICY.items():
+            refresh_sec = int(policy.get("refresh_sec", 0))
+            max_age_sec = int(policy.get("max_age_sec", 0))
+            if refresh_sec <= 0:
+                raise RuntimeError(f"external source refresh_sec must be > 0: source={source_name}")
+            if max_age_sec < refresh_sec:
+                raise RuntimeError(
+                    f"external source max_age_sec must be >= refresh_sec: source={source_name}"
+                )
+            states[source_name] = ExternalSnapshotState(
+                name=source_name,
+                refresh_sec=refresh_sec,
+                max_age_sec=max_age_sec,
+            )
+        return states
+
+    def _get_external_snapshot_strict(
+        self,
+        *,
+        source_name: str,
+        fetch_fn: Callable[[], Any],
+    ) -> Any:
+        if source_name not in self._external_states:
+            raise RuntimeError(f"unknown external source state: {source_name}")
+
+        state = self._external_states[source_name]
+        now_ts = time.time()
+        age_sec = state.age_sec(now_ts)
+
+        # refresh 주기 이전이면 기존 snapshot 재사용 (계약된 기본 동작)
+        if state.snapshot is not None and age_sec is not None and age_sec < float(state.refresh_sec):
+            logger.info(
+                "External intelligence snapshot reused within refresh window: source=%s age_sec=%.2f refresh_sec=%s",
+                source_name,
+                age_sec,
+                state.refresh_sec,
+            )
+            return state.snapshot
+
+        try:
+            snapshot = fetch_fn()
+        except Exception as exc:
+            if state.snapshot is not None and age_sec is not None and age_sec <= float(state.max_age_sec):
+                logger.warning(
+                    "External intelligence refresh failed but cached snapshot remains within freshness contract: "
+                    "source=%s age_sec=%.2f max_age_sec=%s error=%s",
+                    source_name,
+                    age_sec,
+                    state.max_age_sec,
+                    exc,
+                )
+                return state.snapshot
+            raise
+
+        self._external_states[source_name] = ExternalSnapshotState(
+            name=state.name,
+            refresh_sec=state.refresh_sec,
+            max_age_sec=state.max_age_sec,
+            snapshot=snapshot,
+            last_success_ts=now_ts,
+        )
+        logger.info(
+            "External intelligence snapshot refreshed: source=%s refresh_sec=%s max_age_sec=%s",
+            source_name,
+            state.refresh_sec,
+            state.max_age_sec,
+        )
+        return snapshot
+
+    def _determine_retry_sleep_sec(self, exc: Exception) -> int:
+        message = f"{type(exc).__name__}: {exc}"
+
+        if self._is_alpha_vantage_daily_quota_error(message):
+            retry_sec = self._seconds_until_next_utc_reset()
+            if retry_sec <= 0:
+                raise RuntimeError("computed retry_sec must be > 0 for Alpha Vantage quota lockout")
+            logger.warning(
+                "Alpha Vantage daily quota detected. Market research worker will sleep until next UTC reset: retry_sec=%s",
+                retry_sec,
+            )
+            return retry_sec
+
+        return max(5, min(int(self._worker_interval_sec), 300))
+
+    def _is_alpha_vantage_daily_quota_error(self, message: str) -> bool:
+        text_norm = str(message or "").lower()
+        return (
+            "alpha vantage" in text_norm
+            and "25 requests per day" in text_norm
+        )
+
+    def _seconds_until_next_utc_reset(self) -> int:
+        now_utc = datetime.now(timezone.utc)
+        next_reset = (now_utc + timedelta(days=1)).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        seconds = int((next_reset - now_utc).total_seconds())
+        if seconds <= 0:
+            raise RuntimeError("next UTC reset calculation returned non-positive seconds")
+        return seconds
 
     # ========================================================
     # Snapshot fetch (strict / symbol fallback)

@@ -77,6 +77,10 @@ STRICT · NO-FALLBACK
      - /api/events/skip-reasons
      - /api/events/skip-hourly
      - /api/events/recent
+- 2026-03-08 (PATCH):
+  1) FIX(ROOT-CAUSE): 외부 뉴스 API quota 초과가 /api/market-analysis, /api/quant-analysis 500으로 전파되던 문제 수정
+  2) FIX(STRICT): Alpha Vantage daily quota 초과 시 명시적 503 응답으로 승격
+  3) FIX(SECURITY): provider 오류 응답은 구조화하되 민감정보 노출 금지 유지
 ========================================================
 """
 
@@ -85,10 +89,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Query, Request, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -311,6 +315,55 @@ def _persist_analysis_event(
     )
 
 
+def _is_alpha_vantage_daily_quota_error(message: str) -> bool:
+    text_norm = str(message or "").lower()
+    return "alpha vantage" in text_norm and "25 requests per day" in text_norm
+
+
+def _seconds_until_next_utc_reset() -> int:
+    now_utc = datetime.now(timezone.utc)
+    next_reset = (now_utc + timedelta(days=1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    seconds = int((next_reset - now_utc).total_seconds())
+    if seconds <= 0:
+        raise RuntimeError("next UTC reset calculation returned non-positive seconds")
+    return seconds
+
+
+def _raise_ai_provider_http_exception(exc: Exception, *, route_name: str) -> None:
+    message = str(exc)
+
+    if _is_alpha_vantage_daily_quota_error(message):
+        retry_after_sec = _seconds_until_next_utc_reset()
+        retry_at_utc = (
+            datetime.now(timezone.utc) + timedelta(seconds=retry_after_sec)
+        ).isoformat().replace("+00:00", "Z")
+
+        logger.warning(
+            "AI analysis provider quota exceeded: route=%s retry_after_sec=%s",
+            route_name,
+            retry_after_sec,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unavailable",
+                "route": route_name,
+                "reason": "external_provider_quota_exceeded",
+                "provider": "Alpha Vantage",
+                "message": "External market analysis is temporarily unavailable because the news provider daily quota has been exceeded.",
+                "retry_after_sec": retry_after_sec,
+                "retry_at_utc": retry_at_utc,
+            },
+        ) from exc
+
+    raise
+
+
 # =====================================================
 # Pages
 # =====================================================
@@ -367,10 +420,14 @@ def api_quant_analysis(
     include_external_market_b = bool(include_external_market)
 
     def _build() -> Dict[str, Any]:
-        result = _QUANT_ANALYST.analyze(
-            question=normalized_question,
-            include_external_market=include_external_market_b,
-        )
+        try:
+            result = _QUANT_ANALYST.analyze(
+                question=normalized_question,
+                include_external_market=include_external_market_b,
+            )
+        except Exception as exc:
+            _raise_ai_provider_http_exception(exc, route_name="/api/quant-analysis")
+
         payload = result.dashboard_payload
         _persist_analysis_event(
             report_type="dashboard_query",
@@ -397,9 +454,13 @@ def api_market_analysis(
     normalized_question = _require_question(question)
 
     def _build() -> Dict[str, Any]:
-        result = _QUANT_ANALYST.analyze_market_only(
-            question=normalized_question,
-        )
+        try:
+            result = _QUANT_ANALYST.analyze_market_only(
+                question=normalized_question,
+            )
+        except Exception as exc:
+            _raise_ai_provider_http_exception(exc, route_name="/api/market-analysis")
+
         payload = result.dashboard_payload
         _persist_analysis_event(
             report_type="market_query",
