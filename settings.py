@@ -282,7 +282,7 @@ class Settings:
     ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
     preflight_ws_wait_sec: int = 60
-    ws_min_kline_buffer: int = 60
+    ws_min_kline_buffer: int = 300
     ws_max_kline_delay_sec: float = 120.0
     ws_orderbook_max_delay_sec: float = 10.0
     ws_log_enabled: bool = False
@@ -338,7 +338,7 @@ class Settings:
     reconcile_confirm_n: int = 3
     force_close_on_desync: bool = False
     max_signal_latency_ms: int = 200
-    max_exec_latency_ms: int = 2500
+    max_exec_latency_ms: int = 6000
 
     # run_bot_ws
     position_resync_sec: float = 20.0
@@ -399,7 +399,7 @@ class Settings:
     analyst_event_lookback_limit: int = 300
     analyst_include_external_market: bool = True
 
-    analyst_auto_report_market_interval_sec: int = 30
+    analyst_auto_report_market_interval_sec: int = 300
     analyst_auto_report_system_interval_sec: int = 1800
     analyst_auto_report_persist: bool = True
     analyst_auto_report_notify: bool = False
@@ -1078,7 +1078,7 @@ def load_settings() -> Settings:
     ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
     ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
     preflight_ws_wait_sec = _as_int("PREFLIGHT_WS_WAIT_SEC", 60)
-    ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 120)
+    ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 300)
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_orderbook_max_delay_sec = _as_float("WS_ORDERBOOK_MAX_DELAY_SEC", 10.0)
     ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)

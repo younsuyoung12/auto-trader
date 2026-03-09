@@ -673,6 +673,7 @@ function renderErrorsTable(items) {
     `;
     body.appendChild(tr);
   });
+  
 }
 
 function prependLiveError(item) {
@@ -693,19 +694,28 @@ function renderTradesTable(items) {
     return;
   }
 
-  state.recentTrades.forEach((item) => {
-    const pnl = Number(item.pnl_usdt || 0);
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td class="mono text-xs">${item.exit_ts || item.entry_ts || "-"}</td>
+state.recentTrades.forEach((item) => {
+
+  const pnl = Number(item.pnl_usdt || 0);
+  const tr = document.createElement("tr");
+
+  const ts = item.exit_ts || item.entry_ts;
+  const timeKST = ts
+    ? new Date(ts).toLocaleString("ko-KR", { timeZone: "Asia/Seoul" })
+    : "-";
+
+  tr.innerHTML = `
+      <td class="mono text-xs">${timeKST}</td>
       <td>${item.trade_type || "-"} / ${item.side_label || "-"}</td>
       <td class="mono text-xs">${item.entry_price !== undefined ? fmtMaybe(item.entry_price, 4) : "-"} → ${item.exit_price !== undefined && item.exit_price !== null ? fmtMaybe(item.exit_price, 4) : "-"}</td>
       <td>${item.regime_label || "-"} / ${item.strategy || "-"}</td>
       <td>${item.close_reason_label || "-"}</td>
       <td class="${pnl > 0 ? "value-positive" : pnl < 0 ? "value-negative" : "value-neutral"} mono">${fmtSigned(pnl, 2)}</td>
-    `;
-    body.appendChild(tr);
-  });
+  `;
+
+  body.appendChild(tr);
+});
+
 }
 
 function prependLiveTrade(item) {

@@ -1,7 +1,10 @@
-"""market_features_ws.py
+"""
 =====================================================
+FILE: infra/market_features_ws.py
 BingX WebSocket 캔들(1m/5m/15m/...)과 depth5 오더북을
 GPT-5.1 트레이더용 엔트리 피처로 변환하는 모듈.
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
+=====================================================
 
 핵심 원칙
 -----------------------------------------------------
@@ -30,44 +33,62 @@ extra 주요 필드
 
 변경 이력
 -----------------------------------------------------
-- 2026-03-01: raw_ohlcv_last20 포맷을 dict -> (ts_ms, o, h, l, c, v) tuple 로 변경 (STRICT 호환)
-- 2026-03-01: indicators dict 에 scalar 지표(rsi/ema/atr/macd...) 포함 (unified_features_builder 호환)
+- 2026-03-01:
+  1) raw_ohlcv_last20 포맷을 dict -> (ts_ms, o, h, l, c, v) tuple 로 변경 (STRICT 호환)
+  2) indicators dict 에 scalar 지표(rsi/ema/atr/macd...) 포함 (unified_features_builder 호환)
+
+- 2026-03-09 (TRADE-GRADE PATCH 5):
+  1) FIX(ROOT-CAUSE): 동일 5m 캔들에서는 신호 재계산보다 freeze 상태를 우선 적용하는 early gate 추가
+     - lightweight 5m/orderbook 확인 후 같은 latest_ts 이면 즉시 기존 결정 반환
+     - 같은 캔들 동안 intra-candle LONG/SHORT flip 및 점수 흔들림 차단
+  2) FIX(TRADE-GRADE): no-signal(None) 결정도 동일 5m 캔들 동안 freeze
+     - 첫 판단이 저변동성/방향미확정으로 스킵이면 같은 캔들에서는 계속 스킵 유지
+  3) FIX(STRICT): majority_trend 가 MIXED/NEUTRAL 인 경우 depth_imbalance 로 방향을 직접 결정하지 않음
+     - 오더북 쏠림은 리스크/해석용 메타로만 유지
+     - 방향 결정은 상위 TF trend → 5m EMA 정렬 순으로만 수행
+  4) FIX(STRICT): 방향이 끝까지 확정되지 않으면 LONG 기본값으로 진입하지 않고 None 반환
+  5) FIX(BUG): 저변동성 구간 스킵 로그 후 실제로 None 반환
+  6) FIX(STRICT): freeze 재사용 시 last_close_ts 는 최신 런타임 값으로 갱신
+  7) FIX(CLEANUP): 중복 top-level 함수 정의 제거
+  8) FIX(MISSING): _compute_orderbook_features / build_entry_features_ws 누락 복원
+=====================================================
 """
+
+from __future__ import annotations
 
 import math
 import time
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from settings import load_settings
 from infra.telelog import log, send_tg
 from infra.market_data_ws import (
-    get_klines_with_volume,
-    get_orderbook,
-    get_last_kline_delay_ms,
-    get_health_snapshot,
-    KLINE_MIN_BUFFER,
     KLINE_MAX_DELAY_SEC,
+    KLINE_MIN_BUFFER,
     ORDERBOOK_MAX_DELAY_SEC,
+    get_health_snapshot,
+    get_klines_with_volume,
+    get_last_kline_delay_ms,
+    get_orderbook,
 )
 from strategy.indicators import (
-    ema,
-    rsi,
-    calc_atr,
-    macd,
-    bollinger_bands,
-    obv,
-    adx,
-    stochastic_oscillator,
     Candle,
+    adx,
+    bollinger_bands,
     build_regime_features_from_candles,
+    calc_atr,
+    ema,
+    macd,
+    obv,
+    rsi,
+    stochastic_oscillator,
 )
 
 SET = load_settings()
 
-# 반환 타입 alias: get_trading_signal 이 돌려주는 튜플 구조
 EntrySignal = Tuple[
     str,                 # chosen_signal ("LONG"|"SHORT")
-    str,                 # signal_source ("TREND"/"RANGE"/"GENERIC"...)
+    str,                 # signal_source ("TREND"|"RANGE"|"GENERIC"...)
     int,                 # latest_ts (ms)
     List[List[float]],   # candles_5m (ts, o, h, l, c)
     List[List[float]],   # candles_5m_raw (ts, o, h, l, c, v)
@@ -75,25 +96,20 @@ EntrySignal = Tuple[
     Dict[str, Any],      # extra (GPT/EntryScore용 메타)
 ]
 
-# 필수/옵션 타임프레임
-# - REQUIRED_TFS: 이 목록의 타임프레임은 부족/지연 시 곧바로 오류로 본다.
-# - EXTRA_TFS: 있으면 피처에 포함하지만, 없어도 오류로 보지 않는다.
 REQUIRED_TFS: List[str] = list(
     getattr(SET, "features_required_tfs", ["1m", "5m", "15m", "1h", "4h"])
 )
 EXTRA_TFS: List[str] = []
 
-# 각 타임프레임별 기본 파라미터 (EMA 길이, RSI/ATR 길이 등)
 TF_CONFIG: Dict[str, Dict[str, int]] = {
-    "1m":  {"ema_fast": 9,  "ema_slow": 21, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
-    "5m":  {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    "1m": {"ema_fast": 9, "ema_slow": 21, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    "5m": {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
     "15m": {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
-    "1h":  {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
-    "4h":  {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
-    "1d":  {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    "1h": {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    "4h": {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    "1d": {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
 }
 
-# 텔레그램 에러 알림 쿨다운 (초)
 FEATURE_ERROR_TG_COOLDOWN_SEC: float = float(
     getattr(SET, "features_error_tg_cooldown_sec", 60.0)
 )
@@ -103,8 +119,20 @@ class FeatureBuildError(RuntimeError):
     """필수 시세 데이터가 부족/지연된 경우 사용하는 예외."""
 
 
-# 최근 에러 알림 전송 시각 (같은 원인으로 텔레폭주 방지)
 _LAST_ERROR_SENT: Dict[str, float] = {}
+
+# 동일 5m 캔들(latest_ts) 동안 최초 결정 결과를 그대로 재사용한다.
+# - SIGNAL: chosen_signal / signal_source / extra 를 freeze
+# - NO_SIGNAL: no-signal 결정도 freeze (같은 캔들 동안 재계산 금지)
+# - last_price 는 freeze 하지 않는다(현재가 반영 유지)
+_SIGNAL_FREEZE_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    sym = str(symbol).upper().strip()
+    if not sym:
+        raise FeatureBuildError("symbol is empty (STRICT)")
+    return sym
 
 
 def _now_ms() -> int:
@@ -112,11 +140,9 @@ def _now_ms() -> int:
 
 
 def _notify_error_once(key: str, human_msg: str) -> None:
-    """같은 유형의 에러에 대해 텔레그램 알림을 일정 시간 간격으로만 보낸다."""
     now = time.time()
     last = _LAST_ERROR_SENT.get(key)
     if last is not None and (now - last) < FEATURE_ERROR_TG_COOLDOWN_SEC:
-        # 로그에는 남기되 텔레그램은 생략
         log(f"[MKT-FEAT] (suppressed) {human_msg}")
         return
 
@@ -125,16 +151,90 @@ def _notify_error_once(key: str, human_msg: str) -> None:
     try:
         send_tg("❌ [시세 데이터 오류 - GPT 피처 빌더]\n" + human_msg)
     except Exception:
-        # 텔레그램 자체 오류는 여기서만 먹고 넘어간다.
         pass
 
 
 def _fail(symbol: str, location: str, reason: str) -> None:
-    """에러 메시지를 텔레그램/로그에 남기고 FeatureBuildError 로 올린다."""
     msg = f"[{symbol}] {location}: {reason}"
     key = f"{symbol}|{location}|{reason}"
     _notify_error_once(key, msg)
     raise FeatureBuildError(msg)
+
+
+def _get_signal_freeze_state(symbol: str) -> Optional[Dict[str, Any]]:
+    state = _SIGNAL_FREEZE_STATE.get(_normalize_symbol(symbol))
+    if state is None:
+        return None
+    if not isinstance(state, dict):
+        raise FeatureBuildError("signal freeze state must be dict (STRICT)")
+    return state
+
+
+def _set_signal_freeze_state(
+    *,
+    symbol: str,
+    latest_ts: int,
+    chosen_signal: Optional[str],
+    signal_source: Optional[str],
+    extra: Optional[Dict[str, Any]],
+    blocked_reason: Optional[str] = None,
+) -> None:
+    sym = _normalize_symbol(symbol)
+
+    if not isinstance(latest_ts, int) or latest_ts <= 0:
+        raise FeatureBuildError("signal freeze latest_ts must be int > 0 (STRICT)")
+
+    if chosen_signal is None:
+        if signal_source is not None:
+            raise FeatureBuildError(
+                "signal freeze signal_source must be None when chosen_signal is None (STRICT)"
+            )
+        if extra is not None:
+            raise FeatureBuildError(
+                "signal freeze extra must be None when chosen_signal is None (STRICT)"
+            )
+
+        reason = None if blocked_reason is None else str(blocked_reason).strip()
+        _SIGNAL_FREEZE_STATE[sym] = {
+            "latest_ts": int(latest_ts),
+            "chosen_signal": None,
+            "signal_source": None,
+            "extra": None,
+            "blocked_reason": (reason if reason else None),
+        }
+        return
+
+    sig = str(chosen_signal).upper().strip()
+    if sig not in ("LONG", "SHORT"):
+        raise FeatureBuildError(
+            f"signal freeze chosen_signal invalid (STRICT): {chosen_signal!r}"
+        )
+
+    src = str(signal_source).strip() if signal_source is not None else ""
+    if not src:
+        raise FeatureBuildError("signal freeze signal_source is empty (STRICT)")
+    if not isinstance(extra, dict):
+        raise FeatureBuildError("signal freeze extra must be dict (STRICT)")
+
+    _SIGNAL_FREEZE_STATE[sym] = {
+        "latest_ts": int(latest_ts),
+        "chosen_signal": sig,
+        "signal_source": src,
+        "extra": dict(extra),
+        "blocked_reason": None,
+    }
+
+
+def _clone_frozen_extra_for_return(
+    frozen_extra: Dict[str, Any],
+    *,
+    last_close_ts: float,
+) -> Dict[str, Any]:
+    if not isinstance(frozen_extra, dict):
+        raise FeatureBuildError("frozen extra must be dict (STRICT)")
+    cloned = dict(frozen_extra)
+    cloned["last_close_ts"] = float(last_close_ts)
+    return cloned
 
 
 def _fetch_candles_strict(
@@ -144,14 +244,6 @@ def _fetch_candles_strict(
     cfg: Dict[str, int],
     required: bool,
 ) -> List[Tuple[int, float, float, float, float, float]]:
-    """WS 버퍼에서 캔들을 가져오되, 필수 타임프레임이면 엄격하게 검사한다.
-
-    - required=True 인 경우:
-      · 버퍼 길이 < need_len 이면 즉시 FeatureBuildError
-      · get_last_kline_delay_ms(...) > KLINE_MAX_DELAY_SEC 이면 FeatureBuildError
-    - required=False 인 경우:
-      · 부족/지연이면 빈 리스트를 반환하고, 피처 계산에서 건너뛴다.
-    """
     ema_fast_len = int(cfg.get("ema_fast", 20))
     ema_slow_len = int(cfg.get("ema_slow", 50))
     rsi_len = int(cfg.get("rsi", 14))
@@ -165,8 +257,9 @@ def _fetch_candles_strict(
         atr_len + 1,
         range_len,
         KLINE_MIN_BUFFER,
-        atr_len * 2,  # ADX 계산을 위한 최소 캔들 수(대략 2 * length)
+        atr_len * 2,
     )
+
     buf = get_klines_with_volume(symbol, interval, limit=max(300, need_len * 2))
 
     if not buf or len(buf) < need_len:
@@ -177,20 +270,17 @@ def _fetch_candles_strict(
         )
         if required:
             _fail(symbol, f"kline_{interval}", reason)
-        else:
-            log(f"[MKT-FEAT] optional {reason}")
-            return []
+        log(f"[MKT-FEAT] optional {reason}")
+        return []
 
     delay_ms = get_last_kline_delay_ms(symbol, interval)
     if delay_ms is None:
         reason = f"{interval} 마지막 캔들 수신 시각 정보를 가져오지 못했습니다."
         if required:
             _fail(symbol, f"kline_{interval}", reason)
-        else:
-            log(f"[MKT-FEAT] optional {reason}")
-            return []
+        log(f"[MKT-FEAT] optional {reason}")
+        return []
 
-    # KLINE_MAX_DELAY_SEC 초 이상 지연되면 비정상으로 간주
     if delay_ms > KLINE_MAX_DELAY_SEC * 1000.0:
         reason = (
             f"{interval} 캔들이 {delay_ms/1000.0:.1f}초 동안 갱신되지 않았습니다 "
@@ -198,22 +288,19 @@ def _fetch_candles_strict(
         )
         if required:
             _fail(symbol, f"kline_{interval}", reason)
-        else:
-            log(f"[MKT-FEAT] optional {reason}")
-            return []
+        log(f"[MKT-FEAT] optional {reason}")
+        return []
 
     return [r for r in buf[-max(300, need_len):] if len(r) >= 6]
 
 
 def _candles_from_ws_buf(
     buf: List[Tuple[int, float, float, float, float, float]]
-)  -> List[Tuple[int, float, float, float, float, float]]:
-    """WS 버퍼 포맷(ts, o, h, l, c, v)를 그대로 반환."""
+) -> List[Tuple[int, float, float, float, float, float]]:
     return buf
 
 
 def _last_two_valid(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
-    """NaN 을 제외한 값 중 마지막 두 개를 반환."""
     valid = [v for v in vals if not math.isnan(v)]
     if len(valid) < 2:
         return None, None
@@ -224,11 +311,6 @@ def _detect_last_cross(
     ema_fast_vals: List[float],
     ema_slow_vals: List[float],
 ) -> Tuple[str, Optional[int]]:
-    """골든/데드 크로스를 단순 탐지한다.
-
-    반환:
-      ("GOLDEN"|"DEAD"|"NONE", bars_ago 또는 None)
-    """
     n = min(len(ema_fast_vals), len(ema_slow_vals))
     if n == 0:
         return "NONE", None
@@ -254,23 +336,18 @@ def _detect_last_cross(
 
     if last_cross_idx is None:
         return "NONE", None
+
     bars_ago = n - 1 - last_cross_idx
     return last_cross_type, bars_ago
 
 
 def _volume_stats(values: List[float], ma_len: int) -> Tuple[float, float, float, float]:
-    """거래량 통계 계산 (마지막 값, 이동평균, 비율, z-score).
-
-    반환:
-      (last, ma, ratio, zscore)
-    """
     if not values:
         return math.nan, math.nan, math.nan, math.nan
 
     last = float(values[-1])
-    n = len(values)
 
-    if n < ma_len:
+    if len(values) < ma_len:
         window = [float(v) for v in values]
     else:
         window = [float(v) for v in values[-ma_len:]]
@@ -285,13 +362,6 @@ def _volume_stats(values: List[float], ma_len: int) -> Tuple[float, float, float
 
 
 def _normalize_regime_keys(regime: Dict[str, Any]) -> Dict[str, Any]:
-    """TA-Lib indicators.py 에서 생성된 regime 딕셔너리를 그대로 복사해 반환한다.
-
-    과거 버전 호환을 위한 alias 보정(atr_pct, range_pct, rsi_last 등)은
-    더 이상 수행하지 않는다. 값이 없다면 상위 레이어에서
-    FeatureBuildError 또는 시그널 SKIP 으로 처리하게 두어,
-    폴백/추론 없이 "있는 그대로"만 사용한다.
-    """
     return dict(regime)
 
 
@@ -300,10 +370,6 @@ def _validate_core_features(
     interval: str,
     feats: Dict[str, Any],
 ) -> None:
-    """필수 타임프레임의 핵심 피처들이 모두 유효한 숫자인지 검사한다.
-
-    하나라도 NaN/None/비수치이면 FeatureBuildError 로 전체 빌드를 중단한다.
-    """
     core_keys = [
         "last_close",
         "ema_fast",
@@ -321,6 +387,7 @@ def _validate_core_features(
         "volume_ma",
         "volume_zscore",
     ]
+
     for key in core_keys:
         v = feats.get(key)
         if not isinstance(v, (int, float)) or math.isnan(float(v)):
@@ -330,7 +397,6 @@ def _validate_core_features(
                 f"{interval} 핵심 피처 '{key}' 가 NaN/None 입니다.",
             )
 
-    # ADX 는 필수 값으로 취급한다. 계산 실패(None) 인 경우도 오류 처리.
     adx_val = feats.get("adx")
     if adx_val is None or (
         isinstance(adx_val, (int, float)) and math.isnan(float(adx_val))
@@ -348,11 +414,6 @@ def _build_timeframe_features(
     buf: List[Tuple[int, float, float, float, float, float]],
     cfg: Dict[str, int],
 ) -> Dict[str, Any]:
-    """단일 타임프레임에 대한 피처 묶음을 생성한다.
-
-    유명 트레이더들이 자주 참고하는 지표들을 최대한 모아서
-    GPT 가 한 번에 읽기 좋은 형태로 정리한다.
-    """
     closes = [c[4] for c in buf]
     highs = [c[2] for c in buf]
     lows = [c[3] for c in buf]
@@ -368,36 +429,22 @@ def _build_timeframe_features(
 
     candles_for_calc: List[Candle] = _candles_from_ws_buf(buf)
 
-    # GPT 프롬프트용 원시 OHLCV 스냅샷(최대 20개)
-    # - 1m/5m/15m 에 대해서만 raw_ohlcv_last20 키로 내보낸다.
-    # raw_ohlcv_last20: STRICT 포맷 (ts_ms, open, high, low, close, volume)
-    # - unified_features_builder / pattern_detection 과 입력 포맷을 맞춘다.
     raw_ohlcv_last20: List[Tuple[int, float, float, float, float, float]] = []
     raw_slice = buf[-20:] if len(buf) >= 20 else buf
     for ts, o, h, l, c, v in raw_slice:
         try:
             raw_ohlcv_last20.append(
-                (
-                    int(ts),
-                    float(o),
-                    float(h),
-                    float(l),
-                    float(c),
-                    float(v),
-                )
+                (int(ts), float(o), float(h), float(l), float(c), float(v))
             )
         except Exception as e:
             _fail(symbol, f"raw_ohlcv_{interval}", f"raw_ohlcv_last20 build failed: {e}")
 
-
-    # EMA(추세), 최근 기울기
     ema_fast_vals = ema(closes, ema_fast_len)
     ema_slow_vals = ema(closes, ema_slow_len)
     ema_fast_val = ema_fast_vals[-1] if ema_fast_vals else math.nan
     ema_slow_val = ema_slow_vals[-1] if ema_slow_vals else math.nan
 
     ema_fast_prev, ema_fast_last = _last_two_valid(ema_fast_vals)
-
     if math.isnan(ema_fast_val) or math.isnan(ema_slow_val) or last_close <= 0:
         ema_dist_pct = math.nan
     else:
@@ -408,14 +455,12 @@ def _build_timeframe_features(
     else:
         ema_fast_slope_pct = (ema_fast_last - ema_fast_prev) / last_close
 
-    # EMA slow slope (pct) for unified_features_builder compatibility
     ema_slow_prev, ema_slow_last = _last_two_valid(ema_slow_vals)
     if ema_slow_prev is None or ema_slow_last is None or last_close <= 0:
         ema_slow_slope_pct = math.nan
     else:
         ema_slow_slope_pct = (ema_slow_last - ema_slow_prev) / last_close
 
-    # 수익률 (최근 1, 3, 5 봉 기준)
     def _ret(n_bars: int) -> float:
         if len(closes) <= n_bars:
             return math.nan
@@ -429,7 +474,6 @@ def _build_timeframe_features(
     ret_3 = _ret(3)
     ret_5 = _ret(5)
 
-    # ATR 및 박스 폭
     atr_val = calc_atr(candles_for_calc[-(atr_len + 1):], length=atr_len)
     atr_pct = (atr_val / last_close) if (atr_val is not None and last_close > 0) else math.nan
 
@@ -445,18 +489,15 @@ def _build_timeframe_features(
     else:
         range_pct = math.nan
 
-    # RSI
     rsi_vals = rsi(closes, rsi_len)
     rsi_last = rsi_vals[-1] if rsi_vals else math.nan
 
-    # MACD / 시그널 / 히스토그램
     macd_line, macd_signal, macd_hist = macd(closes)
     macd_last = macd_line[-1] if macd_line else math.nan
     macd_signal_last = macd_signal[-1] if macd_signal else math.nan
     macd_hist_last = macd_hist[-1] if macd_hist else math.nan
 
-    # 볼린저 밴드 (폭/위치)
-    bb_mid, bb_upper, bb_lower = bollinger_bands(closes)
+    _, bb_upper, bb_lower = bollinger_bands(closes)
     bb_width_pct = math.nan
     bb_pos = math.nan
     if bb_upper and bb_lower:
@@ -471,23 +512,18 @@ def _build_timeframe_features(
             bb_width_pct = (u - l) / last_close
             bb_pos = (last_close - l) / (u - l)
 
-    # 스토캐스틱
     stoch_k_vals, stoch_d_vals = stochastic_oscillator(highs, lows, closes)
     stoch_k_last = stoch_k_vals[-1] if stoch_k_vals else math.nan
     stoch_d_last = stoch_d_vals[-1] if stoch_d_vals else math.nan
 
-    # ADX (추세 강도)
     adx_val = adx(candles_for_calc, length=atr_len)
 
-    # 거래량 통계 및 OBV
     vol_last, vol_ma, vol_ratio, vol_z = _volume_stats(vols, vol_ma_len)
     obv_vals = obv(closes, vols)
     obv_last = obv_vals[-1] if obv_vals else math.nan
 
-    # 골든/데드 크로스
     cross_type, cross_bars_ago = _detect_last_cross(ema_fast_vals, ema_slow_vals)
 
-    # 극단적인 가격/거래량 정지 구간 방어
     try:
         if (
             not math.isnan(range_pct)
@@ -505,7 +541,6 @@ def _build_timeframe_features(
     except Exception as e:
         log(f"[MKT-FEAT] flat-market check error interval={interval}: {e}")
 
-    # 단순 상태 플래그 (GPT 가 해석하기 쉬운 0/1/-1 값)
     def _flag(condition: bool) -> int:
         return 1 if condition else 0
 
@@ -524,7 +559,6 @@ def _build_timeframe_features(
     else:
         strong_trend_flag = 0
 
-    # 저변동성 플래그 (타임프레임 단위)
     is_low_volatility = 0
     try:
         if (
@@ -533,7 +567,6 @@ def _build_timeframe_features(
             and isinstance(range_pct, (int, float))
             and not math.isnan(range_pct)
         ):
-            # 이 값들은 get_trading_signal 의 기본 threshold 와 동일하게 맞춘다.
             low_range_th_local = 0.01
             low_atr_th_local = 0.004
             if atr_pct < low_atr_th_local and range_pct < low_range_th_local:
@@ -576,19 +609,15 @@ def _build_timeframe_features(
         "strong_trend_flag": strong_trend_flag,
         "volume_last": vol_last,
         "volume_ma": vol_ma,
-        "volume_ratio": vol_ratio,     # 1.0 이상이면 최근 거래량이 평균보다 큼
-        "volume_zscore": vol_z,        # 2 이상이면 통계적으로 꽤 큰 스파이크
+        "volume_ratio": vol_ratio,
+        "volume_zscore": vol_z,
         "obv": obv_last,
-        "cross_type": cross_type,      # "GOLDEN" / "DEAD" / "NONE"
+        "cross_type": cross_type,
         "cross_bars_ago": cross_bars_ago,
         "is_low_volatility": is_low_volatility,
     }
 
-    # 패턴 엔진용 지표 시리즈 (RSI / MACD 히스토그램 등)
-    # indicators: unified_features_builder 가 참조하는 scalar 지표는 indicators dict 에도 포함한다.
-    # - top-level 값은 유지(기존 호환)
     indicators: Dict[str, Any] = {
-        # Scalars (unified_features_builder expects these under timeframes[tf]["indicators"])
         "ema_fast": float(ema_fast_val) if isinstance(ema_fast_val, (int, float)) else math.nan,
         "ema_slow": float(ema_slow_val) if isinstance(ema_slow_val, (int, float)) else math.nan,
         "ema_fast_slope_pct": float(ema_fast_slope_pct) if isinstance(ema_fast_slope_pct, (int, float)) else math.nan,
@@ -608,7 +637,6 @@ def _build_timeframe_features(
         "volume_zscore": float(vol_z) if isinstance(vol_z, (int, float)) else math.nan,
     }
 
-    # Optional series (pattern_detection uses these when present)
     try:
         if rsi_vals:
             rsi_clean = [
@@ -620,6 +648,7 @@ def _build_timeframe_features(
                 indicators["rsi_series"] = rsi_clean
     except Exception:
         pass
+
     try:
         if macd_hist:
             macd_hist_clean = [
@@ -634,13 +663,9 @@ def _build_timeframe_features(
 
     tf_features["indicators"] = indicators
 
-
-    # GPT 프롬프트에서 직접 차트 패턴을 해석할 수 있게,
-    # 1m/5m/15m 에 대해서만 최근 20개 원시 OHLCV 를 함께 실어 보낸다.
     if interval in ("1m", "5m", "15m"):
         tf_features["raw_ohlcv_last20"] = raw_ohlcv_last20
 
-    # 5m / 15m / 1h 등의 타임프레임는 regime 피처도 같이 계산
     if interval in ("5m", "15m", "1h", "4h"):
         try:
             regime = build_regime_features_from_candles(
@@ -652,25 +677,19 @@ def _build_timeframe_features(
                 range_window=range_len,
             )
             if regime is not None:
-                # TA-Lib indicators.py 에서 생성된 regime 키 정합을 한 번 더 보정
                 tf_features["regime"] = _normalize_regime_keys(regime)
         except Exception as e:
             log(f"[MKT-FEAT] regime feature 계산 중 예외 interval={interval}: {e}")
 
-
-    # UNIFIED FEATURE COMPATIBILITY
-    # - unified_features_builder expects timeframes[tf]['candles_raw'] to be a list of (ts,o,h,l,c,v).
-    # - We expose WS buffer data directly without REST backfill or inference.
-    tf_features['candles_raw'] = [
+    tf_features["candles_raw"] = [
         (int(ts), float(o), float(h), float(l), float(c), float(v))
         for (ts, o, h, l, c, v) in buf
     ]
-    tf_features['candles'] = list(tf_features['candles_raw'])
+    tf_features["candles"] = list(tf_features["candles_raw"])
     return tf_features
 
 
 def _compute_trend_bias(tf_features: Dict[str, Any]) -> int:
-    """ema_fast / ema_slow 를 기준으로 LONG(1)/SHORT(-1)/중립(0) 편향을 계산."""
     ema_fast_val = float(tf_features.get("ema_fast") or math.nan)
     ema_slow_val = float(tf_features.get("ema_slow") or math.nan)
     if math.isnan(ema_fast_val) or math.isnan(ema_slow_val):
@@ -685,7 +704,6 @@ def _compute_trend_bias(tf_features: Dict[str, Any]) -> int:
 def _build_multi_timeframe_summary(
     tf_map: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """여러 타임프레임 피처를 종합해 간단한 멀티 타임프레임 요약을 만든다."""
     trend_votes: Dict[str, int] = {}
     for iv, feats in tf_map.items():
         trend_votes[iv] = _compute_trend_bias(feats)
@@ -705,11 +723,11 @@ def _build_multi_timeframe_summary(
     trend_align_long = long_votes >= 3 and short_votes == 0
     trend_align_short = short_votes >= 3 and long_votes == 0
 
-    # ADX / RSI / Stoch 기반 멀티 타임프레임 요약
     adx_trend_tfs = 0
     overbought_tfs = 0
     oversold_tfs = 0
     low_vol_tfs = 0
+
     for feats in tf_map.values():
         adx_val = feats.get("adx")
         if isinstance(adx_val, (int, float)) and not math.isnan(adx_val) and adx_val >= 25.0:
@@ -717,6 +735,7 @@ def _build_multi_timeframe_summary(
 
         rsi_val = feats.get("rsi")
         stoch_k_val = feats.get("stoch_k")
+
         if isinstance(rsi_val, (int, float)) and not math.isnan(rsi_val) and rsi_val >= 70.0:
             overbought_tfs += 1
         elif isinstance(stoch_k_val, (int, float)) and not math.isnan(stoch_k_val) and stoch_k_val >= 80.0:
@@ -727,7 +746,6 @@ def _build_multi_timeframe_summary(
         elif isinstance(stoch_k_val, (int, float)) and not math.isnan(stoch_k_val) and stoch_k_val <= 20.0:
             oversold_tfs += 1
 
-        # 저변동성 타임프레임 개수 집계
         is_lv = feats.get("is_low_volatility")
         if isinstance(is_lv, int) and is_lv == 1:
             low_vol_tfs += 1
@@ -739,15 +757,14 @@ def _build_multi_timeframe_summary(
         "trend_align_long": trend_align_long,
         "trend_align_short": trend_align_short,
         "majority_trend": majority_trend,
-        "adx_trend_tfs": adx_trend_tfs,       # ADX 25 이상인 타임프레임 수
-        "overbought_tfs": overbought_tfs,     # RSI/스토캐스틱 과열 타임프레임 수
-        "oversold_tfs": oversold_tfs,         # RSI/스토캐스틱 과매도 타임프레임 수
-        "low_vol_tfs": low_vol_tfs,           # 저변동성 타임프레임 수
+        "adx_trend_tfs": adx_trend_tfs,
+        "overbought_tfs": overbought_tfs,
+        "oversold_tfs": oversold_tfs,
+        "low_vol_tfs": low_vol_tfs,
     }
 
 
 def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
-    """depth5 오더북에서 스프레드/비대칭성 등을 계산한다."""
     ob = get_orderbook(symbol, limit=5)
     now_ms = _now_ms()
 
@@ -761,7 +778,6 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     bids = ob.get("bids") or []
     asks = ob.get("asks") or []
 
-    # exchTs(거래소 타임스탬프) 우선, 없으면 ts(로컬) 사용
     ts_ms: Optional[int] = None
     for key in ("exchTs", "ts"):
         if ob.get(key) is not None:
@@ -787,7 +803,6 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     mid = (best_bid + best_ask) / 2.0 if (best_ask > 0 and best_bid > 0) else math.nan
     spread_pct = (spread_abs / mid) if (mid and mid > 0) else math.nan
 
-    # 단순 depth 비대칭성: (bid_notional - ask_notional) / (bid_notional + ask_notional)
     def _depth_notional(side: List[List[float]]) -> float:
         total = 0.0
         for row in side:
@@ -829,55 +844,27 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
 def build_entry_features_ws(
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """WS 로우데이터를 기반으로 GPT-5.1 진입/관리용 피처를 생성한다.
-
-    사용 예시:
-        from market_features_ws import build_entry_features_ws
-
-        features = build_entry_features_ws(SET.symbol)
-        # gpt_decider.ask_entry_decision_safe(..., market_features=features)
-
-    동작 개요:
-        1) market_data_ws.get_health_snapshot(...) 으로 전체 헬스를 한 번 체크.
-           - overall_ok=False 이면 상세 사유와 함께 FeatureBuildError.
-        2) REQUIRED_TFS (기본 1m/5m/15m)에 대해
-           - 최소 버퍼 개수(KLINE_MIN_BUFFER 이상) & 지연(KLINE_MAX_DELAY_SEC 이하) 검증.
-        3) EXTRA_TFS (1h/4h/1d)는 있으면 피처를 만들고, 없으면 건너뜀.
-        4) depth5 오더북이 비어 있거나 ORDERBOOK_MAX_DELAY_SEC 을 넘게 지연되면 오류.
-        5) 위 검증이 모두 통과된 경우에만 timeframes/orderbook/multi_timeframe 으로 구성된 dict 를 반환.
-
-    주의:
-        - 이 모듈에서는 REST 백필을 절대로 호출하지 않는다.
-        - WS 로우데이터가 비정상일 때는 FeatureBuildError 를 던지고,
-          원인은 텔레그램/Render 로그에서 바로 확인할 수 있다.
-    """
     if symbol is None:
         symbol = SET.symbol
 
+    symbol = _normalize_symbol(symbol)
     checked_at_ms = _now_ms()
 
-    # 1) 전체 헬스 스냅샷 (요약)
     try:
         snap = get_health_snapshot(symbol)
         if not snap.get("overall_ok", True):
-            # 세부 사유는 snap["klines"]/ ["orderbook"] 에 이미 담겨 있으므로
-            # 여기서는 간략히 상태만 알린다.
             _fail(
                 symbol,
                 "health_snapshot",
                 "WS 시세 데이터 헬스 체크 결과 overall_ok=False 입니다. market_data_ws.get_health_snapshot 로그를 확인해 주세요.",
             )
     except FeatureBuildError:
-        # 이미 _fail 에서 처리됨
         raise
     except Exception as e:
-        # 헬스 스냅샷을 못 가져왔다고 해서 바로 죽이지는 않고,
-        # 아래 개별 타임프레임 검증에서 한 번 더 체크한다.
         log(f"[MKT-FEAT] get_health_snapshot error: {e}")
 
     timeframes: Dict[str, Dict[str, Any]] = {}
 
-    # 2) 필수/옵션 타임프레임별 피처 계산
     all_tfs: List[str] = list(dict.fromkeys(REQUIRED_TFS + EXTRA_TFS))
     for iv in all_tfs:
         cfg = TF_CONFIG.get(iv)
@@ -893,7 +880,6 @@ def build_entry_features_ws(
             required=is_required,
         )
         if not buf:
-            # optional 이고 실패한 경우
             continue
 
         try:
@@ -904,7 +890,6 @@ def build_entry_features_ws(
         except FeatureBuildError:
             raise
         except Exception as e:
-            # 피처 계산 중 예외 → 필수 타임프레임이면 오류로 올리기
             reason = f"{iv} 피처 계산 중 예외가 발생했습니다: {e}"
             if is_required:
                 _fail(symbol, f"features_{iv}", reason)
@@ -914,10 +899,7 @@ def build_entry_features_ws(
     if not timeframes:
         _fail(symbol, "features", "어떤 타임프레임에서도 피처를 생성하지 못했습니다.")
 
-    # 3) 오더북 피처
     ob_features = _compute_orderbook_features(symbol)
-
-    # 4) 멀티 타임프레임 요약
     mtf_summary = _build_multi_timeframe_summary(timeframes)
 
     return {
@@ -929,49 +911,111 @@ def build_entry_features_ws(
     }
 
 
-# ─────────────────────────────────────────────────────
-# 엔트리 시그널 빌더: entry_flow.try_open_new_position(...) 에서 사용
-# ─────────────────────────────────────────────────────
-
-
 def get_trading_signal(
     *,
     settings: Any,
     last_close_ts: float,
     symbol: Optional[str] = None,
 ) -> Optional[EntrySignal]:
-    """WS 기반 엔트리 시그널/컨텍스트를 생성한다.
-
-    반환 형식:
-        (chosen_signal, signal_source, latest_ts,
-         candles_5m, candles_5m_raw, last_price, extra)
-
-    - chosen_signal : "LONG" / "SHORT"
-    - signal_source : 로그/DB용 전략 라벨 ("TREND", "RANGE", "GENERIC" 등)
-    - latest_ts     : 기준 5m 캔들 타임스탬프(ms)
-    - candles_5m    : [[ts, o, h, l, c], ...]
-    - candles_5m_raw: [[ts, o, h, l, c, v], ...]
-    - last_price    : 현재 기준가(오더북 last/mark/5m 종가 순으로 선택)
-    - extra         :
-        · signal_score  : 0~3 근사 시그널 강도
-        · atr_fast      : 5m ATR
-        · atr_slow      : 15m ATR
-        · direction_raw : LONG=+1, SHORT=-1
-        · direction_norm: 위와 동일
-        · regime_level  : TREND=1.0, RANGE=2.0, GENERIC=1.5
-        · market_features: build_entry_features_ws(...) 전체 반환값
-        · last_close_ts : 최근 청산 시각(단일 전략 기준)
-    """
-    # 심볼 결정: 우선 settings.symbol, 없으면 글로벌 SET.symbol
     if symbol is None:
         symbol = getattr(settings, "symbol", None) or SET.symbol
 
-    # 1) WS 피처 빌더 실행 (필수 데이터/헬스 체크는 여기서 끝낸다)
+    symbol = _normalize_symbol(symbol)
+
+    cfg_5m = TF_CONFIG.get(
+        "5m",
+        {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
+    )
+    try:
+        buf_5m = _fetch_candles_strict(
+            symbol,
+            "5m",
+            cfg=cfg_5m,
+            required=True,
+        )
+    except FeatureBuildError as e:
+        log(f"[MKT-FEAT] get_trading_signal: 5m fetch FeatureBuildError: {e}")
+        return None
+    except Exception as e:
+        log(f"[MKT-FEAT] get_trading_signal: 5m fetch unexpected error: {e}")
+        return None
+
+    if not buf_5m:
+        log("[MKT-FEAT] get_trading_signal: 5m buf_5m 이 비어 있습니다.")
+        return None
+
+    candles_5m_raw: List[List[float]] = [
+        [float(ts), float(o), float(h), float(l), float(c), float(v)]
+        for (ts, o, h, l, c, v) in buf_5m
+    ]
+    candles_5m: List[List[float]] = [
+        [float(ts), float(o), float(h), float(l), float(c)]
+        for (ts, o, h, l, c, v) in buf_5m
+    ]
+    latest_ts = int(buf_5m[-1][0])
+
+    try:
+        ob_now = _compute_orderbook_features(symbol)
+    except FeatureBuildError as e:
+        log(f"[MKT-FEAT] get_trading_signal: orderbook FeatureBuildError: {e}")
+        return None
+    except Exception as e:
+        log(f"[MKT-FEAT] get_trading_signal: orderbook unexpected error: {e}")
+        return None
+
+    last_price_candidates: List[float] = []
+    ob_last = ob_now.get("last_price")
+    if isinstance(ob_last, (int, float)):
+        last_price_candidates.append(float(ob_last))
+
+    ob_mark = ob_now.get("mark_price")
+    if isinstance(ob_mark, (int, float)):
+        last_price_candidates.append(float(ob_mark))
+
+    tf5_close_light = buf_5m[-1][4]
+    if isinstance(tf5_close_light, (int, float)):
+        last_price_candidates.append(float(tf5_close_light))
+
+    if last_price_candidates:
+        last_price = float(last_price_candidates[0])
+    else:
+        last_price = float(buf_5m[-1][4])
+
+    freeze_state = _get_signal_freeze_state(symbol)
+    if freeze_state is not None:
+        frozen_ts = freeze_state.get("latest_ts")
+        if isinstance(frozen_ts, int) and frozen_ts == latest_ts:
+            frozen_signal = freeze_state.get("chosen_signal")
+            if frozen_signal is None:
+                return None
+
+            frozen_source = freeze_state.get("signal_source")
+            frozen_extra = freeze_state.get("extra")
+            if (
+                isinstance(frozen_signal, str)
+                and frozen_signal in ("LONG", "SHORT")
+                and isinstance(frozen_source, str)
+                and frozen_source.strip()
+                and isinstance(frozen_extra, dict)
+            ):
+                return (
+                    frozen_signal,
+                    frozen_source,
+                    latest_ts,
+                    candles_5m,
+                    candles_5m_raw,
+                    float(last_price),
+                    _clone_frozen_extra_for_return(
+                        frozen_extra,
+                        last_close_ts=float(last_close_ts),
+                    ),
+                )
+            raise FeatureBuildError("signal freeze state payload invalid (STRICT)")
+
     try:
         features = build_entry_features_ws(symbol)
     except FeatureBuildError as e:
         log(f"[MKT-FEAT] get_trading_signal FeatureBuildError: {e}")
-        # 여기서 텔레그램 알림은 이미 _fail 에서 보냈으므로 추가 전송은 하지 않는다.
         return None
     except Exception as e:
         msg = f"[MKT-FEAT] get_trading_signal unexpected error: {e}"
@@ -989,12 +1033,18 @@ def get_trading_signal(
     tf5 = tfs.get("5m")
     if not tf5:
         log("[MKT-FEAT] get_trading_signal: 5m timeframes 가 없습니다.")
+        _set_signal_freeze_state(
+            symbol=symbol,
+            latest_ts=latest_ts,
+            chosen_signal=None,
+            signal_source=None,
+            extra=None,
+            blocked_reason="missing_5m_features",
+        )
         return None
 
     tf15 = tfs.get("15m")
-    tf1 = tfs.get("1m")
 
-    # 1.5) 저변동성 필터: 5m range/ATR 모두 너무 작으면 엔트리 스킵
     try:
         range_pct_5 = tf5.get("range_pct")
         atr_pct_5 = tf5.get("atr_pct")
@@ -1026,11 +1076,9 @@ def get_trading_signal(
             and atr_pct_5 < low_atr_th
         )
 
-        # 멀티 타임프레임에서 저변동성 타임프레임 수
         low_vol_tfs = int(mtf.get("low_vol_tfs") or 0)
 
         if (is_low_range and is_low_atr) or (is_low_vol_5 and low_vol_tfs >= 2):
-            # TA-Lib 기반 range_pct / atr_pct 가 정상 계산되었는지 로그로도 함께 체크
             range_str = (
                 f"{range_pct_5:.4f}"
                 if isinstance(range_pct_5, (int, float)) and not math.isnan(range_pct_5)
@@ -1047,46 +1095,19 @@ def get_trading_signal(
                 f"atr_pct={atr_str}, "
                 f"th=({low_range_th:.4f}, {low_atr_th:.4f}), low_vol_tfs={low_vol_tfs})"
             )
-            
+            _set_signal_freeze_state(
+                symbol=symbol,
+                latest_ts=latest_ts,
+                chosen_signal=None,
+                signal_source=None,
+                extra=None,
+                blocked_reason="low_volatility",
+            )
+            return None
     except Exception as e:
         log(f"[MKT-FEAT] low-volatility filter 계산 중 예외 발생: {e}")
 
-    # 2) 5m 캔들 버퍼 확보 (가드/스냅샷용) - WS 버퍼 그대로 사용
-    cfg_5m = TF_CONFIG.get(
-        "5m",
-        {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
-    )
-    try:
-        buf_5m = _fetch_candles_strict(
-            symbol,
-            "5m",
-            cfg=cfg_5m,
-            required=True,
-        )
-    except FeatureBuildError as e:
-        log(f"[MKT-FEAT] get_trading_signal: 5m fetch FeatureBuildError: {e}")
-        return None
-    except Exception as e:
-        log(f"[MKT-FEAT] get_trading_signal: 5m fetch unexpected error: {e}")
-        return None
-
-    if not buf_5m:
-        log("[MKT-FEAT] get_trading_signal: 5m buf_5m 이 비어 있습니다.")
-        return None
-
-    candles_5m_raw: List[List[float]] = [
-        [float(ts), float(o), float(h), float(l), float(c), float(v)]
-        for (ts, o, h, l, c, v) in buf_5m
-    ]
-    candles_5m: List[List[float]] = [
-        [float(ts), float(o), float(h), float(l), float(c)]
-        for (ts, o, h, l, c, v) in buf_5m
-    ]
-
-    latest_ts = int(buf_5m[-1][0])
-
-    # 3) 기준 가격(last_price) 선택
-    last_price_candidates: List[float] = []
+    last_price_candidates = []
 
     ob_last = ob.get("last_price")
     if isinstance(ob_last, (int, float)):
@@ -1100,33 +1121,21 @@ def get_trading_signal(
     if isinstance(tf5_close, (int, float)):
         last_price_candidates.append(float(tf5_close))
 
-    if tf1:
-        tf1_close = tf1.get("last_close")
-        if isinstance(tf1_close, (int, float)):
-            last_price_candidates.append(float(tf1_close))
-
     if last_price_candidates:
-        last_price = last_price_candidates[0]
+        last_price = float(last_price_candidates[0])
     else:
-        # 최후 보루: 5m 마지막 종가
         last_price = float(buf_5m[-1][4])
 
-    # 4) 방향 편향(chosen_signal) 계산
     majority_trend = str(mtf.get("majority_trend", "NEUTRAL")).upper()
     depth_imbalance = ob.get("depth_imbalance")
 
-    trend_bias = 0  # LONG=+1 / SHORT=-1 / 0=중립
+    trend_bias = 0
 
     if majority_trend == "LONG":
         trend_bias = 1
     elif majority_trend == "SHORT":
         trend_bias = -1
-    else:
-         # 오더북 쏠림이 강할 때만 방향 반영 (과도한 방향 흔들림 방지)
-        if isinstance(depth_imbalance, (int, float)) and abs(depth_imbalance) >= 0.20:
-            trend_bias = 1 if depth_imbalance > 0 else -1
 
-    # 여전히 0이면 5m EMA 정렬로 최소 방향은 정해준다.
     if trend_bias == 0:
         ema_fast_5 = tf5.get("ema_fast")
         ema_slow_5 = tf5.get("ema_slow")
@@ -1136,15 +1145,27 @@ def get_trading_signal(
             elif ema_fast_5 < ema_slow_5:
                 trend_bias = -1
 
-    # 완전히 애매한 경우라도 GPT 가 최종 판단하므로 한쪽을 기본값으로 둔다.
-    if trend_bias >= 0:
+    if trend_bias > 0:
         chosen_signal = "LONG"
         direction_num = 1.0
-    else:
+    elif trend_bias < 0:
         chosen_signal = "SHORT"
         direction_num = -1.0
+    else:
+        log(
+            "[MKT-FEAT] get_trading_signal: 방향이 확정되지 않아 시그널 생성을 중단합니다 "
+            f"(majority_trend={majority_trend}, depth_imbalance={depth_imbalance})."
+        )
+        _set_signal_freeze_state(
+            symbol=symbol,
+            latest_ts=latest_ts,
+            chosen_signal=None,
+            signal_source=None,
+            extra=None,
+            blocked_reason="direction_undecided",
+        )
+        return None
 
-    # 5) signal_source (레짐 라벨) 결정 - 완전 단순화
     signal_source = "GENERIC"
     try:
         adx_trend_tfs = int(mtf.get("adx_trend_tfs") or 0)
@@ -1157,10 +1178,8 @@ def get_trading_signal(
         elif (overbought_tfs + oversold_tfs) >= 1:
             signal_source = "RANGE"
     except Exception:
-        # 어떤 이유로든 계산 실패하면 GENERIC 유지
         pass
 
-    # regime_level 숫자 라벨 (EntryScore/GPT 메타용)
     if signal_source == "TREND":
         regime_level = 1.0
     elif signal_source == "RANGE":
@@ -1168,24 +1187,12 @@ def get_trading_signal(
     else:
         regime_level = 1.5
 
-    # 6) signal_score / ATR fast/slow 계산 (EntryScore용 필수 필드)
     atr_fast = tf5.get("atr")
-    if isinstance(atr_fast, (int, float)):
-        atr_fast_val = float(atr_fast)
-    else:
-        atr_fast_val = float("nan")
+    atr_fast_val = float(atr_fast) if isinstance(atr_fast, (int, float)) else float("nan")
 
-    if tf15:
-        atr_slow = tf15.get("atr")
-    else:
-        atr_slow = atr_fast
+    atr_slow = tf15.get("atr") if tf15 else atr_fast
+    atr_slow_val = float(atr_slow) if isinstance(atr_slow, (int, float)) else float("nan")
 
-    if isinstance(atr_slow, (int, float)):
-        atr_slow_val = float(atr_slow)
-    else:
-        atr_slow_val = float("nan")
-
-    # ▶ 확장된 시그널 강도 점수 (0.5 ~ 6.0)
     signal_score = 0.5
     try:
         vol_z = tf5.get("volume_zscore")
@@ -1198,10 +1205,8 @@ def get_trading_signal(
     except Exception:
         pass
 
-    # 최종 범위 확장
     signal_score = max(0.5, min(signal_score, 6.0))
 
-    # 6.5) ENTRY 핵심 피처 (trend_strength / volatility / volume_zscore) 추출
     reg5 = tf5.get("regime") or {}
     trend_strength = reg5.get("trend_strength")
     volatility = tf5.get("atr_pct")
@@ -1217,9 +1222,16 @@ def get_trading_signal(
                 f"[MKT-FEAT] get_trading_signal: 핵심 피처 {name} 가 NaN/None 입니다. "
                 "엔트리 시그널 생성을 중단합니다."
             )
+            _set_signal_freeze_state(
+                symbol=symbol,
+                latest_ts=latest_ts,
+                chosen_signal=None,
+                signal_source=None,
+                extra=None,
+                blocked_reason=f"invalid_{name}",
+            )
             return None
 
-    # 7) extra 메타 구성 (GPT/gpt_trader + EntryScore 공용)
     extra: Dict[str, Any] = {
         "signal_score": float(signal_score),
         "atr_fast": atr_fast_val,
@@ -1234,8 +1246,6 @@ def get_trading_signal(
         "last_close_ts": float(last_close_ts),
     }
 
-
-    # 참고용으로 일부 핵심 값도 함께 넣어 준다.
     try:
         extra["majority_trend"] = majority_trend
         extra["depth_imbalance"] = depth_imbalance
@@ -1244,6 +1254,14 @@ def get_trading_signal(
         extra["strong_trend_flag_5m"] = tf5.get("strong_trend_flag")
     except Exception:
         pass
+
+    _set_signal_freeze_state(
+        symbol=symbol,
+        latest_ts=latest_ts,
+        chosen_signal=chosen_signal,
+        signal_source=signal_source,
+        extra=extra,
+    )
 
     return (
         chosen_signal,

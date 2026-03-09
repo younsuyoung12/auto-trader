@@ -18,6 +18,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-09:
+  1) FIX(ROOT-CAUSE): signal payload 5m ts 와 authoritative WS 5m ts 를 강제 일치 검증
+     - get_trading_signal 반환 latest_ts, candles_5m, candles_5m_raw, WS 5m buffer 마지막 ts 불일치 시 즉시 예외
+     - signal 생성 시점과 진입 후보 생성 시점의 캔들 기준 불일치를 차단
+  2) FIX(TRADE-GRADE): candles_5m / candles_5m_raw 를 authoritative WS 5m OHLCV 로 재구성
+     - 5튜플 → volume=0.0 주입 제거
+     - 진입 파이프라인 내부 None→0 / 임의 OHLCV 보정 제거
+  3) FIX(INSTITUTIONAL): multi-timeframe directional confirmation guard 추가
+     - 5m confirmed momentum 필수 정렬
+     - 15m / 1h / orderflow / options secondary alignment 기반 반전 히스테리시스 추가
+     - 새 5m 캔들마다 LONG↔SHORT 교차 진입되는 whipsaw 완화
+  4) ADD(AUDIT): direction stability 진단 메타 추가
+     - tf slope pct / directional state / support-opposition count 를 candidate meta 에 기록
+
 - 2026-03-08:
   1) FIX(TRADE-GRADE): duplicate top-level function 제거
      - _require_tp_sl_from_settings_or_extra 중복 정의 제거
@@ -53,7 +67,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Sequence
 
 from infra.market_data_ws import (
     get_klines_with_volume as ws_get_klines_with_volume,
@@ -73,6 +87,24 @@ ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 60, "5m": 60, "15m": 60, "1h"
 ORDERFLOW_BLOCK_DELTA_RATIO_PCT: float = 8.0
 OPTIONS_BEARISH_PCR_THRESHOLD: float = 1.20
 OPTIONS_BULLISH_PCR_THRESHOLD: float = 0.83
+
+DIRECTION_CONFIRM_MIN_LEN_BY_TF: Dict[str, int] = {
+    "5m": 6,
+    "15m": 6,
+    "1h": 6,
+}
+DIRECTION_CONFIRM_LOOKBACK_CLOSED_BARS_BY_TF: Dict[str, int] = {
+    "5m": 3,
+    "15m": 3,
+    "1h": 3,
+}
+DIRECTION_CONFIRM_MIN_SLOPE_PCT_BY_TF: Dict[str, float] = {
+    "5m": 0.0004,
+    "15m": 0.0008,
+    "1h": 0.0015,
+}
+DIRECTION_CONFIRM_REQUIRED_SECONDARY_SUPPORTS: int = 1
+DIRECTION_CONFIRM_MAX_SECONDARY_OPPOSE: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +219,232 @@ def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[fl
     if sl <= 0.0:
         raise RuntimeError("sl_pct must be > 0 (STRICT)")
     return float(tp), float(sl)
+
+
+def _normalize_ws_ohlcv_row_strict(row: Any, *, name: str, index: int) -> tuple[int, float, float, float, float, float]:
+    if not isinstance(row, (list, tuple)):
+        raise RuntimeError(f"{name}[{index}] must be list/tuple (STRICT), got {type(row).__name__}")
+    if len(row) < 6:
+        raise RuntimeError(f"{name}[{index}] must have >=6 fields (STRICT), got len={len(row)}")
+
+    ts = _require_int_ms(row[0], f"{name}[{index}].ts")
+    o = _as_float(row[1], f"{name}[{index}].open", min_value=0.0)
+    h = _as_float(row[2], f"{name}[{index}].high", min_value=0.0)
+    l = _as_float(row[3], f"{name}[{index}].low", min_value=0.0)
+    c = _as_float(row[4], f"{name}[{index}].close", min_value=0.0)
+    v = _as_float(row[5], f"{name}[{index}].volume", min_value=0.0)
+
+    if min(o, h, l, c) <= 0.0:
+        raise RuntimeError(f"{name}[{index}] OHLC must be > 0 (STRICT)")
+    if h < max(o, c, l):
+        raise RuntimeError(f"{name}[{index}] high is inconsistent (STRICT)")
+    if l > min(o, c, h):
+        raise RuntimeError(f"{name}[{index}] low is inconsistent (STRICT)")
+
+    return (int(ts), float(o), float(h), float(l), float(c), float(v))
+
+
+def _normalize_ws_ohlcv_series_strict(arr: Any, *, name: str, min_len: int) -> list[tuple[int, float, float, float, float, float]]:
+    if not isinstance(arr, list):
+        raise RuntimeError(f"{name} must be list (STRICT)")
+    if len(arr) < min_len:
+        raise RuntimeError(f"{name} len insufficient (STRICT): need>={min_len} got={len(arr)}")
+
+    fixed = [_normalize_ws_ohlcv_row_strict(it, name=name, index=i) for i, it in enumerate(arr)]
+    try:
+        validate_kline_series_strict(fixed, name=name, min_len=min_len)
+    except DataIntegrityError as e:
+        raise RuntimeError(f"{name} integrity fail (STRICT): {e}") from e
+    return fixed
+
+
+def _validate_signal_payload_candle_ts_strict(
+    candles: Any,
+    *,
+    name: str,
+    expected_latest_ts_ms: int,
+    min_len: int,
+    min_width: int,
+) -> None:
+    if not isinstance(candles, list):
+        raise RuntimeError(f"{name} must be list (STRICT)")
+    if len(candles) < min_len:
+        raise RuntimeError(f"{name} len insufficient (STRICT): need>={min_len} got={len(candles)}")
+
+    last_ts: Optional[int] = None
+    prev_ts: Optional[int] = None
+    for i, row in enumerate(candles):
+        if not isinstance(row, (list, tuple)):
+            raise RuntimeError(f"{name}[{i}] must be list/tuple (STRICT)")
+        if len(row) < min_width:
+            raise RuntimeError(f"{name}[{i}] width insufficient (STRICT): need>={min_width} got={len(row)}")
+        ts = _require_int_ms(row[0], f"{name}[{i}].ts")
+        if prev_ts is not None and ts <= prev_ts:
+            raise RuntimeError(f"{name} ts must be strictly increasing (STRICT): prev={prev_ts} now={ts}")
+        prev_ts = ts
+        last_ts = ts
+
+    if last_ts is None:
+        raise RuntimeError(f"{name} is empty (STRICT)")
+    if last_ts != expected_latest_ts_ms:
+        raise RuntimeError(
+            f"{name} latest ts mismatch (STRICT): expected={expected_latest_ts_ms} got={last_ts}"
+        )
+
+
+def _load_authoritative_ohlcv_series_strict(
+    symbol: str,
+    interval: str,
+    *,
+    min_len: int,
+    expected_latest_ts_ms: Optional[int] = None,
+) -> list[tuple[int, float, float, float, float, float]]:
+    raw = ws_get_klines_with_volume(symbol, interval, limit=min_len)
+    series = _normalize_ws_ohlcv_series_strict(raw, name=f"ws_kline[{interval}]", min_len=min_len)
+    if expected_latest_ts_ms is not None:
+        actual_latest_ts = int(series[-1][0])
+        if actual_latest_ts != int(expected_latest_ts_ms):
+            raise RuntimeError(
+                f"ws_kline[{interval}] latest ts mismatch (STRICT): expected={expected_latest_ts_ms} got={actual_latest_ts}"
+            )
+    return series
+
+
+def _compute_closed_slope_pct_strict(
+    series: Sequence[tuple[int, float, float, float, float, float]],
+    *,
+    interval: str,
+    lookback_closed_bars: int,
+) -> float:
+    need = int(lookback_closed_bars) + 1
+    if len(series) < need + 1:
+        raise RuntimeError(
+            f"ws_kline[{interval}] insufficient for confirmed slope (STRICT): need>={need + 1} got={len(series)}"
+        )
+
+    closed = list(series[-(lookback_closed_bars + 1) : -1])
+    if len(closed) != lookback_closed_bars:
+        raise RuntimeError(f"ws_kline[{interval}] closed slice invalid (STRICT)")
+
+    start_close = _as_float(closed[0][4], f"ws_kline[{interval}].closed_start_close", min_value=0.0)
+    end_close = _as_float(closed[-1][4], f"ws_kline[{interval}].closed_end_close", min_value=0.0)
+    if start_close <= 0.0:
+        raise RuntimeError(f"ws_kline[{interval}] closed_start_close must be > 0 (STRICT)")
+    return float((end_close - start_close) / start_close)
+
+
+def _classify_directional_state_from_slope_pct_strict(slope_pct: float, *, threshold: float, label: str) -> str:
+    sp = _as_float(slope_pct, label)
+    th = _as_float(threshold, f"{label}.threshold", min_value=0.0)
+    if sp >= th:
+        return "LONG"
+    if sp <= -th:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def _derive_orderflow_directional_state_strict(
+    *,
+    delta_ratio_pct: float,
+    aggression_bias: str,
+    divergence: str,
+) -> str:
+    delta_ratio = _as_float(delta_ratio_pct, "market_data.delta_ratio_pct")
+    bias = _normalize_aggression_bias_strict(aggression_bias)
+    div = _normalize_divergence_strict(divergence)
+
+    long_votes = 0
+    short_votes = 0
+
+    if bias == "aggressive_buy_dominant":
+        long_votes += 1
+    elif bias == "aggressive_sell_dominant":
+        short_votes += 1
+
+    if delta_ratio >= ORDERFLOW_BLOCK_DELTA_RATIO_PCT:
+        long_votes += 1
+    elif delta_ratio <= -ORDERFLOW_BLOCK_DELTA_RATIO_PCT:
+        short_votes += 1
+
+    if div == "bullish_divergence":
+        long_votes += 1
+    elif div == "bearish_divergence":
+        short_votes += 1
+
+    if long_votes > short_votes:
+        return "LONG"
+    if short_votes > long_votes:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def _derive_options_directional_state_strict(
+    *,
+    options_bias: str,
+    put_call_oi_ratio: float,
+    put_call_volume_ratio: float,
+) -> str:
+    bias = _normalize_options_bias_strict(options_bias)
+    oi_ratio = _as_float(put_call_oi_ratio, "market_data.put_call_oi_ratio", min_value=0.0)
+    vol_ratio = _as_float(put_call_volume_ratio, "market_data.put_call_volume_ratio", min_value=0.0)
+
+    if (
+        bias == "bullish"
+        and oi_ratio <= OPTIONS_BULLISH_PCR_THRESHOLD
+        and vol_ratio <= OPTIONS_BULLISH_PCR_THRESHOLD
+    ):
+        return "LONG"
+    if (
+        bias == "bearish"
+        and oi_ratio >= OPTIONS_BEARISH_PCR_THRESHOLD
+        and vol_ratio >= OPTIONS_BEARISH_PCR_THRESHOLD
+    ):
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def _evaluate_direction_stability_guard_strict(
+    *,
+    direction: str,
+    tf_states: Dict[str, str],
+    tf_slopes_pct: Dict[str, float],
+    orderflow_state: str,
+    options_state: str,
+) -> Optional[str]:
+    dir_norm = str(direction).upper().strip()
+    if dir_norm not in ("LONG", "SHORT"):
+        raise RuntimeError(f"invalid direction for stability guard (STRICT): {direction!r}")
+
+    primary_state = str(tf_states.get("5m") or "").upper().strip()
+    if primary_state != dir_norm:
+        slope = tf_slopes_pct.get("5m")
+        raise RuntimeError(
+            f"5m confirmed momentum misaligned (STRICT): direction={dir_norm} state={primary_state} slope_pct={slope}"
+        )
+
+    support_count = 0
+    oppose_count = 0
+    for label in ("15m", "1h"):
+        state = str(tf_states.get(label) or "").upper().strip()
+        if state == dir_norm:
+            support_count += 1
+        elif state in ("LONG", "SHORT") and state != dir_norm:
+            oppose_count += 1
+
+    for label, state in (("orderflow", orderflow_state), ("options", options_state)):
+        state_norm = str(state).upper().strip()
+        if state_norm == dir_norm:
+            support_count += 1
+        elif state_norm in ("LONG", "SHORT") and state_norm != dir_norm:
+            oppose_count += 1
+
+    if support_count < DIRECTION_CONFIRM_REQUIRED_SECONDARY_SUPPORTS:
+        return f"direction_secondary_support_insufficient:{dir_norm}:support={support_count}"
+    if oppose_count > DIRECTION_CONFIRM_MAX_SECONDARY_OPPOSE:
+        return f"direction_secondary_opposition_excess:{dir_norm}:oppose={oppose_count}"
+    if oppose_count > support_count:
+        return f"direction_secondary_alignment_negative:{dir_norm}:support={support_count}:oppose={oppose_count}"
+    return None
 
 
 def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], settings: Any) -> Dict[str, float | str]:
@@ -484,6 +742,24 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -
     )
     options_bias = _normalize_options_bias_strict(market_data.get("options_bias"))
 
+    direction_stability_guard_reason = market_data.get("direction_stability_guard_reason")
+    if direction_stability_guard_reason is not None:
+        reason = _require_nonempty_str(direction_stability_guard_reason, "market_data.direction_stability_guard_reason")
+        return EntryCandidate(
+            action="SKIP",
+            direction=direction,
+            tp_pct=float(tp_pct),
+            sl_pct=float(sl_pct),
+            reason=f"direction_stability_guard:{reason}",
+            meta={
+                "symbol": symbol,
+                "signal_ts_ms": int(signal_ts_ms),
+                "direction": direction,
+                "direction_stability_guard_reason": reason,
+            },
+            guard_adjustments={},
+        )
+
     meta = {
         "symbol": symbol,
         "regime": str(market_data.get("regime") or "").strip() or str(market_data.get("signal_source") or "").strip(),
@@ -511,6 +787,12 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -
         "put_call_oi_ratio": float(put_call_oi_ratio),
         "put_call_volume_ratio": float(put_call_volume_ratio),
         "options_bias": options_bias,
+        "direction_tf_states": market_data.get("direction_tf_states"),
+        "direction_tf_slopes_pct": market_data.get("direction_tf_slopes_pct"),
+        "direction_orderflow_state": market_data.get("direction_orderflow_state"),
+        "direction_options_state": market_data.get("direction_options_state"),
+        "direction_secondary_support_count": market_data.get("direction_secondary_support_count"),
+        "direction_secondary_oppose_count": market_data.get("direction_secondary_oppose_count"),
     }
 
     return EntryCandidate(
@@ -621,46 +903,41 @@ def _build_entry_market_data(
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
 
+    _validate_signal_payload_candle_ts_strict(
+        candles_5m,
+        name="signal.candles_5m",
+        expected_latest_ts_ms=ts_ms,
+        min_len=ENTRY_REQUIRED_KLINES_MIN["5m"],
+        min_width=5,
+    )
+    _validate_signal_payload_candle_ts_strict(
+        candles_5m_raw,
+        name="signal.candles_5m_raw",
+        expected_latest_ts_ms=ts_ms,
+        min_len=ENTRY_REQUIRED_KLINES_MIN["5m"],
+        min_width=6,
+    )
+
+    authoritative_5m = _load_authoritative_ohlcv_series_strict(
+        symbol,
+        "5m",
+        min_len=max(ENTRY_REQUIRED_KLINES_MIN["5m"], len(candles_5m_raw)),
+        expected_latest_ts_ms=ts_ms,
+    )
+    confirm_15m = _load_authoritative_ohlcv_series_strict(
+        symbol,
+        "15m",
+        min_len=max(ENTRY_REQUIRED_KLINES_MIN["15m"], DIRECTION_CONFIRM_MIN_LEN_BY_TF["15m"]),
+    )
+    confirm_1h = _load_authoritative_ohlcv_series_strict(
+        symbol,
+        "1h",
+        min_len=max(ENTRY_REQUIRED_KLINES_MIN["1h"], DIRECTION_CONFIRM_MIN_LEN_BY_TF["1h"]),
+    )
+
     lp = _as_float(last_price, "last_price", min_value=0.0)
     if lp <= 0:
         raise RuntimeError("last_price must be > 0 (STRICT)")
-
-    def _normalize_candles(arr: Any, *, name: str) -> Any:
-        if not isinstance(arr, list) or not arr:
-            return arr
-
-        fixed: list[tuple[int, float, float, float, float, float]] = []
-        for i, it in enumerate(arr):
-            if isinstance(it, (list, tuple)):
-                if len(it) >= 6:
-                    ts, o, h, l, c, v = it[0], it[1], it[2], it[3], it[4], it[5]
-                    fixed.append((int(ts), float(o), float(h), float(l), float(c), float(v)))
-                    continue
-                if len(it) == 5:
-                    ts, o, h, l, c = it[0], it[1], it[2], it[3], it[4]
-                    fixed.append((int(ts), float(o), float(h), float(l), float(c), 0.0))
-                    continue
-                raise RuntimeError(f"{name}[{i}] invalid candle tuple len<5 (STRICT): len={len(it)}")
-
-            if all(hasattr(it, a) for a in ("ts", "open", "high", "low", "close")):
-                fixed.append(
-                    (
-                        int(getattr(it, "ts")),
-                        float(getattr(it, "open")),
-                        float(getattr(it, "high")),
-                        float(getattr(it, "low")),
-                        float(getattr(it, "close")),
-                        0.0,
-                    )
-                )
-                continue
-
-            raise RuntimeError(f"{name}[{i}] invalid candle type (STRICT): {type(it).__name__}")
-
-        return fixed
-
-    candles_5m_norm = _normalize_candles(candles_5m, name="candles_5m")
-    candles_5m_raw_norm = _normalize_candles(candles_5m_raw, name="candles_5m_raw")
 
     try:
         market_features = build_unified_features(symbol)
@@ -672,14 +949,51 @@ def _build_entry_market_data(
 
     decision_meta = _extract_runtime_decision_meta_strict(market_features, settings)
 
+    direction_tf_slopes_pct = {
+        "5m": _compute_closed_slope_pct_strict(
+            authoritative_5m,
+            interval="5m",
+            lookback_closed_bars=DIRECTION_CONFIRM_LOOKBACK_CLOSED_BARS_BY_TF["5m"],
+        ),
+        "15m": _compute_closed_slope_pct_strict(
+            confirm_15m,
+            interval="15m",
+            lookback_closed_bars=DIRECTION_CONFIRM_LOOKBACK_CLOSED_BARS_BY_TF["15m"],
+        ),
+        "1h": _compute_closed_slope_pct_strict(
+            confirm_1h,
+            interval="1h",
+            lookback_closed_bars=DIRECTION_CONFIRM_LOOKBACK_CLOSED_BARS_BY_TF["1h"],
+        ),
+    }
+    direction_tf_states = {
+        tf: _classify_directional_state_from_slope_pct_strict(
+            slope_pct,
+            threshold=DIRECTION_CONFIRM_MIN_SLOPE_PCT_BY_TF[tf],
+            label=f"direction_tf_slopes_pct[{tf}]",
+        )
+        for tf, slope_pct in direction_tf_slopes_pct.items()
+    }
+
+    direction_orderflow_state = _derive_orderflow_directional_state_strict(
+        delta_ratio_pct=float(decision_meta["delta_ratio_pct"]),
+        aggression_bias=str(decision_meta["aggression_bias"]),
+        divergence=str(decision_meta["divergence"]),
+    )
+    direction_options_state = _derive_options_directional_state_strict(
+        options_bias=str(decision_meta["options_bias"]),
+        put_call_oi_ratio=float(decision_meta["put_call_oi_ratio"]),
+        put_call_volume_ratio=float(decision_meta["put_call_volume_ratio"]),
+    )
+
     out = {
         "symbol": symbol,
         "direction": direction,
         "signal_source": signal_source_s,
         "regime": signal_source_s,
         "signal_ts_ms": int(ts_ms),
-        "candles_5m": candles_5m_norm,
-        "candles_5m_raw": candles_5m_raw_norm,
+        "candles_5m": list(authoritative_5m),
+        "candles_5m_raw": list(authoritative_5m),
         "last_price": float(lp),
         "extra": extra,
         "market_features": market_features,
@@ -701,6 +1015,10 @@ def _build_entry_market_data(
         "put_call_oi_ratio": float(decision_meta["put_call_oi_ratio"]),
         "put_call_volume_ratio": float(decision_meta["put_call_volume_ratio"]),
         "options_bias": str(decision_meta["options_bias"]),
+        "direction_tf_slopes_pct": direction_tf_slopes_pct,
+        "direction_tf_states": direction_tf_states,
+        "direction_orderflow_state": direction_orderflow_state,
+        "direction_options_state": direction_options_state,
     }
 
     structural_block_reason = _evaluate_structural_entry_conflict_strict(out)
@@ -708,6 +1026,42 @@ def _build_entry_market_data(
         msg = f"[SKIP][STRUCTURE_FILTER] entry blocked: {symbol} ({direction}) reason={structural_block_reason}"
         log_fn(msg)
         notify_entry_block_fn(f"STRUCTURE_FILTER:{symbol}:{structural_block_reason}", msg, 60)
+        return None
+
+    direction_stability_guard_reason = _evaluate_direction_stability_guard_strict(
+        direction=direction,
+        tf_states=direction_tf_states,
+        tf_slopes_pct=direction_tf_slopes_pct,
+        orderflow_state=direction_orderflow_state,
+        options_state=direction_options_state,
+    )
+    secondary_support_count = 0
+    secondary_oppose_count = 0
+    for state in (
+        direction_tf_states["15m"],
+        direction_tf_states["1h"],
+        direction_orderflow_state,
+        direction_options_state,
+    ):
+        state_norm = str(state).upper().strip()
+        if state_norm == direction:
+            secondary_support_count += 1
+        elif state_norm in ("LONG", "SHORT") and state_norm != direction:
+            secondary_oppose_count += 1
+
+    out["direction_secondary_support_count"] = int(secondary_support_count)
+    out["direction_secondary_oppose_count"] = int(secondary_oppose_count)
+    out["direction_stability_guard_reason"] = direction_stability_guard_reason
+
+    if direction_stability_guard_reason is not None:
+        msg = (
+            f"[SKIP][DIRECTION_STABILITY] entry blocked: {symbol} ({direction}) "
+            f"reason={direction_stability_guard_reason} tf_states={direction_tf_states} "
+            f"tf_slopes_pct={direction_tf_slopes_pct} orderflow={direction_orderflow_state} "
+            f"options={direction_options_state}"
+        )
+        log_fn(msg)
+        notify_entry_block_fn(f"DIRECTION_STABILITY:{symbol}:{direction_stability_guard_reason}", msg, 60)
         return None
 
     validate_entry_market_data_bundle_strict(out)

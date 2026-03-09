@@ -21,6 +21,17 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-09 (TRADE-GRADE PATCH 4):
+  1) FIX(ROOT-CAUSE): cand.action 비-ENTER 경로의 즉시 SKIP 흐름 복구
+     - _decide_entry_candidate_strict 결과가 ENTER가 아니면 downstream risk/execution 경로로 진입하지 않음
+     - candidate skip 로그/텔레그램 억제 로직 유지
+  2) FIX(STRICT): cand.action 정규화 값을 단일 변수(action)로 고정 사용
+     - 조건 분기 중 중복 비교 제거
+     - signal_final.action도 하드코딩 "ENTER" 대신 정규화 값 사용
+  3) FIX(COOLDOWN): LAST_ENTRY_GPT_CALL_TS 는 confirmed ENTER candidate 에 대해서만 갱신
+     - NO-ENTRY / HOLD / 기타 비-ENTER 액션에서는 cooldown 오염 금지
+  4) 기존 기능 삭제 없음
+
 - 2026-03-07 (TRADE-GRADE PATCH):
   1) 5m 캔들 단위 진입 게이트 추가
      - 동일 signal_ts_ms(사실상 동일 5m 캔들)에서 중복 진입 평가 금지
@@ -75,6 +86,16 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
   3) 보호주문/포지션 상태 오판 방지
      - 실제 거래소 포지션이 열려 있는 경우에만 보호주문 누락을 치명으로 판정
 
+- 2026-03-09 (TRADE-GRADE PATCH 3):
+  1) FIX(ROOT-CAUSE): 메인 루프를 고주기 감독 루프 + 스로틀된 진입 평가 루프로 재구성
+     - 무거운 _build_entry_market_data / regime / risk / execution 경로를 매 틱 반복 실행하지 않음
+     - WS 1m 캔들/오더북 마커 갱신 기준으로만 진입 평가 수행
+  2) FIX(LATENCY): equity 조회 1초 TTL 캐시 추가
+     - 고주기 루프에서도 REST balance/equity 조회가 병목이 되지 않도록 정합성 보존형 캐시 적용
+  3) FIX(RESPONSIVENESS): 엔진 sleep 1초 고정 제거 → 0.2초 감독 tick 적용
+     - SAFE_STOP / SIGTERM / 신규 캔들 감지를 더 빠르게 반영
+  4) 기존 기능 삭제 없음
+
 - 2026-03-08 (TRADE-GRADE PATCH 2):
   1) FIX(ROOT-CAUSE): 고정 10초 warmup 제거 → 실제 WS 준비 완료 게이트 추가
   2) FIX(STRICT): entry required klines 최소 길이를 downstream EMA200 요구량과 정합화
@@ -93,7 +114,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -217,6 +238,15 @@ _WS_LIVENESS_FAIL_HARDSTOP_N: int = 3
 _ACCOUNT_WS_FAIL_HARDSTOP_N: int = 3
 _ACCOUNT_WS_READY_TIMEOUT_SEC: float = 20.0
 
+ENGINE_LOOP_TICK_SEC: float = 0.20
+ENGINE_PROTECTION_GUARD_INTERVAL_SEC: float = 1.00
+ENGINE_ENTRY_OB_MIN_INTERVAL_SEC: float = 0.35
+ENGINE_ENTRY_FORCE_INTERVAL_SEC: float = 1.00
+ENGINE_EQUITY_CACHE_TTL_SEC: float = 1.00
+
+_EQUITY_CACHE_VALUE: Optional[float] = None
+_EQUITY_CACHE_TS: float = 0.0
+
 
 def _as_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
     if isinstance(v, bool):
@@ -244,6 +274,74 @@ def _require_int_ms(v: Any, name: str) -> int:
     if iv <= 0:
         raise RuntimeError(f"{name} must be > 0 (STRICT)")
     return iv
+
+
+def _invalidate_equity_cache() -> None:
+    global _EQUITY_CACHE_VALUE, _EQUITY_CACHE_TS
+    _EQUITY_CACHE_VALUE = None
+    _EQUITY_CACHE_TS = 0.0
+
+
+def _get_latest_ws_kline_ts_optional(symbol: str, interval: str) -> Optional[int]:
+    buf = ws_get_klines_with_volume(symbol, interval, limit=1)
+    if not isinstance(buf, list):
+        raise RuntimeError(f"ws_get_klines_with_volume returned non-list (STRICT): interval={interval}")
+    if not buf:
+        return None
+
+    row = buf[-1]
+    if not isinstance(row, (list, tuple)) or not row:
+        raise RuntimeError(f"ws kline row invalid (STRICT): interval={interval}")
+    return _require_int_ms(row[0], f"ws[{interval}].openTime")
+
+
+def _get_orderbook_marker_ts_optional(symbol: str) -> Optional[int]:
+    ob = ws_get_orderbook(symbol, limit=1)
+    if ob is None:
+        return None
+    if not isinstance(ob, dict):
+        raise RuntimeError("ws_get_orderbook returned non-dict (STRICT)")
+
+    ts_val = ob.get("ts")
+    if ts_val is None:
+        return None
+    return _require_int_ms(ts_val, "orderbook.ts")
+
+
+def _should_run_entry_cycle(
+    symbol: str,
+    now_ts: float,
+    last_eval_wall_ts: float,
+    last_eval_1m_ts: Optional[int],
+    last_eval_orderbook_ts: Optional[int],
+) -> Tuple[bool, Optional[int], Optional[int]]:
+    latest_1m_ts = _get_latest_ws_kline_ts_optional(symbol, "1m")
+    latest_orderbook_ts = _get_orderbook_marker_ts_optional(symbol)
+
+    if latest_1m_ts is not None and last_eval_1m_ts is not None and latest_1m_ts < last_eval_1m_ts:
+        raise RuntimeError(
+            f"entry loop 1m ts rollback detected (STRICT): prev={last_eval_1m_ts} now={latest_1m_ts}"
+        )
+
+    if latest_orderbook_ts is not None and last_eval_orderbook_ts is not None and latest_orderbook_ts < last_eval_orderbook_ts:
+        raise RuntimeError(
+            f"entry loop orderbook ts rollback detected (STRICT): prev={last_eval_orderbook_ts} now={latest_orderbook_ts}"
+        )
+
+    if last_eval_wall_ts <= 0.0:
+        return True, latest_1m_ts, latest_orderbook_ts
+
+    if latest_1m_ts is not None and (last_eval_1m_ts is None or latest_1m_ts > last_eval_1m_ts):
+        return True, latest_1m_ts, latest_orderbook_ts
+
+    if latest_orderbook_ts is not None and (last_eval_orderbook_ts is None or latest_orderbook_ts > last_eval_orderbook_ts):
+        if (now_ts - last_eval_wall_ts) >= ENGINE_ENTRY_OB_MIN_INTERVAL_SEC:
+            return True, latest_1m_ts, latest_orderbook_ts
+
+    if (now_ts - last_eval_wall_ts) >= ENGINE_ENTRY_FORCE_INTERVAL_SEC:
+        return True, latest_1m_ts, latest_orderbook_ts
+
+    return False, latest_1m_ts, latest_orderbook_ts
 
 
 def _claim_entry_signal_ts_or_skip(signal_ts_ms: Any) -> bool:
@@ -771,6 +869,28 @@ def _get_equity_current_usdt_strict() -> float:
     raise RuntimeError("equity_current_usdt invalid: 0.0")
 
 
+def _get_equity_current_usdt_cached_strict(now_ts: float) -> float:
+    global _EQUITY_CACHE_VALUE, _EQUITY_CACHE_TS
+
+    now_f = float(now_ts)
+    if not math.isfinite(now_f) or now_f <= 0.0:
+        raise RuntimeError("now_ts must be finite > 0 (STRICT)")
+
+    cached_value = _EQUITY_CACHE_VALUE
+    cached_ts = _EQUITY_CACHE_TS
+    if cached_value is not None:
+        age = now_f - float(cached_ts)
+        if age < 0:
+            raise RuntimeError(f"equity cache ts rollback detected (STRICT): cache_ts={cached_ts} now_ts={now_f}")
+        if age <= ENGINE_EQUITY_CACHE_TTL_SEC:
+            return float(cached_value)
+
+    fresh = _get_equity_current_usdt_strict()
+    _EQUITY_CACHE_VALUE = float(fresh)
+    _EQUITY_CACHE_TS = now_f
+    return float(fresh)
+
+
 def _load_equity_peak_bootstrap(symbol: str) -> Optional[float]:
     sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not sym:
@@ -1166,9 +1286,6 @@ def main() -> None:
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
 
-    # -----------------------------------------
-    # Market Research Worker (external market)
-    # -----------------------------------------
     try:
         researcher = MarketResearcher()
 
@@ -1188,6 +1305,7 @@ def main() -> None:
         raise
 
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
+    _invalidate_equity_cache()
     LAST_EXCHANGE_SYNC_TS = time.time()
 
     confirm_n_i = int(SET.reconcile_confirm_n)
@@ -1245,6 +1363,10 @@ def main() -> None:
     position_resync_sec = float(SET.position_resync_sec)
     last_fill_check: float = 0.0
     last_balance_log: float = 0.0
+    last_protection_guard_ts: float = 0.0
+    last_entry_cycle_wall_ts: float = 0.0
+    last_entry_cycle_1m_ts: Optional[int] = None
+    last_entry_cycle_orderbook_ts: Optional[int] = None
 
     max_signal_latency_ms = float(SET.max_signal_latency_ms)
     max_exec_latency_ms = float(SET.max_exec_latency_ms)
@@ -1258,8 +1380,9 @@ def main() -> None:
 
             _account_ws_connected_guard_or_raise()
 
-            if OPEN_TRADES:
+            if OPEN_TRADES and (now - last_protection_guard_ts) >= ENGINE_PROTECTION_GUARD_INTERVAL_SEC:
                 _protection_orders_guard_or_raise()
+                last_protection_guard_ts = now
 
             if SIGTERM_DEADLINE_TS is not None and now >= SIGTERM_DEADLINE_TS and not _SIGTERM_DEADLINE_HANDLED:
                 _SIGTERM_DEADLINE_HANDLED = True
@@ -1279,6 +1402,7 @@ def main() -> None:
 
             if now - LAST_EXCHANGE_SYNC_TS >= position_resync_sec:
                 OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
+                _invalidate_equity_cache()
                 LAST_EXCHANGE_SYNC_TS = now
 
             if now - last_balance_log >= 60:
@@ -1298,6 +1422,8 @@ def main() -> None:
 
             if now - last_fill_check >= float(SET.poll_fills_sec):
                 OPEN_TRADES, closed_list = check_closes(OPEN_TRADES, TRADER_STATE)
+                if closed_list:
+                    _invalidate_equity_cache()
                 for closed in closed_list:
                     t: Trade = closed["trade"]
                     reason: str = closed["reason"]
@@ -1385,8 +1511,9 @@ def main() -> None:
                                 if maybe_exit_with_gpt(t, SET, scenario="RUNTIME_EXIT_CHECK"):
                                     OPEN_TRADES = [ot for ot in OPEN_TRADES if ot is not t]
                                     LAST_CLOSE_TS = now
+                                    _invalidate_equity_cache()
                             LAST_EXIT_CANDLE_TS_1M = last_ts_ms
-                interruptible_sleep(1)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
             if SAFE_STOP_REQUESTED and not OPEN_TRADES:
@@ -1395,11 +1522,22 @@ def main() -> None:
 
             entry_cooldown_sec = float(SET.entry_cooldown_sec)
             if now - LAST_ENTRY_GPT_CALL_TS < entry_cooldown_sec:
-                interruptible_sleep(1)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
+                continue
+
+            should_run_entry_cycle, latest_1m_ts, latest_orderbook_ts = _should_run_entry_cycle(
+                SET.symbol,
+                now,
+                last_entry_cycle_wall_ts,
+                last_entry_cycle_1m_ts,
+                last_entry_cycle_orderbook_ts,
+            )
+            if not should_run_entry_cycle:
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
             try:
-                equity_current_usdt = _get_equity_current_usdt_strict()
+                equity_current_usdt = _get_equity_current_usdt_cached_strict(now)
                 _EQUITY_CONSEC_FAILS = 0
             except Exception as e:
                 _EQUITY_CONSEC_FAILS += 1
@@ -1421,6 +1559,10 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
+            last_entry_cycle_wall_ts = now
+            last_entry_cycle_1m_ts = latest_1m_ts
+            last_entry_cycle_orderbook_ts = latest_orderbook_ts
+
             market_data = _build_entry_market_data(
                 SET,
                 LAST_CLOSE_TS,
@@ -1428,7 +1570,7 @@ def main() -> None:
                 log_fn=log,
             )
             if market_data is None:
-                interruptible_sleep(1)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
             try:
@@ -1440,12 +1582,8 @@ def main() -> None:
                 _maybe_send_error_tg("DATA_INTEGRITY", msg, cooldown_sec=60)
                 raise RuntimeError(msg) from e
 
-            # =========================================================
-            # TRADE-GRADE PATCH:
-            # 동일 5m 캔들(signal_ts_ms 동일)에서는 진입 평가를 한 번만 수행한다.
-            # =========================================================
             if not _claim_entry_signal_ts_or_skip(market_data.get("signal_ts_ms")):
-                interruptible_sleep(1)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
             mf = market_data.get("market_features")
@@ -1461,7 +1599,7 @@ def main() -> None:
                 msg = f"[SKIP][REGIME_NO_TRADE] score={float(regime_decision.score):.1f} band={regime_decision.band}"
                 log(msg)
                 _maybe_send_entry_block_tg("REGIME_NO_TRADE", msg, cooldown_sec=60)
-                interruptible_sleep(5)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
             account_state = account_builder.build(
@@ -1482,14 +1620,18 @@ def main() -> None:
                 _maybe_send_error_tg("LATENCY_SIGNAL", msg, cooldown_sec=60)
                 raise RuntimeError(msg)
 
-            LAST_ENTRY_GPT_CALL_TS = now
+            action = str(cand.action).upper().strip()
+            if not action:
+                raise RuntimeError("cand.action missing (STRICT)")
 
-            if str(cand.action).upper().strip() != "ENTER":
+            if action != "ENTER":
                 msg = f"[SKIP][CANDIDATE] {cand.reason}"
                 log(msg)
                 _maybe_send_entry_block_tg("CANDIDATE_SKIP", msg, cooldown_sec=60)
-                interruptible_sleep(5)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
+
+            LAST_ENTRY_GPT_CALL_TS = now
 
             micro = (mf or {}).get("microstructure") if isinstance(mf, dict) else None
             if not isinstance(micro, dict):
@@ -1522,7 +1664,7 @@ def main() -> None:
                 msg = f"[SKIP][RISK_PHYSICS] {rp.reason}"
                 log(msg)
                 _maybe_send_entry_block_tg("RISK_PHYSICS_SKIP", msg, cooldown_sec=60)
-                interruptible_sleep(5)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
             try:
@@ -1591,7 +1733,7 @@ def main() -> None:
             )
 
             signal_final = Signal(
-                action="ENTER",
+                action=action,
                 direction=str(cand.direction),
                 tp_pct=float(cand.tp_pct),
                 sl_pct=float(cand.sl_pct),
@@ -1613,14 +1755,15 @@ def main() -> None:
 
             if trade:
                 OPEN_TRADES.append(trade)
+                _invalidate_equity_cache()
 
-            interruptible_sleep(1)
+            interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
 
         except AccountStateNotReadyError as e:
             msg = f"[SKIP][ACCOUNT_NOT_READY] {e}"
             log(msg)
             _maybe_send_entry_block_tg("ACCOUNT_NOT_READY", msg, cooldown_sec=60)
-            interruptible_sleep(10)
+            interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
 
         except Exception as e:
             SAFE_STOP_REQUESTED = True

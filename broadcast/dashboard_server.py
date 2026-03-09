@@ -145,7 +145,6 @@ from settings import load_settings
 
 logger = logging.getLogger(__name__)
 
-
 # =====================================================
 # FastAPI App
 # =====================================================
