@@ -7,21 +7,29 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
-- ROOT-CAUSE 복구: run_bot_ws.py 가 요구하는 ExecutionEngine 클래스 복원
-- SIGNAL 계약 정합 복구: Signal(action/direction/tp_pct/sl_pct/risk_pct/meta) 입력을 엄격 해석
-- 수량 계산 복구: qty 직접 입력 또는 risk_pct × capital × leverage / entry_price 방식 지원
+- FIX(ROOT-CAUSE): require_deterministic_client_order_id=True 환경에서
+  signal이 entry_client_order_id를 주지 않아도 deterministic client_order_id를 강제 생성
+- FIX(CONTRACT): run_bot_ws Signal 구조(action/direction/tp_pct/sl_pct/risk_pct/meta)와 정합 유지
+- FIX(EXECUTION): order_executor.open_position_with_tp_sl() 호출 계약에서
+  deterministic client_order_id 누락으로 실패하던 경로 복구
 - 기존 기능 삭제 없음: 실제 주문 실행 SSOT 는 order_executor.open_position_with_tp_sl() 유지
 
 코드 정리 내용
-- execution_engine 내부 중복 주문 실행/검증 로직 제거
-- order_executor 공개 계약 재노출(re-export) 유지
-- signal/meta 2계층 정규화 추가
-- action 을 side 로 오인하던 잘못된 해석 제거
-- 사용 안 하는 중복 구현/죽은 로직 제거
+- deterministic client_order_id 생성 로직 추가
+- 불필요 import 제거
+- signal/meta 2계층 정규화 유지
+- action 을 side 로 오인하던 잘못된 해석 유지 차단
+- 사용 안 하는 중복 구현/죽은 로직 정리
 
 변경 이력
 --------------------------------------------------------
 - 2026-03-10:
+  1) FIX(ROOT-CAUSE): settings.require_deterministic_client_order_id=True 일 때
+     entry_client_order_id 누락 시 deterministic client_order_id 자동 생성 추가
+  2) FIX(CONTRACT): 생성된 client_order_id 를 Trade.client_entry_id 와 엄격 검증하도록 유지
+  3) CLEANUP: dead import 제거 및 해시용 canonicalization 유틸 추가
+
+- 2026-03-09:
   1) FIX(ROOT-CAUSE): ExecutionEngine 클래스 복구
      - __init__(settings)
      - execute(signal) -> Trade
@@ -29,20 +37,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   3) FIX(SYNTAX): entry_client_order_id 대입 구문 오타 수정
   4) FIX(SIZING): qty 누락 시 risk_pct 기반 수량 계산 복구
   5) CLEANUP: execution_engine 내부 중복 실행 로직 제거, order_executor 단일 SSOT 유지
-
-- 2026-03-09:
-  1) ROOT-CAUSE 확인
-     - current HEAD 에서 ExecutionEngine 클래스 누락으로 ImportError 발생
-     - run_bot_ws.py 의 import / instantiate 계약 불일치 확인
 ========================================================
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
-from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, is_dataclass, replace
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
 
 from execution.order_executor import (
@@ -304,7 +310,9 @@ def _extract_action_if_present_or_raise(
         return
 
     if action != "ENTER":
-        raise OrderExecutionError(f"ExecutionEngine only accepts ENTER action (STRICT): got={action!r}")
+        raise OrderExecutionError(
+            f"ExecutionEngine only accepts ENTER action (STRICT): got={action!r}"
+        )
 
 
 def _compute_qty_from_risk_strict(
@@ -335,6 +343,178 @@ def _compute_qty_from_risk_strict(
         raise OrderExecutionError("computed qty invalid (STRICT)")
 
     return float(qty)
+
+
+def _canonicalize_for_hash_strict(
+    value: Any,
+    *,
+    path: str,
+    seen: set[int],
+) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise OrderExecutionError(f"{path} contains non-finite float (STRICT)")
+        return format(value, ".15g")
+
+    if isinstance(value, Decimal):
+        return str(value)
+
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    if isinstance(value, Mapping):
+        obj_id = id(value)
+        if obj_id in seen:
+            raise OrderExecutionError(f"{path} contains cyclic mapping reference (STRICT)")
+        seen.add(obj_id)
+        try:
+            out: dict[str, Any] = {}
+            for k in sorted(value.keys(), key=lambda item: str(item)):
+                out[str(k)] = _canonicalize_for_hash_strict(
+                    value[k],
+                    path=f"{path}.{k}",
+                    seen=seen,
+                )
+            return out
+        finally:
+            seen.remove(obj_id)
+
+    if isinstance(value, (list, tuple)):
+        obj_id = id(value)
+        if obj_id in seen:
+            raise OrderExecutionError(f"{path} contains cyclic sequence reference (STRICT)")
+        seen.add(obj_id)
+        try:
+            return [
+                _canonicalize_for_hash_strict(v, path=f"{path}[{idx}]", seen=seen)
+                for idx, v in enumerate(value)
+            ]
+        finally:
+            seen.remove(obj_id)
+
+    if isinstance(value, set):
+        obj_id = id(value)
+        if obj_id in seen:
+            raise OrderExecutionError(f"{path} contains cyclic set reference (STRICT)")
+        seen.add(obj_id)
+        try:
+            normalized_items = [
+                _canonicalize_for_hash_strict(v, path=f"{path}[set_item]", seen=seen)
+                for v in value
+            ]
+            return sorted(
+                normalized_items,
+                key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=True),
+            )
+        finally:
+            seen.remove(obj_id)
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        return _canonicalize_for_hash_strict(dumped, path=path, seen=seen)
+
+    if is_dataclass(value):
+        dumped = asdict(value)
+        return _canonicalize_for_hash_strict(dumped, path=path, seen=seen)
+
+    if hasattr(value, "__dict__"):
+        public_dict = {
+            str(k): v
+            for k, v in vars(value).items()
+            if not str(k).startswith("_")
+        }
+        if not public_dict:
+            raise OrderExecutionError(f"{path} object has no public fields for deterministic hash (STRICT)")
+        return _canonicalize_for_hash_strict(public_dict, path=path, seen=seen)
+
+    raise OrderExecutionError(
+        f"{path} contains unsupported type for deterministic client_order_id: "
+        f"{type(value).__name__} (STRICT)"
+    )
+
+
+def _build_deterministic_client_order_id_strict(
+    *,
+    signal: Any,
+    req: EntryExecutionRequest,
+) -> str:
+    signal_map = _signal_to_mapping_strict(signal)
+    signal_payload = _canonicalize_for_hash_strict(signal_map, path="signal", seen=set())
+
+    request_payload = {
+        "symbol": req.symbol,
+        "side_open": req.side_open,
+        "qty": format(req.qty, ".15g"),
+        "entry_price_hint": format(req.entry_price_hint, ".15g"),
+        "tp_pct": format(req.tp_pct, ".15g"),
+        "sl_pct": format(req.sl_pct, ".15g"),
+        "source": req.source,
+        "soft_mode": req.soft_mode,
+        "sl_floor_ratio": None if req.sl_floor_ratio is None else format(req.sl_floor_ratio, ".15g"),
+        "available_usdt": None if req.available_usdt is None else format(req.available_usdt, ".15g"),
+        "risk_pct": None if req.risk_pct is None else format(req.risk_pct, ".15g"),
+    }
+
+    payload = {
+        "signal": signal_payload,
+        "request": request_payload,
+    }
+
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest().upper()
+    client_order_id = f"AT{digest[:34]}"
+
+    return _normalize_optional_client_order_id_strict(client_order_id)  # type: ignore[return-value]
+
+
+def _settings_require_deterministic_client_order_id_strict(settings: Any) -> bool:
+    raw = getattr(settings, "require_deterministic_client_order_id", None)
+    normalized = _normalize_optional_bool_strict(
+        raw,
+        field_name="settings.require_deterministic_client_order_id",
+    )
+    return bool(normalized) if normalized is not None else False
+
+
+def _enforce_or_generate_client_order_id_strict(
+    *,
+    signal: Any,
+    req: EntryExecutionRequest,
+    settings: Any,
+) -> EntryExecutionRequest:
+    if req.entry_client_order_id is not None:
+        return req
+
+    if not _settings_require_deterministic_client_order_id_strict(settings):
+        return req
+
+    generated = _build_deterministic_client_order_id_strict(signal=signal, req=req)
+
+    logger.info(
+        "ExecutionEngine generated deterministic entry_client_order_id "
+        "(symbol=%s side=%s cid=%s)",
+        req.symbol,
+        req.side_open,
+        generated,
+    )
+
+    return replace(req, entry_client_order_id=generated)
 
 
 def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutionRequest:
@@ -569,10 +749,16 @@ class ExecutionEngine:
 
     def execute(self, signal: Any) -> Trade:
         req = _normalize_entry_request_strict(signal, self._settings)
+        req = _enforce_or_generate_client_order_id_strict(
+            signal=signal,
+            req=req,
+            settings=self._settings,
+        )
 
         logger.info(
             "ExecutionEngine.execute start "
-            "(symbol=%s side=%s qty=%s entry_price_hint=%s tp_pct=%s sl_pct=%s risk_pct=%s source=%s soft_mode=%s)",
+            "(symbol=%s side=%s qty=%s entry_price_hint=%s tp_pct=%s sl_pct=%s risk_pct=%s "
+            "source=%s soft_mode=%s entry_client_order_id=%s)",
             req.symbol,
             req.side_open,
             req.qty,
@@ -582,6 +768,7 @@ class ExecutionEngine:
             req.risk_pct,
             req.source,
             req.soft_mode,
+            req.entry_client_order_id,
         )
 
         trade = open_position_with_tp_sl(
@@ -606,12 +793,13 @@ class ExecutionEngine:
 
         logger.info(
             "ExecutionEngine.execute success "
-            "(symbol=%s side=%s qty=%s entry=%s entry_order_id=%s)",
+            "(symbol=%s side=%s qty=%s entry=%s entry_order_id=%s client_entry_id=%s)",
             getattr(trade, "symbol", None),
             getattr(trade, "side", None),
             getattr(trade, "qty", None),
             getattr(trade, "entry_price", getattr(trade, "entry", None)),
             getattr(trade, "entry_order_id", None),
+            getattr(trade, "client_entry_id", None),
         )
         return trade
 
