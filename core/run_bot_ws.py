@@ -21,6 +21,16 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-09 (TRADE-GRADE PATCH 5):
+  1) FIX(ROOT-CAUSE): 동일 5m 캔들 진입 게이트를 메모리 변수에서 DB 영속 체크포인트로 승격
+     - LAST_ENTRY_EVAL_SIGNAL_TS_MS 재시작 리셋 문제 제거
+     - 엔진 재부팅 후에도 이미 처리한 signal_ts_ms 재평가 금지
+  2) ADD(STRICT): bt_engine_runtime_state 진입 게이트 전용 행 잠금 + advisory xact lock 추가
+     - 다중 프로세스/중복 기동 시에도 같은 symbol 의 동일 캔들 중복 claim 차단
+  3) ADD(BOOT): 부팅 시 persisted entry signal gate 복구
+     - DB 저장값과 메모리 게이트를 동기화하여 rollback / duplicate 판정 일관성 확보
+  4) 기존 기능 삭제 없음
+
 - 2026-03-09 (TRADE-GRADE PATCH 4):
   1) FIX(ROOT-CAUSE): cand.action 비-ENTER 경로의 즉시 SKIP 흐름 복구
      - _decide_entry_candidate_strict 결과가 ENTER가 아니면 downstream risk/execution 경로로 진입하지 않음
@@ -226,6 +236,9 @@ LAST_ENTRY_GPT_CALL_TS: float = 0.0
 # TRADE-GRADE PATCH:
 # 같은 signal_ts_ms(실질적으로 동일 5m 캔들)에서는 진입 평가를 한 번만 수행한다.
 LAST_ENTRY_EVAL_SIGNAL_TS_MS: Optional[int] = None
+ENTRY_GATE_RUNTIME_STATE_SCOPE: str = "ENTRY_EVAL_SIGNAL_GATE"
+ENTRY_GATE_RUNTIME_STATE_TABLE: str = "bt_engine_runtime_state"
+
 
 _BALANCE_CONSEC_FAILS: int = 0
 _EQUITY_CONSEC_FAILS: int = 0
@@ -274,6 +287,83 @@ def _require_int_ms(v: Any, name: str) -> int:
     if iv <= 0:
         raise RuntimeError(f"{name} must be > 0 (STRICT)")
     return iv
+
+
+def _normalize_symbol_strict(symbol: Any, *, name: str = "symbol") -> str:
+    s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        raise RuntimeError(f"{name} is empty (STRICT)")
+    return s
+
+
+def _entry_gate_lock_key(symbol: str) -> int:
+    sym = _normalize_symbol_strict(symbol, name="entry_gate.symbol")
+    raw = hashlib.sha1(f"{ENTRY_GATE_RUNTIME_STATE_SCOPE}:{sym}".encode("utf-8")).digest()[:8]
+    key = int.from_bytes(raw, byteorder="big", signed=False) & 0x7FFFFFFFFFFFFFFF
+    if key <= 0:
+        raise RuntimeError("entry gate advisory lock key invalid (STRICT)")
+    return key
+
+
+def _ensure_entry_gate_runtime_state_table_or_raise() -> None:
+    ddl = text(
+        f"""
+        CREATE TABLE IF NOT EXISTS {ENTRY_GATE_RUNTIME_STATE_TABLE} (
+            scope TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            last_entry_eval_signal_ts_ms BIGINT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (scope, symbol)
+        )
+        """
+    )
+
+    with get_session() as session:
+        session.execute(ddl)
+        session.commit()
+
+
+def _load_persisted_entry_signal_ts_or_raise(symbol: str) -> Optional[int]:
+    sym = _normalize_symbol_strict(symbol, name="entry_gate.symbol")
+    q = text(
+        f"""
+        SELECT last_entry_eval_signal_ts_ms
+        FROM {ENTRY_GATE_RUNTIME_STATE_TABLE}
+        WHERE scope = :scope
+          AND symbol = :symbol
+        """
+    )
+
+    with get_session() as session:
+        row = session.execute(
+            q,
+            {
+                "scope": ENTRY_GATE_RUNTIME_STATE_SCOPE,
+                "symbol": sym,
+            },
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    persisted = _require_int_ms(row[0], f"{ENTRY_GATE_RUNTIME_STATE_TABLE}.last_entry_eval_signal_ts_ms")
+    return int(persisted)
+
+
+def _bootstrap_entry_signal_gate_or_raise(symbol: str) -> None:
+    global LAST_ENTRY_EVAL_SIGNAL_TS_MS
+
+    _ensure_entry_gate_runtime_state_table_or_raise()
+    persisted = _load_persisted_entry_signal_ts_or_raise(symbol)
+    LAST_ENTRY_EVAL_SIGNAL_TS_MS = persisted
+    if persisted is None:
+        log(f"[ENTRY_GATE][BOOT] no persisted signal gate: symbol={_normalize_symbol_strict(symbol)}")
+        return
+
+    log(
+        "[ENTRY_GATE][BOOT] persisted signal gate loaded: "
+        f"symbol={_normalize_symbol_strict(symbol)} last_entry_eval_signal_ts_ms={persisted}"
+    )
 
 
 def _invalidate_equity_cache() -> None:
@@ -344,30 +434,104 @@ def _should_run_entry_cycle(
     return False, latest_1m_ts, latest_orderbook_ts
 
 
-def _claim_entry_signal_ts_or_skip(signal_ts_ms: Any) -> bool:
+def _claim_entry_signal_ts_or_skip(symbol: str, signal_ts_ms: Any) -> bool:
     """
     TRADE-GRADE PATCH:
     - 동일 signal_ts_ms(동일 5m 캔들 판단)에서는 진입 평가를 한 번만 수행한다.
+    - 메모리만이 아니라 DB 영속 체크포인트를 단일 진실원으로 사용한다.
     - 과거 ts가 오면 rollback으로 간주하고 즉시 예외.
+    - 동일 symbol 다중 프로세스 기동에서도 advisory xact lock + row lock 으로 중복 claim을 차단한다.
     """
     global LAST_ENTRY_EVAL_SIGNAL_TS_MS
 
+    sym = _normalize_symbol_strict(symbol, name="entry_gate.symbol")
     current_ts = _require_int_ms(signal_ts_ms, "market_data.signal_ts_ms")
-    prev_ts = LAST_ENTRY_EVAL_SIGNAL_TS_MS
+    prev_mem_ts = LAST_ENTRY_EVAL_SIGNAL_TS_MS
 
-    if prev_ts is None:
-        LAST_ENTRY_EVAL_SIGNAL_TS_MS = current_ts
-        return True
-
-    if current_ts < prev_ts:
+    if prev_mem_ts is not None and current_ts < prev_mem_ts:
         raise RuntimeError(
-            f"entry signal ts rollback detected (STRICT): prev={prev_ts} now={current_ts}"
+            f"entry signal ts rollback detected vs memory (STRICT): prev={prev_mem_ts} now={current_ts}"
         )
 
-    if current_ts == prev_ts:
-        return False
+    q_select = text(
+        f"""
+        SELECT last_entry_eval_signal_ts_ms
+        FROM {ENTRY_GATE_RUNTIME_STATE_TABLE}
+        WHERE scope = :scope
+          AND symbol = :symbol
+        FOR UPDATE
+        """
+    )
+    q_insert = text(
+        f"""
+        INSERT INTO {ENTRY_GATE_RUNTIME_STATE_TABLE} (scope, symbol, last_entry_eval_signal_ts_ms, updated_at)
+        VALUES (:scope, :symbol, :signal_ts_ms, NOW())
+        """
+    )
+    q_update = text(
+        f"""
+        UPDATE {ENTRY_GATE_RUNTIME_STATE_TABLE}
+        SET last_entry_eval_signal_ts_ms = :signal_ts_ms,
+            updated_at = NOW()
+        WHERE scope = :scope
+          AND symbol = :symbol
+        """
+    )
 
-    LAST_ENTRY_EVAL_SIGNAL_TS_MS = current_ts
+    with get_session() as session:
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": _entry_gate_lock_key(sym)},
+        )
+        row = session.execute(
+            q_select,
+            {
+                "scope": ENTRY_GATE_RUNTIME_STATE_SCOPE,
+                "symbol": sym,
+            },
+        ).fetchone()
+
+        prev_db_ts: Optional[int]
+        if row is None:
+            prev_db_ts = None
+            session.execute(
+                q_insert,
+                {
+                    "scope": ENTRY_GATE_RUNTIME_STATE_SCOPE,
+                    "symbol": sym,
+                    "signal_ts_ms": int(current_ts),
+                },
+            )
+            session.commit()
+            LAST_ENTRY_EVAL_SIGNAL_TS_MS = int(current_ts)
+            return True
+
+        prev_db_ts = _require_int_ms(
+            row[0],
+            f"{ENTRY_GATE_RUNTIME_STATE_TABLE}.last_entry_eval_signal_ts_ms",
+        )
+
+        if current_ts < prev_db_ts:
+            raise RuntimeError(
+                f"entry signal ts rollback detected vs db (STRICT): prev={prev_db_ts} now={current_ts}"
+            )
+
+        if current_ts == prev_db_ts:
+            LAST_ENTRY_EVAL_SIGNAL_TS_MS = int(prev_db_ts)
+            session.commit()
+            return False
+
+        session.execute(
+            q_update,
+            {
+                "scope": ENTRY_GATE_RUNTIME_STATE_SCOPE,
+                "symbol": sym,
+                "signal_ts_ms": int(current_ts),
+            },
+        )
+        session.commit()
+
+    LAST_ENTRY_EVAL_SIGNAL_TS_MS = int(current_ts)
     return True
 
 
@@ -1230,7 +1394,7 @@ def _on_safe_stop() -> None:
 def main() -> None:
     global RUNNING, OPEN_TRADES, LAST_CLOSE_TS, CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
-    global _BALANCE_CONSEC_FAILS, _EQUITY_CONSEC_FAILS
+    global _BALANCE_CONSEC_FAILS, _EQUITY_CONSEC_FAILS, LAST_ENTRY_EVAL_SIGNAL_TS_MS
 
     start_async_worker(
         num_threads=int(SET.async_worker_threads),
@@ -1239,6 +1403,7 @@ def main() -> None:
     )
 
     _verify_ws_boot_configuration_or_die()
+    _bootstrap_entry_signal_gate_or_raise(SET.symbol)
 
     if bool(SET.ws_enabled):
         _backfill_ws_kline_history(SET.symbol)
@@ -1582,7 +1747,7 @@ def main() -> None:
                 _maybe_send_error_tg("DATA_INTEGRITY", msg, cooldown_sec=60)
                 raise RuntimeError(msg) from e
 
-            if not _claim_entry_signal_ts_or_skip(market_data.get("signal_ts_ms")):
+            if not _claim_entry_signal_ts_or_skip(SET.symbol, market_data.get("signal_ts_ms")):
                 interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
