@@ -820,9 +820,9 @@ def _stage_execution_dry_run_strict(sig: Signal) -> None:
     )
 
     eng = ExecutionEngine(view)
-    out = eng.execute(sig)
-    if out is not None:
-        raise PreflightError("ExecutionEngine dry-run returned Trade (unexpected) (STRICT)")
+    req = eng._normalize_entry_request_strict(sig, view)
+    if req.qty <= 0:
+         raise PreflightError("execution sizing invalid (STRICT)")
 
 
 def run_preflight(*, preflight_only: bool) -> None:
