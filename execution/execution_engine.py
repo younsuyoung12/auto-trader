@@ -16,6 +16,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
 - 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
 
+PATCH NOTES — 2026-03-09 (TRADE-GRADE)
+- 실행 계약 정합(ROOT-CAUSE)
+  - order_executor.open_position_with_tp_sl() 성공 반환 Trade 는
+    반드시 reconciliation_status="PROTECTION_VERIFIED" 상태여야 한다.
+  - execution_engine 는 과도기 상태(ENTRY_FILLED)를 허용하지 않는다.
+  - order_executor 가 검증 완료한 last_synced_at 을 우선 보존해 DB 영속화와 이벤트 기록에 사용한다.
+- 실행 레이어 상태 모델 정리
+  - _ALLOWED_RECONCILIATION_STATUSES 를 PROTECTION_VERIFIED 단일 상태로 축소
+  - 보호주문 검증이 끝나지 않은 Trade 는 실행 성공으로 취급하지 않음
+- 기존 기능 삭제 없음
+
 PATCH NOTES — 2026-03-07 (TRADE-GRADE)
 - POSITION 이벤트 기록 보강(STRICT):
   - 실제 진입 성공 후 bt_events 에 event_type="POSITION" 이벤트를 추가 기록
@@ -72,6 +83,11 @@ PATCH NOTES — 2026-03-02 (FIX)
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-09:
+  1) FIX(ROOT-CAUSE): order_executor 와 reconciliation_status 계약 단일화
+     - real trade 성공 상태는 PROTECTION_VERIFIED만 허용
+  2) FIX(STRICT): order_executor 가 기록한 last_synced_at(tz-aware)을 보존 사용
+  3) 기존 주문/DB/알림/리턴 기능 삭제 없음
 - 2026-03-07:
   1) POSITION 이벤트 기록 누락 수정
      - 실제 체결/TEST_DRY_RUN 양쪽 경로에 POSITION 이벤트 기록 추가
@@ -141,7 +157,7 @@ logger = logging.getLogger(__name__)
 _EXECUTION_LOCK: Lock = Lock()
 
 _ALLOWED_DECISION_ACTIONS = ("ENTRY", "NO_ENTRY", "HOLD", "EXIT")
-_ALLOWED_RECONCILIATION_STATUSES = ("ENTRY_FILLED", "PROTECTION_VERIFIED")
+_ALLOWED_RECONCILIATION_STATUSES = ("PROTECTION_VERIFIED",)
 
 
 def _as_bool_strict(v: Any, name: str) -> bool:
@@ -211,6 +227,14 @@ def _require_str_list(values: Any, name: str) -> List[str]:
     for idx, item in enumerate(values):
         out.append(_require_nonempty_str(item, f"{name}[{idx}]"))
     return out
+
+
+def _require_tz_aware_datetime(value: Any, name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise OrderFailed(f"{name} must be datetime (STRICT)")
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise OrderFailed(f"{name} must be timezone-aware datetime (STRICT)")
+    return value
 
 
 def _normalize_decision_action(action: str) -> str:
@@ -1738,10 +1762,10 @@ class ExecutionEngine:
                 extra_json={"signal_source": signal_source, "entry_client_order_id": entry_client_order_id, "entry_order_id": entry_order_id},
             )
 
-            now_sync = datetime.now(timezone.utc)
-
-            setattr(trade, "reconciliation_status", "PROTECTION_VERIFIED")
-            setattr(trade, "last_synced_at", now_sync)
+            trade_last_synced_at = _require_tz_aware_datetime(
+                getattr(trade, "last_synced_at", None),
+                "trade.last_synced_at",
+            )
 
             trade_id = record_trade_open_returning_id(
                 symbol=symbol,
@@ -1767,10 +1791,12 @@ class ExecutionEngine:
                 remaining_qty=float(remaining_qty),
                 realized_pnl_usdt=float(realized_pnl_usdt),
                 reconciliation_status="PROTECTION_VERIFIED",
-                last_synced_at=now_sync,
+                last_synced_at=trade_last_synced_at,
             )
 
             setattr(trade, "id", int(trade_id))
+            setattr(trade, "reconciliation_status", "PROTECTION_VERIFIED")
+            setattr(trade, "last_synced_at", trade_last_synced_at)
 
             _emit_position_event_strict(
                 symbol=symbol,

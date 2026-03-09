@@ -12,6 +12,22 @@ Binance USDT-M Futures - Order Execution Layer (Production)
 - Timestamp error (-1021) recovery: sync_server_time() + single retry
 - No print(); logging only
 
+PATCH NOTES — 2026-03-09 (TRADE-GRADE)
+--------------------------------------------------------
+- 실행 레이어 계약 정합(ROOT-CAUSE)
+  - open_position_with_tp_sl()는 TP/SL 보호주문 검증 완료 후에만 성공 Trade를 반환한다.
+  - 반환 Trade.reconciliation_status 를 ENTRY_FILLED 가 아니라 PROTECTION_VERIFIED 로 확정한다.
+  - execution_engine.py 와 order_executor.py 간 상태 계약 충돌 제거
+- 체결 수량/잔량 정합 강화
+  - 예상 수량(expected_qty)이 아니라 실제 체결 수량(executedQty)을 기준으로
+    ENTRY 이벤트 / TP·SL 설치 / 반환 Trade.qty / remaining_qty 를 일치시킨다.
+- 강제 청산 경로 근본 강화
+  - close_position_market(): FILLED 검증 + 포지션 0 반영 확인까지 완료해야 성공
+  - close_all_positions_market(): 각 reduce-only MARKET 주문의 FILLED 검증 후,
+    최종적으로 심볼 전체 포지션 0 반영까지 확인해야 성공
+  - 기존 제출만 하고 끝나는 강제 청산 경로 제거
+- 기존 기능 삭제 없음
+
 PATCH NOTES — 2026-03-04 (TRADE-GRADE)
 --------------------------------------------------------
 - 체결 안정성 강화(Partial fill/지연 체결/가시성 지연 대응)
@@ -100,9 +116,11 @@ _FILTER_CACHE_TTL_SEC: int = 1800  # 30 minutes
 _IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
 _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
 
-# Protection order verification
+# Protection / close verification
 _PROTECTION_VERIFY_WAIT_SEC: float = 3.0
 _PROTECTION_VERIFY_POLL_SEC: float = 0.2
+_CLOSE_VERIFY_WAIT_SEC: float = 1.5
+_CLOSE_VERIFY_POLL_SEC: float = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1152,56 @@ def _verify_position_reflects_execution_strict(
         time.sleep(0.2)
 
 
+def _verify_all_positions_closed_strict(
+    *,
+    symbol: str,
+    settings: Any,
+    max_wait_sec: float = _CLOSE_VERIFY_WAIT_SEC,
+) -> None:
+    """
+    STRICT:
+    - 심볼의 모든 live positionAmt 가 0 으로 반영될 때까지 짧게 폴링한다.
+    - 제출만 하고 성공으로 간주하지 않는다.
+    """
+    sym = _normalize_symbol(symbol)
+    _ = _require_timeout_sec(settings)
+
+    deadline = time.time() + float(max_wait_sec)
+    last_live: List[str] = []
+
+    while True:
+        rows = fetch_open_positions(sym)
+        if not isinstance(rows, list):
+            raise PositionVerificationError("fetch_open_positions returned non-list (STRICT)")
+
+        live_desc: List[str] = []
+        live_count = 0
+
+        for row in rows:
+            if not isinstance(row, dict):
+                raise PositionVerificationError("fetch_open_positions contains non-dict row (STRICT)")
+            row_symbol = str(row.get("symbol") or "").upper().strip()
+            if row_symbol != sym:
+                continue
+            if "positionAmt" not in row:
+                raise PositionVerificationError("position row missing positionAmt (STRICT)")
+            amt = _require_decimal(row.get("positionAmt"), name="position.positionAmt")
+            if _decimal_abs(amt) > Decimal("0.000000000001"):
+                ps = str(row.get("positionSide") or "").upper().strip() or "BOTH"
+                live_desc.append(f"{ps}:{_d_to_str(amt)}")
+                live_count += 1
+
+        if live_count == 0:
+            return
+
+        last_live = live_desc
+        if time.time() >= deadline:
+            raise PositionVerificationError(
+                f"positions not fully closed within {max_wait_sec}s (live={last_live})"
+            )
+        time.sleep(_CLOSE_VERIFY_POLL_SEC)
+
+
 # ---------------------------------------------------------------------------
 # Protection order verification (TRADE-GRADE)
 # ---------------------------------------------------------------------------
@@ -1406,7 +1474,6 @@ def open_position_with_tp_sl(
     open_side = _normalize_side(side_open)
 
     lev = _require_leverage(settings)
-
     final_qty_raw = _require_positive_float(qty, "qty")
 
     tp_pct_f = float(tp_pct)
@@ -1493,6 +1560,10 @@ def open_position_with_tp_sl(
     if entry_price <= 0 or not math.isfinite(entry_price):
         raise OrderExecutionError("entry_price resolved invalid (<=0 or non-finite)")
 
+    filled_qty_f = float(exec_qty_dec)
+    if filled_qty_f <= 0:
+        raise OrderExecutionError("filled quantity resolved invalid (STRICT)")
+
     # 3) 포지션 반영 확인(가시성 지연 방어)
     _verify_position_reflects_execution_strict(
         symbol=sym,
@@ -1548,13 +1619,13 @@ def open_position_with_tp_sl(
                         "entry_price": float(entry_price),
                         "slippage_pct": float(slip_pct),
                         "max_entry_slippage_pct": float(max_slip_f),
-                        "qty": float(expected_qty_f),
+                        "qty": float(filled_qty_f),
                         "entry_order_id": entry_order_id,
                         "clientOrderId": entry_cid,
                     },
                 )
                 try:
-                    close_position_market(sym, open_side, float(expected_qty_f))
+                    close_position_market(sym, open_side, float(filled_qty_f))
                 except Exception as e2:
                     logger.exception("slippage guard force close failed (symbol=%s)", sym)
                     raise OrderExecutionError("slippage guard close failed") from e2
@@ -1567,7 +1638,7 @@ def open_position_with_tp_sl(
         regime=source,
         side=_event_side_from_open_side(open_side),
         price=float(entry_price),
-        qty=float(expected_qty_f),
+        qty=float(filled_qty_f),
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
@@ -1595,14 +1666,14 @@ def open_position_with_tp_sl(
             if sl_price < floor_price:
                 sl_price = floor_price
 
-    # 6) TP/SL 설치 (체결 수량을 그대로 사용)
+    # 6) TP/SL 설치 (실제 체결 수량 기준)
     close_side = "SELL" if open_side == "BUY" else "BUY"
 
     try:
         tp_order_id, sl_order_id = set_tp_sl(
             symbol=sym,
             side_open=open_side,
-            qty=float(expected_qty_f),
+            qty=float(filled_qty_f),
             tp_price=float(tp_price),
             sl_price=float(sl_price),
             soft_mode=bool(soft_mode),
@@ -1622,7 +1693,7 @@ def open_position_with_tp_sl(
             extra_json={
                 "err": str(e),
                 "soft_mode": bool(soft_mode),
-                "qty": float(expected_qty_f),
+                "qty": float(filled_qty_f),
                 "entry_order_id": entry_order_id,
                 "clientOrderId": entry_cid,
             },
@@ -1665,7 +1736,7 @@ def open_position_with_tp_sl(
             extra_json={
                 "err": str(e),
                 "soft_mode": bool(soft_mode),
-                "qty": float(expected_qty_f),
+                "qty": float(filled_qty_f),
                 "entry_order_id": entry_order_id,
                 "tp_order_id": tp_order_id,
                 "sl_order_id": sl_order_id,
@@ -1692,7 +1763,7 @@ def open_position_with_tp_sl(
         regime=source,
         side=_event_side_from_open_side(open_side),
         price=float(entry_price),
-        qty=float(expected_qty_f),
+        qty=float(filled_qty_f),
         leverage=int(float(lev)),
         tp_pct=float(tp_pct_f),
         sl_pct=float(sl_pct_f),
@@ -1714,7 +1785,7 @@ def open_position_with_tp_sl(
     return _make_trade_strict(
         symbol=sym,
         side=open_side,
-        qty=float(expected_qty_f),
+        qty=float(filled_qty_f),
         entry_price=float(entry_price),
         leverage=int(float(lev)),
         source=str(source or "MARKET"),
@@ -1725,9 +1796,9 @@ def open_position_with_tp_sl(
         sl_order_id=str(sl_order_id) if sl_order_id is not None else None,
         client_entry_id=str(entry_cid),
         exchange_position_side="BOTH",
-        remaining_qty=float(expected_qty_f),
+        remaining_qty=float(filled_qty_f),
         realized_pnl_usdt=0.0,
-        reconciliation_status="ENTRY_FILLED",
+        reconciliation_status="PROTECTION_VERIFIED",
         last_synced_at=now_sync,
     )
 
@@ -1763,7 +1834,7 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
     if order_id is None:
         raise OrderExecutionError("close response missing orderId (STRICT)")
 
-    _, _, avg_px = _wait_order_filled_strict(
+    _, exec_qty_dec, avg_px = _wait_order_filled_strict(
         symbol=sym,
         order_id=str(order_id),
         settings=SET,
@@ -1772,23 +1843,29 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
     )
 
+    _verify_all_positions_closed_strict(
+        symbol=sym,
+        settings=SET,
+        max_wait_sec=float(getattr(SET, "position_close_wait_sec", _CLOSE_VERIFY_WAIT_SEC) or _CLOSE_VERIFY_WAIT_SEC),
+    )
+
     log_event(
         event_type="EXIT",
         symbol=sym,
         regime="MANUAL_CLOSE",
         side=_event_side_close(),
         price=float(avg_px),
-        qty=float(expected_qty_f),
+        qty=float(exec_qty_dec),
         leverage=getattr(SET, "leverage", None),
         reason="MARKET_CLOSE_FILLED",
         extra_json={"close_side": close_side, "clientOrderId": cid, "orderId": str(order_id)},
     )
 
     logger.info(
-        "close market filled (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
+        "close market filled + position closed (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
         sym,
         close_side,
-        expected_qty_f,
+        float(exec_qty_dec),
         order_id,
         cid,
     )
@@ -1844,14 +1921,36 @@ def close_all_positions_market(symbol: str) -> int:
             pos_side,
         )
 
+        filt = get_symbol_filters(sym)
+        expected_qty_dec, _, _ = _round_qty_and_price(
+            filters=filt,
+            order_type="MARKET",
+            raw_qty=float(qty2),
+            raw_price=None,
+            raw_stop_price=None,
+        )
+
         resp = place_market(
             symbol=sym,
             side=close_side,
-            qty=float(qty2),
+            qty=float(expected_qty_dec),
             settings=SET,
             reduce_only=True,
             position_side=pos_side,
             client_order_id=client_id,
+        )
+
+        order_id = resp.get("orderId") if isinstance(resp, dict) else None
+        if order_id is None:
+            raise OrderExecutionError("force close response missing orderId (STRICT)")
+
+        _, exec_qty_dec, avg_px = _wait_order_filled_strict(
+            symbol=sym,
+            order_id=str(order_id),
+            settings=SET,
+            expected_qty=expected_qty_dec,
+            qty_step=filt.market_step,
+            max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
         )
 
         log_event(
@@ -1859,18 +1958,26 @@ def close_all_positions_market(symbol: str) -> int:
             symbol=sym,
             regime="SIGTERM_FORCE_CLOSE",
             side=_event_side_close(),
-            price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
-            qty=float(qty2),
+            price=float(avg_px),
+            qty=float(exec_qty_dec),
             leverage=getattr(SET, "leverage", None),
             reason="SIGTERM_DEADLINE_FORCE_CLOSE",
             extra_json={
                 "direction": direction,
                 "close_side": close_side,
                 "positionSide": pos_side,
-                "orderId": resp.get("orderId") if isinstance(resp, dict) else None,
+                "orderId": str(order_id),
+                "clientOrderId": client_id,
             },
         )
         submitted += 1
+
+    if submitted > 0:
+        _verify_all_positions_closed_strict(
+            symbol=sym,
+            settings=SET,
+            max_wait_sec=float(getattr(SET, "position_close_wait_sec", _CLOSE_VERIFY_WAIT_SEC) or _CLOSE_VERIFY_WAIT_SEC),
+        )
 
     return submitted
 
