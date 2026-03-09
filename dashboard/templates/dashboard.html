@@ -5,6 +5,18 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+--------------------------------------------------------
+- 상단 헤더에 서버 런타임 상태칩 추가
+- ENGINE 상태와 SERVER LIVE/STOP 상태를 분리 표시
+- engine_status runtime payload strict 렌더링 추가
+
+코드 정리 내용
+--------------------------------------------------------
+- 상단 상태칩 렌더링 로직 정리
+- runtime tooltip 생성 로직 추가
+- 불필요한 중복 없이 기존 UI 구조 유지
+
 설계 원칙
 --------------------------------------------------------
 - “조용한 실패” 금지: API 실패/JSON 파싱 실패/네트워크 오류는 화면에 명시적으로 표시한다.
@@ -13,22 +25,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 모바일 접속 차단: PC 전용 대시보드만 허용한다.
 - Polling 금지: 실시간 갱신은 WebSocket만 사용한다.
 - 초기 화면 구성용 1회성 REST 조회는 허용한다.
-- 기존 기능 삭제 금지. 기존 위젯/차트/테이블/실시간 반영 기능은 유지하고,
-  AI 분석 검색 UI만 추가한다.
-- /api/engine/ws-status 와 /api/engine/health 는 엔진 메모리가 아니라
-  DB 스냅샷 기준으로 동작한다.
+- 기존 기능 삭제 금지. 기존 위젯/차트/테이블/실시간 반영 기능은 유지한다.
+- /api/engine/ws-status 와 /api/engine/health 는 엔진 메모리가 아니라 DB 스냅샷 기준으로 동작한다.
+- 서버 런타임 상태는 engine_status.runtime 기준으로 표시한다.
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-07:
-  1) 대비가 강한 프리미엄 카드형 UI 유지
-  2) 모든 주요 박스에 명확한 테두리/그림자/강조색 적용 유지
-  3) 전문 용어를 쉬운 한국어로 정리 유지
-  4) SKIP 사유를 쉬운 한국어로 매핑하는 프론트 로직 유지
-  5) AI 분석 검색 섹션 추가
-     - 통합 분석(/api/quant-analysis)
-     - 외부 시장 분석(/api/market-analysis)
-  6) 상단 메뉴 가독성 개선
+- 2026-03-09:
+  1) FEAT(HEADER): ENGINE 상태 옆에 SERVER 런타임 상태칩 추가
+  2) FEAT(STRICT): engine_status.runtime payload 검증/렌더링 추가
+  3) FEAT(UI): SERVER_LIVE / SERVER_STOP tooltip 표시 추가
+
+- 2026-03-08:
+  1) AI 분석 검색 섹션 추가 유지
+  2) 상단 메뉴 가독성 개선 유지
 ========================================================
 -->
 
@@ -827,10 +837,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           <span id="last-updated-label">마지막 업데이트: -</span>
           <span id="ws-last-message-label">실시간 수신: -</span>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <span class="status-chip status-neutral" id="engine-top-status">
             <span class="tiny-dot tiny-dot-neutral"></span>
             엔진 상태 대기
+          </span>
+          <span class="status-chip status-neutral" id="server-runtime-chip" title="서버 런타임 상태 대기">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            서버 상태 대기
           </span>
         </div>
       </div>
@@ -1587,7 +1601,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         s === "ENTRY" ||
         s === "HOLD" ||
         s === "QUANT_ANALYSIS" ||
-        s === "MARKET_ANALYSIS"
+        s === "MARKET_ANALYSIS" ||
+        s === "SERVER_LIVE" ||
+        s === "RUNNING" ||
+        s === "LIVE"
       ) {
         cls = "status-ok";
         dot = "tiny-dot-ok";
@@ -1601,7 +1618,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         s.includes("NO_ENTRY") ||
         s.includes("CLOSED") ||
         s.includes("FLAT") ||
-        s.includes("OUT_OF_SCOPE")
+        s.includes("OUT_OF_SCOPE") ||
+        s === "SERVER_STOP" ||
+        s === "STOP" ||
+        s === "STOPPED"
       ) {
         cls = "status-fatal";
         dot = "tiny-dot-fatal";
@@ -1727,6 +1747,48 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       return map[input] || input;
     }
 
+    function buildRuntimeTooltip(runtime) {
+      if (!runtime || typeof runtime !== "object") {
+        throw new Error("engine_status.runtime invalid");
+      }
+
+      const status = String(runtime.status || "").trim();
+      const source = String(runtime.source || "").trim();
+      const reason = String(runtime.reason || "").trim();
+      const staleMs = runtime.stale_ms;
+      const thresholdMs = runtime.threshold_ms;
+      const runtimeTsMs = runtime.ts_ms;
+
+      const parts = [];
+
+      if (status) parts.push(`상태: ${status}`);
+      if (source) parts.push(`기준: ${source}`);
+      if (reason) parts.push(`사유: ${reason}`);
+      if (staleMs !== undefined && staleMs !== null) parts.push(`지연(ms): ${staleMs}`);
+      if (thresholdMs !== undefined && thresholdMs !== null) parts.push(`기준값(ms): ${thresholdMs}`);
+      if (runtimeTsMs !== undefined && runtimeTsMs !== null) parts.push(`판정시각(ms): ${runtimeTsMs}`);
+
+      return parts.join(" | ");
+    }
+
+    function renderServerRuntime(runtime) {
+      const chip = $("server-runtime-chip");
+      if (!chip) {
+        throw new Error("server-runtime-chip missing");
+      }
+      if (!runtime || typeof runtime !== "object") {
+        throw new Error("engine_status.runtime invalid");
+      }
+
+      const status = String(runtime.status || "").trim();
+      if (!status) {
+        throw new Error("engine_status.runtime.status invalid");
+      }
+
+      applyStatusChip(chip, status);
+      chip.title = buildRuntimeTooltip(runtime);
+    }
+
     function createOrUpdateChart(existing, canvasId, type, labels, data, datasetLabel) {
       const canvas = $(canvasId);
       if (!canvas) throw new Error(`${canvasId}: canvas missing`);
@@ -1806,6 +1868,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       state.engine = data;
       applyStatusChip("engine-status-chip", data.status || "대기");
       applyStatusChip("engine-top-status", data.status || "대기");
+
+      renderServerRuntime(data.runtime);
 
       $("engine-db-latency").textContent = `${fmtMaybe(data.db_latency_ms, 0)} ms`;
       $("engine-recent-errors").textContent = fmtMaybe(data.recent_errors, 0);

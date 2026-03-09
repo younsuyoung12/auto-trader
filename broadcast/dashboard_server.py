@@ -6,14 +6,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
-- Alpha Vantage 실응답 기준 quota 감지 문구 확장
-- /api/market-analysis, /api/quant-analysis 외부 provider quota 초과를 일관되게 503으로 승격
-- AI 분석 결과 payload strict 검증 추가
+- /api/engine/health, /api/engine/status에 runtime 상태 추가
+- DB orderbook snapshot 기준 SERVER_LIVE / SERVER_STOP 판정 추가
+- /api/engine/ws-status에도 runtime 상태 포함
 
 코드 정리 내용
-- quota 감지 로직 공통화 정리
-- provider 오류 응답 메시지 정합화
-- 분석 payload strict dict 검증 추가
+- 엔진 runtime 판정 로직 공통 함수로 정리
+- runtime 응답 구조를 engine/ws-status와 engine/health에서 일관화
+- 사용하지 않는 코드 추가 없이 기존 기능 유지
 
 역할
 --------------------------------------------------------
@@ -56,10 +56,10 @@ STRICT · NO-FALLBACK
 변경 이력
 --------------------------------------------------------
 - 2026-03-09:
-  1) FIX(ROOT-CAUSE): Alpha Vantage quota 감지 문구를 실운영 응답 형태까지 확장
-  2) FIX(STRICT): /api/market-analysis, /api/quant-analysis provider quota 초과를 일관되게 503 응답으로 승격
-  3) FIX(STRICT): AI 분석 결과 dashboard_payload dict 검증 추가
-  4) CLEANUP: provider 오류 응답 메시지 정합화
+  1) FIX(ROOT-CAUSE): /api/engine/health, /api/engine/status에 runtime 상태 추가
+  2) FIX(STRICT): DB orderbook snapshot 기준 SERVER_LIVE / SERVER_STOP 판정 추가
+  3) FIX(STRICT): /api/engine/ws-status에도 runtime 상태 포함
+  4) CLEANUP: runtime 판정 로직 공통 함수로 정리
 
 - 2026-03-08:
   1) Redis 캐시 연동 추가(STRICT)
@@ -130,6 +130,11 @@ from services.system_monitor import get_latest_watchdog_snapshot, get_system_sta
 from settings import load_settings
 
 logger = logging.getLogger(__name__)
+
+_ENGINE_RUNTIME_STATUS_SERVER_LIVE = "SERVER_LIVE"
+_ENGINE_RUNTIME_STATUS_SERVER_STOP = "SERVER_STOP"
+_ENGINE_RUNTIME_SOURCE_DATABASE = "database_orderbook_snapshot"
+_ENGINE_RUNTIME_STALE_THRESHOLD_MS = 120_000
 
 # =====================================================
 # FastAPI App
@@ -223,6 +228,10 @@ def _datetime_to_epoch_ms_strict(value: Any, name: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000.0)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 def _cached_json(
@@ -1144,6 +1153,70 @@ def _fetch_latest_orderbook_snapshot_strict(
     }
 
 
+
+
+def _build_engine_runtime_status(
+    *,
+    orderbook: Optional[Dict[str, Any]],
+    now_ms: int,
+    stale_threshold_ms: int = _ENGINE_RUNTIME_STALE_THRESHOLD_MS,
+) -> Dict[str, Any]:
+    normalized_now_ms = _require_positive_int(now_ms, "now_ms")
+    normalized_threshold_ms = _require_positive_int(stale_threshold_ms, "stale_threshold_ms")
+
+    if orderbook is None:
+        return {
+            "status": _ENGINE_RUNTIME_STATUS_SERVER_STOP,
+            "reason": "orderbook_snapshot_not_found",
+            "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
+            "threshold_ms": normalized_threshold_ms,
+            "snapshot_ts_ms": None,
+            "stale_ms": None,
+        }
+
+    normalized_orderbook = _require_dict(orderbook, "orderbook")
+    orderbook_ok_raw = normalized_orderbook.get("ok")
+    if not isinstance(orderbook_ok_raw, bool):
+        raise RuntimeError("orderbook.ok must be bool (STRICT)")
+    if not orderbook_ok_raw:
+        error_reason = normalized_orderbook.get("error")
+        if error_reason is None:
+            raise RuntimeError("orderbook.error is required when orderbook.ok is false (STRICT)")
+        normalized_error_reason = _require_nonempty_str(error_reason, "orderbook.error")
+        return {
+            "status": _ENGINE_RUNTIME_STATUS_SERVER_STOP,
+            "reason": normalized_error_reason,
+            "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
+            "threshold_ms": normalized_threshold_ms,
+            "snapshot_ts_ms": None,
+            "stale_ms": None,
+        }
+
+    snapshot_ts_ms = _require_positive_int(normalized_orderbook.get("ts"), "orderbook.ts")
+    stale_ms = normalized_now_ms - snapshot_ts_ms
+    if stale_ms < 0:
+        raise RuntimeError("orderbook stale_ms must be >= 0 (STRICT)")
+
+    if stale_ms > normalized_threshold_ms:
+        return {
+            "status": _ENGINE_RUNTIME_STATUS_SERVER_STOP,
+            "reason": "orderbook_snapshot_stale",
+            "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
+            "threshold_ms": normalized_threshold_ms,
+            "snapshot_ts_ms": snapshot_ts_ms,
+            "stale_ms": stale_ms,
+        }
+
+    return {
+        "status": _ENGINE_RUNTIME_STATUS_SERVER_LIVE,
+        "reason": "orderbook_snapshot_fresh",
+        "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
+        "threshold_ms": normalized_threshold_ms,
+        "snapshot_ts_ms": snapshot_ts_ms,
+        "stale_ms": stale_ms,
+    }
+
+
 def _ws_status(
     db: Session,
     symbol: str,
@@ -1176,19 +1249,23 @@ def _ws_status(
             "len": buf_len,
         }
 
-    ob = _fetch_latest_orderbook_snapshot_strict(db, symbol=normalized_symbol)
-    if ob is None:
+    latest_orderbook = _fetch_latest_orderbook_snapshot_strict(db, symbol=normalized_symbol)
+    if latest_orderbook is None:
         out["orderbook"] = {"ok": False, "error": "not_found"}
-        return out
+    else:
+        out["orderbook"] = {
+            "ok": bool(latest_orderbook["has_bids"]) and bool(latest_orderbook["has_asks"]),
+            "bestBid": latest_orderbook["bestBid"],
+            "bestAsk": latest_orderbook["bestAsk"],
+            "ts": latest_orderbook["ts"],
+            "bids_len": latest_orderbook["bids_len"],
+            "asks_len": latest_orderbook["asks_len"],
+        }
 
-    out["orderbook"] = {
-        "ok": bool(ob["has_bids"]) and bool(ob["has_asks"]),
-        "bestBid": ob["bestBid"],
-        "bestAsk": ob["bestAsk"],
-        "ts": ob["ts"],
-        "bids_len": ob["bids_len"],
-        "asks_len": ob["asks_len"],
-    }
+    out["runtime"] = _build_engine_runtime_status(
+        orderbook=out["orderbook"],
+        now_ms=_now_ms(),
+    )
     return out
 
 
@@ -1199,7 +1276,9 @@ def api_engine_ws_status(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     tfs = ["1m", "5m", "15m", "1h", "4h"]
-    return _ws_status(db, symbol, min_buf=min_buf, tfs=tfs)
+    ws_status = _ws_status(db, symbol, min_buf=min_buf, tfs=tfs)
+    ws_status["ts_ms"] = _now_ms()
+    return ws_status
 
 
 @app.get("/api/engine/latency")
@@ -1215,6 +1294,7 @@ def api_engine_health(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
+    now_ms = _now_ms()
     db_ms = _db_latency_ms(db)
     recent_errors = _count_recent_events_strict(db, minutes=10, event_type="ERROR")
     recent_skips = _count_recent_events_strict(db, minutes=10, event_type="SKIP")
@@ -1229,14 +1309,23 @@ def api_engine_health(
         latest_watchdog_reason=watchdog_reason,
     )
 
+    ws_status = _ws_status(
+        db,
+        normalized_symbol,
+        min_buf=300,
+        tfs=["1m", "5m", "15m", "1h", "4h"],
+    )
+    runtime = _require_dict(ws_status.get("runtime"), "ws_status.runtime")
+
     return {
         "status": status,
         "reasons": reasons,
+        "runtime": runtime,
         "symbol": normalized_symbol,
         "db_latency_ms": db_ms,
         "recent_errors": int(recent_errors),
         "recent_skips": int(recent_skips),
         "latest_watchdog": latest_watchdog,
-        "ws_status": _ws_status(db, normalized_symbol, min_buf=300, tfs=["1m", "5m", "15m", "1h", "4h"]),
-        "ts_ms": int(time.time() * 1000),
+        "ws_status": ws_status,
+        "ts_ms": now_ms,
     }

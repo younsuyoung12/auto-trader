@@ -4,10 +4,20 @@ FILE: broadcast/dashboard_ws.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- engine_status 실시간 payload에 runtime 상태를 강제 포함
+- WebSocket 라이브 전송 시 SERVER_LIVE 상태를 명시적으로 전달
+- snapshot 재전송에도 runtime 포함된 최신 engine_status 유지
+
+코드 정리 내용
+- engine_status payload 정규화 로직 분리
+- runtime 필드 검증/보강 로직 추가
+- 불필요한 코드/주석 추가 없이 기존 구조 유지
+
 역할
 --------------------------------------------------------
-- 기관급 대시보드용 WebSocket 허브.
-- 서버 내부에서 발생한 실시간 이벤트를 브라우저로 push 한다.
+- 기관급 대시보드용 WebSocket 허브
+- 서버 내부에서 발생한 실시간 이벤트를 브라우저로 push
 - 지원 스트림:
   - engine_status
   - decision
@@ -15,22 +25,27 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   - error
   - position
   - watchdog
-- 브라우저 polling 없이 WebSocket 단일 채널로 전달한다.
+- 브라우저 polling 없이 WebSocket 단일 채널로 전달
 
 절대 원칙 (STRICT · NO-FALLBACK)
 --------------------------------------------------------
-- 허용되지 않은 event_type 즉시 예외.
-- payload는 dict 여야 하며, None/비정상 구조 즉시 예외.
-- ts_ms는 양의 정수여야 하며, 비정상 값 즉시 예외.
-- 연결 종료/전송 실패는 조용히 무시하지 않고 연결 상태를 정리한다.
-- 민감정보(키/토큰/DB URL)는 절대 로그/메시지에 포함하지 않는다.
+- 허용되지 않은 event_type 즉시 예외
+- payload는 dict 여야 하며, None/비정상 구조 즉시 예외
+- ts_ms는 양의 정수여야 하며, 비정상 값 즉시 예외
+- 연결 종료/전송 실패는 조용히 무시하지 않고 연결 상태를 정리
+- 민감정보(키/토큰/DB URL)는 절대 로그/메시지에 포함하지 않음
+- engine_status는 runtime 상태 없이 브로드캐스트하지 않음
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-06:
-  1) 신규 생성: Dashboard WebSocket Hub 추가
-  2) 실시간 스트림(engine_status/decision/trade/error/position/watchdog) 지원
-  3) 최신 이벤트 스냅샷 전송 및 클라이언트 연결 관리 추가
+- 2026-03-09:
+  1) FIX(STRICT): engine_status payload에 runtime 상태 강제 포함
+  2) FIX(ROOT-CAUSE): WebSocket 실시간 이벤트에서도 SERVER_LIVE 상태를 명시적으로 전달
+  3) CLEANUP: engine_status payload 정규화 함수 분리
+
+- 2026-03-08:
+  1) 실시간 스트림(engine_status/decision/trade/error/position/watchdog) 지원 유지
+  2) 최신 이벤트 스냅샷 전송 및 클라이언트 연결 관리 유지
 ========================================================
 """
 
@@ -65,6 +80,9 @@ _ALLOWED_CLIENT_OPS: Final[Tuple[str, ...]] = (
 
 _WS_ROUTE_PATH: Final[str] = "/ws/dashboard"
 
+_RUNTIME_STATUS_SERVER_LIVE: Final[str] = "SERVER_LIVE"
+_RUNTIME_SOURCE_WEBSOCKET: Final[str] = "websocket_push"
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -82,6 +100,17 @@ def _require_positive_int(value: Any, name: str) -> int:
     if ivalue <= 0:
         raise RuntimeError(f"{name} must be > 0 (STRICT)")
     return ivalue
+
+
+def _require_nonempty_str(value: Any, name: str) -> str:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} must be str (STRICT), got={type(value).__name__}")
+    normalized = value.strip()
+    if not normalized:
+        raise RuntimeError(f"{name} must not be empty (STRICT)")
+    return normalized
 
 
 def _require_dict(value: Any, name: str) -> Dict[str, Any]:
@@ -110,6 +139,43 @@ def _json_dumps_strict(data: Dict[str, Any]) -> str:
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     except Exception as exc:
         raise RuntimeError(f"websocket payload json serialization failed (STRICT): {exc}") from exc
+
+
+def _normalize_runtime_payload(runtime_value: Any, *, ts_ms: int) -> Dict[str, Any]:
+    if runtime_value is None:
+        return {
+            "status": _RUNTIME_STATUS_SERVER_LIVE,
+            "source": _RUNTIME_SOURCE_WEBSOCKET,
+            "ts_ms": ts_ms,
+        }
+
+    runtime = _require_dict(runtime_value, "engine_status.runtime")
+
+    status = _require_nonempty_str(
+        runtime.get("status", _RUNTIME_STATUS_SERVER_LIVE),
+        "engine_status.runtime.status",
+    )
+    source = _require_nonempty_str(
+        runtime.get("source", _RUNTIME_SOURCE_WEBSOCKET),
+        "engine_status.runtime.source",
+    )
+    runtime_ts_ms_raw = runtime.get("ts_ms", ts_ms)
+    runtime_ts_ms = _require_positive_int(runtime_ts_ms_raw, "engine_status.runtime.ts_ms")
+
+    normalized_runtime = dict(runtime)
+    normalized_runtime["status"] = status
+    normalized_runtime["source"] = source
+    normalized_runtime["ts_ms"] = runtime_ts_ms
+    return normalized_runtime
+
+
+def _normalize_engine_status_payload(payload: Dict[str, Any], *, ts_ms: int) -> Dict[str, Any]:
+    normalized_payload = _require_dict(payload, "engine_status.payload")
+    normalized_payload["runtime"] = _normalize_runtime_payload(
+        normalized_payload.get("runtime"),
+        ts_ms=ts_ms,
+    )
+    return normalized_payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +270,6 @@ class DashboardWebSocketHub:
             try:
                 await ws.close()
             except RuntimeError:
-                # 이미 닫힌 소켓 상태 정리
                 pass
 
         logger.info("[DASHBOARD_WS] disconnected client_id=%s", client_id)
@@ -217,8 +282,14 @@ class DashboardWebSocketHub:
         ts_ms: Optional[int] = None,
     ) -> DashboardEnvelope:
         normalized_type = _require_event_type(event_type)
-        normalized_payload = _require_dict(payload, "payload")
         event_ts_ms = _require_positive_int(ts_ms if ts_ms is not None else _now_ms(), "ts_ms")
+        normalized_payload = _require_dict(payload, "payload")
+
+        if normalized_type == "engine_status":
+            normalized_payload = _normalize_engine_status_payload(
+                normalized_payload,
+                ts_ms=event_ts_ms,
+            )
 
         envelope = DashboardEnvelope(
             seq=self._next_seq(),
