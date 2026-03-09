@@ -1,3 +1,4 @@
+# core/run_bot_preflight.py
 """
 ========================================================
 FILE: core/run_bot_preflight.py
@@ -9,6 +10,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   단일 canonical 값으로 정규화해 execution_engine 충돌을 제거
 - PREFLIGHT 단계 상세 의미는 preflight_reason_detail / preflight_stage 로 분리해
   source 필드와 의미가 섞이지 않도록 구조 수정
+- EXECUTION_DRY_RUN 단계에서 ExecutionEngine 인스턴스 메서드 오호출을 제거하고
+  module-level 정규화 함수 + deterministic client_order_id 생성 경로를 검증하도록 수정
 - 사용하지 않는 import / dataclass 제거 및 상단 주석 구조 정리
 
 코드 정리 내용
@@ -16,6 +19,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 미사용 dataclass(PreflightPipeline) 제거
 - os.getpid 직접 사용으로 동적 import 제거
 - PREFLIGHT 신호 생성 로직을 helper로 분리해 중복 의미 혼선 제거
+- dry-run에서 실제 주문 제출 경로를 타지 않도록 검증 로직 정리
 
 설계 원칙
 - 폴백 금지
@@ -30,7 +34,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 2026-03-10:
   1) FIX(STRICT): PREFLIGHT dry-run Signal의 source 계열 필드 충돌 제거
   2) FIX(STRUCTURE): PREFLIGHT lifecycle 정보와 시장/신호 source 의미를 분리
-  3) CLEANUP: 미사용 import/dataclass 제거, 상단 주석 최근 기준으로 정리
+  3) FIX(ROOT-CAUSE): EXECUTION_DRY_RUN 에서 ExecutionEngine 인스턴스 메서드 오호출 제거
+  4) FIX(CONTRACT): dry-run 에서 normalize + deterministic client_order_id 생성 경로 검증
+  5) CLEANUP: 미사용 import/dataclass 제거, 상단 주석 최근 기준으로 정리
 ========================================================
 """
 
@@ -81,7 +87,11 @@ from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey  # noqa: E402
 from infra.drift_detector import DriftDetector, DriftDetectorConfig, DriftSnapshot, DriftDetectedError  # noqa: E402
 from execution.invariant_guard import SignalInvariantInputs, validate_signal_invariants_strict, InvariantViolation  # noqa: E402
 
-from execution.execution_engine import ExecutionEngine  # noqa: E402
+from execution.execution_engine import (  # noqa: E402
+    ExecutionEngine,
+    _enforce_or_generate_client_order_id_strict,
+    _normalize_entry_request_strict,
+)
 from strategy.signal import Signal  # noqa: E402
 
 from meta.meta_strategy_engine import MetaStrategyConfig, MetaStrategyEngine  # noqa: E402
@@ -820,9 +830,43 @@ def _stage_execution_dry_run_strict(sig: Signal) -> None:
     )
 
     eng = ExecutionEngine(view)
-    req = eng._normalize_entry_request_strict(sig, view)
+    req = _normalize_entry_request_strict(sig, eng.settings)
+    req = _enforce_or_generate_client_order_id_strict(
+        signal=sig,
+        req=req,
+        settings=eng.settings,
+    )
+
     if req.qty <= 0:
-         raise PreflightError("execution sizing invalid (STRICT)")
+        raise PreflightError("execution sizing invalid (STRICT)")
+
+    if req.entry_price_hint <= 0:
+        raise PreflightError("execution entry_price_hint invalid (STRICT)")
+
+    if req.tp_pct <= 0:
+        raise PreflightError("execution tp_pct invalid (STRICT)")
+
+    if not req.soft_mode and req.sl_pct <= 0:
+        raise PreflightError("execution sl_pct invalid while soft_mode=False (STRICT)")
+
+    if not hasattr(eng.settings, "require_deterministic_client_order_id"):
+        raise PreflightError("settings.require_deterministic_client_order_id missing (STRICT)")
+
+    require_deterministic_cid = _require_bool(
+        getattr(eng.settings, "require_deterministic_client_order_id"),
+        "settings.require_deterministic_client_order_id",
+    )
+
+    if require_deterministic_cid and not str(req.entry_client_order_id or "").strip():
+        raise PreflightError(
+            "deterministic entry_client_order_id missing after dry-run normalization (STRICT)"
+        )
+
+    log(
+        "[PRE-FLIGHT][EXECUTION_DRY_RUN] validated "
+        f"symbol={req.symbol} side={req.side_open} qty={req.qty} "
+        f"entry_price_hint={req.entry_price_hint} entry_client_order_id={req.entry_client_order_id}"
+    )
 
 
 def run_preflight(*, preflight_only: bool) -> None:
