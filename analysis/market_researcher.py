@@ -6,18 +6,16 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
-- FIX(DB): sync_once()의 market_features / trade_context_snapshots 적재 후 명시적 commit 추가
-- 외부 인텔리전스 source별 이중 메모리 캐시 제거
-- source fetcher 내부(DB 영속 캐시 + 메모리 캐시)를 단일 진실원으로 사용하도록 구조 유지
-- market_researcher 는 외부 source freshness를 직접 들고 있지 않고 fetcher 계약만 신뢰
-- Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
+- FIX(ROOT-CAUSE): 요청 경로에서 외부 인텔리전스를 매번 재호출하던 구조를 리포트 단위 freshness cache 구조로 변경
+- FIX(ROOT-CAUSE): /api/market-analysis 반복 호출 시 동일 주기 내 외부 sentiment/news/macro/onchain/options 재호출 차단
+- FIX(STRICT): stale fallback 없이 명시적 TTL 이내 캐시만 허용, TTL 초과 시 반드시 신규 리포트 재생성
+- FIX(DB): sync_once()는 항상 신규 리포트를 생성·적재 후 commit 완료 시점에만 캐시 갱신
 
 코드 정리 내용
-- ExternalSnapshotState / _EXTERNAL_SOURCE_POLICY 제거 유지
-- stale external snapshot fallback 경로 완전 제거 유지
-- 외부 snapshot refresh 로그/상태 관리 중복 제거 유지
-- source fetch 경로를 fetcher 단일 책임으로 정리 유지
-- 불필요한 우회 수정 없이 DB 트랜잭션 완료 지점만 명확화
+- run() / sync_once()의 리포트 생성 경로를 단일 메서드(_build_report_fresh_or_raise)로 정리
+- 요청 경로 캐시 로직을 _get_cached_report_or_build_or_raise 로 분리
+- 리포트 캐시 상태를 _ReportCacheState 단일 구조체로 정리
+- 기존 외부 source fetcher 책임은 유지하고, market_researcher 는 요청 경로 재호출만 제어
 
 역할:
 - Binance USDⓈ-M Futures 공개 시장 데이터를 해석해 외부 시장 분석 리포트를 생성한다.
@@ -39,18 +37,21 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - DB 적재 실패 시 즉시 예외 전파
 - 거래소 정책상 "지원 불가(unavailable_or_policy_conflict)" 데이터는
   명시적 상태값으로 노출하며, 존재하지 않는 데이터를 임의 생성하지 않는다.
+- 리포트 캐시는 명시적 freshness 계약으로만 사용하며, stale fallback 용도로 사용하지 않는다.
 
 변경 이력:
+2026-03-10
+1) FIX(ROOT-CAUSE): 요청 경로 직접 외부 호출 구조를 리포트 freshness cache 구조로 변경
+2) FIX(STRICT): TTL 초과 stale cache 재사용 금지, TTL 이내 캐시만 명시적으로 허용
+3) FIX(DB): sync_once()는 항상 신규 리포트 적재 후 commit 성공 시점에만 캐시 갱신
+4) CLEANUP: run/sync/build 경로를 단일 리포트 생성 메서드 중심으로 정리
+
 2026-03-09
 1) FIX(DB): sync_once()의 market_features / trade_context_snapshots 적재 후 명시적 commit 추가
 2) FIX(ROOT-CAUSE): 외부 인텔리전스 freshness/cache 책임을 source fetcher 내부로 단일화
 3) FIX(STRICT): market_researcher 내부 stale external snapshot 재사용 구조 완전 제거
 4) FIX(STRUCTURE): fetcher(DB 영속 캐시 + 메모리 캐시)만 외부 source 진실원으로 사용
 5) FIX(ROBUST): Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
-
-2026-03-08
-1) derivatives/news/macro/sentiment/onchain/options/volume-profile/orderflow 연동 확장
-2) force_orders 상태 계약 정리 및 worker retry/sleep 구조 강화
 ========================================================
 """
 
@@ -58,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -201,6 +203,12 @@ class ResearchSyncResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class _ReportCacheState:
+    report: MarketResearchReport
+    stored_monotonic_sec: float
+
+
 class MarketResearcher:
     """
     공개 외부 시장 데이터를 기반으로 외부 시장 구조 분석 수행.
@@ -240,8 +248,14 @@ class MarketResearcher:
         self._last_force_orders_status: str = "unknown"
         self._last_force_orders_reason: Optional[str] = None
 
+        self._report_cache_ttl_sec = self._worker_interval_sec
+        self._report_cache_lock = threading.Lock()
+        self._report_cache_state: Optional[_ReportCacheState] = None
+
         if self._worker_interval_sec <= 0:
             raise RuntimeError("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC must be > 0")
+        if self._report_cache_ttl_sec <= 0:
+            raise RuntimeError("report cache ttl must be > 0")
         if self._kline_limit <= 0:
             raise RuntimeError("ANALYST_KLINE_LIMIT must be > 0")
         if self._ratio_limit <= 0:
@@ -262,29 +276,7 @@ class MarketResearcher:
     # ========================================================
 
     def run(self) -> MarketResearchReport:
-        snapshot = self._fetch_market_snapshot_strict()
-
-        derivatives_snapshot = self._fetch_derivatives_snapshot_or_raise()
-        news_snapshot = self._fetch_news_snapshot_or_raise()
-        macro_snapshot = self._fetch_macro_snapshot_or_raise()
-        sentiment_snapshot = self._fetch_sentiment_snapshot_or_raise()
-        onchain_snapshot = self._fetch_onchain_snapshot_or_raise()
-        options_snapshot = self._fetch_options_snapshot_or_raise()
-
-        volume_profile_report = self._build_volume_profile_report_or_raise(snapshot.klines)
-        orderflow_report = self._build_orderflow_report_or_raise()
-
-        report = self._build_report(
-            snapshot=snapshot,
-            derivatives_snapshot=derivatives_snapshot,
-            news_snapshot=news_snapshot,
-            macro_snapshot=macro_snapshot,
-            sentiment_snapshot=sentiment_snapshot,
-            onchain_snapshot=onchain_snapshot,
-            volume_profile_report=volume_profile_report,
-            orderflow_report=orderflow_report,
-            options_snapshot=options_snapshot,
-        )
+        report = self._get_cached_report_or_build_or_raise(force_refresh=False)
         logger.info(
             "Market research completed: symbol=%s trend=%s regime=%s conviction=%s force_orders_status=%s force_order_count=%s",
             report.symbol,
@@ -301,7 +293,7 @@ class MarketResearcher:
         return report.dashboard_payload
 
     def sync_once(self) -> ResearchSyncResult:
-        report = self.run()
+        report = self._build_report_fresh_or_raise()
         market_feature = self._build_persistable_market_feature(report)
         trade_context = self._build_persistable_trade_context(report, market_feature.pattern_score)
 
@@ -312,6 +304,8 @@ class MarketResearcher:
             market_features_inserted = self._upsert_market_feature(session, market_feature)
             trade_context_inserted = self._upsert_trade_context_snapshot(session, trade_context)
             session.commit()
+
+        self._store_report_cache(report)
 
         result = ResearchSyncResult(
             symbol=market_feature.symbol,
@@ -364,6 +358,75 @@ class MarketResearcher:
             sleep_sec = self._worker_interval_sec - elapsed
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
+
+    def _get_cached_report_or_build_or_raise(self, *, force_refresh: bool) -> MarketResearchReport:
+        with self._report_cache_lock:
+            if not force_refresh and self._report_cache_state is not None:
+                now_monotonic_sec = time.monotonic()
+                if self._is_report_cache_fresh_or_raise(self._report_cache_state, now_monotonic_sec):
+                    logger.info(
+                        "Market research cache hit: symbol=%s as_of_ms=%s cache_age_sec=%.3f ttl_sec=%s",
+                        self._report_cache_state.report.symbol,
+                        self._report_cache_state.report.as_of_ms,
+                        now_monotonic_sec - self._report_cache_state.stored_monotonic_sec,
+                        self._report_cache_ttl_sec,
+                    )
+                    return self._report_cache_state.report
+
+            report = self._build_report_fresh_or_raise()
+            self._report_cache_state = _ReportCacheState(
+                report=report,
+                stored_monotonic_sec=time.monotonic(),
+            )
+            logger.info(
+                "Market research cache refreshed: symbol=%s as_of_ms=%s ttl_sec=%s",
+                report.symbol,
+                report.as_of_ms,
+                self._report_cache_ttl_sec,
+            )
+            return report
+
+    def _store_report_cache(self, report: MarketResearchReport) -> None:
+        with self._report_cache_lock:
+            self._report_cache_state = _ReportCacheState(
+                report=report,
+                stored_monotonic_sec=time.monotonic(),
+            )
+
+    def _is_report_cache_fresh_or_raise(
+        self,
+        state: _ReportCacheState,
+        now_monotonic_sec: float,
+    ) -> bool:
+        age_sec = now_monotonic_sec - state.stored_monotonic_sec
+        if age_sec < 0:
+            raise RuntimeError("report cache monotonic age must be >= 0")
+        return age_sec <= float(self._report_cache_ttl_sec)
+
+    def _build_report_fresh_or_raise(self) -> MarketResearchReport:
+        snapshot = self._fetch_market_snapshot_strict()
+
+        derivatives_snapshot = self._fetch_derivatives_snapshot_or_raise()
+        news_snapshot = self._fetch_news_snapshot_or_raise()
+        macro_snapshot = self._fetch_macro_snapshot_or_raise()
+        sentiment_snapshot = self._fetch_sentiment_snapshot_or_raise()
+        onchain_snapshot = self._fetch_onchain_snapshot_or_raise()
+        options_snapshot = self._fetch_options_snapshot_or_raise()
+
+        volume_profile_report = self._build_volume_profile_report_or_raise(snapshot.klines)
+        orderflow_report = self._build_orderflow_report_or_raise()
+
+        return self._build_report(
+            snapshot=snapshot,
+            derivatives_snapshot=derivatives_snapshot,
+            news_snapshot=news_snapshot,
+            macro_snapshot=macro_snapshot,
+            sentiment_snapshot=sentiment_snapshot,
+            onchain_snapshot=onchain_snapshot,
+            volume_profile_report=volume_profile_report,
+            orderflow_report=orderflow_report,
+            options_snapshot=options_snapshot,
+        )
 
     # ========================================================
     # External source fetch wrappers

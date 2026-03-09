@@ -5,6 +5,21 @@ from __future__ import annotations
 FILE: execution/risk_physics_engine.py
 STRICT · NO-FALLBACK · PRODUCTION MODE
 ========================================================
+
+핵심 변경 요약
+- auto_block_engine 출력 계약과 정합화:
+  * AutoBlockDecision.reasons 를 list[str] 기준으로 STRICT 검증 유지
+- 상단 변경 이력 정리:
+  * 미래 날짜 제거
+  * 최근 변경 이력만 유지
+- 초기화 코드 명확화:
+  * self.policy = policy if policy is not None else RiskPhysicsPolicy()
+
+코드 정리 내용
+- 불필요한 과거 PATCH NOTES 정리
+- 기존 정책/기능 삭제 없음
+- auto_block / dd / consecutive loss / RR 정책 흐름 유지
+
 역할
 --------------------------------------------------------
 - Regime allocation(0.0~1.0) + AccountState(DD/연속손실) + Signal(tp/sl) +
@@ -43,35 +58,17 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
    - micro_score_risk(0~100) + EV Heatmap 상태로 block_entry / risk_multiplier 산출
    - block_entry=True면 SKIP
    - risk_multiplier는 allocation에 곱셈 적용
-6) 최종 allocation 산출:
+6) 최종 allocation 산출
    - effective_alloc = allocation_adjusted
    - 상한(max_allocation)은 정책상 제한값(기본 1.0)
    - 최소(min_allocation_if_enter) 미만이면 SKIP
 
-PATCH NOTES
+변경 이력
 --------------------------------------------------------
-- 2026-03-10
-  1) FIX(ROOT-CAUSE): AutoBlockDecision 출력 계약 검증 추가
-     - block_entry / risk_multiplier / reasons shape 를 STRICT 검증
-     - auto_block_engine 이상 출력이 allocation 경로에 조용히 섞이지 않도록 차단
-  2) FIX(STRICT): heatmap 입력 계약 강화
-     - heatmap_status="OK"/"BLOCK" 이면 heatmap_n > 0 필수
-     - heatmap_status="NOT_READY" 이면 heatmap_ev 는 반드시 None
-  3) FIX(STRICT): policy 정합 강화
-     - min_allocation_if_enter <= max_allocation 강제
-     - dd/consecutive multiplier 는 감쇠 정책이므로 1.0 초과 금지 유지
-  4) FIX(AUDIT): reason 조합 로직 단일화
-     - dd / consec / auto block 사유 문자열 정규화
-  5) 기존 기능 삭제 없음
-
-- 2026-03-03 (TRADE-GRADE)
-  - AutoBlock(microstructure + EV heatmap) 반영:
-    * decide() 입력에 micro_score_risk / heatmap_status / heatmap_ev / heatmap_n 추가
-    * risk/auto_block_engine.decide_auto_block() 결과로 SKIP 또는 allocation 감쇠
-- 2026-03-02
-  - "전액 배분형"으로 전환:
-    * base_risk_pct 제거
-    * effective_risk_pct = allocation_adjusted
+- 2026-03-09
+  1) auto_block_engine 출력 계약(list[str] reasons) 기준으로 STRICT 정합 유지
+  2) 상단 이력/요약 구조 정리 및 미래 날짜 제거
+  3) policy 초기화 구문 명확화
 ========================================================
 """
 
@@ -196,7 +193,12 @@ def _validate_auto_block_decision_strict(abd: AutoBlockDecision) -> None:
     if not isinstance(abd.block_entry, bool):
         raise RiskPhysicsError("auto_block_engine.block_entry must be bool (STRICT)")
 
-    _ = _as_float(abd.risk_multiplier, "auto_block_engine.risk_multiplier", min_value=0.0, max_value=1.0)
+    _ = _as_float(
+        abd.risk_multiplier,
+        "auto_block_engine.risk_multiplier",
+        min_value=0.0,
+        max_value=1.0,
+    )
 
     if not isinstance(abd.reasons, list):
         raise RiskPhysicsError("auto_block_engine.reasons must be list (STRICT)")
@@ -240,7 +242,7 @@ class RiskPhysicsEngine:
     """
 
     def __init__(self, policy: Optional[RiskPhysicsPolicy] = None) -> None:
-        self.policy = policy or RiskPhysicsPolicy()
+        self.policy = policy if policy is not None else RiskPhysicsPolicy()
         self._validate_policy(self.policy)
 
     @staticmethod
@@ -265,7 +267,12 @@ class RiskPhysicsEngine:
         _as_float(p.min_planned_rr, "policy.min_planned_rr", min_value=0.1)
 
         _as_float(p.max_allocation, "policy.max_allocation", min_value=0.0, max_value=1.0)
-        _as_float(p.min_allocation_if_enter, "policy.min_allocation_if_enter", min_value=0.0, max_value=1.0)
+        _as_float(
+            p.min_allocation_if_enter,
+            "policy.min_allocation_if_enter",
+            min_value=0.0,
+            max_value=1.0,
+        )
         if p.min_allocation_if_enter > p.max_allocation:
             raise ValueError("policy.min_allocation_if_enter must be <= policy.max_allocation")
 

@@ -6,13 +6,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ============================================================
 
 핵심 변경 요약
-- run_bot_ws 부팅 시 embedded market_researcher 자동 기동 제거
-- 자동매매 엔진과 외부 시장 분석 워커를 역할 분리
-- 봇 재시작/부팅만으로 외부 인텔리전스 API가 암묵 호출되던 구조 제거
+- run_bot_ws 에서 Signal → ExecutionEngine 가격 계약을 명시적으로 보강
+- cand.meta 간접 의존을 제거하고 entry_price_hint 를 authoritative market_data 기준으로 주입
+- stale kline 경고 로그의 dead expression 제거
+- 미사용 import/상태 변수 정리
 
 코드 정리 내용
-- 미사용 import(MarketResearcher) 제거
-- embedded market_researcher autostart 관련 dead bootstrap 코드 제거
+- 미사용 import(EntryCandidate) 제거
+- 미사용 전역 상태(START_TS) 제거
+- execution price alias 정리 helper 추가
 - 상단 변경 이력 최근 2일 기준으로 정리
 
 run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
@@ -31,6 +33,15 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-10 (TRADE-GRADE PATCH 8):
+  1) FIX(ROOT-CAUSE): Signal → ExecutionEngine 가격 계약을 run_bot_ws 에서 명시적으로 보장
+     - entry_price_hint 를 authoritative market_data/cand.meta 실데이터에서 strict 추출 후 Signal.meta 에 주입
+     - 기존 cand.meta 가격 유무에 간접 의존하던 구조 제거
+     - 가격 계약 미충족 시 즉시 예외 처리
+  2) CLEANUP: execution price alias purge helper 추가, stale kline 경고 로그 dead expression 제거
+  3) CLEANUP: 미사용 import(EntryCandidate) / 미사용 전역 상태(START_TS) 제거
+  4) 기존 자동매매 기능 삭제 없음
+
 - 2026-03-09 (TRADE-GRADE PATCH 7):
   1) FIX(ROOT-CAUSE): run_bot_ws 부팅 시 embedded market_researcher 자동 기동 제거
      - 자동매매 엔진이 외부 시장 분석 워커를 암묵적으로 띄우지 않음
@@ -38,11 +49,6 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
      - 외부 시장 분석 기능 자체는 dashboard_server / analysis.market_researcher 전용 경로로 유지
   2) CLEANUP: 미사용 MarketResearcher import 및 autostart bootstrap 코드 제거
   3) 기존 자동매매 기능 삭제 없음
-
-- 2026-03-08 ~ 2026-03-09 (최근 변경 유지):
-  1) 동일 5m 캔들 진입 게이트 DB 영속화 및 pre-claim 구조 반영
-  2) equity TTL 캐시 / 고주기 감독 루프 / WS 준비 게이트 / 보호주문 가드 유지
-  3) PnL / close_time / reconcile / drift / invariant / SAFE_STOP 흐름 유지
 ============================================================
 """
 
@@ -105,7 +111,7 @@ from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder, AccountStateNotReadyError
 from execution.risk_physics_engine import RiskPhysicsEngine, RiskPhysicsPolicy
 from strategy.signal import Signal
-from core.entry_pipeline import EntryCandidate, _build_entry_market_data, _decide_entry_candidate_strict
+from core.entry_pipeline import _build_entry_market_data, _decide_entry_candidate_strict
 
 from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 
@@ -130,7 +136,6 @@ from infra.drift_detector import (
 )
 
 SET = load_settings()
-START_TS: float = time.time()
 RUNNING: bool = True
 
 ENTRY_REQUIRED_TFS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
@@ -574,6 +579,73 @@ def _normalize_direction_for_events_strict(v: Any) -> str:
     raise RuntimeError(f"invalid trade side for events: {v!r}")
 
 
+_SIGNAL_EXECUTION_PRICE_ALIASES: tuple[str, ...] = (
+    "entry_price_hint",
+    "entry_price",
+    "price",
+    "mark_price",
+    "last_price",
+    "close",
+)
+
+
+def _extract_first_positive_price_from_mapping_optional(mapping: Any, *, source_name: str) -> tuple[Optional[float], Optional[str]]:
+    if mapping is None:
+        return None, None
+    if not isinstance(mapping, dict):
+        raise RuntimeError(f"{source_name} must be dict when provided (STRICT)")
+
+    for alias in _SIGNAL_EXECUTION_PRICE_ALIASES:
+        if alias not in mapping:
+            continue
+        raw = mapping.get(alias)
+        if raw is None:
+            continue
+        price = _as_float(raw, f"{source_name}.{alias}", min_value=0.0)
+        if price <= 0.0:
+            raise RuntimeError(f"{source_name}.{alias} must be > 0 (STRICT)")
+        return float(price), f"{source_name}.{alias}"
+
+    return None, None
+
+
+def _resolve_entry_price_hint_for_signal_or_raise(
+    market_data: Dict[str, Any],
+    cand_meta: Optional[Dict[str, Any]],
+) -> tuple[float, str]:
+    if not isinstance(market_data, dict):
+        raise RuntimeError("market_data must be dict for signal price resolution (STRICT)")
+
+    market_features = market_data.get("market_features")
+    search_spaces: list[tuple[str, Any]] = [
+        ("market_data", market_data),
+        ("market_data.market_features", market_features),
+        ("cand.meta", cand_meta),
+    ]
+
+    for source_name, source_mapping in search_spaces:
+        price, path = _extract_first_positive_price_from_mapping_optional(
+            source_mapping,
+            source_name=source_name,
+        )
+        if price is not None and path is not None:
+            return float(price), str(path)
+
+    raise RuntimeError(
+        "entry price contract missing for Signal/ExecutionEngine "
+        f"(required aliases={_SIGNAL_EXECUTION_PRICE_ALIASES}) (STRICT)"
+    )
+
+
+def _purge_signal_execution_price_aliases_inplace(meta: Dict[str, Any]) -> None:
+    if not isinstance(meta, dict):
+        raise RuntimeError("signal.meta must be dict for price alias purge (STRICT)")
+
+    for alias in _SIGNAL_EXECUTION_PRICE_ALIASES:
+        if alias in meta:
+            del meta[alias]
+
+
 def _wait_account_ws_ready_or_raise(timeout_sec: float) -> None:
     timeout_f = float(timeout_sec)
     if not math.isfinite(timeout_f) or timeout_f <= 0:
@@ -900,7 +972,7 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
             log(f"[WS_LIVENESS][FAIL] future kline ts detected age_ms={age_ms} consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
         elif age_ms > int(stale_sec_f * 1000.0):
             _WS_LIVENESS_CONSEC_FAILS += 1
-            log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAIL_HARDSTOP_N if False else _WS_LIVENESS_FAIL_HARDSTOP_N}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
+            log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
         else:
             if _WS_LIVENESS_CONSEC_FAILS != 0:
                 log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
@@ -1863,9 +1935,17 @@ def main() -> None:
                 _maybe_send_error_tg("INVARIANT", msg, cooldown_sec=60)
                 raise RuntimeError(msg) from e
 
+            entry_price_hint, entry_price_source = _resolve_entry_price_hint_for_signal_or_raise(
+                market_data,
+                cand.meta if isinstance(cand.meta, dict) else None,
+            )
+
             meta2 = dict(cand.meta or {})
+            _purge_signal_execution_price_aliases_inplace(meta2)
             meta2.update(
                 {
+                    "entry_price_hint": float(entry_price_hint),
+                    "entry_price_source": str(entry_price_source),
                     "equity_current_usdt": float(account_state.equity_current_usdt),
                     "equity_peak_usdt": float(account_state.equity_peak_usdt),
                     "dd_pct": float(account_state.dd_pct),
