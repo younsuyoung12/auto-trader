@@ -26,7 +26,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - _require_tz_aware_datetime 는 compatibility alias 로 유지
      - helper naming drift 로 인한 Pylance undefined variable 오류 근본 제거
   2) FIX(STRICT): _persist_partial_progress_to_db_strict 의 synced_at 검증 경로 정합화
-  3) 기존 기능 삭제 없음
+  3) FIX(CONTRACT): Trade.entry_ts 필드 추가
+     - execution_engine 의 trade.entry_ts 계약을 수용하도록 메모리 Trade 모델 확장
+     - entry_ts 가 제공되면 timezone-aware datetime 만 허용
+  4) 기존 기능 삭제 없음
 
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): 부분청산 누적 손익/잔량을 DB에 즉시 반영
@@ -208,6 +211,9 @@ class Trade:
     client_entry_id: Optional[str] = None
     id: int = 0
 
+    # execution contract
+    entry_ts: Optional[datetime] = None  # 실제 체결 시각(tz-aware) - 제공되면 반드시 검증
+
     # legacy alias
     entry: float = 0.0
 
@@ -242,6 +248,9 @@ class Trade:
             self.entry = float(self.entry_price)
         if self.entry > 0 and self.entry_price == 0:
             self.entry_price = float(self.entry)
+
+        if self.entry_ts is not None:
+            self.entry_ts = _require_tzaware_dt(self.entry_ts, "trade.entry_ts")
 
         ps = str(self.exchange_position_side or "").upper().strip()
         if ps not in ("BOTH", "LONG", "SHORT"):

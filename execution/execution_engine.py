@@ -1,1875 +1,1962 @@
+# execution/order_executor.py
 """
 ========================================================
-FILE: execution/execution_engine.py
+FILE: execution/order_executor.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
+Binance USDT-M Futures - Order Execution Layer (Production)
 
-역할
-- strategy.Signal을 받아 “실행”만 한다.
-- 가드(수동/볼륨/점프/스프레드/하드리스크) → 주문 실행 → DB 영속화 → 알림
-- 폴백 금지: 누락/불일치/모호성은 즉시 예외
+핵심:
+- REST endpoints: /fapi/*
+- Symbol filters enforced via /fapi/v1/exchangeInfo (tick/step/minQty)
+- Idempotency via newClientOrderId (openOrders + order lookup + in-process lock)
+- Timestamp error (-1021) recovery: sync_server_time() + single retry
+- No print(); logging only
 
-핵심 원칙
-- 예외 삼키기 금지(단, 관측/알림 목적의 예외는 별도 이벤트로 기록 후 흐름에 영향 X)
-- “SKIP”은 정상 흐름(리스크/가드에 의해 실행하지 않는 결정)으로 처리한다.
-- “ENTER”는 필요한 메타/필드가 1개라도 없으면 즉시 중단한다.
-- 동시 실행(레이스) 금지: execute()는 전역 단일 락으로 직렬화한다.
-- 알림(텔레그램)은 메인 실행을 블로킹하면 안 된다(비동기 위임). 실패해도 실행 흐름을 망치지 않는다.
-
-PATCH NOTES — 2026-03-09 (TRADE-GRADE)
-- 실행 계약 정합(ROOT-CAUSE)
-  - order_executor.open_position_with_tp_sl() 성공 반환 Trade 는
-    반드시 reconciliation_status="PROTECTION_VERIFIED" 상태여야 한다.
-  - execution_engine 는 과도기 상태(ENTRY_FILLED)를 허용하지 않는다.
-  - order_executor 가 검증 완료한 last_synced_at 을 우선 보존해 DB 영속화와 이벤트 기록에 사용한다.
-- 실행 레이어 상태 모델 정리
-  - _ALLOWED_RECONCILIATION_STATUSES 를 PROTECTION_VERIFIED 단일 상태로 축소
-  - 보호주문 검증이 끝나지 않은 Trade 는 실행 성공으로 취급하지 않음
+PATCH NOTES — 2026-03-10 (TRADE-GRADE)
+--------------------------------------------------------
+- execution_engine 계약 정합(ROOT-CAUSE)
+  - open_position_with_tp_sl() 반환 Trade 에 entry_ts(tz-aware) 주입
+  - 반환 Trade.reconciliation_status 를 PROTECTION_VERIFIED 로 승격
+  - execution_engine 가 요구하는 성공 계약과 완전 일치
+- 강제청산/수동청산 검증 강화(STRICT)
+  - close_position_market(): MARKET close FILLED 확인 + symbol flat(0 position) 확인
+  - close_all_positions_market(): 모든 reduce-only close order FILLED 확인 + 최종 flat 확인
 - 기존 기능 삭제 없음
 
-PATCH NOTES — 2026-03-07 (TRADE-GRADE)
-- POSITION 이벤트 기록 보강(STRICT):
-  - 실제 진입 성공 후 bt_events 에 event_type="POSITION" 이벤트를 추가 기록
-  - TEST_DRY_RUN 경로도 is_test=True POSITION 이벤트를 기록
-  - 기존 주문/DB/알림/리턴 흐름은 변경하지 않음
-  - 대시보드 /api/position/current 의 STRICT 조회 입력을 충족하도록 최소 이벤트만 추가
-
-PATCH NOTES — 2026-03-06 (TRADE-GRADE)
-- DECISION 이벤트 연결(STRICT):
-  - NO_ENTRY / ENTRY 의사결정 이벤트를 bt_events 에 기록
-  - 대시보드 "왜 진입 안하는지 / 왜 진입했는지" 패널용 payload 엄격 생성
-  - 필수 결정 지표(entry_score / trend_strength / spread / orderbook_imbalance) 누락 시 즉시 예외
-
 PATCH NOTES — 2026-03-04 (TRADE-GRADE)
-- Invariant Guard 연결(STRICT):
-  - ENTER 흐름에서 meta/signal 수학 무결성(0..1/finite/필수키)을 execute() 초기에 검증
-  - notional/qty/slippage/spread 등 실행 수학값을 hard_risk_guard_check 이전에 재검증
-  - 위반 시 폴백 없이 즉시 OrderFailed 로 중단
+--------------------------------------------------------
+- 체결 안정성 강화(Partial fill/지연 체결/가시성 지연 대응)
+  - ENTRY/EXIT MARKET 주문 후 주문 상태(FILLED) + executedQty/avgPrice STRICT 검증
+  - 체결 수량 mismatch 시 즉시 예외(진행 금지)
+  - 포지션 반영(positionAmt) 확인 루프 추가(짧은 대기, 제한 횟수) 후 불일치 시 예외
+- 동시성/일관성 강화
+  - Idempotency 조회에서 비정상 타입 발견 시 즉시 예외(조용한 continue 금지)
+  - entry 주문 전 동일한 라운딩(필터 기반)으로 “예상 수량” 확정 후 전송
+- 예외 전파 구조 정비
+  - open_position_with_tp_sl()에서 예외를 삼키고 None 반환하던 흐름 제거(STRICT)
+  - 필요한 이벤트 기록 후 예외 전파(폴백/조용한 종료 금지)
 
 PATCH NOTES — 2026-03-03 (TRADE-GRADE)
-- ENV 직접 접근 제거(SSOT 준수):
-  - os.getenv 기반 TEST_* 플래그 제거
-  - settings 객체의 test_* 필드로만 테스트 모드 제어(미존재 시 안전 기본값 False/0.0)
-- 운영 사고 방지:
-  - test_force_enter / test_bypass_guards / test_fake_available_usdt 는 test_dry_run=1에서만 허용(아니면 즉시 예외)
-- 예외 삼키기 제거:
-  - trade.order_state / trade.id setattr 실패를 조용히 무시하지 않음(실패 시 예외 전파)
-- 폴백 제거:
-  - quant_final_decision 기본값 "ENTER" 강제 주입 제거(존재할 때만 기록)
+--------------------------------------------------------
+- Trade STRICT 필드 정합 보강:
+  - state.trader_state.Trade.__post_init__ 요구사항 충족:
+    * last_synced_at (tz-aware) 반드시 주입
+    * client_entry_id(=entry_client_order_id) 주입
+    * reconciliation_status 명시
+  - 결과: open_position_with_tp_sl() 반환 Trade가 STRICT 검증을 통과하도록 보장
 
-PATCH NOTES — 2026-03-03 (TRADE-GRADE)
-- bt_trade_snapshots 확장 컬럼 저장 연결:
-  - meta에서 Decision/Micro/EV/AutoBlock 값을 읽어 record_trade_snapshot에 전달
-  - exec_expected_price/exec_filled_avg_price/exec_slippage_pct 즉시 저장(대기 불필요)
-- Execution Quality 이벤트 기록 비동기화:
-  - 체결 후 t+1s/t+3s/t+5s markPrice 조회는 async_worker로 위임(메인 execute 블로킹 제거)
-  - bt_events에 on_execution_quality / on_execution_quality_fail 기록
-
-PATCH NOTES — 2026-03-02 (UPGRADE)
-- Telegram I/O 비동기화:
-  - infra/async_worker.submit()로 send_tg / send_skip_tg를 위임(메인 실행 블로킹 제거)
-- bt_trade_snapshots에 DD 영속화 저장(STRICT):
-  - meta.equity_current_usdt / meta.equity_peak_usdt / meta.dd_pct 를 STRICT로 요구
-- deterministic entry_client_order_id 생성/주입:
-  - 동일 signal 재시도 시 동일 newClientOrderId 생성 → 중복 진입 차단
-- bt_trades 실행/복구 필드 영속화(STRICT):
-  - entry_order_id / tp_order_id / sl_order_id
-  - exchange_position_side / remaining_qty / realized_pnl_usdt
-  - reconciliation_status / last_synced_at
-
-PATCH NOTES — 2026-03-02 (FIX)
-- Pylance "Trade is not defined" 해결:
-  - from state.trader_state import Trade 추가
+PATCH NOTES — 2026-03-02
+--------------------------------------------------------
+- TP/SL 주문 생성 시 orderId를 반환/상위로 전달(set_tp_sl -> (tp_order_id, sl_order_id))
+- Entry/TP/SL에 결정적(deterministic) clientOrderId를 주입할 수 있도록 확장
+  - entry_client_order_id(kw-only) 지원
+  - settings.require_deterministic_client_order_id=True 인 경우 미지정 시 즉시 예외(폴백 금지)
+- Trade 객체 생성 시(레거시 호환) Trade 시그니처에 존재하는 필드만 주입(호환성 유지)
+  - entry_order_id/tp_order_id/sl_order_id/exchange_position_side/remaining_qty/realized_pnl_usdt 등
+- STRICT 유지: 누락/불일치/실패 시 즉시 예외 또는 명시적 실패 처리(추정/폴백 금지)
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-09:
-  1) FIX(ROOT-CAUSE): order_executor 와 reconciliation_status 계약 단일화
-     - real trade 성공 상태는 PROTECTION_VERIFIED만 허용
-  2) FIX(STRICT): order_executor 가 기록한 last_synced_at(tz-aware)을 보존 사용
-  3) 기존 주문/DB/알림/리턴 기능 삭제 없음
-- 2026-03-07:
-  1) POSITION 이벤트 기록 누락 수정
-     - 실제 체결/TEST_DRY_RUN 양쪽 경로에 POSITION 이벤트 기록 추가
-  2) 기존 주문/DB/알림/리턴 기능 변경 없음
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): execution_engine 계약 정합
+     - Trade.entry_ts 주입
+     - Trade.reconciliation_status=PROTECTION_VERIFIED
+  2) FIX(STRICT): close_position_market / close_all_positions_market 에 flat verify 추가
+  3) 기존 기능 삭제 없음
+
 - 2026-03-06:
-  1) 보호주문 검증 연동 강화
-     - order_executor 의 TP/SL 실가시성 검증 결과를 execution_engine 에서 필수 필드로 재검증
-  2) TP 주문 필수화
-     - ENTER 성공 후 trade.tp_order_id 누락 시 즉시 예외
-  3) reconciliation_status 승격
-     - 보호주문 검증 완료 상태를 PROTECTION_VERIFIED 로 영속화
-  4) 보호주문 검증 완료 이벤트 추가
-     - PROTECTION_VERIFIED 이벤트를 bt_events 에 기록
+  1) TP/SL 보호주문 가시성 검증 추가
+     - ENTRY 후 TP/SL 주문이 실제로 거래소에 존재하는지 polling 검증
+     - orderId / clientOrderId / side / type / positionSide / reduceOnly|closePosition / status 엄격 확인
+  2) 보호주문 검증 실패 시 무보호 포지션 방지
+     - close_all_positions_market()로 즉시 정리 시도 후 예외 전파
+  3) 보호주문 검증 전용 예외 추가
+     - ProtectionOrderVerificationError
 ========================================================
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
+import re
+import threading
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from threading import Lock
+from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, List, Optional, Tuple
 
-from events.signals_logger import log_event, log_signal, log_skip_event
-from execution.exchange_api import get_available_usdt, get_balance_detail, req
-from execution.execution_quality_engine import ExecutionQualityError, build_execution_quality_snapshot_obj
-from execution.exceptions import OrderFailed, StateViolation
-from execution.order_executor import (
-    ProtectionOrderVerificationError,
-    open_position_with_tp_sl,
+from execution.exchange_api import (
+    fetch_open_positions,
+    get_exchange_info,
+    get_open_orders,
+    get_order,
+    get_order_by_client_id,
+    get_position,
+    req,
+    set_leverage,
+    set_margin_mode,
+    sync_server_time,
 )
-from execution.order_state import OrderState
-from execution.risk_manager import hard_risk_guard_check
-from infra.async_worker import submit as submit_async
-from infra.telelog import send_skip_tg, send_tg
-from risk.entry_guards_ws import (
-    check_manual_position_guard,
-    check_price_jump_guard,
-    check_spread_guard,
-    check_volume_guard,
-)
-from strategy.signal import Signal
-from state.db_writer import (
-    close_latest_open_trade_returning_id,
-    record_trade_exit_snapshot,
-    record_trade_open_returning_id,
-    record_trade_snapshot,
-)
+from execution.retry_policy import execute_with_retry  # type: ignore
+from events.signals_logger import log_event
+from settings import load_settings
 from state.trader_state import Trade
 
-from execution.invariant_guard import (
-    ExecutionInvariantInputs,
-    InvariantViolation,
-    SignalInvariantInputs,
-    validate_execution_invariants_strict,
-    validate_signal_from_meta_strict,
-    validate_signal_invariants_strict,
-)
+# Decimal precision for money/qty calculations
+getcontext().prec = 28
 
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# Global single execution lock (STRICT)
-# ============================================================
-_EXECUTION_LOCK: Lock = Lock()
+SET = load_settings()
 
-_ALLOWED_DECISION_ACTIONS = ("ENTRY", "NO_ENTRY", "HOLD", "EXIT")
-_ALLOWED_RECONCILIATION_STATUSES = ("PROTECTION_VERIFIED",)
+# Cache TTLs
+_FILTER_CACHE_TTL_SEC: int = 1800  # 30 minutes
+_IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
+_IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
 
-
-def _as_bool_strict(v: Any, name: str) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise ValueError(f"{name} must be bool-like (got {v!r})")
+# Protection order verification
+_PROTECTION_VERIFY_WAIT_SEC: float = 3.0
+_PROTECTION_VERIFY_POLL_SEC: float = 0.2
 
 
-def _as_float(
-    value: Any,
-    name: str,
-    *,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
-) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a number (bool not allowed)")
-    try:
-        v = float(value)
-    except Exception as e:
-        raise ValueError(f"{name} must be a number") from e
-
-    if not math.isfinite(v):
-        raise ValueError(f"{name} must be finite")
-
-    if min_value is not None and v < min_value:
-        raise ValueError(f"{name} must be >= {min_value}")
-    if max_value is not None and v > max_value:
-        raise ValueError(f"{name} must be <= {max_value}")
-
-    return v
+# ---------------------------------------------------------------------------
+# Exceptions (TRADE-GRADE)
+# ---------------------------------------------------------------------------
+class OrderExecutionError(RuntimeError):
+    """Raised when order execution/verification fails (STRICT)."""
 
 
-def _opt_float_strict(value: Any, name: str) -> Optional[float]:
-    if value is None:
-        return None
-    return float(_as_float(value, name))
+class OrderFillTimeoutError(OrderExecutionError):
+    """Raised when an order is not FILLED within deadline (STRICT)."""
 
 
-def _require_nonempty_str(value: Any, name: str) -> str:
-    if value is None:
-        raise OrderFailed(f"{name} is required (STRICT)")
-    if not isinstance(value, str):
-        raise OrderFailed(f"{name} must be str (STRICT)")
-    s = value.strip()
+class PartialFillError(OrderExecutionError):
+    """Raised when executedQty mismatches expectedQty (STRICT)."""
+
+
+class PositionVerificationError(OrderExecutionError):
+    """Raised when exchange position does not reflect expected execution (STRICT)."""
+
+
+class ProtectionOrderVerificationError(OrderExecutionError):
+    """Raised when TP/SL protection orders are missing or invalid (STRICT)."""
+
+
+# ---------------------------------------------------------------------------
+# Event side normalization (EventBus strict: LONG/SHORT/CLOSE)
+# ---------------------------------------------------------------------------
+def _event_side_from_open_side(open_side: str) -> str:
+    s = str(open_side).upper().strip()
+    if s == "BUY":
+        return "LONG"
+    if s == "SELL":
+        return "SHORT"
+    return "CLOSE"
+
+
+def _event_side_close() -> str:
+    return "CLOSE"
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SymbolFilters:
+    """Parsed trading filters for a single symbol (Binance USDT-M Futures)."""
+
+    symbol: str
+    tick_size: Decimal
+    lot_step: Decimal
+    lot_min_qty: Decimal
+    market_step: Decimal
+    market_min_qty: Decimal
+
+
+# ---------------------------------------------------------------------------
+# Caches / Locks
+# ---------------------------------------------------------------------------
+_FILTER_CACHE: Dict[str, Tuple[float, SymbolFilters]] = {}
+_FILTER_LOCK = threading.Lock()
+
+_SETTINGS_APPLIED: set[str] = set()
+_SETTINGS_LOCK = threading.Lock()
+
+# ClientOrderId concurrency control + recent cache
+_CLIENT_ID_CACHE: Dict[str, float] = {}
+_CLIENT_ID_INFLIGHT: set[str] = set()
+_CLIENT_ID_LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Helpers: normalization / parsing / formatting
+# ---------------------------------------------------------------------------
+def _normalize_symbol(symbol: str) -> str:
+    s = str(symbol).replace("-", "").replace("/", "").upper().strip()
     if not s:
-        raise OrderFailed(f"{name} must not be empty (STRICT)")
+        raise ValueError("symbol is empty")
     return s
 
 
-def _require_str_list(values: Any, name: str) -> List[str]:
-    if values is None:
-        raise OrderFailed(f"{name} is required (STRICT)")
-    if not isinstance(values, list):
-        raise OrderFailed(f"{name} must be list[str] (STRICT)")
-    if not values:
-        raise OrderFailed(f"{name} must not be empty (STRICT)")
-
-    out: List[str] = []
-    for idx, item in enumerate(values):
-        out.append(_require_nonempty_str(item, f"{name}[{idx}]"))
-    return out
+def _normalize_side(side: str) -> str:
+    s = str(side).upper().strip()
+    if s in {"BUY", "LONG"}:
+        return "BUY"
+    if s in {"SELL", "SHORT"}:
+        return "SELL"
+    raise ValueError(f"invalid side: {side!r}")
 
 
-def _require_tz_aware_datetime(value: Any, name: str) -> datetime:
-    if not isinstance(value, datetime):
-        raise OrderFailed(f"{name} must be datetime (STRICT)")
-    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
-        raise OrderFailed(f"{name} must be timezone-aware datetime (STRICT)")
-    return value
+def _normalize_position_side(position_side: Optional[str]) -> str:
+    if position_side is None:
+        return "BOTH"
+    ps = str(position_side).upper().strip()
+    if ps in {"BOTH", "LONG", "SHORT"}:
+        return ps
+    raise ValueError(f"invalid position_side: {position_side!r}")
 
 
-def _normalize_decision_action(action: str) -> str:
-    a = _require_nonempty_str(action, "decision.action").upper()
-    if a not in _ALLOWED_DECISION_ACTIONS:
-        raise OrderFailed(f"unsupported decision action (STRICT): {a}")
-    return a
+def _to_decimal(x: Any, *, name: str) -> Decimal:
+    try:
+        d = Decimal(str(x))
+    except Exception:
+        raise ValueError(f"invalid decimal for {name}") from None
+    return d
 
 
-def _meta_pick_first(meta: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
-    """
-    STRICT:
-    - 0/False 같은 값이 '없음'으로 오해되지 않도록, 키 존재 여부로만 선택한다.
-    """
-    for k in keys:
-        if k in meta:
-            return meta[k]
-    return None
+def _d_to_str(d: Decimal) -> str:
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    if s in {"", "-0"}:
+        return "0"
+    return s
 
 
-def _require_meta_numeric_from_keys(
-    meta: Dict[str, Any],
-    keys: Tuple[str, ...],
-    name: str,
-    *,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
-) -> float:
-    raw = _meta_pick_first(meta, keys)
-    if raw is None:
-        raise OrderFailed(f"{name} is required (STRICT)")
-    return float(_as_float(raw, name, min_value=min_value, max_value=max_value))
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        raise ValueError("step must be > 0")
+    if value <= 0:
+        raise ValueError("value must be > 0")
+    units = (value / step).to_integral_value(rounding=ROUND_DOWN)
+    return units * step
 
 
-def _optional_meta_numeric_from_keys(
-    meta: Dict[str, Any],
-    keys: Tuple[str, ...],
-    name: str,
-    *,
-    min_value: Optional[float] = None,
-    max_value: Optional[float] = None,
-) -> Optional[float]:
-    raw = _meta_pick_first(meta, keys)
-    if raw is None:
-        return None
-    return float(_as_float(raw, name, min_value=min_value, max_value=max_value))
+def _prune_client_id_cache(now: float) -> None:
+    cutoff = now - _IDEMPOTENCY_CACHE_TTL_SEC
+    dead = [k for k, ts in _CLIENT_ID_CACHE.items() if ts < cutoff]
+    for k in dead:
+        _CLIENT_ID_CACHE.pop(k, None)
 
 
-def _calculate_exit_prices_strict(
-    *,
-    direction: str,
-    entry_price: float,
-    tp_pct: float,
-    sl_pct: float,
-) -> Tuple[float, float]:
-    if entry_price <= 0:
-        raise OrderFailed("entry_price must be > 0 (STRICT)")
-    if tp_pct <= 0:
-        raise OrderFailed("tp_pct must be > 0 (STRICT)")
-    if sl_pct <= 0:
-        raise OrderFailed("sl_pct must be > 0 (STRICT)")
-
-    d = _require_nonempty_str(direction, "direction").upper()
-    if d == "LONG":
-        target_price = entry_price * (1.0 + tp_pct)
-        stop_price = entry_price * (1.0 - sl_pct)
-    elif d == "SHORT":
-        target_price = entry_price * (1.0 - tp_pct)
-        stop_price = entry_price * (1.0 + sl_pct)
-    else:
-        raise OrderFailed("direction must be LONG or SHORT (STRICT)")
-
-    if target_price <= 0 or stop_price <= 0:
-        raise OrderFailed("calculated target/stop price invalid (STRICT)")
-    return float(target_price), float(stop_price)
-
-
-def _build_decision_payload_strict(
-    *,
-    meta: Dict[str, Any],
-    action: str,
-    summary: str,
-    reasons: List[str],
-    signal_source: str,
-    current_price: float,
-    direction: str,
-    spread_snapshot: Optional[float],
-    position_qty: Optional[float],
-    entry_price: Optional[float] = None,
-    tp_pct: Optional[float] = None,
-    sl_pct: Optional[float] = None,
-) -> Dict[str, Any]:
-    normalized_action = _normalize_decision_action(action)
-    summary_s = _require_nonempty_str(summary, "decision.summary")
-    reasons_l = _require_str_list(reasons, "decision.reasons")
-    signal_source_s = _require_nonempty_str(signal_source, "decision.signal_source")
-
-    current_price_f = float(_as_float(current_price, "decision.current_price", min_value=0.0))
-    if current_price_f <= 0:
-        raise OrderFailed("decision.current_price must be > 0 (STRICT)")
-
-    entry_score = _require_meta_numeric_from_keys(
-        meta,
-        ("entry_score", "entryScore", "engine_total", "engine_total_score", "engine_total_score_v2"),
-        "decision.entry_score",
-    )
-    trend_strength = _require_meta_numeric_from_keys(
-        meta,
-        ("trend_strength", "trend_score", "trendScore", "trend_strength_1m"),
-        "decision.trend_strength",
-    )
-    orderbook_imbalance = _require_meta_numeric_from_keys(
-        meta,
-        ("orderbook_imbalance", "depth_ratio", "depth_imbalance", "orderbookImbalance"),
-        "decision.orderbook_imbalance",
-    )
-
-    if spread_snapshot is not None:
-        spread = float(_as_float(spread_snapshot, "decision.spread_snapshot", min_value=0.0))
-    else:
-        spread = _require_meta_numeric_from_keys(
-            meta,
-            ("spread", "spread_pct", "current_spread_pct"),
-            "decision.spread",
-            min_value=0.0,
-        )
-
-    threshold = _optional_meta_numeric_from_keys(
-        meta,
-        ("entry_score_threshold", "decision_threshold", "entry_threshold"),
-        "decision.threshold",
-    )
-    exit_score = _optional_meta_numeric_from_keys(
-        meta,
-        ("exit_score", "exitScore"),
-        "decision.exit_score",
-    )
-
-    regime = _meta_pick_first(meta, ("regime",))
-    regime_s = _require_nonempty_str(regime, "meta.regime") if regime is not None else None
-
-    payload: Dict[str, Any] = {
-        "action": normalized_action,
-        "summary": summary_s,
-        "reasons": reasons_l,
-        "entry_score": float(entry_score),
-        "trend_strength": float(trend_strength),
-        "spread": float(spread),
-        "orderbook_imbalance": float(orderbook_imbalance),
-        "current_price": float(current_price_f),
-        "signal_source": signal_source_s,
-        "side": _require_nonempty_str(direction, "direction").upper(),
-        "regime": regime_s,
-    }
-
-    if threshold is not None:
-        payload["threshold"] = float(threshold)
-    if exit_score is not None:
-        payload["exit_score"] = float(exit_score)
-    if position_qty is not None:
-        payload["position_qty"] = float(_as_float(position_qty, "decision.position_qty", min_value=0.0))
-    if entry_price is not None:
-        entry_price_f = float(_as_float(entry_price, "decision.entry_price", min_value=0.0))
-        if entry_price_f <= 0:
-            raise OrderFailed("decision.entry_price must be > 0 (STRICT)")
-        payload["entry_price"] = entry_price_f
-
-        if tp_pct is not None and sl_pct is not None:
-            target_price, stop_price = _calculate_exit_prices_strict(
-                direction=direction,
-                entry_price=entry_price_f,
-                tp_pct=float(_as_float(tp_pct, "decision.tp_pct", min_value=0.0)),
-                sl_pct=float(_as_float(sl_pct, "decision.sl_pct", min_value=0.0)),
-            )
-            payload["target_price"] = target_price
-            payload["stop_price"] = stop_price
-
-    return payload
-
-
-def _emit_decision_event_strict(
-    *,
-    meta: Dict[str, Any],
-    symbol: str,
-    regime: str,
-    direction: str,
-    signal_source: str,
-    action: str,
-    reason_code: str,
-    summary: str,
-    reasons: List[str],
-    current_price: float,
-    spread_snapshot: Optional[float],
-    position_qty: Optional[float],
-    entry_price: Optional[float] = None,
-    tp_pct: Optional[float] = None,
-    sl_pct: Optional[float] = None,
-) -> None:
-    reason_code_s = _require_nonempty_str(reason_code, "decision.reason_code")
-
-    payload = _build_decision_payload_strict(
-        meta=meta,
-        action=action,
-        summary=summary,
-        reasons=reasons,
-        signal_source=signal_source,
-        current_price=current_price,
-        direction=direction,
-        spread_snapshot=spread_snapshot,
-        position_qty=position_qty,
-        entry_price=entry_price,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-    )
-
-    log_event(
-        "DECISION",
-        symbol=symbol,
-        regime=regime,
-        source="execution_engine.decision",
-        side=direction,
-        price=float(current_price),
-        qty=(float(position_qty) if position_qty is not None else None),
-        reason=reason_code_s,
-        extra_json=payload,
-    )
-
-
-def _emit_position_event_strict(
-    *,
-    symbol: str,
-    regime: str,
-    direction: str,
-    signal_source: str,
-    entry_price: float,
-    position_qty: float,
-    leverage: float,
-    tp_pct: float,
-    sl_pct: float,
-    allocation_ratio: float,
-    trade_id: Optional[int],
-    entry_order_id: Optional[str],
-    tp_order_id: Optional[str],
-    sl_order_id: Optional[str],
-    exchange_position_side: str,
-    remaining_qty: float,
-    realized_pnl_usdt: float,
-    reconciliation_status: str,
-    entry_ts: datetime,
-    entry_client_order_id: str,
-    reason: str,
-    is_test: bool = False,
-) -> None:
-    symbol_s = _require_nonempty_str(symbol, "position.symbol").upper()
-    regime_s = _require_nonempty_str(regime, "position.regime")
-    direction_s = _require_nonempty_str(direction, "position.direction").upper()
-    signal_source_s = _require_nonempty_str(signal_source, "position.signal_source")
-    exchange_position_side_s = _require_nonempty_str(
-        exchange_position_side,
-        "position.exchange_position_side",
-    ).upper()
-    reconciliation_status_s = _require_nonempty_str(
-        reconciliation_status,
-        "position.reconciliation_status",
-    ).upper()
-    reason_s = _require_nonempty_str(reason, "position.reason")
-    entry_client_order_id_s = _require_nonempty_str(
-        entry_client_order_id,
-        "position.entry_client_order_id",
-    )
-
-    if direction_s not in ("LONG", "SHORT"):
-        raise OrderFailed("position.direction must be LONG or SHORT (STRICT)")
-    if exchange_position_side_s not in ("BOTH", "LONG", "SHORT"):
-        raise OrderFailed("position.exchange_position_side must be BOTH/LONG/SHORT (STRICT)")
-    if not isinstance(entry_ts, datetime) or entry_ts.tzinfo is None or entry_ts.tzinfo.utcoffset(entry_ts) is None:
-        raise OrderFailed("position.entry_ts must be tz-aware datetime (STRICT)")
-
-    entry_price_f = float(_as_float(entry_price, "position.entry_price", min_value=0.0))
-    position_qty_f = float(_as_float(position_qty, "position.position_qty", min_value=0.0))
-    leverage_f = float(_as_float(leverage, "position.leverage", min_value=1.0))
-    tp_pct_f = float(_as_float(tp_pct, "position.tp_pct", min_value=0.0, max_value=1.0))
-    sl_pct_f = float(_as_float(sl_pct, "position.sl_pct", min_value=0.0, max_value=1.0))
-    allocation_ratio_f = float(
-        _as_float(
-            allocation_ratio,
-            "position.allocation_ratio",
-            min_value=0.0,
-            max_value=1.0,
-        )
-    )
-    remaining_qty_f = float(_as_float(remaining_qty, "position.remaining_qty", min_value=0.0))
-    realized_pnl_usdt_f = float(_as_float(realized_pnl_usdt, "position.realized_pnl_usdt"))
-
-    if entry_price_f <= 0:
-        raise OrderFailed("position.entry_price must be > 0 (STRICT)")
-    if position_qty_f <= 0:
-        raise OrderFailed("position.position_qty must be > 0 (STRICT)")
-    if remaining_qty_f <= 0:
-        raise OrderFailed("position.remaining_qty must be > 0 (STRICT)")
-
-    extra_json: Dict[str, Any] = {
-        "state": "OPEN",
-        "signal_source": signal_source_s,
-        "trade_id": (int(trade_id) if trade_id is not None else None),
-        "entry_order_id": (entry_order_id.strip() if isinstance(entry_order_id, str) and entry_order_id.strip() else None),
-        "tp_order_id": (tp_order_id.strip() if isinstance(tp_order_id, str) and tp_order_id.strip() else None),
-        "sl_order_id": (sl_order_id.strip() if isinstance(sl_order_id, str) and sl_order_id.strip() else None),
-        "entry_client_order_id": entry_client_order_id_s,
-        "exchange_position_side": exchange_position_side_s,
-        "remaining_qty": remaining_qty_f,
-        "realized_pnl_usdt": realized_pnl_usdt_f,
-        "reconciliation_status": reconciliation_status_s,
-        "entry_ts": entry_ts.astimezone(timezone.utc).isoformat(),
-    }
-
-    log_event(
-        "POSITION",
-        symbol=symbol_s,
-        regime=regime_s,
-        source="execution_engine.position",
-        side=direction_s,
-        price=entry_price_f,
-        qty=position_qty_f,
-        leverage=leverage_f,
-        tp_pct=tp_pct_f,
-        sl_pct=sl_pct_f,
-        risk_pct=allocation_ratio_f,
-        reason=reason_s,
-        extra_json=extra_json,
-        is_test=bool(is_test),
-    )
-
-
-def _require_meta_equity(meta: Dict[str, Any]) -> tuple[float, float, float]:
-    if "equity_current_usdt" not in meta:
-        raise OrderFailed("signal.meta['equity_current_usdt'] is required (STRICT)")
-    if "equity_peak_usdt" not in meta:
-        raise OrderFailed("signal.meta['equity_peak_usdt'] is required (STRICT)")
-    if "dd_pct" not in meta:
-        raise OrderFailed("signal.meta['dd_pct'] is required (STRICT)")
-
-    eq_cur = _as_float(meta.get("equity_current_usdt"), "meta.equity_current_usdt", min_value=0.0)
-    eq_peak = _as_float(meta.get("equity_peak_usdt"), "meta.equity_peak_usdt", min_value=0.0)
-    dd = _as_float(meta.get("dd_pct"), "meta.dd_pct", min_value=0.0, max_value=100.0)
-
-    if eq_cur <= 0 or eq_peak <= 0:
-        raise OrderFailed("meta equity values must be > 0 (STRICT)")
-    return float(eq_cur), float(eq_peak), float(dd)
-
-
-def _deterministic_entry_client_order_id(symbol: str, direction: str, signal_ts_ms: int) -> str:
-    sym = str(symbol).upper().strip()
-    if not sym:
-        raise ValueError("symbol is empty")
-    dir_u = str(direction).upper().strip()
-    if dir_u not in ("LONG", "SHORT"):
-        raise ValueError("direction must be LONG/SHORT")
-    if not isinstance(signal_ts_ms, int) or signal_ts_ms <= 0:
-        raise ValueError("signal_ts_ms must be int > 0")
-
-    d = "L" if dir_u == "LONG" else "S"
-    sym8 = sym[:8]
-    cid = f"ent-{sym8}-{d}-{signal_ts_ms}"
+def _validate_client_order_id(client_order_id: str) -> str:
+    cid = str(client_order_id).strip()
+    if not cid:
+        raise ValueError("client_order_id is empty")
     if len(cid) > 36:
-        cid = cid[:36]
-
+        raise ValueError("client_order_id exceeds 36 chars")
     try:
         cid.encode("ascii")
-    except UnicodeEncodeError as e:
-        raise ValueError("generated client order id must be ASCII") from e
-
-    if not cid or len(cid) > 36:
-        raise ValueError("generated client order id invalid")
-
+    except UnicodeEncodeError:
+        raise ValueError("client_order_id must be ASCII") from None
     return cid
 
 
-def _submit_tg_nonblocking(func, msg: str, *, label: str) -> None:
-    """
-    STRICT:
-    - 텔레그램 전송은 매매 실행을 블로킹하면 안 된다.
-    - 실패해도 매매 흐름을 깨지 않는다(알림은 비핵심 I/O).
-    """
+def _make_client_order_id(prefix: str = "at") -> str:
+    base = f"{prefix}-{uuid.uuid4().hex}"
+    return base[:36]
+
+
+def _make_child_client_order_id(parent: str, suffix: str) -> str:
+    p = _validate_client_order_id(parent)
+    sfx = str(suffix).strip().lower()
+    if not sfx:
+        raise ValueError("suffix is empty")
+    tail = f"-{sfx}"
+    if len(tail) >= 36:
+        raise ValueError("suffix too long for client order id")
+    head_max = 36 - len(tail)
+    return f"{p[:head_max]}{tail}"
+
+
+def _require_positive_float(v: Any, name: str) -> float:
     try:
-        ok = submit_async(func, msg, critical=False, label=label)
-        if not ok:
-            logger.warning("[TG][DROP] queue full label=%s", label)
+        f = float(v)
     except Exception as e:
-        logger.warning("[TG][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
+        raise ValueError(f"{name} must be a number") from e
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be finite")
+    if f <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return f
 
 
-def _submit_task_nonblocking(fn, *args: Any, label: str) -> None:
-    """
-    STRICT:
-    - 비핵심 작업(관측/리포팅)은 async_worker로 위임한다.
-    """
+def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
+    v = getattr(settings, "allocation_ratio", None)
+    if v is None:
+        v = getattr(settings, "risk_pct", None)
+    if v is None:
+        return None
     try:
-        ok = submit_async(fn, *args, critical=False, label=label)
-        if not ok:
-            logger.warning("[ASYNC][DROP] queue full label=%s", label)
+        f = float(v)
+    except Exception:
+        return None
+    if not math.isfinite(f):
+        return None
+    return f
+
+
+def _trade_ctor_supported_fields() -> set[str]:
+    f = getattr(Trade, "__dataclass_fields__", None)
+    if isinstance(f, dict) and f:
+        return set(f.keys())
+
+    try:
+        sig = inspect.signature(Trade)  # type: ignore[arg-type]
+        names = {p.name for p in sig.parameters.values() if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)}
+        if not names:
+            raise RuntimeError("Trade signature has no parameters (unexpected)")
+        return names
     except Exception as e:
-        logger.warning("[ASYNC][SUBMIT_FAIL] label=%s err=%s", label, f"{type(e).__name__}:{e}")
+        raise RuntimeError("unable to introspect Trade ctor fields (STRICT)") from e
 
 
-def _fetch_mark_price_strict(symbol: str) -> float:
-    """
-    STRICT: /fapi/v1/premiumIndex markPrice 조회
-    """
-    sym = str(symbol).replace("-", "").replace("/", "").upper().strip()
-    if not sym:
-        raise OrderFailed("symbol is empty (STRICT)")
-
-    data = req("GET", "/fapi/v1/premiumIndex", {"symbol": sym}, private=False)
-    if not isinstance(data, dict):
-        raise OrderFailed("premiumIndex response must be dict (STRICT)")
-    if "markPrice" not in data:
-        raise OrderFailed("premiumIndex.markPrice missing (STRICT)")
-
-    px = _as_float(data.get("markPrice"), "premiumIndex.markPrice", min_value=0.0)
-    if px <= 0:
-        raise OrderFailed("premiumIndex.markPrice must be > 0 (STRICT)")
-    return float(px)
+def _make_trade_strict(**kwargs: Any) -> Trade:
+    allowed = _trade_ctor_supported_fields()
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return Trade(**filtered)  # type: ignore[arg-type]
 
 
-def _collect_post_prices_strict(symbol: str) -> Dict[str, float]:
-    """
-    STRICT: 체결 후 마크가격을 t+1s/t+3s/t+5s 시점에 각각 조회한다.
-    - 이 함수는 async_worker에서만 실행하도록 설계한다(메인 execute 블로킹 금지).
-    """
-    time.sleep(1.0)
-    p1 = _fetch_mark_price_strict(symbol)
-    time.sleep(2.0)
-    p3 = _fetch_mark_price_strict(symbol)
-    time.sleep(2.0)
-    p5 = _fetch_mark_price_strict(symbol)
-    return {"t+1s": p1, "t+3s": p3, "t+5s": p5}
+def _resolve_order_event_time_strict(order: Dict[str, Any], *, label: str) -> datetime:
+    if not isinstance(order, dict):
+        raise OrderExecutionError(f"{label} must be dict (STRICT)")
+
+    for key in ("updateTime", "time", "transactTime"):
+        raw = order.get(key)
+        if raw is None:
+            continue
+        try:
+            ms = int(raw)
+        except Exception as e:
+            raise OrderExecutionError(f"{label}.{key} invalid int ms (STRICT): {e}") from e
+        if ms <= 0:
+            raise OrderExecutionError(f"{label}.{key} must be > 0 (STRICT)")
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+    raise OrderExecutionError(f"{label} missing updateTime/time/transactTime (STRICT)")
 
 
-def _exec_quality_task(symbol: str, direction: str, regime: str, expected_price: float, filled_avg_price: float) -> None:
-    """
-    비동기 실행 품질 스냅샷 이벤트 기록.
-    - 실패해도 거래 흐름은 깨지지 않는다(관측용).
-    """
+# ---------------------------------------------------------------------------
+# Binance error helpers
+# ---------------------------------------------------------------------------
+_CODE_RE = re.compile(r"code=([-]?\d+)")
+
+
+def _extract_code(err: Exception) -> Optional[int]:
+    m = _CODE_RE.search(str(err))
+    if not m:
+        return None
     try:
-        post_prices = _collect_post_prices_strict(symbol)
-        side = "BUY" if direction == "LONG" else "SELL"
-        snap = build_execution_quality_snapshot_obj(
-            symbol=symbol,
-            side=side,
-            expected_price=float(expected_price),
-            filled_avg_price=float(filled_avg_price),
-            post_prices=post_prices,
-        )
-        log_event(
-            "on_execution_quality",
-            symbol=symbol,
-            regime=regime,
-            source="execution_engine.exec_quality",
-            side=direction,
-            price=float(filled_avg_price),
-            reason="execution_quality_snapshot",
-            extra_json={
-                "expected_price": snap.expected_price,
-                "filled_avg_price": snap.filled_avg_price,
-                "slippage_pct": snap.slippage_pct,
-                "adverse_move_pct": snap.adverse_move_pct,
-                "post_prices": dict(snap.post_prices),
-                "execution_score": snap.execution_score,
-                "meta": dict(snap.meta),
-            },
-        )
-    except (ExecutionQualityError, OrderFailed, ValueError, RuntimeError) as e:
-        log_event(
-            "on_execution_quality_fail",
-            symbol=symbol,
-            regime=regime,
-            source="execution_engine.exec_quality",
-            side=direction,
-            price=float(filled_avg_price) if math.isfinite(float(filled_avg_price)) else None,
-            reason="execution_quality_failed",
-            extra_json={"error": str(e)[:240]},
-        )
+        return int(m.group(1))
+    except Exception:
+        return None
 
 
-def _require_trade_exec_fields(
-    trade: Any,
-    *,
-    soft_mode: bool,
-) -> Tuple[str, str, Optional[str], str, float, float, str]:
-    entry_order_id = getattr(trade, "entry_order_id", None)
-    tp_order_id = getattr(trade, "tp_order_id", None)
-    sl_order_id = getattr(trade, "sl_order_id", None)
+def _is_timestamp_error(err: Exception) -> bool:
+    s = str(err).lower()
+    code = _extract_code(err)
+    if code == -1021:
+        return True
+    if "-1021" in s:
+        return True
+    if "timestamp" in s and ("recvwindow" in s or "ahead of the server" in s or "behind the server" in s):
+        return True
+    return False
 
-    if not isinstance(entry_order_id, str) or not entry_order_id.strip():
-        raise OrderFailed("trade.entry_order_id is required (STRICT)")
 
-    if not isinstance(tp_order_id, str) or not tp_order_id.strip():
-        raise OrderFailed("trade.tp_order_id is required (STRICT)")
+def _is_order_not_found(err: Exception) -> bool:
+    s = str(err).lower()
+    code = _extract_code(err)
+    if code in {-2013, -2011}:
+        return True
+    if "order does not exist" in s:
+        return True
+    return False
 
-    if sl_order_id is not None and (not isinstance(sl_order_id, str) or not sl_order_id.strip()):
-        raise OrderFailed("trade.sl_order_id must be str or None (STRICT)")
 
-    if not bool(soft_mode):
-        if not isinstance(sl_order_id, str) or not sl_order_id.strip():
-            raise OrderFailed("soft_mode=False but trade.sl_order_id is missing (STRICT)")
+def _is_no_need_change_margin(err: Exception) -> bool:
+    s = str(err).lower()
+    code = _extract_code(err)
+    if code == -4046:
+        return True
+    if "no need to change margin type" in s:
+        return True
+    return False
 
-    exchange_position_side = getattr(trade, "exchange_position_side", None)
-    if not isinstance(exchange_position_side, str) or not exchange_position_side.strip():
-        raise OrderFailed("trade.exchange_position_side is required (STRICT)")
-    exchange_position_side = exchange_position_side.strip().upper()
-    if exchange_position_side not in ("BOTH", "LONG", "SHORT"):
-        raise OrderFailed("trade.exchange_position_side must be BOTH/LONG/SHORT (STRICT)")
 
-    remaining_qty = getattr(trade, "remaining_qty", None)
-    if remaining_qty is None:
-        raise OrderFailed("trade.remaining_qty is required (STRICT)")
-    remaining_qty_f = _as_float(remaining_qty, "trade.remaining_qty", min_value=0.0)
-    if remaining_qty_f <= 0:
-        raise OrderFailed("trade.remaining_qty must be > 0 (STRICT)")
+def _is_no_need_change_leverage(err: Exception) -> bool:
+    s = str(err).lower()
+    code = _extract_code(err)
+    if code in {-4047, -4048}:
+        return True
+    if "no need to change leverage" in s or "leverage not modified" in s or "not modified" in s:
+        return True
+    return False
 
-    realized_pnl_usdt = getattr(trade, "realized_pnl_usdt", None)
-    if realized_pnl_usdt is None:
-        raise OrderFailed("trade.realized_pnl_usdt is required (STRICT)")
-    realized_pnl_usdt_f = _as_float(realized_pnl_usdt, "trade.realized_pnl_usdt")
 
-    reconciliation_status = getattr(trade, "reconciliation_status", None)
-    if not isinstance(reconciliation_status, str) or not reconciliation_status.strip():
-        raise OrderFailed("trade.reconciliation_status is required (STRICT)")
-    reconciliation_status = reconciliation_status.strip().upper()
-    if reconciliation_status not in _ALLOWED_RECONCILIATION_STATUSES:
-        raise OrderFailed(
-            f"trade.reconciliation_status unexpected (STRICT): {reconciliation_status!r}"
-        )
+def _call_with_time_sync_retry(fn) -> Any:
+    try:
+        return execute_with_retry(fn)
+    except Exception as e:
+        if _is_timestamp_error(e):
+            logger.warning("timestamp error detected; syncing server time and retrying once")
+            sync_server_time()
+            return execute_with_retry(fn)
+        raise
 
-    return (
-        entry_order_id.strip(),
-        tp_order_id.strip(),
-        (sl_order_id.strip() if isinstance(sl_order_id, str) else None),
-        exchange_position_side,
-        float(remaining_qty_f),
-        float(realized_pnl_usdt_f),
-        reconciliation_status,
+
+# ---------------------------------------------------------------------------
+# Symbol filters: exchangeInfo cache
+# ---------------------------------------------------------------------------
+def _parse_symbol_filters(exchange_info: Dict[str, Any], symbol: str) -> SymbolFilters:
+    symbols = exchange_info.get("symbols")
+    if not isinstance(symbols, list):
+        raise RuntimeError("exchangeInfo missing 'symbols' list")
+
+    sym_info = None
+    for item in symbols:
+        if isinstance(item, dict) and str(item.get("symbol", "")).upper() == symbol:
+            sym_info = item
+            break
+
+    if not isinstance(sym_info, dict):
+        raise RuntimeError(f"exchangeInfo does not contain symbol={symbol}")
+
+    filters = sym_info.get("filters")
+    if not isinstance(filters, list):
+        raise RuntimeError(f"exchangeInfo symbol={symbol} missing filters")
+
+    tick: Optional[Decimal] = None
+    lot_step: Optional[Decimal] = None
+    lot_min: Optional[Decimal] = None
+    mkt_step: Optional[Decimal] = None
+    mkt_min: Optional[Decimal] = None
+
+    for f in filters:
+        if not isinstance(f, dict):
+            raise RuntimeError("exchangeInfo.filters contains non-dict (STRICT)")
+        ftype = str(f.get("filterType", "")).upper().strip()
+
+        if ftype == "PRICE_FILTER":
+            tick = _to_decimal(f.get("tickSize"), name="tickSize")
+        elif ftype == "LOT_SIZE":
+            lot_step = _to_decimal(f.get("stepSize"), name="stepSize(LOT_SIZE)")
+            lot_min = _to_decimal(f.get("minQty"), name="minQty(LOT_SIZE)")
+        elif ftype == "MARKET_LOT_SIZE":
+            mkt_step = _to_decimal(f.get("stepSize"), name="stepSize(MARKET_LOT_SIZE)")
+            mkt_min = _to_decimal(f.get("minQty"), name="minQty(MARKET_LOT_SIZE)")
+
+    if tick is None or tick <= 0:
+        raise RuntimeError(f"missing/invalid PRICE_FILTER.tickSize for symbol={symbol}")
+
+    if lot_step is None or lot_min is None:
+        if mkt_step is None or mkt_min is None:
+            raise RuntimeError(f"missing LOT_SIZE and MARKET_LOT_SIZE for symbol={symbol}")
+        lot_step = mkt_step
+        lot_min = mkt_min
+
+    if mkt_step is None or mkt_min is None:
+        mkt_step = lot_step
+        mkt_min = lot_min
+
+    if lot_step <= 0 or lot_min <= 0 or mkt_step <= 0 or mkt_min <= 0:
+        raise RuntimeError(f"invalid step/minQty in exchangeInfo for symbol={symbol}")
+
+    return SymbolFilters(
+        symbol=symbol,
+        tick_size=tick,
+        lot_step=lot_step,
+        lot_min_qty=lot_min,
+        market_step=mkt_step,
+        market_min_qty=mkt_min,
     )
 
 
-class _SettingsView:
-    __slots__ = ("_base", "_overrides")
+def get_symbol_filters(symbol: str) -> SymbolFilters:
+    sym = _normalize_symbol(symbol)
+    now = time.time()
 
-    def __init__(self, base: Any, overrides: Dict[str, float]):
-        object.__setattr__(self, "_base", base)
-        object.__setattr__(self, "_overrides", overrides)
+    with _FILTER_LOCK:
+        cached = _FILTER_CACHE.get(sym)
+        if cached:
+            ts, filt = cached
+            if now - ts <= _FILTER_CACHE_TTL_SEC:
+                return filt
 
-    def __getattr__(self, name: str) -> Any:
-        overrides = object.__getattribute__(self, "_overrides")
-        if name in overrides:
-            return overrides[name]
-        base = object.__getattribute__(self, "_base")
-        return getattr(base, name)
+    info = get_exchange_info(sym)
+    if not isinstance(info, dict):
+        raise RuntimeError("get_exchange_info returned non-dict")
+    filt = _parse_symbol_filters(info, sym)
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        raise AttributeError("SettingsView is read-only")
-
-
-def _build_guard_settings_view(settings: Any, guard_adjustments: Dict[str, float]) -> _SettingsView:
-    if guard_adjustments is None:
-        raise OrderFailed("guard_adjustments must not be None (STRICT)")
-    if not isinstance(guard_adjustments, dict):
-        raise OrderFailed("guard_adjustments must be dict (STRICT)")
-
-    overrides: Dict[str, float] = {}
-    for k, v in guard_adjustments.items():
-        if not isinstance(k, str) or not k.strip():
-            raise ValueError("guard_adjustments key must be non-empty str")
-        if not hasattr(settings, k):
-            raise OrderFailed(f"guard_adjustments contains unknown settings key: {k}")
-        overrides[k] = _as_float(v, f"guard_adjustments.{k}", min_value=0.0)
-
-    return _SettingsView(settings, overrides)
+    with _FILTER_LOCK:
+        _FILTER_CACHE[sym] = (now, filt)
+    return filt
 
 
-def _resolve_guard_adjustments(signal: Signal) -> Dict[str, float]:
-    ga = getattr(signal, "guard_adjustments", None)
-    if ga is None:
-        return {}
-    if not isinstance(ga, dict):
-        raise OrderFailed("signal.guard_adjustments must be dict or None (STRICT)")
-    return dict(ga)
+# ---------------------------------------------------------------------------
+# Trading settings enforcement (margin mode / leverage)
+# ---------------------------------------------------------------------------
+def _require_margin_mode(settings: Any) -> str:
+    mm = getattr(settings, "margin_mode", None)
+    if not isinstance(mm, str) or not mm.strip():
+        raise ValueError("settings.margin_mode is required")
+    mm_u = mm.strip().upper()
+    if mm_u == "CROSS":
+        mm_u = "CROSSED"
+    if mm_u not in {"ISOLATED", "CROSSED"}:
+        raise ValueError(f"invalid margin_mode: {mm!r}")
+    return mm_u
 
 
-def _resolve_dynamic_allocation(meta: Dict[str, Any]) -> Optional[float]:
-    v = meta.get("dynamic_allocation_ratio")
+def _require_leverage(settings: Any) -> int:
+    lev = getattr(settings, "leverage", None)
+    if lev is None:
+        raise ValueError("settings.leverage is required")
+    try:
+        iv = int(float(lev))
+    except Exception:
+        raise ValueError(f"invalid leverage: {lev!r}") from None
+    if iv < 1:
+        raise ValueError("leverage must be >= 1")
+    return iv
+
+
+def _require_timeout_sec(settings: Any) -> int:
+    v = getattr(settings, "request_timeout_sec", None)
     if v is None:
-        v = meta.get("dynamic_risk_pct")
+        raise ValueError("settings.request_timeout_sec is required")
+    try:
+        iv = int(float(v))
+    except Exception:
+        raise ValueError("invalid request_timeout_sec") from None
+    if iv < 1:
+        raise ValueError("request_timeout_sec must be >= 1")
+    return iv
+
+
+def _require_recv_window_ms(settings: Any) -> int:
+    v = getattr(settings, "recv_window_ms", None)
     if v is None:
-        return None
-    return _as_float(v, "meta.dynamic_allocation_ratio", min_value=0.0, max_value=1.0)
+        raise ValueError("settings.recv_window_ms is required")
+    try:
+        iv = int(float(v))
+    except Exception:
+        raise ValueError("invalid recv_window_ms") from None
+    if iv < 1:
+        raise ValueError("recv_window_ms must be >= 1")
+    return iv
 
 
-def _meta_optional(meta: Dict[str, Any], key: str) -> Any:
-    return meta.get(key) if key in meta else None
+def ensure_trading_settings(symbol: str, settings: Optional[Any] = None) -> None:
+    sym = _normalize_symbol(symbol)
+    st = settings if settings is not None else SET
+    margin_mode = _require_margin_mode(st)
+    leverage = _require_leverage(st)
+
+    with _SETTINGS_LOCK:
+        if sym in _SETTINGS_APPLIED:
+            return
+
+    try:
+        set_margin_mode(sym, margin_mode)
+    except Exception as e:
+        if not _is_no_need_change_margin(e):
+            raise RuntimeError(f"set_margin_mode failed: {e}") from None
+
+    try:
+        set_leverage(sym, leverage)
+    except Exception as e:
+        if not _is_no_need_change_leverage(e):
+            raise RuntimeError(f"set_leverage failed: {e}") from None
+
+    with _SETTINGS_LOCK:
+        _SETTINGS_APPLIED.add(sym)
+
+    logger.info("trading settings ensured (symbol=%s margin_mode=%s leverage=%s)", sym, margin_mode, leverage)
 
 
-def _meta_optional_dict(meta: Dict[str, Any], key: str) -> Optional[dict]:
-    if key not in meta:
-        return None
-    v = meta.get(key)
+# ---------------------------------------------------------------------------
+# Idempotency helpers
+# ---------------------------------------------------------------------------
+def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional[Dict[str, Any]]:
+    orders = get_open_orders(symbol)
+    if not isinstance(orders, list):
+        raise RuntimeError("get_open_orders returned non-list")
+    for o in orders:
+        if not isinstance(o, dict):
+            raise RuntimeError("openOrders contains non-dict (STRICT)")
+        if str(o.get("clientOrderId", "")).strip() == client_order_id:
+            return o
+    return None
+
+
+def _find_open_order_by_id(symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
+    orders = get_open_orders(symbol)
+    if not isinstance(orders, list):
+        raise RuntimeError("get_open_orders returned non-list")
+    for o in orders:
+        if not isinstance(o, dict):
+            raise RuntimeError("openOrders contains non-dict (STRICT)")
+        oid = o.get("orderId")
+        if oid is None:
+            raise RuntimeError("openOrders row missing orderId (STRICT)")
+        if str(oid).strip() == str(order_id).strip():
+            return o
+    return None
+
+
+def _get_order_by_client_id(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
+    params = {"symbol": symbol, "origClientOrderId": client_order_id}
+    try:
+        data = _call_with_time_sync_retry(
+            lambda: req("GET", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec)
+        )
+    except Exception as e:
+        if _is_order_not_found(e):
+            return None
+        raise
+    if not isinstance(data, dict):
+        raise RuntimeError("GET /fapi/v1/order returned non-dict")
+    return data
+
+
+def _wait_for_inflight_or_existing(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
+    deadline = time.time() + _IDEMPOTENCY_INFLIGHT_WAIT_SEC
+    while True:
+        with _CLIENT_ID_LOCK:
+            inflight = client_order_id in _CLIENT_ID_INFLIGHT
+
+        existing = _find_open_order_by_client_id(symbol, client_order_id)
+        if existing is not None:
+            return existing
+
+        existing2 = _get_order_by_client_id(symbol, client_order_id, timeout_sec)
+        if existing2 is not None:
+            return existing2
+
+        if not inflight:
+            return None
+
+        if time.time() >= deadline:
+            raise RuntimeError("idempotency conflict: order is in-flight but not visible")
+        time.sleep(0.05)
+
+
+# ---------------------------------------------------------------------------
+# Core order placement
+# ---------------------------------------------------------------------------
+def _round_qty_and_price(
+    *,
+    filters: SymbolFilters,
+    order_type: str,
+    raw_qty: Any,
+    raw_price: Optional[Any],
+    raw_stop_price: Optional[Any],
+) -> Tuple[Decimal, Optional[Decimal], Optional[Decimal]]:
+    type_u = order_type.upper().strip()
+    is_market_like = type_u == "MARKET" or type_u.endswith("_MARKET")
+
+    step = filters.market_step if is_market_like else filters.lot_step
+    min_qty = filters.market_min_qty if is_market_like else filters.lot_min_qty
+
+    qty = _to_decimal(raw_qty, name="quantity")
+    if qty <= 0:
+        raise ValueError("quantity must be > 0")
+
+    qty_n = _floor_to_step(qty, step)
+    if qty_n <= 0:
+        raise ValueError("quantity rounded to 0")
+    if qty_n < min_qty:
+        raise ValueError(f"quantity {qty_n} < minQty {min_qty}")
+
+    price_n: Optional[Decimal] = None
+    if raw_price is not None:
+        price = _to_decimal(raw_price, name="price")
+        if price <= 0:
+            raise ValueError("price must be > 0")
+        price_n = _floor_to_step(price, filters.tick_size)
+        if price_n <= 0:
+            raise ValueError("price rounded to 0")
+
+    stop_n: Optional[Decimal] = None
+    if raw_stop_price is not None:
+        sp = _to_decimal(raw_stop_price, name="stopPrice")
+        if sp <= 0:
+            raise ValueError("stopPrice must be > 0")
+        stop_n = _floor_to_step(sp, filters.tick_size)
+        if stop_n <= 0:
+            raise ValueError("stopPrice rounded to 0")
+
+    return qty_n, price_n, stop_n
+
+
+def _place_order(
+    *,
+    settings: Optional[Any],
+    symbol: str,
+    side: str,
+    order_type: str,
+    quantity: Any,
+    price: Optional[Any] = None,
+    stop_price: Optional[Any] = None,
+    time_in_force: Optional[str] = None,
+    reduce_only: Optional[bool] = None,
+    position_side: Optional[str] = None,
+    close_position: Optional[bool] = None,
+    client_order_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    st = settings if settings is not None else SET
+
+    sym = _normalize_symbol(symbol)
+    side_u = _normalize_side(side)
+    type_u = str(order_type).upper().strip()
+    if not type_u:
+        raise ValueError("order_type is empty")
+
+    tif_u: Optional[str] = None
+    if time_in_force is not None:
+        tif_u = str(time_in_force).upper().strip() or None
+
+    pos_side_u = _normalize_position_side(position_side)
+
+    timeout_sec = _require_timeout_sec(st)
+    recv_window_ms = _require_recv_window_ms(st)
+
+    cid = _validate_client_order_id(client_order_id) if client_order_id else _make_client_order_id()
+
+    acquired = False
+    with _CLIENT_ID_LOCK:
+        now = time.time()
+        _prune_client_id_cache(now)
+        if cid not in _CLIENT_ID_INFLIGHT:
+            _CLIENT_ID_INFLIGHT.add(cid)
+            _CLIENT_ID_CACHE[cid] = now
+            acquired = True
+
+    if not acquired:
+        existing_wait = _wait_for_inflight_or_existing(sym, cid, timeout_sec)
+        if existing_wait is not None:
+            logger.info(
+                "idempotency hit (inflight wait): returning existing order (symbol=%s clientOrderId=%s orderId=%s)",
+                sym,
+                cid,
+                existing_wait.get("orderId"),
+            )
+            return existing_wait
+
+        with _CLIENT_ID_LOCK:
+            now = time.time()
+            _prune_client_id_cache(now)
+            if cid in _CLIENT_ID_INFLIGHT:
+                raise RuntimeError("idempotency conflict: could not acquire inflight lock")
+            _CLIENT_ID_INFLIGHT.add(cid)
+            _CLIENT_ID_CACHE[cid] = now
+
+    try:
+        ensure_trading_settings(sym, st)
+
+        filt = get_symbol_filters(sym)
+        qty_n, price_n, stop_n = _round_qty_and_price(
+            filters=filt,
+            order_type=type_u,
+            raw_qty=quantity,
+            raw_price=price,
+            raw_stop_price=stop_price,
+        )
+
+        existing = _find_open_order_by_client_id(sym, cid)
+        if existing is not None:
+            logger.info(
+                "idempotency hit: returning existing open order (symbol=%s clientOrderId=%s orderId=%s)",
+                sym,
+                cid,
+                existing.get("orderId"),
+            )
+            return existing
+
+        existing2 = _get_order_by_client_id(sym, cid, timeout_sec)
+        if existing2 is not None:
+            logger.info(
+                "idempotency hit: returning existing order (symbol=%s clientOrderId=%s orderId=%s status=%s)",
+                sym,
+                cid,
+                existing2.get("orderId"),
+                existing2.get("status"),
+            )
+            return existing2
+
+        params: Dict[str, Any] = {
+            "symbol": sym,
+            "side": side_u,
+            "type": type_u,
+            "quantity": _d_to_str(qty_n),
+            "newClientOrderId": cid,
+            "recvWindow": recv_window_ms,
+            "newOrderRespType": "RESULT",
+        }
+
+        params["positionSide"] = pos_side_u
+
+        if reduce_only is not None:
+            params["reduceOnly"] = bool(reduce_only)
+
+        if close_position is not None:
+            params["closePosition"] = bool(close_position)
+
+        if price_n is not None:
+            params["price"] = _d_to_str(price_n)
+        if stop_n is not None:
+            params["stopPrice"] = _d_to_str(stop_n)
+
+        if type_u in {"LIMIT", "STOP", "TAKE_PROFIT"}:
+            params["timeInForce"] = tif_u or "GTC"
+            if "price" not in params:
+                raise ValueError(f"price is required for order_type={type_u}")
+
+        if type_u in {"STOP", "TAKE_PROFIT"} and "stopPrice" not in params:
+            raise ValueError(f"stopPrice is required for order_type={type_u}")
+
+        if type_u in {"STOP_MARKET", "TAKE_PROFIT_MARKET"} and "stopPrice" not in params:
+            raise ValueError(f"stopPrice is required for order_type={type_u}")
+
+        logger.info(
+            "submit order (symbol=%s side=%s type=%s qty=%s price=%s stopPrice=%s reduceOnly=%s positionSide=%s clientOrderId=%s)",
+            sym,
+            side_u,
+            type_u,
+            _d_to_str(qty_n),
+            params.get("price"),
+            params.get("stopPrice"),
+            params.get("reduceOnly"),
+            params.get("positionSide"),
+            cid,
+        )
+
+        def _do():
+            return req("POST", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec)
+
+        data = _call_with_time_sync_retry(_do)
+        if not isinstance(data, dict):
+            raise RuntimeError("POST /fapi/v1/order returned non-dict")
+
+        logger.info(
+            "order accepted (symbol=%s orderId=%s status=%s clientOrderId=%s)",
+            sym,
+            data.get("orderId"),
+            data.get("status"),
+            data.get("clientOrderId"),
+        )
+        return data
+    finally:
+        with _CLIENT_ID_LOCK:
+            _CLIENT_ID_INFLIGHT.discard(cid)
+
+
+def place_market(
+    symbol: str,
+    side: str,
+    qty: float,
+    *,
+    settings: Optional[Any] = None,
+    reduce_only: bool = False,
+    position_side: Optional[str] = "BOTH",
+    client_order_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return _place_order(
+        settings=settings,
+        symbol=symbol,
+        side=side,
+        order_type="MARKET",
+        quantity=qty,
+        reduce_only=reduce_only,
+        position_side=position_side,
+        client_order_id=client_order_id,
+    )
+
+
+def place_limit(
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    *,
+    settings: Optional[Any] = None,
+    time_in_force: str = "GTC",
+    reduce_only: bool = False,
+    position_side: Optional[str] = "BOTH",
+    client_order_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return _place_order(
+        settings=settings,
+        symbol=symbol,
+        side=side,
+        order_type="LIMIT",
+        quantity=qty,
+        price=price,
+        time_in_force=time_in_force,
+        reduce_only=reduce_only,
+        position_side=position_side,
+        client_order_id=client_order_id,
+    )
+
+
+def place_conditional(
+    symbol: str,
+    side: str,
+    qty: float,
+    trigger_price: float,
+    order_type: str,
+    *,
+    settings: Optional[Any] = None,
+    reduce_only: bool = True,
+    position_side: Optional[str] = "BOTH",
+    client_order_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    type_u = str(order_type).upper().strip()
+    return _place_order(
+        settings=settings,
+        symbol=symbol,
+        side=side,
+        order_type=type_u,
+        quantity=qty,
+        stop_price=trigger_price,
+        reduce_only=reduce_only,
+        position_side=position_side,
+        client_order_id=client_order_id,
+    )
+
+
+def cancel_order_safe(
+    symbol: str,
+    order_id: int | str,
+    *,
+    settings: Optional[Any] = None,
+) -> Dict[str, Any]:
+    st = settings if settings is not None else SET
+    sym = _normalize_symbol(symbol)
+    timeout_sec = _require_timeout_sec(st)
+
+    params = {"symbol": sym, "orderId": order_id}
+
+    def _do():
+        return req("DELETE", "/fapi/v1/order", params, private=True, timeout_sec=timeout_sec)
+
+    data = _call_with_time_sync_retry(_do)
+    if not isinstance(data, dict):
+        raise RuntimeError("DELETE /fapi/v1/order returned non-dict")
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Fill / Position verification (TRADE-GRADE)
+# ---------------------------------------------------------------------------
+def _decimal_abs(x: Decimal) -> Decimal:
+    return x if x >= 0 else -x
+
+
+def _require_decimal(v: Any, *, name: str) -> Decimal:
+    try:
+        d = Decimal(str(v))
+    except Exception as e:
+        raise OrderExecutionError(f"{name} not decimal-convertible") from e
+    return d
+
+
+def _require_order_field_strict(od: Dict[str, Any], key: str) -> Any:
+    if key not in od:
+        raise OrderExecutionError(f"order missing required field: {key}")
+    v = od[key]
     if v is None:
-        return None
-    if not isinstance(v, dict):
-        raise OrderFailed(f"meta.{key} must be dict when provided (STRICT)")
+        raise OrderExecutionError(f"order field {key} is None")
     return v
 
 
-def _meta_optional_list(meta: Dict[str, Any], key: str) -> Optional[list]:
-    if key not in meta:
-        return None
-    v = meta.get(key)
-    if v is None:
-        return None
-    if not isinstance(v, list):
-        raise OrderFailed(f"meta.{key} must be list when provided (STRICT)")
-    return v
+def _compute_avg_price_strict(order: Dict[str, Any]) -> float:
+    ap = order.get("avgPrice")
+    if ap is not None:
+        try:
+            apf = float(ap)
+        except Exception:
+            apf = 0.0
+        if apf > 0 and math.isfinite(apf):
+            return float(apf)
+
+    cq = _require_order_field_strict(order, "cummulativeQuoteQty")
+    eq = _require_order_field_strict(order, "executedQty")
+    cqf = float(cq)
+    eqf = float(eq)
+    if not math.isfinite(cqf) or not math.isfinite(eqf) or cqf <= 0 or eqf <= 0:
+        raise OrderExecutionError("FILLED order has non-positive executedQty/cummulativeQuoteQty")
+    px = cqf / eqf
+    if not math.isfinite(px) or px <= 0:
+        raise OrderExecutionError("computed avg price invalid")
+    return float(px)
 
 
-def _meta_optional_str(meta: Dict[str, Any], key: str) -> Optional[str]:
-    if key not in meta:
-        return None
-    v = meta.get(key)
-    if v is None:
-        return None
-    s = str(v).strip()
+def _wait_order_filled_strict(
+    *,
+    symbol: str,
+    order_id: str,
+    settings: Any,
+    expected_qty: Decimal,
+    qty_step: Decimal,
+    max_wait_sec: float,
+) -> Tuple[Dict[str, Any], Decimal, float]:
+    sym = _normalize_symbol(symbol)
+    timeout_sec = _require_timeout_sec(settings)
+
+    if not str(order_id).strip():
+        raise OrderExecutionError("order_id is empty (STRICT)")
+    if expected_qty <= 0:
+        raise OrderExecutionError("expected_qty must be > 0 (STRICT)")
+    if qty_step <= 0:
+        raise OrderExecutionError("qty_step must be > 0 (STRICT)")
+
+    deadline = time.time() + float(max_wait_sec)
+    last_status = "UNKNOWN"
+
+    while True:
+        od = _call_with_time_sync_retry(
+            lambda: req(
+                "GET",
+                "/fapi/v1/order",
+                {"symbol": sym, "orderId": order_id},
+                private=True,
+                timeout_sec=timeout_sec,
+            )
+        )
+        if not isinstance(od, dict):
+            raise OrderExecutionError("GET /fapi/v1/order returned non-dict")
+
+        status = str(od.get("status") or "").upper()
+        last_status = status
+
+        if status == "FILLED":
+            exec_qty = _require_decimal(_require_order_field_strict(od, "executedQty"), name="order.executedQty")
+            if exec_qty <= 0:
+                raise OrderExecutionError("FILLED but executedQty <= 0 (STRICT)")
+
+            diff = _decimal_abs(exec_qty - expected_qty)
+            tol = qty_step / Decimal("2")
+            if diff > tol:
+                raise PartialFillError(
+                    f"executedQty mismatch (expected={_d_to_str(expected_qty)}, got={_d_to_str(exec_qty)}, step={_d_to_str(qty_step)})"
+                )
+
+            avg_price = _compute_avg_price_strict(od)
+            return od, exec_qty, avg_price
+
+        if time.time() >= deadline:
+            raise OrderFillTimeoutError(
+                f"order not FILLED within {max_wait_sec}s (status={last_status})"
+            )
+
+        time.sleep(0.2)
+
+
+def _verify_position_reflects_execution_strict(
+    *,
+    symbol: str,
+    open_side: str,
+    executed_qty: Decimal,
+    qty_step: Decimal,
+    settings: Any,
+    max_wait_sec: float = 1.2,
+) -> Decimal:
+    sym = _normalize_symbol(symbol)
+    side_u = _normalize_side(open_side)
+    if executed_qty <= 0:
+        raise PositionVerificationError("executed_qty must be > 0 (STRICT)")
+    if qty_step <= 0:
+        raise PositionVerificationError("qty_step must be > 0 (STRICT)")
+
+    deadline = time.time() + float(max_wait_sec)
+    last_amt: Optional[Decimal] = None
+
+    while True:
+        pos = get_position(sym)
+        if not isinstance(pos, dict):
+            raise PositionVerificationError("get_position returned non-dict (STRICT)")
+
+        if "positionAmt" not in pos:
+            raise PositionVerificationError("position missing positionAmt (STRICT)")
+
+        amt = _require_decimal(pos.get("positionAmt"), name="position.positionAmt")
+        last_amt = amt
+
+        if side_u == "BUY":
+            if amt <= 0:
+                pass
+            else:
+                if _decimal_abs(amt) + qty_step < executed_qty:
+                    raise PositionVerificationError(
+                        f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
+                    )
+                return amt
+        else:
+            if amt >= 0:
+                pass
+            else:
+                if _decimal_abs(amt) + qty_step < executed_qty:
+                    raise PositionVerificationError(
+                        f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
+                    )
+                return amt
+
+        if time.time() >= deadline:
+            raise PositionVerificationError(
+                f"position not reflecting execution within {max_wait_sec}s (last_positionAmt={_d_to_str(last_amt) if last_amt is not None else 'None'})"
+            )
+        time.sleep(0.2)
+
+
+def _wait_symbol_flat_strict(
+    *,
+    symbol: str,
+    settings: Any,
+    max_wait_sec: float,
+) -> None:
+    sym = _normalize_symbol(symbol)
+    if not math.isfinite(float(max_wait_sec)) or float(max_wait_sec) <= 0.0:
+        raise OrderExecutionError("max_wait_sec must be finite > 0 (STRICT)")
+
+    deadline = time.time() + float(max_wait_sec)
+    last_nonzero_amt: Optional[float] = None
+
+    while True:
+        rows = fetch_open_positions(sym)
+        if not isinstance(rows, list):
+            raise OrderExecutionError("fetch_open_positions returned non-list (STRICT)")
+
+        nonzero_found = False
+        for row in rows:
+            if not isinstance(row, dict):
+                raise OrderExecutionError("fetch_open_positions contains non-dict row (STRICT)")
+            if _normalize_symbol(str(row.get("symbol") or "")) != sym:
+                continue
+            if "positionAmt" not in row:
+                raise OrderExecutionError("position row missing positionAmt (STRICT)")
+            amt = float(row["positionAmt"])
+            if not math.isfinite(amt):
+                raise OrderExecutionError("positionAmt not finite (STRICT)")
+            if abs(amt) > 1e-12:
+                nonzero_found = True
+                last_nonzero_amt = float(amt)
+                break
+
+        if not nonzero_found:
+            return
+
+        if time.time() >= deadline:
+            raise PositionVerificationError(
+                f"symbol not flat within {max_wait_sec}s (STRICT): symbol={sym} last_nonzero_amt={last_nonzero_amt}"
+            )
+
+        time.sleep(0.2)
+
+
+# ---------------------------------------------------------------------------
+# Protection order verification (TRADE-GRADE)
+# ---------------------------------------------------------------------------
+def _normalize_order_status_strict(v: Any) -> str:
+    s = str(v or "").upper().strip()
     if not s:
-        raise OrderFailed(f"meta.{key} must be non-empty when provided (STRICT)")
+        raise ProtectionOrderVerificationError("order.status is missing (STRICT)")
     return s
 
 
-def _snapshot_kwargs_from_meta(meta: Dict[str, Any], *, entry_price_hint: float, filled_entry_price: float) -> Dict[str, Any]:
-    """
-    record_trade_snapshot의 확장 필드(TRADE-GRADE) 입력을 meta에서 추출한다.
-    - 값이 '존재하면' STRICT 타입/범위 검증 후 전달
-    - 존재하지 않으면 None(미기록)
-    """
-    decision_id = _meta_optional_str(meta, "decision_id")
-    quant_decision_pre = _meta_optional_dict(meta, "quant_decision_pre")
-    quant_constraints = _meta_optional_dict(meta, "quant_constraints")
-    quant_final_decision = _meta_optional_str(meta, "quant_final_decision")
+def _fetch_order_visibility_snapshot_strict(
+    *,
+    symbol: str,
+    order_id: Optional[str],
+    client_order_id: Optional[str],
+    timeout_sec: int,
+) -> Optional[Dict[str, Any]]:
+    sym = _normalize_symbol(symbol)
 
-    gpt_severity = _meta_optional(meta, "gpt_severity")
-    if gpt_severity is not None:
-        gpt_severity = int(_as_float(gpt_severity, "meta.gpt_severity", min_value=0.0, max_value=3.0))
-    gpt_tags = _meta_optional_list(meta, "gpt_tags")
-    gpt_confidence_penalty = _meta_optional(meta, "gpt_confidence_penalty")
-    if gpt_confidence_penalty is not None:
-        gpt_confidence_penalty = _as_float(meta.get("gpt_confidence_penalty"), "meta.gpt_confidence_penalty", min_value=0.0, max_value=1.0)
-    gpt_suggested_risk_multiplier = _meta_optional(meta, "gpt_suggested_risk_multiplier")
-    if gpt_suggested_risk_multiplier is not None:
-        gpt_suggested_risk_multiplier = _as_float(
-            gpt_suggested_risk_multiplier,
-            "meta.gpt_suggested_risk_multiplier",
-            min_value=0.0,
-            max_value=1.0,
-        )
-    gpt_rationale_short = _meta_optional_str(meta, "gpt_rationale_short")
-
-    micro_funding_rate = _meta_optional(meta, "micro_funding_rate")
-    if micro_funding_rate is not None:
-        micro_funding_rate = _as_float(micro_funding_rate, "meta.micro_funding_rate")
-    micro_funding_z = _meta_optional(meta, "micro_funding_z")
-    if micro_funding_z is not None:
-        micro_funding_z = _as_float(micro_funding_z, "meta.micro_funding_z")
-    micro_open_interest = _meta_optional(meta, "micro_open_interest")
-    if micro_open_interest is not None:
-        micro_open_interest = _as_float(micro_open_interest, "meta.micro_open_interest", min_value=0.0)
-    micro_oi_z = _meta_optional(meta, "micro_oi_z")
-    if micro_oi_z is not None:
-        micro_oi_z = _as_float(micro_oi_z, "meta.micro_oi_z")
-    micro_long_short_ratio = _meta_optional(meta, "micro_long_short_ratio")
-    if micro_long_short_ratio is not None:
-        micro_long_short_ratio = _as_float(micro_long_short_ratio, "meta.micro_long_short_ratio", min_value=0.0)
-    micro_lsr_z = _meta_optional(meta, "micro_lsr_z")
-    if micro_lsr_z is not None:
-        micro_lsr_z = _as_float(micro_lsr_z, "meta.micro_lsr_z")
-    micro_distortion_index = _meta_optional(meta, "micro_distortion_index")
-    if micro_distortion_index is not None:
-        micro_distortion_index = _as_float(micro_distortion_index, "meta.micro_distortion_index")
-    micro_score_risk = _meta_optional(meta, "micro_score_risk")
-    if micro_score_risk is not None:
-        micro_score_risk = _as_float(micro_score_risk, "meta.micro_score_risk", min_value=0.0, max_value=100.0)
-
-    ev_cell_key = _meta_optional_str(meta, "ev_cell_key")
-    ev_cell_ev = _meta_optional(meta, "ev_cell_ev")
-    if ev_cell_ev is not None:
-        ev_cell_ev = _as_float(ev_cell_ev, "meta.ev_cell_ev")
-    ev_cell_n = _meta_optional(meta, "ev_cell_n")
-    if ev_cell_n is not None:
-        ev_cell_n = int(_as_float(ev_cell_n, "meta.ev_cell_n", min_value=0.0))
-    ev_cell_status = _meta_optional_str(meta, "ev_cell_status")
-
-    auto_blocked = meta.get("auto_blocked") if "auto_blocked" in meta else None
-    if auto_blocked is not None:
-        auto_blocked = bool(auto_blocked)
-    auto_risk_multiplier = _meta_optional(meta, "auto_risk_multiplier")
-    if auto_risk_multiplier is not None:
-        auto_risk_multiplier = _as_float(auto_risk_multiplier, "meta.auto_risk_multiplier", min_value=0.0, max_value=1.0)
-    auto_block_reasons = _meta_optional_dict(meta, "auto_block_reasons")
-
-    if entry_price_hint <= 0:
-        raise OrderFailed("entry_price_hint must be > 0 for exec snapshot (STRICT)")
-    slip_pct = abs(float(filled_entry_price) - float(entry_price_hint)) / float(entry_price_hint) * 100.0
-    if not math.isfinite(slip_pct) or slip_pct < 0.0:
-        raise OrderFailed(f"computed slippage_pct invalid (STRICT): {slip_pct}")
-
-    return {
-        "decision_id": decision_id,
-        "quant_decision_pre": quant_decision_pre,
-        "quant_constraints": quant_constraints,
-        "quant_final_decision": quant_final_decision,
-        "gpt_severity": gpt_severity,
-        "gpt_tags": gpt_tags,
-        "gpt_confidence_penalty": gpt_confidence_penalty,
-        "gpt_suggested_risk_multiplier": gpt_suggested_risk_multiplier,
-        "gpt_rationale_short": gpt_rationale_short,
-        "micro_funding_rate": micro_funding_rate,
-        "micro_funding_z": micro_funding_z,
-        "micro_open_interest": micro_open_interest,
-        "micro_oi_z": micro_oi_z,
-        "micro_long_short_ratio": micro_long_short_ratio,
-        "micro_lsr_z": micro_lsr_z,
-        "micro_distortion_index": micro_distortion_index,
-        "micro_score_risk": micro_score_risk,
-        "exec_expected_price": float(entry_price_hint),
-        "exec_filled_avg_price": float(filled_entry_price),
-        "exec_slippage_pct": float(slip_pct),
-        "exec_adverse_move_pct": None,
-        "exec_score": None,
-        "exec_post_prices": None,
-        "ev_cell_key": ev_cell_key,
-        "ev_cell_ev": ev_cell_ev,
-        "ev_cell_n": ev_cell_n,
-        "ev_cell_status": ev_cell_status,
-        "auto_blocked": auto_blocked,
-        "auto_risk_multiplier": auto_risk_multiplier,
-        "auto_block_reasons": auto_block_reasons,
-    }
-
-
-class ExecutionEngine:
-    def __init__(self, settings: Any):
-        self.settings = settings
-
-        required = ["symbol", "leverage", "slippage_block_pct", "slippage_stop_engine", "require_deterministic_client_order_id"]
-        missing = [k for k in required if not hasattr(settings, k)]
-        if missing:
-            raise ValueError(f"settings missing required fields: {missing}")
-
-        if bool(getattr(settings, "require_deterministic_client_order_id")) is not True:
-            raise ValueError("settings.require_deterministic_client_order_id must be True (TRADE-GRADE)")
-
-        self.test_force_enter: bool = _as_bool_strict(getattr(settings, "test_force_enter", False), "settings.test_force_enter")
-        self.test_bypass_guards: bool = _as_bool_strict(getattr(settings, "test_bypass_guards", False), "settings.test_bypass_guards")
-        self.test_dry_run: bool = _as_bool_strict(getattr(settings, "test_dry_run", False), "settings.test_dry_run")
-
-        fake_usdt_raw = getattr(settings, "test_fake_available_usdt", 0.0)
-        self.test_fake_available_usdt: float = float(_as_float(fake_usdt_raw, "settings.test_fake_available_usdt", min_value=0.0))
-
-        if self.test_bypass_guards and not self.test_dry_run:
-            raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
-        if self.test_force_enter and not self.test_dry_run:
-            raise RuntimeError("test_force_enter is only allowed with test_dry_run=True (STRICT)")
-        if self.test_fake_available_usdt > 0 and not self.test_dry_run:
-            raise RuntimeError("test_fake_available_usdt is only allowed with test_dry_run=True (STRICT)")
-
-        if any([self.test_force_enter, self.test_bypass_guards, self.test_dry_run, self.test_fake_available_usdt > 0]):
-            logger.warning(
-                "[TEST MODE ENABLED] FORCE_ENTER=%s BYPASS_GUARDS=%s DRY_RUN=%s FAKE_USDT=%s",
-                self.test_force_enter,
-                self.test_bypass_guards,
-                self.test_dry_run,
-                self.test_fake_available_usdt,
-            )
-
-    def execute(self, signal: Signal) -> Optional[Trade]:
-        if not isinstance(signal, Signal):
-            raise ValueError("signal must be Signal")
-
-        action = str(signal.action).upper().strip()
-        if action not in ("ENTER", "SKIP"):
-            raise ValueError(f"signal.action invalid: {signal.action!r}")
-
-        if self.test_force_enter:
-            action = "ENTER"
-
-        if not _EXECUTION_LOCK.acquire(blocking=False):
-            raise StateViolation("Concurrent execute() call detected (STRICT)")
-
-        state: OrderState = OrderState.CREATED
+    if order_id is not None and str(order_id).strip():
+        open_row = _find_open_order_by_id(sym, str(order_id))
+        if open_row is not None:
+            return open_row
 
         try:
-            meta = signal.meta
-            if not isinstance(meta, dict):
-                raise OrderFailed("signal.meta must be dict (STRICT)")
+            row = get_order(sym, str(order_id))
+        except Exception as e:
+            if not _is_order_not_found(e):
+                raise
+        else:
+            if not isinstance(row, dict):
+                raise ProtectionOrderVerificationError("get_order returned non-dict (STRICT)")
+            return row
 
-            symbol = meta.get("symbol")
-            if not isinstance(symbol, str) or not symbol.strip():
-                raise OrderFailed("signal.meta['symbol'] is required (STRICT)")
-            symbol = symbol.strip().upper()
+    if client_order_id is not None and str(client_order_id).strip():
+        open_row_by_client = _find_open_order_by_client_id(sym, str(client_order_id))
+        if open_row_by_client is not None:
+            return open_row_by_client
 
-            regime = meta.get("regime")
-            if not isinstance(regime, str) or not regime.strip():
-                raise OrderFailed("signal.meta['regime'] is required (STRICT)")
-            regime = regime.strip()
+        try:
+            row2 = get_order_by_client_id(sym, str(client_order_id))
+        except Exception as e:
+            if not _is_order_not_found(e):
+                raise
+        else:
+            if not isinstance(row2, dict):
+                raise ProtectionOrderVerificationError("get_order_by_client_id returned non-dict (STRICT)")
+            return row2
 
-            signal_source = meta.get("signal_source")
-            if not isinstance(signal_source, str) or not signal_source.strip():
-                raise OrderFailed("signal.meta['signal_source'] is required (STRICT)")
-            signal_source = signal_source.strip()
+    _ = timeout_sec
+    return None
 
-            signal_ts_ms = meta.get("signal_ts_ms")
-            if not isinstance(signal_ts_ms, int) or signal_ts_ms <= 0:
-                raise OrderFailed("signal.meta['signal_ts_ms'] must be int > 0 (STRICT)")
 
-            direction = str(signal.direction).upper().strip()
-            if direction not in ("LONG", "SHORT"):
-                raise ValueError("signal.direction must be LONG or SHORT")
+def _validate_protection_order_shape_strict(
+    *,
+    order: Dict[str, Any],
+    symbol: str,
+    expected_side: str,
+    expected_type: str,
+    expected_position_side: str,
+    expected_client_order_id: Optional[str],
+) -> str:
+    if not isinstance(order, dict):
+        raise ProtectionOrderVerificationError("protection order must be dict (STRICT)")
 
-            last_price = _as_float(meta.get("last_price"), "meta.last_price", min_value=0.0)
-            if last_price <= 0:
-                raise OrderFailed("meta.last_price must be > 0 (STRICT)")
+    order_symbol = _normalize_symbol(order.get("symbol", ""))
+    if order_symbol != _normalize_symbol(symbol):
+        raise ProtectionOrderVerificationError(
+            f"protection order symbol mismatch (STRICT): got={order_symbol} expected={symbol}"
+        )
 
-            if action == "SKIP":
-                _emit_decision_event_strict(
-                    meta=meta,
-                    symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    action="NO_ENTRY",
-                    reason_code=str(signal.reason or "signal_skip"),
-                    summary="전략 레이어에서 진입하지 않기로 결정",
-                    reasons=[str(signal.reason or "signal_skip")],
-                    current_price=float(last_price),
-                    spread_snapshot=None,
-                    position_qty=None,
-                )
+    order_id = order.get("orderId")
+    if order_id is None or not str(order_id).strip():
+        raise ProtectionOrderVerificationError("protection order missing orderId (STRICT)")
 
-                msg = f"[SKIP] {symbol} {direction} reason={signal.reason}"
-                logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine",
-                    side=direction,
-                    reason=str(signal.reason) or "skip",
-                    extra={"signal_source": signal_source, "ts_ms": signal_ts_ms},
-                )
-                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                return None
+    side = str(order.get("side") or "").upper().strip()
+    if side != _normalize_side(expected_side):
+        raise ProtectionOrderVerificationError(
+            f"protection order side mismatch (STRICT): got={side} expected={_normalize_side(expected_side)}"
+        )
 
-            try:
-                validate_signal_from_meta_strict(meta)
-                validate_signal_invariants_strict(
-                    SignalInvariantInputs(
-                        symbol=str(symbol),
-                        direction=str(direction),
-                        risk_pct=float(_as_float(signal.risk_pct, "signal.risk_pct", min_value=0.0, max_value=1.0)),
-                        tp_pct=float(_as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0, max_value=1.0)),
-                        sl_pct=float(_as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0, max_value=1.0)),
-                        dd_pct=(float(meta["dd_pct"]) if "dd_pct" in meta and meta.get("dd_pct") is not None else None),
-                        micro_score_risk=(float(meta["micro_score_risk"]) if "micro_score_risk" in meta and meta.get("micro_score_risk") is not None else None),
-                        final_risk_multiplier=None,
-                        equity_current_usdt=(float(meta["equity_current_usdt"]) if "equity_current_usdt" in meta and meta.get("equity_current_usdt") is not None else None),
-                        equity_peak_usdt=(float(meta["equity_peak_usdt"]) if "equity_peak_usdt" in meta and meta.get("equity_peak_usdt") is not None else None),
-                    )
-                )
-            except (InvariantViolation, ValueError) as e:
-                raise OrderFailed(f"invariant violation (STRICT): {e}") from e
+    order_type = str(order.get("type") or "").upper().strip()
+    if order_type != str(expected_type).upper().strip():
+        raise ProtectionOrderVerificationError(
+            f"protection order type mismatch (STRICT): got={order_type} expected={str(expected_type).upper().strip()}"
+        )
 
-            candles_5m = meta.get("candles_5m")
-            candles_5m_raw = meta.get("candles_5m_raw")
-            extra = meta.get("extra")
-            if extra is not None and not isinstance(extra, dict):
-                raise OrderFailed("meta.extra must be dict or None (STRICT)")
+    status = _normalize_order_status_strict(order.get("status"))
+    if status in {"CANCELED", "EXPIRED", "REJECTED"}:
+        raise ProtectionOrderVerificationError(
+            f"protection order terminal status (STRICT): orderId={order_id} status={status}"
+        )
+    if status not in {"NEW", "PARTIALLY_FILLED"}:
+        raise ProtectionOrderVerificationError(
+            f"unexpected protection order status (STRICT): orderId={order_id} status={status}"
+        )
 
-            dyn_alloc = _resolve_dynamic_allocation(meta)
-            if dyn_alloc is not None:
-                sig_alloc = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
-                if abs(dyn_alloc - sig_alloc) > 1e-12:
-                    raise OrderFailed(f"dynamic_allocation mismatch: meta={dyn_alloc} != signal={sig_alloc} (STRICT)")
+    position_side = str(order.get("positionSide") or "").upper().strip() or "BOTH"
+    if position_side != _normalize_position_side(expected_position_side):
+        raise ProtectionOrderVerificationError(
+            f"protection order positionSide mismatch (STRICT): got={position_side} expected={_normalize_position_side(expected_position_side)}"
+        )
 
-            manual_ok = check_manual_position_guard(
-                get_balance_detail_func=get_balance_detail,
+    reduce_only = bool(order.get("reduceOnly", False))
+    close_position = bool(order.get("closePosition", False))
+    if not reduce_only and not close_position:
+        raise ProtectionOrderVerificationError("protection order must be reduceOnly or closePosition (STRICT)")
+
+    if expected_client_order_id is not None:
+        cid = str(order.get("clientOrderId") or "").strip()
+        if cid != str(expected_client_order_id).strip():
+            raise ProtectionOrderVerificationError(
+                f"protection order clientOrderId mismatch (STRICT): got={cid!r} expected={str(expected_client_order_id).strip()!r}"
+            )
+
+    return str(order_id).strip()
+
+
+def _wait_protection_orders_visible_strict(
+    *,
+    symbol: str,
+    close_side: str,
+    position_side: str,
+    tp_order_id: Optional[str],
+    sl_order_id: Optional[str],
+    tp_client_order_id: Optional[str],
+    sl_client_order_id: Optional[str],
+    soft_mode: bool,
+    settings: Any,
+) -> Tuple[Optional[str], Optional[str]]:
+    timeout_sec = _require_timeout_sec(settings)
+    deadline = time.time() + min(float(timeout_sec), _PROTECTION_VERIFY_WAIT_SEC)
+
+    tp_verified_id: Optional[str] = None
+    sl_verified_id: Optional[str] = None
+
+    while True:
+        if tp_order_id is not None:
+            tp_row = _fetch_order_visibility_snapshot_strict(
                 symbol=symbol,
-                latest_ts=float(signal_ts_ms),
+                order_id=tp_order_id,
+                client_order_id=tp_client_order_id,
+                timeout_sec=timeout_sec,
             )
-            if not manual_ok:
-                _emit_decision_event_strict(
-                    meta=meta,
+            if tp_row is not None:
+                tp_verified_id = _validate_protection_order_shape_strict(
+                    order=tp_row,
                     symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    action="NO_ENTRY",
-                    reason_code="manual_guard_blocked",
-                    summary="수동 포지션 가드로 진입 차단",
-                    reasons=["manual_guard_blocked"],
-                    current_price=float(last_price),
-                    spread_snapshot=None,
-                    position_qty=None,
+                    expected_side=close_side,
+                    expected_type="TAKE_PROFIT_MARKET",
+                    expected_position_side=position_side,
+                    expected_client_order_id=tp_client_order_id,
                 )
 
-                msg = f"[SKIP] manual_guard_blocked: {symbol}"
-                logger.warning(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.manual",
-                    side=direction,
-                    reason="manual_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms},
-                )
-                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                return None
-
-            avail_usdt = (
-                float(self.test_fake_available_usdt)
-                if self.test_fake_available_usdt > 0
-                else _as_float(get_available_usdt(), "available_usdt", min_value=0.0)
-            )
-            if avail_usdt <= 0:
-                msg = f"[SKIP] available_usdt<=0: {symbol}"
-                logger.warning(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.balance",
-                    side=direction,
-                    reason="balance_zero_or_invalid",
-                    extra={"available_usdt": avail_usdt, "ts_ms": signal_ts_ms},
-                )
-                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                return None
-
-            best_bid: Optional[float] = None
-            best_ask: Optional[float] = None
-
-            guard_adjustments = _resolve_guard_adjustments(signal)
-            guard_settings = _build_guard_settings_view(self.settings, guard_adjustments)
-
-            if candles_5m_raw is None:
-                raise OrderFailed("meta.candles_5m_raw is required for volume guard (STRICT)")
-            vol_ok = check_volume_guard(
-                settings=guard_settings,
-                candles_5m_raw=candles_5m_raw,
-                latest_ts=float(signal_ts_ms),
-                signal_source=signal_source,
-                direction=direction,
-            )
-            if not vol_ok:
-                _emit_decision_event_strict(
-                    meta=meta,
-                    symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    action="NO_ENTRY",
-                    reason_code="volume_guard_blocked",
-                    summary="거래량 가드로 진입 차단",
-                    reasons=["volume_guard_blocked"],
-                    current_price=float(last_price),
-                    spread_snapshot=None,
-                    position_qty=None,
-                )
-
-                msg = f"[SKIP] volume_guard_blocked: {symbol}"
-                logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.volume",
-                    side=direction,
-                    reason="volume_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms},
-                )
-                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                if not self.test_bypass_guards:
-                    return None
-
-            if candles_5m is None:
-                raise OrderFailed("meta.candles_5m is required for price jump guard (STRICT)")
-            price_ok = check_price_jump_guard(
-                settings=guard_settings,
-                candles_5m=candles_5m,
-                latest_ts=float(signal_ts_ms),
-                signal_source=signal_source,
-                direction=direction,
-            )
-            if not price_ok:
-                _emit_decision_event_strict(
-                    meta=meta,
-                    symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    action="NO_ENTRY",
-                    reason_code="price_jump_guard_blocked",
-                    summary="가격 점프 가드로 진입 차단",
-                    reasons=["price_jump_guard_blocked"],
-                    current_price=float(last_price),
-                    spread_snapshot=None,
-                    position_qty=None,
-                )
-
-                msg = f"[SKIP] price_jump_guard_blocked: {symbol}"
-                logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.price_jump",
-                    side=direction,
-                    reason="price_jump_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms},
-                )
-                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                if not self.test_bypass_guards:
-                    return None
-
-            spread_ok, best_bid, best_ask = check_spread_guard(
-                settings=guard_settings,
+        if not soft_mode and sl_order_id is not None:
+            sl_row = _fetch_order_visibility_snapshot_strict(
                 symbol=symbol,
-                latest_ts=float(signal_ts_ms),
-                signal_source=signal_source,
-                direction=direction,
+                order_id=sl_order_id,
+                client_order_id=sl_client_order_id,
+                timeout_sec=timeout_sec,
             )
-            spread_pct_snapshot: Optional[float] = None
-            if best_bid is not None and best_ask is not None:
-                bb_tmp = float(best_bid)
-                ba_tmp = float(best_ask)
-                if bb_tmp > 0 and ba_tmp > 0 and ba_tmp > bb_tmp:
-                    mid_tmp = (bb_tmp + ba_tmp) / 2.0
-                    if mid_tmp > 0:
-                        spread_pct_snapshot = (ba_tmp - bb_tmp) / mid_tmp
-
-            if not spread_ok:
-                _emit_decision_event_strict(
-                    meta=meta,
+            if sl_row is not None:
+                sl_verified_id = _validate_protection_order_shape_strict(
+                    order=sl_row,
                     symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    action="NO_ENTRY",
-                    reason_code="spread_guard_blocked",
-                    summary="스프레드 가드로 진입 차단",
-                    reasons=["spread_guard_blocked"],
-                    current_price=float(last_price),
-                    spread_snapshot=spread_pct_snapshot,
-                    position_qty=None,
+                    expected_side=close_side,
+                    expected_type="STOP_MARKET",
+                    expected_position_side=position_side,
+                    expected_client_order_id=sl_client_order_id,
                 )
 
-                msg = f"[SKIP] spread_guard_blocked: {symbol}"
-                logger.info(msg)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.guard.spread",
-                    side=direction,
-                    reason="spread_guard_blocked",
-                    extra={"ts_ms": signal_ts_ms, "best_bid": best_bid, "best_ask": best_ask},
-                )
-                _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                if not self.test_bypass_guards:
-                    return None
+        tp_ok = (tp_order_id is None) or (tp_verified_id is not None)
+        sl_ok = bool(soft_mode) or ((sl_order_id is None) is False and sl_verified_id is not None)
 
-            entry_price_hint = float(last_price)
-            price_for_qty = float(last_price)
-            if best_bid is not None and best_ask is not None:
-                bb = float(best_bid)
-                ba = float(best_ask)
-                if bb > 0 and ba > 0 and ba > bb:
-                    mid = (bb + ba) / 2.0
-                    if mid > 0:
-                        price_for_qty = mid
-                    entry_price_hint = ba if direction == "LONG" else bb
+        if tp_ok and sl_ok:
+            return tp_verified_id, (None if soft_mode else sl_verified_id)
 
-            if price_for_qty <= 0:
-                raise OrderFailed("price_for_qty must be > 0 (STRICT)")
-
-            slippage_pct_for_invariant = abs(float(entry_price_hint) - float(last_price)) / float(last_price)
-
-            slippage_block_pct = _as_float(getattr(self.settings, "slippage_block_pct"), "settings.slippage_block_pct", min_value=0.0)
-            slippage_stop_engine = bool(getattr(self.settings, "slippage_stop_engine"))
-
-            if slippage_block_pct > 0:
-                slippage_pct = slippage_pct_for_invariant
-                if slippage_pct > slippage_block_pct:
-                    _emit_decision_event_strict(
-                        meta=meta,
-                        symbol=symbol,
-                        regime=regime,
-                        direction=direction,
-                        signal_source=signal_source,
-                        action="NO_ENTRY",
-                        reason_code="slippage_block",
-                        summary="슬리피지 기준 초과로 진입 차단",
-                        reasons=["slippage_block"],
-                        current_price=float(last_price),
-                        spread_snapshot=spread_pct_snapshot,
-                        position_qty=None,
-                    )
-
-                    msg = f"[SKIP] {symbol} {direction} slippage_block slippage_pct={slippage_pct}"
-                    logger.warning(msg)
-                    log_skip_event(
-                        symbol=symbol,
-                        regime=regime,
-                        source="execution_engine.slippage",
-                        side=direction,
-                        reason="slippage_block",
-                        extra={"slippage_pct": slippage_pct, "slippage_block_pct": slippage_block_pct, "ts_ms": signal_ts_ms},
-                    )
-                    _submit_tg_nonblocking(send_skip_tg, msg, label="send_skip_tg")
-                    if slippage_stop_engine:
-                        raise OrderFailed("slippage_block triggered and slippage_stop_engine=True (STRICT)")
-                    if not self.test_bypass_guards:
-                        return None
-
-            leverage = _as_float(getattr(self.settings, "leverage"), "settings.leverage", min_value=1.0)
-            allocation_ratio = _as_float(signal.risk_pct, "signal.risk_pct(allocation_ratio)", min_value=0.0, max_value=1.0)
-            tp_pct = _as_float(signal.tp_pct, "signal.tp_pct", min_value=0.0, max_value=1.0)
-            sl_pct = _as_float(signal.sl_pct, "signal.sl_pct", min_value=0.0, max_value=1.0)
-
-            if allocation_ratio <= 0:
-                raise OrderFailed("ENTER requires allocation_ratio(signal.risk_pct) > 0 (STRICT)")
-            if tp_pct <= 0:
-                raise OrderFailed("ENTER requires signal.tp_pct > 0 (STRICT)")
-            if sl_pct <= 0:
-                raise OrderFailed("ENTER requires signal.sl_pct > 0 (STRICT)")
-
-            if leverage > 1.0 and allocation_ratio >= 0.8:
-                raise OrderFailed(
-                    f"allocation_mode violation: leverage({leverage})>1 with large allocation_ratio({allocation_ratio}) (STRICT)"
-                )
-
-            notional = avail_usdt * allocation_ratio * leverage
-            if notional <= 0:
-                raise OrderFailed("notional must be > 0 (STRICT)")
-
-            qty_raw = notional / price_for_qty
-            if qty_raw <= 0:
-                raise OrderFailed("qty_raw must be > 0 (STRICT)")
-
-            try:
-                validate_execution_invariants_strict(
-                    ExecutionInvariantInputs(
-                        symbol=str(symbol),
-                        direction=str(direction),
-                        leverage=float(leverage),
-                        available_usdt=float(avail_usdt),
-                        notional=float(notional),
-                        price_for_qty=float(price_for_qty),
-                        qty_raw=float(qty_raw),
-                        entry_price_hint=float(entry_price_hint),
-                        last_price=float(last_price),
-                        slippage_pct=float(slippage_pct_for_invariant),
-                        spread_pct_snapshot=(float(spread_pct_snapshot) if spread_pct_snapshot is not None else None),
-                    )
-                )
-            except InvariantViolation as e:
-                raise OrderFailed(f"execution invariant violation (STRICT): {e}") from e
-
-            ok, guard_reason, guard_extra = hard_risk_guard_check(
-                self.settings,
-                symbol=symbol,
-                side=direction,
-                entry_price=float(entry_price_hint),
-                notional=float(notional),
-                available_usdt=float(avail_usdt),
-            )
-            if not ok:
-                _emit_decision_event_strict(
-                    meta=meta,
-                    symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    action="NO_ENTRY",
-                    reason_code=str(guard_reason),
-                    summary="하드 리스크 가드로 진입 차단",
-                    reasons=[str(guard_reason)],
-                    current_price=float(last_price),
-                    spread_snapshot=spread_pct_snapshot,
-                    position_qty=None,
-                )
-
-                msg = f"[SKIP] hard_risk_guard_blocked: {guard_reason}"
-                logger.warning("%s extra=%s", msg, guard_extra)
-                log_skip_event(
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine.risk_guard",
-                    side=direction,
-                    reason=str(guard_reason),
-                    extra=guard_extra,
-                )
-                _submit_tg_nonblocking(send_skip_tg, f"{msg} {symbol} {direction}", label="send_skip_tg")
-                if not self.test_bypass_guards:
-                    return None
-
-            side_open = "BUY" if direction == "LONG" else "SELL"
-
-            soft_mode = False
-            sl_floor_ratio: Optional[float] = None
-            if isinstance(extra, dict):
-                soft_mode = bool(extra.get("soft_mode") or extra.get("soft") or False)
-                if extra.get("sl_floor_ratio") is not None:
-                    sl_floor_ratio = _as_float(extra.get("sl_floor_ratio"), "extra.sl_floor_ratio", min_value=0.0)
-
-            _emit_decision_event_strict(
-                meta=meta,
-                symbol=symbol,
-                regime=regime,
-                direction=direction,
-                signal_source=signal_source,
-                action="ENTRY",
-                reason_code="entry_submit",
-                summary="모든 가드 통과로 진입 실행",
-                reasons=["guards_passed", "entry_submit"],
-                current_price=float(entry_price_hint),
-                spread_snapshot=spread_pct_snapshot,
-                position_qty=float(qty_raw),
-                entry_price=float(entry_price_hint),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
+        if time.time() >= deadline:
+            raise ProtectionOrderVerificationError(
+                "protection orders not visible within deadline "
+                f"(tp_visible={tp_verified_id is not None}, sl_visible={sl_verified_id is not None}, soft_mode={bool(soft_mode)})"
             )
 
-            log_event(
-                "on_entry_submitted",
-                symbol=symbol,
-                regime=regime,
-                source="execution_engine",
-                side=direction,
-                price=float(entry_price_hint),
-                qty=float(qty_raw),
-                leverage=float(leverage),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                risk_pct=float(allocation_ratio),
-                reason="entry_submit",
-                extra_json={"signal_source": signal_source, "reason": str(signal.reason)[:200]},
-            )
+        time.sleep(_PROTECTION_VERIFY_POLL_SEC)
 
-            log_signal(
-                event="ENTRY_SIGNAL",
-                symbol=symbol,
-                regime=regime,
-                source=str(signal_source),
-                side=direction,
-                price=float(entry_price_hint),
-                qty=float(qty_raw),
-                leverage=float(leverage),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                risk_pct=float(allocation_ratio),
-                reason=str(signal.reason) or "enter",
-                extra_json={
-                    "candle_ts": int(signal_ts_ms),
-                    "available_usdt": float(avail_usdt),
-                    "notional": float(notional),
-                    "regime_score": meta.get("regime_score"),
-                    "regime_band": meta.get("regime_band"),
-                    "regime_allocation": meta.get("regime_allocation"),
-                    "dd_pct": meta.get("dd_pct"),
-                    "consecutive_losses": meta.get("consecutive_losses"),
-                    "risk_physics_reason": meta.get("risk_physics_reason"),
-                    "dynamic_allocation_ratio": dyn_alloc,
-                },
-            )
 
-            eq_cur_usdt, eq_peak_usdt, dd_pct_v = _require_meta_equity(meta)
-            entry_client_order_id = _deterministic_entry_client_order_id(symbol=symbol, direction=direction, signal_ts_ms=signal_ts_ms)
+# ---------------------------------------------------------------------------
+# TP/SL
+# ---------------------------------------------------------------------------
+def set_tp_sl(
+    *,
+    symbol: str,
+    side_open: str,
+    qty: float,
+    tp_price: float,
+    sl_price: float,
+    soft_mode: bool = False,
+    sl_floor_ratio: Optional[float] = None,
+    settings: Optional[Any] = None,
+    tp_client_order_id: Optional[str] = None,
+    sl_client_order_id: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    _ = sl_floor_ratio
 
-            state = OrderState.SUBMITTED
+    sym = _normalize_symbol(symbol)
+    open_side = _normalize_side(side_open)
+    close_side = "SELL" if open_side == "BUY" else "BUY"
 
-            entry_score_val = _meta_pick_first(meta, ("entry_score", "entryScore"))
-            engine_total_val = _meta_pick_first(meta, ("engine_total", "engine_total_score", "engine_total_score_v2"))
+    tp_order_id: Optional[str] = None
+    sl_order_id: Optional[str] = None
 
-            if self.test_dry_run:
-                state = OrderState.FILLED
-                entry_price_sim = float(entry_price_hint)
-                entry_qty_sim = float(qty_raw)
-                entry_ts_dt_sim = datetime.fromtimestamp(float(signal_ts_ms) / 1000.0, tz=timezone.utc)
+    if tp_price and tp_price > 0:
+        tp_resp = place_conditional(
+            symbol=sym,
+            side=close_side,
+            qty=qty,
+            trigger_price=float(tp_price),
+            order_type="TAKE_PROFIT_MARKET",
+            settings=settings,
+            reduce_only=True,
+            position_side="BOTH",
+            client_order_id=tp_client_order_id,
+        )
+        oid = tp_resp.get("orderId") if isinstance(tp_resp, dict) else None
+        if oid is None:
+            raise RuntimeError("TP order response missing orderId")
+        tp_order_id = str(oid)
 
+    if soft_mode:
+        return tp_order_id, None
+
+    if sl_price and sl_price > 0:
+        sl_resp = place_conditional(
+            symbol=sym,
+            side=close_side,
+            qty=qty,
+            trigger_price=float(sl_price),
+            order_type="STOP_MARKET",
+            settings=settings,
+            reduce_only=True,
+            position_side="BOTH",
+            client_order_id=sl_client_order_id,
+        )
+        oid = sl_resp.get("orderId") if isinstance(sl_resp, dict) else None
+        if oid is None:
+            raise RuntimeError("SL order response missing orderId")
+        sl_order_id = str(oid)
+
+    return tp_order_id, sl_order_id
+
+
+def open_position_with_tp_sl(
+    settings: Any,
+    symbol: str,
+    side_open: str,
+    qty: float,
+    entry_price_hint: float,
+    tp_pct: float,
+    sl_pct: float,
+    source: str,
+    soft_mode: bool = False,
+    sl_floor_ratio: Optional[float] = None,
+    *,
+    available_usdt: Optional[float] = None,
+    entry_client_order_id: Optional[str] = None,
+) -> Optional["Trade"]:
+    _ = available_usdt
+
+    sym = _normalize_symbol(symbol)
+    open_side = _normalize_side(side_open)
+
+    lev = _require_leverage(settings)
+
+    final_qty_raw = _require_positive_float(qty, "qty")
+
+    tp_pct_f = float(tp_pct)
+    sl_pct_f = float(sl_pct)
+    if tp_pct_f < 0 or sl_pct_f < 0:
+        raise ValueError("tp_pct and sl_pct must be >= 0")
+
+    if not bool(soft_mode) and sl_pct_f <= 0:
+        raise ValueError("sl_pct must be > 0 when soft_mode=False")
+
+    eph = float(entry_price_hint)
+    if not math.isfinite(eph):
+        raise ValueError("entry_price_hint must be finite")
+
+    require_det = bool(getattr(settings, "require_deterministic_client_order_id", False))
+    if entry_client_order_id is not None:
+        entry_cid = _validate_client_order_id(entry_client_order_id)
+    else:
+        if require_det:
+            raise ValueError("entry_client_order_id is required when settings.require_deterministic_client_order_id=True")
+        entry_cid = _make_client_order_id(prefix="ent")
+
+    tp_cid = _make_child_client_order_id(entry_cid, "tp")
+    sl_cid = _make_child_client_order_id(entry_cid, "sl")
+
+    ensure_trading_settings(sym, settings)
+    filt = get_symbol_filters(sym)
+    expected_qty_dec, _, _ = _round_qty_and_price(
+        filters=filt,
+        order_type="MARKET",
+        raw_qty=final_qty_raw,
+        raw_price=None,
+        raw_stop_price=None,
+    )
+    expected_qty_f = float(expected_qty_dec)
+
+    # 1) ENTRY 제출
+    try:
+        entry_resp = place_market(
+            symbol=sym,
+            side=open_side,
+            qty=float(expected_qty_f),
+            settings=settings,
+            reduce_only=False,
+            position_side="BOTH",
+            client_order_id=entry_cid,
+        )
+    except Exception as e:
+        logger.exception(
+            "entry order failed (symbol=%s side=%s qty=%s source=%s)",
+            sym,
+            open_side,
+            expected_qty_f,
+            source,
+        )
+        log_event(
+            event_type="ERROR",
+            symbol=sym,
+            regime=source,
+            side=_event_side_from_open_side(open_side),
+            reason=str(e) or "entry_order_failed",
+            extra_json={"open_side": open_side, "qty": float(expected_qty_f), "clientOrderId": entry_cid},
+        )
+        raise OrderExecutionError("entry order submission failed") from e
+
+    order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
+    if order_id is None:
+        raise OrderExecutionError("entry response missing orderId (STRICT)")
+    entry_order_id = str(order_id)
+
+    # 2) ENTRY 체결 검증
+    max_wait = float(getattr(settings, "entry_fill_wait_sec", 2.0) or 2.0)
+    od, exec_qty_dec, entry_price = _wait_order_filled_strict(
+        symbol=sym,
+        order_id=entry_order_id,
+        settings=settings,
+        expected_qty=expected_qty_dec,
+        qty_step=filt.market_step,
+        max_wait_sec=max_wait,
+    )
+
+    if entry_price <= 0 or not math.isfinite(entry_price):
+        raise OrderExecutionError("entry_price resolved invalid (<=0 or non-finite)")
+
+    entry_ts_dt = _resolve_order_event_time_strict(od, label="entry_order")
+
+    # 3) 포지션 반영 확인
+    _verify_position_reflects_execution_strict(
+        symbol=sym,
+        open_side=open_side,
+        executed_qty=exec_qty_dec,
+        qty_step=filt.market_step,
+        settings=settings,
+        max_wait_sec=float(getattr(settings, "position_reflect_wait_sec", 1.2) or 1.2),
+    )
+
+    # 4) 슬리피지 진단
+    if eph > 0 and math.isfinite(eph):
+        slip_pct = abs(entry_price - eph) / eph * 100.0
+        logger.info(
+            "entry slippage diag (symbol=%s hint=%s fill=%s slip_pct=%.4f clientOrderId=%s orderId=%s)",
+            sym,
+            eph,
+            entry_price,
+            slip_pct,
+            entry_cid,
+            entry_order_id,
+        )
+
+    max_slip = getattr(settings, "max_entry_slippage_pct", None)
+    if max_slip is not None:
+        try:
+            max_slip_f = float(max_slip)
+        except Exception as e:
+            raise ValueError("settings.max_entry_slippage_pct must be a number") from e
+        if max_slip_f < 0:
+            raise ValueError("settings.max_entry_slippage_pct must be >= 0")
+        if max_slip_f > 0:
+            if eph <= 0:
+                raise ValueError("entry_price_hint must be > 0 when max_entry_slippage_pct is enabled")
+            slip_pct = abs(entry_price - eph) / eph * 100.0
+            if slip_pct > max_slip_f:
+                logger.warning(
+                    "slippage guard triggered (symbol=%s hint=%s fill=%s slip_pct=%.4f limit=%.4f) -> force close",
+                    sym,
+                    eph,
+                    entry_price,
+                    slip_pct,
+                    max_slip_f,
+                )
                 log_event(
-                    "on_entry_filled",
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine",
-                    side=direction,
-                    price=float(entry_price_sim),
-                    qty=float(entry_qty_sim),
-                    leverage=float(leverage),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    risk_pct=float(allocation_ratio),
-                    reason="entry_filled_simulated",
-                    extra_json={"test_dry_run": True},
-                    is_test=True,
-                )
-
-                trade_id = record_trade_open_returning_id(
-                    symbol=symbol,
-                    side=str(side_open),
-                    qty=float(entry_qty_sim),
-                    entry_price=float(entry_price_sim),
-                    entry_ts=entry_ts_dt_sim,
-                    is_auto=True,
-                    regime_at_entry=str(regime),
-                    strategy=str(signal_source),
-                    entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
-                    trend_score_at_entry=None,
-                    range_score_at_entry=None,
-                    leverage=float(leverage),
-                    risk_pct=float(allocation_ratio),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    note="TEST_DRY_RUN",
-                    entry_order_id=None,
-                    tp_order_id=None,
-                    sl_order_id=None,
-                    exchange_position_side="BOTH",
-                    remaining_qty=float(entry_qty_sim),
-                    realized_pnl_usdt=0.0,
-                    reconciliation_status="TEST_DRY_RUN",
-                    last_synced_at=entry_ts_dt_sim,
-                )
-
-                _emit_position_event_strict(
-                    symbol=symbol,
-                    regime=regime,
-                    direction=direction,
-                    signal_source=signal_source,
-                    entry_price=float(entry_price_sim),
-                    position_qty=float(entry_qty_sim),
-                    leverage=float(leverage),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    allocation_ratio=float(allocation_ratio),
-                    trade_id=int(trade_id),
-                    entry_order_id=None,
-                    tp_order_id=None,
-                    sl_order_id=None,
-                    exchange_position_side="BOTH",
-                    remaining_qty=float(entry_qty_sim),
-                    realized_pnl_usdt=0.0,
-                    reconciliation_status="TEST_DRY_RUN",
-                    entry_ts=entry_ts_dt_sim,
-                    entry_client_order_id=str(entry_client_order_id),
-                    reason="position_opened_simulated",
-                    is_test=True,
-                )
-
-                snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price_sim))
-
-                record_trade_snapshot(
-                    trade_id=int(trade_id),
-                    symbol=symbol,
-                    entry_ts=entry_ts_dt_sim,
-                    direction=str(direction),
-                    signal_source=str(signal_source),
-                    regime=str(regime),
-                    entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
-                    engine_total=_opt_float_strict(engine_total_val, "meta.engine_total"),
-                    trend_strength=None,
-                    atr_pct=None,
-                    volume_zscore=None,
-                    depth_ratio=None,
-                    spread_pct=spread_pct_snapshot,
-                    last_price=float(last_price),
-                    risk_pct=float(allocation_ratio),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    gpt_action="ENTER",
-                    gpt_reason=str(signal.reason or ""),
-                    equity_current_usdt=float(eq_cur_usdt),
-                    equity_peak_usdt=float(eq_peak_usdt),
-                    dd_pct=float(dd_pct_v),
-                    **snap_kwargs,
-                )
-
-                closed_trade_id = close_latest_open_trade_returning_id(
-                    symbol=symbol,
-                    side=str(side_open),
-                    exit_price=float(entry_price_sim),
-                    exit_ts=entry_ts_dt_sim,
-                    pnl_usdt=0.0,
-                    close_reason="TEST_DRY_RUN",
-                    regime_at_exit=str(regime),
-                    pnl_pct_futures=0.0,
-                    pnl_pct_spot_ref=None,
-                    note="TEST_DRY_RUN closed immediately",
-                )
-
-                record_trade_exit_snapshot(
-                    trade_id=int(closed_trade_id),
-                    symbol=symbol,
-                    close_ts=entry_ts_dt_sim,
-                    close_price=float(entry_price_sim),
-                    pnl=0.0,
-                    close_reason="TEST_DRY_RUN",
-                    exit_atr_pct=None,
-                    exit_trend_strength=None,
-                    exit_volume_zscore=None,
-                    exit_depth_ratio=None,
-                )
-
-                _submit_tg_nonblocking(send_tg, f"[TEST_DRY_RUN] DB recorded + closed: {symbol} {direction} trade_id={trade_id}", label="send_tg")
-                return None
-
-            try:
-                trade = open_position_with_tp_sl(
-                    settings=self.settings,
-                    symbol=symbol,
-                    side_open=side_open,
-                    qty=float(qty_raw),
-                    entry_price_hint=float(entry_price_hint),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    source=str(signal_source),
-                    soft_mode=bool(soft_mode),
-                    sl_floor_ratio=sl_floor_ratio,
-                    entry_client_order_id=str(entry_client_order_id),
-                )
-            except ProtectionOrderVerificationError as e:
-                log_event(
-                    "ERROR",
-                    symbol=symbol,
-                    regime=regime,
-                    source="execution_engine",
-                    side=direction,
-                    price=float(entry_price_hint),
-                    qty=float(qty_raw),
-                    leverage=float(leverage),
-                    tp_pct=float(tp_pct),
-                    sl_pct=float(sl_pct),
-                    risk_pct=float(allocation_ratio),
-                    reason="protection_order_verification_failed",
+                    event_type="ERROR",
+                    symbol=sym,
+                    regime=source,
+                    side=_event_side_from_open_side(open_side),
+                    reason="slippage_guard_force_close",
                     extra_json={
-                        "signal_source": signal_source,
-                        "entry_client_order_id": entry_client_order_id,
-                        "error": str(e)[:240],
+                        "entry_price_hint": float(eph),
+                        "entry_price": float(entry_price),
+                        "slippage_pct": float(slip_pct),
+                        "max_entry_slippage_pct": float(max_slip_f),
+                        "qty": float(expected_qty_f),
+                        "entry_order_id": entry_order_id,
+                        "clientOrderId": entry_cid,
                     },
                 )
-                raise
-            if trade is None:
-                raise OrderFailed("open_position_with_tp_sl returned None (STRICT)")
+                try:
+                    close_position_market(sym, open_side, float(expected_qty_f))
+                except Exception as e2:
+                    logger.exception("slippage guard force close failed (symbol=%s)", sym)
+                    raise OrderExecutionError("slippage guard close failed") from e2
+                raise OrderExecutionError("slippage guard triggered")
 
-            state = OrderState.FILLED
-            setattr(trade, "order_state", state.value)
+    log_event(
+        event_type="ENTRY",
+        symbol=sym,
+        regime=source,
+        side=_event_side_from_open_side(open_side),
+        price=float(entry_price),
+        qty=float(expected_qty_f),
+        leverage=int(float(lev)),
+        tp_pct=float(tp_pct_f),
+        sl_pct=float(sl_pct_f),
+        risk_pct=_get_allocation_ratio_for_log(settings),
+        reason="MARKET_ENTRY_FILLED",
+        extra_json={"open_side": open_side, "clientOrderId": entry_cid, "entry_order_id": entry_order_id},
+    )
 
-            (
-                entry_order_id,
-                tp_order_id,
-                sl_order_id,
-                pos_side,
-                remaining_qty,
-                realized_pnl_usdt,
-                reconciliation_status,
-            ) = _require_trade_exec_fields(trade, soft_mode=bool(soft_mode))
+    # 5) TP/SL 가격 계산
+    if open_side == "BUY":
+        tp_price = entry_price * (1.0 + tp_pct_f)
+        sl_price = entry_price * (1.0 - sl_pct_f)
+    else:
+        tp_price = entry_price * (1.0 - tp_pct_f)
+        sl_price = entry_price * (1.0 + sl_pct_f)
 
-            entry_price = getattr(trade, "entry", getattr(trade, "entry_price", None))
-            if entry_price is None:
-                raise OrderFailed("trade.entry/entry_price is required (STRICT)")
-            entry_price = _as_float(entry_price, "trade.entry_price", min_value=0.0)
+    if isinstance(sl_floor_ratio, (int, float)) and float(sl_floor_ratio) > 0:
+        floor_r = float(sl_floor_ratio)
+        if open_side == "BUY":
+            floor_price = entry_price * (1.0 - floor_r)
+            if sl_price > floor_price:
+                sl_price = floor_price
+        else:
+            floor_price = entry_price * (1.0 + floor_r)
+            if sl_price < floor_price:
+                sl_price = floor_price
 
-            entry_qty = getattr(trade, "qty", None)
-            if entry_qty is None:
-                raise OrderFailed("trade.qty is required (STRICT)")
-            entry_qty = _as_float(entry_qty, "trade.qty", min_value=0.0)
+    # 6) TP/SL 설치
+    close_side = "SELL" if open_side == "BUY" else "BUY"
 
-            entry_ts_dt = getattr(trade, "entry_ts", None)
-            if not isinstance(entry_ts_dt, datetime) or entry_ts_dt.tzinfo is None or entry_ts_dt.tzinfo.utcoffset(entry_ts_dt) is None:
-                raise OrderFailed("trade.entry_ts (tz-aware datetime) is required (STRICT)")
+    try:
+        tp_order_id, sl_order_id = set_tp_sl(
+            symbol=sym,
+            side_open=open_side,
+            qty=float(expected_qty_f),
+            tp_price=float(tp_price),
+            sl_price=float(sl_price),
+            soft_mode=bool(soft_mode),
+            sl_floor_ratio=sl_floor_ratio,
+            settings=settings,
+            tp_client_order_id=tp_cid,
+            sl_client_order_id=sl_cid,
+        )
+    except Exception as e:
+        logger.exception("set_tp_sl failed (symbol=%s soft_mode=%s)", sym, bool(soft_mode))
+        log_event(
+            event_type="ERROR",
+            symbol=sym,
+            regime=source,
+            side=_event_side_from_open_side(open_side),
+            reason="tp_sl_set_failed",
+            extra_json={
+                "err": str(e),
+                "soft_mode": bool(soft_mode),
+                "qty": float(expected_qty_f),
+                "entry_order_id": entry_order_id,
+                "clientOrderId": entry_cid,
+            },
+        )
 
-            if reconciliation_status != "PROTECTION_VERIFIED":
-                raise OrderFailed(
-                    f"trade.reconciliation_status must be PROTECTION_VERIFIED after ENTRY (STRICT), got={reconciliation_status!r}"
-                )
+        try:
+            close_all_positions_market(sym)
+        except Exception as e2:
+            logger.exception("force close after TP/SL failure also failed (symbol=%s)", sym)
+            raise OrderExecutionError("force close after TP/SL failure failed") from e2
 
-            log_event(
-                "PROTECTION_VERIFIED",
-                symbol=symbol,
-                regime=regime,
-                source="execution_engine",
-                side=direction,
-                price=float(entry_price),
-                qty=float(entry_qty),
-                leverage=float(leverage),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                risk_pct=float(allocation_ratio),
-                reason="protection_orders_verified",
-                extra_json={
-                    "signal_source": signal_source,
-                    "entry_order_id": entry_order_id,
-                    "tp_order_id": tp_order_id,
-                    "sl_order_id": sl_order_id,
-                    "entry_client_order_id": entry_client_order_id,
-                    "exchange_position_side": pos_side,
-                },
-            )
+        raise OrderExecutionError("tp/sl set failed") from e
 
-            log_event(
-                "on_entry_filled",
-                symbol=symbol,
-                regime=regime,
-                source="execution_engine",
-                side=direction,
-                price=float(entry_price),
-                qty=float(entry_qty),
-                leverage=float(leverage),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                risk_pct=float(allocation_ratio),
-                reason="entry_filled",
-                extra_json={"signal_source": signal_source, "entry_client_order_id": entry_client_order_id, "entry_order_id": entry_order_id},
-            )
+    if tp_order_id is None or not str(tp_order_id).strip():
+        raise OrderExecutionError("TP order_id is missing after set_tp_sl (STRICT)")
+    if not bool(soft_mode) and (sl_order_id is None or not str(sl_order_id).strip()):
+        raise OrderExecutionError("soft_mode=False but SL order_id is missing (STRICT)")
 
-            trade_last_synced_at = _require_tz_aware_datetime(
-                getattr(trade, "last_synced_at", None),
-                "trade.last_synced_at",
-            )
+    # 7) 보호주문 실제 존재 검증
+    try:
+        tp_verified_id, sl_verified_id = _wait_protection_orders_visible_strict(
+            symbol=sym,
+            close_side=close_side,
+            position_side="BOTH",
+            tp_order_id=str(tp_order_id),
+            sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
+            tp_client_order_id=tp_cid,
+            sl_client_order_id=(sl_cid if sl_order_id is not None else None),
+            soft_mode=bool(soft_mode),
+            settings=settings,
+        )
+    except Exception as e:
+        logger.exception("protection order verification failed (symbol=%s soft_mode=%s)", sym, bool(soft_mode))
+        log_event(
+            event_type="ERROR",
+            symbol=sym,
+            regime=source,
+            side=_event_side_from_open_side(open_side),
+            reason="protection_order_verification_failed",
+            extra_json={
+                "err": str(e),
+                "soft_mode": bool(soft_mode),
+                "qty": float(expected_qty_f),
+                "entry_order_id": entry_order_id,
+                "tp_order_id": tp_order_id,
+                "sl_order_id": sl_order_id,
+                "tp_clientOrderId": tp_cid,
+                "sl_clientOrderId": (sl_cid if sl_order_id is not None else None),
+                "entry_clientOrderId": entry_cid,
+            },
+        )
 
-            trade_id = record_trade_open_returning_id(
-                symbol=symbol,
-                side=str(side_open),
-                qty=float(entry_qty),
-                entry_price=float(entry_price),
-                entry_ts=entry_ts_dt,
-                is_auto=True,
-                regime_at_entry=str(regime),
-                strategy=str(signal_source),
-                entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
-                trend_score_at_entry=None,
-                range_score_at_entry=None,
-                leverage=float(leverage),
-                risk_pct=float(allocation_ratio),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                note=f"reason={str(signal.reason or '')[:180]}",
-                entry_order_id=str(entry_order_id),
-                tp_order_id=str(tp_order_id),
-                sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
-                exchange_position_side=str(pos_side),
-                remaining_qty=float(remaining_qty),
-                realized_pnl_usdt=float(realized_pnl_usdt),
-                reconciliation_status="PROTECTION_VERIFIED",
-                last_synced_at=trade_last_synced_at,
-            )
+        try:
+            close_all_positions_market(sym)
+        except Exception as e2:
+            logger.exception("force close after protection verification failure also failed (symbol=%s)", sym)
+            raise OrderExecutionError("force close after protection verification failure failed") from e2
 
-            setattr(trade, "id", int(trade_id))
-            setattr(trade, "reconciliation_status", "PROTECTION_VERIFIED")
-            setattr(trade, "last_synced_at", trade_last_synced_at)
+        raise ProtectionOrderVerificationError("protection order verification failed") from e
 
-            _emit_position_event_strict(
-                symbol=symbol,
-                regime=regime,
-                direction=direction,
-                signal_source=signal_source,
-                entry_price=float(entry_price),
-                position_qty=float(entry_qty),
-                leverage=float(leverage),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                allocation_ratio=float(allocation_ratio),
-                trade_id=int(trade_id),
-                entry_order_id=str(entry_order_id),
-                tp_order_id=str(tp_order_id),
-                sl_order_id=(str(sl_order_id) if sl_order_id is not None else None),
-                exchange_position_side=str(pos_side),
-                remaining_qty=float(remaining_qty),
-                realized_pnl_usdt=float(realized_pnl_usdt),
-                reconciliation_status="PROTECTION_VERIFIED",
-                entry_ts=entry_ts_dt,
-                entry_client_order_id=str(entry_client_order_id),
-                reason="position_opened",
-                is_test=False,
-            )
+    tp_order_id = tp_verified_id
+    sl_order_id = sl_verified_id
 
-            snap_kwargs = _snapshot_kwargs_from_meta(meta, entry_price_hint=float(entry_price_hint), filled_entry_price=float(entry_price))
+    log_event(
+        event_type="TP_SL_SET",
+        symbol=sym,
+        regime=source,
+        side=_event_side_from_open_side(open_side),
+        price=float(entry_price),
+        qty=float(expected_qty_f),
+        leverage=int(float(lev)),
+        tp_pct=float(tp_pct_f),
+        sl_pct=float(sl_pct_f),
+        risk_pct=_get_allocation_ratio_for_log(settings),
+        reason="TP_SL_CONFIGURED",
+        extra_json={
+            "soft_mode": bool(soft_mode),
+            "tp_order_id": tp_order_id,
+            "sl_order_id": sl_order_id,
+            "tp_clientOrderId": tp_cid,
+            "sl_clientOrderId": (sl_cid if sl_order_id is not None else None),
+            "entry_order_id": entry_order_id,
+            "entry_clientOrderId": entry_cid,
+        },
+    )
 
-            record_trade_snapshot(
-                trade_id=int(trade_id),
-                symbol=symbol,
-                entry_ts=entry_ts_dt,
-                direction=str(direction),
-                signal_source=str(signal_source),
-                regime=str(regime),
-                entry_score=_opt_float_strict(entry_score_val, "meta.entry_score"),
-                engine_total=_opt_float_strict(engine_total_val, "meta.engine_total"),
-                trend_strength=None,
-                atr_pct=None,
-                volume_zscore=None,
-                depth_ratio=None,
-                spread_pct=spread_pct_snapshot,
-                last_price=float(last_price),
-                risk_pct=float(allocation_ratio),
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                gpt_action="ENTER",
-                gpt_reason=str(signal.reason or ""),
-                equity_current_usdt=float(eq_cur_usdt),
-                equity_peak_usdt=float(eq_peak_usdt),
-                dd_pct=float(dd_pct_v),
-                **snap_kwargs,
-            )
+    now_sync = datetime.now(timezone.utc)
 
-            _submit_task_nonblocking(
-                _exec_quality_task,
-                str(symbol),
-                str(direction),
-                str(regime),
-                float(entry_price_hint),
-                float(entry_price),
-                label="exec_quality",
-            )
+    return _make_trade_strict(
+        symbol=sym,
+        side=open_side,
+        qty=float(expected_qty_f),
+        entry_price=float(entry_price),
+        entry=float(entry_price),
+        entry_ts=entry_ts_dt,
+        leverage=int(float(lev)),
+        source=str(source or "MARKET"),
+        tp_price=float(tp_price) if tp_price > 0 else 0.0,
+        sl_price=float(sl_price) if sl_price > 0 else 0.0,
+        entry_order_id=entry_order_id,
+        tp_order_id=str(tp_order_id) if tp_order_id is not None else None,
+        sl_order_id=str(sl_order_id) if sl_order_id is not None else None,
+        client_entry_id=str(entry_cid),
+        exchange_position_side="BOTH",
+        remaining_qty=float(expected_qty_f),
+        realized_pnl_usdt=0.0,
+        reconciliation_status="PROTECTION_VERIFIED",
+        last_synced_at=now_sync,
+    )
 
-            _submit_tg_nonblocking(
-                send_tg,
-                f"[ENTRY][FILLED] {symbol} {direction} "
-                f"alloc={allocation_ratio*100:.1f}% tp={tp_pct*100:.2f}% sl={sl_pct*100:.2f}% "
-                f"price={float(entry_price):.4f} qty={float(entry_qty):.6f} src={signal_source}",
-                label="send_tg",
-            )
 
-            return trade
+def close_position_market(symbol: str, side_open: str, qty: float) -> None:
+    sym = _normalize_symbol(symbol)
+    open_side = _normalize_side(side_open)
+    close_side = "SELL" if open_side == "BUY" else "BUY"
 
-        finally:
-            _EXECUTION_LOCK.release()
+    ensure_trading_settings(sym, SET)
+    filt = get_symbol_filters(sym)
+    expected_qty_dec, _, _ = _round_qty_and_price(
+        filters=filt,
+        order_type="MARKET",
+        raw_qty=_require_positive_float(qty, "qty"),
+        raw_price=None,
+        raw_stop_price=None,
+    )
+    expected_qty_f = float(expected_qty_dec)
+
+    cid = _make_client_order_id(prefix="cls")
+    resp = place_market(
+        symbol=sym,
+        side=close_side,
+        qty=float(expected_qty_f),
+        settings=SET,
+        reduce_only=True,
+        position_side="BOTH",
+        client_order_id=cid,
+    )
+
+    order_id = resp.get("orderId") if isinstance(resp, dict) else None
+    if order_id is None:
+        raise OrderExecutionError("close response missing orderId (STRICT)")
+
+    _, _, avg_px = _wait_order_filled_strict(
+        symbol=sym,
+        order_id=str(order_id),
+        settings=SET,
+        expected_qty=expected_qty_dec,
+        qty_step=filt.market_step,
+        max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
+    )
+
+    _wait_symbol_flat_strict(
+        symbol=sym,
+        settings=SET,
+        max_wait_sec=float(getattr(SET, "position_flat_wait_sec", 1.5) or 1.5),
+    )
+
+    log_event(
+        event_type="EXIT",
+        symbol=sym,
+        regime="MANUAL_CLOSE",
+        side=_event_side_close(),
+        price=float(avg_px),
+        qty=float(expected_qty_f),
+        leverage=getattr(SET, "leverage", None),
+        reason="MARKET_CLOSE_FILLED",
+        extra_json={"close_side": close_side, "clientOrderId": cid, "orderId": str(order_id)},
+    )
+
+    logger.info(
+        "close market filled and flat verified (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
+        sym,
+        close_side,
+        expected_qty_f,
+        order_id,
+        cid,
+    )
+
+
+def close_all_positions_market(symbol: str) -> int:
+    sym = _normalize_symbol(symbol)
+
+    positions = fetch_open_positions(sym)
+    if not isinstance(positions, list):
+        raise RuntimeError("fetch_open_positions returned non-list")
+    if not positions:
+        return 0
+
+    submitted = 0
+
+    for p in positions:
+        if not isinstance(p, dict):
+            raise RuntimeError("position item is not a dict")
+        if str(p.get("symbol") or "").upper() != sym:
+            continue
+
+        if "positionAmt" not in p:
+            raise RuntimeError("position missing positionAmt")
+        try:
+            amt = float(p.get("positionAmt"))
+        except Exception as e:
+            raise RuntimeError(f"positionAmt parse failed: {e}") from e
+
+        if abs(amt) < 1e-12:
+            continue
+
+        if "positionSide" not in p:
+            raise RuntimeError("position missing positionSide")
+        pos_side = str(p.get("positionSide") or "").upper().strip()
+        if pos_side not in ("BOTH", "LONG", "SHORT"):
+            raise RuntimeError(f"invalid positionSide: {pos_side!r}")
+
+        if pos_side in ("LONG", "SHORT"):
+            direction = pos_side
+        else:
+            direction = "LONG" if amt > 0 else "SHORT"
+
+        close_side = "SELL" if direction == "LONG" else "BUY"
+        qty2 = abs(amt)
+
+        ensure_trading_settings(sym, SET)
+        filt = get_symbol_filters(sym)
+        expected_qty_dec, _, _ = _round_qty_and_price(
+            filters=filt,
+            order_type="MARKET",
+            raw_qty=_require_positive_float(qty2, "qty2"),
+            raw_price=None,
+            raw_stop_price=None,
+        )
+
+        client_id = _make_client_order_id(prefix="sigterm")
+        logger.warning(
+            "[FORCE_CLOSE] submit reduce-only market close: symbol=%s direction=%s qty=%s positionSide=%s",
+            sym,
+            direction,
+            qty2,
+            pos_side,
+        )
+
+        resp = place_market(
+            symbol=sym,
+            side=close_side,
+            qty=float(expected_qty_dec),
+            settings=SET,
+            reduce_only=True,
+            position_side=pos_side,
+            client_order_id=client_id,
+        )
+
+        order_id = resp.get("orderId") if isinstance(resp, dict) else None
+        if order_id is None:
+            raise OrderExecutionError("force close response missing orderId (STRICT)")
+
+        _, _, avg_px = _wait_order_filled_strict(
+            symbol=sym,
+            order_id=str(order_id),
+            settings=SET,
+            expected_qty=expected_qty_dec,
+            qty_step=filt.market_step,
+            max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
+        )
+
+        log_event(
+            event_type="EXIT",
+            symbol=sym,
+            regime="SIGTERM_FORCE_CLOSE",
+            side=_event_side_close(),
+            price=float(avg_px),
+            qty=float(expected_qty_dec),
+            leverage=getattr(SET, "leverage", None),
+            reason="SIGTERM_DEADLINE_FORCE_CLOSE",
+            extra_json={
+                "direction": direction,
+                "close_side": close_side,
+                "positionSide": pos_side,
+                "orderId": str(order_id),
+            },
+        )
+        submitted += 1
+
+    if submitted > 0:
+        _wait_symbol_flat_strict(
+            symbol=sym,
+            settings=SET,
+            max_wait_sec=float(getattr(SET, "position_flat_wait_sec", 1.5) or 1.5),
+        )
+
+    return submitted
+
+
+__all__ = [
+    "open_position_with_tp_sl",
+    "place_market",
+    "place_limit",
+    "place_conditional",
+    "cancel_order_safe",
+    "set_tp_sl",
+    "close_position_market",
+    "get_symbol_filters",
+    "ensure_trading_settings",
+    "close_all_positions_market",
+]
