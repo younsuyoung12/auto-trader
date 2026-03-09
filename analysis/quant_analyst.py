@@ -5,6 +5,16 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- market-only / full-analysis scope 계약 검증 강화
+- 내부/거래/외부 분석 결과 symbol 정합성 검증 추가
+- dashboard payload / 최종 응답 무결성 검증 강화
+
+코드 정리 내용
+- scope별 검증 로직 분리
+- 분석 객체 symbol 계약 검증 추가
+- dashboard payload 타임스탬프/카드 구조 검증 강화
+
 역할:
 - 내부 DB 기반 시장 분석 + 거래 분석 + 외부 Binance 시장 분석을 통합한다.
 - GPT Analyst Engine에 분석 컨텍스트를 전달해 최종 분석/원인/해결책을 생성한다.
@@ -21,20 +31,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 분석 실패 시 즉시 예외 전파
 
 변경 이력:
-2026-03-07
-- 신규 생성
-- 내부/외부 시장 분석 + 거래 분석 + GPT 분석 오케스트레이터 추가
-- market-analysis 전용 순수 외부시장 분석 경로 추가
-- 입력 사용 검증을 실제 제공된 분석 컨텍스트 기준으로 강화
-- 대시보드 payload 생성 로직을 분석 범위별(optional card) 구조로 확장
+2026-03-09
+1) FIX(STRICT): market-only / full-analysis scope 계약 검증 강화
+2) FIX(INTEGRITY): internal/trade/external summary symbol 정합성 검증 추가
+3) FIX(PAYLOAD): dashboard payload / 최종 응답 타임스탬프 및 카드 구조 검증 강화
+4) CLEANUP: scope별 검증 로직 분리
 
-2026-03-07 (PATCH)
-1) 분석 객체 to_dict() 결과가 빈 mapping 이면 즉시 예외 처리하도록 강화
-2) market-only 스코프에서 generic GPT analyze()를 무조건 호출하지 않도록 분기 추가
-3) GPT 엔진의 scope별 메서드 계약 검증 로직 추가
-4) gpt_result / dashboard_payload / 최종 응답 무결성 검증 추가
-
-2026-03-08 (PATCH 2)
+2026-03-08
 1) MarketResearchReport 확장 필드(volume profile / orderflow / options)를 dashboard payload에 반영
 2) external_market card 에 POC / Value Area / CVD / delta ratio / options bias 핵심 필드 추가
 3) external_market card 에 volume_profile_summary / orderflow_summary / options_summary nested payload 추가
@@ -168,12 +171,24 @@ class QuantAnalyst:
 
         if include_internal_market:
             internal_market_summary_obj = self._market_analyzer.run()
+            self._validate_summary_symbol_contract_or_raise(
+                obj=internal_market_summary_obj,
+                field_name="internal_market_summary_obj",
+            )
 
         if include_trade_analysis:
             trade_summary_obj = self._trade_analyzer.run()
+            self._validate_summary_symbol_contract_or_raise(
+                obj=trade_summary_obj,
+                field_name="trade_summary_obj",
+            )
 
         if include_external_market:
             external_market_summary_obj = self._market_researcher.run()
+            self._validate_summary_symbol_contract_or_raise(
+                obj=external_market_summary_obj,
+                field_name="external_market_summary_obj",
+            )
 
         internal_market_summary = self._object_to_non_empty_mapping_or_none(
             obj=internal_market_summary_obj,
@@ -186,6 +201,15 @@ class QuantAnalyst:
         external_market_summary = self._object_to_non_empty_mapping_or_none(
             obj=external_market_summary_obj,
             field_name="external_market_summary",
+        )
+
+        self._validate_scope_input_contract_or_raise(
+            include_internal_market=include_internal_market,
+            include_trade_analysis=include_trade_analysis,
+            include_external_market=include_external_market,
+            internal_market_summary=internal_market_summary,
+            trade_summary=trade_summary,
+            external_market_summary=external_market_summary,
         )
 
         gpt_result_obj = self._dispatch_gpt_analysis_or_raise(
@@ -273,11 +297,24 @@ class QuantAnalyst:
         )
 
         if is_market_only_scope:
+            self._validate_market_only_scope_contract_or_raise(
+                internal_market_summary=internal_market_summary,
+                trade_summary=trade_summary,
+                external_market_summary=external_market_summary,
+            )
             return self._dispatch_market_only_gpt_analysis_or_raise(
                 question=question,
                 external_market_summary=external_market_summary,
             )
 
+        self._validate_general_scope_contract_or_raise(
+            include_internal_market=include_internal_market,
+            include_trade_analysis=include_trade_analysis,
+            include_external_market=include_external_market,
+            internal_market_summary=internal_market_summary,
+            trade_summary=trade_summary,
+            external_market_summary=external_market_summary,
+        )
         return self._dispatch_generic_gpt_analysis_or_raise(
             question=question,
             internal_market_summary=internal_market_summary,
@@ -452,6 +489,56 @@ class QuantAnalyst:
                 "include_external_market=False but external_market_summary was provided"
             )
 
+    def _validate_market_only_scope_contract_or_raise(
+        self,
+        *,
+        internal_market_summary: Optional[Dict[str, Any]],
+        trade_summary: Optional[Dict[str, Any]],
+        external_market_summary: Optional[Dict[str, Any]],
+    ) -> None:
+        if internal_market_summary is not None:
+            raise RuntimeError("market-only scope must not include internal_market_summary")
+        if trade_summary is not None:
+            raise RuntimeError("market-only scope must not include trade_summary")
+        if external_market_summary is None:
+            raise RuntimeError("market-only scope requires external_market_summary")
+
+    def _validate_general_scope_contract_or_raise(
+        self,
+        *,
+        include_internal_market: bool,
+        include_trade_analysis: bool,
+        include_external_market: bool,
+        internal_market_summary: Optional[Dict[str, Any]],
+        trade_summary: Optional[Dict[str, Any]],
+        external_market_summary: Optional[Dict[str, Any]],
+    ) -> None:
+        if include_internal_market and internal_market_summary is None:
+            raise RuntimeError("general scope internal_market_summary missing")
+        if include_trade_analysis and trade_summary is None:
+            raise RuntimeError("general scope trade_summary missing")
+        if include_external_market and external_market_summary is None:
+            raise RuntimeError("general scope external_market_summary missing")
+
+    def _validate_summary_symbol_contract_or_raise(
+        self,
+        *,
+        obj: Any,
+        field_name: str,
+    ) -> None:
+        if obj is None:
+            raise RuntimeError(f"{field_name} is missing (STRICT)")
+
+        symbol_value = getattr(obj, "symbol", None)
+        if not isinstance(symbol_value, str) or not symbol_value.strip():
+            raise RuntimeError(f"{field_name}.symbol must be a non-empty string")
+
+        normalized_symbol = symbol_value.strip().replace("-", "").replace("/", "").upper()
+        if normalized_symbol != self._symbol:
+            raise RuntimeError(
+                f"{field_name}.symbol mismatch: expected={self._symbol} got={normalized_symbol}"
+            )
+
     def _validate_gpt_result_or_raise(self, gpt_result: GptAnalystResult) -> None:
         if not isinstance(gpt_result.scope, str) or not gpt_result.scope.strip():
             raise RuntimeError("gpt_result.scope must be a non-empty string")
@@ -506,9 +593,9 @@ class QuantAnalyst:
             raise RuntimeError(f"{field_name} object must provide callable to_dict()")
 
         data = to_dict_method()
-        if not isinstance(data, dict) or not data:
+        if not isinstance(data, Mapping) or not data:
             raise RuntimeError(f"{field_name} must be a non-empty mapping")
-        return data
+        return dict(data)
 
     def _gpt_result_to_non_empty_mapping_or_raise(
         self,
@@ -519,9 +606,9 @@ class QuantAnalyst:
             raise RuntimeError("GptAnalystResult must provide callable to_dict()")
 
         data = to_dict_method()
-        if not isinstance(data, dict) or not data:
+        if not isinstance(data, Mapping) or not data:
             raise RuntimeError("GptAnalystResult.to_dict() must return a non-empty mapping")
-        return data
+        return dict(data)
 
     # ========================================================
     # Dashboard payload
@@ -701,6 +788,10 @@ class QuantAnalyst:
 
         if not isinstance(payload["symbol"], str) or not payload["symbol"].strip():
             raise RuntimeError("dashboard_payload.symbol must be a non-empty string")
+        if payload["symbol"].strip().upper() != self._symbol:
+            raise RuntimeError(
+                f"dashboard_payload.symbol mismatch: expected={self._symbol} got={payload['symbol']}"
+            )
         if not isinstance(payload["question"], str) or not payload["question"].strip():
             raise RuntimeError("dashboard_payload.question must be a non-empty string")
         if not isinstance(payload["scope"], str) or not payload["scope"].strip():
@@ -716,12 +807,32 @@ class QuantAnalyst:
         if not isinstance(payload["market_cards"], dict) or not payload["market_cards"]:
             raise RuntimeError("dashboard_payload.market_cards must be a non-empty mapping")
 
+        generated_ts_ms = payload["generated_ts_ms"]
+        analysis_as_of_ts_ms = payload["analysis_as_of_ts_ms"]
+        if isinstance(generated_ts_ms, bool) or isinstance(analysis_as_of_ts_ms, bool):
+            raise RuntimeError("dashboard payload timestamps must not be bool")
+        try:
+            generated_ts_ms_i = int(generated_ts_ms)
+            analysis_as_of_ts_ms_i = int(analysis_as_of_ts_ms)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("dashboard payload timestamps must be int-like") from exc
+        if generated_ts_ms_i <= 0 or analysis_as_of_ts_ms_i <= 0:
+            raise RuntimeError("dashboard payload timestamps must be > 0")
+        if generated_ts_ms_i < analysis_as_of_ts_ms_i:
+            raise RuntimeError(
+                f"generated_ts_ms must be >= analysis_as_of_ts_ms: generated={generated_ts_ms_i} as_of={analysis_as_of_ts_ms_i}"
+            )
+
     def _validate_response_or_raise(self, result: QuantAnalystResponse) -> None:
         data = result.to_dict()
         if not isinstance(data, dict) or not data:
             raise RuntimeError("QuantAnalystResponse.to_dict() must return a non-empty mapping")
         if not isinstance(result.symbol, str) or not result.symbol.strip():
             raise RuntimeError("QuantAnalystResponse.symbol must be a non-empty string")
+        if result.symbol.strip().upper() != self._symbol:
+            raise RuntimeError(
+                f"QuantAnalystResponse.symbol mismatch: expected={self._symbol} got={result.symbol}"
+            )
         if not isinstance(result.question, str) or not result.question.strip():
             raise RuntimeError("QuantAnalystResponse.question must be a non-empty string")
         if result.generated_ts_ms <= 0:

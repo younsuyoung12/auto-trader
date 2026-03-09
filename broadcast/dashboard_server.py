@@ -5,6 +5,16 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- Alpha Vantage 실응답 기준 quota 감지 문구 확장
+- /api/market-analysis, /api/quant-analysis 외부 provider quota 초과를 일관되게 503으로 승격
+- AI 분석 결과 payload strict 검증 추가
+
+코드 정리 내용
+- quota 감지 로직 공통화 정리
+- provider 오류 응답 메시지 정합화
+- 분석 payload strict dict 검증 추가
+
 역할
 --------------------------------------------------------
 Auto-Trader 대시보드 API 서버.
@@ -45,42 +55,18 @@ STRICT · NO-FALLBACK
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-07:
+- 2026-03-09:
+  1) FIX(ROOT-CAUSE): Alpha Vantage quota 감지 문구를 실운영 응답 형태까지 확장
+  2) FIX(STRICT): /api/market-analysis, /api/quant-analysis provider quota 초과를 일관되게 503 응답으로 승격
+  3) FIX(STRICT): AI 분석 결과 dashboard_payload dict 검증 추가
+  4) CLEANUP: provider 오류 응답 메시지 정합화
+
+- 2026-03-08:
   1) Redis 캐시 연동 추가(STRICT)
-     - dashboard_server startup 시 settings(SSOT) 기반 Redis 초기화
-     - 비용 큰 조회 API에 짧은 TTL 캐시 적용
-     - 캐시 miss 시 기존 DB 조회 로직 그대로 수행 후 캐시 저장
-  2) 엔진 WS 상태 조회를 메모리 기반이 아닌 DB 스냅샷 기반으로 변경
-     - 분리 배포 구조(AWS engine / Render dashboard) 정합성 확보
-     - bt_candles / bt_orderbook_snapshots 기준으로 ws-status 계산
-  3) AI Trading Intelligence 엔드포인트 추가
-     - /api/quant-analysis
-     - /api/market-analysis
-  4) dashboard template/static 경로를 dashboard/* 구조로 정합화
-  5) 분석 결과 bt_events 기록 연동
-     - event_type='QUANT_ANALYSIS'
-  6) /api/market-analysis를 순수 외부시장 분석 경로로 분리
-     - QuantAnalyst.analyze_market_only() 사용
-     - TradeAnalyzer / 내부 DB 거래 분석 비의존화
-- 2026-03-06:
-  1) Engine Watchdog API 추가:
-     - /api/engine/health
-     - /api/engine/ws-status
-     - /api/engine/latency
-  2) Dashboard WebSocket 엔드포인트 추가:
-     - /ws/dashboard
-  3) Decision / Error / Position / Performance / System API 추가
-- 2026-03-01:
-  1) recent trades 라벨 매핑을 is_auto/strategy 기준으로 수정
-  2) EntryScore API에 include_test 옵션 추가
-  3) bt_events 기반 이벤트 분석 API 추가:
-     - /api/events/skip-reasons
-     - /api/events/skip-hourly
-     - /api/events/recent
-- 2026-03-08 (PATCH):
-  1) FIX(ROOT-CAUSE): 외부 뉴스 API quota 초과가 /api/market-analysis, /api/quant-analysis 500으로 전파되던 문제 수정
-  2) FIX(STRICT): Alpha Vantage daily quota 초과 시 명시적 503 응답으로 승격
-  3) FIX(SECURITY): provider 오류 응답은 구조화하되 민감정보 노출 금지 유지
+  2) 엔진 WS 상태 조회를 DB 스냅샷 기반으로 변경
+  3) /api/quant-analysis, /api/market-analysis 추가
+  4) bt_events 분석 결과 기록 연동
+  5) 외부 provider quota 초과 시 명시적 503 응답 구조 도입
 ========================================================
 """
 
@@ -315,8 +301,22 @@ def _persist_analysis_event(
 
 
 def _is_alpha_vantage_daily_quota_error(message: str) -> bool:
-    text_norm = str(message or "").lower()
-    return "alpha vantage" in text_norm and "25 requests per day" in text_norm
+    text_norm = str(message or "").strip().lower()
+    if not text_norm:
+        return False
+
+    has_vendor_marker = ("alpha vantage" in text_norm) or ("alphavantage" in text_norm)
+    if not has_vendor_marker:
+        return False
+
+    quota_markers = (
+        "25 requests per day",
+        "free api requests more sparingly",
+        "please consider spreading out your free api requests more sparingly",
+        "alphavantage.co/premium",
+        "daily quota",
+    )
+    return any(marker in text_norm for marker in quota_markers)
 
 
 def _seconds_until_next_utc_reset() -> int:
@@ -354,7 +354,7 @@ def _raise_ai_provider_http_exception(exc: Exception, *, route_name: str) -> Non
                 "route": route_name,
                 "reason": "external_provider_quota_exceeded",
                 "provider": "Alpha Vantage",
-                "message": "External market analysis is temporarily unavailable because the news provider daily quota has been exceeded.",
+                "message": "External market analysis is temporarily unavailable because the external provider daily quota has been exceeded.",
                 "retry_after_sec": retry_after_sec,
                 "retry_at_utc": retry_at_utc,
             },
@@ -427,7 +427,7 @@ def api_quant_analysis(
         except Exception as exc:
             _raise_ai_provider_http_exception(exc, route_name="/api/quant-analysis")
 
-        payload = result.dashboard_payload
+        payload = _require_dict(result.dashboard_payload, "quant_analysis.dashboard_payload")
         _persist_analysis_event(
             report_type="dashboard_query",
             payload=payload,
@@ -460,7 +460,7 @@ def api_market_analysis(
         except Exception as exc:
             _raise_ai_provider_http_exception(exc, route_name="/api/market-analysis")
 
-        payload = result.dashboard_payload
+        payload = _require_dict(result.dashboard_payload, "market_analysis.dashboard_payload")
         _persist_analysis_event(
             report_type="market_query",
             payload=payload,

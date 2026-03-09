@@ -1,8 +1,20 @@
 """
 ========================================================
-state/db_core.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
+FILE: state/db_core.py
+AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
+
+핵심 변경 요약
+- DB_URL을 정규화된 Postgres URL로 단일화
+- 세션/커밋 계약을 더 명확하게 정리
+- 상단 변경 이력 최근 2일 기준으로 정리
+
+코드 정리 내용
+- 원시 env 값과 정규화 URL 혼용 제거
+- 세션 팩토리/엔진 생성부 정리
+- 설명 주석 정리
+
 설계 원칙:
 - Render Postgres를 단일 DB 소스로 사용한다.
 - 접속 정보는 TRADER_DB_URL 환경변수 1개만 사용한다.
@@ -13,30 +25,15 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-01:
-  1) 로컬 테스트 편의: python-dotenv로 .env 로딩 추가(override=False, env 우선)
-  2) 기존 STRICT 정책(미설정 즉시 예외 / sqlite 금지 / Postgres 스킴만 허용) 유지
+- 2026-03-09
+  1) FIX(STRICT): DB_URL을 정규화된 Postgres URL로 단일화
+  2) FIX(CONTRACT): get_session 세션/커밋 계약을 명확화
+  3) CLEANUP: 원시 env 값과 정규화 URL 혼용 제거
+  4) CLEANUP: 변경 이력 최근 2일 기준 정리
 
-- 2026-03-03 (PATCH)
-  1) python-dotenv 의존성 제거(외부 의존성/배포 리스크 제거)
-  2) 내장 .env 로더 추가(옵션):
-     - .env 파일이 존재할 때만 TRADER_DB_URL을 읽는다.
-     - 이미 환경변수에 TRADER_DB_URL이 있으면 덮어쓰지 않는다(override 금지).
-  3) STRICT 정책 유지:
-     - TRADER_DB_URL 미설정 시 즉시 예외
-     - sqlite 금지
-     - Postgres 스킴만 허용(postgres:// 는 postgresql:// 로 정규화)
-
-- 2026-03-06 (TRADE-GRADE)
-  1) SQLAlchemy connection pool 명시화:
-     - pool_size=5
-     - max_overflow=5
-     - pool_timeout=30
-     - pool_recycle=1800
-     - pool_pre_ping=True
-  2) 운영 안정성 강화:
-     - DB 연결 재사용을 통해 불필요한 connect/disconnect 빈도 완화
-     - 죽은 연결 감지 및 재생성 안정화
+- 2026-03-08
+  1) SQLAlchemy pool 설정 명시화
+  2) .env 옵션 로딩 / Postgres 스킴 정규화 / sqlite 금지 유지
 ========================================================
 """
 
@@ -48,7 +45,13 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+_POOL_SIZE = 5
+_MAX_OVERFLOW = 5
+_POOL_TIMEOUT_SEC = 30
+_POOL_RECYCLE_SEC = 1800
 
 
 def _load_dotenv_trader_db_url_if_needed() -> None:
@@ -56,8 +59,8 @@ def _load_dotenv_trader_db_url_if_needed() -> None:
 
     STRICT:
     - 이미 환경변수에 TRADER_DB_URL이 있으면 덮어쓰지 않는다.
-    - .env가 없으면 아무것도 하지 않는다(폴백 아님, 단순 미사용).
-    - 파싱 실패/형식 오류는 즉시 예외(조용히 무시 금지).
+    - .env가 없으면 아무것도 하지 않는다.
+    - 파싱 실패/형식 오류는 즉시 예외로 올린다.
     """
     if os.getenv("TRADER_DB_URL"):
         return
@@ -74,7 +77,6 @@ def _load_dotenv_trader_db_url_if_needed() -> None:
         if not line or line.startswith("#"):
             continue
 
-        # allow "export KEY=VALUE"
         if line.startswith("export "):
             line = line[len("export ") :].strip()
 
@@ -88,64 +90,65 @@ def _load_dotenv_trader_db_url_if_needed() -> None:
         if not key:
             raise RuntimeError("Invalid .env line (empty key)")
 
-        # strip optional quotes
         if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
             value = value[1:-1]
 
         if key == "TRADER_DB_URL":
-            if not value.strip():
+            normalized = value.strip()
+            if not normalized:
                 raise RuntimeError("TRADER_DB_URL in .env is empty")
-            found = value.strip()
+            found = normalized
             break
 
     if found is not None:
         os.environ["TRADER_DB_URL"] = found
 
 
+def _require_normalized_postgres_db_url_or_raise() -> str:
+    raw = os.getenv("TRADER_DB_URL")
+    if raw is None or not str(raw).strip():
+        raise RuntimeError(
+            "TRADER_DB_URL 환경변수가 설정되어 있지 않습니다. "
+            "환경변수 또는 로컬 .env에 TRADER_DB_URL을 설정하세요."
+        )
+
+    url = str(raw).strip()
+    url_lower = url.lower()
+
+    if url_lower.startswith("sqlite:"):
+        raise RuntimeError("TRADER_DB_URL이 sqlite 로 설정되어 있습니다. Render Postgres만 허용합니다.")
+
+    if url_lower.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+        url_lower = url.lower()
+
+    allowed_prefixes = (
+        "postgresql://",
+        "postgresql+psycopg2://",
+        "postgresql+psycopg://",
+    )
+    if not url_lower.startswith(allowed_prefixes):
+        raise RuntimeError(
+            "TRADER_DB_URL이 Postgres URL 형식이 아닙니다. "
+            "허용 스킴: postgresql://, postgresql+psycopg2://, postgresql+psycopg:// "
+            "(postgres:// 는 postgresql:// 로 자동 정규화)"
+        )
+
+    return url
+
+
 # Optional local .env support (no external dependency)
 _load_dotenv_trader_db_url_if_needed()
 
-DB_URL = os.getenv("TRADER_DB_URL")
+# 공개 상수는 항상 정규화된 URL만 노출한다.
+DB_URL: str = _require_normalized_postgres_db_url_or_raise()
 
-if not DB_URL or not str(DB_URL).strip():
-    raise RuntimeError(
-        "TRADER_DB_URL 환경변수가 설정되어 있지 않습니다. "
-        "환경변수 또는 로컬 .env에 TRADER_DB_URL을 설정하세요."
-    )
-
-_url = str(DB_URL).strip()
-_url_l = _url.lower()
-
-# sqlite 등 금지
-if _url_l.startswith("sqlite:"):
-    raise RuntimeError("TRADER_DB_URL이 sqlite 로 설정되어 있습니다. Render Postgres만 허용합니다.")
-
-# SQLAlchemy 호환: postgres:// → postgresql:// 정규화 (폴백 아님, alias 정리)
-if _url_l.startswith("postgres://"):
-    _url = "postgresql://" + _url[len("postgres://") :]
-    _url_l = _url.lower()
-
-_ALLOWED_PREFIXES = (
-    "postgresql://",
-    "postgresql+psycopg2://",
-    "postgresql+psycopg://",
-)
-
-if not _url_l.startswith(_ALLOWED_PREFIXES):
-    raise RuntimeError(
-        "TRADER_DB_URL이 Postgres URL 형식이 아닙니다. "
-        "허용 스킴: postgresql://, postgresql+psycopg2://, postgresql+psycopg:// "
-        "(postgres:// 는 postgresql:// 로 자동 정규화)"
-    )
-
-# SQLAlchemy Engine / Session (스키마 변경은 여기서 하지 않는다)
-# TRADE-GRADE: Render/AWS 운영 안정성을 위해 pool 설정을 명시한다.
-engine = create_engine(
-    _url,
-    pool_size=5,
-    max_overflow=5,
-    pool_timeout=30,
-    pool_recycle=1800,
+engine: Engine = create_engine(
+    DB_URL,
+    pool_size=_POOL_SIZE,
+    max_overflow=_MAX_OVERFLOW,
+    pool_timeout=_POOL_TIMEOUT_SEC,
+    pool_recycle=_POOL_RECYCLE_SEC,
     pool_pre_ping=True,
     future=True,
 )
@@ -165,10 +168,14 @@ def get_session() -> Iterator[Session]:
     """DB 세션 컨텍스트 헬퍼.
 
     STRICT:
-    - 예외 발생 시 rollback 후 예외를 다시 올린다.
     - 정상 종료 시 commit 한다.
+    - 예외 발생 시 rollback 후 예외를 다시 전파한다.
+    - 세션은 항상 close 한다.
     """
-    session: Session = SessionLocal()
+    session = SessionLocal()
+    if not isinstance(session, Session):
+        raise RuntimeError("SessionLocal() must return sqlalchemy.orm.Session (STRICT)")
+
     try:
         yield session
         session.commit()

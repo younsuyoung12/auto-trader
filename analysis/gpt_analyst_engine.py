@@ -5,6 +5,18 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- OpenAI 요청 payload 계약 검증 강화
+- market-only / full-analysis 입력 계약 분리
+- OpenAI 응답의 scope / used_inputs / raw text 무결성 검증 강화
+- 실제 미사용 temperature 설정 의존 제거
+
+코드 정리 내용
+- 미사용 temperature 설정/검증 제거
+- payload 계약 검증 로직 분리
+- 응답 무결성 검증 함수 보강
+- 최근 변경 이력 2일 기준으로 정리
+
 역할:
 - AI Quant Analyst / AI Market Analyst용 OpenAI 호출 전용 엔진.
 - 내부 DB 분석 결과와 외부 시장 분석 결과를 받아
@@ -21,43 +33,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 응답은 반드시 JSON object 1개여야 한다
 
 변경 이력:
-2026-03-07
-- 신규 생성
-- Responses API 기반 GPT 분석 엔진 추가
+2026-03-09
+1) FIX(STRICT): market-only / full-analysis payload 계약 검증 강화
+2) FIX(INTEGRITY): OpenAI 응답 raw text / scope / used_inputs 무결성 검증 강화
+3) CLEANUP: 미사용 ANALYST_OPENAI_TEMPERATURE 의존 제거
+4) CLEANUP: payload / response validation 로직 정리
 
-2026-03-07 (PATCH)
-1) market-only 전용 analyze_market_only() 추가
-2) analyze_external_market_only() 별칭 추가
-3) OpenAI 호출부를 _request_analysis_or_raise()로 분리
-4) external_market_summary만으로도 payload 생성 가능하도록 전용 payload builder 추가
-5) out_of_scope 에서는 used_inputs 빈 리스트 허용으로 strict 파서 보강
-
-2026-03-08 (PATCH)
-1) OpenAI input 직렬화 전 Decimal/중첩 payload를 JSON-safe 구조로 강제 변환
-2) payload 내 지원하지 않는 타입 발견 시 즉시 예외 처리
-3) market-only / full 분석 경로 모두 동일 직렬화 규칙 적용
-4) Responses API 요청에서 temperature 파라미터 제거
-5) OpenAI timeout / bad request / generic 실패를 분리해 원인 명확화
-6) Structured Outputs(JSON Schema) 강제 적용
-7) SDK 응답 구조 차이에 대비한 model_dump()/to_dict() 기반 재귀 텍스트 추출 추가
-
-2026-03-08 (PATCH 2)
-1) Responses API status / incomplete / refusal 를 선검증하도록 강화
-2) response.output 전체 재귀 문자열 수집 대신 output.message.content.output_text 우선의 strict 추출로 교체
-3) SDK가 구조화 객체를 직접 노출하는 경우 parsed dict를 우선 사용하도록 보강
-4) JSON 파싱 실패 시 에러 위치/주변 스니펫을 로그에 남겨 원인 추적 강화
-5) 잘린 응답(max_output_tokens 등)과 일반 invalid JSON을 구분해 fail-fast 진단 강화
-
-2026-03-08 (PATCH 3)
-1) 출력 길이 제한 지침(answer/root_causes/recommendations)을 system instructions에 명시해 max_output_tokens 초과 위험 축소
-2) 요청 직전 payload 요약(question 길이 / payload 문자 수 / 섹션별 key 수 / token budget) 진단 로그 추가
-3) incomplete(max_output_tokens) 발생 시 response usage / request summary 를 함께 로그 및 예외에 포함하도록 강화
-4) completed 응답도 usage / output_text 길이 진단 로그를 남기도록 보강
-
-2026-03-08 (PATCH 4)
-1) used_inputs 는 실제 payload에 존재하는 섹션만 허용하도록 system instructions 강화
-2) 요청마다 존재/부재 섹션 정보를 runtime instructions 로 주입하도록 보강
-3) GPT 결과의 used_inputs 가 실제 payload와 불일치하면 엔진 단계에서 즉시 예외 발생하도록 strict 검증 추가
+2026-03-08
+1) Structured Outputs(JSON Schema) 강제 적용
+2) Responses API status / incomplete / refusal 선검증 강화
+3) output.message.content.output_text 우선 strict 추출 적용
+4) used_inputs 와 실제 payload 섹션 불일치 strict 검증 추가
 ========================================================
 """
 
@@ -158,15 +144,12 @@ class GptAnalystEngine:
         self._model = self._require_str_setting("ANALYST_OPENAI_MODEL")
         self._timeout_sec = self._require_float_setting("ANALYST_OPENAI_TIMEOUT_SEC")
         self._max_output_tokens = self._require_int_setting("ANALYST_OPENAI_MAX_OUTPUT_TOKENS")
-        self._temperature = self._require_float_setting("ANALYST_OPENAI_TEMPERATURE")
         self._reasoning_effort = self._optional_str_setting("ANALYST_OPENAI_REASONING_EFFORT")
 
         if self._timeout_sec <= 0.0:
             raise RuntimeError("ANALYST_OPENAI_TIMEOUT_SEC must be > 0")
         if self._max_output_tokens <= 0:
             raise RuntimeError("ANALYST_OPENAI_MAX_OUTPUT_TOKENS must be > 0")
-        if not math.isfinite(self._temperature) or self._temperature < 0.0 or self._temperature > 2.0:
-            raise RuntimeError("ANALYST_OPENAI_TEMPERATURE must be within [0,2]")
 
         self._client = self._make_client()
 
@@ -225,19 +208,14 @@ class GptAnalystEngine:
         trade_summary: Mapping[str, Any],
         external_market_summary: Optional[Mapping[str, Any]],
     ) -> Dict[str, Any]:
-        if not isinstance(question, str) or not question.strip():
-            raise RuntimeError("question must be a non-empty string")
-        if not isinstance(internal_market_summary, Mapping) or not internal_market_summary:
-            raise RuntimeError("internal_market_summary must be a non-empty mapping")
-        if not isinstance(trade_summary, Mapping) or not trade_summary:
-            raise RuntimeError("trade_summary must be a non-empty mapping")
-        if external_market_summary is not None and (
-            not isinstance(external_market_summary, Mapping) or not external_market_summary
-        ):
-            raise RuntimeError("external_market_summary must be a non-empty mapping when provided")
+        normalized_question = self._require_nonempty_str(question, "question")
+        self._require_non_empty_mapping(internal_market_summary, "internal_market_summary")
+        self._require_non_empty_mapping(trade_summary, "trade_summary")
+        if external_market_summary is not None:
+            self._require_non_empty_mapping(external_market_summary, "external_market_summary")
 
         payload: Dict[str, Any] = {
-            "question": question.strip(),
+            "question": normalized_question,
             "internal_market_summary": dict(internal_market_summary),
             "trade_summary": dict(trade_summary),
         }
@@ -245,6 +223,11 @@ class GptAnalystEngine:
         if external_market_summary is not None:
             payload["external_market_summary"] = dict(external_market_summary)
 
+        self._validate_payload_contract_or_raise(
+            payload,
+            expected_sections={"internal_market_summary", "trade_summary"},
+            allow_optional_external=True,
+        )
         return payload
 
     def _build_market_only_payload(
@@ -253,15 +236,57 @@ class GptAnalystEngine:
         question: str,
         external_market_summary: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        if not isinstance(question, str) or not question.strip():
-            raise RuntimeError("question must be a non-empty string")
-        if not isinstance(external_market_summary, Mapping) or not external_market_summary:
-            raise RuntimeError("external_market_summary must be a non-empty mapping")
+        normalized_question = self._require_nonempty_str(question, "question")
+        self._require_non_empty_mapping(external_market_summary, "external_market_summary")
 
-        return {
-            "question": question.strip(),
+        payload = {
+            "question": normalized_question,
             "external_market_summary": dict(external_market_summary),
         }
+
+        self._validate_payload_contract_or_raise(
+            payload,
+            expected_sections={"external_market_summary"},
+            allow_optional_external=False,
+        )
+        return payload
+
+    def _validate_payload_contract_or_raise(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        expected_sections: set[str],
+        allow_optional_external: bool,
+    ) -> None:
+        if not isinstance(payload, Mapping) or not payload:
+            raise RuntimeError("payload must be a non-empty mapping")
+
+        question = payload.get("question")
+        self._require_nonempty_str(question, "payload.question")
+
+        available_sections = set(self._extract_available_input_sections(payload))
+        if not allow_optional_external:
+            if available_sections != expected_sections:
+                raise RuntimeError(
+                    f"payload sections mismatch: expected={sorted(expected_sections)} actual={sorted(available_sections)}"
+                )
+            return
+
+        required_sections = set(expected_sections)
+        if not required_sections.issubset(available_sections):
+            raise RuntimeError(
+                f"payload missing required sections: required={sorted(required_sections)} actual={sorted(available_sections)}"
+            )
+
+        unexpected_sections = available_sections - {
+            "internal_market_summary",
+            "trade_summary",
+            "external_market_summary",
+        }
+        if unexpected_sections:
+            raise RuntimeError(
+                f"payload contains unexpected analysis sections: {sorted(unexpected_sections)}"
+            )
 
     # ========================================================
     # OpenAI client / response handling
@@ -286,6 +311,8 @@ class GptAnalystEngine:
             raise RuntimeError("payload must be a non-empty mapping")
 
         json_safe_payload = self._json_safe_or_raise(payload, field_name="payload")
+        self._validate_json_safe_payload_or_raise(json_safe_payload)
+
         input_text = json.dumps(json_safe_payload, ensure_ascii=False, separators=(",", ":"))
         request_summary = self._build_request_summary(json_safe_payload, input_text)
         runtime_instructions = self._build_runtime_instructions(json_safe_payload)
@@ -461,7 +488,13 @@ class GptAnalystEngine:
                 f"invalid={sorted(invalid_claims)}, available={sorted(available_inputs)}"
             )
 
-        if len(available_inputs) == 1 and result.scope != "out_of_scope":
+        if result.scope == "out_of_scope":
+            if result.used_inputs:
+                if not set(result.used_inputs).issubset(available_inputs):
+                    raise RuntimeError("out_of_scope used_inputs must be empty or valid subset of available inputs")
+            return
+
+        if len(available_inputs) == 1:
             only_available = next(iter(available_inputs))
             if result.used_inputs != [only_available]:
                 raise RuntimeError(
@@ -964,7 +997,7 @@ class GptAnalystEngine:
             if not used_inputs:
                 raise RuntimeError("Non-out_of_scope response must include at least one used input")
 
-        return GptAnalystResult(
+        result = GptAnalystResult(
             scope=scope,
             answer_ko=answer_ko,
             root_causes=root_causes,
@@ -973,6 +1006,21 @@ class GptAnalystEngine:
             used_inputs=used_inputs,
             raw_response_text=raw_text,
         )
+        self._validate_result_integrity_or_raise(result)
+        return result
+
+    def _validate_result_integrity_or_raise(self, result: GptAnalystResult) -> None:
+        if result.scope not in _ALLOWED_SCOPE:
+            raise RuntimeError(f"Unexpected result.scope: {result.scope}")
+        if not isinstance(result.raw_response_text, str) or not result.raw_response_text.strip():
+            raise RuntimeError("raw_response_text must be a non-empty string")
+        if result.scope == "out_of_scope":
+            if result.answer_ko != _OUT_OF_SCOPE_MESSAGE:
+                raise RuntimeError("out_of_scope answer_ko mismatch")
+            if result.root_causes:
+                raise RuntimeError("out_of_scope root_causes must be empty")
+            if result.recommendations:
+                raise RuntimeError("out_of_scope recommendations must be empty")
 
     def _extract_single_json_object(self, raw_text: str) -> str:
         text = raw_text.strip()
@@ -1081,6 +1129,14 @@ class GptAnalystEngine:
             f"Unsupported payload type for JSON serialization in {field_name}: {value.__class__.__name__}"
         )
 
+    def _validate_json_safe_payload_or_raise(self, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping) or not payload:
+            raise RuntimeError("json_safe payload must be a non-empty mapping")
+        self._require_nonempty_str(payload.get("question"), "payload.question")
+        available_sections = self._extract_available_input_sections(payload)
+        if not available_sections:
+            raise RuntimeError("json_safe payload must include at least one analysis section")
+
     # ========================================================
     # Field validators
     # ========================================================
@@ -1094,6 +1150,10 @@ class GptAnalystEngine:
         if not isinstance(value, str) or not value.strip():
             raise RuntimeError(f"{field_name} must be a non-empty string")
         return value.strip()
+
+    def _require_non_empty_mapping(self, value: Any, field_name: str) -> None:
+        if not isinstance(value, Mapping) or not value:
+            raise RuntimeError(f"{field_name} must be a non-empty mapping")
 
     def _require_string_list(self, value: Any, field_name: str) -> List[str]:
         if not isinstance(value, list):

@@ -5,6 +5,18 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- Deribit 옵션시장 snapshot을 프로세스 메모리 캐시 + Postgres 영속 캐시로 이중 관리
+- 서버 재시작 후에도 DB의 fresh snapshot을 재사용하도록 구조 변경
+- stale DB/메모리 캐시 재사용 금지, TTL 만료 후 fetch 실패 시 즉시 예외 전파 유지
+- request timeout을 상수 고정값이 아니라 settings(SSOT) 기반으로 정합화
+
+코드 정리 내용
+- snapshot 생성/직렬화/역직렬화 로직 분리
+- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합
+- 미사용 고정 timeout 상수 제거
+- 중복 조립 로직 정리
+
 역할:
 - Deribit 공개 옵션 시장 데이터를 수집/정규화해 Options Market Snapshot 을 생성한다.
 - Put/Call OI 비율, Put/Call 거래량 비율, ATM 옵션 OI 구조를 계산한다.
@@ -42,27 +54,41 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   - dashboard_payload
 
 변경 이력:
+2026-03-09
+1) FIX(ROOT-CAUSE): 옵션시장 snapshot DB 영속 캐시 추가
+2) FIX(STRICT): DB의 fresh snapshot만 사용, stale snapshot 재사용 금지
+3) FIX(STRUCTURE): options snapshot table 생성/저장/조회 책임을 fetcher 내부로 통합
+4) FIX(SSOT): request timeout 상수 제거, ANALYST_HTTP_TIMEOUT_SEC 사용으로 정합화
+
 2026-03-08
-- 신규 생성
-- Deribit 공개 옵션시장 Feature Engine 추가
-- Put/Call OI 비율, 거래량 비율, ATM 옵션 OI 구조 계산 추가
-- market_researcher / quant_analyst / entry_pipeline 연동용 구조 확정
+1) Deribit 공개 옵션시장 Feature Engine 추가
+2) Put/Call OI 비율, 거래량 비율, ATM 옵션 OI 구조 계산 추가
+3) market_researcher / quant_analyst / entry_pipeline 연동용 구조 확정
 ========================================================
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
+from sqlalchemy import text
 
 from settings import SETTINGS
+from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
+
+_OPTIONS_CACHE_TTL_SEC = 1800
+_OPTIONS_SNAPSHOT_TABLE = "analyst_options_market_snapshots"
+_OPTIONS_SNAPSHOT_SOURCE_KEY = "deribit_options_market_v1"
 
 
 @dataclass(frozen=True)
@@ -116,10 +142,14 @@ class OptionsMarketSnapshot:
 class OptionsMarketFetcher:
     """
     Deribit 공개 옵션시장 데이터 수집기.
+
+    설계:
+    - fetch()는 메모리 캐시 → DB 영속 캐시 → 외부 API 순으로만 조회한다.
+    - DB 영속 캐시는 주 소스이며, TTL 안의 fresh snapshot만 허용한다.
+    - stale snapshot 재사용은 금지한다.
     """
 
     _BASE_URL = "https://www.deribit.com/api/v2"
-    _REQUEST_TIMEOUT_SEC = 10
     _SUPPORTED_QUOTE_SUFFIXES: Tuple[str, ...] = ("USDT", "USDC", "BUSD", "USD")
     _INSTRUMENT_PATTERN = re.compile(
         r"^(?P<currency>[A-Z]+)-(?P<expiry>\d{1,2}[A-Z]{3}\d{2})-(?P<strike>\d+(?:\.\d+)*)-(?P<side>[CP])$"
@@ -127,53 +157,129 @@ class OptionsMarketFetcher:
 
     def __init__(self) -> None:
         self._symbol = self._require_str_setting("ANALYST_MARKET_SYMBOL")
+        self._timeout_sec = self._require_float_setting("ANALYST_HTTP_TIMEOUT_SEC")
         self._currency = self._derive_base_currency_from_symbol_or_raise(self._symbol)
         self._index_name = self._derive_index_name_or_raise(self._currency)
+        self._cache_ttl_sec = _OPTIONS_CACHE_TTL_SEC
+
         self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "auto-trader/options-market-fetcher"})
+
+        self._state_lock = threading.RLock()
+        self._cached_snapshot: OptionsMarketSnapshot | None = None
+        self._cached_snapshot_fetched_monotonic: float | None = None
+        self._db_schema_ready = False
+
+        logger.info(
+            "OptionsMarketFetcher initialized: symbol=%s currency=%s index_name=%s cache_ttl_sec=%d source_key=%s",
+            self._symbol,
+            self._currency,
+            self._index_name,
+            self._cache_ttl_sec,
+            _OPTIONS_SNAPSHOT_SOURCE_KEY,
+        )
 
     # ========================================================
     # Public API
     # ========================================================
 
     def fetch(self) -> OptionsMarketSnapshot:
-        as_of_ms = self._now_ms()
+        with self._state_lock:
+            cached = self._get_fresh_cached_snapshot_locked()
+            if cached is not None:
+                age_sec = self._get_cached_snapshot_age_sec_locked()
+                if age_sec is None:
+                    raise RuntimeError("Cached options snapshot age missing")
+                logger.info(
+                    "Options snapshot served from memory cache: symbol=%s age_sec=%.2f ttl_sec=%d",
+                    self._symbol,
+                    age_sec,
+                    self._cache_ttl_sec,
+                )
+                return cached
 
-        summaries_payload = self._request_result_or_raise(
-            path="/public/get_book_summary_by_currency",
-            params={
-                "currency": self._currency,
-                "kind": "option",
-            },
-        )
-        if not isinstance(summaries_payload, list):
-            raise RuntimeError("Deribit option summaries result must be a list")
-        if len(summaries_payload) == 0:
-            raise RuntimeError(f"Deribit option summaries returned empty list: currency={self._currency}")
+            persisted = self._load_fresh_db_snapshot_locked()
+            if persisted is not None:
+                self._set_memory_cache_locked(persisted)
+                logger.info(
+                    "Options snapshot served from DB cache: symbol=%s ttl_sec=%d as_of_ms=%d",
+                    self._symbol,
+                    self._cache_ttl_sec,
+                    persisted.as_of_ms,
+                )
+                return persisted
 
-        index_payload = self._request_result_or_raise(
-            path="/public/get_index_price",
-            params={
-                "index_name": self._index_name,
-            },
-        )
-        if not isinstance(index_payload, Mapping):
-            raise RuntimeError("Deribit index price result must be an object")
+            as_of_ms = self._now_ms()
 
-        index_price = self._require_decimal_from_mapping(
-            index_payload,
-            "index_price",
-            "deribit.index_price",
-        )
-        if index_price <= Decimal("0"):
-            raise RuntimeError("Deribit index_price must be > 0")
+            summaries_payload = self._request_result_or_raise(
+                path="/public/get_book_summary_by_currency",
+                params={
+                    "currency": self._currency,
+                    "kind": "option",
+                },
+            )
+            if not isinstance(summaries_payload, list):
+                raise RuntimeError("Deribit option summaries result must be a list")
+            if len(summaries_payload) == 0:
+                raise RuntimeError(f"Deribit option summaries returned empty list: currency={self._currency}")
 
-        parsed_options = [
-            self._parse_option_summary_row(row=row, idx=idx)
-            for idx, row in enumerate(summaries_payload)
-        ]
-        if len(parsed_options) == 0:
-            raise RuntimeError("Parsed Deribit options list is empty")
+            index_payload = self._request_result_or_raise(
+                path="/public/get_index_price",
+                params={
+                    "index_name": self._index_name,
+                },
+            )
+            if not isinstance(index_payload, Mapping):
+                raise RuntimeError("Deribit index price result must be an object")
 
+            index_price = self._require_decimal_from_mapping(
+                index_payload,
+                "index_price",
+                "deribit.index_price",
+            )
+            if index_price <= Decimal("0"):
+                raise RuntimeError("Deribit index_price must be > 0")
+
+            parsed_options = [
+                self._parse_option_summary_row(row=row, idx=idx)
+                for idx, row in enumerate(summaries_payload)
+            ]
+            if len(parsed_options) == 0:
+                raise RuntimeError("Parsed Deribit options list is empty")
+
+            snapshot = self._build_snapshot_from_options(
+                as_of_ms=as_of_ms,
+                index_price=index_price,
+                parsed_options=parsed_options,
+            )
+
+            self._persist_snapshot_locked(snapshot=snapshot, fetched_at_ms=as_of_ms)
+            self._set_memory_cache_locked(snapshot)
+
+            logger.info(
+                "Options market fetched from Deribit and persisted: symbol=%s currency=%s option_count=%s pcr_oi=%s pcr_vol=%s options_bias=%s cache_ttl_sec=%d",
+                self._symbol,
+                self._currency,
+                snapshot.option_count,
+                self._fmt_decimal(snapshot.put_call_oi_ratio, 4),
+                self._fmt_decimal(snapshot.put_call_volume_ratio, 4),
+                snapshot.options_bias,
+                self._cache_ttl_sec,
+            )
+
+            return snapshot
+
+    # ========================================================
+    # Snapshot build / cache
+    # ========================================================
+
+    def _build_snapshot_from_options(
+        self,
+        *,
+        as_of_ms: int,
+        index_price: Decimal,
+        parsed_options: Sequence[DeribitOptionSummary],
+    ) -> OptionsMarketSnapshot:
         calls = [item for item in parsed_options if item.option_type == "call"]
         puts = [item for item in parsed_options if item.option_type == "put"]
 
@@ -270,16 +376,6 @@ class OptionsMarketFetcher:
             analyst_summary_ko=analyst_summary_ko,
         )
 
-        logger.info(
-            "Options market fetched: symbol=%s currency=%s option_count=%s pcr_oi=%s pcr_vol=%s options_bias=%s",
-            self._symbol,
-            self._currency,
-            len(parsed_options),
-            self._fmt_decimal(put_call_oi_ratio, 4),
-            self._fmt_decimal(put_call_volume_ratio, 4),
-            options_bias,
-        )
-
         return OptionsMarketSnapshot(
             symbol=self._symbol,
             currency=self._currency,
@@ -312,6 +408,337 @@ class OptionsMarketFetcher:
             dashboard_payload=dashboard_payload,
         )
 
+    def _get_fresh_cached_snapshot_locked(self) -> OptionsMarketSnapshot | None:
+        if self._cached_snapshot is None:
+            return None
+        if self._cached_snapshot_fetched_monotonic is None:
+            raise RuntimeError("Cached options snapshot timestamp missing")
+
+        age_sec = time.monotonic() - self._cached_snapshot_fetched_monotonic
+        if age_sec < 0:
+            raise RuntimeError("Cached options snapshot age must not be negative")
+        if age_sec >= self._cache_ttl_sec:
+            logger.info(
+                "Options memory cache expired: symbol=%s age_sec=%.2f ttl_sec=%d",
+                self._symbol,
+                age_sec,
+                self._cache_ttl_sec,
+            )
+            return None
+        return self._cached_snapshot
+
+    def _get_cached_snapshot_age_sec_locked(self) -> float | None:
+        if self._cached_snapshot_fetched_monotonic is None:
+            return None
+        age_sec = time.monotonic() - self._cached_snapshot_fetched_monotonic
+        if age_sec < 0:
+            raise RuntimeError("Cached options snapshot age must not be negative")
+        return age_sec
+
+    def _set_memory_cache_locked(self, snapshot: OptionsMarketSnapshot) -> None:
+        self._cached_snapshot = snapshot
+        self._cached_snapshot_fetched_monotonic = time.monotonic()
+
+    def _load_fresh_db_snapshot_locked(self) -> OptionsMarketSnapshot | None:
+        self._ensure_db_schema_locked()
+
+        with get_session() as session:
+            row = session.execute(
+                text(
+                    f"""
+                    SELECT
+                        id,
+                        source_key,
+                        symbol,
+                        fetched_at_ms,
+                        snapshot_as_of_ms,
+                        cache_ttl_sec,
+                        snapshot_payload
+                    FROM {_OPTIONS_SNAPSHOT_TABLE}
+                    WHERE source_key = :source_key
+                      AND symbol = :symbol
+                    ORDER BY fetched_at_ms DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "source_key": _OPTIONS_SNAPSHOT_SOURCE_KEY,
+                    "symbol": self._symbol,
+                },
+            ).mappings().first()
+
+        if row is None:
+            logger.info("No persisted options snapshot found in DB: symbol=%s", self._symbol)
+            return None
+
+        snapshot = self._snapshot_from_db_row(row)
+        fetched_at_ms = self._require_int_from_any(row.get("fetched_at_ms"), "db.fetched_at_ms")
+        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
+        if age_sec >= self._cache_ttl_sec:
+            logger.info(
+                "Options DB cache expired: symbol=%s age_sec=%.2f ttl_sec=%d fetched_at_ms=%d",
+                self._symbol,
+                age_sec,
+                self._cache_ttl_sec,
+                fetched_at_ms,
+            )
+            return None
+
+        return snapshot
+
+    def _persist_snapshot_locked(self, *, snapshot: OptionsMarketSnapshot, fetched_at_ms: int) -> None:
+        self._ensure_db_schema_locked()
+
+        snapshot_payload = self._snapshot_to_storage_payload(snapshot)
+        snapshot_payload_json = json.dumps(snapshot_payload, ensure_ascii=False, separators=(",", ":"))
+
+        with get_session() as session:
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO {_OPTIONS_SNAPSHOT_TABLE} (
+                        source_key,
+                        symbol,
+                        fetched_at_ms,
+                        snapshot_as_of_ms,
+                        cache_ttl_sec,
+                        snapshot_payload
+                    ) VALUES (
+                        :source_key,
+                        :symbol,
+                        :fetched_at_ms,
+                        :snapshot_as_of_ms,
+                        :cache_ttl_sec,
+                        CAST(:snapshot_payload AS JSONB)
+                    )
+                    """
+                ),
+                {
+                    "source_key": _OPTIONS_SNAPSHOT_SOURCE_KEY,
+                    "symbol": snapshot.symbol,
+                    "fetched_at_ms": fetched_at_ms,
+                    "snapshot_as_of_ms": snapshot.as_of_ms,
+                    "cache_ttl_sec": self._cache_ttl_sec,
+                    "snapshot_payload": snapshot_payload_json,
+                },
+            )
+            session.commit()
+
+    def _ensure_db_schema_locked(self) -> None:
+        if self._db_schema_ready:
+            return
+
+        with get_session() as session:
+            session.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {_OPTIONS_SNAPSHOT_TABLE} (
+                        id BIGSERIAL PRIMARY KEY,
+                        source_key TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        fetched_at_ms BIGINT NOT NULL,
+                        snapshot_as_of_ms BIGINT NOT NULL,
+                        cache_ttl_sec INTEGER NOT NULL,
+                        snapshot_payload JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            session.execute(
+                text(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{_OPTIONS_SNAPSHOT_TABLE}_source_symbol_fetched
+                    ON {_OPTIONS_SNAPSHOT_TABLE} (source_key, symbol, fetched_at_ms DESC, id DESC)
+                    """
+                )
+            )
+            session.commit()
+
+        self._db_schema_ready = True
+        logger.info("Options DB schema ensured: table=%s", _OPTIONS_SNAPSHOT_TABLE)
+
+    def _snapshot_to_storage_payload(self, snapshot: OptionsMarketSnapshot) -> Dict[str, Any]:
+        return {
+            "symbol": snapshot.symbol,
+            "currency": snapshot.currency,
+            "as_of_ms": snapshot.as_of_ms,
+            "source": snapshot.source,
+            "index_name": snapshot.index_name,
+            "index_price": self._fmt_decimal(snapshot.index_price, 10),
+            "option_count": snapshot.option_count,
+            "call_count": snapshot.call_count,
+            "put_count": snapshot.put_count,
+            "total_call_open_interest": self._fmt_decimal(snapshot.total_call_open_interest, 10),
+            "total_put_open_interest": self._fmt_decimal(snapshot.total_put_open_interest, 10),
+            "total_open_interest": self._fmt_decimal(snapshot.total_open_interest, 10),
+            "put_call_oi_ratio": self._fmt_decimal(snapshot.put_call_oi_ratio, 10),
+            "total_call_volume_24h": self._fmt_decimal(snapshot.total_call_volume_24h, 10),
+            "total_put_volume_24h": self._fmt_decimal(snapshot.total_put_volume_24h, 10),
+            "total_volume_24h": self._fmt_decimal(snapshot.total_volume_24h, 10),
+            "put_call_volume_ratio": self._fmt_decimal(snapshot.put_call_volume_ratio, 10),
+            "atm_call_instrument": snapshot.atm_call_instrument,
+            "atm_put_instrument": snapshot.atm_put_instrument,
+            "atm_call_strike": self._fmt_decimal(snapshot.atm_call_strike, 10),
+            "atm_put_strike": self._fmt_decimal(snapshot.atm_put_strike, 10),
+            "atm_call_open_interest": self._fmt_decimal(snapshot.atm_call_open_interest, 10),
+            "atm_put_open_interest": self._fmt_decimal(snapshot.atm_put_open_interest, 10),
+            "atm_put_call_oi_ratio": self._fmt_decimal(snapshot.atm_put_call_oi_ratio, 10),
+            "oi_bias": snapshot.oi_bias,
+            "flow_bias": snapshot.flow_bias,
+            "options_bias": snapshot.options_bias,
+            "analyst_summary_ko": snapshot.analyst_summary_ko,
+            "dashboard_payload": snapshot.dashboard_payload,
+        }
+
+    def _snapshot_from_db_row(self, row: Mapping[str, Any]) -> OptionsMarketSnapshot:
+        source_key = self._require_nonempty_str_from_any(row.get("source_key"), "db.source_key")
+        if source_key != _OPTIONS_SNAPSHOT_SOURCE_KEY:
+            raise RuntimeError(
+                f"Persisted options snapshot source_key mismatch: expected={_OPTIONS_SNAPSHOT_SOURCE_KEY}, got={source_key}"
+            )
+
+        symbol = self._require_nonempty_str_from_any(row.get("symbol"), "db.symbol").upper()
+        if symbol != self._symbol:
+            raise RuntimeError(
+                f"Persisted options snapshot symbol mismatch: expected={self._symbol}, got={symbol}"
+            )
+
+        snapshot_as_of_ms = self._require_int_from_any(row.get("snapshot_as_of_ms"), "db.snapshot_as_of_ms")
+        if snapshot_as_of_ms <= 0:
+            raise RuntimeError("db.snapshot_as_of_ms must be positive")
+
+        cache_ttl_sec = self._require_int_from_any(row.get("cache_ttl_sec"), "db.cache_ttl_sec")
+        if cache_ttl_sec != self._cache_ttl_sec:
+            logger.info(
+                "Persisted options snapshot ttl differs from runtime ttl: persisted=%d runtime=%d",
+                cache_ttl_sec,
+                self._cache_ttl_sec,
+            )
+
+        payload = self._coerce_json_object(row.get("snapshot_payload"), "db.snapshot_payload")
+
+        payload_symbol = self._require_nonempty_str_from_any(payload.get("symbol"), "snapshot_payload.symbol").upper()
+        if payload_symbol != self._symbol:
+            raise RuntimeError(
+                f"Persisted options payload symbol mismatch: expected={self._symbol}, got={payload_symbol}"
+            )
+
+        payload_as_of_ms = self._require_int_from_any(payload.get("as_of_ms"), "snapshot_payload.as_of_ms")
+        if payload_as_of_ms != snapshot_as_of_ms:
+            raise RuntimeError(
+                f"Persisted options as_of_ms mismatch: row={snapshot_as_of_ms}, payload={payload_as_of_ms}"
+            )
+
+        dashboard_payload = payload.get("dashboard_payload")
+        if not isinstance(dashboard_payload, Mapping):
+            raise RuntimeError("snapshot_payload.dashboard_payload must be an object")
+
+        return OptionsMarketSnapshot(
+            symbol=self._symbol,
+            currency=self._require_nonempty_str_from_any(payload.get("currency"), "snapshot_payload.currency"),
+            as_of_ms=snapshot_as_of_ms,
+            source=self._require_nonempty_str_from_any(payload.get("source"), "snapshot_payload.source"),
+            index_name=self._require_nonempty_str_from_any(payload.get("index_name"), "snapshot_payload.index_name"),
+            index_price=self._to_decimal(payload.get("index_price"), "snapshot_payload.index_price"),
+            option_count=self._require_int_from_any(payload.get("option_count"), "snapshot_payload.option_count"),
+            call_count=self._require_int_from_any(payload.get("call_count"), "snapshot_payload.call_count"),
+            put_count=self._require_int_from_any(payload.get("put_count"), "snapshot_payload.put_count"),
+            total_call_open_interest=self._to_decimal(
+                payload.get("total_call_open_interest"),
+                "snapshot_payload.total_call_open_interest",
+            ),
+            total_put_open_interest=self._to_decimal(
+                payload.get("total_put_open_interest"),
+                "snapshot_payload.total_put_open_interest",
+            ),
+            total_open_interest=self._to_decimal(
+                payload.get("total_open_interest"),
+                "snapshot_payload.total_open_interest",
+            ),
+            put_call_oi_ratio=self._to_decimal(
+                payload.get("put_call_oi_ratio"),
+                "snapshot_payload.put_call_oi_ratio",
+            ),
+            total_call_volume_24h=self._to_decimal(
+                payload.get("total_call_volume_24h"),
+                "snapshot_payload.total_call_volume_24h",
+            ),
+            total_put_volume_24h=self._to_decimal(
+                payload.get("total_put_volume_24h"),
+                "snapshot_payload.total_put_volume_24h",
+            ),
+            total_volume_24h=self._to_decimal(
+                payload.get("total_volume_24h"),
+                "snapshot_payload.total_volume_24h",
+            ),
+            put_call_volume_ratio=self._to_decimal(
+                payload.get("put_call_volume_ratio"),
+                "snapshot_payload.put_call_volume_ratio",
+            ),
+            atm_call_instrument=self._require_nonempty_str_from_any(
+                payload.get("atm_call_instrument"),
+                "snapshot_payload.atm_call_instrument",
+            ),
+            atm_put_instrument=self._require_nonempty_str_from_any(
+                payload.get("atm_put_instrument"),
+                "snapshot_payload.atm_put_instrument",
+            ),
+            atm_call_strike=self._to_decimal(
+                payload.get("atm_call_strike"),
+                "snapshot_payload.atm_call_strike",
+            ),
+            atm_put_strike=self._to_decimal(
+                payload.get("atm_put_strike"),
+                "snapshot_payload.atm_put_strike",
+            ),
+            atm_call_open_interest=self._to_decimal(
+                payload.get("atm_call_open_interest"),
+                "snapshot_payload.atm_call_open_interest",
+            ),
+            atm_put_open_interest=self._to_decimal(
+                payload.get("atm_put_open_interest"),
+                "snapshot_payload.atm_put_open_interest",
+            ),
+            atm_put_call_oi_ratio=self._to_decimal(
+                payload.get("atm_put_call_oi_ratio"),
+                "snapshot_payload.atm_put_call_oi_ratio",
+            ),
+            oi_bias=self._require_nonempty_str_from_any(payload.get("oi_bias"), "snapshot_payload.oi_bias"),
+            flow_bias=self._require_nonempty_str_from_any(payload.get("flow_bias"), "snapshot_payload.flow_bias"),
+            options_bias=self._require_nonempty_str_from_any(
+                payload.get("options_bias"),
+                "snapshot_payload.options_bias",
+            ),
+            analyst_summary_ko=self._require_nonempty_str_from_any(
+                payload.get("analyst_summary_ko"),
+                "snapshot_payload.analyst_summary_ko",
+            ),
+            dashboard_payload=dict(dashboard_payload),
+        )
+
+    def _compute_age_sec_from_fetched_at_ms(self, fetched_at_ms: int) -> float:
+        now_ms = self._now_ms()
+        age_ms = now_ms - fetched_at_ms
+        if age_ms < 0:
+            raise RuntimeError(
+                f"Options snapshot fetched_at_ms is in the future: now_ms={now_ms}, fetched_at_ms={fetched_at_ms}"
+            )
+        return age_ms / 1000.0
+
+    def _coerce_json_object(self, value: Any, field_name: str) -> Dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"{field_name} must be valid JSON object text") from exc
+            if not isinstance(decoded, Mapping):
+                raise RuntimeError(f"{field_name} JSON root must be an object")
+            return dict(decoded)
+        raise RuntimeError(f"{field_name} must be mapping or JSON string")
+
     # ========================================================
     # HTTP / API
     # ========================================================
@@ -333,7 +760,7 @@ class OptionsMarketFetcher:
             response = self._session.get(
                 url,
                 params=dict(params),
-                timeout=self._REQUEST_TIMEOUT_SEC,
+                timeout=self._timeout_sec,
             )
         except requests.RequestException as exc:
             raise RuntimeError(f"Deribit request failed: path={path}") from exc
@@ -654,6 +1081,20 @@ class OptionsMarketFetcher:
             raise RuntimeError(f"Missing required decimal field: {field_name}")
         return self._to_decimal(row[key], field_name)
 
+    def _require_nonempty_str_from_any(self, value: Any, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"{field_name} must be a non-empty string")
+        return value.strip()
+
+    def _require_int_from_any(self, value: Any, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise RuntimeError(f"{field_name} must not be bool")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"{field_name} must be an integer") from exc
+        return parsed
+
     def _to_decimal(
         self,
         value: Any,
@@ -681,8 +1122,6 @@ class OptionsMarketFetcher:
         return f"{normalized:.{scale}f}"
 
     def _now_ms(self) -> int:
-        import time
-
         ts_ms = int(time.time() * 1000)
         if ts_ms <= 0:
             raise RuntimeError("current timestamp must be > 0")

@@ -5,6 +5,18 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- 외부 인텔리전스 source별 이중 메모리 캐시 제거
+- source fetcher 내부(DB 영속 캐시 + 메모리 캐시)를 단일 진실원으로 사용하도록 구조 변경
+- market_researcher 는 외부 source freshness를 직접 들고 있지 않고 fetcher 계약만 신뢰
+- Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
+
+코드 정리 내용
+- ExternalSnapshotState / _EXTERNAL_SOURCE_POLICY 제거
+- stale external snapshot fallback 경로 완전 제거
+- 외부 snapshot refresh 로그/상태 관리 중복 제거
+- source fetch 경로를 fetcher 단일 책임으로 정리
+
 역할:
 - Binance USDⓈ-M Futures 공개 시장 데이터를 해석해 외부 시장 분석 리포트를 생성한다.
 - 내부 DB 분석과 분리된 "외부 시장 분석(Market Research)" 레이어를 담당한다.
@@ -27,53 +39,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   명시적 상태값으로 노출하며, 존재하지 않는 데이터를 임의 생성하지 않는다.
 
 변경 이력:
-2026-03-07
-- 신규 생성
-- Binance 외부 시장 구조 분석기 추가
-- AWS 실행용 DB 적재 루프 추가
-- market_features / trade_context_snapshots 적재 기능 추가
-- ratio endpoint(symbol 누락 응답) 직접 파싱 경로 추가
+2026-03-09
+1) FIX(ROOT-CAUSE): 외부 인텔리전스 freshness/cache 책임을 source fetcher 내부로 단일화
+2) FIX(STRICT): market_researcher 내부 stale external snapshot 재사용 구조 완전 제거
+3) FIX(STRUCTURE): fetcher(DB 영속 캐시 + 메모리 캐시)만 외부 source 진실원으로 사용
+4) FIX(ROBUST): Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
 
-2026-03-08 (PATCH)
-1) derivatives/news/macro/sentiment/onchain fetcher 연동
-2) MarketResearchReport 에 외부 인텔리전스 섹션 5종 추가
-3) key_signals / analyst_summary_ko / dashboard_payload 에 외부 인텔리전스 요약 반영
-4) 기존 Binance 기반 핵심 지표/DB 적재 구조는 유지
-
-2026-03-08 (PATCH 2)
-1) force_orders 조회 실패 시 warning 후 빈 리스트로 진행하던 fallback 제거
-2) force_orders 는 STRICT 필수 데이터로 승격
-3) 공개 REST 정책/엔드포인트 불가 시 즉시 예외 전파
-
-2026-03-08 (PATCH 3)
-1) VolumeProfileEngine 연동 추가
-2) OrderFlowCvdEngine 연동 추가
-3) OptionsMarketFetcher 연동 추가
-4) MarketResearchReport 에 POC / Value Area / CVD / Options bias 핵심 필드 추가
-5) key_signals / analyst_summary_ko / dashboard_payload 에 volume profile / order flow / options 요약 반영
-6) 기존 Binance/파생/뉴스/거시/심리/온체인 구조는 삭제 없이 유지
-
-2026-03-08 (PATCH 4)
-1) FIX(TRADE-GRADE): force_orders "필수 데이터" 계약 재정의
-2) public REST unavailable_or_policy_conflict 는 즉시 크래시 대신
-   명시적 상태(force_orders_status / force_orders_reason)로 승격
-3) 실제 수집된 force_orders 리스트만 liquidation 계산에 사용
-4) force_orders 비가용 상태에서도 데이터 조작/추정 없이 외부 시장 분석 계속 수행
-
-2026-03-08 (PATCH 5)
-1) FIX(TRADE-GRADE): run_forever worker 생존성 강화
-2) sync_once 예외가 발생해도 worker thread가 종료되지 않도록 logger.exception 후 재시도
-3) 예외를 조용히 삼키지 않고 전체 traceback 로그를 남긴다
-4) retry sleep은 과도한 재시도를 막기 위해 5~300초 범위로 제한
-
-2026-03-08 (PATCH 6)
-1) FIX(ROOT-CAUSE): 저빈도 외부 인텔리전스(뉴스/거시/심리/온체인/옵션/파생) 재호출 구조를
-   source별 refresh/freshness 계약 기반 캐시 구조로 변경
-2) FIX(TRADE-GRADE): 최근 성공 스냅샷이 freshness 계약 안에 있을 때만 재사용
-   (임의 데이터 생성/조작 없음)
-3) FIX(RATE-LIMIT): Alpha Vantage daily quota 초과 시 다음 UTC 00:00까지
-   worker retry를 장주기 sleep으로 승격
-4) 기존 리포트/DB 적재/핵심 계산 구조 삭제 없음
+2026-03-08
+1) derivatives/news/macro/sentiment/onchain/options/volume-profile/orderflow 연동 확장
+2) force_orders 상태 계약 정리 및 worker retry/sleep 구조 강화
 ========================================================
 """
 
@@ -86,7 +60,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from statistics import pstdev
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from sqlalchemy import text
 
@@ -109,36 +83,6 @@ from settings import SETTINGS
 from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
-
-_EXTERNAL_SOURCE_POLICY: Dict[str, Dict[str, int]] = {
-    # 실시간성은 높지만 초단위는 불필요
-    "derivatives": {"refresh_sec": 300, "max_age_sec": 1800},
-    # 뉴스는 저빈도 소스. AlphaVantage 무료 quota(25/day) 정합
-    "news": {"refresh_sec": 3600, "max_age_sec": 86400},
-    # 거시 데이터는 더 저빈도
-    "macro": {"refresh_sec": 14400, "max_age_sec": 86400},
-    # 심리/온체인/옵션은 중저빈도
-    "sentiment": {"refresh_sec": 1800, "max_age_sec": 21600},
-    "onchain": {"refresh_sec": 1800, "max_age_sec": 21600},
-    "options": {"refresh_sec": 1800, "max_age_sec": 21600},
-}
-
-
-@dataclass(frozen=True)
-class ExternalSnapshotState:
-    name: str
-    refresh_sec: int
-    max_age_sec: int
-    snapshot: Any = None
-    last_success_ts: Optional[float] = None
-
-    def age_sec(self, now_ts: float) -> Optional[float]:
-        if self.last_success_ts is None:
-            return None
-        age = now_ts - self.last_success_ts
-        if age < 0:
-            raise RuntimeError(f"snapshot age became negative: source={self.name}")
-        return age
 
 
 @dataclass(frozen=True)
@@ -293,8 +237,6 @@ class MarketResearcher:
         self._last_force_orders_status: str = "unknown"
         self._last_force_orders_reason: Optional[str] = None
 
-        self._external_states: Dict[str, ExternalSnapshotState] = self._build_external_states_or_raise()
-
         if self._worker_interval_sec <= 0:
             raise RuntimeError("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC must be > 0")
         if self._kline_limit <= 0:
@@ -319,30 +261,12 @@ class MarketResearcher:
     def run(self) -> MarketResearchReport:
         snapshot = self._fetch_market_snapshot_strict()
 
-        derivatives_snapshot = self._get_external_snapshot_strict(
-            source_name="derivatives",
-            fetch_fn=self._derivatives_fetcher.fetch,
-        )
-        news_snapshot = self._get_external_snapshot_strict(
-            source_name="news",
-            fetch_fn=self._news_fetcher.fetch,
-        )
-        macro_snapshot = self._get_external_snapshot_strict(
-            source_name="macro",
-            fetch_fn=self._macro_fetcher.fetch,
-        )
-        sentiment_snapshot = self._get_external_snapshot_strict(
-            source_name="sentiment",
-            fetch_fn=self._sentiment_fetcher.fetch,
-        )
-        onchain_snapshot = self._get_external_snapshot_strict(
-            source_name="onchain",
-            fetch_fn=self._onchain_fetcher.fetch,
-        )
-        options_snapshot = self._get_external_snapshot_strict(
-            source_name="options",
-            fetch_fn=self._options_fetcher.fetch,
-        )
+        derivatives_snapshot = self._fetch_derivatives_snapshot_or_raise()
+        news_snapshot = self._fetch_news_snapshot_or_raise()
+        macro_snapshot = self._fetch_macro_snapshot_or_raise()
+        sentiment_snapshot = self._fetch_sentiment_snapshot_or_raise()
+        onchain_snapshot = self._fetch_onchain_snapshot_or_raise()
+        options_snapshot = self._fetch_options_snapshot_or_raise()
 
         volume_profile_report = self._build_volume_profile_report_or_raise(snapshot.klines)
         orderflow_report = self._build_orderflow_report_or_raise()
@@ -384,7 +308,6 @@ class MarketResearcher:
 
             market_features_inserted = self._upsert_market_feature(session, market_feature)
             trade_context_inserted = self._upsert_trade_context_snapshot(session, trade_context)
-            session.commit()
 
         result = ResearchSyncResult(
             symbol=market_feature.symbol,
@@ -439,78 +362,43 @@ class MarketResearcher:
                 time.sleep(sleep_sec)
 
     # ========================================================
-    # External intelligence freshness contract
+    # External source fetch wrappers
     # ========================================================
 
-    def _build_external_states_or_raise(self) -> Dict[str, ExternalSnapshotState]:
-        states: Dict[str, ExternalSnapshotState] = {}
-        for source_name, policy in _EXTERNAL_SOURCE_POLICY.items():
-            refresh_sec = int(policy.get("refresh_sec", 0))
-            max_age_sec = int(policy.get("max_age_sec", 0))
-            if refresh_sec <= 0:
-                raise RuntimeError(f"external source refresh_sec must be > 0: source={source_name}")
-            if max_age_sec < refresh_sec:
-                raise RuntimeError(
-                    f"external source max_age_sec must be >= refresh_sec: source={source_name}"
-                )
-            states[source_name] = ExternalSnapshotState(
-                name=source_name,
-                refresh_sec=refresh_sec,
-                max_age_sec=max_age_sec,
-            )
-        return states
+    def _fetch_derivatives_snapshot_or_raise(self) -> DerivativesMarketSnapshot:
+        snapshot = self._derivatives_fetcher.fetch()
+        if not isinstance(snapshot, DerivativesMarketSnapshot):
+            raise RuntimeError("derivatives fetcher must return DerivativesMarketSnapshot")
+        return snapshot
 
-    def _get_external_snapshot_strict(
-        self,
-        *,
-        source_name: str,
-        fetch_fn: Callable[[], Any],
-    ) -> Any:
-        if source_name not in self._external_states:
-            raise RuntimeError(f"unknown external source state: {source_name}")
+    def _fetch_news_snapshot_or_raise(self) -> CryptoNewsSnapshot:
+        snapshot = self._news_fetcher.fetch()
+        if not isinstance(snapshot, CryptoNewsSnapshot):
+            raise RuntimeError("news fetcher must return CryptoNewsSnapshot")
+        return snapshot
 
-        state = self._external_states[source_name]
-        now_ts = time.time()
-        age_sec = state.age_sec(now_ts)
+    def _fetch_macro_snapshot_or_raise(self) -> MacroMarketSnapshot:
+        snapshot = self._macro_fetcher.fetch()
+        if not isinstance(snapshot, MacroMarketSnapshot):
+            raise RuntimeError("macro fetcher must return MacroMarketSnapshot")
+        return snapshot
 
-        # refresh 주기 이전이면 기존 snapshot 재사용 (계약된 기본 동작)
-        if state.snapshot is not None and age_sec is not None and age_sec < float(state.refresh_sec):
-            logger.info(
-                "External intelligence snapshot reused within refresh window: source=%s age_sec=%.2f refresh_sec=%s",
-                source_name,
-                age_sec,
-                state.refresh_sec,
-            )
-            return state.snapshot
+    def _fetch_sentiment_snapshot_or_raise(self) -> SentimentSnapshot:
+        snapshot = self._sentiment_fetcher.fetch()
+        if not isinstance(snapshot, SentimentSnapshot):
+            raise RuntimeError("sentiment fetcher must return SentimentSnapshot")
+        return snapshot
 
-        try:
-            snapshot = fetch_fn()
-        except Exception as exc:
-            if state.snapshot is not None and age_sec is not None and age_sec <= float(state.max_age_sec):
-                logger.warning(
-                    "External intelligence refresh failed but cached snapshot remains within freshness contract: "
-                    "source=%s age_sec=%.2f max_age_sec=%s error=%s",
-                    source_name,
-                    age_sec,
-                    state.max_age_sec,
-                    exc,
-                )
-                return state.snapshot
-            raise
+    def _fetch_onchain_snapshot_or_raise(self) -> OnchainSnapshot:
+        snapshot = self._onchain_fetcher.fetch()
+        if not isinstance(snapshot, OnchainSnapshot):
+            raise RuntimeError("onchain fetcher must return OnchainSnapshot")
+        return snapshot
 
-        self._external_states[source_name] = ExternalSnapshotState(
-            name=state.name,
-            refresh_sec=state.refresh_sec,
-            max_age_sec=state.max_age_sec,
-            snapshot=snapshot,
-            last_success_ts=now_ts,
-        )
-        logger.info(
-            "External intelligence snapshot refreshed: source=%s refresh_sec=%s max_age_sec=%s",
-            source_name,
-            state.refresh_sec,
-            state.max_age_sec,
-        )
+    def _fetch_options_snapshot_or_raise(self) -> OptionsMarketSnapshot:
+        snapshot = self._options_fetcher.fetch()
+        if not isinstance(snapshot, OptionsMarketSnapshot):
+            raise RuntimeError("options fetcher must return OptionsMarketSnapshot")
         return snapshot
 
     def _determine_retry_sleep_sec(self, exc: Exception) -> int:
@@ -529,11 +417,22 @@ class MarketResearcher:
         return max(5, min(int(self._worker_interval_sec), 300))
 
     def _is_alpha_vantage_daily_quota_error(self, message: str) -> bool:
-        text_norm = str(message or "").lower()
-        return (
-            "alpha vantage" in text_norm
-            and "25 requests per day" in text_norm
+        text_norm = str(message or "").strip().lower()
+        if not text_norm:
+            return False
+
+        has_vendor_marker = ("alpha vantage" in text_norm) or ("alphavantage" in text_norm)
+        if not has_vendor_marker:
+            return False
+
+        quota_markers = (
+            "25 requests per day",
+            "free api requests more sparingly",
+            "please consider spreading out your free api requests more sparingly",
+            "alphavantage.co/premium",
+            "daily quota",
         )
+        return any(marker in text_norm for marker in quota_markers)
 
     def _seconds_until_next_utc_reset(self) -> int:
         now_utc = datetime.now(timezone.utc)

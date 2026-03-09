@@ -5,6 +5,16 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- Alpha Vantage 뉴스 snapshot을 프로세스 메모리 캐시 + Postgres 영속 캐시로 이중 관리
+- 서버 재시작 후에도 DB의 fresh 뉴스 snapshot을 재사용하도록 구조 변경
+- stale DB/메모리 캐시 재사용 금지, TTL 만료 후 fetch 실패 시 즉시 예외 전파 유지
+
+코드 정리 내용
+- 뉴스 snapshot 생성/직렬화/역직렬화 로직 분리
+- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합
+- 미사용/중복 조립 로직 정리
+
 역할:
 - Alpha Vantage NEWS_SENTIMENT 를 사용해 BTC 관련 최신 뉴스/감성 데이터를 수집한다.
 - 외부 시장 분석(Market Research) 레이어의 뉴스 데이터 소스 역할만 수행한다.
@@ -19,27 +29,23 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 뉴스/감성 데이터는 외부 공개/공식 API로만 수집한다
 
 변경 이력:
+2026-03-09
+1) FIX(ROOT-CAUSE): 프로세스 재시작 시 Alpha Vantage 뉴스 재호출로 quota가 누적되던 문제를 DB 영속 캐시로 수정
+2) FIX(STRICT): DB의 fresh 뉴스 snapshot만 사용, stale snapshot 재사용 금지
+3) FIX(STRUCTURE): news snapshot table 생성/저장/조회 책임을 fetcher 내부로 통합
+4) FIX(LOG): cache source(memory/db/api) 구분 로그 추가
+
 2026-03-08
-1) 신규 생성
-2) Alpha Vantage NEWS_SENTIMENT 기반 BTC 뉴스 fetcher 추가
-3) headline / overall sentiment / source / published time strict 파싱 추가
-
-2026-03-08 (PATCH 2)
-1) FIX(TRADE-GRADE): Alpha Vantage NEWS_SENTIMENT 요청 파라미터를 최소 유효 계약으로 축소
-2) tickers 를 "CRYPTO:{base_asset}" 단일 필터로 고정
-3) topics / FOREX:USD 결합 제거
-4) 기존 Invalid inputs 오류 제거 목적
-
-2026-03-08 (PATCH 3)
-1) FIX(ROOT-CAUSE): Alpha Vantage 무료 daily quota(25/day) 정합화용 뉴스 snapshot cache 추가
-2) FIX(CONCURRENCY): 동시 호출 시 중복 외부 요청 방지 lock 추가
-3) FIX(SECURITY): Alpha Vantage Information/Note 메시지 내 API key 노출 마스킹
-4) FIX(STRICT): cache 만료 후 fetch 실패 시 stale cache fallback 금지
+1) Alpha Vantage NEWS_SENTIMENT 기반 BTC 뉴스 fetcher 추가
+2) NEWS_SENTIMENT 요청 파라미터 최소 유효 계약으로 축소
+3) 무료 daily quota(25/day) 정합화용 프로세스 cache TTL 적용
+4) cache 만료 후 fetch 실패 시 stale cache fallback 금지
 ========================================================
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -49,8 +55,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Mapping, Optional
 
 import requests
+from sqlalchemy import text
 
 from settings import SETTINGS
+from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +69,9 @@ _SECONDS_PER_DAY = 86400
 _NEWS_LIMIT = 20
 _SENTIMENT_BULLISH_THRESHOLD = Decimal("0.15")
 _SENTIMENT_BEARISH_THRESHOLD = Decimal("-0.15")
+
+_NEWS_SNAPSHOT_TABLE = "analyst_crypto_news_snapshots"
+_NEWS_SNAPSHOT_SOURCE_KEY = "alphavantage_news_sentiment_crypto_v1"
 
 
 @dataclass(frozen=True)
@@ -113,12 +124,14 @@ class CryptoNewsFetcher:
         self._cached_snapshot: CryptoNewsSnapshot | None = None
         self._cached_snapshot_fetched_monotonic: float | None = None
         self._last_alpha_vantage_request_monotonic: float | None = None
+        self._db_schema_ready = False
 
         logger.info(
-            "CryptoNewsFetcher initialized: symbol=%s ticker_filter=%s cache_ttl_sec=%d",
+            "CryptoNewsFetcher initialized: symbol=%s ticker_filter=%s cache_ttl_sec=%d source_key=%s",
             self._symbol,
             self._ticker_filter,
             self._cache_ttl_sec,
+            _NEWS_SNAPSHOT_SOURCE_KEY,
         )
 
     @property
@@ -133,12 +146,23 @@ class CryptoNewsFetcher:
                 if age_sec is None:
                     raise RuntimeError("Cached crypto news snapshot age missing")
                 logger.info(
-                    "Crypto news snapshot served from cache: symbol=%s age_sec=%.2f ttl_sec=%d",
+                    "Crypto news snapshot served from memory cache: symbol=%s age_sec=%.2f ttl_sec=%d",
                     self._symbol,
                     age_sec,
                     self._cache_ttl_sec,
                 )
                 return cached
+
+            persisted = self._load_fresh_db_snapshot_locked()
+            if persisted is not None:
+                self._set_memory_cache_locked(persisted)
+                logger.info(
+                    "Crypto news snapshot served from DB cache: symbol=%s ttl_sec=%d as_of_ms=%d",
+                    self._symbol,
+                    self._cache_ttl_sec,
+                    persisted.as_of_ms,
+                )
+                return persisted
 
             payload = self._request_json_locked(
                 params=self._build_news_request_params_strict()
@@ -183,84 +207,25 @@ class CryptoNewsFetcher:
                 )
 
             news_items_sorted = sorted(news_items, key=lambda x: x.published_ts_ms, reverse=True)
-            as_of_ms = news_items_sorted[0].published_ts_ms
-
-            bullish_count = 0
-            bearish_count = 0
-            neutral_count = 0
-            score_sum = Decimal("0")
-
-            for item in news_items_sorted:
-                score_sum += item.overall_sentiment_score
-                if item.overall_sentiment_score >= _SENTIMENT_BULLISH_THRESHOLD:
-                    bullish_count += 1
-                elif item.overall_sentiment_score <= _SENTIMENT_BEARISH_THRESHOLD:
-                    bearish_count += 1
-                else:
-                    neutral_count += 1
-
-            average_sentiment_score = score_sum / Decimal(len(news_items_sorted))
-            sentiment_bias = self._classify_sentiment_bias(
-                average_score=average_sentiment_score,
-                bullish_count=bullish_count,
-                bearish_count=bearish_count,
-            )
-            key_signals = self._build_key_signals(
-                sentiment_bias=sentiment_bias,
-                bullish_count=bullish_count,
-                bearish_count=bearish_count,
-                average_sentiment_score=average_sentiment_score,
+            fetched_at_ms = self._now_ms()
+            snapshot = self._build_snapshot_from_news_items(
+                news_items_sorted=news_items_sorted,
+                fetched_at_ms=fetched_at_ms,
             )
 
-            dashboard_payload = {
-                "symbol": self._symbol,
-                "as_of_ms": as_of_ms,
-                "ticker_filter": self._ticker_filter,
-                "average_sentiment_score": self._fmt_decimal(average_sentiment_score, 6),
-                "bullish_count": bullish_count,
-                "bearish_count": bearish_count,
-                "neutral_count": neutral_count,
-                "sentiment_bias": sentiment_bias,
-                "latest_news": [
-                    {
-                        "title": item.title,
-                        "source": item.source,
-                        "published_at_utc": item.published_at_utc,
-                        "url": item.url,
-                        "overall_sentiment_score": self._fmt_decimal(item.overall_sentiment_score, 6),
-                        "overall_sentiment_label": item.overall_sentiment_label,
-                    }
-                    for item in news_items_sorted[:8]
-                ],
-                "key_signals": list(key_signals),
-            }
-
-            result = CryptoNewsSnapshot(
-                symbol=self._symbol,
-                as_of_ms=as_of_ms,
-                average_sentiment_score=average_sentiment_score,
-                bullish_count=bullish_count,
-                bearish_count=bearish_count,
-                neutral_count=neutral_count,
-                sentiment_bias=sentiment_bias,
-                latest_news=news_items_sorted[:8],
-                key_signals=key_signals,
-                dashboard_payload=dashboard_payload,
-            )
-
-            self._cached_snapshot = result
-            self._cached_snapshot_fetched_monotonic = time.monotonic()
+            self._persist_snapshot_locked(snapshot=snapshot, fetched_at_ms=fetched_at_ms)
+            self._set_memory_cache_locked(snapshot)
 
             logger.info(
-                "Crypto news snapshot fetched: symbol=%s ticker_filter=%s bias=%s avg_score=%s news_count=%s cache_ttl_sec=%d",
-                result.symbol,
+                "Crypto news snapshot fetched from Alpha Vantage and persisted: symbol=%s ticker_filter=%s bias=%s avg_score=%s latest_news_count=%s cache_ttl_sec=%d",
+                snapshot.symbol,
                 self._ticker_filter,
-                result.sentiment_bias,
-                self._fmt_decimal(result.average_sentiment_score, 6),
-                len(result.latest_news),
+                snapshot.sentiment_bias,
+                self._fmt_decimal(snapshot.average_sentiment_score, 6),
+                len(snapshot.latest_news),
                 self._cache_ttl_sec,
             )
-            return result
+            return snapshot
 
     def _build_news_request_params_strict(self) -> Dict[str, Any]:
         if not self._ticker_filter.startswith("CRYPTO:"):
@@ -309,6 +274,83 @@ class CryptoNewsFetcher:
 
         return payload
 
+    def _build_snapshot_from_news_items(
+        self,
+        *,
+        news_items_sorted: List[CryptoNewsItem],
+        fetched_at_ms: int,
+    ) -> CryptoNewsSnapshot:
+        if not news_items_sorted:
+            raise RuntimeError("news_items_sorted must not be empty")
+
+        as_of_ms = news_items_sorted[0].published_ts_ms
+
+        bullish_count = 0
+        bearish_count = 0
+        neutral_count = 0
+        score_sum = Decimal("0")
+
+        for item in news_items_sorted:
+            score_sum += item.overall_sentiment_score
+            if item.overall_sentiment_score >= _SENTIMENT_BULLISH_THRESHOLD:
+                bullish_count += 1
+            elif item.overall_sentiment_score <= _SENTIMENT_BEARISH_THRESHOLD:
+                bearish_count += 1
+            else:
+                neutral_count += 1
+
+        average_sentiment_score = score_sum / Decimal(len(news_items_sorted))
+        sentiment_bias = self._classify_sentiment_bias(
+            average_score=average_sentiment_score,
+            bullish_count=bullish_count,
+            bearish_count=bearish_count,
+        )
+        key_signals = self._build_key_signals(
+            sentiment_bias=sentiment_bias,
+            bullish_count=bullish_count,
+            bearish_count=bearish_count,
+            average_sentiment_score=average_sentiment_score,
+        )
+
+        latest_news = list(news_items_sorted[:8])
+
+        dashboard_payload = {
+            "symbol": self._symbol,
+            "as_of_ms": as_of_ms,
+            "fetched_at_ms": fetched_at_ms,
+            "ticker_filter": self._ticker_filter,
+            "average_sentiment_score": self._fmt_decimal(average_sentiment_score, 6),
+            "bullish_count": bullish_count,
+            "bearish_count": bearish_count,
+            "neutral_count": neutral_count,
+            "sentiment_bias": sentiment_bias,
+            "latest_news": [
+                {
+                    "title": item.title,
+                    "source": item.source,
+                    "published_at_utc": item.published_at_utc,
+                    "url": item.url,
+                    "overall_sentiment_score": self._fmt_decimal(item.overall_sentiment_score, 6),
+                    "overall_sentiment_label": item.overall_sentiment_label,
+                }
+                for item in latest_news
+            ],
+            "key_signals": list(key_signals),
+        }
+
+        return CryptoNewsSnapshot(
+            symbol=self._symbol,
+            as_of_ms=as_of_ms,
+            average_sentiment_score=average_sentiment_score,
+            bullish_count=bullish_count,
+            bearish_count=bearish_count,
+            neutral_count=neutral_count,
+            sentiment_bias=sentiment_bias,
+            latest_news=latest_news,
+            key_signals=key_signals,
+            dashboard_payload=dashboard_payload,
+        )
+
     def _get_fresh_cached_snapshot_locked(self) -> CryptoNewsSnapshot | None:
         if self._cached_snapshot is None:
             return None
@@ -320,7 +362,7 @@ class CryptoNewsFetcher:
             raise RuntimeError("Cached crypto news snapshot age must not be negative")
         if age_sec >= self._cache_ttl_sec:
             logger.info(
-                "Crypto news snapshot cache expired: symbol=%s age_sec=%.2f ttl_sec=%d",
+                "Crypto news memory cache expired: symbol=%s age_sec=%.2f ttl_sec=%d",
                 self._symbol,
                 age_sec,
                 self._cache_ttl_sec,
@@ -335,6 +377,287 @@ class CryptoNewsFetcher:
         if age_sec < 0:
             raise RuntimeError("Cached crypto news snapshot age must not be negative")
         return age_sec
+
+    def _set_memory_cache_locked(self, snapshot: CryptoNewsSnapshot) -> None:
+        self._cached_snapshot = snapshot
+        self._cached_snapshot_fetched_monotonic = time.monotonic()
+
+    def _load_fresh_db_snapshot_locked(self) -> CryptoNewsSnapshot | None:
+        self._ensure_db_schema_locked()
+
+        with get_session() as session:
+            row = session.execute(
+                text(
+                    f"""
+                    SELECT
+                        id,
+                        source_key,
+                        symbol,
+                        fetched_at_ms,
+                        snapshot_as_of_ms,
+                        cache_ttl_sec,
+                        snapshot_payload
+                    FROM {_NEWS_SNAPSHOT_TABLE}
+                    WHERE source_key = :source_key
+                      AND symbol = :symbol
+                    ORDER BY fetched_at_ms DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "source_key": _NEWS_SNAPSHOT_SOURCE_KEY,
+                    "symbol": self._symbol,
+                },
+            ).mappings().first()
+
+        if row is None:
+            logger.info("No persisted crypto news snapshot found in DB: symbol=%s", self._symbol)
+            return None
+
+        snapshot = self._snapshot_from_db_row(row)
+        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
+        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
+        if age_sec >= self._cache_ttl_sec:
+            logger.info(
+                "Crypto news DB cache expired: symbol=%s age_sec=%.2f ttl_sec=%d fetched_at_ms=%d",
+                self._symbol,
+                age_sec,
+                self._cache_ttl_sec,
+                fetched_at_ms,
+            )
+            return None
+
+        return snapshot
+
+    def _persist_snapshot_locked(self, *, snapshot: CryptoNewsSnapshot, fetched_at_ms: int) -> None:
+        self._ensure_db_schema_locked()
+
+        snapshot_payload = self._snapshot_to_storage_payload(snapshot)
+        snapshot_payload_json = json.dumps(snapshot_payload, ensure_ascii=False, separators=(",", ":"))
+
+        with get_session() as session:
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO {_NEWS_SNAPSHOT_TABLE} (
+                        source_key,
+                        symbol,
+                        fetched_at_ms,
+                        snapshot_as_of_ms,
+                        cache_ttl_sec,
+                        snapshot_payload
+                    ) VALUES (
+                        :source_key,
+                        :symbol,
+                        :fetched_at_ms,
+                        :snapshot_as_of_ms,
+                        :cache_ttl_sec,
+                        CAST(:snapshot_payload AS JSONB)
+                    )
+                    """
+                ),
+                {
+                    "source_key": _NEWS_SNAPSHOT_SOURCE_KEY,
+                    "symbol": snapshot.symbol,
+                    "fetched_at_ms": fetched_at_ms,
+                    "snapshot_as_of_ms": snapshot.as_of_ms,
+                    "cache_ttl_sec": self._cache_ttl_sec,
+                    "snapshot_payload": snapshot_payload_json,
+                },
+            )
+
+    def _ensure_db_schema_locked(self) -> None:
+        if self._db_schema_ready:
+            return
+
+        with get_session() as session:
+            session.execute(
+                text(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {_NEWS_SNAPSHOT_TABLE} (
+                        id BIGSERIAL PRIMARY KEY,
+                        source_key TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        fetched_at_ms BIGINT NOT NULL,
+                        snapshot_as_of_ms BIGINT NOT NULL,
+                        cache_ttl_sec INTEGER NOT NULL,
+                        snapshot_payload JSONB NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            )
+            session.execute(
+                text(
+                    f"""
+                    CREATE INDEX IF NOT EXISTS idx_{_NEWS_SNAPSHOT_TABLE}_source_symbol_fetched
+                    ON {_NEWS_SNAPSHOT_TABLE} (source_key, symbol, fetched_at_ms DESC, id DESC)
+                    """
+                )
+            )
+
+        self._db_schema_ready = True
+        logger.info("Crypto news DB schema ensured: table=%s", _NEWS_SNAPSHOT_TABLE)
+
+    def _snapshot_to_storage_payload(self, snapshot: CryptoNewsSnapshot) -> Dict[str, Any]:
+        return {
+            "symbol": snapshot.symbol,
+            "as_of_ms": snapshot.as_of_ms,
+            "average_sentiment_score": self._fmt_decimal(snapshot.average_sentiment_score, 10),
+            "bullish_count": snapshot.bullish_count,
+            "bearish_count": snapshot.bearish_count,
+            "neutral_count": snapshot.neutral_count,
+            "sentiment_bias": snapshot.sentiment_bias,
+            "latest_news": [
+                self._news_item_to_storage_payload(item)
+                for item in snapshot.latest_news
+            ],
+            "key_signals": list(snapshot.key_signals),
+            "dashboard_payload": snapshot.dashboard_payload,
+        }
+
+    def _snapshot_from_db_row(self, row: Mapping[str, Any]) -> CryptoNewsSnapshot:
+        source_key = self._require_nonempty_str(row.get("source_key"), "db.source_key")
+        if source_key != _NEWS_SNAPSHOT_SOURCE_KEY:
+            raise RuntimeError(
+                f"Persisted crypto news snapshot source_key mismatch: expected={_NEWS_SNAPSHOT_SOURCE_KEY}, got={source_key}"
+            )
+
+        symbol = self._require_nonempty_str(row.get("symbol"), "db.symbol").upper()
+        if symbol != self._symbol:
+            raise RuntimeError(
+                f"Persisted crypto news snapshot symbol mismatch: expected={self._symbol}, got={symbol}"
+            )
+
+        snapshot_as_of_ms = self._require_int(row.get("snapshot_as_of_ms"), "db.snapshot_as_of_ms")
+        if snapshot_as_of_ms <= 0:
+            raise RuntimeError("db.snapshot_as_of_ms must be positive")
+
+        cache_ttl_sec = self._require_int(row.get("cache_ttl_sec"), "db.cache_ttl_sec")
+        if cache_ttl_sec != self._cache_ttl_sec:
+            logger.info(
+                "Persisted crypto news snapshot ttl differs from runtime ttl: persisted=%d runtime=%d",
+                cache_ttl_sec,
+                self._cache_ttl_sec,
+            )
+
+        payload = self._coerce_json_object(row.get("snapshot_payload"), "db.snapshot_payload")
+
+        payload_symbol = self._require_nonempty_str(payload.get("symbol"), "snapshot_payload.symbol").upper()
+        if payload_symbol != self._symbol:
+            raise RuntimeError(
+                f"Persisted crypto news payload symbol mismatch: expected={self._symbol}, got={payload_symbol}"
+            )
+
+        payload_as_of_ms = self._require_int(payload.get("as_of_ms"), "snapshot_payload.as_of_ms")
+        if payload_as_of_ms != snapshot_as_of_ms:
+            raise RuntimeError(
+                f"Persisted crypto news as_of_ms mismatch: row={snapshot_as_of_ms}, payload={payload_as_of_ms}"
+            )
+
+        average_sentiment_score = self._to_decimal(
+            payload.get("average_sentiment_score"),
+            "snapshot_payload.average_sentiment_score",
+        )
+        bullish_count = self._require_int(payload.get("bullish_count"), "snapshot_payload.bullish_count")
+        bearish_count = self._require_int(payload.get("bearish_count"), "snapshot_payload.bearish_count")
+        neutral_count = self._require_int(payload.get("neutral_count"), "snapshot_payload.neutral_count")
+        sentiment_bias = self._require_nonempty_str(payload.get("sentiment_bias"), "snapshot_payload.sentiment_bias")
+
+        raw_latest_news = payload.get("latest_news")
+        if not isinstance(raw_latest_news, list) or not raw_latest_news:
+            raise RuntimeError("snapshot_payload.latest_news must be a non-empty list")
+        latest_news = [
+            self._news_item_from_storage_payload(item, f"snapshot_payload.latest_news[{idx}]")
+            for idx, item in enumerate(raw_latest_news)
+        ]
+
+        raw_key_signals = payload.get("key_signals")
+        if not isinstance(raw_key_signals, list):
+            raise RuntimeError("snapshot_payload.key_signals must be a list")
+        key_signals = [
+            self._require_nonempty_str(item, f"snapshot_payload.key_signals[{idx}]")
+            for idx, item in enumerate(raw_key_signals)
+        ]
+
+        dashboard_payload = payload.get("dashboard_payload")
+        if not isinstance(dashboard_payload, Mapping):
+            raise RuntimeError("snapshot_payload.dashboard_payload must be an object")
+
+        return CryptoNewsSnapshot(
+            symbol=self._symbol,
+            as_of_ms=snapshot_as_of_ms,
+            average_sentiment_score=average_sentiment_score,
+            bullish_count=bullish_count,
+            bearish_count=bearish_count,
+            neutral_count=neutral_count,
+            sentiment_bias=sentiment_bias,
+            latest_news=latest_news,
+            key_signals=key_signals,
+            dashboard_payload=dict(dashboard_payload),
+        )
+
+    def _news_item_to_storage_payload(self, item: CryptoNewsItem) -> Dict[str, Any]:
+        return {
+            "title": item.title,
+            "source": item.source,
+            "published_at_utc": item.published_at_utc,
+            "published_ts_ms": item.published_ts_ms,
+            "url": item.url,
+            "overall_sentiment_score": self._fmt_decimal(item.overall_sentiment_score, 10),
+            "overall_sentiment_label": item.overall_sentiment_label,
+            "summary": item.summary,
+        }
+
+    def _news_item_from_storage_payload(self, payload: Any, field_name: str) -> CryptoNewsItem:
+        if not isinstance(payload, Mapping):
+            raise RuntimeError(f"{field_name} must be an object")
+
+        summary = payload.get("summary")
+        summary_text: Optional[str]
+        if summary is None:
+            summary_text = None
+        else:
+            summary_text = self._optional_str(summary)
+
+        return CryptoNewsItem(
+            title=self._require_nonempty_str(payload.get("title"), f"{field_name}.title"),
+            source=self._require_nonempty_str(payload.get("source"), f"{field_name}.source"),
+            published_at_utc=self._require_nonempty_str(payload.get("published_at_utc"), f"{field_name}.published_at_utc"),
+            published_ts_ms=self._require_int(payload.get("published_ts_ms"), f"{field_name}.published_ts_ms"),
+            url=self._require_nonempty_str(payload.get("url"), f"{field_name}.url"),
+            overall_sentiment_score=self._to_decimal(
+                payload.get("overall_sentiment_score"),
+                f"{field_name}.overall_sentiment_score",
+            ),
+            overall_sentiment_label=self._require_nonempty_str(
+                payload.get("overall_sentiment_label"),
+                f"{field_name}.overall_sentiment_label",
+            ),
+            summary=summary_text,
+        )
+
+    def _compute_age_sec_from_fetched_at_ms(self, fetched_at_ms: int) -> float:
+        now_ms = self._now_ms()
+        age_ms = now_ms - fetched_at_ms
+        if age_ms < 0:
+            raise RuntimeError(
+                f"Crypto news snapshot fetched_at_ms is in the future: now_ms={now_ms}, fetched_at_ms={fetched_at_ms}"
+            )
+        return age_ms / 1000.0
+
+    def _coerce_json_object(self, value: Any, field_name: str) -> Dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"{field_name} must be valid JSON object text") from exc
+            if not isinstance(decoded, Mapping):
+                raise RuntimeError(f"{field_name} JSON root must be an object")
+            return dict(decoded)
+        raise RuntimeError(f"{field_name} must be mapping or JSON string")
 
     def _sleep_before_alpha_vantage_request_locked(self) -> None:
         if _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC <= 0:
@@ -353,6 +676,12 @@ class CryptoNewsFetcher:
 
         remain_sec = _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC - elapsed_sec
         if remain_sec <= 0:
+            logger.info(
+                "Alpha Vantage news pacing skip: symbol=%s elapsed_sec=%.4f min_interval_sec=%.2f",
+                self._symbol,
+                elapsed_sec,
+                _ALPHA_VANTAGE_MIN_REQUEST_INTERVAL_SEC,
+            )
             return
 
         logger.info(
@@ -463,6 +792,15 @@ class CryptoNewsFetcher:
             raise RuntimeError(f"{field_name} must be a non-empty string")
         return value.strip()
 
+    def _require_int(self, value: Any, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise RuntimeError(f"{field_name} must not be bool")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"{field_name} must be an integer") from exc
+        return parsed
+
     def _optional_str(self, value: Any) -> Optional[str]:
         if value is None:
             return None
@@ -473,6 +811,12 @@ class CryptoNewsFetcher:
 
     def _fmt_decimal(self, value: Decimal, scale: int) -> str:
         return f"{value:.{scale}f}"
+
+    def _now_ms(self) -> int:
+        ts_ms = int(time.time() * 1000)
+        if ts_ms <= 0:
+            raise RuntimeError("current timestamp must be > 0")
+        return ts_ms
 
     def _require_str_setting(self, name: str) -> str:
         value = getattr(SETTINGS, name, None)

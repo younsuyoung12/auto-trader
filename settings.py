@@ -5,6 +5,17 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
+핵심 변경 요약
+- analyst_auto_report_market_interval_sec 기본값 불일치 수정 (30 → 300)
+- max_exec_latency_ms 기본값 불일치 수정 (6000 → 2500)
+- analyst_openai_temperature 는 호환성 필드로 유지하되 현행 Responses API 경로 비핵심임을 명시
+- 상단 변경 이력 최근 2일 기준으로 정리
+
+코드 정리 내용
+- dataclass 기본값과 load_settings 기본값 불일치 정리
+- 오래된 변경 이력 정리
+- 주석 구조 정리
+
 설계 원칙
 - settings.py 는 단일 설정 소스(SSOT)다.
 - env(os.environ) 우선, 로컬 .env는 옵션이며 env를 덮어쓰지 않는다.
@@ -18,91 +29,16 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-08 (PATCH 2):
-  1) 외부시장 인텔리전스용 Alpha Vantage 설정 추가
-     - alphavantage_api_key
-  2) ENV 매핑 추가:
-     - ALPHAVANTAGE_API_KEY → alphavantage_api_key
-  3) STRICT 검증 추가:
-     - alphavantage_api_key 누락 시 즉시 예외
-- 2026-03-08 (PATCH):
-  1) Trader OpenAI 설정 로딩과 Analyst OpenAI 설정 로딩을 구조적으로 분리
-  2) OPENAI_* / OPENAI_TRADER_* / OPENAI_SUPERVISOR_* legacy alias 충돌 시 즉시 예외 처리
-  3) analyst_openai_* 기본값과 load_settings() 기본값 불일치 제거
-  4) analyst_openai_model 이 trader openai_model 을 암묵 상속하던 결합 제거
-  5) Settings flat 필드는 유지하여 기존 호출부 호환성 보존
-- 2026-03-07 (AI TRADING INTELLIGENCE):
-  1) AI Quant Analyst / AI Market Analyst 설정 추가
-     - analyst_market_symbol
-     - analyst_db_market_timeframe
-     - analyst_db_market_lookback_limit
-     - analyst_pattern_entry_threshold
-     - analyst_spread_guard_bps
-     - analyst_imbalance_guard_abs
-     - analyst_trade_lookback_limit
-     - analyst_event_lookback_limit
-     - analyst_include_external_market
-     - analyst_auto_report_market_interval_sec
-     - analyst_auto_report_system_interval_sec
-     - analyst_auto_report_persist
-     - analyst_auto_report_notify
-     - analyst_openai_model
-     - analyst_openai_timeout_sec
-     - analyst_openai_max_output_tokens
-     - analyst_openai_temperature
-     - analyst_openai_reasoning_effort
-  2) Binance 외부 시장 분석 설정 추가
-     - binance_futures_base_url
-     - analyst_kline_interval
-     - analyst_kline_limit
-     - analyst_http_timeout_sec
-     - analyst_ratio_period
-     - analyst_ratio_limit
-     - analyst_depth_limit
-     - analyst_funding_limit
-     - analyst_force_order_limit
-     - analyst_max_server_drift_ms
-  3) SETTINGS singleton 추가
-  4) frozen dataclass 적용(구성 불변 규칙)
-  5) 대문자 alias 접근 지원(__getattr__)
-- 2026-03-06 (TRADE-GRADE):
-  1) 실전 운영 기본값 정비:
-     - allocation_ratio / risk_pct 기본값 1.0 → 0.35
-     - max_spread_pct 기본값 0.0008 → 0.0015
-     - slippage_block_pct 기본값 0.3 → 0.002
-     - max_exec_latency_ms 기본값 400 ↔ 2500 불일치 제거 → 2500으로 통일
-  2) Drift Detector 설정 SSOT 수용:
-     - drift_allocation_abs_jump
-     - drift_allocation_spike_ratio
-     - drift_multiplier_abs_jump
-     - drift_micro_abs_jump
-     - drift_stable_regime_steps
-  3) run_bot_ws 운영 파라미터 SSOT 확장:
-     - reconcile_confirm_n
-     - ws_klines_stale_sec
-  4) STRICT 검증 추가:
-     - spread/slippage/drift 관련 범위 검증 추가
-- 2026-03-04 (TRADE-GRADE):
-  1) OpenAI 설정 SSOT 필드 추가:
-     - openai_api_key / openai_model / openai_max_tokens / openai_temperature / openai_max_latency_sec
-  2) ENV 매핑 추가:
-     - OPENAI_API_KEY → openai_api_key
-     - OPENAI_MODEL/OPENAI_TRADER_MODEL/OPENAI_SUPERVISOR_MODEL → openai_model (alias 우선순위)
-     - OPENAI_MAX_TOKENS 등 OpenAI 관련 설정 매핑 추가
-  3) STRICT 검증 추가:
-     - openai_api_key / openai_model 누락 시 즉시 예외
-     - openai_max_tokens 범위, temperature 범위, max_latency_sec > 0 검증
-- 2026-03-03 (TRADE-GRADE):
-  1) 테스트 토글을 settings로 공식화(SSOT):
-     - test_dry_run / test_bypass_guards / test_force_enter / test_fake_available_usdt 추가
-  2) 운영 사고 방지:
-     - test_bypass_guards / test_force_enter / test_fake_available_usdt 는 test_dry_run=True에서만 허용(아니면 즉시 예외)
-  3) run_bot_ws에서 getattr 기본값으로 읽던 운영 파라미터를 settings로 정식 수용:
-     - ws_backfill_tfs / ws_backfill_limit
-     - md_store_flush_sec / ob_store_interval_sec / md_store_tfs
-     - position_resync_sec
-  4) 누락된 env 매핑 보완:
-     - session_jump_mult_* env 로딩 추가
+- 2026-03-09:
+  1) FIX(ROOT-CAUSE): analyst_auto_report_market_interval_sec loader 기본값 30 → 300 정합화
+  2) FIX(ROOT-CAUSE): max_exec_latency_ms dataclass 기본값 6000 → 2500 정합화
+  3) CLEANUP: analyst_openai_temperature 호환성 필드 유지 주석 보강
+  4) CLEANUP: 변경 이력 최근 2일 기준으로 정리
+
+- 2026-03-08:
+  1) Alpha Vantage / AI Analyst / Binance 외부 시장 분석 설정 추가
+  2) Trader OpenAI / Analyst OpenAI 설정 로딩 구조 분리
+  3) SETTINGS singleton / frozen dataclass / 대문자 alias 접근 지원
 ========================================================
 """
 
@@ -338,7 +274,7 @@ class Settings:
     reconcile_confirm_n: int = 3
     force_close_on_desync: bool = False
     max_signal_latency_ms: int = 200
-    max_exec_latency_ms: int = 6000
+    max_exec_latency_ms: int = 2500
 
     # run_bot_ws
     position_resync_sec: float = 20.0
@@ -407,6 +343,7 @@ class Settings:
     analyst_openai_model: str = "gpt-5-mini"
     analyst_openai_timeout_sec: float = 120.0
     analyst_openai_max_output_tokens: int = 1200
+    # Responses API 경로에서는 temperature 미사용. 호환성/레거시 설정 유지용 필드.
     analyst_openai_temperature: float = 0.1
     analyst_openai_reasoning_effort: Optional[str] = None
 
@@ -704,6 +641,7 @@ def _load_analyst_openai_settings() -> Dict[str, Any]:
             default=1200,
             label="analyst_openai_max_output_tokens",
         ),
+        # Responses API 경로에서는 현재 미사용이나, 레거시 호환을 위해 로딩 유지
         "analyst_openai_temperature": _resolve_float_env(
             ["ANALYST_OPENAI_TEMPERATURE"],
             default=0.1,
@@ -1181,7 +1119,7 @@ def load_settings() -> Settings:
     analyst_event_lookback_limit = _as_int("ANALYST_EVENT_LOOKBACK_LIMIT", 300)
     analyst_include_external_market = _as_bool("ANALYST_INCLUDE_EXTERNAL_MARKET", True)
 
-    analyst_auto_report_market_interval_sec = _as_int("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC", 30)
+    analyst_auto_report_market_interval_sec = _as_int("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC", 300)
     analyst_auto_report_system_interval_sec = _as_int("ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC", 1800)
     analyst_auto_report_persist = _as_bool("ANALYST_AUTO_REPORT_PERSIST", True)
     analyst_auto_report_notify = _as_bool("ANALYST_AUTO_REPORT_NOTIFY", False)

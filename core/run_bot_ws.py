@@ -5,6 +5,16 @@ FILE: core/run_bot_ws.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ============================================================
 
+핵심 변경 요약
+- run_bot_ws 부팅 시 embedded market_researcher 자동 기동 제거
+- 자동매매 엔진과 외부 시장 분석 워커를 역할 분리
+- 봇 재시작/부팅만으로 외부 인텔리전스 API가 암묵 호출되던 구조 제거
+
+코드 정리 내용
+- 미사용 import(MarketResearcher) 제거
+- embedded market_researcher autostart 관련 dead bootstrap 코드 제거
+- 상단 변경 이력 최근 2일 기준으로 정리
+
 run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 핵심 원칙 (STRICT · NO-FALLBACK)
@@ -21,110 +31,18 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
-- 2026-03-10 (TRADE-GRADE PATCH 6):
-  1) FIX(ROOT-CAUSE): 동일 5m 캔들 진입 게이트 claim 시점을 _build_entry_market_data 호출 전으로 승격
-     - equity/data_health/WS readiness 통과 후 현재 authoritative WS 5m candle ts 를 먼저 claim
-     - same-candle no-signal / direction-block / low-volatility skip 도 재시작 후 재평가되지 않음
-     - 같은 5m 캔들 내 LONG↔SHORT late flip 재진입 경로 근본 차단
-  2) FIX(STRICT): market_data.signal_ts_ms 와 pre-claimed authoritative WS 5m ts 일치 강제
-     - signal generator 와 runtime gate 의 candle 기준 불일치 즉시 예외
-  3) FIX(PNL): closed trade 처리 시 summary['pnl'] 대신 trade.realized_pnl_usdt 총손익 우선 사용
-     - partial close 누적 후 final close 의 리스크 캐시/연속손실/계정상태 왜곡 제거
-  4) FIX(TIME): close cache exit_ts 를 now 가 아니라 거래소 close_time / trade.close_ts 기준으로 기록
-  5) FIX(RECONCILE): fetch_exchange_position_snapshot 에서 다중 live row 집계 지원
-     - sync_exchange 와 동일한 one-way 집계 규칙으로 정합
-  6) 기존 기능 삭제 없음
+- 2026-03-09 (TRADE-GRADE PATCH 7):
+  1) FIX(ROOT-CAUSE): run_bot_ws 부팅 시 embedded market_researcher 자동 기동 제거
+     - 자동매매 엔진이 외부 시장 분석 워커를 암묵적으로 띄우지 않음
+     - 봇 재시작/부팅만으로 Alpha Vantage 등 외부 인텔리전스 소스가 호출되던 경로 제거
+     - 외부 시장 분석 기능 자체는 dashboard_server / analysis.market_researcher 전용 경로로 유지
+  2) CLEANUP: 미사용 MarketResearcher import 및 autostart bootstrap 코드 제거
+  3) 기존 자동매매 기능 삭제 없음
 
-- 2026-03-09 (TRADE-GRADE PATCH 5):
-  1) FIX(ROOT-CAUSE): 동일 5m 캔들 진입 게이트를 메모리 변수에서 DB 영속 체크포인트로 승격
-     - LAST_ENTRY_EVAL_SIGNAL_TS_MS 재시작 리셋 문제 제거
-     - 엔진 재부팅 후에도 이미 처리한 signal_ts_ms 재평가 금지
-  2) ADD(STRICT): bt_engine_runtime_state 진입 게이트 전용 행 잠금 + advisory xact lock 추가
-     - 다중 프로세스/중복 기동 시에도 같은 symbol 의 동일 캔들 중복 claim 차단
-  3) ADD(BOOT): 부팅 시 persisted entry signal gate 복구
-     - DB 저장값과 메모리 게이트를 동기화하여 rollback / duplicate 판정 일관성 확보
-  4) 기존 기능 삭제 없음
-
-- 2026-03-09 (TRADE-GRADE PATCH 4):
-  1) FIX(ROOT-CAUSE): cand.action 비-ENTER 경로의 즉시 SKIP 흐름 복구
-     - _decide_entry_candidate_strict 결과가 ENTER가 아니면 downstream risk/execution 경로로 진입하지 않음
-     - candidate skip 로그/텔레그램 억제 로직 유지
-  2) FIX(STRICT): cand.action 정규화 값을 단일 변수(action)로 고정 사용
-     - 조건 분기 중 중복 비교 제거
-     - signal_final.action도 하드코딩 "ENTER" 대신 정규화 값 사용
-  3) FIX(COOLDOWN): LAST_ENTRY_GPT_CALL_TS 는 confirmed ENTER candidate 에 대해서만 갱신
-     - NO-ENTRY / HOLD / 기타 비-ENTER 액션에서는 cooldown 오염 금지
-  4) 기존 기능 삭제 없음
-
-- 2026-03-07 (TRADE-GRADE PATCH):
-  1) 5m 캔들 단위 진입 게이트 추가
-     - 동일 signal_ts_ms(사실상 동일 5m 캔들)에서 중복 진입 평가 금지
-     - LONG/SHORT flip(같은 캔들 내 방향 뒤집힘) 근본 차단
-  2) signal_ts_ms rollback 방어 추가
-     - 이전에 처리한 캔들보다 과거 ts가 오면 즉시 예외
-  3) 기존 기능 삭제 없음
-     - entry_pipeline / execution_engine / risk / drift / reconcile / SAFE_STOP 흐름 유지
-
-- 2026-03-06 (TRADE-GRADE):
-  1) Drift Detector 설정을 settings.py SSOT로 연결
-     - drift_allocation_abs_jump
-     - drift_allocation_spike_ratio
-     - drift_multiplier_abs_jump
-     - drift_micro_abs_jump
-     - drift_stable_regime_steps
-  2) run_bot_ws 주요 운영값을 settings.py SSOT로 직접 사용
-     - ws_klines_stale_sec
-     - reconcile_confirm_n
-     - max_signal_latency_ms
-     - max_exec_latency_ms
-     - position_resync_sec
-     - poll_fills_sec
-     - entry_cooldown_sec
-  3) 기본값 fallback/log 최소화:
-     - settings에 존재하는 값은 코드 내부 기본값으로 덮지 않음
-
-- 2026-03-06 (PATCH):
-  1) 엔진 런타임 경로에서 entry_flow 직접 호출 제거
-  2) unified_features → execution_engine 연결을 유지하면서
-     execution_engine이 요구하는 decision meta(entry_score/trend_strength/spread/orderbook_imbalance)를
-     run_bot_ws에서 엄격 추출해 주입
-  3) 기존 자동매매 구조(WS → unified_features → risk_physics → execution_engine) 복구
-  4) 기존 주문/리스크/드리프트/리컨실/로그/SAFE_STOP 로직 유지
-
-- 2026-03-05 (TRADE-GRADE):
-  1) FIX: entry market_data candles_5m/candles_5m_raw 정규화
-     - get_trading_signal이 Candle 객체 / 5튜플 / 6튜플을 혼합 반환할 수 있으므로,
-       _build_entry_market_data에서 항상 6튜플(OHLCV)로 통일 후 STRICT 검증 수행
-
-- 2026-03-06:
-  1) account websocket(USER DATA STREAM) 시작/준비 단계 추가
-  2) account websocket 연결 상태 가드 추가
-  3) 엔진 부팅 시 market ws + account ws 이중 websocket 구조로 정합 강화
-
-- 2026-03-06:
-  1) 보호주문 감시 가드 추가
-     - OPEN_TRADES 보유 중 TP/SL 보호주문 존재 여부를 account_ws + REST로 교차 검증
-  2) 보호주문 누락 시 SAFE_STOP 강화
-     - 보호주문 미존재 시 즉시 SAFE_STOP
-     - force_close_on_desync=True 이면 강제청산 제출 후 종료
-  3) 보호주문/포지션 상태 오판 방지
-     - 실제 거래소 포지션이 열려 있는 경우에만 보호주문 누락을 치명으로 판정
-
-- 2026-03-09 (TRADE-GRADE PATCH 3):
-  1) FIX(ROOT-CAUSE): 메인 루프를 고주기 감독 루프 + 스로틀된 진입 평가 루프로 재구성
-     - 무거운 _build_entry_market_data / regime / risk / execution 경로를 매 틱 반복 실행하지 않음
-     - WS 1m 캔들/오더북 마커 갱신 기준으로만 진입 평가 수행
-  2) FIX(LATENCY): equity 조회 1초 TTL 캐시 추가
-     - 고주기 루프에서도 REST balance/equity 조회가 병목이 되지 않도록 정합성 보존형 캐시 적용
-  3) FIX(RESPONSIVENESS): 엔진 sleep 1초 고정 제거 → 0.2초 감독 tick 적용
-     - SAFE_STOP / SIGTERM / 신규 캔들 감지를 더 빠르게 반영
-  4) 기존 기능 삭제 없음
-
-- 2026-03-08 (TRADE-GRADE PATCH 2):
-  1) FIX(ROOT-CAUSE): 고정 10초 warmup 제거 → 실제 WS 준비 완료 게이트 추가
-  2) FIX(STRICT): entry required klines 최소 길이를 downstream EMA200 요구량과 정합화
-  3) FIX(BOOT): ws_backfill_limit가 부족해도 필수 최소 길이 이상으로 부팅 backfill 강제
-  4) FIX(STARTUP): market data ready 확인 후 health monitor 시작
+- 2026-03-08 ~ 2026-03-09 (최근 변경 유지):
+  1) 동일 5m 캔들 진입 게이트 DB 영속화 및 pre-claim 구조 반영
+  2) equity TTL 캐시 / 고주기 감독 루프 / WS 준비 게이트 / 보호주문 가드 유지
+  3) PnL / close_time / reconcile / drift / invariant / SAFE_STOP 흐름 유지
 ============================================================
 """
 
@@ -187,7 +105,6 @@ from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder, AccountStateNotReadyError
 from execution.risk_physics_engine import RiskPhysicsEngine, RiskPhysicsPolicy
 from strategy.signal import Signal
-from analysis.market_researcher import MarketResearcher
 from core.entry_pipeline import EntryCandidate, _build_entry_market_data, _decide_entry_candidate_strict
 
 from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
@@ -1532,23 +1449,10 @@ def main() -> None:
     start_telegram_command_thread(on_stop_command=_on_safe_stop)
     start_signal_analysis_thread(interval_sec=SIGNAL_ANALYSIS_INTERVAL_SEC)
 
-    try:
-        researcher = MarketResearcher()
-
-        def _research_loop():
-            researcher.run_forever()
-
-        threading.Thread(
-            target=_research_loop,
-            name="market-researcher",
-            daemon=True,
-        ).start()
-
-        log("[BOOT] market_researcher thread started")
-
-    except Exception as e:
-        log(f"[BOOT][FATAL] market_researcher start failed: {e}")
-        raise
+    log(
+        "[BOOT] embedded market_researcher autostart disabled in run_bot_ws "
+        "(STRICT separation: trading engine does not implicitly launch external analysis worker)"
+    )
 
     OPEN_TRADES, _ = sync_open_trades_from_exchange(SET.symbol, replace=True, current_trades=OPEN_TRADES)
     _invalidate_equity_cache()
