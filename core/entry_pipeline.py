@@ -18,6 +18,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): 5m-only 방향 진입 차단
+     - market_features_ws 가 direction_source="5m_only" 로 판단한 신호는 진입 후보 생성 단계에서 차단
+     - 저주기 흔들림이 상위 TF 합의 없이 실제 엔트리까지 내려오는 경로 제거
+  2) FIX(ROOT-CAUSE): higher timeframe alignment 가드 강화
+     - secondary support 계산에서 15m / 1h 를 orderflow/options 와 분리
+     - 최소 1개 이상의 higher-TF(15m/1h) 지지 없으면 진입 차단
+     - higher-TF(15m/1h) 반대 방향이 1개라도 있으면 진입 차단
+  3) ADD(TRADE-GRADE): signal extra.direction_source / high_tf_bias_* 계약 검증 추가
+     - signal 생성 레이어의 방향 결정 근거를 entry pipeline 에서도 명시적으로 검증
+  4) ADD(AUDIT): higher_tf_support/oppose 및 signal direction contract meta 추가
+
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): signal payload 5m ts 와 authoritative WS 5m ts 를 강제 일치 검증
      - get_trading_signal 반환 latest_ts, candles_5m, candles_5m_raw, WS 5m buffer 마지막 ts 불일치 시 즉시 예외
@@ -105,6 +117,13 @@ DIRECTION_CONFIRM_MIN_SLOPE_PCT_BY_TF: Dict[str, float] = {
 }
 DIRECTION_CONFIRM_REQUIRED_SECONDARY_SUPPORTS: int = 1
 DIRECTION_CONFIRM_MAX_SECONDARY_OPPOSE: int = 1
+
+# 2026-03-10 hard policy:
+# - higher timeframe 합의 없는 5m-only 신호는 엔트리 차단
+# - higher timeframe 반대가 1개라도 있으면 차단
+DIRECTION_CONFIRM_REQUIRED_HIGHER_TF_SUPPORTS: int = 1
+DIRECTION_CONFIRM_MAX_HIGHER_TF_OPPOSE: int = 0
+DIRECTION_CONFIRM_BLOCK_5M_ONLY_SOURCE: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +221,29 @@ def _normalize_options_bias_strict(v: Any) -> str:
     if s not in allowed:
         raise RuntimeError(f"invalid options_market.options_bias (STRICT): {s!r}")
     return s
+
+
+def _normalize_direction_source_strict(v: Any, name: str) -> str:
+    s = _require_nonempty_str(v, name).strip()
+    allowed = {
+        "4h_1h_agree",
+        "1h_15m_agree",
+        "15m_5m_agree",
+        "4h_15m_agree",
+        "1h_5m_agree",
+        "5m_only",
+        "undecided",
+    }
+    if s not in allowed:
+        raise RuntimeError(f"{name} invalid (STRICT): {s!r}")
+    return s
+
+
+def _normalize_direction_bias_int_strict(v: Any, name: str) -> int:
+    iv = int(_as_float(v, name, min_value=-1.0, max_value=1.0))
+    if iv not in (-1, 0, 1):
+        raise RuntimeError(f"{name} must be one of -1/0/1 (STRICT): {iv}")
+    return int(iv)
 
 
 def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
@@ -322,7 +364,7 @@ def _compute_closed_slope_pct_strict(
             f"ws_kline[{interval}] insufficient for confirmed slope (STRICT): need>={need + 1} got={len(series)}"
         )
 
-    closed = list(series[-(lookback_closed_bars + 1) : -1])
+    closed = list(series[-(lookback_closed_bars + 1): -1])
     if len(closed) != lookback_closed_bars:
         raise RuntimeError(f"ws_kline[{interval}] closed slice invalid (STRICT)")
 
@@ -403,6 +445,62 @@ def _derive_options_directional_state_strict(
     return "NEUTRAL"
 
 
+def _extract_signal_direction_contract_from_extra_strict(extra: Any) -> Dict[str, Any]:
+    if extra is None:
+        return {
+            "direction_source": None,
+            "high_tf_bias_4h": None,
+            "high_tf_bias_1h": None,
+            "high_tf_bias_15m": None,
+            "bias_5m": None,
+            "support_count": None,
+            "oppose_count": None,
+        }
+    if not isinstance(extra, dict):
+        raise RuntimeError("extra must be dict or None (STRICT)")
+
+    out: Dict[str, Any] = {
+        "direction_source": None,
+        "high_tf_bias_4h": None,
+        "high_tf_bias_1h": None,
+        "high_tf_bias_15m": None,
+        "bias_5m": None,
+        "support_count": None,
+        "oppose_count": None,
+    }
+
+    if extra.get("direction_source") is not None:
+        out["direction_source"] = _normalize_direction_source_strict(
+            extra.get("direction_source"),
+            "extra.direction_source",
+        )
+    if extra.get("high_tf_bias_4h") is not None:
+        out["high_tf_bias_4h"] = _normalize_direction_bias_int_strict(
+            extra.get("high_tf_bias_4h"),
+            "extra.high_tf_bias_4h",
+        )
+    if extra.get("high_tf_bias_1h") is not None:
+        out["high_tf_bias_1h"] = _normalize_direction_bias_int_strict(
+            extra.get("high_tf_bias_1h"),
+            "extra.high_tf_bias_1h",
+        )
+    if extra.get("high_tf_bias_15m") is not None:
+        out["high_tf_bias_15m"] = _normalize_direction_bias_int_strict(
+            extra.get("high_tf_bias_15m"),
+            "extra.high_tf_bias_15m",
+        )
+    if extra.get("bias_5m") is not None:
+        out["bias_5m"] = _normalize_direction_bias_int_strict(
+            extra.get("bias_5m"),
+            "extra.bias_5m",
+        )
+    if extra.get("support_count") is not None:
+        out["support_count"] = int(_as_float(extra.get("support_count"), "extra.support_count", min_value=0.0))
+    if extra.get("oppose_count") is not None:
+        out["oppose_count"] = int(_as_float(extra.get("oppose_count"), "extra.oppose_count", min_value=0.0))
+    return out
+
+
 def _evaluate_direction_stability_guard_strict(
     *,
     direction: str,
@@ -410,6 +508,7 @@ def _evaluate_direction_stability_guard_strict(
     tf_slopes_pct: Dict[str, float],
     orderflow_state: str,
     options_state: str,
+    signal_direction_contract: Dict[str, Any],
 ) -> Optional[str]:
     dir_norm = str(direction).upper().strip()
     if dir_norm not in ("LONG", "SHORT"):
@@ -422,14 +521,19 @@ def _evaluate_direction_stability_guard_strict(
             f"5m confirmed momentum misaligned (STRICT): direction={dir_norm} state={primary_state} slope_pct={slope}"
         )
 
+    higher_tf_support_count = 0
+    higher_tf_oppose_count = 0
     support_count = 0
     oppose_count = 0
+
     for label in ("15m", "1h"):
         state = str(tf_states.get(label) or "").upper().strip()
         if state == dir_norm:
             support_count += 1
+            higher_tf_support_count += 1
         elif state in ("LONG", "SHORT") and state != dir_norm:
             oppose_count += 1
+            higher_tf_oppose_count += 1
 
     for label, state in (("orderflow", orderflow_state), ("options", options_state)):
         state_norm = str(state).upper().strip()
@@ -444,6 +548,40 @@ def _evaluate_direction_stability_guard_strict(
         return f"direction_secondary_opposition_excess:{dir_norm}:oppose={oppose_count}"
     if oppose_count > support_count:
         return f"direction_secondary_alignment_negative:{dir_norm}:support={support_count}:oppose={oppose_count}"
+
+    if higher_tf_support_count < DIRECTION_CONFIRM_REQUIRED_HIGHER_TF_SUPPORTS:
+        return f"higher_tf_support_insufficient:{dir_norm}:support={higher_tf_support_count}"
+    if higher_tf_oppose_count > DIRECTION_CONFIRM_MAX_HIGHER_TF_OPPOSE:
+        return f"higher_tf_opposition_present:{dir_norm}:oppose={higher_tf_oppose_count}"
+
+    direction_source = signal_direction_contract.get("direction_source")
+    if direction_source is not None:
+        if DIRECTION_CONFIRM_BLOCK_5M_ONLY_SOURCE and direction_source == "5m_only":
+            return f"signal_direction_source_blocked:{direction_source}"
+
+        bias_map = {
+            "4h": signal_direction_contract.get("high_tf_bias_4h"),
+            "1h": signal_direction_contract.get("high_tf_bias_1h"),
+            "15m": signal_direction_contract.get("high_tf_bias_15m"),
+            "5m": signal_direction_contract.get("bias_5m"),
+        }
+        expected = 1 if dir_norm == "LONG" else -1
+
+        for tf_label, tf_bias in bias_map.items():
+            if tf_bias is None:
+                continue
+            if int(tf_bias) == -expected and tf_label in ("15m", "1h", "4h"):
+                return f"signal_contract_higher_tf_oppose:{tf_label}:{tf_bias}"
+            if tf_label == "5m" and int(tf_bias) != 0 and int(tf_bias) != expected:
+                return f"signal_contract_5m_bias_mismatch:{tf_bias}"
+
+        contract_support = signal_direction_contract.get("support_count")
+        contract_oppose = signal_direction_contract.get("oppose_count")
+        if contract_support is not None and int(contract_support) <= 0:
+            return f"signal_contract_support_invalid:{contract_support}"
+        if contract_oppose is not None and int(contract_oppose) > 0 and higher_tf_support_count <= 0:
+            return f"signal_contract_oppose_without_higher_tf_support:{contract_oppose}"
+
     return None
 
 
@@ -793,6 +931,13 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -
         "direction_options_state": market_data.get("direction_options_state"),
         "direction_secondary_support_count": market_data.get("direction_secondary_support_count"),
         "direction_secondary_oppose_count": market_data.get("direction_secondary_oppose_count"),
+        "direction_higher_tf_support_count": market_data.get("direction_higher_tf_support_count"),
+        "direction_higher_tf_oppose_count": market_data.get("direction_higher_tf_oppose_count"),
+        "signal_direction_source": market_data.get("signal_direction_source"),
+        "signal_high_tf_bias_4h": market_data.get("signal_high_tf_bias_4h"),
+        "signal_high_tf_bias_1h": market_data.get("signal_high_tf_bias_1h"),
+        "signal_high_tf_bias_15m": market_data.get("signal_high_tf_bias_15m"),
+        "signal_bias_5m": market_data.get("signal_bias_5m"),
     }
 
     return EntryCandidate(
@@ -899,6 +1044,8 @@ def _build_entry_market_data(
         log_fn(msg)
         notify_entry_block_fn(f"WS_NOT_READY:{symbol}:{prereq_reason}", msg, 60)
         return None
+
+    signal_direction_contract = _extract_signal_direction_contract_from_extra_strict(extra)
 
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
@@ -1019,6 +1166,11 @@ def _build_entry_market_data(
         "direction_tf_states": direction_tf_states,
         "direction_orderflow_state": direction_orderflow_state,
         "direction_options_state": direction_options_state,
+        "signal_direction_source": signal_direction_contract.get("direction_source"),
+        "signal_high_tf_bias_4h": signal_direction_contract.get("high_tf_bias_4h"),
+        "signal_high_tf_bias_1h": signal_direction_contract.get("high_tf_bias_1h"),
+        "signal_high_tf_bias_15m": signal_direction_contract.get("high_tf_bias_15m"),
+        "signal_bias_5m": signal_direction_contract.get("bias_5m"),
     }
 
     structural_block_reason = _evaluate_structural_entry_conflict_strict(out)
@@ -1034,23 +1186,34 @@ def _build_entry_market_data(
         tf_slopes_pct=direction_tf_slopes_pct,
         orderflow_state=direction_orderflow_state,
         options_state=direction_options_state,
+        signal_direction_contract=signal_direction_contract,
     )
+
     secondary_support_count = 0
     secondary_oppose_count = 0
-    for state in (
-        direction_tf_states["15m"],
-        direction_tf_states["1h"],
-        direction_orderflow_state,
-        direction_options_state,
+    higher_tf_support_count = 0
+    higher_tf_oppose_count = 0
+
+    for label, state in (
+        ("15m", direction_tf_states["15m"]),
+        ("1h", direction_tf_states["1h"]),
+        ("orderflow", direction_orderflow_state),
+        ("options", direction_options_state),
     ):
         state_norm = str(state).upper().strip()
         if state_norm == direction:
             secondary_support_count += 1
+            if label in ("15m", "1h"):
+                higher_tf_support_count += 1
         elif state_norm in ("LONG", "SHORT") and state_norm != direction:
             secondary_oppose_count += 1
+            if label in ("15m", "1h"):
+                higher_tf_oppose_count += 1
 
     out["direction_secondary_support_count"] = int(secondary_support_count)
     out["direction_secondary_oppose_count"] = int(secondary_oppose_count)
+    out["direction_higher_tf_support_count"] = int(higher_tf_support_count)
+    out["direction_higher_tf_oppose_count"] = int(higher_tf_oppose_count)
     out["direction_stability_guard_reason"] = direction_stability_guard_reason
 
     if direction_stability_guard_reason is not None:
@@ -1058,7 +1221,8 @@ def _build_entry_market_data(
             f"[SKIP][DIRECTION_STABILITY] entry blocked: {symbol} ({direction}) "
             f"reason={direction_stability_guard_reason} tf_states={direction_tf_states} "
             f"tf_slopes_pct={direction_tf_slopes_pct} orderflow={direction_orderflow_state} "
-            f"options={direction_options_state}"
+            f"options={direction_options_state} signal_direction_source={signal_direction_contract.get('direction_source')} "
+            f"higher_tf_support={higher_tf_support_count} higher_tf_oppose={higher_tf_oppose_count}"
         )
         log_fn(msg)
         notify_entry_block_fn(f"DIRECTION_STABILITY:{symbol}:{direction_stability_guard_reason}", msg, 60)

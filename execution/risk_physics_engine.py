@@ -50,6 +50,20 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 PATCH NOTES
 --------------------------------------------------------
+- 2026-03-10
+  1) FIX(ROOT-CAUSE): AutoBlockDecision 출력 계약 검증 추가
+     - block_entry / risk_multiplier / reasons shape 를 STRICT 검증
+     - auto_block_engine 이상 출력이 allocation 경로에 조용히 섞이지 않도록 차단
+  2) FIX(STRICT): heatmap 입력 계약 강화
+     - heatmap_status="OK"/"BLOCK" 이면 heatmap_n > 0 필수
+     - heatmap_status="NOT_READY" 이면 heatmap_ev 는 반드시 None
+  3) FIX(STRICT): policy 정합 강화
+     - min_allocation_if_enter <= max_allocation 강제
+     - dd/consecutive multiplier 는 감쇠 정책이므로 1.0 초과 금지 유지
+  4) FIX(AUDIT): reason 조합 로직 단일화
+     - dd / consec / auto block 사유 문자열 정규화
+  5) 기존 기능 삭제 없음
+
 - 2026-03-03 (TRADE-GRADE)
   - AutoBlock(microstructure + EV heatmap) 반영:
     * decide() 입력에 micro_score_risk / heatmap_status / heatmap_ev / heatmap_n 추가
@@ -63,9 +77,9 @@ PATCH NOTES
 
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
-from risk.auto_block_engine import AutoBlockError, AutoBlockDecision, decide_auto_block
+from risk.auto_block_engine import AutoBlockDecision, AutoBlockError, decide_auto_block
 
 
 # ─────────────────────────────────────────────
@@ -111,12 +125,12 @@ class RiskPhysicsPolicy:
 class RiskPhysicsDecision:
     # "ENTER" / "SKIP" / "STOP"
     action_override: str
-    effective_risk_pct: float  # 이제 "계좌 투입 비율"로 사용
+    effective_risk_pct: float  # "계좌 투입 비율"로 사용
     allocation_used: float
     planned_rr: float
     reason: str
 
-    # TRADE-GRADE: audit fields (optional, for caller meta logging)
+    # TRADE-GRADE: audit fields
     auto_blocked: bool = False
     auto_risk_multiplier: float = 1.0
     micro_score_risk: Optional[float] = None
@@ -160,6 +174,13 @@ def _require_ratio_0_1(v: Any, name: str) -> float:
     return _as_float(v, name, min_value=0.0, max_value=1.0)
 
 
+def _require_nonempty_status(v: Any, name: str) -> str:
+    s = str(v).strip().upper()
+    if not s:
+        raise RiskPhysicsInputError(f"{name} is empty")
+    return s
+
+
 def _compute_planned_rr(tp_pct: Any, sl_pct: Any) -> float:
     tp = _as_float(tp_pct, "signal.tp_pct", min_value=0.0)
     sl = _as_float(sl_pct, "signal.sl_pct", min_value=0.0)
@@ -169,6 +190,31 @@ def _compute_planned_rr(tp_pct: Any, sl_pct: Any) -> float:
     if not math.isfinite(rr) or rr <= 0.0:
         raise RiskPhysicsInputError(f"planned_rr invalid: {rr}")
     return rr
+
+
+def _validate_auto_block_decision_strict(abd: AutoBlockDecision) -> None:
+    if not isinstance(abd.block_entry, bool):
+        raise RiskPhysicsError("auto_block_engine.block_entry must be bool (STRICT)")
+
+    _ = _as_float(abd.risk_multiplier, "auto_block_engine.risk_multiplier", min_value=0.0, max_value=1.0)
+
+    if not isinstance(abd.reasons, list):
+        raise RiskPhysicsError("auto_block_engine.reasons must be list (STRICT)")
+    for i, reason in enumerate(abd.reasons):
+        s = str(reason).strip()
+        if not s:
+            raise RiskPhysicsError(f"auto_block_engine.reasons[{i}] must be non-empty str (STRICT)")
+
+
+def _compose_reason_strict(*parts: str) -> str:
+    out: List[str] = []
+    for p in parts:
+        s = str(p).strip()
+        if s:
+            out.append(s)
+    if not out:
+        raise RiskPhysicsError("reason parts empty (STRICT)")
+    return "|".join(out)
 
 
 # ─────────────────────────────────────────────
@@ -220,6 +266,8 @@ class RiskPhysicsEngine:
 
         _as_float(p.max_allocation, "policy.max_allocation", min_value=0.0, max_value=1.0)
         _as_float(p.min_allocation_if_enter, "policy.min_allocation_if_enter", min_value=0.0, max_value=1.0)
+        if p.min_allocation_if_enter > p.max_allocation:
+            raise ValueError("policy.min_allocation_if_enter must be <= policy.max_allocation")
 
     def decide(
         self,
@@ -242,9 +290,7 @@ class RiskPhysicsEngine:
         rr = _compute_planned_rr(tp_pct, sl_pct)
 
         msr = _as_float(micro_score_risk, "micro_score_risk", min_value=0.0, max_value=100.0)
-        st = str(heatmap_status).strip().upper()
-        if not st:
-            raise RiskPhysicsInputError("heatmap_status is empty")
+        st = _require_nonempty_status(heatmap_status, "heatmap_status")
         if st not in ("NOT_READY", "OK", "BLOCK"):
             raise RiskPhysicsInputError(f"heatmap_status invalid: {st!r}")
 
@@ -257,6 +303,8 @@ class RiskPhysicsEngine:
         else:
             if heatmap_ev is None:
                 raise RiskPhysicsInputError("heatmap_ev is required when heatmap_status!=NOT_READY")
+            if hn <= 0:
+                raise RiskPhysicsInputError("heatmap_n must be > 0 when heatmap_status!=NOT_READY")
             hev = _as_float(heatmap_ev, "heatmap_ev")
 
         # Policy: STOP
@@ -266,7 +314,9 @@ class RiskPhysicsEngine:
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
                 planned_rr=rr,
-                reason=f"dd_stop_engine(dd_pct={dd:.2f}>= {self.policy.dd_stop_engine_pct:.2f})",
+                reason=_compose_reason_strict(
+                    f"dd_stop_engine(dd_pct={dd:.2f}>= {self.policy.dd_stop_engine_pct:.2f})"
+                ),
                 auto_blocked=False,
                 auto_risk_multiplier=1.0,
                 micro_score_risk=msr,
@@ -282,7 +332,9 @@ class RiskPhysicsEngine:
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
                 planned_rr=rr,
-                reason=f"dd_block_entry(dd_pct={dd:.2f}>= {self.policy.dd_block_entry_pct:.2f})",
+                reason=_compose_reason_strict(
+                    f"dd_block_entry(dd_pct={dd:.2f}>= {self.policy.dd_block_entry_pct:.2f})"
+                ),
                 auto_blocked=False,
                 auto_risk_multiplier=1.0,
                 micro_score_risk=msr,
@@ -297,7 +349,9 @@ class RiskPhysicsEngine:
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
                 planned_rr=rr,
-                reason=f"consec_block(consecutive_losses={consec}>= {self.policy.consec_block_n})",
+                reason=_compose_reason_strict(
+                    f"consec_block(consecutive_losses={consec}>= {self.policy.consec_block_n})"
+                ),
                 auto_blocked=False,
                 auto_risk_multiplier=1.0,
                 micro_score_risk=msr,
@@ -312,7 +366,9 @@ class RiskPhysicsEngine:
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
                 planned_rr=rr,
-                reason=f"planned_rr_too_low(rr={rr:.3f}< {self.policy.min_planned_rr:.3f})",
+                reason=_compose_reason_strict(
+                    f"planned_rr_too_low(rr={rr:.3f}< {self.policy.min_planned_rr:.3f})"
+                ),
                 auto_blocked=False,
                 auto_risk_multiplier=1.0,
                 micro_score_risk=msr,
@@ -321,14 +377,13 @@ class RiskPhysicsEngine:
                 heatmap_n=hn,
             )
 
-        # If regime allocation says no-trade, skip explicitly
         if alloc <= 0.0:
             return RiskPhysicsDecision(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
                 planned_rr=rr,
-                reason="regime_allocation_zero",
+                reason=_compose_reason_strict("regime_allocation_zero"),
                 auto_blocked=False,
                 auto_risk_multiplier=1.0,
                 micro_score_risk=msr,
@@ -369,13 +424,23 @@ class RiskPhysicsEngine:
         except AutoBlockError as e:
             raise RiskPhysicsError(f"auto_block_engine failed: {e}") from e
 
+        _validate_auto_block_decision_strict(abd)
+
+        auto_reason = "auto_ok"
+        if abd.reasons:
+            auto_reason = f"auto_reasons={','.join(abd.reasons)}"
+
         if abd.block_entry:
             return RiskPhysicsDecision(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
                 planned_rr=rr,
-                reason=f"auto_block({','.join(abd.reasons)})|{dd_reason}|{consec_reason}",
+                reason=_compose_reason_strict(
+                    f"auto_block({','.join(abd.reasons)})",
+                    dd_reason,
+                    consec_reason,
+                ),
                 auto_blocked=True,
                 auto_risk_multiplier=float(abd.risk_multiplier),
                 micro_score_risk=msr,
@@ -389,7 +454,7 @@ class RiskPhysicsEngine:
         if alloc_adj < 0.0 or alloc_adj > 1.0 or not math.isfinite(alloc_adj):
             raise RiskPhysicsError(f"allocation invalid after auto_block multiplier: {alloc_adj}")
 
-        # Policy cap (explicit rule)
+        # Explicit cap policy
         if alloc_adj > self.policy.max_allocation:
             alloc_adj = float(self.policy.max_allocation)
 
@@ -399,7 +464,12 @@ class RiskPhysicsEngine:
                 effective_risk_pct=0.0,
                 allocation_used=float(alloc_adj),
                 planned_rr=rr,
-                reason=f"effective_allocation_zero_after_adjustments|{dd_reason}|{consec_reason}|auto_mul={abd.risk_multiplier}",
+                reason=_compose_reason_strict(
+                    "effective_allocation_zero_after_adjustments",
+                    dd_reason,
+                    consec_reason,
+                    auto_reason,
+                ),
                 auto_blocked=False,
                 auto_risk_multiplier=float(abd.risk_multiplier),
                 micro_score_risk=msr,
@@ -414,7 +484,12 @@ class RiskPhysicsEngine:
                 effective_risk_pct=0.0,
                 allocation_used=float(alloc_adj),
                 planned_rr=rr,
-                reason=f"effective_allocation_below_min(alloc={alloc_adj:.6f}< {self.policy.min_allocation_if_enter:.6f})",
+                reason=_compose_reason_strict(
+                    f"effective_allocation_below_min(alloc={alloc_adj:.6f}< {self.policy.min_allocation_if_enter:.6f})",
+                    dd_reason,
+                    consec_reason,
+                    auto_reason,
+                ),
                 auto_blocked=False,
                 auto_risk_multiplier=float(abd.risk_multiplier),
                 micro_score_risk=msr,
@@ -428,7 +503,12 @@ class RiskPhysicsEngine:
             effective_risk_pct=float(alloc_adj),
             allocation_used=float(alloc_adj),
             planned_rr=rr,
-            reason=f"ok|{dd_reason}|{consec_reason}|auto_mul={abd.risk_multiplier}",
+            reason=_compose_reason_strict(
+                "ok",
+                dd_reason,
+                consec_reason,
+                auto_reason,
+            ),
             auto_blocked=False,
             auto_risk_multiplier=float(abd.risk_multiplier),
             micro_score_risk=msr,

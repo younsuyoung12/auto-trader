@@ -23,6 +23,19 @@ sync_exchange.py (Binance USDT-M Futures 전용, 거래소 상태 동기화 + DB
 - TP/SL 보호 주문은 reduceOnly=True 또는 closePosition=True +
   (STOP_MARKET / TAKE_PROFIT_MARKET)로 운영한다.
 
+PATCH NOTES — 2026-03-09 (TRADE-GRADE)
+--------------------------------------------------------
+- DB 접근 정합:
+  - SessionLocal 직접 사용 제거 → state.db_core.get_session() 경유
+- 부분청산/재시작 정합(ROOT-CAUSE):
+  - 메모리 Trade 재구성 시 qty는 현재 remaining이 아니라 DB 원본 qty를 유지
+  - remaining_qty만 거래소 현재 잔량(abs_qty)로 반영
+  - 부분청산 후 재시작 시 qty 원본 손실로 인한 PnL/청산 요약 왜곡 방지
+- 실행 계약 정합 강화:
+  - PROTECTION_VERIFIED 상태라면 entry_order_id / tp_order_id / sl_order_id / remaining_qty / last_synced_at 필수
+  - exchange remaining(abs_qty)가 DB 원본 qty를 초과하면 즉시 예외
+- 기존 기능 삭제 없음
+
 PATCH NOTES — 2026-03-07
 --------------------------------------------------------
 - POSITION 이벤트 기록 보강(STRICT):
@@ -44,6 +57,12 @@ PATCH NOTES — 2026-03-02
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-09:
+  1) FIX(ROOT-CAUSE): 재시작 복구 시 qty 원본 유지 + remaining_qty만 실잔량으로 복구
+  2) FIX(STRICT): DB 접근을 get_session() SSOT 경유로 통일
+  3) FIX(CONTRACT): PROTECTION_VERIFIED 실행 필드 누락 시 즉시 예외
+  4) FIX(STRICT): exchange abs_qty > db qty 정합 불일치 즉시 예외
+  5) 기존 기능 삭제 없음
 - 2026-03-07:
   1) POSITION 이벤트 기록 추가
      - sync 성공 직후 source="sync_exchange" POSITION 이벤트 저장
@@ -77,7 +96,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from events.signals_logger import log_event
 from execution.exchange_api import fetch_open_orders, fetch_open_positions
 from infra.telelog import log, send_tg
-from state.db_core import SessionLocal
+from state.db_core import get_session
 from state.db_models import Trade as TradeORM
 from state.trader_state import Trade as MemTrade
 
@@ -486,6 +505,17 @@ def _update_trade_exec_fields_strict(
     if pos_dir not in ("LONG", "SHORT"):
         raise RuntimeError(f"invalid pos_dir (STRICT): {pos_dir!r}")
 
+    db_qty = _safe_float_strict(db_trade.qty, "bt_trades.qty")
+    if db_qty <= 0:
+        raise RuntimeError("bt_trades.qty must be > 0 (STRICT)")
+    if abs_qty - db_qty > 1e-12:
+        raise RuntimeError(
+            f"exchange remaining abs_qty exceeds original db qty (STRICT): db_qty={db_qty} exch_abs_qty={abs_qty}"
+        )
+
+    if db_trade.entry_order_id is None or not str(db_trade.entry_order_id).strip():
+        raise RuntimeError("ENTRY orderId is missing in DB (STRICT)")
+
     db_trade.remaining_qty = float(abs_qty)
 
     ps = _normalize_position_side_raw(position_side_raw, default_both=True)
@@ -535,16 +565,26 @@ def _build_mem_trade_strict(
     leverage_i = _safe_positive_int_strict(db_trade.leverage, "bt_trades.leverage")
     exchange_position_side = _normalize_position_side_raw(db_trade.exchange_position_side, default_both=True)
 
+    if db_trade.entry_order_id is None or not str(db_trade.entry_order_id).strip():
+        raise RuntimeError("bt_trades.entry_order_id is required after reconciliation (STRICT)")
     if db_trade.tp_order_id is None or not str(db_trade.tp_order_id).strip():
         raise RuntimeError("bt_trades.tp_order_id is required after reconciliation (STRICT)")
     if db_trade.sl_order_id is None or not str(db_trade.sl_order_id).strip():
         raise RuntimeError("bt_trades.sl_order_id is required after reconciliation (STRICT)")
+
+    original_qty = _safe_float_strict(db_trade.qty, "bt_trades.qty")
+    if original_qty <= 0:
+        raise RuntimeError("bt_trades.qty must be > 0 (STRICT)")
 
     if db_trade.remaining_qty is None:
         raise RuntimeError("bt_trades.remaining_qty is required after reconciliation (STRICT)")
     remaining_qty = _safe_float_strict(db_trade.remaining_qty, "bt_trades.remaining_qty")
     if remaining_qty <= 0:
         raise RuntimeError("bt_trades.remaining_qty must be > 0 (STRICT)")
+    if remaining_qty - original_qty > 1e-12:
+        raise RuntimeError(
+            f"bt_trades.remaining_qty must be <= bt_trades.qty (STRICT): remaining={remaining_qty} qty={original_qty}"
+        )
 
     last_synced_at = _require_tz_aware_datetime(db_trade.last_synced_at, "bt_trades.last_synced_at")
     reconciliation_status = _require_nonempty_str(db_trade.reconciliation_status, "bt_trades.reconciliation_status").upper()
@@ -560,11 +600,11 @@ def _build_mem_trade_strict(
     return MemTrade(
         symbol=_normalize_symbol(db_trade.symbol),
         side=_entry_side_from_dir(pos_dir),
-        qty=float(abs_qty),
+        qty=float(original_qty),
         entry_price=float(entry_price),
         leverage=int(leverage_i),
         entry=float(entry_price),
-        entry_order_id=str(db_trade.entry_order_id) if db_trade.entry_order_id is not None else None,
+        entry_order_id=str(db_trade.entry_order_id),
         tp_order_id=str(db_trade.tp_order_id),
         sl_order_id=str(db_trade.sl_order_id),
         tp_price=float(tp_price) if tp_price is not None else 0.0,
@@ -610,8 +650,14 @@ def sync_open_trades_from_exchange(
     if len(open_orders) != len(orders):
         raise RuntimeError("fetch_open_orders contains non-dict row (STRICT)")
 
-    session = SessionLocal()
-    try:
+    rebuilt: Optional[MemTrade] = None
+    db_open: Optional[TradeORM] = None
+    tp_id: Optional[str] = None
+    tp_price: Optional[float] = None
+    sl_id: Optional[str] = None
+    sl_price: Optional[float] = None
+
+    with get_session() as session:
         db_open = _load_db_open_trade_strict(session, sym)
 
         if abs_qty <= 0:
@@ -647,7 +693,7 @@ def sync_open_trades_from_exchange(
             tp_id=tp_id,
             sl_id=sl_id,
         )
-        session.commit()
+        session.flush()
 
         _emit_position_sync_event_strict(
             symbol=sym,
@@ -668,13 +714,13 @@ def sync_open_trades_from_exchange(
             sl_price=sl_price,
         )
 
-        out = [rebuilt] if replace else (list(current_trades) + [rebuilt])
+    if rebuilt is None:
+        raise RuntimeError("rebuilt trade missing after sync (STRICT)")
 
-        _notify_sync_ok(sym, pos_dir=pos_dir, abs_qty=abs_qty, tp_id=tp_id, sl_id=sl_id)
-        return out, 1
+    out = [rebuilt] if replace else (list(current_trades) + [rebuilt])
 
-    finally:
-        session.close()
+    _notify_sync_ok(sym, pos_dir=pos_dir, abs_qty=abs_qty, tp_id=tp_id, sl_id=sl_id)
+    return out, 1
 
 
 __all__ = [

@@ -33,6 +33,16 @@ extra 주요 필드
 
 변경 이력
 -----------------------------------------------------
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): 방향 결정 로직을 "전체 TF 다수결"에서
+     "상위 TF 우선 계층형 결정"으로 변경
+     - 4h / 1h / 15m / 5m 순서로 우선순위 적용
+     - 1m vote / depth_imbalance 로 방향 직접 결정 금지
+     - 상위 TF 합의가 없으면 무리하게 LONG/SHORT 생성하지 않고 None 반환
+  2) FIX(STRICT): same-candle freeze 상태의 ts rollback 검증 추가
+  3) FIX(TRADE-GRADE): extra 에 direction_source / high_tf_bias / support_count / oppose_count 기록
+  4) 기존 기능 삭제 없음
+
 - 2026-03-01:
   1) raw_ohlcv_last20 포맷을 dict -> (ts_ms, o, h, l, c, v) tuple 로 변경 (STRICT 호환)
   2) indicators dict 에 scalar 지표(rsi/ema/atr/macd...) 포함 (unified_features_builder 호환)
@@ -588,6 +598,7 @@ def _build_timeframe_features(
         "ema_slow_len": ema_slow_len,
         "ema_dist_pct": ema_dist_pct,
         "ema_fast_slope_pct": ema_fast_slope_pct,
+        "ema_slow_slope_pct": ema_slow_slope_pct,
         "atr": atr_val,
         "atr_pct": atr_pct,
         "range_pct": range_pct,
@@ -841,6 +852,68 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_direction_bias_strict(
+    *,
+    tf5: Dict[str, Any],
+    tf15: Optional[Dict[str, Any]],
+    tf1h: Optional[Dict[str, Any]],
+    tf4h: Optional[Dict[str, Any]],
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    방향 결정은 "상위 TF 우선"으로만 수행한다.
+    - 1m vote / depth_imbalance 는 방향 직접 결정에 사용하지 않는다.
+    - 4h/1h 합의 → 1h/15m 합의 → 15m/5m 합의 → 5m 단독 순서
+    """
+    b5 = _compute_trend_bias(tf5)
+    b15 = _compute_trend_bias(tf15) if tf15 else 0
+    b1h = _compute_trend_bias(tf1h) if tf1h else 0
+    b4h = _compute_trend_bias(tf4h) if tf4h else 0
+
+    support_count = 0
+    oppose_count = 0
+    chosen = 0
+    source = "NONE"
+
+    if b4h != 0 and b1h != 0 and b4h == b1h:
+        chosen = b4h
+        source = "4h_1h_agree"
+    elif b1h != 0 and b15 != 0 and b1h == b15:
+        chosen = b1h
+        source = "1h_15m_agree"
+    elif b15 != 0 and b5 != 0 and b15 == b5:
+        chosen = b15
+        source = "15m_5m_agree"
+    elif b4h != 0 and b1h == 0 and b15 != 0 and b4h == b15:
+        chosen = b4h
+        source = "4h_15m_agree"
+    elif b1h != 0 and b15 == 0 and b5 != 0 and b1h == b5:
+        chosen = b1h
+        source = "1h_5m_agree"
+    elif b5 != 0:
+        chosen = b5
+        source = "5m_only"
+    else:
+        chosen = 0
+        source = "undecided"
+
+    if chosen != 0:
+        for bias in (b4h, b1h, b15, b5):
+            if bias == chosen:
+                support_count += 1
+            elif bias == -chosen:
+                oppose_count += 1
+
+    return chosen, {
+        "5m_bias": b5,
+        "15m_bias": b15,
+        "1h_bias": b1h,
+        "4h_bias": b4h,
+        "direction_source": source,
+        "support_count": support_count,
+        "oppose_count": oppose_count,
+    }
+
+
 def build_entry_features_ws(
     symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -984,33 +1057,38 @@ def get_trading_signal(
     freeze_state = _get_signal_freeze_state(symbol)
     if freeze_state is not None:
         frozen_ts = freeze_state.get("latest_ts")
-        if isinstance(frozen_ts, int) and frozen_ts == latest_ts:
-            frozen_signal = freeze_state.get("chosen_signal")
-            if frozen_signal is None:
-                return None
-
-            frozen_source = freeze_state.get("signal_source")
-            frozen_extra = freeze_state.get("extra")
-            if (
-                isinstance(frozen_signal, str)
-                and frozen_signal in ("LONG", "SHORT")
-                and isinstance(frozen_source, str)
-                and frozen_source.strip()
-                and isinstance(frozen_extra, dict)
-            ):
-                return (
-                    frozen_signal,
-                    frozen_source,
-                    latest_ts,
-                    candles_5m,
-                    candles_5m_raw,
-                    float(last_price),
-                    _clone_frozen_extra_for_return(
-                        frozen_extra,
-                        last_close_ts=float(last_close_ts),
-                    ),
+        if isinstance(frozen_ts, int):
+            if frozen_ts > latest_ts:
+                raise FeatureBuildError(
+                    f"signal freeze ts rollback detected (STRICT): frozen_ts={frozen_ts} latest_ts={latest_ts}"
                 )
-            raise FeatureBuildError("signal freeze state payload invalid (STRICT)")
+            if frozen_ts == latest_ts:
+                frozen_signal = freeze_state.get("chosen_signal")
+                if frozen_signal is None:
+                    return None
+
+                frozen_source = freeze_state.get("signal_source")
+                frozen_extra = freeze_state.get("extra")
+                if (
+                    isinstance(frozen_signal, str)
+                    and frozen_signal in ("LONG", "SHORT")
+                    and isinstance(frozen_source, str)
+                    and frozen_source.strip()
+                    and isinstance(frozen_extra, dict)
+                ):
+                    return (
+                        frozen_signal,
+                        frozen_source,
+                        latest_ts,
+                        candles_5m,
+                        candles_5m_raw,
+                        float(last_price),
+                        _clone_frozen_extra_for_return(
+                            frozen_extra,
+                            last_close_ts=float(last_close_ts),
+                        ),
+                    )
+                raise FeatureBuildError("signal freeze state payload invalid (STRICT)")
 
     try:
         features = build_entry_features_ws(symbol)
@@ -1044,6 +1122,8 @@ def get_trading_signal(
         return None
 
     tf15 = tfs.get("15m")
+    tf1h = tfs.get("1h")
+    tf4h = tfs.get("4h")
 
     try:
         range_pct_5 = tf5.get("range_pct")
@@ -1126,24 +1206,15 @@ def get_trading_signal(
     else:
         last_price = float(buf_5m[-1][4])
 
-    majority_trend = str(mtf.get("majority_trend", "NEUTRAL")).upper()
     depth_imbalance = ob.get("depth_imbalance")
+    majority_trend = str(mtf.get("majority_trend", "NEUTRAL")).upper()
 
-    trend_bias = 0
-
-    if majority_trend == "LONG":
-        trend_bias = 1
-    elif majority_trend == "SHORT":
-        trend_bias = -1
-
-    if trend_bias == 0:
-        ema_fast_5 = tf5.get("ema_fast")
-        ema_slow_5 = tf5.get("ema_slow")
-        if isinstance(ema_fast_5, (int, float)) and isinstance(ema_slow_5, (int, float)):
-            if ema_fast_5 > ema_slow_5:
-                trend_bias = 1
-            elif ema_fast_5 < ema_slow_5:
-                trend_bias = -1
+    trend_bias, direction_meta = _resolve_direction_bias_strict(
+        tf5=tf5,
+        tf15=tf15,
+        tf1h=tf1h,
+        tf4h=tf4h,
+    )
 
     if trend_bias > 0:
         chosen_signal = "LONG"
@@ -1154,7 +1225,9 @@ def get_trading_signal(
     else:
         log(
             "[MKT-FEAT] get_trading_signal: 방향이 확정되지 않아 시그널 생성을 중단합니다 "
-            f"(majority_trend={majority_trend}, depth_imbalance={depth_imbalance})."
+            f"(majority_trend={majority_trend}, direction_source={direction_meta.get('direction_source')}, "
+            f"support={direction_meta.get('support_count')}, oppose={direction_meta.get('oppose_count')}, "
+            f"depth_imbalance={depth_imbalance})."
         )
         _set_signal_freeze_state(
             symbol=symbol,
@@ -1173,7 +1246,7 @@ def get_trading_signal(
         oversold_tfs = int(mtf.get("oversold_tfs") or 0)
         strong_trend_flag = tf5.get("strong_trend_flag")
 
-        if adx_trend_tfs >= 2 and strong_trend_flag == 1:
+        if direction_meta.get("support_count", 0) >= 2 and adx_trend_tfs >= 2 and strong_trend_flag == 1:
             signal_source = "TREND"
         elif (overbought_tfs + oversold_tfs) >= 1:
             signal_source = "RANGE"
@@ -1196,10 +1269,14 @@ def get_trading_signal(
     signal_score = 0.5
     try:
         vol_z = tf5.get("volume_zscore")
+        support_count = int(direction_meta.get("support_count") or 0)
+        oppose_count = int(direction_meta.get("oppose_count") or 0)
         if signal_source == "TREND":
             signal_score += 1.5
-        if majority_trend in ("LONG", "SHORT"):
-            signal_score += 1.0
+        if support_count > 0:
+            signal_score += min(float(support_count) * 0.75, 2.5)
+        if oppose_count > 0:
+            signal_score -= min(float(oppose_count) * 0.75, 2.0)
         if isinstance(vol_z, (int, float)):
             signal_score += min(abs(vol_z) * 0.5, 2.0)
     except Exception:
@@ -1244,16 +1321,19 @@ def get_trading_signal(
         "volume_zscore": float(volume_zscore),
         "market_features": features,
         "last_close_ts": float(last_close_ts),
+        "majority_trend": majority_trend,
+        "depth_imbalance": depth_imbalance,
+        "spread_pct": ob.get("spread_pct"),
+        "volume_zscore_5m": tf5.get("volume_zscore"),
+        "strong_trend_flag_5m": tf5.get("strong_trend_flag"),
+        "direction_source": direction_meta.get("direction_source"),
+        "high_tf_bias_4h": direction_meta.get("4h_bias"),
+        "high_tf_bias_1h": direction_meta.get("1h_bias"),
+        "high_tf_bias_15m": direction_meta.get("15m_bias"),
+        "bias_5m": direction_meta.get("5m_bias"),
+        "support_count": int(direction_meta.get("support_count") or 0),
+        "oppose_count": int(direction_meta.get("oppose_count") or 0),
     }
-
-    try:
-        extra["majority_trend"] = majority_trend
-        extra["depth_imbalance"] = depth_imbalance
-        extra["spread_pct"] = ob.get("spread_pct")
-        extra["volume_zscore_5m"] = tf5.get("volume_zscore")
-        extra["strong_trend_flag_5m"] = tf5.get("strong_trend_flag")
-    except Exception:
-        pass
 
     _set_signal_freeze_state(
         symbol=symbol,

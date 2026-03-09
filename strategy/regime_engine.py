@@ -45,8 +45,31 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
   60 <= < 80              -> multiplier = 0.5
   >= 80                   -> multiplier = 0.0 (진입 금지급 과열)
 
+추가 정책 — Absolute Threshold Hysteresis (TRADE-GRADE)
+--------------------------------------------------------
+- 경계 점수(35/50/65) 근처에서 band/allocation 이 한 틱마다 흔들리는 것을 줄이기 위해
+  명시적 hysteresis margin 을 적용한다.
+- 이는 폴백이 아니라 "상태 전이 정책"이다.
+- 기본 margin = 2.0 score points
+
+  예시:
+  - LOW -> MID 승격: score >= 52
+  - MID -> LOW 강등: score < 48
+  - MID -> HIGH 승격: score >= 67
+  - HIGH -> MID 강등: score < 63
+
 PATCH NOTES
 --------------------------------------------------------
+- 2026-03-10
+  - FIX(ROOT-CAUSE): typing import 계약 누락 수정
+    * snapshot_decision_state() 추가 후 Dict import 누락으로 Pylance reportUndefinedVariable 발생
+    * typing import 를 현재 annotation 사용과 정합화
+  - 기존 기능 삭제 없음
+- 2026-03-09
+  - TRADE-GRADE: absolute threshold hysteresis 추가
+    * decide() 가 이전 band 상태를 기준으로 경계 흔들림을 완화
+    * entry/no-entry 및 allocation 경계 출렁임 감소
+  - decide_state snapshot API 추가
 - 2026-03-03
   - TRADE-GRADE: micro_score_risk 기반 allocation 페널티 반영 API 추가(STRICT)
     * decide_with_microstructure(...)
@@ -63,7 +86,7 @@ import math
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Tuple
 
 
 # ─────────────────────────────────────────────
@@ -168,6 +191,62 @@ def _band_and_allocation_by_absolute_threshold(score: float) -> Tuple[str, float
     return "HIGH", 1.0
 
 
+def _allocation_by_band_strict(band: str) -> float:
+    b = str(band).strip().upper()
+    if b == "NO_TRADE":
+        return 0.0
+    if b == "LOW":
+        return 0.4
+    if b == "MID":
+        return 0.7
+    if b == "HIGH":
+        return 1.0
+    raise RegimeEngineError(f"unknown regime band: {band!r}")
+
+
+def _band_with_hysteresis(score: float, prev_band: Optional[str], margin: float) -> str:
+    """
+    STRICT:
+    - 이전 band 가 있으면 경계 전이를 hysteresis margin 기준으로 판단
+    - 이전 band 가 없으면 절대 기준 그대로 사용
+    """
+    raw_band, _ = _band_and_allocation_by_absolute_threshold(score)
+    if prev_band is None:
+        return raw_band
+
+    b = str(prev_band).strip().upper()
+    if b not in {"NO_TRADE", "LOW", "MID", "HIGH"}:
+        raise RegimeEngineError(f"invalid previous regime band: {prev_band!r}")
+
+    if margin <= 0.0 or not math.isfinite(margin):
+        raise RegimeEngineError(f"hysteresis margin invalid: {margin}")
+
+    # 경계: 35 / 50 / 65
+    if b == "NO_TRADE":
+        if score >= 35.0 + margin:
+            return "LOW"
+        return "NO_TRADE"
+
+    if b == "LOW":
+        if score < 35.0 - margin:
+            return "NO_TRADE"
+        if score >= 50.0 + margin:
+            return "MID"
+        return "LOW"
+
+    if b == "MID":
+        if score < 50.0 - margin:
+            return "LOW"
+        if score >= 65.0 + margin:
+            return "HIGH"
+        return "MID"
+
+    # HIGH
+    if score < 65.0 - margin:
+        return "MID"
+    return "HIGH"
+
+
 def _micro_multiplier(micro_score_risk: float) -> float:
     """
     확정 정책(명시 룰): micro_score_risk(0~100) -> allocation multiplier.
@@ -202,6 +281,7 @@ class RegimeEngine:
         *,
         window_size: int = 200,
         percentile_min_history: int = 60,
+        hysteresis_margin: float = 2.0,
     ) -> None:
         if not isinstance(window_size, int) or window_size <= 0:
             raise ValueError("window_size must be positive int")
@@ -210,11 +290,25 @@ class RegimeEngine:
         if percentile_min_history > window_size:
             raise ValueError("percentile_min_history must be <= window_size")
 
+        if isinstance(hysteresis_margin, bool):
+            raise ValueError("hysteresis_margin must be numeric (bool not allowed)")
+        try:
+            hysteresis_margin_f = float(hysteresis_margin)
+        except Exception as e:
+            raise ValueError("hysteresis_margin must be numeric") from e
+        if not math.isfinite(hysteresis_margin_f) or hysteresis_margin_f <= 0.0:
+            raise ValueError("hysteresis_margin must be finite > 0")
+
         self._window_size: int = window_size
         self._percentile_min_history: int = percentile_min_history
+        self._hysteresis_margin: float = float(hysteresis_margin_f)
 
         self._lock = threading.Lock()
         self._scores: Deque[float] = deque(maxlen=window_size)
+
+        # TRADE-GRADE: allocation band 경계 흔들림 완화용 상태
+        self._last_decision_band: Optional[str] = None
+        self._last_decision_score: Optional[float] = None
 
     # ── properties ─────────────────────────────
     @property
@@ -225,6 +319,10 @@ class RegimeEngine:
     def history_len(self) -> int:
         with self._lock:
             return len(self._scores)
+
+    @property
+    def hysteresis_margin(self) -> float:
+        return self._hysteresis_margin
 
     # ── update / snapshot ──────────────────────
     def update(self, score: object) -> float:
@@ -245,6 +343,14 @@ class RegimeEngine:
         with self._lock:
             return list(self._scores)
 
+    def snapshot_decision_state(self) -> Dict[str, Optional[float | str]]:
+        """현재 hysteresis decision state 스냅샷."""
+        with self._lock:
+            return {
+                "last_decision_band": self._last_decision_band,
+                "last_decision_score": self._last_decision_score,
+            }
+
     # ── absolute threshold decision ────────────
     def decide(self, score: object) -> RegimeDecision:
         """
@@ -253,12 +359,17 @@ class RegimeEngine:
         STRICT:
         - score 유효성 강제
         - allocation은 정책에 따른 결정값(폴백 없음)
+        - 이전 decision state 를 사용해 band hysteresis 적용
         """
         v = _as_score(score, name="regime_score")
-        band, alloc = _band_and_allocation_by_absolute_threshold(v)
 
         with self._lock:
             hlen = len(self._scores)
+            prev_band = self._last_decision_band
+            band = _band_with_hysteresis(v, prev_band, self._hysteresis_margin)
+            alloc = _allocation_by_band_strict(band)
+            self._last_decision_band = band
+            self._last_decision_score = float(v)
 
         return RegimeDecision(
             score=v,
@@ -284,10 +395,8 @@ class RegimeEngine:
         ms = _as_micro_score(micro_score_risk, name="micro_score_risk")
         mul = _micro_multiplier(ms)
 
-        # allocation은 정책에 의해 곱셈 적용(클램프 아님)
         alloc = float(base.allocation) * float(mul)
 
-        # band는 "의미 보존"을 위해 suffix만 추가(정책적 표기)
         band = base.band
         if mul == 0.0:
             band = f"{band}|MICRO_BLOCK"

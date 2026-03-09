@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 ========================================================
 strategy/account_state_builder.py
@@ -42,6 +44,20 @@ DD(드로우다운) 정의
 - 외부 I/O를 하지 않기 때문에, 재시작 후에도 DD를 유지하려면 caller가
   persisted_equity_peak_usdt(이전에 저장해둔 피크)를 전달해야 한다.
 
+PATCH NOTES — 2026-03-10
+--------------------------------------------------------
+- STRICT runtime-state contract 강화:
+  - 최신 closed trade anchor(id, ts) rollback 감지 추가
+  - 동일 builder 인스턴스에서 과거 스냅샷이 다시 들어오면 즉시 예외
+- closed_trades 무결성 강화:
+  - duplicate trade id 금지
+  - exit_ts desc 정렬 위반 금지
+  - same exit_ts tie 시 id desc 위반 금지
+- planned RR 입력 계약 강화:
+  - tp_pct/sl_pct는 "둘 다 존재" 또는 "둘 다 없음"만 허용
+  - 한쪽만 존재하는 부분 입력은 즉시 예외
+- peak runtime state snapshot API 추가
+
 PATCH NOTES — 2026-03-02
 --------------------------------------------------------
 - AccountStateBuilder 도입(런타임 DD + 최근 승률/연속손실/계획 RR).
@@ -56,8 +72,6 @@ PATCH NOTES — 2026-03-02 (PATCH)
 - closed_trades 정렬(최신→과거) 검증 추가(위반 시 즉시 예외).
 ========================================================
 """
-
-from __future__ import annotations
 
 import math
 import threading
@@ -139,7 +153,6 @@ def _as_datetime(v: Any, name: str) -> datetime:
             raise AccountStateInputError(f"{name} must be timezone-aware datetime")
         return v
     if isinstance(v, str) and v.strip():
-        # STRICT: ISO8601만 허용. 실패 시 예외.
         try:
             dt = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
         except Exception as e:
@@ -162,20 +175,31 @@ def _extract_closed_trade_row(row: Any) -> Tuple[int, datetime, float, Optional[
     exit_ts = _as_datetime(row.get("exit_ts"), "trade.exit_ts")
     pnl_usdt = _as_float(row.get("pnl_usdt"), "trade.pnl_usdt")
 
-    # tp/sl은 선택(있을 때만 planned RR 계산)
     tp_pct = row.get("tp_pct")
     sl_pct = row.get("sl_pct")
+
+    if (tp_pct is None) ^ (sl_pct is None):
+        raise AccountStateInputError("trade.tp_pct and trade.sl_pct must be provided together (STRICT)")
 
     tp_f = None if tp_pct is None else _as_float(tp_pct, "trade.tp_pct", min_value=0.0)
     sl_f = None if sl_pct is None else _as_float(sl_pct, "trade.sl_pct", min_value=0.0)
 
-    # STRICT: tp/sl이 둘 다 있으면 0보다 커야 RR이 의미있다.
     if tp_f is not None and tp_f <= 0:
-        tp_f = None
+        raise AccountStateInputError("trade.tp_pct must be > 0 when provided (STRICT)")
     if sl_f is not None and sl_f <= 0:
-        sl_f = None
+        raise AccountStateInputError("trade.sl_pct must be > 0 when provided (STRICT)")
 
     return trade_id, exit_ts, pnl_usdt, tp_f, sl_f
+
+
+def _validate_closed_trades_unique(
+    rows: List[Tuple[int, datetime, float, Optional[float], Optional[float]]]
+) -> None:
+    seen: set[int] = set()
+    for trade_id, *_ in rows:
+        if trade_id in seen:
+            raise AccountStateInputError(f"duplicate closed trade id detected: {trade_id}")
+        seen.add(trade_id)
 
 
 def _validate_closed_trades_sorted_desc(
@@ -184,16 +208,25 @@ def _validate_closed_trades_sorted_desc(
     """
     STRICT: 최신→과거(내림차순) 정렬을 검증한다.
     - rows[0].exit_ts >= rows[1].exit_ts >= ...
+    - 같은 exit_ts면 id desc 이어야 함
     """
     if len(rows) < 2:
         return
-    prev_ts = rows[0][1]
+
+    prev_id, prev_ts, *_ = rows[0]
     for i in range(1, len(rows)):
-        ts = rows[i][1]
+        trade_id, ts, *_ = rows[i]
+
         if ts > prev_ts:
             raise AccountStateInputError(
                 "closed_trades must be sorted by exit_ts desc (most recent first)"
             )
+        if ts == prev_ts and trade_id > prev_id:
+            raise AccountStateInputError(
+                "closed_trades with same exit_ts must be sorted by id desc (STRICT)"
+            )
+
+        prev_id = trade_id
         prev_ts = ts
 
 
@@ -207,8 +240,10 @@ def _compute_planned_rr_avg(rows: List[Tuple[int, datetime, float, Optional[floa
         if tp is None or sl is None:
             continue
         rr = tp / sl
-        if math.isfinite(rr) and rr > 0:
-            vals.append(rr)
+        if not math.isfinite(rr) or rr <= 0:
+            raise AccountStateInputError(f"planned RR invalid (STRICT): {rr}")
+        vals.append(rr)
+
     if not vals:
         return None
     return float(sum(vals) / len(vals))
@@ -246,6 +281,8 @@ class AccountStateBuilder:
 
         self._lock = threading.Lock()
         self._equity_peak_usdt: Optional[float] = None
+        self._last_closed_trade_id: Optional[int] = None
+        self._last_closed_trade_ts: Optional[datetime] = None
 
         if initial_equity_peak_usdt is not None:
             peak = _as_float(initial_equity_peak_usdt, "initial_equity_peak_usdt", min_value=0.0)
@@ -257,6 +294,14 @@ class AccountStateBuilder:
         """caller가 외부 저장(예: DB)할 수 있도록 현재 peak를 반환한다(없으면 None)."""
         with self._lock:
             return None if self._equity_peak_usdt is None else float(self._equity_peak_usdt)
+
+    def snapshot_runtime_state(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "equity_peak_usdt": None if self._equity_peak_usdt is None else float(self._equity_peak_usdt),
+                "last_closed_trade_id": self._last_closed_trade_id,
+                "last_closed_trade_ts": self._last_closed_trade_ts,
+            }
 
     def reset_peak(self) -> None:
         """의도적 리셋(운영에서 일반적으로 사용 금지)."""
@@ -283,11 +328,9 @@ class AccountStateBuilder:
             if persisted_peak <= 0.0:
                 raise AccountStateInputError("persisted_equity_peak_usdt must be > 0")
 
-        # peak equity 확정(STRICT, 외부 I/O 없이)
         with self._lock:
             runtime_peak = self._equity_peak_usdt
 
-            # peak 후보: runtime_peak / persisted_peak / equity_now
             candidates: List[float] = [float(equity_now)]
             if runtime_peak is not None:
                 candidates.append(float(runtime_peak))
@@ -316,12 +359,28 @@ class AccountStateBuilder:
         if not parsed:
             raise AccountStateNotReadyError("no closed_trades provided")
 
-        # STRICT: 최신→과거 정렬 검증
+        _validate_closed_trades_unique(parsed)
         _validate_closed_trades_sorted_desc(parsed)
 
         last_id, last_ts, *_ = parsed[0]
 
-        # consecutive losses: from most recent backwards
+        with self._lock:
+            prev_last_id = self._last_closed_trade_id
+            prev_last_ts = self._last_closed_trade_ts
+
+            if prev_last_ts is not None:
+                if last_ts < prev_last_ts:
+                    raise AccountStateInputError(
+                        f"latest closed trade ts rollback detected (STRICT): prev={prev_last_ts} now={last_ts}"
+                    )
+                if last_ts == prev_last_ts and prev_last_id is not None and last_id < prev_last_id:
+                    raise AccountStateInputError(
+                        f"latest closed trade id rollback detected (STRICT): prev={prev_last_id} now={last_id}"
+                    )
+
+            self._last_closed_trade_id = int(last_id)
+            self._last_closed_trade_ts = last_ts
+
         consec_losses = 0
         for _, __, pnl, ___, ____ in parsed:
             if pnl < 0:
@@ -329,7 +388,6 @@ class AccountStateBuilder:
             else:
                 break
 
-        # win rate over last N
         n = min(self._win_rate_window, len(parsed))
         window = parsed[:n]
         if len(window) < self._min_trades_for_win_rate:

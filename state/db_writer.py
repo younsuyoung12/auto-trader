@@ -15,6 +15,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-09 (TRADE-GRADE, STRICT WRITE-PATH FIX)
+  1) FIX(ROOT-CAUSE): OPEN write-path 실행 계약 검증 강화
+     - reconciliation_status / last_synced_at / execution ids / remaining_qty / position_side 정합 검증 추가
+     - PROTECTION_VERIFIED 상태는 필수 실행 필드 누락 시 즉시 예외
+  2) FIX(STATE): CLOSE write-path 에서 실행/복구 필드 종결 처리 추가
+     - remaining_qty=0.0
+     - realized_pnl_usdt 즉시 반영
+     - reconciliation_status="CLOSED"
+     - last_synced_at=exit_ts
+  3) FIX(MATH): snapshot write-path 에서 equity_current / equity_peak / dd_pct 삼자 정합 검증 추가
+  4) FIX(RANGE): risk_pct / tp_pct / sl_pct / exec_slippage_pct / exec_adverse_move_pct / auto_risk_multiplier 범위 검증 강화
+  5) 기존 기능 삭제 없음
+
 - 2026-03-07 (TRADE-GRADE, STRICT WRITE-PATH FIX)
   1) bt_trades 분석 호환 필드 저장 보강:
      - OPEN 시 즉시 기록:
@@ -85,6 +98,17 @@ from sqlalchemy import desc
 
 from state.db_core import get_session
 from state.db_models import ExternalEvent, FundingRate, TradeExitSnapshot, TradeORM, TradeSnapshot
+
+
+_ALLOWED_POSITION_SIDES = ("BOTH", "LONG", "SHORT")
+_ALLOWED_OPEN_RECONCILIATION_STATUSES = (
+    "ENTRY_FILLED",
+    "PROTECTION_VERIFIED",
+    "TEST_DRY_RUN",
+    "MISMATCH_NO_POSITION",
+    "MISMATCH_PROTECTION_ORDERS",
+)
+_DD_PCT_ABS_TOL = 0.25
 
 
 def _utc_now() -> datetime:
@@ -240,6 +264,95 @@ def _setattr_strict(row: Any, field: str, value: Any) -> None:
     setattr(row, field, value)
 
 
+def _opt_position_side_strict(v: Any, name: str) -> Optional[str]:
+    s = _opt_nonempty_str_maxlen(v, name, max_len=16)
+    if s is None:
+        return None
+    su = s.upper()
+    if su not in _ALLOWED_POSITION_SIDES:
+        raise ValueError(f"{name} must be one of {_ALLOWED_POSITION_SIDES}")
+    return su
+
+
+def _opt_open_reconciliation_status_strict(v: Any, name: str) -> Optional[str]:
+    s = _opt_nonempty_str_maxlen(v, name, max_len=32)
+    if s is None:
+        return None
+    su = s.upper()
+    if su not in _ALLOWED_OPEN_RECONCILIATION_STATUSES:
+        raise ValueError(f"{name} invalid status: {su}")
+    return su
+
+
+def _validate_equity_dd_triplet_strict(
+    *,
+    equity_current_usdt: Optional[float],
+    equity_peak_usdt: Optional[float],
+    dd_pct: Optional[float],
+) -> None:
+    if equity_current_usdt is None and equity_peak_usdt is None and dd_pct is None:
+        return
+
+    if equity_current_usdt is None or equity_peak_usdt is None or dd_pct is None:
+        raise ValueError("equity_current_usdt / equity_peak_usdt / dd_pct must be provided together (STRICT)")
+
+    cur = float(equity_current_usdt)
+    peak = float(equity_peak_usdt)
+    dd = float(dd_pct)
+
+    if peak <= 0.0 or cur <= 0.0:
+        raise ValueError("equity_current_usdt and equity_peak_usdt must be > 0 when dd_pct is provided")
+    if cur > peak + 1e-9:
+        raise ValueError(f"equity_current_usdt > equity_peak_usdt (STRICT): cur={cur} peak={peak}")
+
+    dd_expected = (peak - cur) / peak * 100.0
+    if abs(dd_expected - dd) > _DD_PCT_ABS_TOL:
+        raise ValueError(
+            f"dd_pct inconsistent with equity values (STRICT): expected={dd_expected:.6f} actual={dd:.6f}"
+        )
+
+
+def _validate_open_exec_contract_strict(
+    *,
+    qty: float,
+    entry_order_id: Optional[str],
+    tp_order_id: Optional[str],
+    sl_order_id: Optional[str],
+    exchange_position_side: Optional[str],
+    remaining_qty: Optional[float],
+    realized_pnl_usdt: Optional[float],
+    reconciliation_status: Optional[str],
+    last_synced_at: Optional[datetime],
+) -> None:
+    _ = sl_order_id
+
+    if remaining_qty is not None:
+        if remaining_qty <= 0:
+            raise ValueError("remaining_qty must be > 0 when provided")
+        if remaining_qty - qty > 1e-9:
+            raise ValueError("remaining_qty must be <= qty (STRICT)")
+
+    if reconciliation_status is None and last_synced_at is not None:
+        raise ValueError("last_synced_at provided without reconciliation_status (STRICT)")
+
+    if reconciliation_status is not None and last_synced_at is None:
+        raise ValueError("reconciliation_status provided without last_synced_at (STRICT)")
+
+    if reconciliation_status == "PROTECTION_VERIFIED":
+        if entry_order_id is None:
+            raise ValueError("entry_order_id is required for PROTECTION_VERIFIED")
+        if tp_order_id is None:
+            raise ValueError("tp_order_id is required for PROTECTION_VERIFIED")
+        if exchange_position_side is None:
+            raise ValueError("exchange_position_side is required for PROTECTION_VERIFIED")
+        if remaining_qty is None:
+            raise ValueError("remaining_qty is required for PROTECTION_VERIFIED")
+        if realized_pnl_usdt is None:
+            raise ValueError("realized_pnl_usdt is required for PROTECTION_VERIFIED")
+        if last_synced_at is None:
+            raise ValueError("last_synced_at is required for PROTECTION_VERIFIED")
+
+
 # ─────────────────────────────────────────────
 # Trades (bt_trades)
 # ─────────────────────────────────────────────
@@ -283,12 +396,29 @@ def record_trade_open_returning_id(
     eoid = _opt_nonempty_str_maxlen(entry_order_id, "entry_order_id", max_len=64)
     tpid = _opt_nonempty_str_maxlen(tp_order_id, "tp_order_id", max_len=64)
     slid = _opt_nonempty_str_maxlen(sl_order_id, "sl_order_id", max_len=64)
-    pside = _opt_nonempty_str_maxlen(exchange_position_side, "exchange_position_side", max_len=16)
+    pside = _opt_position_side_strict(exchange_position_side, "exchange_position_side")
 
     rem_qty = _opt_float_min(remaining_qty, "remaining_qty", min_value=0.0)
     rpnl = _opt_float(realized_pnl_usdt, "realized_pnl_usdt")
-    rstat = _opt_nonempty_str_maxlen(reconciliation_status, "reconciliation_status", max_len=32)
+    rstat = _opt_open_reconciliation_status_strict(reconciliation_status, "reconciliation_status")
     lsync = _opt_tzaware_dt(last_synced_at, "last_synced_at")
+
+    entry_score_v = _opt_float_range(entry_score, "entry_score", min_value=0.0, max_value=1.0)
+    risk_pct_v = _opt_float_range(risk_pct, "risk_pct", min_value=0.0, max_value=1.0)
+    tp_pct_v = _opt_float_range(tp_pct, "tp_pct", min_value=0.0, max_value=1.0)
+    sl_pct_v = _opt_float_range(sl_pct, "sl_pct", min_value=0.0, max_value=1.0)
+
+    _validate_open_exec_contract_strict(
+        qty=float(q),
+        entry_order_id=eoid,
+        tp_order_id=tpid,
+        sl_order_id=slid,
+        exchange_position_side=pside,
+        remaining_qty=rem_qty,
+        realized_pnl_usdt=rpnl,
+        reconciliation_status=rstat,
+        last_synced_at=lsync,
+    )
 
     _require_model_field(TradeORM, "opened_ts_ms", model_name="TradeORM")
     _require_model_field(TradeORM, "status", model_name="TradeORM")
@@ -305,13 +435,13 @@ def record_trade_open_returning_id(
             is_auto=bool(is_auto),
             regime_at_entry=(str(regime_at_entry).strip()[:16] if regime_at_entry else None),
             strategy=(str(strategy).strip()[:16] if strategy else None),
-            entry_score=_opt_float(entry_score, "entry_score"),
+            entry_score=entry_score_v,
             trend_score_at_entry=_opt_float(trend_score_at_entry, "trend_score_at_entry"),
             range_score_at_entry=_opt_float(range_score_at_entry, "range_score_at_entry"),
             leverage=_opt_float(leverage, "leverage"),
-            risk_pct=_opt_float(risk_pct, "risk_pct"),
-            tp_pct=_opt_float(tp_pct, "tp_pct"),
-            sl_pct=_opt_float(sl_pct, "sl_pct"),
+            risk_pct=risk_pct_v,
+            tp_pct=tp_pct_v,
+            sl_pct=sl_pct_v,
             note=(str(note).strip()[:255] if note else None),
             opened_ts_ms=int(opened_ts_ms),
             status="OPEN",
@@ -390,6 +520,10 @@ def close_latest_open_trade_returning_id(
         trade.exit_ts = xts
         trade.pnl_usdt = float(pnl_val)
         trade.close_reason = str(reason).strip()[:32]
+        trade.remaining_qty = 0.0
+        trade.realized_pnl_usdt = float(pnl_val)
+        trade.reconciliation_status = "CLOSED"
+        trade.last_synced_at = xts
 
         if regime_at_exit:
             trade.regime_at_exit = str(regime_at_exit).strip()[:16]
@@ -481,6 +615,11 @@ def record_trade_snapshot(
     eq_cur = _opt_float_min(equity_current_usdt, "equity_current_usdt", min_value=0.0)
     eq_peak = _opt_float_min(equity_peak_usdt, "equity_peak_usdt", min_value=0.0)
     dd_v = _opt_float_range(dd_pct, "dd_pct", min_value=0.0, max_value=100.0)
+    _validate_equity_dd_triplet_strict(
+        equity_current_usdt=eq_cur,
+        equity_peak_usdt=eq_peak,
+        dd_pct=dd_v,
+    )
 
     # Decision Reconciliation
     did = _opt_nonempty_str_maxlen(decision_id, "decision_id", max_len=64)
@@ -522,6 +661,11 @@ def record_trade_snapshot(
     arm = _opt_float_range(auto_risk_multiplier, "auto_risk_multiplier", min_value=0.0, max_value=1.0)
     abr = _opt_json_dict(auto_block_reasons, "auto_block_reasons")
 
+    entry_score_v = _opt_float_range(entry_score, "entry_score", min_value=0.0, max_value=1.0)
+    risk_pct_v = _opt_float_range(risk_pct, "risk_pct", min_value=0.0, max_value=1.0)
+    tp_pct_v = _opt_float_range(tp_pct, "tp_pct", min_value=0.0, max_value=1.0)
+    sl_pct_v = _opt_float_range(sl_pct, "sl_pct", min_value=0.0, max_value=1.0)
+
     with get_session() as session:
         t = session.query(TradeORM).filter(TradeORM.id == tid).first()
         if t is None:
@@ -543,7 +687,7 @@ def record_trade_snapshot(
             direction=dirn,
             signal_source=(str(signal_source).strip() if signal_source else None),
             regime=(str(regime).strip() if regime else None),
-            entry_score=_opt_float(entry_score, "entry_score"),
+            entry_score=entry_score_v,
             engine_total=_opt_float(engine_total, "engine_total"),
             trend_strength=_opt_float(trend_strength, "trend_strength"),
             atr_pct=_opt_float(atr_pct, "atr_pct"),
@@ -553,9 +697,9 @@ def record_trade_snapshot(
             hour_kst=int(hour_kst) if hour_kst is not None else None,
             weekday_kst=int(weekday_kst) if weekday_kst is not None else None,
             last_price=float(last_price) if last_price is not None else None,
-            risk_pct=_opt_float(risk_pct, "risk_pct"),
-            tp_pct=_opt_float(tp_pct, "tp_pct"),
-            sl_pct=_opt_float(sl_pct, "sl_pct"),
+            risk_pct=risk_pct_v,
+            tp_pct=tp_pct_v,
+            sl_pct=sl_pct_v,
             gpt_action=(str(gpt_action).strip() if gpt_action else None),
             gpt_reason=(str(gpt_reason).strip() if gpt_reason else None),
             created_at=_utc_now(),
@@ -715,6 +859,8 @@ def record_funding_rate(
         payload = dict(rj) if rj is not None else {}
         if mp is not None:
             payload["mark_price"] = float(mp)
+
+    _ = payload
 
     with get_session() as session:
         fr = FundingRate(

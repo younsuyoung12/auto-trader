@@ -9,10 +9,19 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 설정/입력 값이 비정상이면 즉시 예외(ValueError/RuntimeError).
 - DB 조회 실패는 즉시 예외(운영 로그에 남게).
 - 트레이딩 엔진(AWS) → DB/대시보드(Render) 원격 환경 전제.
+- DB 접근은 state.db_core.get_session() SSOT만 사용한다.
 ========================================================
 
 변경 이력
 --------------------------------------------------------
+2026-03-09
+- FIX(ROOT-CAUSE): 포지션 가치 상한을 "신규 주문 notional"이 아니라
+  "현재 포지션 반영 projected 총 익스포저" 기준으로 계산하도록 변경
+- FIX(STRICT): DB 접근을 SessionLocal 직접 사용에서 get_session() SSOT로 변경
+- ADD(TRADE-GRADE): 현재 거래소 포지션 방향/수량/진입가 기반 projected exposure 메타 기록
+- FIX(RISK-MODEL): 반대 방향 신규 주문은 단순 차단이 아니라 순노출(net exposure) 기준으로 평가
+- 기존 기능 삭제 없음
+
 2026-03-02
 - STRICT 파싱 강화: 거래소/DB 응답에서 필수 필드 누락 시 즉시 예외(폴백 제거)
 - symbol/side 정규화 및 입력 검증 강화
@@ -34,7 +43,7 @@ from typing import Any, Dict, Optional, Tuple
 from sqlalchemy import func, select
 
 from execution.exchange_api import get_position
-from state.db_core import SessionLocal
+from state.db_core import get_session
 from state.db_models import Trade as TradeORM
 
 logger = logging.getLogger(__name__)
@@ -73,6 +82,15 @@ def _normalize_side(side: str) -> str:
     if s in {"LONG", "SHORT", "BUY", "SELL"}:
         return s
     raise ValueError("side must be one of LONG/SHORT/BUY/SELL")
+
+
+def _normalize_trade_direction(side: str) -> str:
+    s = _normalize_side(side)
+    if s in {"LONG", "BUY"}:
+        return "LONG"
+    if s in {"SHORT", "SELL"}:
+        return "SHORT"
+    raise ValueError(f"invalid trade side: {side!r}")
 
 
 def _req_float_from_dict(d: Dict[str, Any], key: str) -> float:
@@ -171,6 +189,44 @@ def _kst_day_start_utc() -> datetime:
     return start_kst.astimezone(timezone.utc)
 
 
+def _calc_projected_abs_notional_strict(
+    *,
+    current_direction: Optional[str],
+    current_abs_notional: float,
+    incoming_direction: str,
+    incoming_notional: float,
+) -> Tuple[float, str]:
+    """
+    One-way 기준 projected 총 익스포저 계산.
+
+    - 현재 포지션 없음: incoming_notional
+    - 같은 방향 추가 진입: current + incoming
+    - 반대 방향: 순노출(net) 기준 abs(current - incoming)
+
+    Returns:
+      (projected_abs_notional, mode)
+    """
+    if current_abs_notional < 0:
+        raise ValueError("current_abs_notional must be >= 0")
+    if incoming_notional <= 0:
+        raise ValueError("incoming_notional must be > 0")
+
+    incoming_dir = _normalize_trade_direction(incoming_direction)
+
+    if current_direction is None or current_abs_notional == 0.0:
+        return float(incoming_notional), "fresh_entry"
+
+    current_dir = _normalize_trade_direction(current_direction)
+
+    if current_dir == incoming_dir:
+        return float(current_abs_notional + incoming_notional), "same_direction_add"
+
+    if incoming_notional >= current_abs_notional:
+        return float(incoming_notional - current_abs_notional), "opposite_direction_flip_or_reduce"
+
+    return float(current_abs_notional - incoming_notional), "opposite_direction_reduce"
+
+
 # ─────────────────────────────────────────────────────────────
 # DB queries (STRICT)
 # ─────────────────────────────────────────────────────────────
@@ -184,25 +240,19 @@ def _get_today_realized_pnl_usdt(symbol: str) -> float:
     end_utc = start_utc + timedelta(days=1)
 
     try:
-        session = SessionLocal()
-    except Exception as e:
-        raise RuntimeError(f"DB SessionLocal create failed: {e}") from e
-
-    try:
-        stmt = (
-            select(func.coalesce(func.sum(TradeORM.pnl_usdt), 0))
-            .where(TradeORM.symbol == symbol)
-            .where(TradeORM.exit_ts.isnot(None))
-            .where(TradeORM.pnl_usdt.isnot(None))
-            .where(TradeORM.exit_ts >= start_utc)
-            .where(TradeORM.exit_ts < end_utc)
-        )
-        result = session.execute(stmt).scalar_one()
-        return float(result)
+        with get_session() as session:
+            stmt = (
+                select(func.coalesce(func.sum(TradeORM.pnl_usdt), 0))
+                .where(TradeORM.symbol == symbol)
+                .where(TradeORM.exit_ts.isnot(None))
+                .where(TradeORM.pnl_usdt.isnot(None))
+                .where(TradeORM.exit_ts >= start_utc)
+                .where(TradeORM.exit_ts < end_utc)
+            )
+            result = session.execute(stmt).scalar_one()
+            return float(result)
     except Exception as e:
         raise RuntimeError(f"daily pnl query failed: {e}") from e
-    finally:
-        session.close()
 
 
 def _get_total_realized_pnl_usdt(symbol: str) -> float:
@@ -212,23 +262,17 @@ def _get_total_realized_pnl_usdt(symbol: str) -> float:
     - pnl_usdt NULL 제외
     """
     try:
-        session = SessionLocal()
-    except Exception as e:
-        raise RuntimeError(f"DB SessionLocal create failed: {e}") from e
-
-    try:
-        stmt = (
-            select(func.coalesce(func.sum(TradeORM.pnl_usdt), 0))
-            .where(TradeORM.symbol == symbol)
-            .where(TradeORM.exit_ts.isnot(None))
-            .where(TradeORM.pnl_usdt.isnot(None))
-        )
-        result = session.execute(stmt).scalar_one()
-        return float(result)
+        with get_session() as session:
+            stmt = (
+                select(func.coalesce(func.sum(TradeORM.pnl_usdt), 0))
+                .where(TradeORM.symbol == symbol)
+                .where(TradeORM.exit_ts.isnot(None))
+                .where(TradeORM.pnl_usdt.isnot(None))
+            )
+            result = session.execute(stmt).scalar_one()
+            return float(result)
     except Exception as e:
         raise RuntimeError(f"total pnl query failed: {e}") from e
-    finally:
-        session.close()
 
 
 def _get_consecutive_losses(symbol: str, *, lookback: int = 50) -> int:
@@ -239,20 +283,16 @@ def _get_consecutive_losses(symbol: str, *, lookback: int = 50) -> int:
         raise ValueError("lookback must be > 0")
 
     try:
-        session = SessionLocal()
-    except Exception as e:
-        raise RuntimeError(f"DB SessionLocal create failed: {e}") from e
-
-    try:
-        stmt = (
-            select(TradeORM.pnl_usdt)
-            .where(TradeORM.symbol == symbol)
-            .where(TradeORM.exit_ts.isnot(None))
-            .where(TradeORM.pnl_usdt.isnot(None))
-            .order_by(TradeORM.exit_ts.desc())
-            .limit(int(lookback))
-        )
-        rows = session.execute(stmt).all()
+        with get_session() as session:
+            stmt = (
+                select(TradeORM.pnl_usdt)
+                .where(TradeORM.symbol == symbol)
+                .where(TradeORM.exit_ts.isnot(None))
+                .where(TradeORM.pnl_usdt.isnot(None))
+                .order_by(TradeORM.exit_ts.desc())
+                .limit(int(lookback))
+            )
+            rows = session.execute(stmt).all()
 
         cnt = 0
         for (pnl_val,) in rows:
@@ -264,8 +304,6 @@ def _get_consecutive_losses(symbol: str, *, lookback: int = 50) -> int:
         return cnt
     except Exception as e:
         raise RuntimeError(f"consecutive losses query failed: {e}") from e
-    finally:
-        session.close()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -298,9 +336,9 @@ def hard_risk_guard_check(
     - 일일 손실 한도(USDT)
     - (옵션) available_usdt 기준 일일 손실 % 한도
     - 연속 손실 한도
-    - 계좌 대비 포지션 가치 상한
+    - 계좌 대비 projected 총 포지션 가치 상한
     - 청산거리 최소 % (현재 포지션이 있는 경우에만 liquidationPrice 기반 체크)
-    - (옵션) 보유 포지션 미실현 손실 한도(물타기/추가진입 방지)
+    - (옵션) 보유 포지션 미실현 손실 한도(물타기 방지)
 
     Returns:
         (ok, reason, extra)
@@ -308,7 +346,7 @@ def hard_risk_guard_check(
     _validate_hard_risk_settings(settings)
 
     symbol_n = _normalize_symbol(symbol)
-    side_n = _normalize_side(side)
+    side_n = _normalize_trade_direction(side)
 
     entry_price_f = _as_float(entry_price, "entry_price", min_value=0.0)
     notional_f = _as_float(notional, "notional", min_value=0.0)
@@ -325,7 +363,7 @@ def hard_risk_guard_check(
         "symbol": symbol_n,
         "side": side_n,
         "entry_price": entry_price_f,
-        "notional": notional_f,
+        "incoming_notional": notional_f,
         "available_usdt": available_f,
     }
 
@@ -369,13 +407,46 @@ def hard_risk_guard_check(
         if consec_losses >= consec_limit:
             return False, "hard_consecutive_losses_limit_exceeded", extra
 
-    # [3] 계좌 대비 포지션 가치 상한
+    # [3] 계좌 대비 projected 총 포지션 가치 상한
     pct_cap = float(getattr(settings, "hard_position_value_pct_cap"))
     extra["hard_position_value_pct_cap"] = pct_cap
 
+    pos = _get_position_snapshot(symbol_n)
+
+    pos_amt = _req_float_from_dict(pos, "positionAmt")
+    extra["positionAmt"] = pos_amt
+
+    current_direction: Optional[str] = None
+    current_entry_price: Optional[float] = None
+    current_abs_notional = 0.0
+
+    if abs(pos_amt) > 0.0:
+        current_direction = "LONG" if pos_amt > 0 else "SHORT"
+        current_entry_price = _req_float_from_dict_multi(
+            pos,
+            ("entryPrice",),
+            name="entry_price",
+        )
+        if current_entry_price <= 0:
+            raise RuntimeError("entryPrice must be > 0 when positionAmt != 0")
+        current_abs_notional = abs(pos_amt) * current_entry_price
+
+    extra["current_position_direction"] = current_direction
+    extra["current_position_entry_price"] = current_entry_price
+    extra["current_position_abs_notional"] = current_abs_notional
+
+    projected_abs_notional, projected_mode = _calc_projected_abs_notional_strict(
+        current_direction=current_direction,
+        current_abs_notional=float(current_abs_notional),
+        incoming_direction=side_n,
+        incoming_notional=float(notional_f),
+    )
+    extra["projected_abs_notional"] = projected_abs_notional
+    extra["projected_exposure_mode"] = projected_mode
+
     max_notional = available_f * (pct_cap / 100.0)
     extra["max_notional_by_cap"] = max_notional
-    if notional_f > max_notional:
+    if projected_abs_notional > max_notional:
         return False, "hard_position_value_pct_cap_exceeded", extra
 
     # [4] 청산거리 최소 % + [5] (옵션) 보유 포지션 미실현 손실 한도
@@ -383,11 +454,6 @@ def hard_risk_guard_check(
     open_unrealized_limit = float(getattr(settings, "hard_open_unrealized_loss_limit_usdt", 0.0) or 0.0)
 
     if liq_min_pct > 0 or open_unrealized_limit > 0:
-        pos = _get_position_snapshot(symbol_n)
-
-        pos_amt = _req_float_from_dict(pos, "positionAmt")
-        extra["positionAmt"] = pos_amt
-
         # [5] (옵션) 보유 포지션 미실현 손실 한도(물타기/추가진입 방지)
         if open_unrealized_limit > 0 and abs(pos_amt) > 0:
             unrl = _req_float_from_dict_multi(
@@ -408,7 +474,13 @@ def hard_risk_guard_check(
                 raise RuntimeError("liquidationPrice must be > 0 when positionAmt != 0")
             extra["liquidationPrice"] = liq_price
 
-            dist_pct = abs(entry_price_f - liq_price) / entry_price_f * 100.0
+            # live 포지션이 있으면 거래소 live entryPrice 기준으로 평가
+            liq_ref_price = float(current_entry_price) if current_entry_price is not None else entry_price_f
+            if liq_ref_price <= 0:
+                raise RuntimeError("liquidation reference price must be > 0 (STRICT)")
+            extra["liquidation_distance_reference_price"] = liq_ref_price
+
+            dist_pct = abs(liq_ref_price - liq_price) / liq_ref_price * 100.0
             extra["liquidation_distance_pct"] = dist_pct
             if dist_pct < liq_min_pct:
                 return False, "hard_liquidation_distance_too_close", extra

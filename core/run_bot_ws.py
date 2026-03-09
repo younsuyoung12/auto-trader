@@ -21,6 +21,20 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-10 (TRADE-GRADE PATCH 6):
+  1) FIX(ROOT-CAUSE): 동일 5m 캔들 진입 게이트 claim 시점을 _build_entry_market_data 호출 전으로 승격
+     - equity/data_health/WS readiness 통과 후 현재 authoritative WS 5m candle ts 를 먼저 claim
+     - same-candle no-signal / direction-block / low-volatility skip 도 재시작 후 재평가되지 않음
+     - 같은 5m 캔들 내 LONG↔SHORT late flip 재진입 경로 근본 차단
+  2) FIX(STRICT): market_data.signal_ts_ms 와 pre-claimed authoritative WS 5m ts 일치 강제
+     - signal generator 와 runtime gate 의 candle 기준 불일치 즉시 예외
+  3) FIX(PNL): closed trade 처리 시 summary['pnl'] 대신 trade.realized_pnl_usdt 총손익 우선 사용
+     - partial close 누적 후 final close 의 리스크 캐시/연속손실/계정상태 왜곡 제거
+  4) FIX(TIME): close cache exit_ts 를 now 가 아니라 거래소 close_time / trade.close_ts 기준으로 기록
+  5) FIX(RECONCILE): fetch_exchange_position_snapshot 에서 다중 live row 집계 지원
+     - sync_exchange 와 동일한 one-way 집계 규칙으로 정합
+  6) 기존 기능 삭제 없음
+
 - 2026-03-09 (TRADE-GRADE PATCH 5):
   1) FIX(ROOT-CAUSE): 동일 5m 캔들 진입 게이트를 메모리 변수에서 DB 영속 체크포인트로 승격
      - LAST_ENTRY_EVAL_SIGNAL_TS_MS 재시작 리셋 문제 제거
@@ -233,12 +247,10 @@ SIGNAL_ANALYSIS_INTERVAL_SEC: int = int(SET.signal_analysis_interval_sec)
 LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
-# TRADE-GRADE PATCH:
-# 같은 signal_ts_ms(실질적으로 동일 5m 캔들)에서는 진입 평가를 한 번만 수행한다.
+# 같은 authoritative 5m 캔들(openTime)에서는 진입 평가를 한 번만 수행한다.
 LAST_ENTRY_EVAL_SIGNAL_TS_MS: Optional[int] = None
 ENTRY_GATE_RUNTIME_STATE_SCOPE: str = "ENTRY_EVAL_SIGNAL_GATE"
 ENTRY_GATE_RUNTIME_STATE_TABLE: str = "bt_engine_runtime_state"
-
 
 _BALANCE_CONSEC_FAILS: int = 0
 _EQUITY_CONSEC_FAILS: int = 0
@@ -385,6 +397,13 @@ def _get_latest_ws_kline_ts_optional(symbol: str, interval: str) -> Optional[int
     return _require_int_ms(row[0], f"ws[{interval}].openTime")
 
 
+def _get_latest_ws_5m_signal_gate_ts_or_raise(symbol: str) -> int:
+    latest_5m_ts = _get_latest_ws_kline_ts_optional(symbol, "5m")
+    if latest_5m_ts is None:
+        raise RuntimeError("authoritative ws 5m latest ts is missing (STRICT)")
+    return int(latest_5m_ts)
+
+
 def _get_orderbook_marker_ts_optional(symbol: str) -> Optional[int]:
     ob = ws_get_orderbook(symbol, limit=1)
     if ob is None:
@@ -436,9 +455,8 @@ def _should_run_entry_cycle(
 
 def _claim_entry_signal_ts_or_skip(symbol: str, signal_ts_ms: Any) -> bool:
     """
-    TRADE-GRADE PATCH:
-    - 동일 signal_ts_ms(동일 5m 캔들 판단)에서는 진입 평가를 한 번만 수행한다.
-    - 메모리만이 아니라 DB 영속 체크포인트를 단일 진실원으로 사용한다.
+    동일 authoritative 5m candle ts 에서는 진입 평가를 한 번만 수행한다.
+    - DB 영속 체크포인트를 단일 진실원으로 사용한다.
     - 과거 ts가 오면 rollback으로 간주하고 즉시 예외.
     - 동일 symbol 다중 프로세스 기동에서도 advisory xact lock + row lock 으로 중복 claim을 차단한다.
     """
@@ -491,9 +509,7 @@ def _claim_entry_signal_ts_or_skip(symbol: str, signal_ts_ms: Any) -> bool:
             },
         ).fetchone()
 
-        prev_db_ts: Optional[int]
         if row is None:
-            prev_db_ts = None
             session.execute(
                 q_insert,
                 {
@@ -878,7 +894,6 @@ def _protection_orders_guard_or_raise() -> None:
     if not symbol:
         raise RuntimeError("trade.symbol is empty (STRICT)")
 
-    # 실제 거래소 포지션이 열려 있을 때만 보호주문 누락을 치명으로 본다.
     if not _exchange_position_is_open_strict(symbol):
         return
 
@@ -968,7 +983,7 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
             log(f"[WS_LIVENESS][FAIL] future kline ts detected age_ms={age_ms} consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
         elif age_ms > int(stale_sec_f * 1000.0):
             _WS_LIVENESS_CONSEC_FAILS += 1
-            log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
+            log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAIL_HARDSTOP_N if False else _WS_LIVENESS_FAIL_HARDSTOP_N}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
         else:
             if _WS_LIVENESS_CONSEC_FAILS != 0:
                 log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
@@ -1274,28 +1289,55 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
     live: List[Dict[str, Any]] = []
     for r in rows:
         if not isinstance(r, dict):
-            continue
+            raise RuntimeError("fetch_open_positions contains non-dict row (STRICT)")
         if str(r.get("symbol") or "").upper().strip() != sym:
             continue
         if "positionAmt" not in r:
             raise RuntimeError("positionRisk.positionAmt missing (STRICT)")
-        try:
-            amt = float(r["positionAmt"])
-        except Exception as e:
-            raise RuntimeError(f"positionAmt parse failed (STRICT): {e}") from e
+        amt = _as_float(r["positionAmt"], "positionRisk.positionAmt")
         if abs(amt) > 1e-12:
             live.append(r)
 
     if not live:
         return {"symbol": sym, "positionAmt": "0", "entryPrice": "0"}
 
-    if len(live) != 1:
-        raise RuntimeError(f"ambiguous exchange positions (STRICT): count={len(live)}")
+    dirs: set[str] = set()
+    pos_sides: set[str] = set()
+    total_signed_amt = 0.0
+    weighted_entry_sum = 0.0
 
-    r0 = live[0]
-    if "entryPrice" not in r0:
-        raise RuntimeError("positionRisk.entryPrice missing (STRICT)")
-    return {"symbol": sym, "positionAmt": str(r0["positionAmt"]), "entryPrice": str(r0["entryPrice"])}
+    for idx, r in enumerate(live):
+        amt = _as_float(r.get("positionAmt"), f"positionRisk[{idx}].positionAmt")
+        entry = _as_float(r.get("entryPrice"), f"positionRisk[{idx}].entryPrice", min_value=0.0)
+        if entry <= 0:
+            raise RuntimeError("positionRisk.entryPrice must be > 0 (STRICT)")
+
+        ps_raw = str(r.get("positionSide") or "").upper().strip() or "BOTH"
+        if ps_raw not in ("BOTH", "LONG", "SHORT"):
+            raise RuntimeError(f"positionRisk.positionSide invalid (STRICT): {ps_raw!r}")
+        pos_sides.add(ps_raw)
+
+        row_dir = ps_raw if ps_raw in ("LONG", "SHORT") else ("LONG" if amt > 0 else "SHORT")
+        dirs.add(row_dir)
+
+        total_signed_amt += amt
+        weighted_entry_sum += abs(amt) * entry
+
+    if len(dirs) != 1:
+        raise RuntimeError(f"ambiguous exchange positions / hedge topology (STRICT): dirs={sorted(list(dirs))}")
+    if "BOTH" in pos_sides and len(pos_sides) > 1:
+        raise RuntimeError(
+            f"ambiguous exchange positionSide topology (STRICT): pos_sides={sorted(list(pos_sides))}"
+        )
+    if abs(total_signed_amt) <= 1e-12:
+        raise RuntimeError("aggregated positionAmt became zero unexpectedly (STRICT)")
+
+    abs_qty = abs(total_signed_amt)
+    entry_price = weighted_entry_sum / abs_qty
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        raise RuntimeError("aggregated entryPrice invalid (STRICT)")
+
+    return {"symbol": sym, "positionAmt": str(total_signed_amt), "entryPrice": str(entry_price)}
 
 
 def _get_local_position_snapshot(symbol: str) -> Dict[str, Any]:
@@ -1335,6 +1377,45 @@ def _fetch_exchange_open_orders_snapshot(symbol: str) -> List[Dict[str, Any]]:
     if not isinstance(orders, list):
         raise RuntimeError("fetch_open_orders returned non-list (STRICT)")
     return orders
+
+
+def _resolve_closed_trade_pnl_total_strict(trade: Trade, summary: Dict[str, Any]) -> float:
+    if not isinstance(summary, dict):
+        raise RuntimeError("closed summary must be dict (STRICT)")
+    summary_pnl = summary.get("pnl")
+    if summary_pnl is None:
+        raise RuntimeError("close summary missing pnl (STRICT)")
+    summary_pnl_f = _as_float(summary_pnl, "summary.pnl")
+
+    trade_realized = getattr(trade, "realized_pnl_usdt", None)
+    if trade_realized is None:
+        return float(summary_pnl_f)
+
+    trade_realized_f = _as_float(trade_realized, "trade.realized_pnl_usdt")
+    return float(trade_realized_f)
+
+
+def _resolve_closed_trade_exit_ts_dt_strict(trade: Trade, summary: Dict[str, Any]) -> datetime.datetime:
+    if not isinstance(summary, dict):
+        raise RuntimeError("closed summary must be dict (STRICT)")
+
+    close_ts = getattr(trade, "close_ts", None)
+    if close_ts is not None:
+        close_ts_f = _as_float(close_ts, "trade.close_ts", min_value=0.0)
+        if close_ts_f > 0:
+            dt = datetime.datetime.fromtimestamp(close_ts_f, tz=datetime.timezone.utc)
+            if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+                raise RuntimeError("resolved close datetime must be tz-aware (STRICT)")
+            return dt
+
+    close_time_ms = summary.get("close_time")
+    if close_time_ms is None:
+        raise RuntimeError("close summary missing close_time (STRICT)")
+    close_time_ms_i = _require_int_ms(close_time_ms, "summary.close_time")
+    dt2 = datetime.datetime.fromtimestamp(close_time_ms_i / 1000.0, tz=datetime.timezone.utc)
+    if dt2.tzinfo is None or dt2.tzinfo.utcoffset(dt2) is None:
+        raise RuntimeError("resolved close datetime from close_time must be tz-aware (STRICT)")
+    return dt2
 
 
 def _on_reconcile_desync(result: ReconcileResult) -> None:
@@ -1609,18 +1690,18 @@ def main() -> None:
                     if "qty" not in summary or summary["qty"] is None:
                         raise RuntimeError("close summary missing qty (STRICT)")
 
-                    pnl = float(summary["pnl"])
+                    pnl_total = _resolve_closed_trade_pnl_total_strict(t, summary)
                     avg_price = float(summary["avg_price"])
                     qty = float(summary["qty"])
 
                     LAST_CLOSE_TS = now
-                    CONSEC_LOSSES = (CONSEC_LOSSES + 1) if pnl < 0 else 0
+                    CONSEC_LOSSES = (CONSEC_LOSSES + 1) if pnl_total < 0 else 0
 
                     trade_id = getattr(t, "id", None)
                     if not isinstance(trade_id, int) or trade_id <= 0:
                         raise RuntimeError("closed trade missing valid trade.id (DB record mismatch)")
 
-                    exit_ts_dt = datetime.datetime.fromtimestamp(float(now), tz=datetime.timezone.utc)
+                    exit_ts_dt = _resolve_closed_trade_exit_ts_dt_strict(t, summary)
                     tp_pct_v = getattr(t, "tp_pct", None)
                     sl_pct_v = getattr(t, "sl_pct", None)
 
@@ -1628,7 +1709,7 @@ def main() -> None:
                         {
                             "id": int(trade_id),
                             "exit_ts": exit_ts_dt,
-                            "pnl_usdt": float(pnl),
+                            "pnl_usdt": float(pnl_total),
                             "tp_pct": None if tp_pct_v is None else float(tp_pct_v),
                             "sl_pct": None if sl_pct_v is None else float(sl_pct_v),
                         }
@@ -1642,7 +1723,7 @@ def main() -> None:
                         price=avg_price,
                         qty=qty,
                         reason=reason,
-                        pnl=pnl,
+                        pnl=float(pnl_total),
                     )
 
                     if hard_consec_limit_i > 0 and CONSEC_LOSSES >= hard_consec_limit_i:
@@ -1724,6 +1805,11 @@ def main() -> None:
                 interruptible_sleep(5)
                 continue
 
+            authoritative_5m_gate_ts = _get_latest_ws_5m_signal_gate_ts_or_raise(SET.symbol)
+            if not _claim_entry_signal_ts_or_skip(SET.symbol, authoritative_5m_gate_ts):
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
+                continue
+
             last_entry_cycle_wall_ts = now
             last_entry_cycle_1m_ts = latest_1m_ts
             last_entry_cycle_orderbook_ts = latest_orderbook_ts
@@ -1738,6 +1824,12 @@ def main() -> None:
                 interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
+            signal_ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
+            if signal_ts_ms != authoritative_5m_gate_ts:
+                raise RuntimeError(
+                    f"market_data.signal_ts_ms != authoritative_5m_gate_ts (STRICT): signal_ts_ms={signal_ts_ms} gate_ts={authoritative_5m_gate_ts}"
+                )
+
             try:
                 validate_entry_market_data_bundle_strict(market_data)
             except DataIntegrityError as e:
@@ -1746,10 +1838,6 @@ def main() -> None:
                 log(msg)
                 _maybe_send_error_tg("DATA_INTEGRITY", msg, cooldown_sec=60)
                 raise RuntimeError(msg) from e
-
-            if not _claim_entry_signal_ts_or_skip(SET.symbol, market_data.get("signal_ts_ms")):
-                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
-                continue
 
             mf = market_data.get("market_features")
             eng = (mf or {}).get("engine_scores") if isinstance(mf, dict) else None

@@ -20,6 +20,27 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): timezone-aware datetime strict helper 명칭을 단일화
+     - _require_tzaware_dt 를 canonical helper 로 추가
+     - _require_tz_aware_datetime 는 compatibility alias 로 유지
+     - helper naming drift 로 인한 Pylance undefined variable 오류 근본 제거
+  2) FIX(STRICT): _persist_partial_progress_to_db_strict 의 synced_at 검증 경로 정합화
+  3) 기존 기능 삭제 없음
+
+- 2026-03-09:
+  1) FIX(ROOT-CAUSE): 부분청산 누적 손익/잔량을 DB에 즉시 반영
+     - 엔진 재시작 후에도 partial close 진행 상태가 유지되도록 개선
+  2) FIX(ROOT-CAUSE): 최종 청산 summary 기대 수량을 trade.qty가 아니라 trade.remaining_qty 기준으로 변경
+     - 부분청산 후 마지막 청산 orderId 추론 실패/오판 방지
+  3) FIX(ROOT-CAUSE): 최종 청산 pnl_usdt를 마지막 slice pnl이 아니라
+     accumulated realized_pnl_usdt + final pnl 로 집계
+     - DB 최종 손익 누락 방지
+  4) FIX(STRICT): 포지션 수량이 tracked remaining_qty 보다 증가하면 즉시 예외
+     - 무단 증액/동기화 불일치 조용한 통과 금지
+  5) FIX(STATE): 최종 청산 시 last_synced_at / reconciliation_status 를 거래소 close_time 기준으로 정합화
+  6) 기존 기능 삭제 없음
+
 - 2026-03-03 (TRADE-GRADE):
   1) ENV 직접 접근 제거:
      - os.getenv 기반 설정 읽기 제거(SLIPPAGE_MAX_TICKS, SLIPPAGE_MAX_NOTIONAL_PCT, STOP_ON_HEAVY_SLIPPAGE)
@@ -57,6 +78,8 @@ from infra.account_ws import get_account_positions_snapshot
 from infra.async_worker import submit as submit_async
 from infra.telelog import log, send_tg
 from settings import load_settings
+from state.db_core import get_session
+from state.db_models import Trade as TradeORM
 from state.db_writer import close_latest_open_trade_returning_id, record_trade_exit_snapshot
 
 SET = load_settings()
@@ -115,6 +138,22 @@ def _require_int(v: Any, name: str) -> int:
     return i
 
 
+def _require_tzaware_dt(v: Any, name: str) -> datetime:
+    if not isinstance(v, datetime):
+        raise OrderFailed(f"{name} must be datetime (STRICT)")
+    if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+        raise OrderFailed(f"{name} must be timezone-aware (STRICT)")
+    return v
+
+
+def _require_tz_aware_datetime(v: Any, name: str) -> datetime:
+    """
+    Compatibility alias.
+    기존 호출부/이전 코드와의 naming drift를 막기 위해 유지한다.
+    """
+    return _require_tzaware_dt(v, name)
+
+
 def _epoch_ms_to_dt_utc(ms: int) -> datetime:
     if not isinstance(ms, int) or ms <= 0:
         raise OrderFailed("epoch ms must be int > 0 (STRICT)")
@@ -122,11 +161,8 @@ def _epoch_ms_to_dt_utc(ms: int) -> datetime:
 
 
 def _dt_to_epoch_ms_utc(dt: datetime) -> int:
-    if not isinstance(dt, datetime):
-        raise OrderFailed("dt must be datetime (STRICT)")
-    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-        raise OrderFailed("dt must be timezone-aware (STRICT)")
-    ms = int(dt.timestamp() * 1000)
+    dt2 = _require_tzaware_dt(dt, "dt")
+    ms = int(dt2.timestamp() * 1000)
     if ms <= 0:
         raise OrderFailed("dt timestamp invalid (STRICT)")
     return ms
@@ -222,8 +258,7 @@ class Trade:
 
         if self.last_synced_at is None:
             raise OrderFailed("trade.last_synced_at is required (STRICT)")
-        if self.last_synced_at.tzinfo is None or self.last_synced_at.tzinfo.utcoffset(self.last_synced_at) is None:
-            raise OrderFailed("trade.last_synced_at must be timezone-aware (STRICT)")
+        _require_tzaware_dt(self.last_synced_at, "trade.last_synced_at")
 
         st = get_state(self)
         if self.is_open and st != TradeLifecycleState.ENTERED:
@@ -473,7 +508,7 @@ def check_entry_slippage_once(trade: Trade, entry_price: float) -> bool:
         elif side_u == "SHORT":
             side_u = "SELL"
         _submit_tg_nonblocking("🛑 설정(stop_on_heavy_slippage=True)에 따라 즉시 시장가로 포지션을 정리합니다.")
-        close_position_market(symbol=sym, side_open=side_u, qty=float(trade.qty))
+        close_position_market(symbol=sym, side_open=side_u, qty=float(trade.remaining_qty))
 
     return False
 
@@ -733,7 +768,7 @@ def build_close_summary_strict(
         summary["observed_at_ms"] = int(observed_at_ms)
         return "MANUAL", summary
 
-    expected_qty = _float_strict(trade.qty, "trade.qty")
+    expected_qty = _require_float(trade.remaining_qty, "trade.remaining_qty")
     start_ms = max(1, observed_at_ms - int(lookback_sec * 1000))
     end_ms = observed_at_ms
     user_trades = _fetch_user_trades_strict(sym, start_ms=start_ms, end_ms=end_ms)
@@ -760,6 +795,53 @@ def _calc_pnl_pct_futures(trade: Trade, pnl_usdt: float) -> Optional[float]:
     return float(pnl_usdt) / notional * 100.0
 
 
+def _persist_partial_progress_to_db_strict(
+    *,
+    trade: Trade,
+    synced_remaining_qty: float,
+    realized_pnl_total_usdt: float,
+    synced_at: datetime,
+) -> None:
+    sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
+    entry_side_db = _trade_entry_side_db(trade)
+    rem = _require_float(synced_remaining_qty, "synced_remaining_qty")
+    if rem <= 0:
+        raise CloseSummaryError("synced_remaining_qty must be > 0 (STRICT)")
+    rpnl_total = _require_float(realized_pnl_total_usdt, "realized_pnl_total_usdt")
+    synced_at_dt = _require_tzaware_dt(synced_at, "synced_at")
+
+    with get_session() as session:
+        row = None
+        if int(getattr(trade, "id", 0) or 0) > 0:
+            row = (
+                session.query(TradeORM)
+                .filter(TradeORM.id == int(trade.id))
+                .filter(TradeORM.exit_ts.is_(None))
+                .first()
+            )
+
+        if row is None:
+            row = (
+                session.query(TradeORM)
+                .filter(TradeORM.symbol == sym)
+                .filter(TradeORM.side == entry_side_db)
+                .filter(TradeORM.exit_ts.is_(None))
+                .order_by(TradeORM.entry_ts.desc())
+                .first()
+            )
+
+        if row is None:
+            raise CloseSummaryError(f"open trade row not found for partial progress: symbol={sym} side={entry_side_db}")
+
+        row.remaining_qty = float(rem)
+        row.realized_pnl_usdt = float(rpnl_total)
+        row.reconciliation_status = "PROTECTION_VERIFIED"
+        row.last_synced_at = synced_at_dt
+        if hasattr(type(row), "updated_at"):
+            row.updated_at = synced_at_dt
+        session.flush()
+
+
 def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str, Any]) -> int:
     sym = _require_nonempty_str(trade.symbol, "trade.symbol").upper()
     entry_side_db = _trade_entry_side_db(trade)
@@ -771,22 +853,25 @@ def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str,
             raise CloseSummaryError(f"summary missing required key: {k} (STRICT)")
 
     exit_price = _float_strict(summary.get("avg_price"), "summary.avg_price")
-    pnl_usdt = _float_strict(summary.get("pnl"), "summary.pnl")
+    final_slice_pnl_usdt = _float_strict(summary.get("pnl"), "summary.pnl")
     if exit_price <= 0:
         raise CloseSummaryError("summary.avg_price must be > 0 (STRICT)")
+
+    prior_realized_pnl_usdt = _require_float(trade.realized_pnl_usdt, "trade.realized_pnl_usdt")
+    total_pnl_usdt = float(prior_realized_pnl_usdt + final_slice_pnl_usdt)
 
     close_time_ms = _int_strict(summary.get("close_time"), "summary.close_time")
     exit_ts_dt = _epoch_ms_to_dt_utc(close_time_ms)
 
     close_reason = _require_nonempty_str(reason, "reason")[:32]
-    pnl_pct_futures = _calc_pnl_pct_futures(trade, pnl_usdt)
+    pnl_pct_futures = _calc_pnl_pct_futures(trade, total_pnl_usdt)
 
     trade_id = close_latest_open_trade_returning_id(
         symbol=sym,
         side=entry_side_db,
         exit_price=float(exit_price),
         exit_ts=exit_ts_dt,
-        pnl_usdt=float(pnl_usdt),
+        pnl_usdt=float(total_pnl_usdt),
         close_reason=str(close_reason),
         regime_at_exit=None,
         pnl_pct_futures=pnl_pct_futures,
@@ -799,7 +884,7 @@ def _persist_close_to_db_strict(*, trade: Trade, reason: str, summary: Dict[str,
         symbol=sym,
         close_ts=exit_ts_dt,
         close_price=float(exit_price),
-        pnl=float(pnl_usdt),
+        pnl=float(total_pnl_usdt),
         close_reason=str(close_reason),
         exit_atr_pct=None,
         exit_trend_strength=None,
@@ -817,7 +902,7 @@ def _strict_reconcile_partial_close(
     delta_qty: float,
     start_ms: int,
     end_ms: int,
-) -> float:
+) -> Tuple[float, int]:
     if delta_qty <= 0 or not math.isfinite(delta_qty):
         raise CloseSummaryError("delta_qty invalid (STRICT)")
 
@@ -827,6 +912,7 @@ def _strict_reconcile_partial_close(
     qty_sum = 0.0
     realized_sum = 0.0
     fee_usdt_sum = 0.0
+    last_time_ms: Optional[int] = None
 
     for r in trades_window:
         if str(r.get("side") or "").upper().strip() != close_side:
@@ -840,6 +926,11 @@ def _strict_reconcile_partial_close(
         if qty <= 0:
             raise CloseSummaryError("userTrade.qty must be > 0 (STRICT)")
 
+        t_ms = r.get("time")
+        t_ms_i = int(t_ms) if t_ms is not None else None
+        if t_ms_i is not None and (last_time_ms is None or t_ms_i > last_time_ms):
+            last_time_ms = t_ms_i
+
         qty_sum += qty
         realized_sum += realized
         if commission_asset == "USDT":
@@ -849,10 +940,13 @@ def _strict_reconcile_partial_close(
     if abs(qty_sum - delta_qty) > tol:
         raise CloseSummaryError(f"partial close qty mismatch: expected_delta={delta_qty}, got={qty_sum} (STRICT)")
 
+    if last_time_ms is None or last_time_ms <= 0:
+        raise CloseSummaryError("partial close trades missing close_time (STRICT)")
+
     pnl_delta = realized_sum - fee_usdt_sum
     if not math.isfinite(pnl_delta):
         raise CloseSummaryError("partial pnl_delta not finite (STRICT)")
-    return float(pnl_delta)
+    return float(pnl_delta), int(last_time_ms)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -886,6 +980,11 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
     if prev_remaining <= 0:
         raise CloseSummaryError("trade.remaining_qty must be > 0 (STRICT)")
 
+    if abs_qty > prev_remaining + eps:
+        raise CloseSummaryError(
+            f"position size increased unexpectedly (STRICT): prev_remaining={prev_remaining} now_abs_qty={abs_qty}"
+        )
+
     if abs_qty > eps and abs_qty < prev_remaining - eps:
         delta = prev_remaining - abs_qty
 
@@ -893,12 +992,16 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
             raise CloseSummaryError("trade.last_synced_at is required for partial reconciliation (STRICT)")
 
         start_ms = _dt_to_epoch_ms_utc(t.last_synced_at) - 2000
-        now_dt = datetime.now(timezone.utc)
-        end_ms = _dt_to_epoch_ms_utc(now_dt) + 2000
+        end_ms = int(row.get("transaction_time_ms"))
+        if end_ms <= 0:
+            raise CloseSummaryError("account_ws.position.transaction_time_ms invalid for partial reconciliation (STRICT)")
+        end_ms = end_ms + 2000
         if start_ms <= 0:
             raise CloseSummaryError("partial reconciliation start_ms invalid (STRICT)")
+        if end_ms < start_ms:
+            raise CloseSummaryError("partial reconciliation end_ms < start_ms (STRICT)")
 
-        pnl_delta = _strict_reconcile_partial_close(
+        pnl_delta, close_time_ms = _strict_reconcile_partial_close(
             t,
             symbol=symbol,
             delta_qty=float(delta),
@@ -906,10 +1009,20 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
             end_ms=int(end_ms),
         )
 
-        t.realized_pnl_usdt = float(_require_float(t.realized_pnl_usdt, "trade.realized_pnl_usdt") + pnl_delta)
+        synced_at_dt = _epoch_ms_to_dt_utc(close_time_ms)
+        realized_total = float(_require_float(t.realized_pnl_usdt, "trade.realized_pnl_usdt") + pnl_delta)
+
+        t.realized_pnl_usdt = realized_total
         t.remaining_qty = float(abs_qty)
-        t.last_synced_at = now_dt
-        t.reconciliation_status = "PARTIAL_OK"
+        t.last_synced_at = synced_at_dt
+        t.reconciliation_status = "PROTECTION_VERIFIED"
+
+        _persist_partial_progress_to_db_strict(
+            trade=t,
+            synced_remaining_qty=float(abs_qty),
+            realized_pnl_total_usdt=float(realized_total),
+            synced_at=synced_at_dt,
+        )
 
         _submit_tg_nonblocking(
             f"[PARTIAL_CLOSE] {symbol} side={t.side} "
@@ -921,6 +1034,7 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
     if abs_qty < eps:
         reason, summary = build_close_summary_strict(t)
 
+        total_pnl_usdt = float(_require_float(t.realized_pnl_usdt, "trade.realized_pnl_usdt") + _float_strict(summary.get("pnl"), "summary.pnl"))
         trade_id = _persist_close_to_db_strict(trade=t, reason=str(reason), summary=summary)
         if t.id <= 0:
             t.id = int(trade_id)
@@ -931,11 +1045,13 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
         t.close_reason = str(reason)
 
         close_time_ms = _int_strict(summary.get("close_time"), "summary.close_time")
-        t.close_ts = _epoch_ms_to_dt_utc(close_time_ms).timestamp()
+        close_dt = _epoch_ms_to_dt_utc(close_time_ms)
+        t.close_ts = close_dt.timestamp()
 
         t.remaining_qty = 0.0
-        t.reconciliation_status = "CLOSED_OK"
-        t.last_synced_at = datetime.now(timezone.utc)
+        t.realized_pnl_usdt = float(total_pnl_usdt)
+        t.reconciliation_status = "CLOSED"
+        t.last_synced_at = close_dt
 
         return [], [{"trade": t, "reason": reason, "summary": summary}]
 
