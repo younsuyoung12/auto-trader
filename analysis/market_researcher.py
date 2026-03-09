@@ -6,16 +6,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
+- FIX(DB): sync_once()의 market_features / trade_context_snapshots 적재 후 명시적 commit 추가
 - 외부 인텔리전스 source별 이중 메모리 캐시 제거
-- source fetcher 내부(DB 영속 캐시 + 메모리 캐시)를 단일 진실원으로 사용하도록 구조 변경
+- source fetcher 내부(DB 영속 캐시 + 메모리 캐시)를 단일 진실원으로 사용하도록 구조 유지
 - market_researcher 는 외부 source freshness를 직접 들고 있지 않고 fetcher 계약만 신뢰
 - Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
 
 코드 정리 내용
-- ExternalSnapshotState / _EXTERNAL_SOURCE_POLICY 제거
-- stale external snapshot fallback 경로 완전 제거
-- 외부 snapshot refresh 로그/상태 관리 중복 제거
-- source fetch 경로를 fetcher 단일 책임으로 정리
+- ExternalSnapshotState / _EXTERNAL_SOURCE_POLICY 제거 유지
+- stale external snapshot fallback 경로 완전 제거 유지
+- 외부 snapshot refresh 로그/상태 관리 중복 제거 유지
+- source fetch 경로를 fetcher 단일 책임으로 정리 유지
+- 불필요한 우회 수정 없이 DB 트랜잭션 완료 지점만 명확화
 
 역할:
 - Binance USDⓈ-M Futures 공개 시장 데이터를 해석해 외부 시장 분석 리포트를 생성한다.
@@ -40,10 +42,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력:
 2026-03-09
-1) FIX(ROOT-CAUSE): 외부 인텔리전스 freshness/cache 책임을 source fetcher 내부로 단일화
-2) FIX(STRICT): market_researcher 내부 stale external snapshot 재사용 구조 완전 제거
-3) FIX(STRUCTURE): fetcher(DB 영속 캐시 + 메모리 캐시)만 외부 source 진실원으로 사용
-4) FIX(ROBUST): Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
+1) FIX(DB): sync_once()의 market_features / trade_context_snapshots 적재 후 명시적 commit 추가
+2) FIX(ROOT-CAUSE): 외부 인텔리전스 freshness/cache 책임을 source fetcher 내부로 단일화
+3) FIX(STRICT): market_researcher 내부 stale external snapshot 재사용 구조 완전 제거
+4) FIX(STRUCTURE): fetcher(DB 영속 캐시 + 메모리 캐시)만 외부 source 진실원으로 사용
+5) FIX(ROBUST): Alpha Vantage daily quota 감지 문구를 실응답 기준으로 유지
 
 2026-03-08
 1) derivatives/news/macro/sentiment/onchain/options/volume-profile/orderflow 연동 확장
@@ -308,6 +311,7 @@ class MarketResearcher:
 
             market_features_inserted = self._upsert_market_feature(session, market_feature)
             trade_context_inserted = self._upsert_trade_context_snapshot(session, trade_context)
+            session.commit()
 
         result = ResearchSyncResult(
             symbol=market_feature.symbol,

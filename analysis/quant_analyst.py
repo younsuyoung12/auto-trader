@@ -6,14 +6,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
-- market-only / full-analysis scope 계약 검증 강화
-- 내부/거래/외부 분석 결과 symbol 정합성 검증 추가
-- dashboard payload / 최종 응답 무결성 검증 강화
+- FIX(INTEGRITY): dashboard market_cards별 필수 키/심볼 정합성 검증 추가
+- FIX(PAYLOAD): confidence / root_causes / recommendations / used_inputs 요소 타입 검증 강화
+- FIX(RESPONSE): 최종 응답의 internal/trade/external summary symbol 무결성 검증 추가
+- market-only / full-analysis scope 계약 검증 강화 유지
+- 내부/거래/외부 분석 결과 symbol 정합성 검증 유지
 
 코드 정리 내용
-- scope별 검증 로직 분리
-- 분석 객체 symbol 계약 검증 추가
-- dashboard payload 타임스탬프/카드 구조 검증 강화
+- dashboard payload 카드 검증 로직 분리
+- summary mapping symbol 계약 검증 분리
+- 문자열 리스트 검증 공통화
+- 기존 오케스트레이션/GPT 호출 구조는 삭제 없이 유지
 
 역할:
 - 내부 DB 기반 시장 분석 + 거래 분석 + 외부 Binance 시장 분석을 통합한다.
@@ -32,10 +35,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력:
 2026-03-09
-1) FIX(STRICT): market-only / full-analysis scope 계약 검증 강화
-2) FIX(INTEGRITY): internal/trade/external summary symbol 정합성 검증 추가
-3) FIX(PAYLOAD): dashboard payload / 최종 응답 타임스탬프 및 카드 구조 검증 강화
-4) CLEANUP: scope별 검증 로직 분리
+1) FIX(INTEGRITY): dashboard market_cards별 필수 키/심볼 정합성 검증 추가
+2) FIX(PAYLOAD): confidence / root_causes / recommendations / used_inputs 요소 타입 검증 강화
+3) FIX(RESPONSE): 최종 응답의 internal/trade/external summary symbol 무결성 검증 추가
+4) FIX(STRICT): market-only / full-analysis scope 계약 검증 강화
+5) FIX(INTEGRITY): internal/trade/external summary symbol 정합성 검증 추가
+6) FIX(PAYLOAD): dashboard payload / 최종 응답 타임스탬프 및 카드 구조 검증 강화
+7) CLEANUP: scope별 검증 로직 분리
 
 2026-03-08
 1) MarketResearchReport 확장 필드(volume profile / orderflow / options)를 dashboard payload에 반영
@@ -533,7 +539,31 @@ class QuantAnalyst:
         if not isinstance(symbol_value, str) or not symbol_value.strip():
             raise RuntimeError(f"{field_name}.symbol must be a non-empty string")
 
-        normalized_symbol = symbol_value.strip().replace("-", "").replace("/", "").upper()
+        normalized_symbol = self._normalize_symbol_contract_or_raise(
+            symbol_value,
+            f"{field_name}.symbol",
+        )
+        if normalized_symbol != self._symbol:
+            raise RuntimeError(
+                f"{field_name}.symbol mismatch: expected={self._symbol} got={normalized_symbol}"
+            )
+
+    def _validate_mapping_symbol_contract_or_raise(
+        self,
+        *,
+        data: Mapping[str, Any],
+        field_name: str,
+    ) -> None:
+        if "symbol" not in data:
+            raise RuntimeError(f"{field_name}.symbol is missing")
+        symbol_value = data["symbol"]
+        if not isinstance(symbol_value, str) or not symbol_value.strip():
+            raise RuntimeError(f"{field_name}.symbol must be a non-empty string")
+
+        normalized_symbol = self._normalize_symbol_contract_or_raise(
+            symbol_value,
+            f"{field_name}.symbol",
+        )
         if normalized_symbol != self._symbol:
             raise RuntimeError(
                 f"{field_name}.symbol mismatch: expected={self._symbol} got={normalized_symbol}"
@@ -558,6 +588,19 @@ class QuantAnalyst:
             raise RuntimeError("gpt_result.recommendations must be a list")
         if not isinstance(gpt_result.used_inputs, list):
             raise RuntimeError("gpt_result.used_inputs must be a list")
+
+        self._validate_string_list_or_raise(
+            gpt_result.root_causes,
+            "gpt_result.root_causes",
+        )
+        self._validate_string_list_or_raise(
+            gpt_result.recommendations,
+            "gpt_result.recommendations",
+        )
+        self._validate_string_list_or_raise(
+            gpt_result.used_inputs,
+            "gpt_result.used_inputs",
+        )
 
     def _build_provided_inputs_set(
         self,
@@ -595,7 +638,13 @@ class QuantAnalyst:
         data = to_dict_method()
         if not isinstance(data, Mapping) or not data:
             raise RuntimeError(f"{field_name} must be a non-empty mapping")
-        return dict(data)
+
+        normalized = dict(data)
+        self._validate_mapping_symbol_contract_or_raise(
+            data=normalized,
+            field_name=field_name,
+        )
+        return normalized
 
     def _gpt_result_to_non_empty_mapping_or_raise(
         self,
@@ -788,7 +837,11 @@ class QuantAnalyst:
 
         if not isinstance(payload["symbol"], str) or not payload["symbol"].strip():
             raise RuntimeError("dashboard_payload.symbol must be a non-empty string")
-        if payload["symbol"].strip().upper() != self._symbol:
+        normalized_symbol = self._normalize_symbol_contract_or_raise(
+            payload["symbol"],
+            "dashboard_payload.symbol",
+        )
+        if normalized_symbol != self._symbol:
             raise RuntimeError(
                 f"dashboard_payload.symbol mismatch: expected={self._symbol} got={payload['symbol']}"
             )
@@ -807,6 +860,29 @@ class QuantAnalyst:
         if not isinstance(payload["market_cards"], dict) or not payload["market_cards"]:
             raise RuntimeError("dashboard_payload.market_cards must be a non-empty mapping")
 
+        self._validate_string_list_or_raise(
+            payload["root_causes"],
+            "dashboard_payload.root_causes",
+        )
+        self._validate_string_list_or_raise(
+            payload["recommendations"],
+            "dashboard_payload.recommendations",
+        )
+        self._validate_string_list_or_raise(
+            payload["used_inputs"],
+            "dashboard_payload.used_inputs",
+        )
+
+        confidence = payload["confidence"]
+        if isinstance(confidence, bool):
+            raise RuntimeError("dashboard_payload.confidence must not be bool")
+        try:
+            confidence_f = float(confidence)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("dashboard_payload.confidence must be float-like") from exc
+        if confidence_f < 0.0 or confidence_f > 1.0:
+            raise RuntimeError("dashboard_payload.confidence must be between 0 and 1")
+
         generated_ts_ms = payload["generated_ts_ms"]
         analysis_as_of_ts_ms = payload["analysis_as_of_ts_ms"]
         if isinstance(generated_ts_ms, bool) or isinstance(analysis_as_of_ts_ms, bool):
@@ -823,13 +899,175 @@ class QuantAnalyst:
                 f"generated_ts_ms must be >= analysis_as_of_ts_ms: generated={generated_ts_ms_i} as_of={analysis_as_of_ts_ms_i}"
             )
 
+        self._validate_market_cards_or_raise(
+            market_cards=payload["market_cards"],
+            root_symbol=self._symbol,
+        )
+
+    def _validate_market_cards_or_raise(
+        self,
+        *,
+        market_cards: Mapping[str, Any],
+        root_symbol: str,
+    ) -> None:
+        if not isinstance(market_cards, Mapping) or not market_cards:
+            raise RuntimeError("market_cards must be a non-empty mapping")
+
+        for card_name, card in market_cards.items():
+            if not isinstance(card_name, str) or not card_name.strip():
+                raise RuntimeError("market_cards contains invalid card name")
+            if not isinstance(card, Mapping) or not card:
+                raise RuntimeError(f"market_cards.{card_name} must be a non-empty mapping")
+
+            required_by_card = {
+                "internal_market": (
+                    "symbol",
+                    "timeframe",
+                    "market_regime",
+                    "trend",
+                    "volatility",
+                    "liquidity",
+                    "latest_close_price",
+                    "price_change_pct",
+                    "avg_spread_bps",
+                    "latest_spread_bps",
+                    "avg_pattern_score",
+                    "latest_pattern_score",
+                    "entry_blockers",
+                    "summary_ko",
+                ),
+                "trade_performance": (
+                    "symbol",
+                    "total_trades",
+                    "wins",
+                    "losses",
+                    "breakeven",
+                    "win_rate_pct",
+                    "total_pnl",
+                    "avg_pnl",
+                    "avg_win_pnl",
+                    "avg_loss_pnl",
+                    "entry_failure_reasons",
+                    "loss_causes",
+                    "recent_trade_briefs",
+                    "summary_ko",
+                ),
+                "external_market": (
+                    "symbol",
+                    "trend",
+                    "volatility",
+                    "liquidity",
+                    "market_regime",
+                    "conviction",
+                    "price",
+                    "mark_price",
+                    "index_price",
+                    "spread_bps",
+                    "funding_rate",
+                    "open_interest",
+                    "open_interest_change_pct",
+                    "global_long_short_ratio",
+                    "top_long_short_ratio",
+                    "taker_long_short_ratio",
+                    "crowding_bias",
+                    "liquidation_pressure",
+                    "support_price",
+                    "resistance_price",
+                    "poc_price",
+                    "value_area_low",
+                    "value_area_high",
+                    "poc_distance_bps",
+                    "price_location",
+                    "cvd",
+                    "delta_ratio_pct",
+                    "aggression_bias",
+                    "cvd_trend",
+                    "divergence",
+                    "put_call_oi_ratio",
+                    "put_call_volume_ratio",
+                    "options_bias",
+                    "key_signals",
+                    "volume_profile_summary",
+                    "orderflow_summary",
+                    "options_summary",
+                    "summary_ko",
+                ),
+            }
+
+            if card_name not in required_by_card:
+                raise RuntimeError(f"Unexpected market_cards card: {card_name}")
+
+            for required_key in required_by_card[card_name]:
+                if required_key not in card:
+                    raise RuntimeError(
+                        f"market_cards.{card_name} missing required key: {required_key}"
+                    )
+
+            symbol_value = card["symbol"]
+            if not isinstance(symbol_value, str) or not symbol_value.strip():
+                raise RuntimeError(f"market_cards.{card_name}.symbol must be a non-empty string")
+
+            normalized_card_symbol = self._normalize_symbol_contract_or_raise(
+                symbol_value,
+                f"market_cards.{card_name}.symbol",
+            )
+            if normalized_card_symbol != root_symbol:
+                raise RuntimeError(
+                    f"market_cards.{card_name}.symbol mismatch: expected={root_symbol} got={normalized_card_symbol}"
+                )
+
+            summary_ko = card["summary_ko"]
+            if not isinstance(summary_ko, str) or not summary_ko.strip():
+                raise RuntimeError(f"market_cards.{card_name}.summary_ko must be a non-empty string")
+
+            if card_name == "internal_market":
+                self._validate_string_list_or_raise(
+                    card["entry_blockers"],
+                    "market_cards.internal_market.entry_blockers",
+                )
+
+            if card_name == "trade_performance":
+                self._validate_string_list_or_raise(
+                    card["entry_failure_reasons"],
+                    "market_cards.trade_performance.entry_failure_reasons",
+                )
+                self._validate_string_list_or_raise(
+                    card["loss_causes"],
+                    "market_cards.trade_performance.loss_causes",
+                )
+                self._validate_string_list_or_raise(
+                    card["recent_trade_briefs"],
+                    "market_cards.trade_performance.recent_trade_briefs",
+                )
+
+            if card_name == "external_market":
+                self._validate_string_list_or_raise(
+                    card["key_signals"],
+                    "market_cards.external_market.key_signals",
+                )
+                for nested_key in (
+                    "volume_profile_summary",
+                    "orderflow_summary",
+                    "options_summary",
+                ):
+                    nested_value = card[nested_key]
+                    if not isinstance(nested_value, Mapping) or not nested_value:
+                        raise RuntimeError(
+                            f"market_cards.external_market.{nested_key} must be a non-empty mapping"
+                        )
+
     def _validate_response_or_raise(self, result: QuantAnalystResponse) -> None:
         data = result.to_dict()
         if not isinstance(data, dict) or not data:
             raise RuntimeError("QuantAnalystResponse.to_dict() must return a non-empty mapping")
         if not isinstance(result.symbol, str) or not result.symbol.strip():
             raise RuntimeError("QuantAnalystResponse.symbol must be a non-empty string")
-        if result.symbol.strip().upper() != self._symbol:
+
+        normalized_symbol = self._normalize_symbol_contract_or_raise(
+            result.symbol,
+            "QuantAnalystResponse.symbol",
+        )
+        if normalized_symbol != self._symbol:
             raise RuntimeError(
                 f"QuantAnalystResponse.symbol mismatch: expected={self._symbol} got={result.symbol}"
             )
@@ -839,6 +1077,23 @@ class QuantAnalyst:
             raise RuntimeError("QuantAnalystResponse.generated_ts_ms must be > 0")
         if not isinstance(result.gpt_result, dict) or not result.gpt_result:
             raise RuntimeError("QuantAnalystResponse.gpt_result must be a non-empty mapping")
+
+        if result.internal_market_summary is not None:
+            self._validate_mapping_symbol_contract_or_raise(
+                data=result.internal_market_summary,
+                field_name="QuantAnalystResponse.internal_market_summary",
+            )
+        if result.trade_summary is not None:
+            self._validate_mapping_symbol_contract_or_raise(
+                data=result.trade_summary,
+                field_name="QuantAnalystResponse.trade_summary",
+            )
+        if result.external_market_summary is not None:
+            self._validate_mapping_symbol_contract_or_raise(
+                data=result.external_market_summary,
+                field_name="QuantAnalystResponse.external_market_summary",
+            )
+
         self._validate_dashboard_payload_or_raise(result.dashboard_payload)
 
     # ========================================================
@@ -887,6 +1142,29 @@ class QuantAnalyst:
         if not isinstance(question, str) or not question.strip():
             raise RuntimeError("question must be a non-empty string")
         return question.strip()
+
+    def _normalize_symbol_contract_or_raise(
+        self,
+        symbol: str,
+        field_name: str,
+    ) -> str:
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise RuntimeError(f"{field_name} must be a non-empty string")
+        normalized = symbol.strip().replace("-", "").replace("/", "").upper()
+        if not normalized:
+            raise RuntimeError(f"{field_name} normalized symbol must not be empty")
+        return normalized
+
+    def _validate_string_list_or_raise(
+        self,
+        value: Any,
+        field_name: str,
+    ) -> None:
+        if not isinstance(value, list):
+            raise RuntimeError(f"{field_name} must be a list")
+        for idx, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                raise RuntimeError(f"{field_name}[{idx}] must be a non-empty string")
 
     def _now_ms(self) -> int:
         ts_ms = int(time.time() * 1000)

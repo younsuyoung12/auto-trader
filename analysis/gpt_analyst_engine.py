@@ -6,15 +6,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
-- OpenAI 요청 payload 계약 검증 강화
-- market-only / full-analysis 입력 계약 분리
-- OpenAI 응답의 scope / used_inputs / raw text 무결성 검증 강화
-- 실제 미사용 temperature 설정 의존 제거
+- FIX(CONTRACT): payload 상단 키 / 섹션 symbol 계약 검증 강화
+- FIX(STRICT): OpenAI 응답은 순수 JSON object 1개 또는 fenced JSON 1개만 허용
+- FIX(INTEGRITY): answer_ko 문장 수 / root_causes / recommendations 개수 계약 검증 강화
+- OpenAI 요청 payload 계약 검증 강화 유지
+- market-only / full-analysis 입력 계약 분리 유지
+- OpenAI 응답의 scope / used_inputs / raw text 무결성 검증 강화 유지
+- 실제 미사용 temperature 설정 의존 제거 유지
 
 코드 정리 내용
-- 미사용 temperature 설정/검증 제거
-- payload 계약 검증 로직 분리
-- 응답 무결성 검증 함수 보강
+- payload top-level / section symbol 검증 로직 분리
+- output answer/list 계약 검증 함수 보강
+- JSON 단일 객체 추출 로직 엄격화
 - 최근 변경 이력 2일 기준으로 정리
 
 역할:
@@ -34,10 +37,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력:
 2026-03-09
-1) FIX(STRICT): market-only / full-analysis payload 계약 검증 강화
-2) FIX(INTEGRITY): OpenAI 응답 raw text / scope / used_inputs 무결성 검증 강화
-3) CLEANUP: 미사용 ANALYST_OPENAI_TEMPERATURE 의존 제거
-4) CLEANUP: payload / response validation 로직 정리
+1) FIX(CONTRACT): payload 상단 키 / 섹션 symbol 계약 검증 강화
+2) FIX(STRICT): OpenAI 응답은 순수 JSON object 1개 또는 fenced JSON 1개만 허용
+3) FIX(INTEGRITY): answer_ko 문장 수 / root_causes / recommendations 개수 계약 검증 강화
+4) FIX(STRICT): market-only / full-analysis payload 계약 검증 강화
+5) FIX(INTEGRITY): OpenAI 응답 raw text / scope / used_inputs 무결성 검증 강화
+6) CLEANUP: 미사용 ANALYST_OPENAI_TEMPERATURE 의존 제거
+7) CLEANUP: payload / response validation 로직 정리
 
 2026-03-08
 1) Structured Outputs(JSON Schema) 강제 적용
@@ -69,6 +75,13 @@ _ALLOWED_SCOPE = {
 }
 
 _ALLOWED_USED_INPUTS = {
+    "internal_market_summary",
+    "trade_summary",
+    "external_market_summary",
+}
+
+_ALLOWED_TOP_LEVEL_KEYS = {
+    "question",
     "internal_market_summary",
     "trade_summary",
     "external_market_summary",
@@ -140,6 +153,10 @@ class GptAnalystEngine:
     """
 
     def __init__(self) -> None:
+        self._symbol = self._normalize_symbol_or_raise(
+            self._require_str_setting("ANALYST_MARKET_SYMBOL"),
+            "ANALYST_MARKET_SYMBOL",
+        )
         self._api_key = self._require_str_setting("OPENAI_API_KEY")
         self._model = self._require_str_setting("ANALYST_OPENAI_MODEL")
         self._timeout_sec = self._require_float_setting("ANALYST_OPENAI_TIMEOUT_SEC")
@@ -261,6 +278,8 @@ class GptAnalystEngine:
         if not isinstance(payload, Mapping) or not payload:
             raise RuntimeError("payload must be a non-empty mapping")
 
+        self._validate_payload_top_level_keys_or_raise(payload)
+
         question = payload.get("question")
         self._require_nonempty_str(question, "payload.question")
 
@@ -270,6 +289,7 @@ class GptAnalystEngine:
                 raise RuntimeError(
                     f"payload sections mismatch: expected={sorted(expected_sections)} actual={sorted(available_sections)}"
                 )
+            self._validate_payload_section_symbols_or_raise(payload, available_sections)
             return
 
         required_sections = set(expected_sections)
@@ -278,15 +298,46 @@ class GptAnalystEngine:
                 f"payload missing required sections: required={sorted(required_sections)} actual={sorted(available_sections)}"
             )
 
-        unexpected_sections = available_sections - {
-            "internal_market_summary",
-            "trade_summary",
-            "external_market_summary",
-        }
+        unexpected_sections = available_sections - _ALLOWED_USED_INPUTS
         if unexpected_sections:
             raise RuntimeError(
                 f"payload contains unexpected analysis sections: {sorted(unexpected_sections)}"
             )
+
+        self._validate_payload_section_symbols_or_raise(payload, available_sections)
+
+    def _validate_payload_top_level_keys_or_raise(self, payload: Mapping[str, Any]) -> None:
+        actual_keys = set(payload.keys())
+        missing_question = "question" not in actual_keys
+        if missing_question:
+            raise RuntimeError("payload missing required key: question")
+
+        unexpected_keys = actual_keys - _ALLOWED_TOP_LEVEL_KEYS
+        if unexpected_keys:
+            raise RuntimeError(f"payload contains unexpected top-level keys: {sorted(unexpected_keys)}")
+
+    def _validate_payload_section_symbols_or_raise(
+        self,
+        payload: Mapping[str, Any],
+        sections: set[str],
+    ) -> None:
+        for section_name in sorted(sections):
+            section_value = payload.get(section_name)
+            if not isinstance(section_value, Mapping) or not section_value:
+                raise RuntimeError(f"{section_name} must be a non-empty mapping")
+
+            symbol_value = section_value.get("symbol")
+            if not isinstance(symbol_value, str) or not symbol_value.strip():
+                raise RuntimeError(f"{section_name}.symbol must be a non-empty string")
+
+            normalized_symbol = self._normalize_symbol_or_raise(
+                symbol_value,
+                f"{section_name}.symbol",
+            )
+            if normalized_symbol != self._symbol:
+                raise RuntimeError(
+                    f"{section_name}.symbol mismatch: expected={self._symbol} got={normalized_symbol}"
+                )
 
     # ========================================================
     # OpenAI client / response handling
@@ -489,9 +540,8 @@ class GptAnalystEngine:
             )
 
         if result.scope == "out_of_scope":
-            if result.used_inputs:
-                if not set(result.used_inputs).issubset(available_inputs):
-                    raise RuntimeError("out_of_scope used_inputs must be empty or valid subset of available inputs")
+            if result.used_inputs and not set(result.used_inputs).issubset(available_inputs):
+                raise RuntimeError("out_of_scope used_inputs must be empty or valid subset of available inputs")
             return
 
         if len(available_inputs) == 1:
@@ -1014,6 +1064,13 @@ class GptAnalystEngine:
             raise RuntimeError(f"Unexpected result.scope: {result.scope}")
         if not isinstance(result.raw_response_text, str) or not result.raw_response_text.strip():
             raise RuntimeError("raw_response_text must be a non-empty string")
+
+        sentence_count = self._count_sentences(result.answer_ko)
+        if sentence_count <= 0:
+            raise RuntimeError("answer_ko must contain at least one sentence")
+        if sentence_count > 2:
+            raise RuntimeError("answer_ko must contain at most 2 sentences")
+
         if result.scope == "out_of_scope":
             if result.answer_ko != _OUT_OF_SCOPE_MESSAGE:
                 raise RuntimeError("out_of_scope answer_ko mismatch")
@@ -1021,24 +1078,27 @@ class GptAnalystEngine:
                 raise RuntimeError("out_of_scope root_causes must be empty")
             if result.recommendations:
                 raise RuntimeError("out_of_scope recommendations must be empty")
+            return
+
+        if not (1 <= len(result.root_causes) <= 4):
+            raise RuntimeError("root_causes must contain 1 to 4 items for non-out_of_scope")
+        if not (1 <= len(result.recommendations) <= 4):
+            raise RuntimeError("recommendations must contain 1 to 4 items for non-out_of_scope")
 
     def _extract_single_json_object(self, raw_text: str) -> str:
         text = raw_text.strip()
 
-        fenced_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
+        fenced_match = re.fullmatch(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.DOTALL)
         if fenced_match is not None:
             candidate = fenced_match.group(1).strip()
             self._ensure_single_top_level_json_object(candidate)
             return candidate
 
-        brace_start = text.find("{")
-        brace_end = text.rfind("}")
-        if brace_start == -1 or brace_end == -1 or brace_end <= brace_start:
-            raise RuntimeError("GPT output does not contain a JSON object")
+        if text.startswith("{") and text.endswith("}"):
+            self._ensure_single_top_level_json_object(text)
+            return text
 
-        candidate = text[brace_start : brace_end + 1].strip()
-        self._ensure_single_top_level_json_object(candidate)
-        return candidate
+        raise RuntimeError("GPT output must be exactly one JSON object without extra text")
 
     def _ensure_single_top_level_json_object(self, candidate: str) -> None:
         candidate = candidate.strip()
@@ -1132,10 +1192,15 @@ class GptAnalystEngine:
     def _validate_json_safe_payload_or_raise(self, payload: Mapping[str, Any]) -> None:
         if not isinstance(payload, Mapping) or not payload:
             raise RuntimeError("json_safe payload must be a non-empty mapping")
+
+        self._validate_payload_top_level_keys_or_raise(payload)
         self._require_nonempty_str(payload.get("question"), "payload.question")
+
         available_sections = self._extract_available_input_sections(payload)
         if not available_sections:
             raise RuntimeError("json_safe payload must include at least one analysis section")
+
+        self._validate_payload_section_symbols_or_raise(payload, set(available_sections))
 
     # ========================================================
     # Field validators
@@ -1237,7 +1302,29 @@ class GptAnalystEngine:
             parsed = float(value)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(f"Missing or invalid required float setting: {name}") from exc
+        if not math.isfinite(parsed):
+            raise RuntimeError(f"{name} must be finite")
         return parsed
+
+    # ========================================================
+    # Misc helpers
+    # ========================================================
+
+    def _normalize_symbol_or_raise(self, value: str, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError(f"{field_name} must be a non-empty string")
+        normalized = value.strip().replace("-", "").replace("/", "").upper()
+        if not normalized:
+            raise RuntimeError(f"{field_name} normalized symbol must not be empty")
+        return normalized
+
+    def _count_sentences(self, text: str) -> int:
+        normalized = self._require_nonempty_str(text, "answer_ko")
+        parts = re.split(r"[.!?]+", normalized)
+        count = sum(1 for part in parts if part.strip())
+        if count == 0:
+            return 1
+        return count
 
 
 __all__ = [

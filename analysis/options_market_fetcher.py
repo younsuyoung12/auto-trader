@@ -6,16 +6,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
 핵심 변경 요약
+- FIX(ROOT-CAUSE): 누락된 _require_float_setting 구현을 추가해 Render 부팅 실패 원인 제거
 - Deribit 옵션시장 snapshot을 프로세스 메모리 캐시 + Postgres 영속 캐시로 이중 관리
-- 서버 재시작 후에도 DB의 fresh snapshot을 재사용하도록 구조 변경
+- 서버 재시작 후에도 DB의 fresh snapshot을 재사용하도록 구조 유지
 - stale DB/메모리 캐시 재사용 금지, TTL 만료 후 fetch 실패 시 즉시 예외 전파 유지
-- request timeout을 상수 고정값이 아니라 settings(SSOT) 기반으로 정합화
+- request timeout을 settings(SSOT) 기반으로 엄격 검증
 
 코드 정리 내용
-- snapshot 생성/직렬화/역직렬화 로직 분리
-- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합
-- 미사용 고정 timeout 상수 제거
-- 중복 조립 로직 정리
+- settings float validator 추가로 다른 fetcher 계열과 구조 정합화
+- snapshot 생성/직렬화/역직렬화 로직 분리 유지
+- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합 유지
+- 미사용 import 정리
+- 중복 조립 로직 정리 유지
 
 역할:
 - Deribit 공개 옵션 시장 데이터를 수집/정규화해 Options Market Snapshot 을 생성한다.
@@ -39,6 +41,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 입력 전제:
 - SETTINGS.ANALYST_MARKET_SYMBOL 이 존재해야 한다.
+- SETTINGS.ANALYST_HTTP_TIMEOUT_SEC 이 존재해야 하며 0보다 큰 유한 숫자여야 한다.
 - 현재 symbol 에서 base currency(BTC / ETH 등)를 엄격하게 추출할 수 있어야 한다.
 - Deribit 응답은 JSON-RPC 2.0 object 여야 한다.
 - option instrument_name 은 Deribit 표준 형식을 만족해야 한다.
@@ -55,10 +58,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력:
 2026-03-09
-1) FIX(ROOT-CAUSE): 옵션시장 snapshot DB 영속 캐시 추가
-2) FIX(STRICT): DB의 fresh snapshot만 사용, stale snapshot 재사용 금지
-3) FIX(STRUCTURE): options snapshot table 생성/저장/조회 책임을 fetcher 내부로 통합
-4) FIX(SSOT): request timeout 상수 제거, ANALYST_HTTP_TIMEOUT_SEC 사용으로 정합화
+1) FIX(ROOT-CAUSE): 누락된 _require_float_setting 구현 추가로 Render 부팅 실패 원인 제거
+2) FIX(STRICT): settings timeout 값을 0보다 큰 유한 숫자로 엄격 검증
+3) FIX(ROOT-CAUSE): 옵션시장 snapshot DB 영속 캐시 추가
+4) FIX(STRICT): DB의 fresh snapshot만 사용, stale snapshot 재사용 금지
+5) FIX(STRUCTURE): options snapshot table 생성/저장/조회 책임을 fetcher 내부로 통합
+6) FIX(SSOT): request timeout 상수 제거, ANALYST_HTTP_TIMEOUT_SEC 사용으로 정합화
 
 2026-03-08
 1) Deribit 공개 옵션시장 Feature Engine 추가
@@ -76,7 +81,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import requests
 from sqlalchemy import text
@@ -1031,6 +1036,21 @@ class OptionsMarketFetcher:
         if not isinstance(value, str) or not value.strip():
             raise RuntimeError(f"Missing or invalid required setting: {name}")
         return value.strip()
+
+    def _require_float_setting(self, name: str) -> float:
+        value = getattr(SETTINGS, name, None)
+        if value is None:
+            raise RuntimeError(f"Missing required float setting: {name}")
+
+        parsed = self._to_decimal(value, f"setting.{name}")
+        if parsed <= Decimal("0"):
+            raise RuntimeError(f"{name} must be > 0")
+
+        timeout_sec = float(parsed)
+        if timeout_sec <= 0.0:
+            raise RuntimeError(f"{name} must be > 0")
+
+        return timeout_sec
 
     def _derive_base_currency_from_symbol_or_raise(
         self,
