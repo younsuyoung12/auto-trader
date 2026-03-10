@@ -14,6 +14,7 @@ CORE RESPONSIBILITIES:
 - WATCHDOG/DECISION/PERFORMANCE INIT 상태를 대시보드 계약으로 정규화
 - 캐시/웹소켓/분석 API를 일관된 구조로 제공
 - 외부 AI/시장데이터 provider quota 초과 시 재호출 폭주를 차단한다
+- WS candle buffer 상태를 bt_candles(source='ws') + freshness 기준으로 판정한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -25,20 +26,26 @@ IMPORTANT POLICY:
 - WATCHDOG INIT는 엔진 장애로 취급하지 않는다
 - AI 분석 API는 exact cache hit 우선, cache miss 시 route cooldown / provider block / in-flight guard를 적용한다
 - provider quota 초과 상태는 route 단위가 아니라 provider scope 단위로 차단한다
+- candle buffer health는 bt_candles 전체가 아니라 source='ws' 진실값만 사용한다
+- candle buffer health는 개수뿐 아니라 latest candle freshness까지 함께 검증한다
 
 CHANGE HISTORY:
 - 2026-03-11
-  1) FIX(ROOT-CAUSE): AI 분석 API에 provider block / route cooldown / in-flight guard 추가
-  2) FIX(ROOT-CAUSE): 외부 provider quota 초과 시 동일 provider scope 재호출 폭주 차단
-  3) FIX(STRICT): _raise_ai_provider_http_exception 의 잘못된 bare raise 제거
-  4) FIX(OBSERVABILITY): AI route reject 사유를 HTTP detail / structured log 로 명시
-  5) FIX(ROOT-CAUSE): dashboard health는 DB 최신 orderbook snapshot freshness를 기준 진실원천으로 사용
-  6) FIX(ROOT-CAUSE): ws_orderbook_stale watchdog reason은 DB snapshot이 fresh/delayed면 ENGINE_WARNING으로 올리지 않음
-  7) ADD(OBSERVABILITY): runtime에 is_warning / warning_reason / freshness_state 추가
-  8) FIX(CONTRACT): runtime delayed는 SERVER_STOP이 아니라 SERVER_LIVE로 유지
-  9) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
-  10) FIX(ROOT-CAUSE): WATCHDOG INIT 상태는 engine health에서 경고/치명 사유로 취급하지 않음
-  11) FIX(STRICT): recent trades enrich 경로의 None -> 0.0 보정 제거
+  1) FIX(ROOT-CAUSE): import 시점 NameError 방지를 위해 helper 정의 이후에 settings/app 초기화 순서 정리
+  2) FIX(ROOT-CAUSE): ws-status kline buffer 조회를 bt_candles source='ws' 기준으로 제한
+  3) FIX(ROOT-CAUSE): kline buffer health에 latest candle freshness(stale_ms / freshness_state) 검증 추가
+  4) FIX(OBSERVABILITY): ws-status.buffers에 source / latest_ts_ms / stale_ms / freshness_state / stale_threshold_ms / reasons 추가
+  5) FIX(ROOT-CAUSE): AI 분석 API에 provider block / route cooldown / in-flight guard 추가
+  6) FIX(ROOT-CAUSE): 외부 provider quota 초과 시 동일 provider scope 재호출 폭주 차단
+  7) FIX(STRICT): _raise_ai_provider_http_exception 의 잘못된 bare raise 제거
+  8) FIX(OBSERVABILITY): AI route reject 사유를 HTTP detail / structured log 로 명시
+  9) FIX(ROOT-CAUSE): dashboard health는 DB 최신 orderbook snapshot freshness를 기준 진실원천으로 사용
+  10) FIX(ROOT-CAUSE): ws_orderbook_stale watchdog reason은 DB snapshot이 fresh/delayed면 ENGINE_WARNING으로 올리지 않음
+  11) ADD(OBSERVABILITY): runtime에 is_warning / warning_reason / freshness_state 추가
+  12) FIX(CONTRACT): runtime delayed는 SERVER_STOP이 아니라 SERVER_LIVE로 유지
+  13) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
+  14) FIX(ROOT-CAUSE): WATCHDOG INIT 상태는 engine health에서 경고/치명 사유로 취급하지 않음
+  15) FIX(STRICT): recent trades enrich 경로의 None -> 0.0 보정 제거
 ========================================================
 """
 
@@ -121,6 +128,9 @@ _ENGINE_RUNTIME_FRESHNESS_FRESH = "fresh"
 _ENGINE_RUNTIME_FRESHNESS_DELAYED = "delayed"
 _ENGINE_RUNTIME_FRESHNESS_STALE = "stale"
 
+_ENGINE_KLINE_FRESHNESS_FRESH = "fresh"
+_ENGINE_KLINE_FRESHNESS_STALE = "stale"
+
 _WATCHDOG_STATUS_OK = "OK"
 _WATCHDOG_STATUS_INIT = "INIT"
 
@@ -155,32 +165,6 @@ _AI_GUARD_ROUTE_COOLDOWN = "route-cooldown"
 
 _AI_INFLIGHT_LOCK = Lock()
 _AI_INFLIGHT_KEYS: set[str] = set()
-
-# =====================================================
-# FastAPI App
-# =====================================================
-
-_SETTINGS = load_settings()
-_QUANT_ANALYST = QuantAnalyst()
-
-app = FastAPI(title="Binance Auto Trader Dashboard")
-templates = Jinja2Templates(directory="dashboard/templates")
-
-app.mount("/dashboard/static", StaticFiles(directory="dashboard/static"), name="dashboard-static")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.on_event("startup")
-def _startup_init_cache() -> None:
-    init_cache_from_settings(_SETTINGS)
-    ping_cache()
 
 
 # =====================================================
@@ -278,6 +262,39 @@ def _normalize_optional_event_type(event_type: Optional[str]) -> Optional[str]:
     if event_type is None:
         return None
     return _require_nonempty_str(event_type, "event_type").upper()
+
+
+def _normalize_candle_source(source: Any) -> str:
+    s = _require_nonempty_str(source, "source").lower()
+    if s not in {"ws", "rest"}:
+        raise RuntimeError(f"unsupported candle source (STRICT): {s!r}")
+    return s
+
+
+def _timeframe_to_ms_strict(timeframe: Any) -> int:
+    tf = _require_nonempty_str(timeframe, "timeframe").strip()
+    match = re.fullmatch(r"(\d+)([mhdwM])", tf)
+    if match is None:
+        raise RuntimeError(f"unsupported timeframe format (STRICT): {tf!r}")
+
+    qty = _require_positive_int(match.group(1), "timeframe.qty")
+    unit = match.group(2)
+
+    multipliers = {
+        "m": 60_000,
+        "h": 3_600_000,
+        "d": 86_400_000,
+        "w": 604_800_000,
+        "M": 2_592_000_000,  # 30d fixed contract for dashboard freshness
+    }
+    multiplier = multipliers.get(unit)
+    if multiplier is None:
+        raise RuntimeError(f"unsupported timeframe unit (STRICT): {unit!r}")
+
+    value = qty * multiplier
+    if value <= 0:
+        raise RuntimeError("timeframe ms must be > 0 (STRICT)")
+    return value
 
 
 def _cache_token_bool(value: bool) -> str:
@@ -846,6 +863,37 @@ def _guarded_ai_cached_json(
 
     finally:
         _release_ai_inflight_key(payload_cache_key)
+
+
+# =====================================================
+# FastAPI App
+# =====================================================
+
+_SETTINGS = load_settings()
+_QUANT_ANALYST = QuantAnalyst()
+
+_ENGINE_KLINE_EXTRA_GRACE_MS = int(
+    _require_finite_float(_SETTINGS.ws_max_kline_delay_sec, "settings.ws_max_kline_delay_sec") * 1000.0
+)
+
+app = FastAPI(title="Binance Auto Trader Dashboard")
+templates = Jinja2Templates(directory="dashboard/templates")
+
+app.mount("/dashboard/static", StaticFiles(directory="dashboard/static"), name="dashboard-static")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def _startup_init_cache() -> None:
+    init_cache_from_settings(_SETTINGS)
+    ping_cache()
 
 
 # =====================================================
@@ -1569,25 +1617,31 @@ def _count_recent_events_strict(db: Session, *, minutes: int, event_type: str) -
     return iv
 
 
-def _fetch_recent_candle_buffer_len_strict(
+def _fetch_recent_ws_candle_buffer_status_strict(
     db: Session,
     *,
     symbol: str,
     timeframe: str,
     row_limit: int,
-) -> int:
+    now_ms: int,
+) -> Dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_tf = _require_nonempty_str(timeframe, "timeframe")
     normalized_limit = _require_positive_int(row_limit, "row_limit", max_value=100000)
+    normalized_now_ms = _require_positive_int(now_ms, "now_ms")
+    normalized_source = _normalize_candle_source("ws")
 
     sql = text(
         """
-        SELECT COUNT(*) AS n
+        SELECT
+            COUNT(*) AS n,
+            MAX(ts) AS latest_ts
         FROM (
             SELECT ts
             FROM bt_candles
             WHERE symbol = :symbol
               AND timeframe = :timeframe
+              AND source = :source
             ORDER BY ts DESC
             LIMIT :row_limit
         ) q
@@ -1598,25 +1652,52 @@ def _fetch_recent_candle_buffer_len_strict(
         {
             "symbol": normalized_symbol,
             "timeframe": normalized_tf,
+            "source": normalized_source,
             "row_limit": normalized_limit,
         },
     ).mappings().one_or_none()
 
     if row is None:
-        raise RuntimeError("recent candle buffer row not found (STRICT)")
+        raise RuntimeError("recent ws candle buffer row not found (STRICT)")
 
     n = row.get("n")
     if n is None:
-        raise RuntimeError("recent candle buffer len is required (STRICT)")
+        raise RuntimeError("recent ws candle buffer len is required (STRICT)")
     if isinstance(n, bool):
-        raise RuntimeError("recent candle buffer len must be int (STRICT)")
+        raise RuntimeError("recent ws candle buffer len must be int (STRICT)")
     try:
-        iv = int(n)
+        buffer_len = int(n)
     except Exception as exc:
-        raise RuntimeError(f"recent candle buffer len must be int (STRICT): {exc}") from exc
-    if iv < 0:
-        raise RuntimeError("recent candle buffer len must be >= 0 (STRICT)")
-    return iv
+        raise RuntimeError(f"recent ws candle buffer len must be int (STRICT): {exc}") from exc
+    if buffer_len < 0:
+        raise RuntimeError("recent ws candle buffer len must be >= 0 (STRICT)")
+
+    latest_ts_value = row.get("latest_ts")
+    latest_ts_ms: Optional[int] = None
+    stale_ms: Optional[int] = None
+    freshness_state = _ENGINE_KLINE_FRESHNESS_STALE
+
+    stale_threshold_ms = _timeframe_to_ms_strict(normalized_tf) + _ENGINE_KLINE_EXTRA_GRACE_MS
+
+    if latest_ts_value is not None:
+        latest_ts_ms = _datetime_to_epoch_ms_strict(latest_ts_value, "recent_ws_candle.latest_ts")
+        stale_ms = normalized_now_ms - latest_ts_ms
+        if stale_ms < 0:
+            raise RuntimeError("recent ws candle stale_ms must be >= 0 (STRICT)")
+        freshness_state = (
+            _ENGINE_KLINE_FRESHNESS_FRESH
+            if stale_ms <= stale_threshold_ms
+            else _ENGINE_KLINE_FRESHNESS_STALE
+        )
+
+    return {
+        "source": normalized_source,
+        "buffer_len": buffer_len,
+        "latest_ts_ms": latest_ts_ms,
+        "stale_ms": stale_ms,
+        "freshness_state": freshness_state,
+        "stale_threshold_ms": stale_threshold_ms,
+    }
 
 
 def _fetch_latest_orderbook_snapshot_strict(
@@ -1842,15 +1923,37 @@ def _ws_status(
 
     for tf in tfs:
         tf_name = _require_nonempty_str(tf, "tf")
-        buf_len = _fetch_recent_candle_buffer_len_strict(
+        buf_status = _fetch_recent_ws_candle_buffer_status_strict(
             db,
             symbol=normalized_symbol,
             timeframe=tf_name,
             row_limit=normalized_min_buf,
+            now_ms=now_ms,
         )
+
+        reasons: List[str] = []
+        if buf_status["buffer_len"] < normalized_min_buf:
+            reasons.append(f"buffer_len<{normalized_min_buf} (got={buf_status['buffer_len']})")
+        if buf_status["latest_ts_ms"] is None:
+            reasons.append("no_ws_candle_ts")
+        elif buf_status["freshness_state"] != _ENGINE_KLINE_FRESHNESS_FRESH:
+            stale_ms = buf_status["stale_ms"]
+            stale_threshold_ms = buf_status["stale_threshold_ms"]
+            if stale_ms is None:
+                raise RuntimeError("stale_ms is required when latest_ts_ms exists (STRICT)")
+            reasons.append(
+                f"ws_candle_stale(stale_ms={stale_ms}, threshold_ms={stale_threshold_ms})"
+            )
+
         out["buffers"][tf_name] = {
-            "ok": buf_len >= normalized_min_buf,
-            "len": buf_len,
+            "ok": len(reasons) == 0,
+            "len": buf_status["buffer_len"],
+            "source": buf_status["source"],
+            "latest_ts_ms": buf_status["latest_ts_ms"],
+            "stale_ms": buf_status["stale_ms"],
+            "freshness_state": buf_status["freshness_state"],
+            "stale_threshold_ms": buf_status["stale_threshold_ms"],
+            "reasons": reasons,
         }
 
     latest_orderbook = _fetch_latest_orderbook_snapshot_strict(db, symbol=normalized_symbol)

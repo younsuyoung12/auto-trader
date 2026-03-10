@@ -20,8 +20,18 @@ IMPORTANT POLICY:
 - orderbook timestamp 누락을 현재 시각으로 대체하지 않는다.
 - 비핵심 알림 실패는 로깅하되, 핵심 데이터 실패를 가리지 않는다.
 - market_data_ws 의 WARNING 상태는 관측 정보로 보존하되 feature 생성 실패로 오판하지 않는다.
+- 방향 결정 계약은 entry_pipeline 과 정합해야 하며, 상위 TF 우선 편향으로
+  저주기 confirmed momentum 을 무시하는 구조를 금지한다.
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): direction bias 결정을 entry_pipeline 정합 기준으로 재구성
+     - 기존 4h/1h 우선 구조 제거
+     - 1h/15m → 15m/5m → 1h/5m → 5m_only 순서로 변경
+     - 4h 는 방향 선택이 아닌 관측 메타(telemetry)로만 유지
+  2) FIX(TRADE-GRADE): LONG 편향 완화
+     - 4h/1h LONG 이 15m/5m SHORT 전환을 덮어써 LONG 생성→차단 반복되던 구조 제거
+
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): market_data_ws health snapshot 계약(overall_ok / has_warning / overall_warnings)과 정합화
   2) FIX(STRICT): settings getattr default 제거, 필요한 설정은 명시적으로 검증
@@ -1024,9 +1034,17 @@ def _resolve_direction_bias_strict(
     tf4h: Optional[Dict[str, Any]],
 ) -> Tuple[int, Dict[str, Any]]:
     """
-    방향 결정은 "상위 TF 우선"으로만 수행한다.
-    - 1m vote / depth_imbalance 는 방향 직접 결정에 사용하지 않는다.
-    - 4h/1h 합의 → 1h/15m 합의 → 15m/5m 합의 → 5m 단독 순서
+    방향 결정은 entry_pipeline 의 방향 안정성 계약과 정합해야 한다.
+
+    기존 문제:
+    - 4h/1h 우선 구조가 15m/5m 전환을 덮어써 LONG 편향을 만들었다.
+    - upstream(get_trading_signal)은 LONG 을 만들고,
+      downstream(entry_pipeline)은 5m confirmed momentum 기준으로 그 LONG 을 차단했다.
+
+    수정 원칙:
+    - 방향 선택은 1h/15m/5m 중기~진입 타이밍 합의만 사용한다.
+    - 4h 는 방향 선택에 사용하지 않고 telemetry 용 bias 메타로만 유지한다.
+    - source 값은 entry_pipeline 계약 허용값만 사용한다.
     """
     b5 = _compute_trend_bias(tf5)
     b15 = _compute_trend_bias(tf15) if tf15 else 0
@@ -1036,32 +1054,23 @@ def _resolve_direction_bias_strict(
     support_count = 0
     oppose_count = 0
     chosen = 0
-    source = "NONE"
+    source = "undecided"
 
-    if b4h != 0 and b1h != 0 and b4h == b1h:
-        chosen = b4h
-        source = "4h_1h_agree"
-    elif b1h != 0 and b15 != 0 and b1h == b15:
+    if b1h != 0 and b15 != 0 and b1h == b15:
         chosen = b1h
         source = "1h_15m_agree"
     elif b15 != 0 and b5 != 0 and b15 == b5:
         chosen = b15
         source = "15m_5m_agree"
-    elif b4h != 0 and b1h == 0 and b15 != 0 and b4h == b15:
-        chosen = b4h
-        source = "4h_15m_agree"
-    elif b1h != 0 and b15 == 0 and b5 != 0 and b1h == b5:
+    elif b1h != 0 and b5 != 0 and b1h == b5:
         chosen = b1h
         source = "1h_5m_agree"
     elif b5 != 0:
         chosen = b5
         source = "5m_only"
-    else:
-        chosen = 0
-        source = "undecided"
 
     if chosen != 0:
-        for bias in (b4h, b1h, b15, b5):
+        for bias in (b1h, b15, b5):
             if bias == chosen:
                 support_count += 1
             elif bias == -chosen:

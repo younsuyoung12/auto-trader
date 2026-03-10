@@ -5,10 +5,12 @@ FILE: infra/market_data_ws.py
 ROLE:
 - Binance USDT-M Futures multiplex WebSocket 수신기
 - 멀티 타임프레임 kline + depth5 orderbook을 메모리 버퍼에 유지
+- WS primary market-data를 bt_candles / bt_orderbook_snapshots 에 지속 기록한다
 - 상위 레이어에 getter / atomic snapshot / health snapshot만 제공
 
 CORE RESPONSIBILITIES:
 - WS 수신 데이터의 STRICT 검증 및 메모리 버퍼링
+- WS kline / depth5 orderbook의 DB 영속화(STRICT, fail-fast)
 - 부팅 시 REST bootstrap으로 필수 캔들 preload
 - WS 세션 상태 / market-data freshness / orderbook payload 무결성 관측성 제공
 - strategy / execution / exit 책임과 완전 분리
@@ -21,14 +23,21 @@ IMPORTANT POLICY:
 - orderbook payload 무결성과 feed inactivity warning을 혼동하지 않는다
 - 환경변수 직접 접근 금지, settings.py(SSOT)만 사용
 - orderbook spreadPct/spread_pct 계약은 ratio(0..1) 기준으로 통일한다
+- WS primary feed 의 DB 저장 실패는 치명적 오류로 간주하며 세션을 종료/재연결한다
+- orderbook DB timestamp 는 반드시 거래소 이벤트 시각(E/T)을 사용한다
 
 CHANGE HISTORY:
 - 2026-03-11:
-  1) FIX(ROOT-CAUSE): kline buffer contract now preserves is_closed state end-to-end
-  2) FIX(ROOT-CAUSE): WS open candle updates are stored instead of being discarded until close
-  3) FIX(STRICT): REST bootstrap derives current-candle closed state from explicit close_time only
-  4) ADD(API): get_klines_with_volume_and_closed() for downstream persistence path
-  5) FIX(CONTRACT): legacy public getters keep 5/6-tuple compatibility while internal buffer uses 7-tuple
+  1) FIX(ROOT-CAUSE): orderbook DB/storage ts 를 local receive time 이 아닌 exchange event time(E/T)으로 교정
+  2) FIX(TRADE-GRADE): orderbook 는 event ts / recv ts 를 분리해 DB 정합성과 health 관측성을 동시에 유지
+  3) FIX(ROOT-CAUSE): WS kline / orderbook DB persistence path 추가
+  4) FIX(ROOT-CAUSE): kline close flag(k.x) 를 DB is_closed 계약까지 end-to-end 전달
+  5) FIX(TRADE-GRADE): DB 저장 실패를 fatal message handling error 로 승격, WS 세션 종료/재연결
+  6) FIX(ROOT-CAUSE): kline buffer contract now preserves is_closed state end-to-end
+  7) FIX(ROOT-CAUSE): WS open candle updates are stored instead of being discarded until close
+  8) FIX(STRICT): REST bootstrap derives current-candle closed state from explicit close_time only
+  9) ADD(API): get_klines_with_volume_and_closed() for downstream persistence path
+  10) FIX(CONTRACT): legacy public getters keep 5/6-tuple compatibility while internal buffer uses 7-tuple
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): ws_status.ok 를 transport 상태만 의미하도록 정리
   2) FIX(ROOT-CAUSE): orderbook health 에서 feed inactivity warning 과 payload fail 분리
@@ -36,11 +45,6 @@ CHANGE HISTORY:
   4) ADD(API): get_orderbook_buffer_status() 공개
   5) FIX(ARCH): get_health_snapshot() 가 warning 때문에 overall FAIL 되지 않도록 정리
   6) FIX(CONTRACT): orderbook spreadPct 를 percent가 아닌 ratio(0..1)로 통일
-- 2026-03-09:
-  1) FIX(ROOT-CAUSE): downstream EMA200 요구량과 WS bootstrap/min-buffer 정책 정합화
-  2) FIX(STRICT): 5m / 15m / 1h / 4h interval에 최소 200개 캔들 강제
-  3) FIX(COMPAT): legacy get_klines() limit 미지정 시 지표 계산에 충분한 길이 반환
-  4) FIX(VALIDATION): MAX_KLINES 용량이 strict 최소 요구량보다 작으면 즉시 예외
 ========================================================
 """
 
@@ -54,6 +58,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import requests
 import websocket  # pip install websocket-client
 
+from infra.market_data_store import save_candle_from_ws, save_orderbook_from_ws
 from infra.telelog import log
 from settings import SETTINGS
 
@@ -208,6 +213,15 @@ def _truncate_text(v: Any, max_len: int = 300) -> str:
     if len(s) <= max_len:
         return s
     return s[:max_len] + f"... (truncated, total_len={len(s)})"
+
+
+def _extract_orderbook_event_ts_ms_strict(payload: Dict[str, Any]) -> int:
+    raw_event_ts = payload.get("E")
+    if raw_event_ts is None:
+        raw_event_ts = payload.get("T")
+    if raw_event_ts is None:
+        raise WSProtocolError("orderbook missing exchange event time (E/T) (STRICT)")
+    return _require_int_ms(raw_event_ts, "orderbook.event_ts")
 
 
 # ─────────────────────────────────────────────
@@ -390,14 +404,6 @@ def _mark_ws_error(symbol: str, error: Any) -> None:
     msg = _truncate_text(error)
     with _ws_state_lock:
         _ws_last_error_text[sym] = msg
-
-
-def _mark_orderbook_message(symbol: str, received_at_ms: int) -> None:
-    sym = _normalize_symbol(symbol)
-    if not sym:
-        raise RuntimeError("symbol is required for orderbook message state")
-    with _orderbook_lock:
-        _orderbook_last_recv_ts[sym] = int(received_at_ms)
 
 
 def get_ws_status(symbol: str) -> Dict[str, Any]:
@@ -622,6 +628,27 @@ def _require_kline_progression_strict(prev: KlineRow, new_row: KlineRow, *, cont
         raise WSProtocolError(f"{context} volume decreased within same candle (STRICT)")
 
 
+def _validate_next_kline_row_against_buffer_strict(buf: List[KlineRow], row: KlineRow, *, context: str) -> None:
+    ts = int(row[0])
+    if not buf:
+        return
+
+    last = buf[-1]
+    last_ts = int(last[0])
+
+    if ts < last_ts:
+        raise WSProtocolError(f"{context} kline timestamp rollback (STRICT): new_ts={ts} last_ts={last_ts}")
+
+    if ts == last_ts:
+        _require_kline_progression_strict(last, row, context=context)
+        return
+
+    if bool(last[6]) is False:
+        raise WSProtocolError(
+            f"{context} new candle arrived before previous candle closed (STRICT): prev_ts={last_ts} new_ts={ts}"
+        )
+
+
 def _append_or_update_kline_row_strict(buf: List[KlineRow], row: KlineRow, *, context: str) -> None:
     ts = int(row[0])
     if not buf:
@@ -649,6 +676,34 @@ def _append_or_update_kline_row_strict(buf: List[KlineRow], row: KlineRow, *, co
         del buf[0 : len(buf) - MAX_KLINES]
 
 
+def _persist_ws_kline_strict(
+    *,
+    symbol: str,
+    interval: str,
+    ts_ms: int,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    volume: float,
+    quote_volume: float,
+    is_closed: bool,
+) -> None:
+    save_candle_from_ws(
+        symbol=symbol,
+        interval=interval,
+        ts_ms=ts_ms,
+        open_=open_,
+        high=high,
+        low=low,
+        close=close,
+        volume=volume,
+        quote_volume=quote_volume,
+        source="ws",
+        is_closed=is_closed,
+    )
+
+
 def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -666,6 +721,7 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     l = _require_float(kline_obj.get("l"), "kline.l")
     c = _require_float(kline_obj.get("c"), "kline.c")
     v = _require_float(kline_obj.get("v"), "kline.v", allow_zero=True)
+    q = _require_float(kline_obj.get("q"), "kline.q", allow_zero=True)
     is_closed = _require_bool(kline_obj.get("x"), "kline.x")
 
     row: KlineRow = (ts, o, h, l, c, v, is_closed)
@@ -674,9 +730,26 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     _mark_ws_message(sym, now_ms)
 
     with _kline_lock:
-        _kline_last_recv_ts[key] = now_ms
+        buf = _kline_buffers.setdefault(key, [])
+        _validate_next_kline_row_against_buffer_strict(buf, row, context=f"ws_kline[{sym}:{iv}]")
+
+    _persist_ws_kline_strict(
+        symbol=sym,
+        interval=iv,
+        ts_ms=ts,
+        open_=o,
+        high=h,
+        low=l,
+        close=c,
+        volume=v,
+        quote_volume=q,
+        is_closed=is_closed,
+    )
+
+    with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
         _append_or_update_kline_row_strict(buf, row, context=f"ws_kline[{sym}:{iv}]")
+        _kline_last_recv_ts[key] = now_ms
 
 
 def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
@@ -732,6 +805,21 @@ def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
     return (best_ask - best_bid) / mid
 
 
+def _persist_ws_orderbook_snapshot_strict(
+    *,
+    symbol: str,
+    event_ts_ms: int,
+    bids: List[List[float]],
+    asks: List[List[float]],
+) -> None:
+    save_orderbook_from_ws(
+        symbol=symbol,
+        ts_ms=event_ts_ms,
+        bids=bids,
+        asks=asks,
+    )
+
+
 def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -761,9 +849,9 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     normalized_bids = _normalize_depth_side_strict(raw_bids, name="orderbook.bids")
     normalized_asks = _normalize_depth_side_strict(raw_asks, name="orderbook.asks")
 
+    event_ts_ms = _extract_orderbook_event_ts_ms_strict(payload)
     now_ms = _now_ms()
     _mark_ws_message(sym, now_ms)
-    _mark_orderbook_message(sym, now_ms)
 
     best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
     spread_pct = _compute_spread_pct(best_bid, best_ask)
@@ -771,16 +859,20 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     ob: Dict[str, Any] = {
         "bids": normalized_bids,
         "asks": normalized_asks,
-        "ts": now_ms,
+        "ts": event_ts_ms,
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spreadPct": spread_pct,
         "lastUpdateId": int(update_id),
+        "exchTs": event_ts_ms,
     }
 
-    exch_ts = payload.get("E") or payload.get("T")
-    if exch_ts is not None:
-        ob["exchTs"] = _require_int_ms(exch_ts, "orderbook.exchTs")
+    _persist_ws_orderbook_snapshot_strict(
+        symbol=sym,
+        event_ts_ms=event_ts_ms,
+        bids=normalized_bids,
+        asks=normalized_asks,
+    )
 
     with _orderbook_lock:
         prev2 = _orderbook_last_update_id.get(sym)
@@ -791,6 +883,7 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
 
         _orderbook_buffers[sym] = ob
         _orderbook_last_update_id[sym] = int(update_id)
+        _orderbook_last_recv_ts[sym] = now_ms
 
 
 def _handle_single_msg(expected_symbol: str, data: Any) -> None:
@@ -840,6 +933,7 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
         data = _decode_msg(message)
     except Exception as e:
         log(f"[MD_BINANCE_WS] decode error: {type(e).__name__}: {e}")
+        _mark_ws_error(symbol, f"decode_error:{type(e).__name__}:{e}")
         _close_ws_with_log(ws, context=f"decode_error symbol={_normalize_symbol(symbol)}")
         return
 
@@ -850,8 +944,13 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
         else:
             _handle_single_msg(symbol, data)
     except WSProtocolError as e:
+        _mark_ws_error(symbol, f"protocol_error:{e}")
         log(f"[MD_BINANCE_WS] protocol error: {e}")
         _close_ws_with_log(ws, context=f"protocol_error symbol={_normalize_symbol(symbol)}")
+    except Exception as e:
+        _mark_ws_error(symbol, f"fatal_message_handling_error:{type(e).__name__}:{e}")
+        log(f"[MD_BINANCE_WS] fatal message handling error: {type(e).__name__}: {e}")
+        _close_ws_with_log(ws, context=f"fatal_message_handling_error symbol={_normalize_symbol(symbol)}")
 
 
 def _on_error(symbol: str, ws: websocket.WebSocketApp, error: Any) -> None:

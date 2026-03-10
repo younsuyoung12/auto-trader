@@ -21,10 +21,12 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 - 2026-03-11
-  1) FIX(ROOT-CAUSE): 조회 계층의 None→0/"" 보정 제거
-  2) FIX(ARCH): 무데이터 상태를 INIT / 빈 결과로 명시화
-  3) FIX(STRICT): 행 존재 시 컬럼/타입 검증 강화
-  4) FIX(SQL): entry score 조회에서 COALESCE 제거
+  1) FIX(ROOT-CAUSE): get_summary()가 INIT 상태에서 NULL aggregate 검증 전에 즉시 INIT 요약을 반환하도록 수정
+  2) FIX(STRICT): get_recent_trades()의 is_auto bool(...) 강제 변환 제거, 실제 bool만 허용
+  3) FIX(ROOT-CAUSE): 조회 계층의 None→0/"" 보정 제거
+  4) FIX(ARCH): 무데이터 상태를 INIT / 빈 결과로 명시화
+  5) FIX(STRICT): 행 존재 시 컬럼/타입 검증 강화
+  6) FIX(SQL): entry score 조회에서 COALESCE 제거
 ========================================================
 """
 
@@ -96,6 +98,12 @@ def _optional_nonempty_str(value: Any, name: str) -> Optional[str]:
     if not s:
         raise RuntimeError(f"{name} must not be blank when provided (STRICT)")
     return s
+
+
+def _require_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT), got={type(value).__name__}")
+    return value
 
 
 def _require_finite_float(value: Any, name: str) -> float:
@@ -239,15 +247,13 @@ def get_summary(db: Session) -> Dict[str, Any]:
         raise RuntimeError("summary aggregate row not found (STRICT)")
 
     total = _require_nonnegative_int(r.get("total_trades"), "summary.total_trades")
+    if total == 0:
+        return _build_empty_summary()
+
     wins = _require_nonnegative_int(r.get("wins"), "summary.wins")
     losses = _require_nonnegative_int(r.get("losses"), "summary.losses")
     breakevens = _require_nonnegative_int(r.get("breakevens"), "summary.breakevens")
-
-    total_pnl_raw = r.get("total_pnl_usdt")
-    total_pnl = 0.0 if total_pnl_raw is None else _require_finite_float(total_pnl_raw, "summary.total_pnl_usdt")
-
-    if total == 0:
-        return _build_empty_summary()
+    total_pnl = _require_finite_float(r.get("total_pnl_usdt"), "summary.total_pnl_usdt")
 
     if wins + losses + breakevens != total:
         raise RuntimeError(
@@ -297,7 +303,7 @@ def get_recent_trades(db: Session, limit: int = 50) -> List[Dict[str, Any]]:
                 "id": _require_positive_int(r.get("id"), f"recent_trades[{idx}].id"),
                 "symbol": _require_nonempty_str(r.get("symbol"), f"recent_trades[{idx}].symbol"),
                 "side": _require_nonempty_str(r.get("side"), f"recent_trades[{idx}].side"),
-                "is_auto": bool(r.get("is_auto")),
+                "is_auto": _require_bool(r.get("is_auto"), f"recent_trades[{idx}].is_auto"),
                 "strategy": _optional_nonempty_str(r.get("strategy"), f"recent_trades[{idx}].strategy"),
                 "entry_ts": _optional_iso_datetime(r.get("entry_ts"), f"recent_trades[{idx}].entry_ts"),
                 "exit_ts": _require_iso_datetime(r.get("exit_ts"), f"recent_trades[{idx}].exit_ts"),

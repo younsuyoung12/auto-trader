@@ -17,6 +17,7 @@ CORE RESPONSIBILITIES:
 - pattern / microstructure / volume_profile / orderflow / options 결합
 - institutional multi-factor engine score 산출
 - compact unified_features 출력 계약 보장
+- 방향 비대칭 없는 invariant 사전 검증
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -28,9 +29,14 @@ IMPORTANT POLICY:
 - orderbook spread_pct/spreadPct 계약은 ratio(0..1) 기준으로 통일한다
 - success cache는 TTL 내 성공 결과만 허용, stale cache 재사용 금지
 - settings는 settings.SETTINGS 단일 객체만 사용
+- 본 파일은 매매 결정을 하지 않으므로 특정 방향 하드코딩 검증을 금지한다
 
 CHANGE HISTORY:
 --------------------------------------------------------
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): invariant 검증의 direction="LONG" 하드코딩 제거
+  2) FIX(STRICT): unified_features 단계에서 LONG/SHORT 양방향 invariant 동시 검증 추가
+  3) FIX(ARCH): 방향 비대칭 검증 책임을 _validate_unified_feature_invariants_strict() 로 분리
 - 2026-03-10:
   1) FIX(SSOT): load_settings() 재호출 제거, settings.SETTINGS 단일 객체 사용
   2) FIX(ROOT-CAUSE): build_entry_features_ws() orderbook scalar ↔ WS raw depth5 snapshot 교차 검증 추가
@@ -39,12 +45,6 @@ CHANGE HISTORY:
   5) FIX(CONTRACT): orderbook spread_pct 재계산을 percent가 아닌 ratio(0..1)로 통일
   6) FIX(SCORING): orderbook_micro spread 구간 임계값을 ratio 기준으로 정합화
   7) 기존 pattern/microstructure/volume_profile/orderflow/options 기능 삭제 없음
-- 2026-03-08:
-  1) VolumeProfileEngine 연동 추가
-  2) OrderFlowCvdEngine 연동 추가
-  3) OptionsMarketFetcher 연동 추가
-  4) unified_features 에 volume_profile / orderflow_cvd / options_market compact payload 추가
-  5) engine_scores.total 에 volume_profile_regime / orderflow_regime / options_regime 점수 반영
 ========================================================
 """
 
@@ -163,6 +163,8 @@ _ORDERBOOK_SPREAD_SCORE_BANDS_RATIO: Tuple[float, float, float, float] = (
     0.0010,  # 0.10%
     0.0020,  # 0.20%
 )
+
+_INVARIANT_TEST_DIRECTIONS: Tuple[str, str] = ("LONG", "SHORT")
 
 
 class UnifiedFeaturesError(RuntimeError):
@@ -1578,6 +1580,36 @@ def _build_options_feature_strict(symbol: str) -> OptionsMarketSnapshot:
     return snap
 
 
+def _validate_unified_feature_invariants_strict(symbol: str, micro_score_risk: float, tp_pct: float, sl_pct: float) -> None:
+    stage = "invariant_guard"
+
+    if not math.isfinite(tp_pct) or tp_pct <= 0.0:
+        _fail_unified(symbol, stage, f"tp_pct must be finite > 0 (got={tp_pct})")
+    if not math.isfinite(sl_pct) or sl_pct <= 0.0:
+        _fail_unified(symbol, stage, f"sl_pct must be finite > 0 (got={sl_pct})")
+    if not math.isfinite(micro_score_risk):
+        _fail_unified(symbol, stage, f"micro_score_risk must be finite (got={micro_score_risk})")
+
+    for direction in _INVARIANT_TEST_DIRECTIONS:
+        try:
+            validate_signal_invariants_strict(
+                SignalInvariantInputs(
+                    symbol=str(symbol),
+                    direction=direction,
+                    risk_pct=0.01,
+                    tp_pct=float(tp_pct),
+                    sl_pct=float(sl_pct),
+                    dd_pct=None,
+                    micro_score_risk=float(micro_score_risk),
+                    final_risk_multiplier=None,
+                    equity_current_usdt=None,
+                    equity_peak_usdt=None,
+                )
+            )
+        except InvariantViolation as e:
+            _fail_unified(symbol, stage, f"{direction} invariant violation (STRICT): {e}", e)
+
+
 def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if symbol is None:
         try:
@@ -1654,23 +1686,12 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     except Exception as e:
         _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct must be float-convertible (STRICT)", e)
 
-    try:
-        validate_signal_invariants_strict(
-            SignalInvariantInputs(
-                symbol=str(sym),
-                direction="LONG",
-                risk_pct=0.01,
-                tp_pct=float(tp_pct),
-                sl_pct=float(sl_pct),
-                dd_pct=None,
-                micro_score_risk=float(msr),
-                final_risk_multiplier=None,
-                equity_current_usdt=None,
-                equity_peak_usdt=None,
-            )
-        )
-    except InvariantViolation as e:
-        _fail_unified(sym, "invariant_guard", f"invariant violation (STRICT): {e}", e)
+    _validate_unified_feature_invariants_strict(
+        symbol=sym,
+        micro_score_risk=float(msr),
+        tp_pct=float(tp_pct),
+        sl_pct=float(sl_pct),
+    )
 
     compact_timeframes = _compact_timeframes_for_output(sym, timeframes)
 
