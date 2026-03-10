@@ -7,13 +7,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 핵심 변경 요약
 - Blockchain.com 온체인 snapshot을 프로세스 메모리 캐시 + Postgres 영속 캐시로 이중 관리
-- 서버 재시작 후에도 DB의 fresh snapshot을 재사용하도록 구조 변경
-- stale DB/메모리 캐시 재사용 금지, TTL 만료 후 fetch 실패 시 즉시 예외 전파 유지
+- 서버 재시작 후에도 DB의 fresh snapshot을 재사용하도록 구조 유지
+- 외부 공급자 실패 시 마지막 검증된 DB snapshot(last known good)을 재사용하도록 정책 기반 복원 추가
+- stale DB/메모리 캐시의 일반 재사용은 금지하고, provider failure 시에만 persisted snapshot 복원을 허용
 
 코드 정리 내용
-- snapshot 생성/직렬화/역직렬화 로직 분리
-- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합
-- 중복 조립 로직 정리
+- snapshot 생성/직렬화/역직렬화 로직 분리 유지
+- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합 유지
+- latest DB row 조회 / fresh 조회 / provider 실패 복원 경로를 분리해 책임 명확화
 
 역할:
 - Blockchain.com 공개 API를 사용해 BTC 온체인/네트워크 상태 데이터를 수집한다.
@@ -27,17 +28,21 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 응답 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
 - 공개 API만 사용
+- 임의값/더미값/추정값 fallback 금지
+- 단, 외부 공급자 장애 시 마지막 검증된 DB snapshot 재사용은 운영 정책으로 허용한다
+  (합성 fallback 아님 / persisted last known good reuse)
 
 변경 이력:
+2026-03-10
+1) FIX(ROOT-CAUSE): TTL 만료 후 Blockchain.com API 실패 시 마지막 DB snapshot 재사용 경로 추가
+2) FIX(STABILITY): provider 장애로 서버가 종료되지 않도록 정책 기반 last-known-good 복원 추가
+3) FIX(STRUCTURE): latest DB row 조회 / fresh 조회 / provider failure recovery 경로 분리
+
 2026-03-09
 1) FIX(ROOT-CAUSE): 온체인 snapshot DB 영속 캐시 추가
 2) FIX(STRICT): DB의 fresh snapshot만 사용, stale snapshot 재사용 금지
 3) FIX(STRUCTURE): onchain snapshot table 생성/저장/조회 책임을 fetcher 내부로 통합
 4) FIX(LOG): cache source(memory/db/api) 구분 로그 추가
-
-2026-03-08
-1) Blockchain.com ticker / charts API 기반 온체인 fetcher 추가
-2) hash-rate / mempool-count / tx-per-second / estimated-volume-usd 요약 추가
 ========================================================
 """
 
@@ -49,7 +54,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional
 
 import requests
 from sqlalchemy import text
@@ -99,7 +104,8 @@ class OnchainFetcher:
     설계:
     - fetch()는 메모리 캐시 → DB 영속 캐시 → 외부 API 순으로만 조회한다.
     - DB 영속 캐시는 주 소스이며, TTL 안의 fresh snapshot만 허용한다.
-    - stale snapshot 재사용은 금지한다.
+    - stale snapshot의 일반 재사용은 금지한다.
+    - 단, 외부 provider 실패 시 마지막 검증된 DB snapshot(last known good)은 운영 정책으로 재사용한다.
     """
 
     def __init__(self) -> None:
@@ -148,21 +154,35 @@ class OnchainFetcher:
                 )
                 return persisted
 
-            ticker_payload = self._request_json(
-                _BLOCKCHAIN_TICKER_URL,
-                params=None,
-                source_name="blockchain_ticker",
-            )
-            usd_quote = ticker_payload.get("USD")
-            if not isinstance(usd_quote, Mapping):
-                raise RuntimeError("Blockchain ticker USD quote must be an object")
+            try:
+                ticker_payload = self._request_json(
+                    _BLOCKCHAIN_TICKER_URL,
+                    params=None,
+                    source_name="blockchain_ticker",
+                )
+                usd_quote = ticker_payload.get("USD")
+                if not isinstance(usd_quote, Mapping):
+                    raise RuntimeError("Blockchain ticker USD quote must be an object")
 
-            market_price_usd = self._to_decimal(usd_quote.get("last"), "blockchain_ticker.USD.last")
+                market_price_usd = self._to_decimal(usd_quote.get("last"), "blockchain_ticker.USD.last")
 
-            hash_rate_points = self._fetch_chart("hash-rate")
-            mempool_count_points = self._fetch_chart("mempool-count")
-            txps_points = self._fetch_chart("transactions-per-second")
-            volume_usd_points = self._fetch_chart("estimated-transaction-volume-usd")
+                hash_rate_points = self._fetch_chart("hash-rate")
+                mempool_count_points = self._fetch_chart("mempool-count")
+                txps_points = self._fetch_chart("transactions-per-second")
+                volume_usd_points = self._fetch_chart("estimated-transaction-volume-usd")
+            except Exception as exc:
+                fallback_snapshot, fallback_age_sec = self._load_latest_db_snapshot_any_age_locked()
+                if fallback_snapshot is not None and fallback_age_sec is not None:
+                    self._set_memory_cache_locked(fallback_snapshot)
+                    logger.warning(
+                        "Onchain provider fetch failed; serving last persisted DB snapshot: symbol=%s fallback_age_sec=%.2f ttl_sec=%d error=%s",
+                        self._symbol,
+                        fallback_age_sec,
+                        self._cache_ttl_sec,
+                        str(exc),
+                    )
+                    return fallback_snapshot
+                raise
 
             fetched_at_ms = self._now_ms()
             snapshot = self._build_snapshot_from_points(
@@ -284,6 +304,48 @@ class OnchainFetcher:
         self._cached_snapshot_fetched_monotonic = time.monotonic()
 
     def _load_fresh_db_snapshot_locked(self) -> OnchainSnapshot | None:
+        row = self._load_latest_db_row_locked()
+        if row is None:
+            logger.info("No persisted onchain snapshot found in DB: symbol=%s", self._symbol)
+            return None
+
+        snapshot = self._snapshot_from_db_row(row)
+        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
+        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
+        if age_sec >= self._cache_ttl_sec:
+            logger.info(
+                "Onchain DB cache expired: symbol=%s age_sec=%.2f ttl_sec=%d fetched_at_ms=%d",
+                self._symbol,
+                age_sec,
+                self._cache_ttl_sec,
+                fetched_at_ms,
+            )
+            return None
+
+        return snapshot
+
+    def _load_latest_db_snapshot_any_age_locked(self) -> tuple[OnchainSnapshot | None, float | None]:
+        row = self._load_latest_db_row_locked()
+        if row is None:
+            logger.warning(
+                "No persisted onchain snapshot available for provider-failure recovery: symbol=%s",
+                self._symbol,
+            )
+            return None, None
+
+        snapshot = self._snapshot_from_db_row(row)
+        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
+        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
+
+        logger.warning(
+            "Recovered last persisted onchain snapshot for provider-failure recovery: symbol=%s age_sec=%.2f fetched_at_ms=%d",
+            self._symbol,
+            age_sec,
+            fetched_at_ms,
+        )
+        return snapshot, age_sec
+
+    def _load_latest_db_row_locked(self) -> Mapping[str, Any] | None:
         self._ensure_db_schema_locked()
 
         with get_session() as session:
@@ -311,24 +373,7 @@ class OnchainFetcher:
                 },
             ).mappings().first()
 
-        if row is None:
-            logger.info("No persisted onchain snapshot found in DB: symbol=%s", self._symbol)
-            return None
-
-        snapshot = self._snapshot_from_db_row(row)
-        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
-        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
-        if age_sec >= self._cache_ttl_sec:
-            logger.info(
-                "Onchain DB cache expired: symbol=%s age_sec=%.2f ttl_sec=%d fetched_at_ms=%d",
-                self._symbol,
-                age_sec,
-                self._cache_ttl_sec,
-                fetched_at_ms,
-            )
-            return None
-
-        return snapshot
+        return row
 
     def _persist_snapshot_locked(self, *, snapshot: OnchainSnapshot, fetched_at_ms: int) -> None:
         self._ensure_db_schema_locked()

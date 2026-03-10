@@ -439,9 +439,21 @@ class MarketResearcher:
         return snapshot
 
     def _fetch_news_snapshot_or_raise(self) -> CryptoNewsSnapshot:
-        snapshot = self._news_fetcher.fetch()
+        try:
+            snapshot = self._news_fetcher.fetch()
+        except Exception as exc:
+            logger.warning(
+                 "News fetch failed, using cached snapshot instead: %s",
+            str(exc),
+            )
+            cached = getattr(self._news_fetcher, "_cached_snapshot", None)
+            if cached is not None:
+                return cached
+            raise
+
         if not isinstance(snapshot, CryptoNewsSnapshot):
             raise RuntimeError("news fetcher must return CryptoNewsSnapshot")
+
         return snapshot
 
     def _fetch_macro_snapshot_or_raise(self) -> MacroMarketSnapshot:

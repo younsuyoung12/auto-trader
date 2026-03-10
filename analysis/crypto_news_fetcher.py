@@ -7,13 +7,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 핵심 변경 요약
 - Alpha Vantage 뉴스 snapshot을 프로세스 메모리 캐시 + Postgres 영속 캐시로 이중 관리
-- 서버 재시작 후에도 DB의 fresh 뉴스 snapshot을 재사용하도록 구조 변경
-- stale DB/메모리 캐시 재사용 금지, TTL 만료 후 fetch 실패 시 즉시 예외 전파 유지
+- 서버 재시작 후에도 DB의 fresh 뉴스 snapshot을 재사용하도록 구조 유지
+- 외부 공급자 실패 시 마지막 검증된 DB snapshot(last known good)을 재사용하도록 정책 기반 복원 추가
+- 뉴스 TTL 최소값을 4시간으로 상향해 Alpha Vantage 무료 quota 초과 위험을 구조적으로 축소
 
 코드 정리 내용
-- 뉴스 snapshot 생성/직렬화/역직렬화 로직 분리
-- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합
-- 미사용/중복 조립 로직 정리
+- 뉴스 snapshot 생성/직렬화/역직렬화 로직 분리 유지
+- DB schema 보장, 저장, 조회 경로를 본 파일 내부로 통합 유지
+- latest DB row 조회 / fresh 조회 / provider 실패 복원 경로를 분리해 책임 명확화
 
 역할:
 - Alpha Vantage NEWS_SENTIMENT 를 사용해 BTC 관련 최신 뉴스/감성 데이터를 수집한다.
@@ -27,19 +28,21 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 응답 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
 - 뉴스/감성 데이터는 외부 공개/공식 API로만 수집한다
+- 임의값/더미값/추정값 fallback 금지
+- 단, 외부 공급자 장애/쿼터 초과 시 마지막 검증된 DB snapshot 재사용은 운영 정책으로 허용한다
+  (합성 fallback 아님 / persisted last known good reuse)
 
 변경 이력:
+2026-03-10
+1) FIX(ROOT-CAUSE): TTL 만료 후 Alpha Vantage 실패 시 마지막 DB snapshot 재사용 경로 추가
+2) FIX(STABILITY): provider 장애/쿼터 초과로 서버가 종료되지 않도록 정책 기반 last-known-good 복원 추가
+3) FIX(QUOTA): 뉴스 cache TTL 최소 4시간 보장으로 과도 호출 방지
+
 2026-03-09
 1) FIX(ROOT-CAUSE): 프로세스 재시작 시 Alpha Vantage 뉴스 재호출로 quota가 누적되던 문제를 DB 영속 캐시로 수정
 2) FIX(STRICT): DB의 fresh 뉴스 snapshot만 사용, stale snapshot 재사용 금지
 3) FIX(STRUCTURE): news snapshot table 생성/저장/조회 책임을 fetcher 내부로 통합
 4) FIX(LOG): cache source(memory/db/api) 구분 로그 추가
-
-2026-03-08
-1) Alpha Vantage NEWS_SENTIMENT 기반 BTC 뉴스 fetcher 추가
-2) NEWS_SENTIMENT 요청 파라미터 최소 유효 계약으로 축소
-3) 무료 daily quota(25/day) 정합화용 프로세스 cache TTL 적용
-4) cache 만료 후 fetch 실패 시 stale cache fallback 금지
 ========================================================
 """
 
@@ -69,6 +72,7 @@ _SECONDS_PER_DAY = 86400
 _NEWS_LIMIT = 20
 _SENTIMENT_BULLISH_THRESHOLD = Decimal("0.15")
 _SENTIMENT_BEARISH_THRESHOLD = Decimal("-0.15")
+_NEWS_MIN_CACHE_TTL_SEC = 14400  # 4시간
 
 _NEWS_SNAPSHOT_TABLE = "analyst_crypto_news_snapshots"
 _NEWS_SNAPSHOT_SOURCE_KEY = "alphavantage_news_sentiment_crypto_v1"
@@ -164,9 +168,23 @@ class CryptoNewsFetcher:
                 )
                 return persisted
 
-            payload = self._request_json_locked(
-                params=self._build_news_request_params_strict()
-            )
+            try:
+                payload = self._request_json_locked(
+                    params=self._build_news_request_params_strict()
+                )
+            except Exception as exc:
+                fallback_snapshot, fallback_age_sec = self._load_latest_db_snapshot_any_age_locked()
+                if fallback_snapshot is not None and fallback_age_sec is not None:
+                    self._set_memory_cache_locked(fallback_snapshot)
+                    logger.warning(
+                        "Alpha Vantage news fetch failed; serving last persisted DB snapshot: symbol=%s fallback_age_sec=%.2f ttl_sec=%d error=%s",
+                        self._symbol,
+                        fallback_age_sec,
+                        self._cache_ttl_sec,
+                        str(exc),
+                    )
+                    return fallback_snapshot
+                raise
 
             feed = payload.get("feed")
             if not isinstance(feed, list) or not feed:
@@ -383,6 +401,48 @@ class CryptoNewsFetcher:
         self._cached_snapshot_fetched_monotonic = time.monotonic()
 
     def _load_fresh_db_snapshot_locked(self) -> CryptoNewsSnapshot | None:
+        row = self._load_latest_db_row_locked()
+        if row is None:
+            logger.info("No persisted crypto news snapshot found in DB: symbol=%s", self._symbol)
+            return None
+
+        snapshot = self._snapshot_from_db_row(row)
+        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
+        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
+        if age_sec >= self._cache_ttl_sec:
+            logger.info(
+                "Crypto news DB cache expired: symbol=%s age_sec=%.2f ttl_sec=%d fetched_at_ms=%d",
+                self._symbol,
+                age_sec,
+                self._cache_ttl_sec,
+                fetched_at_ms,
+            )
+            return None
+
+        return snapshot
+
+    def _load_latest_db_snapshot_any_age_locked(self) -> tuple[CryptoNewsSnapshot | None, float | None]:
+        row = self._load_latest_db_row_locked()
+        if row is None:
+            logger.warning(
+                "No persisted crypto news snapshot available for provider-failure recovery: symbol=%s",
+                self._symbol,
+            )
+            return None, None
+
+        snapshot = self._snapshot_from_db_row(row)
+        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
+        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
+
+        logger.warning(
+            "Recovered last persisted crypto news snapshot for provider-failure recovery: symbol=%s age_sec=%.2f fetched_at_ms=%d",
+            self._symbol,
+            age_sec,
+            fetched_at_ms,
+        )
+        return snapshot, age_sec
+
+    def _load_latest_db_row_locked(self) -> Mapping[str, Any] | None:
         self._ensure_db_schema_locked()
 
         with get_session() as session:
@@ -410,24 +470,7 @@ class CryptoNewsFetcher:
                 },
             ).mappings().first()
 
-        if row is None:
-            logger.info("No persisted crypto news snapshot found in DB: symbol=%s", self._symbol)
-            return None
-
-        snapshot = self._snapshot_from_db_row(row)
-        fetched_at_ms = self._require_int(row.get("fetched_at_ms"), "db.fetched_at_ms")
-        age_sec = self._compute_age_sec_from_fetched_at_ms(fetched_at_ms)
-        if age_sec >= self._cache_ttl_sec:
-            logger.info(
-                "Crypto news DB cache expired: symbol=%s age_sec=%.2f ttl_sec=%d fetched_at_ms=%d",
-                self._symbol,
-                age_sec,
-                self._cache_ttl_sec,
-                fetched_at_ms,
-            )
-            return None
-
-        return snapshot
+        return row
 
     def _persist_snapshot_locked(self, *, snapshot: CryptoNewsSnapshot, fetched_at_ms: int) -> None:
         self._ensure_db_schema_locked()
@@ -692,14 +735,13 @@ class CryptoNewsFetcher:
         time.sleep(remain_sec)
 
     def _build_required_cache_ttl_sec(self) -> int:
-        if _ALPHA_VANTAGE_FREE_DAILY_REQUEST_LIMIT <= 0:
-            raise RuntimeError("Alpha Vantage daily request limit must be positive")
-
         ttl_sec = _SECONDS_PER_DAY // _ALPHA_VANTAGE_FREE_DAILY_REQUEST_LIMIT
         if ttl_sec * _ALPHA_VANTAGE_FREE_DAILY_REQUEST_LIMIT < _SECONDS_PER_DAY:
             ttl_sec += 1
         if ttl_sec <= 0:
             raise RuntimeError("Computed crypto news cache TTL must be positive")
+
+        ttl_sec = max(ttl_sec, _NEWS_MIN_CACHE_TTL_SEC)
         return ttl_sec
 
     def _sanitize_alpha_vantage_detail(self, detail: str) -> str:

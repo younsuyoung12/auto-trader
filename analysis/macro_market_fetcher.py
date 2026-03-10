@@ -578,8 +578,10 @@ class MacroMarketFetcher:
         if ttl_sec <= 0:
             raise RuntimeError("Computed macro snapshot cache TTL must be positive")
 
-        return ttl_sec
+        # 최소 TTL 보장 (매크로 데이터는 실시간 필요 없음)
+        ttl_sec = max(ttl_sec, 21600)  # 6시간
 
+        return ttl_sec
     def _classify_risk_regime(self, *, spy: MacroAssetQuote, qqq: MacroAssetQuote) -> str:
         if spy.change_pct > Decimal("0") and qqq.change_pct > Decimal("0"):
             return "risk_on"
