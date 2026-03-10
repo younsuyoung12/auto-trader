@@ -20,6 +20,7 @@ IMPORTANT POLICY:
 - health 판단은 transport / payload / feed activity 를 분리한다
 - orderbook payload 무결성과 feed inactivity warning을 혼동하지 않는다
 - 환경변수 직접 접근 금지, settings.py(SSOT)만 사용
+- orderbook spreadPct/spread_pct 계약은 ratio(0..1) 기준으로 통일한다
 
 CHANGE HISTORY:
 - 2026-03-10:
@@ -28,6 +29,7 @@ CHANGE HISTORY:
   3) ADD(OBSERVABILITY): orderbook 전용 last recv ts / recv_delay 상태 추적 추가
   4) ADD(API): get_orderbook_buffer_status() 공개
   5) FIX(ARCH): get_health_snapshot() 가 warning 때문에 overall FAIL 되지 않도록 정리
+  6) FIX(CONTRACT): orderbook spreadPct 를 percent가 아닌 ratio(0..1)로 통일
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): downstream EMA200 요구량과 WS bootstrap/min-buffer 정책 정합화
   2) FIX(STRICT): 5m / 15m / 1h / 4h interval에 최소 200개 캔들 강제
@@ -635,6 +637,11 @@ def _compute_best_prices_strict(bids: List[List[float]], asks: List[List[float]]
 
 
 def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
+    """
+    STRICT CONTRACT:
+    - orderbook spreadPct/spread_pct 는 엔진 전체에서 ratio(0..1) 기준이다.
+    - 예: 0.0005 == 0.05%
+    """
     if best_bid <= 0 or best_ask <= 0:
         raise WSProtocolError("best prices invalid for spread (STRICT)")
     if best_ask <= best_bid:
@@ -642,7 +649,7 @@ def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
     mid = (best_bid + best_ask) / 2.0
     if mid <= 0:
         raise WSProtocolError("mid invalid (STRICT)")
-    return (best_ask - best_bid) / mid * 100.0
+    return (best_ask - best_bid) / mid
 
 
 def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:

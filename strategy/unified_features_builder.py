@@ -25,6 +25,7 @@ IMPORTANT POLICY:
 - 필수 타임프레임: 1m / 5m / 15m / 1h / 4h
 - 각 TF는 필수 raw OHLCV + indicators dict 를 반드시 포함
 - 오더북은 WS depth5 raw snapshot + authoritative scalar 일관성이 모두 만족해야 함
+- orderbook spread_pct/spreadPct 계약은 ratio(0..1) 기준으로 통일한다
 - success cache는 TTL 내 성공 결과만 허용, stale cache 재사용 금지
 - settings는 settings.SETTINGS 단일 객체만 사용
 
@@ -35,7 +36,9 @@ CHANGE HISTORY:
   2) FIX(ROOT-CAUSE): build_entry_features_ws() orderbook scalar ↔ WS raw depth5 snapshot 교차 검증 추가
   3) FIX(STRICT): authoritative orderbook scalar(best_bid/ask/spread/depth_imbalance/ts_ms) 누락 즉시 예외
   4) FIX(ARCH): orderbook 결합 경로를 _get_orderbook_strict(symbol, base_orderbook) 로 일원화
-  5) 기존 pattern/microstructure/volume_profile/orderflow/options 기능 삭제 없음
+  5) FIX(CONTRACT): orderbook spread_pct 재계산을 percent가 아닌 ratio(0..1)로 통일
+  6) FIX(SCORING): orderbook_micro spread 구간 임계값을 ratio 기준으로 정합화
+  7) 기존 pattern/microstructure/volume_profile/orderflow/options 기능 삭제 없음
 - 2026-03-08:
   1) VolumeProfileEngine 연동 추가
   2) OrderFlowCvdEngine 연동 추가
@@ -151,6 +154,15 @@ _INDICATOR_KEEP_KEYS: Tuple[str, ...] = (
 )
 
 _SUCCESS_CACHE: Dict[Tuple[str, str], Tuple[float, Any]] = {}
+
+# ratio 기준 spread scoring thresholds
+# 기존 percent 기준 0.02 / 0.05 / 0.10 / 0.20 을 ratio로 변환한 값
+_ORDERBOOK_SPREAD_SCORE_BANDS_RATIO: Tuple[float, float, float, float] = (
+    0.0002,  # 0.02%
+    0.0005,  # 0.05%
+    0.0010,  # 0.10%
+    0.0020,  # 0.20%
+)
 
 
 class UnifiedFeaturesError(RuntimeError):
@@ -358,6 +370,7 @@ def _get_orderbook_strict(symbol: str, base_orderbook: Dict[str, Any], limit: in
     STRICT:
     - market_features_ws 가 계산한 authoritative scalar(best/spread/depth_imbalance)를 기준으로
       WS raw depth5 snapshot과 교차 검증한다.
+    - spread_pct/spreadPct 계약은 ratio(0..1) 기준이다.
     """
     stage = "orderbook"
 
@@ -415,7 +428,7 @@ def _get_orderbook_strict(symbol: str, base_orderbook: Dict[str, Any], limit: in
     if mid <= 0:
         _fail_unified(symbol, stage, f"invalid mid price: {mid}")
 
-    spread_pct = (spread / mid) * 100.0
+    spread_pct = spread / mid
     if not math.isfinite(spread_pct) or spread_pct < 0:
         _fail_unified(symbol, stage, f"invalid spread_pct: {spread_pct}")
 
@@ -1100,13 +1113,14 @@ def _score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, 
     if spread_pct < 0:
         _fail_unified(symbol, stage, f"invalid spread_pct (<0): {spread_pct}")
 
-    if spread_pct <= 0.02:
+    band_1, band_2, band_3, band_4 = _ORDERBOOK_SPREAD_SCORE_BANDS_RATIO
+    if spread_pct <= band_1:
         spread_score = 40.0
-    elif spread_pct <= 0.05:
+    elif spread_pct <= band_2:
         spread_score = 30.0
-    elif spread_pct <= 0.10:
+    elif spread_pct <= band_3:
         spread_score = 20.0
-    elif spread_pct <= 0.20:
+    elif spread_pct <= band_4:
         spread_score = 10.0
     else:
         spread_score = 0.0

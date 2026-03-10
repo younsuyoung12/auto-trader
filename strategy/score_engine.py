@@ -4,38 +4,39 @@
 FILE: strategy/score_engine.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
-역할:
+ROLE:
 - 엔진 1차 정량 점수(engine_scores)를 계산한다.
 - 멀티 타임프레임/오더북/패턴 요약을 0~100 점수와 해석 가능한 컴포넌트로 정리해 제공한다.
 - "매매 결정"은 하지 않는다(상위 레이어 책임).
 
-핵심 원칙 (STRICT · NO-FALLBACK):
-- REST 호출/백필/외부 폴백 금지.
-- 더미값 생성/0 치환/None 반환 금지.
-- 필수 입력 누락/손상/타입 불일치 시 즉시 예외(ScoreEngineError).
-- 예외 삼키기 금지(조용히 진행 금지). 필요한 경우 명시적으로 raise 한다.
-- 점수는 0~100로 클램핑하며, total은 고정 가중치로 합산한다.
+CORE RESPONSIBILITIES:
+- 4h / 1h / 15m / 5m 멀티 타임프레임 점수 산출
+- orderbook microstructure 점수 산출
+- pattern summary 연계 timing 점수 산출
+- total weight 무결성 검증 및 최종 합산 점수 제공
 
-입력 전제:
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- REST 호출/백필/외부 폴백 금지
+- 더미값 생성/0 치환/None 반환 금지
+- 필수 입력 누락/손상/타입 불일치 시 즉시 예외(ScoreEngineError)
+- 예외 삼키기 금지(조용히 진행 금지)
+- orderbook spreadPct / spread_pct 계약은 ratio(0..1) 기준으로 통일
+- 점수는 0~100로 클램핑하며, total은 고정 가중치로 합산한다
+
+INPUT CONTRACT:
 - timeframes: "4h","1h","15m","5m" 키 포함
 - pattern_features: {"5m": {...}} 포함
 - pattern_summary: {"pattern_score": 0~1} 포함
 - orderbook: bids/asks 또는 bestBid/bestAsk/spreadPct 등 포함
+- orderbook.spreadPct / spread_pct 는 ratio(예: 0.0005 = 0.05%)
 
-가중치(고정):
-- trend_4h        0.30
-- momentum_1h     0.20
-- structure_15m   0.20
-- timing_5m       0.20
-- orderbook_micro 0.10
-
-변경 이력
+CHANGE HISTORY
 --------------------------------------------------------
-- 2026-03-03 (TRADE-GRADE):
-  1) orderbook 키 정합 강화(STRICT, 폴백 아님):
-     - bestBid/bestAsk/spreadPct/depthImbalance/imbalanceQtyPct 등 camelCase/snake_case 모두 허용
-     - 존재하는 키만 선택(0/False를 “없음”으로 오해하지 않음)
-  2) total weight 무결성 체크 추가(합=1.0 강제)
+- 2026-03-10:
+  1) FIX(CONTRACT): orderbook spreadPct / spread_pct 를 ratio(0..1) 기준으로 통일
+  2) FIX(ROOT-CAUSE): orderbook fallback spread 재계산에서 *100 제거
+  3) FIX(SCORING): orderbook spread score threshold 를 ratio 기준으로 정합화
 ========================================================
 """
 
@@ -55,6 +56,13 @@ TOTAL_WEIGHTS: Dict[str, float] = {
     "timing_5m": 0.20,
     "orderbook_micro": 0.10,
 }
+
+# ratio 기준 spread scoring thresholds
+# 0.02% / 0.05% / 0.10% / 0.20%
+_ORDERBOOK_SPREAD_BAND_1: float = 0.0002
+_ORDERBOOK_SPREAD_BAND_2: float = 0.0005
+_ORDERBOOK_SPREAD_BAND_3: float = 0.0010
+_ORDERBOOK_SPREAD_BAND_4: float = 0.0020
 
 
 class ScoreEngineError(RuntimeError):
@@ -286,6 +294,7 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
     STRICT:
     - best_bid/best_ask/spread_pct/depth_imbalance/imbalance_qty_pct는 "존재하면 사용", 없으면 bids/asks로 계산.
     - camelCase/snake_case 모두 허용(키 alias 처리; 폴백/대체값 주입 아님).
+    - spread_pct/spreadPct 계약은 ratio(0..1) 기준이다.
     """
     stage = "engine_scores.orderbook_micro"
 
@@ -311,7 +320,7 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
         mid = (best_bid + best_ask) / 2.0
         if mid <= 0:
             _fail(symbol, stage, f"invalid mid for spread_pct: {mid}")
-        spread_pct = ((best_ask - best_bid) / mid) * 100.0
+        spread_pct = (best_ask - best_bid) / mid
     spread_pct = _require_float(symbol, stage, spread_pct, "orderbook.spread_pct")
     if spread_pct < 0 or not math.isfinite(spread_pct):
         _fail(symbol, stage, f"invalid spread_pct: {spread_pct}")
@@ -654,13 +663,13 @@ def score_orderbook_micro(symbol: str, orderbook: Dict[str, Any]) -> Dict[str, A
     imbalance_qty_pct = m["imbalance_qty_pct"]
     depth_imbalance = m["depth_imbalance"]
 
-    if spread_pct <= 0.02:
+    if spread_pct <= _ORDERBOOK_SPREAD_BAND_1:
         spread_score = 40.0
-    elif spread_pct <= 0.05:
+    elif spread_pct <= _ORDERBOOK_SPREAD_BAND_2:
         spread_score = 30.0
-    elif spread_pct <= 0.10:
+    elif spread_pct <= _ORDERBOOK_SPREAD_BAND_3:
         spread_score = 20.0
-    elif spread_pct <= 0.20:
+    elif spread_pct <= _ORDERBOOK_SPREAD_BAND_4:
         spread_score = 10.0
     else:
         spread_score = 0.0
