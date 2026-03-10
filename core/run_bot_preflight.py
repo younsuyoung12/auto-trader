@@ -777,7 +777,7 @@ def _stage_meta_l3_strict() -> None:
             recent_window=int(getattr(SET, "meta_recent_window", 20) or 20),
             baseline_window=int(getattr(SET, "meta_baseline_window", 60) or 60),
             min_trades_required=int(getattr(SET, "meta_min_trades_required", 20) or 20),
-            exclude_test_trades=True,
+            exclude_test_trades=False,
         ),
         prompt_cfg=MetaPromptConfig(
             max_recent_trades=int(getattr(SET, "meta_max_recent_trades", 20) or 20),
