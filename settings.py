@@ -47,7 +47,6 @@ import requests
 import websocket  # pip install websocket-client
 
 from infra.telelog import log
-from settings import load_settings
 
 SET = load_settings()
 
