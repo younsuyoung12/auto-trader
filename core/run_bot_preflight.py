@@ -2,41 +2,40 @@
 """
 ========================================================
 FILE: core/run_bot_preflight.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- 트레이딩 엔진 기동 전 인프라 / 데이터 / 실행 계약을 사전 검증한다
+- WS / DB / Binance / feature / execution contract 준비 상태를 검증한 뒤
+  검증 통과 시 run_bot_ws.main() 으로 handoff 한다
+- Meta L3 는 트레이딩 엔진 preflight의 관측 대상이며, 별도 서비스의 readiness와 분리한다
 
-핵심 변경 요약
-- PREFLIGHT dry-run 신호의 source 계열 필드(reason / meta.regime / meta.signal_source / meta.source)를
-  단일 canonical 값으로 정규화해 execution_engine 충돌을 제거
-- PREFLIGHT 단계 상세 의미는 preflight_reason_detail / preflight_stage 로 분리해
-  source 필드와 의미가 섞이지 않도록 구조 수정
-- EXECUTION_DRY_RUN 단계에서 ExecutionEngine 인스턴스 메서드 오호출을 제거하고
-  module-level 정규화 함수 + deterministic client_order_id 생성 경로를 검증하도록 수정
-- 사용하지 않는 import / dataclass 제거 및 상단 주석 구조 정리
+CORE RESPONSIBILITIES:
+- settings / DB / Binance private API / WS bootstrap / unified features 검증
+- 현재 시장 상태와 독립적인 execution dry-run probe 생성 및 실행 계약 검증
+- Meta L3 readiness 관측 및 상태 로그화
+- 치명 계약 위반 시 즉시 예외 및 preflight 중단
 
-코드 정리 내용
-- 미사용 import(fetch_open_positions, KlineRestError) 제거
-- 미사용 dataclass(PreflightPipeline) 제거
-- os.getpid 직접 사용으로 동적 import 제거
-- PREFLIGHT 신호 생성 로직을 helper로 분리해 중복 의미 혼선 제거
-- dry-run에서 실제 주문 제출 경로를 타지 않도록 검증 로직 정리
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- settings 는 SETTINGS 단일 객체만 사용한다
+- 데이터/계약/스키마 불일치는 즉시 예외 처리한다
+- preflight 는 "인프라/계약 검증"이며 "현재 시장의 진입 가능 여부"와 분리한다
+- execution dry-run 은 live no-trade 상태와 무관하게 명시적 probe signal 로 검증한다
+- Meta L3 는 별도 전략/분석 계층이며, trading-engine preflight의 필수 시작 게이트가 아니다
+- silent fail 금지, readiness 부족은 명시적 로그/결과 note 로 드러낸다
 
-설계 원칙
-- 폴백 금지
-- 데이터 누락 시 즉시 예외
-- 예외 삼키기 금지
-- 설정은 settings.py 단일 소스
-- DB 접근은 db_core 경유
-- 시간 역전(timestamp rollback) 발생 시 즉시 SAFE_STOP
-
-변경 이력
+CHANGE HISTORY:
 --------------------------------------------------------
+- 2026-03-11:
+  1) FIX(ARCH): META_L3 를 preflight 필수 게이트에서 observability 단계로 재정의
+  2) FIX(ROOT-CAUSE): live no-trade 상태와 분리된 execution probe signal 도입
+  3) FIX(CONTRACT): signal.risk_pct / meta.dynamic_risk_pct / dynamic_allocation_ratio 계약 일치화
+  4) FIX(SSOT): settings.load_settings() 재호출 제거, SETTINGS 단일 객체 사용
+  5) FIX(SSOT): meta_* / preflight_fake_usdt 를 SETTINGS 정식 필드로 직접 사용
 - 2026-03-10:
   1) FIX(STRICT): PREFLIGHT dry-run Signal의 source 계열 필드 충돌 제거
   2) FIX(STRUCTURE): PREFLIGHT lifecycle 정보와 시장/신호 source 의미를 분리
   3) FIX(ROOT-CAUSE): EXECUTION_DRY_RUN 에서 ExecutionEngine 인스턴스 메서드 오호출 제거
   4) FIX(CONTRACT): dry-run 에서 normalize + deterministic client_order_id 생성 경로 검증
-  5) CLEANUP: 미사용 import/dataclass 제거, 상단 주석 최근 기준으로 정리
 ========================================================
 """
 
@@ -59,7 +58,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from settings import load_settings  # noqa: E402
+from settings import SETTINGS  # noqa: E402
 from infra.telelog import log, send_tg  # noqa: E402
 from infra.async_worker import start_worker as start_async_worker  # noqa: E402
 
@@ -106,15 +105,17 @@ from infra.data_integrity_guard import (  # noqa: E402
     validate_orderbook_strict,
 )
 
-SET = load_settings()
+SET = SETTINGS
 
 ENTRY_REQUIRED_TFS: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
 ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 20, "5m": 20, "15m": 20, "1h": 60, "4h": 60}
 
 PREFLIGHT_SIGNAL_SOURCE = "PREFLIGHT"
 PREFLIGHT_REASON = "PREFLIGHT"
-PREFLIGHT_REASON_DETAIL = "PREFLIGHT_PIPELINE"
-PREFLIGHT_STAGE_NAME = "PIPELINE_SIMULATION"
+PREFLIGHT_REASON_DETAIL = "PREFLIGHT_EXECUTION_PROBE"
+PREFLIGHT_STAGE_NAME = "EXECUTION_DRY_RUN"
+
+META_L3_STAGE_NAME = "META_L3_OBSERVABILITY"
 
 
 class PreflightError(RuntimeError):
@@ -184,18 +185,18 @@ def _verify_required_tfs_or_die(name: str, configured_tfs: List[str], required_t
         raise PreflightError(f"settings.{name} missing required TFs={missing} required={list(required_tfs)} (STRICT)")
 
 
-def _safe_tg_notice(msg: str) -> None:
-    try:
-        send_tg(msg)
-    except Exception:
-        return
-
-
 def _sanitize_err(e: BaseException) -> str:
     s = str(e).replace("\n", " ").strip()
     if len(s) > 240:
         s = s[:240]
     return f"{type(e).__name__}: {s}"
+
+
+def _safe_tg_notice(msg: str) -> None:
+    try:
+        send_tg(msg)
+    except Exception as e:
+        log(f"[PRE-FLIGHT][TG_WARN] send_tg failed: {_sanitize_err(e)}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +216,33 @@ class PreflightBoot:
     signal_ts_ms: int
 
 
+@dataclass(frozen=True, slots=True)
+class PipelineSimulationResult:
+    eq_cur: float
+    eq_peak: float
+    dd_pct: float
+    regime_score: float
+    regime_band: str
+    regime_allocation: float
+    micro_score_risk: float
+    live_effective_risk_pct: float
+    execution_probe_risk_pct: float
+    tp_pct: float
+    sl_pct: float
+    decision_meta: Dict[str, float]
+    hk: HeatmapKey
+    ev_cell_status: str
+    ev_cell_ev: Optional[float]
+    ev_cell_n: int
+
+
+@dataclass(frozen=True, slots=True)
+class MetaL3Status:
+    ready: bool
+    note: str
+    final_risk_multiplier: Optional[float]
+
+
 def _run_stage(name: str, fn: Callable[[], Any]) -> Tuple[StageResult, Any]:
     t0 = time.perf_counter()
     try:
@@ -230,39 +258,56 @@ def _run_stage(name: str, fn: Callable[[], Any]) -> Tuple[StageResult, Any]:
     return StageResult(name=name, ok=True, elapsed_ms=float(dt), note="OK"), out
 
 
+def _resolve_preflight_fake_available_usdt_strict() -> float:
+    value = _finite(SET.preflight_fake_usdt, "settings.preflight_fake_usdt")
+    if value <= 0:
+        raise PreflightError("settings.preflight_fake_usdt must be > 0 (STRICT)")
+    return float(value)
+
+
 def _stage_settings_strict() -> None:
-    symbol = _require_nonempty_str(getattr(SET, "symbol", None), "settings.symbol").replace("-", "").replace("/", "").upper().strip()
+    symbol = _require_nonempty_str(SET.symbol, "settings.symbol").replace("-", "").replace("/", "").upper().strip()
     if not symbol:
         raise PreflightError("settings.symbol normalized empty (STRICT)")
 
-    _ = _require_nonempty_str(getattr(SET, "api_key", None), "settings.api_key")
-    _ = _require_nonempty_str(getattr(SET, "api_secret", None), "settings.api_secret")
+    _ = _require_nonempty_str(SET.api_key, "settings.api_key")
+    _ = _require_nonempty_str(SET.api_secret, "settings.api_secret")
 
-    lev = _finite(getattr(SET, "leverage", None), "settings.leverage")
+    lev = _finite(SET.leverage, "settings.leverage")
     if lev <= 0:
         raise PreflightError("settings.leverage must be > 0 (STRICT)")
 
-    tp = _finite(getattr(SET, "tp_pct", None), "settings.tp_pct")
-    sl = _finite(getattr(SET, "sl_pct", None), "settings.sl_pct")
+    tp = _finite(SET.tp_pct, "settings.tp_pct")
+    sl = _finite(SET.sl_pct, "settings.sl_pct")
     if tp <= 0:
         raise PreflightError("settings.tp_pct must be > 0 (STRICT)")
     if sl <= 0:
         raise PreflightError("settings.sl_pct must be > 0 (STRICT)")
 
-    ws_enabled = _require_bool(getattr(SET, "ws_enabled", True), "settings.ws_enabled")
+    allocation_ratio = _finite(SET.allocation_ratio, "settings.allocation_ratio")
+    risk_pct = _finite(SET.risk_pct, "settings.risk_pct")
+    if allocation_ratio <= 0 or allocation_ratio > 1:
+        raise PreflightError("settings.allocation_ratio must be within (0,1] (STRICT)")
+    if risk_pct <= 0 or risk_pct > 1:
+        raise PreflightError("settings.risk_pct must be within (0,1] (STRICT)")
+    if abs(allocation_ratio - risk_pct) > 1e-12:
+        raise PreflightError("settings.allocation_ratio and settings.risk_pct mismatch (STRICT)")
+
+    ws_enabled = _require_bool(SET.ws_enabled, "settings.ws_enabled")
     if not ws_enabled:
         raise PreflightError("settings.ws_enabled must be True for WS-driven engine (STRICT)")
 
-    ws_subscribe_tfs = _parse_tfs(getattr(SET, "ws_subscribe_tfs", None))
+    ws_subscribe_tfs = _parse_tfs(SET.ws_subscribe_tfs)
     _verify_required_tfs_or_die("ws_subscribe_tfs", ws_subscribe_tfs, ENTRY_REQUIRED_TFS)
 
-    ws_backfill_tfs = _parse_tfs(getattr(SET, "ws_backfill_tfs", None))
+    ws_backfill_tfs = _parse_tfs(SET.ws_backfill_tfs)
     if ws_backfill_tfs:
         _verify_required_tfs_or_die("ws_backfill_tfs", ws_backfill_tfs, ENTRY_REQUIRED_TFS)
 
-    _ = _require_nonempty_str(getattr(SET, "openai_api_key", None), "settings.openai_api_key")
-    _ = _require_nonempty_str(getattr(SET, "openai_model", None), "settings.openai_model")
-    _ = _finite(getattr(SET, "openai_max_latency_sec", None), "settings.openai_max_latency_sec")
+    _ = _require_nonempty_str(SET.openai_api_key, "settings.openai_api_key")
+    _ = _require_nonempty_str(SET.openai_model, "settings.openai_model")
+    _ = _finite(SET.openai_max_latency_sec, "settings.openai_max_latency_sec")
+    _ = _finite(SET.preflight_fake_usdt, "settings.preflight_fake_usdt")
 
 
 def _stage_db_connectivity_strict() -> None:
@@ -277,9 +322,10 @@ def _stage_db_connectivity_strict() -> None:
 
 
 def _stage_binance_private_api_strict() -> None:
-    symbol = str(getattr(SET, "symbol", "")).replace("-", "").replace("/", "").upper().strip()
+    symbol = str(SET.symbol).replace("-", "").replace("/", "").upper().strip()
     if not symbol:
         raise PreflightError("settings.symbol empty (STRICT)")
+
     bal = get_balance_detail("USDT")
     if not isinstance(bal, dict) or not bal:
         raise PreflightError("get_balance_detail('USDT') returned non-dict/empty (STRICT)")
@@ -291,8 +337,8 @@ def _stage_binance_private_api_strict() -> None:
     _ = _finite(bal.get("availableBalance"), "balance.availableBalance")
     _ = _finite(bal.get("crossUnPnl"), "balance.crossUnPnl")
 
-    if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
-        eq_cur = float(_finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt"))
+    if bool(SET.test_dry_run) and float(SET.test_fake_available_usdt) > 0.0:
+        eq_cur = float(_finite(SET.test_fake_available_usdt, "settings.test_fake_available_usdt"))
         if eq_cur <= 0:
             raise PreflightError("settings.test_fake_available_usdt must be > 0 in test_dry_run (STRICT)")
     else:
@@ -336,26 +382,24 @@ def _validate_kline_rows_strict(rows: List[List[Any]], *, name: str, min_len: in
 
 
 def _stage_bootstrap_ws_strict() -> PreflightBoot:
-    symbol = str(getattr(SET, "symbol", "")).replace("-", "").replace("/", "").upper().strip()
+    symbol = str(SET.symbol).replace("-", "").replace("/", "").upper().strip()
     if not symbol:
         raise PreflightError("settings.symbol empty (STRICT)")
 
-    limit = SET.ws_backfill_limit
+    limit = int(SET.ws_backfill_limit)
+    if limit <= 0:
+        raise PreflightError("settings.ws_backfill_limit must be > 0 (STRICT)")
 
     for tf in ("1m", "5m", "15m", "1h", "4h"):
         rows = fetch_klines_rest(symbol, tf, limit=limit)
-        _validate_kline_rows_strict(
-            rows,
-            name=f"REST_KLINES_{tf}",
-            min_len=200,
-        )
+        _validate_kline_rows_strict(rows, name=f"REST_KLINES_{tf}", min_len=200)
         backfill_klines_from_rest(symbol, tf, rows)
 
     start_ws_loop(symbol)
 
-    wait_sec = float(getattr(SET, "preflight_ws_wait_sec", 20.0) or 20.0)
-    if not math.isfinite(wait_sec) or wait_sec <= 0:
-        raise PreflightError("settings.preflight_ws_wait_sec must be finite > 0 (STRICT)")
+    wait_sec = float(_finite(SET.preflight_ws_wait_sec, "settings.preflight_ws_wait_sec"))
+    if wait_sec <= 0:
+        raise PreflightError("settings.preflight_ws_wait_sec must be > 0 (STRICT)")
     deadline = time.time() + wait_sec
 
     while True:
@@ -447,11 +491,6 @@ def _stage_unified_features_strict(boot: PreflightBoot) -> Dict[str, Any]:
 
 
 def _extract_preflight_decision_meta_strict(uf: Dict[str, Any]) -> Dict[str, float]:
-    """
-    STRICT:
-    - preflight에서도 runtime과 동일하게 entry_flow를 통하지 않고
-      execution_engine이 요구하는 decision meta만 unified_features에서 직접 추출한다.
-    """
     if not isinstance(uf, dict) or not uf:
         raise PreflightError("unified_features is required (STRICT)")
 
@@ -481,7 +520,7 @@ def _extract_preflight_decision_meta_strict(uf: Dict[str, Any]) -> Dict[str, flo
     if "depth_imbalance" not in orderbook:
         raise PreflightError("unified_features.orderbook.depth_imbalance missing (STRICT)")
 
-    entry_score_threshold = _finite(getattr(SET, "entry_score_threshold", None), "settings.entry_score_threshold")
+    entry_score_threshold = _finite(SET.entry_score_threshold, "settings.entry_score_threshold")
     total_score_pct = _finite(total.get("score"), "unified_features.engine_scores.total.score")
     trend_strength = _finite(
         trend_components.get("trend_strength"),
@@ -513,16 +552,17 @@ def _extract_preflight_decision_meta_strict(uf: Dict[str, Any]) -> Dict[str, flo
 def _build_preflight_signal_meta_strict(
     *,
     boot: PreflightBoot,
-    eq_cur: float,
-    eq_peak: float,
-    dd_pct: float,
-    regime_decision: Any,
-    rp: Any,
-    hk: HeatmapKey,
-    cell: Any,
-    decision_meta: Dict[str, float],
-    micro_score_risk: float,
+    pipeline: PipelineSimulationResult,
+    meta_l3_status: MetaL3Status,
 ) -> Dict[str, Any]:
+    execution_probe_risk_pct = _finite(pipeline.execution_probe_risk_pct, "pipeline.execution_probe_risk_pct")
+    if execution_probe_risk_pct <= 0:
+        raise PreflightError("pipeline.execution_probe_risk_pct must be > 0 (STRICT)")
+
+    live_effective_risk_pct = _finite(pipeline.live_effective_risk_pct, "pipeline.live_effective_risk_pct")
+    if live_effective_risk_pct < 0 or live_effective_risk_pct > 1:
+        raise PreflightError("pipeline.live_effective_risk_pct out of range 0..1 (STRICT)")
+
     meta: Dict[str, Any] = {
         "symbol": boot.symbol,
         "source": PREFLIGHT_SIGNAL_SOURCE,
@@ -535,26 +575,29 @@ def _build_preflight_signal_meta_strict(
         "extra": {"preflight": True},
         "preflight_stage": PREFLIGHT_STAGE_NAME,
         "preflight_reason_detail": PREFLIGHT_REASON_DETAIL,
-        "equity_current_usdt": float(eq_cur),
-        "equity_peak_usdt": float(eq_peak),
-        "dd_pct": float(dd_pct),
-        "dynamic_allocation_ratio": float(rp.effective_risk_pct),
-        "dynamic_risk_pct": float(rp.effective_risk_pct),
-        "regime_score": float(regime_decision.score),
-        "regime_band": str(regime_decision.band),
-        "regime_allocation": float(regime_decision.allocation),
-        "micro_score_risk": float(micro_score_risk),
-        "ev_cell_key": f"{hk.regime_band}|{hk.distortion_bucket}|{hk.score_bucket}",
-        "ev_cell_status": str(cell.status),
-        "ev_cell_ev": cell.ev,
-        "ev_cell_n": int(cell.n),
-        "auto_blocked": bool(rp.auto_blocked),
-        "auto_risk_multiplier": float(rp.auto_risk_multiplier),
-        "entry_score": float(decision_meta["entry_score"]),
-        "trend_strength": float(decision_meta["trend_strength"]),
-        "spread": float(decision_meta["spread"]),
-        "orderbook_imbalance": float(decision_meta["orderbook_imbalance"]),
-        "entry_score_threshold": float(decision_meta["entry_score_threshold"]),
+        "equity_current_usdt": float(pipeline.eq_cur),
+        "equity_peak_usdt": float(pipeline.eq_peak),
+        "dd_pct": float(pipeline.dd_pct),
+        "dynamic_allocation_ratio": float(execution_probe_risk_pct),
+        "dynamic_risk_pct": float(execution_probe_risk_pct),
+        "live_dynamic_allocation_ratio": float(live_effective_risk_pct),
+        "live_dynamic_risk_pct": float(live_effective_risk_pct),
+        "regime_score": float(pipeline.regime_score),
+        "regime_band": str(pipeline.regime_band),
+        "regime_allocation": float(pipeline.regime_allocation),
+        "micro_score_risk": float(pipeline.micro_score_risk),
+        "ev_cell_key": f"{pipeline.hk.regime_band}|{pipeline.hk.distortion_bucket}|{pipeline.hk.score_bucket}",
+        "ev_cell_status": str(pipeline.ev_cell_status),
+        "ev_cell_ev": pipeline.ev_cell_ev,
+        "ev_cell_n": int(pipeline.ev_cell_n),
+        "meta_l3_ready": bool(meta_l3_status.ready),
+        "meta_l3_note": str(meta_l3_status.note),
+        "meta_l3_final_risk_multiplier": meta_l3_status.final_risk_multiplier,
+        "entry_score": float(pipeline.decision_meta["entry_score"]),
+        "trend_strength": float(pipeline.decision_meta["trend_strength"]),
+        "spread": float(pipeline.decision_meta["spread"]),
+        "orderbook_imbalance": float(pipeline.decision_meta["orderbook_imbalance"]),
+        "entry_score_threshold": float(pipeline.decision_meta["entry_score_threshold"]),
     }
 
     if str(meta.get("source", "")).strip() != PREFLIGHT_SIGNAL_SOURCE:
@@ -563,6 +606,10 @@ def _build_preflight_signal_meta_strict(
         raise PreflightError("preflight meta.regime normalization failed (STRICT)")
     if str(meta.get("signal_source", "")).strip() != PREFLIGHT_SIGNAL_SOURCE:
         raise PreflightError("preflight meta.signal_source normalization failed (STRICT)")
+    if float(meta["dynamic_allocation_ratio"]) <= 0:
+        raise PreflightError("preflight meta.dynamic_allocation_ratio must be > 0 (STRICT)")
+    if float(meta["dynamic_risk_pct"]) <= 0:
+        raise PreflightError("preflight meta.dynamic_risk_pct must be > 0 (STRICT)")
 
     return meta
 
@@ -588,23 +635,28 @@ def _build_preflight_signal_strict(
     if str(meta.get("preflight_stage", "")).strip() != PREFLIGHT_STAGE_NAME:
         raise PreflightError("preflight signal stage missing/invalid (STRICT)")
 
+    risk_pct_f = _finite(risk_pct, "preflight.signal.risk_pct")
+    if risk_pct_f <= 0:
+        raise PreflightError("preflight signal risk_pct must be > 0 (STRICT)")
+
     return Signal(
         action="ENTER",
         direction="LONG",
         tp_pct=float(tp_pct),
         sl_pct=float(sl_pct),
-        risk_pct=float(risk_pct) if float(risk_pct) > 0 else 0.01,
+        risk_pct=float(risk_pct_f),
         reason=PREFLIGHT_REASON,
         guard_adjustments={},
         meta=meta,
     )
 
 
-def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -> Signal:
+def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -> PipelineSimulationResult:
     total_score = float(_finite(uf["engine_scores"]["total"]["score"], "engine_total_score"))
     micro = uf.get("microstructure")
     if not isinstance(micro, dict) or "micro_score_risk" not in micro:
         raise PreflightError("microstructure.micro_score_risk missing (STRICT)")
+
     micro_score_risk = float(_finite(micro.get("micro_score_risk"), "micro_score_risk"))
     if micro_score_risk < 0 or micro_score_risk > 100:
         raise PreflightError(f"micro_score_risk out of range (STRICT): {micro_score_risk}")
@@ -614,9 +666,8 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         regime_engine.update(total_score)
     regime_decision = regime_engine.decide(total_score)
 
-    if not math.isfinite(float(regime_decision.allocation)):
-        raise PreflightError("regime_decision.allocation must be finite (STRICT)")
-    if float(regime_decision.allocation) < 0.0 or float(regime_decision.allocation) > 1.0:
+    regime_allocation = float(_finite(regime_decision.allocation, "regime_decision.allocation"))
+    if regime_allocation < 0.0 or regime_allocation > 1.0:
         raise PreflightError("regime_decision.allocation out of range 0..1 (STRICT)")
 
     ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
@@ -633,8 +684,8 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
     if "availableBalance" not in bal or "crossUnPnl" not in bal:
         raise PreflightError("balance detail missing keys (STRICT)")
 
-    if bool(getattr(SET, "test_dry_run", False)) and float(getattr(SET, "test_fake_available_usdt", 0.0) or 0.0) > 0.0:
-        eq_cur = float(_finite(getattr(SET, "test_fake_available_usdt", None), "settings.test_fake_available_usdt"))
+    if bool(SET.test_dry_run) and float(SET.test_fake_available_usdt) > 0.0:
+        eq_cur = float(_finite(SET.test_fake_available_usdt, "settings.test_fake_available_usdt"))
         if eq_cur <= 0:
             raise PreflightError("settings.test_fake_available_usdt must be > 0 in test_dry_run (STRICT)")
     else:
@@ -655,6 +706,7 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
             ),
             {"symbol": boot.symbol},
         ).scalar()
+
     if v is not None:
         peak = float(v)
         if not math.isfinite(peak) or peak <= 0:
@@ -666,13 +718,13 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         raise PreflightError(f"dd_pct invalid (STRICT): {dd_pct}")
 
     risk_physics = RiskPhysicsEngine(policy=RiskPhysicsPolicy(max_allocation=1.0))
-    tp_pct = float(_finite(getattr(SET, "tp_pct", None), "settings.tp_pct"))
-    sl_pct = float(_finite(getattr(SET, "sl_pct", None), "settings.sl_pct"))
+    tp_pct = float(_finite(SET.tp_pct, "settings.tp_pct"))
+    sl_pct = float(_finite(SET.sl_pct, "settings.sl_pct"))
     if tp_pct <= 0 or sl_pct <= 0:
         raise PreflightError("tp/sl must be > 0 (STRICT)")
 
     rp = risk_physics.decide(
-        regime_allocation=float(regime_decision.allocation),
+        regime_allocation=float(regime_allocation),
         dd_pct=float(dd_pct),
         consecutive_losses=0,
         tp_pct=float(tp_pct),
@@ -682,15 +734,28 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
         heatmap_ev=cell.ev,
         heatmap_n=int(cell.n),
     )
-    if not math.isfinite(float(rp.effective_risk_pct)) or float(rp.effective_risk_pct) < 0.0 or float(rp.effective_risk_pct) > 1.0:
-        raise PreflightError(f"risk_physics effective_risk_pct out of range (STRICT): {rp.effective_risk_pct}")
+
+    live_effective_risk_pct = float(_finite(rp.effective_risk_pct, "risk_physics.effective_risk_pct"))
+    if live_effective_risk_pct < 0.0 or live_effective_risk_pct > 1.0:
+        raise PreflightError(f"risk_physics effective_risk_pct out of range (STRICT): {live_effective_risk_pct}")
+
+    execution_probe_risk_pct = float(_finite(SET.allocation_ratio, "settings.allocation_ratio"))
+    if execution_probe_risk_pct <= 0.0 or execution_probe_risk_pct > 1.0:
+        raise PreflightError("settings.allocation_ratio must be within (0,1] for execution probe (STRICT)")
+
+    if live_effective_risk_pct == 0.0:
+        log(
+            "[PRE-FLIGHT][PIPELINE_SIMULATION][NO_TRADE] "
+            "live_effective_risk_pct=0.0 current market is no-trade. "
+            "execution dry-run will validate contract with explicit execution probe risk."
+        )
 
     drift = DriftDetector(DriftDetectorConfig())
     try:
         drift.update_and_check(
             DriftSnapshot(
                 symbol=boot.symbol,
-                allocation_ratio=float(max(float(rp.effective_risk_pct), 1e-6)),
+                allocation_ratio=float(execution_probe_risk_pct),
                 risk_multiplier=float(max(float(rp.auto_risk_multiplier), 1e-6)),
                 regime_band=str(regime_decision.band),
                 micro_score_risk=float(micro_score_risk),
@@ -704,7 +769,7 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
             SignalInvariantInputs(
                 symbol=boot.symbol,
                 direction="LONG",
-                risk_pct=float(max(float(rp.effective_risk_pct), 1e-6)),
+                risk_pct=float(execution_probe_risk_pct),
                 tp_pct=float(tp_pct),
                 sl_pct=float(sl_pct),
                 dd_pct=float(dd_pct),
@@ -719,24 +784,23 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
 
     decision_meta = _extract_preflight_decision_meta_strict(uf)
 
-    meta = _build_preflight_signal_meta_strict(
-        boot=boot,
+    return PipelineSimulationResult(
         eq_cur=float(eq_cur),
         eq_peak=float(eq_peak),
         dd_pct=float(dd_pct),
-        regime_decision=regime_decision,
-        rp=rp,
-        hk=hk,
-        cell=cell,
-        decision_meta=decision_meta,
+        regime_score=float(regime_decision.score),
+        regime_band=str(regime_decision.band),
+        regime_allocation=float(regime_allocation),
         micro_score_risk=float(micro_score_risk),
-    )
-
-    return _build_preflight_signal_strict(
+        live_effective_risk_pct=float(live_effective_risk_pct),
+        execution_probe_risk_pct=float(execution_probe_risk_pct),
         tp_pct=float(tp_pct),
         sl_pct=float(sl_pct),
-        risk_pct=float(rp.effective_risk_pct),
-        meta=meta,
+        decision_meta=decision_meta,
+        hk=hk,
+        ev_cell_status=str(cell.status),
+        ev_cell_ev=cell.ev,
+        ev_cell_n=int(cell.n),
     )
 
 
@@ -754,7 +818,7 @@ def _stage_gpt_contract_ping_strict() -> None:
             user_payload=payload,
             max_tokens=512,
             temperature=0.0,
-            max_latency_sec=float(getattr(SET, "openai_max_latency_sec")),
+            max_latency_sec=float(SET.openai_max_latency_sec),
         )
     except GptEngineError as e:
         raise PreflightError(f"GPT ping failed (STRICT): {e}") from e
@@ -765,40 +829,70 @@ def _stage_gpt_contract_ping_strict() -> None:
         raise PreflightError("GPT ping schema mismatch (STRICT)")
 
 
-def _stage_meta_l3_strict() -> None:
-    symbol = str(getattr(SET, "symbol", "")).replace("-", "").replace("/", "").upper().strip()
+def _stage_meta_l3_observability_strict() -> MetaL3Status:
+    symbol = str(SET.symbol).replace("-", "").replace("/", "").upper().strip()
     if not symbol:
         raise PreflightError("settings.symbol empty (STRICT)")
 
     cfg = MetaStrategyConfig(
         stats_cfg=MetaStatsConfig(
             symbol=symbol,
-            lookback_trades=int(getattr(SET, "meta_lookback_trades", 200) or 200),
-            recent_window=int(getattr(SET, "meta_recent_window", 20) or 20),
-            baseline_window=int(getattr(SET, "meta_baseline_window", 60) or 60),
-            min_trades_required=int(getattr(SET, "meta_min_trades_required", 20) or 20),
+            lookback_trades=int(SET.meta_lookback_trades),
+            recent_window=int(SET.meta_recent_window),
+            baseline_window=int(SET.meta_baseline_window),
+            min_trades_required=int(SET.meta_min_trades_required),
             exclude_test_trades=False,
         ),
         prompt_cfg=MetaPromptConfig(
-            max_recent_trades=int(getattr(SET, "meta_max_recent_trades", 20) or 20),
-            language=str(getattr(SET, "meta_language", "ko") or "ko"),
-            max_output_sentences=int(getattr(SET, "meta_max_output_sentences", 3) or 3),
-            prompt_version=str(getattr(SET, "meta_prompt_version", "2026-03-03") or "2026-03-03"),
+            max_recent_trades=int(SET.meta_max_recent_trades),
+            language=str(SET.meta_language),
+            max_output_sentences=int(SET.meta_max_output_sentences),
+            prompt_version=str(SET.meta_prompt_version),
         ),
-        cooldown_sec=int(getattr(SET, "meta_cooldown_sec", 60) or 60),
+        cooldown_sec=int(SET.meta_cooldown_sec),
     )
 
     eng = MetaStrategyEngine(cfg)
     try:
         rec = eng.run_once()
     except MetaStatsError as e:
-        log(f"[PRE-FLIGHT][META_L3][NOT_READY] {e}")
-        return
+        note = str(e).strip()
+        if not note:
+            note = "META_L3 not ready (STRICT)"
+        log(f"[PRE-FLIGHT][META_L3][NOT_READY] {note}")
+        return MetaL3Status(ready=False, note=note, final_risk_multiplier=None)
     except Exception as e:
         raise PreflightError(f"Meta L3 run_once failed (STRICT): {_sanitize_err(e)}") from e
 
-    if not math.isfinite(float(rec.final_risk_multiplier)) or float(rec.final_risk_multiplier) < 0.0 or float(rec.final_risk_multiplier) > 1.0:
-        raise PreflightError(f"Meta L3 final_risk_multiplier out of range (STRICT): {rec.final_risk_multiplier}")
+    final_risk_multiplier = float(_finite(rec.final_risk_multiplier, "meta_l3.final_risk_multiplier"))
+    if final_risk_multiplier < 0.0 or final_risk_multiplier > 1.0:
+        raise PreflightError(f"Meta L3 final_risk_multiplier out of range (STRICT): {final_risk_multiplier}")
+
+    return MetaL3Status(
+        ready=True,
+        note="READY",
+        final_risk_multiplier=float(final_risk_multiplier),
+    )
+
+
+def _build_execution_probe_signal_strict(
+    *,
+    boot: PreflightBoot,
+    pipeline: PipelineSimulationResult,
+    meta_l3_status: MetaL3Status,
+) -> Signal:
+    meta = _build_preflight_signal_meta_strict(
+        boot=boot,
+        pipeline=pipeline,
+        meta_l3_status=meta_l3_status,
+    )
+
+    return _build_preflight_signal_strict(
+        tp_pct=float(pipeline.tp_pct),
+        sl_pct=float(pipeline.sl_pct),
+        risk_pct=float(pipeline.execution_probe_risk_pct),
+        meta=meta,
+    )
 
 
 def _stage_execution_dry_run_strict(sig: Signal) -> None:
@@ -819,13 +913,24 @@ def _stage_execution_dry_run_strict(sig: Signal) -> None:
         def __setattr__(self, name: str, value: Any) -> None:
             raise AttributeError("SettingsView is read-only (STRICT)")
 
+    preflight_fake_usdt = _resolve_preflight_fake_available_usdt_strict()
+
+    if not isinstance(sig.meta, dict):
+        raise PreflightError("signal.meta must be dict for execution dry-run (STRICT)")
+    if _finite(sig.risk_pct, "signal.risk_pct") <= 0:
+        raise PreflightError("signal.risk_pct must be > 0 for execution dry-run (STRICT)")
+    if _finite(sig.meta.get("dynamic_risk_pct"), "signal.meta.dynamic_risk_pct") <= 0:
+        raise PreflightError("signal.meta.dynamic_risk_pct must be > 0 for execution dry-run (STRICT)")
+    if _finite(sig.meta.get("dynamic_allocation_ratio"), "signal.meta.dynamic_allocation_ratio") <= 0:
+        raise PreflightError("signal.meta.dynamic_allocation_ratio must be > 0 for execution dry-run (STRICT)")
+
     view = _SettingsView(
         SET,
         {
             "test_dry_run": True,
             "test_bypass_guards": True,
             "test_force_enter": False,
-            "test_fake_available_usdt": float(_finite(getattr(SET, "preflight_fake_usdt", 1000.0), "settings.preflight_fake_usdt")),
+            "test_fake_available_usdt": float(preflight_fake_usdt),
         },
     )
 
@@ -874,8 +979,8 @@ def run_preflight(*, preflight_only: bool) -> None:
     log(f"[PRE-FLIGHT] start host={host} utc={_utc_now().isoformat()} pid={os.getpid()}")
 
     start_async_worker(
-        num_threads=int(getattr(SET, "async_worker_threads", 1) or 1),
-        max_queue_size=int(getattr(SET, "async_worker_queue_size", 2000) or 2000),
+        num_threads=int(SET.async_worker_threads),
+        max_queue_size=int(SET.async_worker_queue_size),
         thread_name_prefix="async-preflight",
     )
 
@@ -898,22 +1003,44 @@ def run_preflight(*, preflight_only: bool) -> None:
     results.append(r)
     assert isinstance(uf, dict)
 
-    r, sig = _run_stage("PIPELINE_SIMULATION", lambda: _stage_pipeline_simulation_strict(boot, uf))
+    r, pipeline = _run_stage("PIPELINE_SIMULATION", lambda: _stage_pipeline_simulation_strict(boot, uf))
+    assert isinstance(pipeline, PipelineSimulationResult)
+    if float(pipeline.live_effective_risk_pct) == 0.0:
+        r = StageResult(
+            name=r.name,
+            ok=r.ok,
+            elapsed_ms=r.elapsed_ms,
+            note="NO_TRADE_CURRENT_REGIME",
+        )
     results.append(r)
-    assert isinstance(sig, Signal)
 
     r, _ = _run_stage("GPT_PING", _stage_gpt_contract_ping_strict)
     results.append(r)
 
-    r, _ = _run_stage("META_L3", _stage_meta_l3_strict)
+    r, meta_l3_status = _run_stage(META_L3_STAGE_NAME, _stage_meta_l3_observability_strict)
+    assert isinstance(meta_l3_status, MetaL3Status)
+    if not meta_l3_status.ready:
+        r = StageResult(
+            name=r.name,
+            ok=r.ok,
+            elapsed_ms=r.elapsed_ms,
+            note=f"NOT_READY: {meta_l3_status.note}",
+        )
     results.append(r)
+
+    sig = _build_execution_probe_signal_strict(
+        boot=boot,
+        pipeline=pipeline,
+        meta_l3_status=meta_l3_status,
+    )
 
     r, _ = _run_stage("EXECUTION_DRY_RUN", lambda: _stage_execution_dry_run_strict(sig))
     results.append(r)
 
     lines = ["✅ PRE-FLIGHT OK", f"Host: {host}", f"Symbol: {boot.symbol}", f"UTC: {_utc_now().isoformat()}"]
     for it in results:
-        lines.append(f"- {it.name}: {it.elapsed_ms:.0f}ms")
+        suffix = f" [{it.note}]" if it.note != "OK" else ""
+        lines.append(f"- {it.name}: {it.elapsed_ms:.0f}ms{suffix}")
     msg = "\n".join(lines)
     log(msg)
     _safe_tg_notice(msg)

@@ -5,7 +5,7 @@ FILE: settings.py
 ROLE:
 - AUTO-TRADER 전체 런타임 설정 SSOT
 - env / optional .env / defaults를 단일 계약으로 로드하고 검증한다
-- 운영/실시간/분석/대시보드 설정의 불일치를 부팅 시점에 차단한다
+- 운영/실시간/분석/대시보드/메타전략 설정의 불일치를 부팅 시점에 차단한다
 
 CORE RESPONSIBILITIES:
 - Settings frozen dataclass 제공
@@ -24,15 +24,16 @@ IMPORTANT POLICY:
 - 민감정보(API key/secret, DB URL, token)는 절대 로그에 남기지 않는다
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(SSOT): run_bot_preflight 가 사용하던 preflight_fake_usdt / meta_* 설정 필드를 정식 승격
+  2) FIX(STRICT): meta strategy / preflight execution probe 설정 검증 추가
+  3) FIX(COMPAT): META_* / PREFLIGHT_FAKE_USDT uppercase alias 접근 호환성 추가
 - 2026-03-10:
   1) FIX(SSOT): unified_features_builder / order_executor / engine_watchdog 가 요구하는 설정 필드를 정식 승격
   2) FIX(SSOT): features_required_tfs / microstructure_* / low_vol_* / exit_fill_wait_sec / position_reflect_wait_sec 추가
   3) FIX(SSOT): engine_watchdog_interval_sec / engine_watchdog_max_db_ping_ms / engine_watchdog_emit_min_sec 추가
   4) FIX(ROOT-CAUSE): ALPHAVANTAGE_API_KEY 를 전역 부팅 필수에서 제거 (분석 계층 전용 optional)
   5) FIX(COMPAT): 신규 설정들의 uppercase alias 접근 호환성 추가
-- 2026-03-09:
-  1) FIX(ROOT-CAUSE): max_exec_latency_ms dataclass / loader 기본값 2500 정합화
-  2) CLEANUP: analyst_openai_temperature 호환성 필드 유지 주석 보강
 ========================================================
 """
 
@@ -101,6 +102,17 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "ENGINE_WATCHDOG_INTERVAL_SEC": "engine_watchdog_interval_sec",
     "ENGINE_WATCHDOG_MAX_DB_PING_MS": "engine_watchdog_max_db_ping_ms",
     "ENGINE_WATCHDOG_EMIT_MIN_SEC": "engine_watchdog_emit_min_sec",
+    # Preflight / Meta
+    "PREFLIGHT_FAKE_USDT": "preflight_fake_usdt",
+    "META_LOOKBACK_TRADES": "meta_lookback_trades",
+    "META_RECENT_WINDOW": "meta_recent_window",
+    "META_BASELINE_WINDOW": "meta_baseline_window",
+    "META_MIN_TRADES_REQUIRED": "meta_min_trades_required",
+    "META_MAX_RECENT_TRADES": "meta_max_recent_trades",
+    "META_LANGUAGE": "meta_language",
+    "META_MAX_OUTPUT_SENTENCES": "meta_max_output_sentences",
+    "META_PROMPT_VERSION": "meta_prompt_version",
+    "META_COOLDOWN_SEC": "meta_cooldown_sec",
     # AI analyst
     "ANALYST_MARKET_SYMBOL": "analyst_market_symbol",
     "ANALYST_DB_MARKET_TIMEFRAME": "analyst_db_market_timeframe",
@@ -358,6 +370,18 @@ class Settings:
     engine_watchdog_interval_sec: float = 5.0
     engine_watchdog_max_db_ping_ms: int = 1500
     engine_watchdog_emit_min_sec: int = 30
+
+    # Preflight / Meta strategy
+    preflight_fake_usdt: float = 1000.0
+    meta_lookback_trades: int = 200
+    meta_recent_window: int = 20
+    meta_baseline_window: int = 60
+    meta_min_trades_required: int = 20
+    meta_max_recent_trades: int = 20
+    meta_language: str = "ko"
+    meta_max_output_sentences: int = 3
+    meta_prompt_version: str = "2026-03-03"
+    meta_cooldown_sec: int = 60
 
     # TEST controls
     test_dry_run: bool = False
@@ -988,6 +1012,36 @@ def _validate_settings(s: Settings) -> None:
     if s.engine_watchdog_emit_min_sec < 1:
         raise ValueError("engine_watchdog_emit_min_sec must be >= 1")
 
+    if s.preflight_fake_usdt <= 0:
+        raise ValueError("preflight_fake_usdt must be > 0")
+
+    if s.meta_lookback_trades < 1:
+        raise ValueError("meta_lookback_trades must be >= 1")
+    if s.meta_recent_window < 1:
+        raise ValueError("meta_recent_window must be >= 1")
+    if s.meta_baseline_window < 1:
+        raise ValueError("meta_baseline_window must be >= 1")
+    if s.meta_min_trades_required < 1:
+        raise ValueError("meta_min_trades_required must be >= 1")
+    if s.meta_max_recent_trades < 1:
+        raise ValueError("meta_max_recent_trades must be >= 1")
+    if s.meta_recent_window > s.meta_lookback_trades:
+        raise ValueError("meta_recent_window must be <= meta_lookback_trades")
+    if s.meta_baseline_window > s.meta_lookback_trades:
+        raise ValueError("meta_baseline_window must be <= meta_lookback_trades")
+    if s.meta_min_trades_required > s.meta_lookback_trades:
+        raise ValueError("meta_min_trades_required must be <= meta_lookback_trades")
+    if s.meta_max_recent_trades > s.meta_lookback_trades:
+        raise ValueError("meta_max_recent_trades must be <= meta_lookback_trades")
+    if not str(s.meta_language or "").strip():
+        raise ValueError("meta_language is empty")
+    if s.meta_max_output_sentences < 1:
+        raise ValueError("meta_max_output_sentences must be >= 1")
+    if not str(s.meta_prompt_version or "").strip():
+        raise ValueError("meta_prompt_version is empty")
+    if s.meta_cooldown_sec < 1:
+        raise ValueError("meta_cooldown_sec must be >= 1")
+
     if not str(s.openai_api_key or "").strip():
         raise RuntimeError("missing OpenAI key (OPENAI_API_KEY)")
     if not str(s.openai_model or "").strip():
@@ -1295,6 +1349,17 @@ def load_settings() -> Settings:
     engine_watchdog_max_db_ping_ms = _as_int("ENGINE_WATCHDOG_MAX_DB_PING_MS", 1500)
     engine_watchdog_emit_min_sec = _as_int("ENGINE_WATCHDOG_EMIT_MIN_SEC", 30)
 
+    preflight_fake_usdt = _as_float("PREFLIGHT_FAKE_USDT", 1000.0)
+    meta_lookback_trades = _as_int("META_LOOKBACK_TRADES", 200)
+    meta_recent_window = _as_int("META_RECENT_WINDOW", 20)
+    meta_baseline_window = _as_int("META_BASELINE_WINDOW", 60)
+    meta_min_trades_required = _as_int("META_MIN_TRADES_REQUIRED", 20)
+    meta_max_recent_trades = _as_int("META_MAX_RECENT_TRADES", 20)
+    meta_language = _as_str("META_LANGUAGE", "ko")
+    meta_max_output_sentences = _as_int("META_MAX_OUTPUT_SENTENCES", 3)
+    meta_prompt_version = _as_str("META_PROMPT_VERSION", "2026-03-03")
+    meta_cooldown_sec = _as_int("META_COOLDOWN_SEC", 60)
+
     redis_url = _as_str("REDIS_URL", "redis://localhost:6379/0")
     dashboard_cache_prefix = _as_str("DASHBOARD_CACHE_PREFIX", "auto_trader_dashboard")
     dashboard_cache_ttl_sec = _as_int("DASHBOARD_CACHE_TTL_SEC", 5)
@@ -1476,6 +1541,16 @@ def load_settings() -> Settings:
         engine_watchdog_interval_sec=engine_watchdog_interval_sec,
         engine_watchdog_max_db_ping_ms=engine_watchdog_max_db_ping_ms,
         engine_watchdog_emit_min_sec=engine_watchdog_emit_min_sec,
+        preflight_fake_usdt=preflight_fake_usdt,
+        meta_lookback_trades=meta_lookback_trades,
+        meta_recent_window=meta_recent_window,
+        meta_baseline_window=meta_baseline_window,
+        meta_min_trades_required=meta_min_trades_required,
+        meta_max_recent_trades=meta_max_recent_trades,
+        meta_language=meta_language,
+        meta_max_output_sentences=meta_max_output_sentences,
+        meta_prompt_version=meta_prompt_version,
+        meta_cooldown_sec=meta_cooldown_sec,
         test_dry_run=test_dry_run,
         test_bypass_guards=test_bypass_guards,
         test_force_enter=test_force_enter,
