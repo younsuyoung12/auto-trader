@@ -1,66 +1,32 @@
 """
 =====================================================
 FILE: infra/market_features_ws.py
-BingX WebSocket 캔들(1m/5m/15m/...)과 depth5 오더북을
-GPT-5.1 트레이더용 엔트리 피처로 변환하는 모듈.
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-=====================================================
+ROLE:
+- WebSocket 기반 캔들/오더북 데이터를 엔트리 피처로 변환한다.
+- 상위 엔진(entry / unified_features / exit)이 사용할 수 있는
+  STRICT · NO-FALLBACK · TRADE-GRADE 피처를 생성한다.
 
-핵심 원칙
------------------------------------------------------
-- WS 순수 데이터만 사용 (REST 백필 · 임의 보정 · 추론 · 폴백 전부 금지)
-- 헬스 체크나 지표 계산 중 하나라도 비정상 / NaN / None 이 발견되면
-  FeatureBuildError 를 발생시키고 피처 생성을 즉시 중단
-- GPT 는 항상 "완전한 피처 셋"만 전달받고, 애매한 데이터로는 절대 진입하지 않음
+CORE RESPONSIBILITIES:
+- 필수 타임프레임 WS 캔들 로드 및 freshness 검증
+- 오더북(depth5) freshness / 무결성 검증
+- 타임프레임별 지표 및 multi-timeframe summary 생성
+- entry_flow 가 직접 사용할 수 있는 trading signal 생성
 
-주요 공개 함수
------------------------------------------------------
-- build_entry_features_ws(symbol) -> Dict[str, Any]
-    · timeframes / orderbook / multi_timeframe 를 포함한 전체 WS 피처
-- get_trading_signal(settings, last_close_ts, symbol) -> EntrySignal
-    · entry_flow 가 바로 사용할 수 있는
-      (chosen_signal, signal_source, latest_ts,
-       candles_5m, candles_5m_raw, last_price, extra) 튜플
+IMPORTANT POLICY:
+- settings.py 는 단일 설정 소스(SSOT)다.
+- 설정 상수/임계값을 market_data_ws 내부 구현 상수에서 가져오지 않는다.
+- 데이터 누락 / stale / NaN / 계약 불일치는 즉시 예외 처리한다.
+- orderbook timestamp 누락을 현재 시각으로 대체하지 않는다.
+- 비핵심 알림 실패는 로깅하되, 핵심 데이터 실패를 가리지 않는다.
 
-extra 주요 필드
------------------------------------------------------
-- signal_score   : 0.5 ~ 6.0 엔트리 강도 점수
-- trend_strength : 5m regime 의 추세 강도 (필수, 없으면 시그널 생성 중단)
-- volatility     : 5m ATR pct (필수)
-- volume_zscore  : 5m 거래량 z-score (필수)
-- majority_trend / depth_imbalance / spread_pct 등은
-  GPT 자연어 해석 및 리스크 로그용 메타로 함께 제공된다.
-
-변경 이력
------------------------------------------------------
+CHANGE HISTORY:
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): 방향 결정 로직을 "전체 TF 다수결"에서
-     "상위 TF 우선 계층형 결정"으로 변경
-     - 4h / 1h / 15m / 5m 순서로 우선순위 적용
-     - 1m vote / depth_imbalance 로 방향 직접 결정 금지
-     - 상위 TF 합의가 없으면 무리하게 LONG/SHORT 생성하지 않고 None 반환
-  2) FIX(STRICT): same-candle freeze 상태의 ts rollback 검증 추가
-  3) FIX(TRADE-GRADE): extra 에 direction_source / high_tf_bias / support_count / oppose_count 기록
-  4) 기존 기능 삭제 없음
-
-- 2026-03-01:
-  1) raw_ohlcv_last20 포맷을 dict -> (ts_ms, o, h, l, c, v) tuple 로 변경 (STRICT 호환)
-  2) indicators dict 에 scalar 지표(rsi/ema/atr/macd...) 포함 (unified_features_builder 호환)
-
-- 2026-03-09 (TRADE-GRADE PATCH 5):
-  1) FIX(ROOT-CAUSE): 동일 5m 캔들에서는 신호 재계산보다 freeze 상태를 우선 적용하는 early gate 추가
-     - lightweight 5m/orderbook 확인 후 같은 latest_ts 이면 즉시 기존 결정 반환
-     - 같은 캔들 동안 intra-candle LONG/SHORT flip 및 점수 흔들림 차단
-  2) FIX(TRADE-GRADE): no-signal(None) 결정도 동일 5m 캔들 동안 freeze
-     - 첫 판단이 저변동성/방향미확정으로 스킵이면 같은 캔들에서는 계속 스킵 유지
-  3) FIX(STRICT): majority_trend 가 MIXED/NEUTRAL 인 경우 depth_imbalance 로 방향을 직접 결정하지 않음
-     - 오더북 쏠림은 리스크/해석용 메타로만 유지
-     - 방향 결정은 상위 TF trend → 5m EMA 정렬 순으로만 수행
-  4) FIX(STRICT): 방향이 끝까지 확정되지 않으면 LONG 기본값으로 진입하지 않고 None 반환
-  5) FIX(BUG): 저변동성 구간 스킵 로그 후 실제로 None 반환
-  6) FIX(STRICT): freeze 재사용 시 last_close_ts 는 최신 런타임 값으로 갱신
-  7) FIX(CLEANUP): 중복 top-level 함수 정의 제거
-  8) FIX(MISSING): _compute_orderbook_features / build_entry_features_ws 누락 복원
+  1) FIX(ROOT-CAUSE): ORDERBOOK_MAX_DELAY_SEC / KLINE_MAX_DELAY_SEC / KLINE_MIN_BUFFER
+     를 market_data_ws 의존에서 제거하고 settings SSOT로 정렬
+  2) FIX(SSOT): load_settings() 재호출 제거, settings.SETTINGS 단일 객체 사용
+  3) FIX(STRICT): orderbook timestamp 누락 시 now_ms fallback 제거
+  4) FIX(STRICT): get_health_snapshot 예외를 로그 후 진행하지 않고 즉시 실패 처리
+  5) FIX(OBSERVABILITY): Telegram 알림 실패 pass 제거, 명시적 로그 기록
 =====================================================
 """
 
@@ -70,12 +36,9 @@ import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from settings import load_settings
+from settings import SETTINGS
 from infra.telelog import log, send_tg
 from infra.market_data_ws import (
-    KLINE_MAX_DELAY_SEC,
-    KLINE_MIN_BUFFER,
-    ORDERBOOK_MAX_DELAY_SEC,
     get_health_snapshot,
     get_klines_with_volume,
     get_last_kline_delay_ms,
@@ -94,7 +57,7 @@ from strategy.indicators import (
     stochastic_oscillator,
 )
 
-SET = load_settings()
+SET = SETTINGS
 
 EntrySignal = Tuple[
     str,                 # chosen_signal ("LONG"|"SHORT")
@@ -123,6 +86,11 @@ TF_CONFIG: Dict[str, Dict[str, int]] = {
 FEATURE_ERROR_TG_COOLDOWN_SEC: float = float(
     getattr(SET, "features_error_tg_cooldown_sec", 60.0)
 )
+
+# SSOT-derived runtime thresholds
+KLINE_MAX_DELAY_SEC: float = float(SET.ws_max_kline_delay_sec)
+ORDERBOOK_MAX_DELAY_SEC: float = float(SET.ws_market_event_max_delay_sec)
+DEFAULT_KLINE_MIN_BUFFER: int = int(SET.ws_min_kline_buffer)
 
 
 class FeatureBuildError(RuntimeError):
@@ -160,8 +128,8 @@ def _notify_error_once(key: str, human_msg: str) -> None:
     log(f"[MKT-FEAT] {human_msg}")
     try:
         send_tg("❌ [시세 데이터 오류 - GPT 피처 빌더]\n" + human_msg)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[MKT-FEAT] telegram notify failed: {e.__class__.__name__}: {e}")
 
 
 def _fail(symbol: str, location: str, reason: str) -> None:
@@ -247,6 +215,44 @@ def _clone_frozen_extra_for_return(
     return cloned
 
 
+def _resolve_min_kline_buffer(interval: str, cfg: Dict[str, int]) -> int:
+    per_interval = getattr(SET, "ws_min_kline_buffer_by_interval", {})
+    if not isinstance(per_interval, dict):
+        raise FeatureBuildError("ws_min_kline_buffer_by_interval must be dict (STRICT)")
+
+    interval_floor = per_interval.get(interval)
+    if interval_floor is None:
+        interval_floor = DEFAULT_KLINE_MIN_BUFFER
+
+    try:
+        interval_floor_int = int(interval_floor)
+    except Exception:
+        raise FeatureBuildError(
+            f"invalid ws_min_kline_buffer for interval={interval!r} (STRICT)"
+        ) from None
+
+    if interval_floor_int <= 0:
+        raise FeatureBuildError(
+            f"ws_min_kline_buffer for interval={interval!r} must be > 0 (STRICT)"
+        )
+
+    ema_fast_len = int(cfg.get("ema_fast", 20))
+    ema_slow_len = int(cfg.get("ema_slow", 50))
+    rsi_len = int(cfg.get("rsi", 14))
+    atr_len = int(cfg.get("atr", 14))
+    range_len = int(cfg.get("range", 50))
+
+    return max(
+        ema_fast_len,
+        ema_slow_len,
+        rsi_len + 1,
+        atr_len + 1,
+        range_len,
+        interval_floor_int,
+        atr_len * 2,
+    )
+
+
 def _fetch_candles_strict(
     symbol: str,
     interval: str,
@@ -254,21 +260,7 @@ def _fetch_candles_strict(
     cfg: Dict[str, int],
     required: bool,
 ) -> List[Tuple[int, float, float, float, float, float]]:
-    ema_fast_len = int(cfg.get("ema_fast", 20))
-    ema_slow_len = int(cfg.get("ema_slow", 50))
-    rsi_len = int(cfg.get("rsi", 14))
-    atr_len = int(cfg.get("atr", 14))
-    range_len = int(cfg.get("range", 50))
-
-    need_len = max(
-        ema_fast_len,
-        ema_slow_len,
-        rsi_len + 1,
-        atr_len + 1,
-        range_len,
-        KLINE_MIN_BUFFER,
-        atr_len * 2,
-    )
+    need_len = _resolve_min_kline_buffer(interval, cfg)
 
     buf = get_klines_with_volume(symbol, interval, limit=max(300, need_len * 2))
 
@@ -548,6 +540,8 @@ def _build_timeframe_features(
                 "WS 시세가 멈췄거나 비정상일 수 있습니다."
             )
             _fail(symbol, f"flat_{interval}", reason)
+    except FeatureBuildError:
+        raise
     except Exception as e:
         log(f"[MKT-FEAT] flat-market check error interval={interval}: {e}")
 
@@ -657,8 +651,8 @@ def _build_timeframe_features(
             ]
             if rsi_clean:
                 indicators["rsi_series"] = rsi_clean
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[MKT-FEAT] rsi_series build error interval={interval}: {e}")
 
     try:
         if macd_hist:
@@ -669,8 +663,8 @@ def _build_timeframe_features(
             ]
             if macd_hist_clean:
                 indicators["macd_hist_series"] = macd_hist_clean
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[MKT-FEAT] macd_hist_series build error interval={interval}: {e}")
 
     tf_features["indicators"] = indicators
 
@@ -775,31 +769,59 @@ def _build_multi_timeframe_summary(
     }
 
 
+def _strict_optional_float(symbol: str, location: str, name: str, value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except Exception:
+        _fail(symbol, location, f"{name} must be float-compatible when present (STRICT)")
+    if not math.isfinite(parsed):
+        _fail(symbol, location, f"{name} must be finite when present (STRICT)")
+    return parsed
+
+
 def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     ob = get_orderbook(symbol, limit=5)
-    now_ms = _now_ms()
 
-    if not ob or not ob.get("bids") or not ob.get("asks"):
+    if not isinstance(ob, dict):
+        _fail(symbol, "orderbook", "오더북 스냅샷 타입이 dict 가 아닙니다.")
+
+    bids = ob.get("bids")
+    asks = ob.get("asks")
+
+    if not isinstance(bids, list) or not bids:
         _fail(
             symbol,
             "orderbook",
-            "depth5 오더북 스냅샷을 가져오지 못했습니다. WS 구독에 '@depth5' 가 포함되어 있는지 확인해 주세요.",
+            "depth5 bids 스냅샷을 가져오지 못했습니다. WS 구독에 '@depth5' 가 포함되어 있는지 확인해 주세요.",
         )
-
-    bids = ob.get("bids") or []
-    asks = ob.get("asks") or []
+    if not isinstance(asks, list) or not asks:
+        _fail(
+            symbol,
+            "orderbook",
+            "depth5 asks 스냅샷을 가져오지 못했습니다. WS 구독에 '@depth5' 가 포함되어 있는지 확인해 주세요.",
+        )
 
     ts_ms: Optional[int] = None
     for key in ("exchTs", "ts"):
-        if ob.get(key) is not None:
-            try:
-                ts_ms = int(ob[key])
-                break
-            except Exception:
-                continue
-    if ts_ms is None:
-        ts_ms = now_ms
+        raw_ts = ob.get(key)
+        if raw_ts is None:
+            continue
+        try:
+            ts_ms = int(raw_ts)
+            break
+        except Exception:
+            _fail(symbol, "orderbook", f"{key} must be int-compatible milliseconds (STRICT)")
 
+    if ts_ms is None:
+        _fail(
+            symbol,
+            "orderbook",
+            "오더북 스냅샷 timestamp(exchTs/ts)가 없습니다. timestamp 누락을 현재 시각으로 대체하지 않습니다.",
+        )
+
+    now_ms = _now_ms()
     age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)
     if age_sec > ORDERBOOK_MAX_DELAY_SEC:
         _fail(
@@ -808,33 +830,59 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
             f"오더북 스냅샷이 {age_sec:.1f}초 동안 갱신되지 않았습니다 (허용 최대 {ORDERBOOK_MAX_DELAY_SEC:.1f}초).",
         )
 
-    best_bid = float(bids[0][0])
-    best_ask = float(asks[0][0])
-    spread_abs = best_ask - best_bid
-    mid = (best_bid + best_ask) / 2.0 if (best_ask > 0 and best_bid > 0) else math.nan
-    spread_pct = (spread_abs / mid) if (mid and mid > 0) else math.nan
+    try:
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+    except Exception:
+        _fail(symbol, "orderbook", "best bid/ask 파싱에 실패했습니다. depth row 형식이 손상되었습니다.")
 
-    def _depth_notional(side: List[List[float]]) -> float:
+    if not math.isfinite(best_bid) or best_bid <= 0:
+        _fail(symbol, "orderbook", "best_bid must be finite > 0 (STRICT)")
+    if not math.isfinite(best_ask) or best_ask <= 0:
+        _fail(symbol, "orderbook", "best_ask must be finite > 0 (STRICT)")
+    if best_ask <= best_bid:
+        _fail(symbol, "orderbook", "best_ask must be greater than best_bid (STRICT)")
+
+    spread_abs = best_ask - best_bid
+    mid = (best_bid + best_ask) / 2.0
+    spread_pct = spread_abs / mid
+
+    def _depth_notional(side_name: str, side: List[List[float]]) -> float:
         total = 0.0
-        for row in side:
-            if len(row) < 2:
-                continue
+        for idx, row in enumerate(side):
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                _fail(
+                    symbol,
+                    "orderbook",
+                    f"{side_name}[{idx}] depth row malformed (STRICT): expected [price, qty]",
+                )
             try:
                 p = float(row[0])
                 q = float(row[1])
-                total += p * q
             except Exception:
-                continue
+                _fail(
+                    symbol,
+                    "orderbook",
+                    f"{side_name}[{idx}] depth row parse failed (STRICT)",
+                )
+            if not math.isfinite(p) or p <= 0:
+                _fail(symbol, "orderbook", f"{side_name}[{idx}] price must be finite > 0 (STRICT)")
+            if not math.isfinite(q) or q < 0:
+                _fail(symbol, "orderbook", f"{side_name}[{idx}] qty must be finite >= 0 (STRICT)")
+            total += p * q
         return total
 
-    bid_notional = _depth_notional(bids)
-    ask_notional = _depth_notional(asks)
-    depth_imbalance: Optional[float]
+    bid_notional = _depth_notional("bids", bids)
+    ask_notional = _depth_notional("asks", asks)
+
     if bid_notional + ask_notional <= 0:
         depth_imbalance = None
     else:
         depth_imbalance = (bid_notional - ask_notional) / (bid_notional + ask_notional)
         depth_imbalance = max(min(depth_imbalance, 1.0), -1.0)
+
+    mark_price = _strict_optional_float(symbol, "orderbook", "markPrice", ob.get("markPrice"))
+    last_price = _strict_optional_float(symbol, "orderbook", "lastPrice", ob.get("lastPrice"))
 
     return {
         "ts_ms": ts_ms,
@@ -847,8 +895,8 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
         "bid_notional": bid_notional,
         "ask_notional": ask_notional,
         "depth_imbalance": depth_imbalance,
-        "mark_price": float(ob.get("markPrice")) if ob.get("markPrice") is not None else None,
-        "last_price": float(ob.get("lastPrice")) if ob.get("lastPrice") is not None else None,
+        "mark_price": mark_price,
+        "last_price": last_price,
     }
 
 
@@ -925,16 +973,20 @@ def build_entry_features_ws(
 
     try:
         snap = get_health_snapshot(symbol)
-        if not snap.get("overall_ok", True):
-            _fail(
-                symbol,
-                "health_snapshot",
-                "WS 시세 데이터 헬스 체크 결과 overall_ok=False 입니다. market_data_ws.get_health_snapshot 로그를 확인해 주세요.",
-            )
     except FeatureBuildError:
         raise
     except Exception as e:
-        log(f"[MKT-FEAT] get_health_snapshot error: {e}")
+        _fail(symbol, "health_snapshot", f"get_health_snapshot 예외: {e}")
+
+    if not isinstance(snap, dict):
+        _fail(symbol, "health_snapshot", "get_health_snapshot 결과가 dict 가 아닙니다.")
+
+    if not snap.get("overall_ok", True):
+        _fail(
+            symbol,
+            "health_snapshot",
+            "WS 시세 데이터 헬스 체크 결과 overall_ok=False 입니다. market_data_ws.get_health_snapshot 로그를 확인해 주세요.",
+        )
 
     timeframes: Dict[str, Dict[str, Any]] = {}
 
@@ -1100,8 +1152,11 @@ def get_trading_signal(
         log(msg)
         try:
             send_tg("❌ [get_trading_signal 예외]\n" + msg)
-        except Exception:
-            pass
+        except Exception as tg_error:
+            log(
+                f"[MKT-FEAT] get_trading_signal telegram notify failed: "
+                f"{tg_error.__class__.__name__}: {tg_error}"
+            )
         return None
 
     tfs: Dict[str, Dict[str, Any]] = features.get("timeframes", {})
@@ -1250,8 +1305,8 @@ def get_trading_signal(
             signal_source = "TREND"
         elif (overbought_tfs + oversold_tfs) >= 1:
             signal_source = "RANGE"
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[MKT-FEAT] signal_source resolution error: {e}")
 
     if signal_source == "TREND":
         regime_level = 1.0
@@ -1279,8 +1334,8 @@ def get_trading_signal(
             signal_score -= min(float(oppose_count) * 0.75, 2.0)
         if isinstance(vol_z, (int, float)):
             signal_score += min(abs(vol_z) * 0.5, 2.0)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[MKT-FEAT] signal_score resolution error: {e}")
 
     signal_score = max(0.5, min(signal_score, 6.0))
 
