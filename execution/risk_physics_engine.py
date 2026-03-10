@@ -3,78 +3,37 @@ from __future__ import annotations
 """
 ========================================================
 FILE: execution/risk_physics_engine.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
-========================================================
+ROLE:
+- Regime allocation + AccountState + Signal + AutoBlock 결과를 통합해
+  최종 계좌 투입 비율(allocation)과 행동(ENTER/SKIP/STOP)을 결정한다.
 
-핵심 변경 요약
-- auto_block_engine 출력 계약과 정합화:
-  * AutoBlockDecision.reasons 를 list[str] 기준으로 STRICT 검증 유지
-- 상단 변경 이력 정리:
-  * 미래 날짜 제거
-  * 최근 변경 이력만 유지
-- 초기화 코드 명확화:
-  * self.policy = policy if policy is not None else RiskPhysicsPolicy()
+CORE RESPONSIBILITIES:
+- regime_allocation / dd_pct / consecutive_losses / planned_rr STRICT 검증
+- DD / 연속 손실 / 최소 RR 정책 기반 allocation 조정
+- auto_block_engine overlay 적용
+- 최종 ENTER / SKIP / STOP 의사결정 반환
+- audit 가능한 decision contract 보장
 
-코드 정리 내용
-- 불필요한 과거 PATCH NOTES 정리
-- 기존 정책/기능 삭제 없음
-- auto_block / dd / consecutive loss / RR 정책 흐름 유지
-
-역할
---------------------------------------------------------
-- Regime allocation(0.0~1.0) + AccountState(DD/연속손실) + Signal(tp/sl) +
-  (TRADE-GRADE) Microstructure + EV Heatmap 상태
-  을 입력으로 받아, "최종 allocation(=계좌 투입 비율)"을 결정한다.
-- 이 파일에서 말하는 effective_risk_pct 는
-  "리스크% 상한"이 아니라 "계좌 투입 비율(0~1)" 이다.
-  예) 1.0 = 전액, 0.7 = 70%, 0.4 = 40%
-
-핵심 원칙 (공동 규칙)
---------------------------------------------------------
-- 절대 폴백 금지:
-  - 입력 누락/형식 오류/범위 이탈 시 즉시 예외.
-  - None → 0 치환, 임의 추정/임의 보정 금지.
-- 정책 기반의 "명시적" 보정만 허용:
-  - DD/연속손실/최소 RR/AutoBlock(명시 룰)에 의한 감쇠/차단.
-- 민감정보 로그 금지.
-- settings 객체 불변(읽기만).
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 입력 누락/형식 오류/범위 이탈 시 즉시 예외
+- 임의 보정 금지, 정책 기반 명시적 보정만 허용
 - 외부 I/O 금지(DB/네트워크 금지). caller가 모든 입력을 공급한다.
+- decision 반환 계약(action_override / allocation_used / reason / audit fields) 일관성 유지
 
-정책 (확정) — 전액 배분형
---------------------------------------------------------
-1) Regime allocation(0.0~1.0) 은 caller가 공급한다.
-2) DD 감쇠(Allocation multiplier)
-   - DD >= 5%  -> x0.8
-   - DD >= 10% -> x0.5
-   - DD >= 15% -> 신규 진입 차단(SKIP)
-   - DD >= 20% -> 엔진 정지 권고(STOP)
-3) 연속 손실 감쇠(Allocation multiplier)
-   - consecutive_losses >= 2 -> x0.7
-   - consecutive_losses >= 3 -> 신규 진입 차단(SKIP)
-4) 최소 계획 RR 강제(현재 신호 기준)
-   - planned_rr = tp_pct / sl_pct
-   - planned_rr < 1.6 -> 신규 진입 차단(SKIP)
-5) (TRADE-GRADE) AutoBlock overlay
-   - micro_score_risk(0~100) + EV Heatmap 상태로 block_entry / risk_multiplier 산출
-   - block_entry=True면 SKIP
-   - risk_multiplier는 allocation에 곱셈 적용
-6) 최종 allocation 산출
-   - effective_alloc = allocation_adjusted
-   - 상한(max_allocation)은 정책상 제한값(기본 1.0)
-   - 최소(min_allocation_if_enter) 미만이면 SKIP
-
-변경 이력
---------------------------------------------------------
-- 2026-03-09
-  1) auto_block_engine 출력 계약(list[str] reasons) 기준으로 STRICT 정합 유지
-  2) 상단 이력/요약 구조 정리 및 미래 날짜 제거
-  3) policy 초기화 구문 명확화
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(STRICT): policy multiplier monotonicity(dd_reduce_2_mult <= dd_reduce_1_mult) 검증 추가
+  2) FIX(ARCH): STOP/SKIP/ENTER 반환 로직을 _build_decision_strict()로 단일화
+  3) FIX(CONTRACT): heatmap_status=NOT_READY 일 때 heatmap_n=0 / heatmap_ev=None 계약 강화
+  4) ADD(OBSERVABILITY): decision audit fields(dd_pct / consecutive_losses / regime_allocation_input) 추가
+  5) FIX(STRICT): action_override 값 검증 및 reason 생성 경로 일원화
 ========================================================
 """
 
 import math
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from risk.auto_block_engine import AutoBlockDecision, AutoBlockError, decide_auto_block
 
@@ -91,8 +50,11 @@ class RiskPhysicsInputError(RiskPhysicsError):
 
 
 # ─────────────────────────────────────────────
-# Data structures
+# Types / Data structures
 # ─────────────────────────────────────────────
+ActionOverride = Literal["ENTER", "SKIP", "STOP"]
+
+
 @dataclass(frozen=True, slots=True)
 class RiskPhysicsPolicy:
     # DD thresholds (percent)
@@ -121,7 +83,7 @@ class RiskPhysicsPolicy:
 @dataclass(frozen=True, slots=True)
 class RiskPhysicsDecision:
     # "ENTER" / "SKIP" / "STOP"
-    action_override: str
+    action_override: ActionOverride
     effective_risk_pct: float  # "계좌 투입 비율"로 사용
     allocation_used: float
     planned_rr: float
@@ -134,6 +96,11 @@ class RiskPhysicsDecision:
     heatmap_status: Optional[str] = None
     heatmap_ev: Optional[float] = None
     heatmap_n: Optional[int] = None
+
+    # Additional audit fields
+    dd_pct: Optional[float] = None
+    consecutive_losses: Optional[int] = None
+    regime_allocation_input: Optional[float] = None
 
 
 # ─────────────────────────────────────────────
@@ -219,12 +186,87 @@ def _compose_reason_strict(*parts: str) -> str:
     return "|".join(out)
 
 
+def _validate_action_override_strict(v: Any) -> ActionOverride:
+    s = str(v).strip().upper()
+    if s not in ("ENTER", "SKIP", "STOP"):
+        raise RiskPhysicsError(f"invalid action_override (STRICT): {v!r}")
+    return s  # type: ignore[return-value]
+
+
+def _build_decision_strict(
+    *,
+    action_override: ActionOverride,
+    effective_risk_pct: float,
+    allocation_used: float,
+    planned_rr: float,
+    reason: str,
+    auto_blocked: bool,
+    auto_risk_multiplier: float,
+    micro_score_risk: float,
+    heatmap_status: str,
+    heatmap_ev: Optional[float],
+    heatmap_n: int,
+    dd_pct: float,
+    consecutive_losses: int,
+    regime_allocation_input: float,
+) -> RiskPhysicsDecision:
+    action = _validate_action_override_strict(action_override)
+    eff = _as_float(effective_risk_pct, "effective_risk_pct", min_value=0.0, max_value=1.0)
+    alloc_used = _as_float(allocation_used, "allocation_used", min_value=0.0, max_value=1.0)
+    rr = _as_float(planned_rr, "planned_rr", min_value=0.0)
+    auto_mult = _as_float(auto_risk_multiplier, "auto_risk_multiplier", min_value=0.0, max_value=1.0)
+    msr = _as_float(micro_score_risk, "micro_score_risk", min_value=0.0, max_value=100.0)
+    st = _require_nonempty_status(heatmap_status, "heatmap_status")
+    dd = _as_float(dd_pct, "dd_pct", min_value=0.0, max_value=100.0)
+    consec = _as_int(consecutive_losses, "consecutive_losses", min_value=0)
+    reg_alloc = _require_ratio_0_1(regime_allocation_input, "regime_allocation_input")
+
+    reason_s = _compose_reason_strict(reason)
+
+    if action == "ENTER" and eff <= 0.0:
+        raise RiskPhysicsError("ENTER decision must have effective_risk_pct > 0 (STRICT)")
+    if action in ("SKIP", "STOP") and eff != 0.0:
+        raise RiskPhysicsError(f"{action} decision must have effective_risk_pct == 0 (STRICT)")
+    if action == "STOP" and alloc_used != 0.0:
+        raise RiskPhysicsError("STOP decision must have allocation_used == 0 (STRICT)")
+
+    if st == "NOT_READY":
+        if heatmap_ev is not None:
+            raise RiskPhysicsError("heatmap_ev must be None when heatmap_status=NOT_READY (STRICT)")
+        if heatmap_n != 0:
+            raise RiskPhysicsError("heatmap_n must be 0 when heatmap_status=NOT_READY (STRICT)")
+        hev: Optional[float] = None
+    else:
+        if heatmap_ev is None:
+            raise RiskPhysicsError("heatmap_ev is required when heatmap_status!=NOT_READY (STRICT)")
+        hev = _as_float(heatmap_ev, "heatmap_ev")
+        if heatmap_n <= 0:
+            raise RiskPhysicsError("heatmap_n must be > 0 when heatmap_status!=NOT_READY (STRICT)")
+
+    return RiskPhysicsDecision(
+        action_override=action,
+        effective_risk_pct=float(eff),
+        allocation_used=float(alloc_used),
+        planned_rr=float(rr),
+        reason=reason_s,
+        auto_blocked=bool(auto_blocked),
+        auto_risk_multiplier=float(auto_mult),
+        micro_score_risk=float(msr),
+        heatmap_status=st,
+        heatmap_ev=hev,
+        heatmap_n=int(heatmap_n),
+        dd_pct=float(dd),
+        consecutive_losses=int(consec),
+        regime_allocation_input=float(reg_alloc),
+    )
+
+
 # ─────────────────────────────────────────────
 # Engine
 # ─────────────────────────────────────────────
 class RiskPhysicsEngine:
     """
-    STRICT · NO-FALLBACK
+    STRICT · NO-FALLBACK · TRADE-GRADE
 
     입력(Caller 책임):
     - regime_allocation: 레짐 엔진 allocation (0~1)
@@ -257,6 +299,9 @@ class RiskPhysicsEngine:
 
         _as_float(p.dd_reduce_1_mult, "policy.dd_reduce_1_mult", min_value=0.0, max_value=1.0)
         _as_float(p.dd_reduce_2_mult, "policy.dd_reduce_2_mult", min_value=0.0, max_value=1.0)
+
+        if p.dd_reduce_2_mult > p.dd_reduce_1_mult:
+            raise ValueError("policy.dd_reduce_2_mult must be <= policy.dd_reduce_1_mult")
 
         _as_int(p.consec_reduce_n, "policy.consec_reduce_n", min_value=0)
         _as_int(p.consec_block_n, "policy.consec_block_n", min_value=0)
@@ -306,6 +351,8 @@ class RiskPhysicsEngine:
         if st == "NOT_READY":
             if heatmap_ev is not None:
                 raise RiskPhysicsInputError("heatmap_ev must be None when heatmap_status=NOT_READY")
+            if hn != 0:
+                raise RiskPhysicsInputError("heatmap_n must be 0 when heatmap_status=NOT_READY")
             hev: Optional[float] = None
         else:
             if heatmap_ev is None:
@@ -316,7 +363,7 @@ class RiskPhysicsEngine:
 
         # Policy: STOP
         if dd >= self.policy.dd_stop_engine_pct:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="STOP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
@@ -330,11 +377,14 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         # Policy: block entry
         if dd >= self.policy.dd_block_entry_pct:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
@@ -348,10 +398,13 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         if consec >= self.policy.consec_block_n and self.policy.consec_block_n > 0:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
@@ -365,10 +418,13 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         if rr < self.policy.min_planned_rr:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
@@ -382,10 +438,13 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         if alloc <= 0.0:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
@@ -397,6 +456,9 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         # Apply DD multipliers
@@ -438,7 +500,7 @@ class RiskPhysicsEngine:
             auto_reason = f"auto_reasons={','.join(abd.reasons)}"
 
         if abd.block_entry:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=0.0,
@@ -454,6 +516,9 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         alloc_adj *= float(abd.risk_multiplier)
@@ -466,7 +531,7 @@ class RiskPhysicsEngine:
             alloc_adj = float(self.policy.max_allocation)
 
         if alloc_adj <= 0.0:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=float(alloc_adj),
@@ -483,10 +548,13 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
         if alloc_adj < self.policy.min_allocation_if_enter:
-            return RiskPhysicsDecision(
+            return _build_decision_strict(
                 action_override="SKIP",
                 effective_risk_pct=0.0,
                 allocation_used=float(alloc_adj),
@@ -503,9 +571,12 @@ class RiskPhysicsEngine:
                 heatmap_status=st,
                 heatmap_ev=hev,
                 heatmap_n=hn,
+                dd_pct=dd,
+                consecutive_losses=consec,
+                regime_allocation_input=alloc,
             )
 
-        return RiskPhysicsDecision(
+        return _build_decision_strict(
             action_override="ENTER",
             effective_risk_pct=float(alloc_adj),
             allocation_used=float(alloc_adj),
@@ -522,6 +593,9 @@ class RiskPhysicsEngine:
             heatmap_status=st,
             heatmap_ev=hev,
             heatmap_n=hn,
+            dd_pct=dd,
+            consecutive_losses=consec,
+            regime_allocation_input=alloc,
         )
 
 

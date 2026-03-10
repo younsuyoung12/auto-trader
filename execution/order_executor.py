@@ -11,6 +11,7 @@ CORE RESPONSIBILITIES:
 - idempotency(newClientOrderId) 보장
 - ENTRY/EXIT MARKET 체결 STRICT 검증
 - 포지션 반영(positionAmt) STRICT 검증
+- 청산 전 보호주문 정리 / 청산 후 포지션 0 STRICT 검증
 - TP/SL 보호주문 visibility STRICT 검증
 - Trade 반환 계약(strict fields / reconciliation_status) 보장
 
@@ -20,14 +21,16 @@ IMPORTANT POLICY:
 - source/symbol/action 계약을 임의 보정하지 않는다
 - 체결 확인 없는 성공 처리 금지
 - 무보호 포지션 상태를 정상으로 취급하지 않는다
+- 청산 후 잔존 보호주문/잔존 포지션을 정상으로 취급하지 않는다
 - print 금지, logging만 사용
 
 CHANGE HISTORY:
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): protection verification 완료 후 Trade.reconciliation_status 를 PROTECTION_VERIFIED 로 정합화
-  2) FIX(STRICT): source fallback 제거, 빈 source 즉시 예외
-  3) FIX(STRICT): tp_pct/sl_pct ratio 계약을 execution 계층에서도 (0,1] / soft_mode 시 sl만 [0,1] 로 강화
-  4) FIX(STRICT): close_all_positions_market()도 MARKET 체결 검증까지 수행하도록 강화
+  1) FIX(ROOT-CAUSE): 청산 전 기존 보호주문(cancel) + 청산 후 포지션 0 검증 추가
+  2) FIX(ROOT-CAUSE): ensure_trading_settings 캐시를 symbol 단독이 아니라 (margin_mode, leverage) 기준으로 정합화
+  3) FIX(STRICT): idempotency 재사용 시 terminal status 주문을 성공으로 취급하지 않고 즉시 예외
+  4) FIX(STRICT): FILLED 대기 중 CANCELED/REJECTED/EXPIRED는 즉시 실패 처리
+  5) FIX(SSOT): settings.SETTINGS 단일 객체 사용
 - 2026-03-06:
   1) TP/SL 보호주문 가시성 검증 추가
   2) 보호주문 검증 실패 시 무보호 포지션 방지
@@ -63,7 +66,7 @@ from execution.exchange_api import (
 )
 from execution.retry_policy import execute_with_retry  # type: ignore
 from events.signals_logger import log_event
-from settings import load_settings
+from settings import SETTINGS
 from state.trader_state import Trade
 
 # Decimal precision for money/qty calculations
@@ -71,7 +74,7 @@ getcontext().prec = 28
 
 logger = logging.getLogger(__name__)
 
-SET = load_settings()
+SET = SETTINGS
 
 # Cache TTLs
 _FILTER_CACHE_TTL_SEC: int = 1800  # 30 minutes
@@ -81,6 +84,26 @@ _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same c
 # Protection order verification
 _PROTECTION_VERIFY_WAIT_SEC: float = 3.0
 _PROTECTION_VERIFY_POLL_SEC: float = 0.2
+_PROTECTION_CANCEL_WAIT_SEC: float = 3.0
+_PROTECTION_CANCEL_POLL_SEC: float = 0.2
+
+# Position close verification
+_POSITION_CLOSE_VERIFY_WAIT_SEC: float = 2.0
+_POSITION_CLOSE_VERIFY_POLL_SEC: float = 0.2
+
+# Existing order status handling
+_TERMINAL_ORDER_STATUSES: set[str] = {
+    "CANCELED",
+    "REJECTED",
+    "EXPIRED",
+    "EXPIRED_IN_MATCH",
+}
+_ACTIVE_OR_FILLED_ORDER_STATUSES: set[str] = {
+    "NEW",
+    "PARTIALLY_FILLED",
+    "FILLED",
+    "PENDING_CANCEL",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +168,7 @@ class SymbolFilters:
 _FILTER_CACHE: Dict[str, Tuple[float, SymbolFilters]] = {}
 _FILTER_LOCK = threading.Lock()
 
-_SETTINGS_APPLIED: set[str] = set()
+_SETTINGS_APPLIED: Dict[str, Tuple[str, int]] = {}
 _SETTINGS_LOCK = threading.Lock()
 
 # ClientOrderId concurrency control + recent cache
@@ -304,11 +327,11 @@ def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
     로그/분석용 allocation_ratio를 가져온다.
 
     - 이 파일에서는 포지션 사이징을 계산하지 않는다(상위 레이어 책임).
-    - settings.allocation_ratio 우선, 없으면 settings.risk_pct(legacy alias) 사용.
+    - allocation_ratio가 있으면 사용하고, 없으면 None을 반환한다.
     """
-    v = getattr(settings, "allocation_ratio", None)
-    if v is None:
-        v = getattr(settings, "risk_pct", None)
+    if not hasattr(settings, "allocation_ratio"):
+        return None
+    v = getattr(settings, "allocation_ratio")
     if v is None:
         return None
     try:
@@ -563,14 +586,61 @@ def _require_recv_window_ms(settings: Any) -> int:
     return iv
 
 
+def _require_entry_fill_wait_sec(settings: Any) -> float:
+    v = getattr(settings, "entry_fill_wait_sec", None)
+    if v is None:
+        raise ValueError("settings.entry_fill_wait_sec is required")
+    return _require_positive_float(v, "settings.entry_fill_wait_sec")
+
+
+def _require_position_reflect_wait_sec(settings: Any) -> float:
+    v = getattr(settings, "position_reflect_wait_sec", None)
+    if v is None:
+        raise ValueError("settings.position_reflect_wait_sec is required")
+    return _require_positive_float(v, "settings.position_reflect_wait_sec")
+
+
+def _require_exit_fill_wait_sec(settings: Any) -> float:
+    v = getattr(settings, "exit_fill_wait_sec", None)
+    if v is None:
+        raise ValueError("settings.exit_fill_wait_sec is required")
+    return _require_positive_float(v, "settings.exit_fill_wait_sec")
+
+
+def _require_deterministic_client_order_id_flag(settings: Any) -> bool:
+    v = getattr(settings, "require_deterministic_client_order_id", None)
+    if not isinstance(v, bool):
+        raise ValueError("settings.require_deterministic_client_order_id must be bool (STRICT)")
+    return v
+
+
+def _get_optional_max_entry_slippage_pct(settings: Any) -> Optional[float]:
+    if not hasattr(settings, "max_entry_slippage_pct"):
+        return None
+    v = getattr(settings, "max_entry_slippage_pct")
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except Exception as e:
+        raise ValueError("settings.max_entry_slippage_pct must be a number") from e
+    if not math.isfinite(f):
+        raise ValueError("settings.max_entry_slippage_pct must be finite")
+    if f < 0:
+        raise ValueError("settings.max_entry_slippage_pct must be >= 0")
+    return float(f)
+
+
 def ensure_trading_settings(symbol: str, settings: Optional[Any] = None) -> None:
     sym = _normalize_symbol(symbol)
     st = settings if settings is not None else SET
     margin_mode = _require_margin_mode(st)
     leverage = _require_leverage(st)
+    desired = (margin_mode, leverage)
 
     with _SETTINGS_LOCK:
-        if sym in _SETTINGS_APPLIED:
+        cached = _SETTINGS_APPLIED.get(sym)
+        if cached == desired:
             return
 
     try:
@@ -586,7 +656,7 @@ def ensure_trading_settings(symbol: str, settings: Optional[Any] = None) -> None
             raise RuntimeError(f"set_leverage failed: {e}") from None
 
     with _SETTINGS_LOCK:
-        _SETTINGS_APPLIED.add(sym)
+        _SETTINGS_APPLIED[sym] = desired
 
     logger.info("trading settings ensured (symbol=%s margin_mode=%s leverage=%s)", sym, margin_mode, leverage)
 
@@ -636,6 +706,31 @@ def _get_order_by_client_id(symbol: str, client_order_id: str, timeout_sec: int)
     return data
 
 
+def _validate_existing_idempotent_order_strict(symbol: str, client_order_id: str, order: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(order, dict):
+        raise RuntimeError("existing order must be dict (STRICT)")
+
+    status = str(order.get("status") or "").upper().strip()
+    if not status:
+        raise OrderExecutionError(
+            f"idempotency order missing status (symbol={symbol} clientOrderId={client_order_id})"
+        )
+
+    if status in _TERMINAL_ORDER_STATUSES:
+        raise OrderExecutionError(
+            f"idempotency conflict with terminal order "
+            f"(symbol={symbol} clientOrderId={client_order_id} status={status})"
+        )
+
+    if status not in _ACTIVE_OR_FILLED_ORDER_STATUSES:
+        raise OrderExecutionError(
+            f"idempotency conflict with unexpected order status "
+            f"(symbol={symbol} clientOrderId={client_order_id} status={status})"
+        )
+
+    return order
+
+
 def _wait_for_inflight_or_existing(symbol: str, client_order_id: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
     deadline = time.time() + _IDEMPOTENCY_INFLIGHT_WAIT_SEC
     while True:
@@ -644,11 +739,11 @@ def _wait_for_inflight_or_existing(symbol: str, client_order_id: str, timeout_se
 
         existing = _find_open_order_by_client_id(symbol, client_order_id)
         if existing is not None:
-            return existing
+            return _validate_existing_idempotent_order_strict(symbol, client_order_id, existing)
 
         existing2 = _get_order_by_client_id(symbol, client_order_id, timeout_sec)
         if existing2 is not None:
-            return existing2
+            return _validate_existing_idempotent_order_strict(symbol, client_order_id, existing2)
 
         if not inflight:
             return None
@@ -753,10 +848,11 @@ def _place_order(
         existing_wait = _wait_for_inflight_or_existing(sym, cid, timeout_sec)
         if existing_wait is not None:
             logger.info(
-                "idempotency hit (inflight wait): returning existing order (symbol=%s clientOrderId=%s orderId=%s)",
+                "idempotency hit (inflight wait): returning existing order (symbol=%s clientOrderId=%s orderId=%s status=%s)",
                 sym,
                 cid,
                 existing_wait.get("orderId"),
+                existing_wait.get("status"),
             )
             return existing_wait
 
@@ -782,16 +878,19 @@ def _place_order(
 
         existing = _find_open_order_by_client_id(sym, cid)
         if existing is not None:
+            existing = _validate_existing_idempotent_order_strict(sym, cid, existing)
             logger.info(
-                "idempotency hit: returning existing open order (symbol=%s clientOrderId=%s orderId=%s)",
+                "idempotency hit: returning existing open order (symbol=%s clientOrderId=%s orderId=%s status=%s)",
                 sym,
                 cid,
                 existing.get("orderId"),
+                existing.get("status"),
             )
             return existing
 
         existing2 = _get_order_by_client_id(sym, cid, timeout_sec)
         if existing2 is not None:
+            existing2 = _validate_existing_idempotent_order_strict(sym, cid, existing2)
             logger.info(
                 "idempotency hit: returning existing order (symbol=%s clientOrderId=%s orderId=%s status=%s)",
                 sym,
@@ -1023,6 +1122,7 @@ def _wait_order_filled_strict(
     - deadline 내 FILLED 아니면 예외
     - executedQty/avgPrice 무결성 검증
     - executedQty mismatch 시 예외
+    - terminal status는 즉시 예외
     """
     sym = _normalize_symbol(symbol)
     timeout_sec = _require_timeout_sec(settings)
@@ -1050,8 +1150,13 @@ def _wait_order_filled_strict(
         if not isinstance(od, dict):
             raise OrderExecutionError("GET /fapi/v1/order returned non-dict")
 
-        status = str(od.get("status") or "").upper()
+        status = str(od.get("status") or "").upper().strip()
         last_status = status
+
+        if status in _TERMINAL_ORDER_STATUSES:
+            raise OrderExecutionError(
+                f"order entered terminal status before FILLED (status={status})"
+            )
 
         if status == "FILLED":
             exec_qty = _require_decimal(_require_order_field_strict(od, "executedQty"), name="order.executedQty")
@@ -1083,7 +1188,7 @@ def _verify_position_reflects_execution_strict(
     executed_qty: Decimal,
     qty_step: Decimal,
     settings: Any,
-    max_wait_sec: float = 1.2,
+    max_wait_sec: float,
 ) -> Decimal:
     """
     STRICT:
@@ -1112,18 +1217,14 @@ def _verify_position_reflects_execution_strict(
         last_amt = amt
 
         if side_u == "BUY":
-            if amt <= 0:
-                pass
-            else:
+            if amt > 0:
                 if _decimal_abs(amt) + qty_step < executed_qty:
                     raise PositionVerificationError(
                         f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
                     )
                 return amt
         else:
-            if amt >= 0:
-                pass
-            else:
+            if amt < 0:
                 if _decimal_abs(amt) + qty_step < executed_qty:
                     raise PositionVerificationError(
                         f"positionAmt smaller than executedQty (amt={_d_to_str(_decimal_abs(amt))}, exec={_d_to_str(executed_qty)})"
@@ -1137,14 +1238,124 @@ def _verify_position_reflects_execution_strict(
         time.sleep(0.2)
 
 
-# ---------------------------------------------------------------------------
-# Protection order verification (TRADE-GRADE)
-# ---------------------------------------------------------------------------
 def _normalize_order_status_strict(v: Any) -> str:
     s = str(v or "").upper().strip()
     if not s:
         raise ProtectionOrderVerificationError("order.status is missing (STRICT)")
     return s
+
+
+def _normalize_order_position_side_from_row(order: Dict[str, Any]) -> str:
+    return _normalize_position_side(order.get("positionSide"))
+
+
+def _is_protection_order_row(order: Dict[str, Any]) -> bool:
+    if not isinstance(order, dict):
+        raise ProtectionOrderVerificationError("order must be dict (STRICT)")
+    type_u = str(order.get("type") or order.get("origType") or "").upper().strip()
+    reduce_only = bool(order.get("reduceOnly", False))
+    close_position = bool(order.get("closePosition", False))
+    is_protection_type = type_u in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}
+    return reduce_only or close_position or is_protection_type
+
+
+def _list_open_protection_orders_strict(
+    *,
+    symbol: str,
+    close_side: Optional[str],
+    position_side: Optional[str],
+) -> List[Dict[str, Any]]:
+    sym = _normalize_symbol(symbol)
+    pos_side_n = _normalize_position_side(position_side) if position_side is not None else None
+    side_n = _normalize_side(close_side) if close_side is not None else None
+
+    orders = get_open_orders(sym)
+    if not isinstance(orders, list):
+        raise ProtectionOrderVerificationError("get_open_orders returned non-list (STRICT)")
+
+    out: List[Dict[str, Any]] = []
+    for row in orders:
+        if not isinstance(row, dict):
+            raise ProtectionOrderVerificationError("open order row must be dict (STRICT)")
+
+        row_symbol = _normalize_symbol(str(row.get("symbol") or ""))
+        if row_symbol != sym:
+            continue
+
+        if not _is_protection_order_row(row):
+            continue
+
+        row_side = _normalize_side(str(row.get("side") or ""))
+        row_pos_side = _normalize_order_position_side_from_row(row)
+
+        if side_n is not None and row_side != side_n:
+            continue
+        if pos_side_n is not None and row_pos_side != pos_side_n:
+            continue
+
+        order_id = row.get("orderId")
+        if order_id is None or not str(order_id).strip():
+            raise ProtectionOrderVerificationError("protection order missing orderId (STRICT)")
+        out.append(row)
+
+    return out
+
+
+def _wait_protection_orders_absent_strict(
+    *,
+    symbol: str,
+    close_side: Optional[str],
+    position_side: Optional[str],
+) -> None:
+    deadline = time.time() + _PROTECTION_CANCEL_WAIT_SEC
+
+    while True:
+        remaining = _list_open_protection_orders_strict(
+            symbol=symbol,
+            close_side=close_side,
+            position_side=position_side,
+        )
+        if not remaining:
+            return
+
+        if time.time() >= deadline:
+            ids = [str(r.get("orderId")) for r in remaining]
+            raise ProtectionOrderVerificationError(
+                f"protection orders still visible after cancel deadline (orderIds={ids})"
+            )
+
+        time.sleep(_PROTECTION_CANCEL_POLL_SEC)
+
+
+def _cancel_open_protection_orders_strict(
+    *,
+    symbol: str,
+    close_side: Optional[str],
+    position_side: Optional[str],
+    settings: Any,
+) -> List[str]:
+    rows = _list_open_protection_orders_strict(
+        symbol=symbol,
+        close_side=close_side,
+        position_side=position_side,
+    )
+
+    canceled_ids: List[str] = []
+    for row in rows:
+        order_id = row.get("orderId")
+        if order_id is None or not str(order_id).strip():
+            raise ProtectionOrderVerificationError("protection order missing orderId during cancel (STRICT)")
+        cancel_order_safe(symbol, str(order_id), settings=settings)
+        canceled_ids.append(str(order_id))
+
+    if canceled_ids:
+        _wait_protection_orders_absent_strict(
+            symbol=symbol,
+            close_side=close_side,
+            position_side=position_side,
+        )
+
+    return canceled_ids
 
 
 def _fetch_order_visibility_snapshot_strict(
@@ -1323,6 +1534,59 @@ def _wait_protection_orders_visible_strict(
         time.sleep(_PROTECTION_VERIFY_POLL_SEC)
 
 
+def _verify_position_closed_strict(
+    *,
+    symbol: str,
+    position_side: str,
+    qty_step: Decimal,
+    settings: Any,
+) -> None:
+    if qty_step <= 0:
+        raise PositionVerificationError("qty_step must be > 0 (STRICT)")
+
+    sym = _normalize_symbol(symbol)
+    pos_side_u = _normalize_position_side(position_side)
+    deadline = time.time() + _POSITION_CLOSE_VERIFY_WAIT_SEC
+    tol = qty_step / Decimal("2")
+
+    while True:
+        rows = fetch_open_positions(sym)
+        if not isinstance(rows, list):
+            raise PositionVerificationError("fetch_open_positions returned non-list (STRICT)")
+
+        still_open = False
+        last_amt: Optional[Decimal] = None
+
+        for row in rows:
+            if not isinstance(row, dict):
+                raise PositionVerificationError("open position row must be dict (STRICT)")
+
+            row_symbol = _normalize_symbol(str(row.get("symbol") or ""))
+            if row_symbol != sym:
+                continue
+
+            row_pos_side = _normalize_position_side(row.get("positionSide"))
+            if row_pos_side != pos_side_u:
+                continue
+
+            amt = _require_decimal(row.get("positionAmt"), name="position.positionAmt")
+            last_amt = amt
+            if _decimal_abs(amt) > tol:
+                still_open = True
+                break
+
+        if not still_open:
+            return
+
+        if time.time() >= deadline:
+            raise PositionVerificationError(
+                f"position not closed within {_POSITION_CLOSE_VERIFY_WAIT_SEC}s "
+                f"(positionSide={pos_side_u}, last_positionAmt={_d_to_str(last_amt) if last_amt is not None else 'None'})"
+            )
+
+        time.sleep(_POSITION_CLOSE_VERIFY_POLL_SEC)
+
+
 # ---------------------------------------------------------------------------
 # TP/SL
 # ---------------------------------------------------------------------------
@@ -1345,15 +1609,20 @@ def set_tp_sl(
     open_side = _normalize_side(side_open)
     close_side = "SELL" if open_side == "BUY" else "BUY"
 
+    qty_f = _require_positive_float(qty, "qty")
+    tp_f = _require_positive_float(tp_price, "tp_price")
+    if not soft_mode:
+        _require_positive_float(sl_price, "sl_price")
+
     tp_order_id: Optional[str] = None
     sl_order_id: Optional[str] = None
 
-    if tp_price and tp_price > 0:
+    if tp_f > 0:
         tp_resp = place_conditional(
             symbol=sym,
             side=close_side,
-            qty=qty,
-            trigger_price=float(tp_price),
+            qty=qty_f,
+            trigger_price=float(tp_f),
             order_type="TAKE_PROFIT_MARKET",
             settings=settings,
             reduce_only=True,
@@ -1372,7 +1641,7 @@ def set_tp_sl(
         sl_resp = place_conditional(
             symbol=sym,
             side=close_side,
-            qty=qty,
+            qty=qty_f,
             trigger_price=float(sl_price),
             order_type="STOP_MARKET",
             settings=settings,
@@ -1423,7 +1692,7 @@ def open_position_with_tp_sl(
     if not math.isfinite(eph) or eph <= 0.0:
         raise ValueError("entry_price_hint must be finite > 0")
 
-    require_det = bool(getattr(settings, "require_deterministic_client_order_id", False))
+    require_det = _require_deterministic_client_order_id_flag(settings)
     if entry_client_order_id is not None:
         entry_cid = _validate_client_order_id(entry_client_order_id)
     else:
@@ -1481,7 +1750,7 @@ def open_position_with_tp_sl(
     entry_order_id = str(order_id)
 
     # 2) ENTRY 체결 검증(FILLED + executedQty + avgPrice)
-    max_wait = float(getattr(settings, "entry_fill_wait_sec", 2.0) or 2.0)
+    max_wait = _require_entry_fill_wait_sec(settings)
     od, exec_qty_dec, entry_price = _wait_order_filled_strict(
         symbol=sym,
         order_id=entry_order_id,
@@ -1502,7 +1771,7 @@ def open_position_with_tp_sl(
         executed_qty=exec_qty_dec,
         qty_step=filt.market_step,
         settings=settings,
-        max_wait_sec=float(getattr(settings, "position_reflect_wait_sec", 1.2) or 1.2),
+        max_wait_sec=_require_position_reflect_wait_sec(settings),
     )
 
     # 4) 슬리피지 진단(민감정보 없음)
@@ -1518,47 +1787,40 @@ def open_position_with_tp_sl(
             entry_order_id,
         )
 
-    max_slip = getattr(settings, "max_entry_slippage_pct", None)
-    if max_slip is not None:
-        try:
-            max_slip_f = float(max_slip)
-        except Exception as e:
-            raise ValueError("settings.max_entry_slippage_pct must be a number") from e
-        if max_slip_f < 0:
-            raise ValueError("settings.max_entry_slippage_pct must be >= 0")
-        if max_slip_f > 0:
-            slip_pct = abs(entry_price - eph) / eph * 100.0
-            if slip_pct > max_slip_f:
-                logger.warning(
-                    "slippage guard triggered (symbol=%s hint=%s fill=%s slip_pct=%.4f limit=%.4f) -> force close",
-                    sym,
-                    eph,
-                    entry_price,
-                    slip_pct,
-                    max_slip_f,
-                )
-                log_event(
-                    event_type="ERROR",
-                    symbol=sym,
-                    regime=source_str,
-                    side=_event_side_from_open_side(open_side),
-                    reason="slippage_guard_force_close",
-                    extra_json={
-                        "entry_price_hint": float(eph),
-                        "entry_price": float(entry_price),
-                        "slippage_pct": float(slip_pct),
-                        "max_entry_slippage_pct": float(max_slip_f),
-                        "qty": float(expected_qty_f),
-                        "entry_order_id": entry_order_id,
-                        "clientOrderId": entry_cid,
-                    },
-                )
-                try:
-                    close_position_market(sym, open_side, float(expected_qty_f))
-                except Exception as e2:
-                    logger.exception("slippage guard force close failed (symbol=%s)", sym)
-                    raise OrderExecutionError("slippage guard close failed") from e2
-                raise OrderExecutionError("slippage guard triggered")
+    max_slip = _get_optional_max_entry_slippage_pct(settings)
+    if max_slip is not None and max_slip > 0:
+        slip_pct = abs(entry_price - eph) / eph * 100.0
+        if slip_pct > max_slip:
+            logger.warning(
+                "slippage guard triggered (symbol=%s hint=%s fill=%s slip_pct=%.4f limit=%.4f) -> force close",
+                sym,
+                eph,
+                entry_price,
+                slip_pct,
+                max_slip,
+            )
+            log_event(
+                event_type="ERROR",
+                symbol=sym,
+                regime=source_str,
+                side=_event_side_from_open_side(open_side),
+                reason="slippage_guard_force_close",
+                extra_json={
+                    "entry_price_hint": float(eph),
+                    "entry_price": float(entry_price),
+                    "slippage_pct": float(slip_pct),
+                    "max_entry_slippage_pct": float(max_slip),
+                    "qty": float(expected_qty_f),
+                    "entry_order_id": entry_order_id,
+                    "clientOrderId": entry_cid,
+                },
+            )
+            try:
+                close_position_market(sym, open_side, float(expected_qty_f))
+            except Exception as e2:
+                logger.exception("slippage guard force close failed (symbol=%s)", sym)
+                raise OrderExecutionError("slippage guard close failed") from e2
+            raise OrderExecutionError("slippage guard triggered")
 
     # ENTRY 이벤트 기록
     log_event(
@@ -1739,6 +2001,21 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
 
     ensure_trading_settings(sym, SET)
     filt = get_symbol_filters(sym)
+
+    canceled_ids = _cancel_open_protection_orders_strict(
+        symbol=sym,
+        close_side=close_side,
+        position_side="BOTH",
+        settings=SET,
+    )
+    if canceled_ids:
+        logger.info(
+            "canceled protection orders before close (symbol=%s close_side=%s orderIds=%s)",
+            sym,
+            close_side,
+            canceled_ids,
+        )
+
     expected_qty_dec, _, _ = _round_qty_and_price(
         filters=filt,
         order_type="MARKET",
@@ -1769,7 +2046,14 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         settings=SET,
         expected_qty=expected_qty_dec,
         qty_step=filt.market_step,
-        max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
+        max_wait_sec=_require_exit_fill_wait_sec(SET),
+    )
+
+    _verify_position_closed_strict(
+        symbol=sym,
+        position_side="BOTH",
+        qty_step=filt.market_step,
+        settings=SET,
     )
 
     log_event(
@@ -1781,11 +2065,16 @@ def close_position_market(symbol: str, side_open: str, qty: float) -> None:
         qty=float(expected_qty_f),
         leverage=getattr(SET, "leverage", None),
         reason="MARKET_CLOSE_FILLED",
-        extra_json={"close_side": close_side, "clientOrderId": cid, "orderId": str(order_id)},
+        extra_json={
+            "close_side": close_side,
+            "clientOrderId": cid,
+            "orderId": str(order_id),
+            "canceled_protection_order_ids": canceled_ids,
+        },
     )
 
     logger.info(
-        "close market filled (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
+        "close market filled and verified (symbol=%s close_side=%s qty=%s orderId=%s clientOrderId=%s)",
         sym,
         close_side,
         expected_qty_f,
@@ -1835,6 +2124,22 @@ def close_all_positions_market(symbol: str) -> int:
             direction = "LONG" if amt > 0 else "SHORT"
 
         close_side = "SELL" if direction == "LONG" else "BUY"
+
+        canceled_ids = _cancel_open_protection_orders_strict(
+            symbol=sym,
+            close_side=close_side,
+            position_side=pos_side,
+            settings=SET,
+        )
+        if canceled_ids:
+            logger.info(
+                "canceled protection orders before force close (symbol=%s positionSide=%s close_side=%s orderIds=%s)",
+                sym,
+                pos_side,
+                close_side,
+                canceled_ids,
+            )
+
         qty2 = abs(amt)
         expected_qty_dec, _, _ = _round_qty_and_price(
             filters=filt,
@@ -1874,7 +2179,14 @@ def close_all_positions_market(symbol: str) -> int:
             settings=SET,
             expected_qty=expected_qty_dec,
             qty_step=filt.market_step,
-            max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
+            max_wait_sec=_require_exit_fill_wait_sec(SET),
+        )
+
+        _verify_position_closed_strict(
+            symbol=sym,
+            position_side=pos_side,
+            qty_step=filt.market_step,
+            settings=SET,
         )
 
         log_event(
@@ -1892,6 +2204,7 @@ def close_all_positions_market(symbol: str) -> int:
                 "positionSide": pos_side,
                 "orderId": str(order_id),
                 "clientOrderId": client_id,
+                "canceled_protection_order_ids": canceled_ids,
             },
         )
         submitted += 1

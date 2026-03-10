@@ -1,55 +1,59 @@
+from __future__ import annotations
+
 """
 ========================================================
 FILE: infra/market_data_rest.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-
-역할
---------------------------------------------------------
+ROLE:
 - Binance Futures 공개 REST /fapi/v1/klines 엔드포인트에서 히스토리 캔들을 조회한다.
 - run_bot_ws 시작 시 WS 버퍼 부트스트랩(backfill) 용도로만 사용한다.
-- 라이브 운영 중에는 WebSocket 데이터만 사용한다.
+- 라이브 운영 중 의사결정은 WebSocket 데이터만 사용한다.
 - 반환 포맷은 WS backfill이 그대로 사용할 수 있는 공통 포맷 list[list] 이다.
   [openTime, open, high, low, close, volume, closeTime]
 
-변경 이력
---------------------------------------------------------
+CORE RESPONSIBILITIES:
+- Binance Futures REST Kline 조회
+- 부트스트랩용 최근 N개 캔들 STRICT 정규화
+- interval 기반 연속성(contiguity) 검증
+- WS/backfill 공통 포맷 반환
+- 네트워크/HTTP/파싱 실패를 숨기지 않고 즉시 예외 전파
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- settings.SETTINGS 단일 객체만 사용
+- 숨은 기본값 금지
+- REST는 부트스트랩 용도만 사용
+- 한 행이라도 손상/누락/비연속이면 전체 실패
+- 행 드랍 / 정렬 무시 / print 폴백 금지
+- HTTP 429/5xx만 제한적 재시도, 그 외 상태코드는 즉시 실패
+
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(SSOT): load_settings() 재호출 제거, settings.SETTINGS 단일 객체 사용
+  2) FIX(SSOT): Binance REST base URL 하드코딩 제거, settings.binance_futures_rest_base 사용
+  3) FIX(STRICT): ws_backfill_limit 숨은 기본값 제거
+  4) FIX(ROOT-CAUSE): openTime strict contiguity(interval_ms 단위) 검증 추가
+  5) FIX(STRICT): OHLC/closeTime/volume 도메인 검증 강화
 - 2026-03-04:
   1) HTTP 5xx/429 재시도 + exponential backoff 추가(실전 내구성 강화)
-  2) connect/read timeout 분리 + Session 재사용(성능/안정성)
+  2) Session 재사용(성능/안정성)
   3) 정렬 실패/정규화 누락/무결성 위반 시 즉시 예외(STRICT)
   4) 예외 삼키기/행 드랍/print 폴백 제거(절대 NO-FALLBACK)
-- 2026-03-05:
-  1) SETTINGS PATCH:
-     - fetch_klines_rest() 기본 limit을 settings(ws_backfill_limit)에서 읽도록 변경
 ========================================================
 """
 
-from __future__ import annotations
-
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import requests
 
-# SETTINGS PATCH: settings SSOT 연동 (백필 limit 기본값을 settings에서 읽는다)
-from settings import load_settings  # SETTINGS PATCH
+from infra.telelog import log
+from settings import SETTINGS
 
-SET = load_settings()  # SETTINGS PATCH
+SET = SETTINGS
 
-# STRICT: telelog는 운영 필수. 없으면 즉시 예외 (NO-FALLBACK).
-try:
-    from infra.telelog import log
-except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "infra.telelog.log is required (STRICT · NO-FALLBACK). "
-        "Do not fallback to print()."
-    ) from e
-
-
-# Binance USDT-M Futures REST base URL (공개 Kline 조회용)
-BINANCE_FUTURES_API_BASE = "https://fapi.binance.com"
+# Binance /fapi/v1/klines 최대 limit
+_MAX_KLINES_LIMIT = 1500
 
 
 class KlineRestError(RuntimeError):
@@ -75,18 +79,80 @@ _INTERVAL_MS: Dict[str, int] = {
     "1d": _DAY_MS,
     "3d": 3 * _DAY_MS,
     "1w": 7 * _DAY_MS,
-    # 월봉은 고정 길이가 아니므로 REST 윈도우 계산용으로만 30일 근사값 사용
+    # 월봉은 고정 길이가 아니므로 REST 연속성 검증에서는 예외 취급하지 않고
+    # 단위 변환용 근사값으로만 사용한다.
     "1M": 30 * _DAY_MS,
 }
 
 
+def _require_setting_attr(name: str) -> Any:
+    if not hasattr(SET, name):
+        raise RuntimeError(f"settings.{name} is required (STRICT)")
+    return getattr(SET, name)
+
+
+def _require_positive_int(v: Any, *, name: str) -> int:
+    if isinstance(v, bool):
+        raise KlineRestError(f"{name} must be int (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise KlineRestError(f"{name} not int-convertible: {v!r}") from e
+    if iv <= 0:
+        raise KlineRestError(f"{name} must be > 0 (STRICT)")
+    return iv
+
+
+def _require_positive_float(v: Any, *, name: str) -> float:
+    if isinstance(v, bool):
+        raise KlineRestError(f"{name} must be float (bool not allowed)")
+    try:
+        fv = float(v)
+    except Exception as e:
+        raise KlineRestError(f"{name} not float-convertible: {v!r}") from e
+    if fv != fv:
+        raise KlineRestError(f"{name} is NaN")
+    if fv in (float("inf"), float("-inf")):
+        raise KlineRestError(f"{name} is infinite")
+    if fv <= 0.0:
+        raise KlineRestError(f"{name} must be > 0 (STRICT)")
+    return fv
+
+
+def _require_nonempty_symbol(symbol: Any) -> str:
+    s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        raise KlineRestError("symbol is empty (STRICT)")
+    return s
+
+
+def _require_rest_base_url() -> str:
+    raw = str(_require_setting_attr("binance_futures_rest_base") or "").strip().rstrip("/")
+    if not raw:
+        raise RuntimeError("settings.binance_futures_rest_base is required (STRICT)")
+    if not (raw.startswith("https://") or raw.startswith("http://")):
+        raise RuntimeError(f"settings.binance_futures_rest_base invalid (STRICT): {raw!r}")
+    return raw
+
+
+def _default_backfill_limit() -> int:
+    return _require_positive_int(_require_setting_attr("ws_backfill_limit"), name="settings.ws_backfill_limit")
+
+
+def _rest_timeout_sec() -> float:
+    return _require_positive_float(_require_setting_attr("ws_rest_timeout_sec"), name="settings.ws_rest_timeout_sec")
+
+
 def _interval_to_ms(interval: str) -> int:
-    if interval not in _INTERVAL_MS:
-        raise ValueError(f"지원하지 않는 interval: {interval}")
-    return _INTERVAL_MS[interval]
+    iv = str(interval or "").strip()
+    if iv not in _INTERVAL_MS:
+        raise KlineRestError(f"지원하지 않는 interval (STRICT): {interval!r}")
+    return _INTERVAL_MS[iv]
 
 
 def _require_int(v: Any, *, name: str) -> int:
+    if isinstance(v, bool):
+        raise KlineRestError(f"{name} not int-convertible: bool")
     try:
         iv = int(v)
     except Exception as e:
@@ -95,11 +161,13 @@ def _require_int(v: Any, *, name: str) -> int:
 
 
 def _require_float(v: Any, *, name: str) -> float:
+    if isinstance(v, bool):
+        raise KlineRestError(f"{name} not float-convertible: bool")
     try:
         fv = float(v)
     except Exception as e:
         raise KlineRestError(f"{name} not float-convertible: {v!r}") from e
-    if fv != fv:  # NaN
+    if fv != fv:
         raise KlineRestError(f"{name} is NaN")
     if fv in (float("inf"), float("-inf")):
         raise KlineRestError(f"{name} is infinite")
@@ -143,7 +211,11 @@ def _normalize_rows_to_common_format_strict(rows: List[Any], interval_ms: int) -
         [openTime_ms, open, high, low, close, volume, closeTime_ms]
 
     STRICT:
-    - 한 행이라도 형식/타입/값이 깨지면 즉시 예외(드랍 금지)
+    - 한 행이라도 형식/타입/값이 깨지면 즉시 예외
+    - OHLC는 모두 > 0 이어야 한다
+    - high/low/open/close 관계 검증
+    - volume >= 0
+    - closeTime >= openTime 이어야 한다
     """
     if not isinstance(rows, list) or not rows:
         raise KlineRestError("rows missing/empty (STRICT)")
@@ -164,7 +236,8 @@ def _normalize_rows_to_common_format_strict(rows: List[Any], interval_ms: int) -
         c = _require_float(r[4], name=f"row[{i}].close")
         v = _require_float(r[5], name=f"row[{i}].volume")
 
-        # 기본적인 OHLCV 무결성 (STRICT)
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            raise KlineRestError(f"row[{i}] OHLC must be > 0 (STRICT)")
         if h < l:
             raise KlineRestError(f"row[{i}] invalid OHLC: high<low (h={h}, l={l})")
         if not (l <= o <= h):
@@ -175,20 +248,50 @@ def _normalize_rows_to_common_format_strict(rows: List[Any], interval_ms: int) -
             raise KlineRestError(f"row[{i}] invalid volume (<0): {v}")
 
         close_time = _require_int(r[6], name=f"row[{i}].closeTime")
-        # Binance는 보통 closeTime = openTime + interval_ms - 1 형태. 다만 데이터 소스별 차이를 고려하여
-        # 최소 조건만 강제한다.
         if close_time < ts:
             raise KlineRestError(
                 f"row[{i}] invalid closeTime (<openTime): openTime={ts}, closeTime={close_time}"
             )
 
-        # closeTime 누락/이상치를 보정하지 않는다(NO-FALLBACK). interval_ms 기반 계산도 금지.
+        # closeTime은 통상 openTime + interval_ms - 1 여야 한다.
+        # 거래소 응답 계약 이상을 숨기지 않기 위해 범위 이탈은 즉시 실패.
+        min_close_time = ts + interval_ms - 1
+        if close_time != min_close_time:
+            raise KlineRestError(
+                f"row[{i}] invalid closeTime contract (STRICT): "
+                f"expected={min_close_time}, got={close_time}, interval_ms={interval_ms}"
+            )
+
         normalized.append([ts, o, h, l, c, v, close_time])
 
     return normalized
 
 
-@dataclass(frozen=True)
+def _validate_contiguous_open_times_strict(rows: List[List[Any]], interval: str, interval_ms: int) -> None:
+    if not rows:
+        raise KlineRestError("rows empty after normalization (STRICT)")
+
+    prev_ts: Optional[int] = None
+    for i, row in enumerate(rows):
+        ts = _extract_ts_from_rest_row_strict(row)
+        if prev_ts is not None:
+            delta = ts - prev_ts
+            if delta != interval_ms:
+                # 월봉은 고정 길이가 아니므로 interval_ms 단위 연속성 강제를 하지 않는다.
+                if interval == "1M":
+                    if delta <= 0:
+                        raise KlineRestError(
+                            f"REST kline ts not strictly increasing at idx={i}: prev={prev_ts}, cur={ts}"
+                        )
+                else:
+                    raise KlineRestError(
+                        f"REST kline contiguity violated (STRICT): interval={interval} "
+                        f"idx={i} prev={prev_ts} cur={ts} delta={delta} expected={interval_ms}"
+                    )
+        prev_ts = ts
+
+
+@dataclass(frozen=True, slots=True)
 class _RetryPolicy:
     max_attempts: int = 5
     base_delay_sec: float = 0.6
@@ -197,12 +300,10 @@ class _RetryPolicy:
 
 
 def _sleep_backoff(policy: _RetryPolicy, attempt_idx: int, *, reason: str) -> None:
-    # attempt_idx: 0..N-1
     delay = policy.base_delay_sec * (2.0 ** attempt_idx)
     if delay > policy.max_delay_sec:
         delay = policy.max_delay_sec
 
-    # 작은 지터(동시 봇 다수 실행 시 동기화 방지). random 사용 없이 time 기반.
     frac = time.time() % 1.0
     delay = delay + min(policy.jitter_sec, frac * policy.jitter_sec)
 
@@ -219,22 +320,19 @@ _SESSION.headers.update(
     }
 )
 
-# connect/read timeout 분리
-_DEFAULT_TIMEOUT: Tuple[float, float] = (3.5, 10.0)
-
 
 def _request_klines_with_retry(
     *,
     url: str,
     params: Dict[str, Any],
-    timeout: Tuple[float, float],
+    timeout_sec: float,
     policy: _RetryPolicy,
 ) -> requests.Response:
     last_err: Optional[BaseException] = None
 
     for attempt in range(policy.max_attempts):
         try:
-            resp = _SESSION.get(url, params=params, timeout=timeout)
+            resp = _SESSION.get(url, params=params, timeout=timeout_sec)
         except (requests.Timeout, requests.ConnectionError) as e:
             last_err = e
             if attempt >= policy.max_attempts - 1:
@@ -242,17 +340,13 @@ def _request_klines_with_retry(
             _sleep_backoff(policy, attempt, reason=f"network:{e.__class__.__name__}")
             continue
         except Exception as e:
-            # requests 내부/기타 예외도 폴백 없이 즉시 실패
             raise KlineRestError(f"REST kline request unexpected error: {e.__class__.__name__}") from e
 
-        # HTTP 레벨 처리
         sc = int(getattr(resp, "status_code", 0) or 0)
 
-        # 200 OK
         if sc == 200:
             return resp
 
-        # 429 rate limit
         if sc == 429:
             if attempt >= policy.max_attempts - 1:
                 body_preview = resp.text[:300] if getattr(resp, "text", None) else ""
@@ -266,12 +360,10 @@ def _request_klines_with_retry(
                         time.sleep(min(ra, policy.max_delay_sec))
                         continue
                 except Exception:
-                    # Retry-After 파싱 실패는 폴백이 아니라, 표준 backoff로 처리한다.
                     pass
             _sleep_backoff(policy, attempt, reason="http:429")
             continue
 
-        # 5xx transient
         if sc in (502, 503, 504):
             if attempt >= policy.max_attempts - 1:
                 body_preview = resp.text[:300] if getattr(resp, "text", None) else ""
@@ -279,11 +371,9 @@ def _request_klines_with_retry(
             _sleep_backoff(policy, attempt, reason=f"http:{sc}")
             continue
 
-        # 기타 상태코드는 즉시 실패(폴백/재시도 남발 금지)
         body_preview = resp.text[:300] if getattr(resp, "text", None) else ""
         raise KlineRestError(f"REST kline HTTP error: status={sc}, body={body_preview}")
 
-    # 이론상 도달 불가. 방어적으로 예외.
     if last_err is not None:
         raise KlineRestError(f"REST kline failed: last_error={last_err.__class__.__name__}") from last_err
     raise KlineRestError("REST kline failed: unknown (no response)")
@@ -295,116 +385,85 @@ def fetch_klines_rest(symbol: str, interval: str, limit: Optional[int] = None) -
 
     STRICT:
     - limit/symbol/interval 무결성 위반 시 즉시 예외
-    - 네트워크/HTTP/파싱/정렬/정규화 실패 시 즉시 예외
-    - 행 드랍/정렬 무시/print 폴백 없음
+    - 네트워크/HTTP/파싱/정렬/정규화/연속성 실패 시 즉시 예외
+    - 행 드랍/정렬 무시/폴백 없음
+    - 반환은 정확히 limit개, 공통 포맷 list[list]
     """
-    # SETTINGS PATCH: limit 미지정이면 settings.ws_backfill_limit 사용
-    if limit is None:
-        limit = int(getattr(SET, "ws_backfill_limit", 120) or 120)  # SETTINGS PATCH
+    request_limit = _default_backfill_limit() if limit is None else _require_positive_int(limit, name="limit")
+    if request_limit > _MAX_KLINES_LIMIT:
+        raise KlineRestError(f"limit must be <= {_MAX_KLINES_LIMIT} (STRICT)")
 
-    if limit <= 0:
-        raise ValueError("limit 은 1 이상이어야 합니다.")
-    # Binance /fapi/v1/klines 최대 limit=1500
-    if limit > 1500:
-        raise ValueError("limit 은 1500 이하여야 합니다. (Binance REST 제한)")
+    norm_symbol = _require_nonempty_symbol(symbol)
+    iv = str(interval or "").strip()
+    interval_ms = _interval_to_ms(iv)
 
-    norm_symbol = str(symbol).upper().strip()
-    if not norm_symbol:
-        raise ValueError("symbol 이 비어 있습니다.")
+    rest_base = _require_rest_base_url()
+    timeout_sec = _rest_timeout_sec()
 
-    iv_ms = _interval_to_ms(interval)
-    end_ms = int(time.time() * 1000)
-
-    # 약간 여유를 두고 더 넓게 요청
-    # (여유분 자체는 REST window 계산용이며, 반환은 아래에서 limit로 강제 절단)
-    start_ms = end_ms - iv_ms * (limit + 20)
-
-    raw_limit = min(limit + 200, 1500)
-
-    url = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/klines"
+    url = f"{rest_base}/fapi/v1/klines"
     params: Dict[str, Any] = {
         "symbol": norm_symbol,
-        "interval": interval,
-        "startTime": start_ms,
-        "endTime": end_ms,
-        "limit": raw_limit,
+        "interval": iv,
+        "limit": request_limit,
     }
 
     log(
         "[REST-KLINES BINANCE] request "
-        f"symbol={norm_symbol}, interval={interval}, "
-        f"start={start_ms}, end={end_ms}, limit≈{limit}, raw_limit={raw_limit}"
+        f"symbol={norm_symbol}, interval={iv}, limit={request_limit}"
     )
 
     resp = _request_klines_with_retry(
         url=url,
         params=params,
-        timeout=_DEFAULT_TIMEOUT,
+        timeout_sec=timeout_sec,
         policy=_RetryPolicy(),
     )
 
-    # JSON 파싱 STRICT
     try:
         data = resp.json()
     except ValueError as e:
         body_preview = resp.text[:300] if getattr(resp, "text", None) else ""
         log(f"[REST-KLINES BINANCE] JSON decode error: {e.__class__.__name__}, body={body_preview}")
-        raise KlineRestError(f"REST kline JSON 파싱 실패: symbol={norm_symbol}, interval={interval}") from e
+        raise KlineRestError(f"REST kline JSON 파싱 실패: symbol={norm_symbol}, interval={iv}") from e
 
     if not isinstance(data, list):
         log(
             "[REST-KLINES BINANCE] unexpected response type: "
             f"{type(data)} payload={str(data)[:300]}"
         )
-        raise KlineRestError(f"REST kline 응답 형식 오류: symbol={norm_symbol}, interval={interval}")
+        raise KlineRestError(f"REST kline 응답 형식 오류: symbol={norm_symbol}, interval={iv}")
 
     if not data:
         log(
             "[REST-KLINES BINANCE] empty rows: "
-            f"symbol={norm_symbol}, interval={interval}, start={start_ms}, end={end_ms}"
+            f"symbol={norm_symbol}, interval={iv}"
         )
-        raise KlineRestError(f"REST kline 조회 실패(빈 응답): symbol={norm_symbol}, interval={interval}")
+        raise KlineRestError(f"REST kline 조회 실패(빈 응답): symbol={norm_symbol}, interval={iv}")
 
-    # 첫 행 샘플 로그(민감정보 없음)
     log(f"[REST-KLINES BINANCE] first row sample: {str(data[0])[:300]}")
 
-    # 공통 포맷으로 STRICT 정규화 (행 드랍 금지)
-    rows_normalized = _normalize_rows_to_common_format_strict(data, iv_ms)
+    rows_normalized = _normalize_rows_to_common_format_strict(data, interval_ms)
 
-    # openTime 기준 STRICT 정렬 (실패 시 즉시 예외)
     try:
         rows_normalized.sort(key=_extract_ts_from_rest_row_strict)
     except Exception as e:
         raise KlineRestError(f"REST kline sort failed (STRICT): {e.__class__.__name__}") from e
 
-    # 정렬 결과 무결성 검사: openTime strictly increasing
-    prev_ts: Optional[int] = None
-    for i, row in enumerate(rows_normalized):
-        ts = _extract_ts_from_rest_row_strict(row)
-        if prev_ts is not None and ts <= prev_ts:
-            raise KlineRestError(
-                f"REST kline ts not strictly increasing at idx={i}: prev={prev_ts}, cur={ts}"
-            )
-        prev_ts = ts
+    _validate_contiguous_open_times_strict(rows_normalized, iv, interval_ms)
 
     first_ts = _extract_ts_from_rest_row_strict(rows_normalized[0])
     last_ts = _extract_ts_from_rest_row_strict(rows_normalized[-1])
     log(f"[REST-KLINES BINANCE] normalized ts range: first_ts={first_ts}, last_ts={last_ts}")
 
-    # limit 개수만큼만 뒤에서 자르기 (요구 개수만 반환)
-    if len(rows_normalized) > limit:
-        rows_normalized = rows_normalized[-limit:]
-
-    if len(rows_normalized) < limit:
-        # STRICT: 요청 limit을 못 채우면 즉시 예외 (부트스트랩 데이터 부족)
+    if len(rows_normalized) != request_limit:
         raise KlineRestError(
-            f"REST kline buffer 부족(STRICT): need={limit} got={len(rows_normalized)} "
-            f"(symbol={norm_symbol}, interval={interval})"
+            f"REST kline buffer 부족(STRICT): need={request_limit} got={len(rows_normalized)} "
+            f"(symbol={norm_symbol}, interval={iv})"
         )
 
     log(
         f"[REST-KLINES BINANCE] loaded {len(rows_normalized)} rows for "
-        f"{norm_symbol} {interval} (requested limit={limit}, raw_limit={raw_limit})"
+        f"{norm_symbol} {iv} (requested limit={request_limit})"
     )
     return rows_normalized
 

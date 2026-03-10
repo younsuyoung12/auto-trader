@@ -1,89 +1,40 @@
 """
 ========================================================
 FILE: state/sync_exchange.py
-STRICT · NO-FALLBACK · PRODUCTION MODE
-========================================================
-sync_exchange.py (Binance USDT-M Futures 전용, 거래소 상태 동기화 + DB 정합)
+ROLE:
+- Binance USDT-M Futures 전용 거래소 상태 동기화 SSOT
+- 거래소 실제 포지션/미체결 주문과 DB(bt_trades) OPEN 트레이드 정합을 강제한다
+- 엔진 재시작 시 거래소 사실값으로 DB 실행 필드와 메모리 Trade를 복구한다
 
-역할
------------------------------------------------------
-- 거래소(Binance USDT-M Futures)의 실제 포지션/미체결 주문 상태를 읽어
-  DB(bt_trades) OPEN 트레이드와 정합을 강제한다.
-- 엔진 재시작(무감독 24/7) 시:
-  - DB OPEN 트레이드 1건 ↔ 거래소 OPEN 포지션 1건(One-way) 정합을 확인하고
-  - 필요한 실행 필드(tp/sl orderId 등)를 DB에 “거래소 사실”로 확정 저장한다.
-- 폴백 금지:
-  - REST 실패, 응답 이상, 정합 불일치(모호/중복/누락) 발생 시 즉시 예외.
+CORE RESPONSIBILITIES:
+- 거래소 포지션/오더 snapshot STRICT 수집
+- DB OPEN 트레이드 1건 ↔ 거래소 OPEN 포지션 1건 정합 강제
+- TP/SL 보호주문 식별 및 실행 필드 DB 반영
+- 메모리 Trade 재구성 전 필수 계약 검증
+- POSITION 이벤트 기록 및 sync 성공 알림
 
-전제(운영 모드)
------------------------------------------------------
-- One-way 모드(단일 포지션) 기준으로 설계한다.
-  (Hedge 모드 감지 시 즉시 예외)
-- bt_trades는 exit_ts IS NULL 인 OPEN 트레이드가 심볼당 최대 1건이어야 한다.
-- TP/SL 보호 주문은 reduceOnly=True 또는 closePosition=True +
-  (STOP_MARKET / TAKE_PROFIT_MARKET)로 운영한다.
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · PRODUCTION MODE
+- REST 실패/응답 이상/정합 불일치 시 즉시 예외
+- DB OPEN 1건 ↔ 거래소 OPEN 포지션 1건 원칙
+- Hedge / ambiguous topology / duplicate memory trade 금지
+- PROTECTION_VERIFIED 상태는 필수 필드 완비 상태에서만 인정
+- 거래소 사실값이 DB/메모리와 다르면 즉시 예외 또는 거래소 사실로 엄격 갱신
+- print 금지, logging만 사용
 
-PATCH NOTES — 2026-03-09 (TRADE-GRADE)
---------------------------------------------------------
-- DB 접근 정합:
-  - SessionLocal 직접 사용 제거 → state.db_core.get_session() 경유
-- 부분청산/재시작 정합(ROOT-CAUSE):
-  - 메모리 Trade 재구성 시 qty는 현재 remaining이 아니라 DB 원본 qty를 유지
-  - remaining_qty만 거래소 현재 잔량(abs_qty)로 반영
-  - 부분청산 후 재시작 시 qty 원본 손실로 인한 PnL/청산 요약 왜곡 방지
-- 실행 계약 정합 강화:
-  - PROTECTION_VERIFIED 상태라면 entry_order_id / tp_order_id / sl_order_id / remaining_qty / last_synced_at 필수
-  - exchange remaining(abs_qty)가 DB 원본 qty를 초과하면 즉시 예외
-- 기존 기능 삭제 없음
-
-PATCH NOTES — 2026-03-07
---------------------------------------------------------
-- POSITION 이벤트 기록 보강(STRICT):
-  - 거래소 ↔ DB 정합 성공 후 bt_events 에 event_type="POSITION" 을 추가 기록
-  - 엔진 재시작/복구 직후에도 대시보드 /api/position/current 가 읽을 수 있는 기준 이벤트를 남긴다
-  - 기존 정합/복구/메모리 Trade 재구성 로직은 변경하지 않음
-
-PATCH NOTES — 2026-03-02
---------------------------------------------------------
-- execution/sync_exchange.py 위치 금지 → state/sync_exchange.py 로 고정
-- (9점대 핵심) DB(bt_trades) ↔ 거래소(포지션/오더) 정합 강제
-  - entry_order_id / tp_order_id / sl_order_id
-  - exchange_position_side / remaining_qty / realized_pnl_usdt
-  - reconciliation_status / last_synced_at
-- 모호성 금지:
-  - TP 후보 2개 이상, SL 후보 2개 이상 → 즉시 예외
-  - DB OPEN 2개 이상 → 즉시 예외
-  - Hedge(동일 심볼 LONG+SHORT 동시) → 즉시 예외
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): DB trade side ↔ exchange pos_dir 방향 정합 검증 추가
+  2) FIX(ROOT-CAUSE): replace=False 경로에서 동일 심볼 memory trade 중복 복구 금지
+  3) FIX(STRICT): TP/SL 동일 orderId 및 비양수 보호가격 검증 추가
+  4) FIX(CONTRACT): PROTECTION_VERIFIED 상태 사전 계약 검증 강화
+  5) FIX(STRICT): DB 필수 문자열 필드(strategy/regime/source) 정합 강화
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): 재시작 복구 시 qty 원본 유지 + remaining_qty만 실잔량으로 복구
   2) FIX(STRICT): DB 접근을 get_session() SSOT 경유로 통일
   3) FIX(CONTRACT): PROTECTION_VERIFIED 실행 필드 누락 시 즉시 예외
   4) FIX(STRICT): exchange abs_qty > db qty 정합 불일치 즉시 예외
   5) 기존 기능 삭제 없음
-- 2026-03-07:
-  1) POSITION 이벤트 기록 추가
-     - sync 성공 직후 source="sync_exchange" POSITION 이벤트 저장
-  2) 기존 정합/복구 기능 변경 없음
-- 2026-03-06:
-  1) 거래소 포지션 집계 로직 강화
-     - 동일 방향 다중 row를 live[0]로 선택하지 않고 전체 합산
-     - abs(positionAmt) 가중 평균 entryPrice 계산
-     - BOTH/LONG/SHORT 혼재 topology는 즉시 예외
-  2) TP/SL 보호 주문 판별 강화
-     - reduceOnly=True 뿐 아니라 closePosition=True 도 보호 주문으로 인정
-  3) 메모리 Trade 재구성 STRICT 강화
-     - leverage NULL fallback 제거
-     - last_synced_at / remaining_qty / reconciliation_status 필수 정합 강화
-- 2026-03-06:
-  1) 보호주문 정합 강화
-     - TP, SL 둘 다 필수 보호 주문으로 강제
-  2) reconciliation_status 정합 변경
-     - OK → PROTECTION_VERIFIED 로 승격
-  3) DB/메모리 정합 강화
-     - tp_order_id / sl_order_id 모두 존재해야 재구성 허용
 ========================================================
 """
 
@@ -182,6 +133,15 @@ def _exit_side_from_dir(pos_dir: str) -> str:
     raise RuntimeError(f"invalid pos_dir for exit side (STRICT): {pos_dir!r}")
 
 
+def _normalize_entry_side_strict(v: Any, name: str) -> str:
+    s = str(v or "").upper().strip()
+    if s in ("BUY", "LONG"):
+        return "BUY"
+    if s in ("SELL", "SHORT"):
+        return "SELL"
+    raise RuntimeError(f"{name} must be BUY/SELL/LONG/SHORT (STRICT), got={v!r}")
+
+
 def _normalize_position_side_raw(v: Any, *, default_both: bool = True) -> str:
     s = str(v or "").upper().strip()
     if not s:
@@ -259,6 +219,7 @@ def _emit_position_sync_event_strict(
 
     regime = _require_nonempty_str(db_trade.regime_at_entry, "bt_trades.regime_at_entry")
     strategy = _require_nonempty_str(db_trade.strategy, "bt_trades.strategy")
+    source = _require_nonempty_str(db_trade.source, "bt_trades.source")
     exchange_position_side = _normalize_position_side_raw(
         db_trade.exchange_position_side,
         default_both=True,
@@ -287,6 +248,7 @@ def _emit_position_sync_event_strict(
     extra_json: Dict[str, Any] = {
         "state": "OPEN",
         "strategy": strategy,
+        "source": source,
         "trade_id": int(db_trade.id),
         "entry_order_id": (str(db_trade.entry_order_id) if db_trade.entry_order_id is not None else None),
         "tp_order_id": (str(db_trade.tp_order_id) if db_trade.tp_order_id is not None else None),
@@ -315,6 +277,67 @@ def _emit_position_sync_event_strict(
         reason="position_synced",
         extra_json=extra_json,
     )
+
+
+def _validate_db_trade_contract_before_sync_strict(db_trade: TradeORM) -> None:
+    _normalize_symbol(db_trade.symbol)
+    _require_nonempty_str(db_trade.strategy, "bt_trades.strategy")
+    _require_nonempty_str(db_trade.regime_at_entry, "bt_trades.regime_at_entry")
+    _require_nonempty_str(db_trade.source, "bt_trades.source")
+    _normalize_entry_side_strict(db_trade.side, "bt_trades.side")
+    _safe_float_strict(db_trade.qty, "bt_trades.qty")
+    _safe_positive_int_strict(db_trade.leverage, "bt_trades.leverage")
+
+    status = _require_nonempty_str(
+        db_trade.reconciliation_status,
+        "bt_trades.reconciliation_status",
+    ).upper()
+
+    if status == "PROTECTION_VERIFIED":
+        if db_trade.entry_order_id is None or not str(db_trade.entry_order_id).strip():
+            raise RuntimeError("PROTECTION_VERIFIED requires entry_order_id (STRICT)")
+        if db_trade.tp_order_id is None or not str(db_trade.tp_order_id).strip():
+            raise RuntimeError("PROTECTION_VERIFIED requires tp_order_id (STRICT)")
+        if db_trade.sl_order_id is None or not str(db_trade.sl_order_id).strip():
+            raise RuntimeError("PROTECTION_VERIFIED requires sl_order_id (STRICT)")
+        if db_trade.remaining_qty is None:
+            raise RuntimeError("PROTECTION_VERIFIED requires remaining_qty (STRICT)")
+        _safe_float_strict(db_trade.remaining_qty, "bt_trades.remaining_qty")
+        if db_trade.last_synced_at is None:
+            raise RuntimeError("PROTECTION_VERIFIED requires last_synced_at (STRICT)")
+        _require_tz_aware_datetime(db_trade.last_synced_at, "bt_trades.last_synced_at")
+
+
+def _ensure_no_duplicate_memory_trade_strict(
+    *,
+    symbol: str,
+    current_trades: List[MemTrade],
+) -> None:
+    sym = _normalize_symbol(symbol)
+    dup_count = 0
+    for t in current_trades:
+        if not isinstance(t, MemTrade):
+            raise RuntimeError("current_trades contains non-MemTrade item (STRICT)")
+        if _normalize_symbol(t.symbol) == sym:
+            dup_count += 1
+    if dup_count > 0:
+        raise RuntimeError(
+            f"current_trades already contains OPEN trade for symbol={sym} (STRICT, n={dup_count})"
+        )
+
+
+def _assert_db_direction_matches_exchange_strict(
+    *,
+    db_trade: TradeORM,
+    pos_dir: str,
+) -> None:
+    db_side = _normalize_entry_side_strict(db_trade.side, "bt_trades.side")
+    expected_side = _entry_side_from_dir(pos_dir)
+    if db_side != expected_side:
+        raise RuntimeError(
+            f"DB trade side mismatches exchange position direction (STRICT): "
+            f"db_side={db_side} exch_expected_side={expected_side}"
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -405,6 +428,8 @@ def _pick_unique_tp_sl_orders_strict(
     - TP 후보가 2개 이상이면 예외
     - SL 후보가 2개 이상이면 예외
     - reduceOnly=True 또는 closePosition=True 보호 주문만 인정
+    - TP/SL orderId 동일 금지
+    - 보호가격이 존재하면 > 0 이어야 함
     """
     sym = _normalize_symbol(symbol)
     exit_side = _exit_side_from_dir(pos_dir)
@@ -449,6 +474,8 @@ def _pick_unique_tp_sl_orders_strict(
             raise RuntimeError("TP candidate missing orderId (STRICT)")
         tp_id = str(oid)
         tp_price = _order_price(tp_cands[0])
+        if tp_price is not None and tp_price <= 0:
+            raise RuntimeError("TP price must be > 0 when present (STRICT)")
 
     sl_id: Optional[str] = None
     sl_price: Optional[float] = None
@@ -458,6 +485,11 @@ def _pick_unique_tp_sl_orders_strict(
             raise RuntimeError("SL candidate missing orderId (STRICT)")
         sl_id = str(oid)
         sl_price = _order_price(sl_cands[0])
+        if sl_price is not None and sl_price <= 0:
+            raise RuntimeError("SL price must be > 0 when present (STRICT)")
+
+    if tp_id is not None and sl_id is not None and tp_id == sl_id:
+        raise RuntimeError(f"TP/SL orderId must be distinct (STRICT): orderId={tp_id}")
 
     return tp_id, tp_price, sl_id, sl_price
 
@@ -505,6 +537,8 @@ def _update_trade_exec_fields_strict(
     if pos_dir not in ("LONG", "SHORT"):
         raise RuntimeError(f"invalid pos_dir (STRICT): {pos_dir!r}")
 
+    _assert_db_direction_matches_exchange_strict(db_trade=db_trade, pos_dir=pos_dir)
+
     db_qty = _safe_float_strict(db_trade.qty, "bt_trades.qty")
     if db_qty <= 0:
         raise RuntimeError("bt_trades.qty must be > 0 (STRICT)")
@@ -519,6 +553,12 @@ def _update_trade_exec_fields_strict(
     db_trade.remaining_qty = float(abs_qty)
 
     ps = _normalize_position_side_raw(position_side_raw, default_both=True)
+    if db_trade.exchange_position_side is not None:
+        db_ps = _normalize_position_side_raw(db_trade.exchange_position_side, default_both=True)
+        if db_ps != ps:
+            raise RuntimeError(
+                f"exchange_position_side mismatch (STRICT): db={db_ps} exch={ps}"
+            )
     db_trade.exchange_position_side = ps
 
     if db_trade.tp_order_id is not None and tp_id is not None:
@@ -539,6 +579,8 @@ def _update_trade_exec_fields_strict(
         raise RuntimeError("TP orderId is missing (STRICT, protection order required)")
     if db_trade.sl_order_id is None:
         raise RuntimeError("SL orderId is missing (STRICT, protection order required)")
+    if str(db_trade.tp_order_id) == str(db_trade.sl_order_id):
+        raise RuntimeError("TP/SL orderId must be distinct in DB (STRICT)")
 
     if db_trade.realized_pnl_usdt is None:
         db_trade.realized_pnl_usdt = 0.0
@@ -640,6 +682,8 @@ def sync_open_trades_from_exchange(
     sym = _normalize_symbol(symbol)
     if current_trades is None:
         current_trades = []
+    if not replace:
+        _ensure_no_duplicate_memory_trade_strict(symbol=sym, current_trades=current_trades)
 
     pos_dir, abs_qty, entry_price, position_side_raw = _fetch_one_way_position_strict(sym)
 
@@ -669,6 +713,8 @@ def sync_open_trades_from_exchange(
 
         if db_open is None:
             raise RuntimeError(f"exchange has OPEN position but DB has NO OPEN trade (STRICT, symbol={sym})")
+
+        _validate_db_trade_contract_before_sync_strict(db_open)
 
         tp_id, tp_price, sl_id, sl_price = _pick_unique_tp_sl_orders_strict(
             sym,

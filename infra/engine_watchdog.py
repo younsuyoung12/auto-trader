@@ -1,52 +1,42 @@
 """
 ========================================================
 FILE: infra/engine_watchdog.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- 실시간 런타임 진단(Watchdog) 스레드.
+- WS / orderbook / DB / rollback 상태를 주기적으로 검사하고,
+  결과를 bt_events(event_type="WATCHDOG")에 기록한다.
+- market_data_ws 의 health snapshot을 진실값으로 사용하고,
+  watchdog 는 진단/기록/콜백 책임만 가진다.
 
-역할
-- 실시간 런타임 “진단(Watchdog)” 스레드.
-- 아래 항목을 주기적으로 검사하고, 결과를 DB(bt_events)에 기록하여 대시보드에서 조회 가능하게 만든다.
+CORE RESPONSIBILITIES:
+- market_data_ws health snapshot(strict) 검사 및 이벤트 기록
+- orderbook integrity 추가 검증
+- kline timestamp rollback 검증
+- DB lag / watchdog loop latency 관측
+- FAIL/WARNING/OK 상태를 구분하여 bt_events 기록
+- 치명 상태 시 on_fatal 콜백 호출
 
-검사 항목
-1) WS delay (kline / orderbook staleness)
-2) orderbook integrity (ask>bid, bids/asks shape 등)
-3) kline rollback (timestamp 역전)
-4) latency (watchdog 루프 처리시간)
-5) DB lag (SELECT 1 왕복 지연)
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- settings.py 외 환경변수 직접 접근 금지
+- market_data_ws 와 다른 stale 정책을 중복 구현하지 않는다
+- transport / payload / warning 판단은 market_data_ws health snapshot을 따른다
+- watchdog 는 warning 과 fail 을 구분한다
+- 조용한 continue / 예외 삼키기 금지
+- 이벤트 기록 실패는 즉시 예외 전파
+- thread start 실패 시 started 상태 rollback 보장
 
-출력(저장)
-- bt_events 테이블에 event_type="WATCHDOG" 로 기록한다.
-- reason 예시:
-  - ok
-  - ws_kline_stale
-  - ws_orderbook_stale
-  - kline_rollback
-  - orderbook_integrity_fail
-  - db_lag
-  - watchdog_internal_error
-
-STRICT 정책
-- 조용한 continue / 예외 삼키기 금지.
-- 단, Watchdog는 “진단 모듈”이므로:
-  - 이상 감지 시: DB 이벤트 기록 + (옵션) on_fatal 콜백 호출(엔진 SAFE_STOP 트리거용).
-  - 모듈 자체 오류 시: watchdog_internal_error 기록 후 on_fatal 호출.
-
-PATCH NOTES — 2026-03-07 (TRADE-GRADE)
-- WATCHDOG source 필드 보강(STRICT):
-  - bt_events 기록 시 source="engine_watchdog" 를 명시적으로 저장
-  - 대시보드 system_monitor 의 STRICT source 검증 통과 목적
-  - 기존 Watchdog 판정/루프/콜백/DB 기록 흐름은 변경하지 않음
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): market_data_ws 와 다른 stale/orderbook 판정 기준 제거
+  2) FIX(ARCH): get_health_snapshot() 를 진실값으로 사용하도록 재설계
+  3) ADD(OBSERVABILITY): WARNING/FAIL/OK level 및 ws snapshot summary 를 WatchdogSnapshot 에 저장
+  4) FIX(STRICT): 숨은 기본값 제거, settings 누락 시 즉시 예외
+  5) FIX(CONCURRENCY): watchdog thread start 실패 rollback 추가
+  6) FIX(POLICY): WARNING 상태는 이벤트 기록만 하고 on_fatal 호출 금지
 - 2026-03-07:
   1) WATCHDOG 이벤트 source 공란 저장 문제 수정
      - _safe_event() 에서 source="engine_watchdog" 명시
-  2) 기존 기능 변경 없음
-- 2026-03-06:
-  1) 신규 생성: 런타임 엔진 진단(Watchdog) 스레드 추가
-  2) bt_events 로 저장하여 대시보드에서 “지속 감시” 가능하게 설계
 ========================================================
 """
 
@@ -56,7 +46,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -65,26 +55,38 @@ from state.db_core import get_session
 from events.signals_logger import log_event
 
 from infra.market_data_ws import (
+    get_health_snapshot,
     get_klines_with_volume as ws_get_klines_with_volume,
     get_orderbook as ws_get_orderbook,
 )
-
 from infra.data_integrity_guard import DataIntegrityError, validate_orderbook_strict
 
 
 # =============================================================================
 # Types
 # =============================================================================
+WatchdogLevel = Literal["OK", "WARNING", "FAIL"]
+
+
 @dataclass(frozen=True, slots=True)
 class WatchdogSnapshot:
+    level: WatchdogLevel
     ok: bool
+    has_warning: bool
     checked_at_ms: int
 
-    # WS
+    # WS / market data snapshot summary
+    ws_transport_ok: bool
+    ws_overall_ok: bool
+    ws_overall_reasons: List[str]
+    ws_overall_warnings: List[str]
+
+    # WS kline
     kline_len: Dict[str, int]
     kline_last_ts_ms: Dict[str, int]
     kline_age_ms: Dict[str, int]
 
+    # orderbook
     orderbook_ok: bool
     orderbook_ts_ms: Optional[int]
     orderbook_age_ms: Optional[int]
@@ -96,9 +98,10 @@ class WatchdogSnapshot:
     # latency
     loop_ms: int
 
-    # reason if not ok
+    # reason
     fail_reason: Optional[str]
-    fail_detail: Optional[Dict[str, Any]]
+    warning_reason: Optional[str]
+    detail: Dict[str, Any]
 
 
 # =============================================================================
@@ -110,6 +113,7 @@ _LAST_SNAPSHOT: Optional[WatchdogSnapshot] = None
 
 _LAST_STATUS_KEY: str = ""
 _LAST_STATUS_TS: float = 0.0
+_STATE_LOCK = threading.RLock()
 
 
 # =============================================================================
@@ -147,6 +151,70 @@ def _positive_int(v: Any, name: str) -> int:
     return int(i)
 
 
+def _require_setting(settings: Any, attr_name: str) -> Any:
+    if not hasattr(settings, attr_name):
+        raise RuntimeError(f"settings.{attr_name} is required (STRICT)")
+    return getattr(settings, attr_name)
+
+
+def _require_setting_positive_int(settings: Any, attr_name: str) -> int:
+    return _positive_int(_require_setting(settings, attr_name), f"settings.{attr_name}")
+
+
+def _require_setting_positive_float(settings: Any, attr_name: str) -> float:
+    value = _finite_float(_require_setting(settings, attr_name), f"settings.{attr_name}")
+    if value <= 0:
+        raise RuntimeError(f"settings.{attr_name} must be > 0 (STRICT)")
+    return value
+
+
+def _require_setting_tfs(settings: Any, attr_name: str) -> Tuple[str, ...]:
+    raw = _require_setting(settings, attr_name)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise RuntimeError(f"settings.{attr_name} must be non-empty list/tuple (STRICT)")
+    out = tuple(str(x).strip() for x in raw if str(x).strip())
+    if not out:
+        raise RuntimeError(f"settings.{attr_name} normalized empty (STRICT)")
+    return out
+
+
+def _safe_event(symbol: str, reason: str, extra: Dict[str, Any]) -> None:
+    """
+    STRICT:
+    - 이벤트 기록 실패는 감추지 않는다.
+    """
+    log_event(
+        event_type="WATCHDOG",
+        symbol=str(symbol),
+        source="engine_watchdog",
+        side="CLOSE",
+        reason=str(reason),
+        extra_json=dict(extra),
+    )
+
+
+def _should_emit(key: str, *, min_interval_sec: int) -> bool:
+    global _LAST_STATUS_KEY, _LAST_STATUS_TS
+
+    now = time.time()
+    with _STATE_LOCK:
+        if key != _LAST_STATUS_KEY:
+            _LAST_STATUS_KEY = key
+            _LAST_STATUS_TS = now
+            return True
+        if (now - _LAST_STATUS_TS) >= float(min_interval_sec):
+            _LAST_STATUS_TS = now
+            return True
+        return False
+
+
+def _normalize_reason_list(values: Any, name: str) -> List[str]:
+    if not isinstance(values, list):
+        raise RuntimeError(f"{name} must be list (STRICT)")
+    out = [str(x).strip() for x in values if str(x).strip()]
+    return out
+
+
 def _interval_ms(tf: str) -> int:
     s = str(tf).strip().lower()
     if s == "1m":
@@ -162,94 +230,60 @@ def _interval_ms(tf: str) -> int:
     raise RuntimeError(f"unsupported tf (STRICT): {tf!r}")
 
 
-def _safe_event(symbol: str, reason: str, extra: Dict[str, Any]) -> None:
-    """
-    STRICT:
-    - 이벤트 기록 실패는 감추지 않는다.
-    - 다만 Watchdog 내부에서 예외가 연쇄 폭발하면 진단 자체가 불능이 되므로,
-      여기서는 log_event 실패 시 즉시 예외를 올린다(상위에서 watchdog_internal_error 처리).
-    """
-    log_event(
-        event_type="WATCHDOG",
-        symbol=str(symbol),
-        source="engine_watchdog",
-        side="CLOSE",
-        reason=str(reason),
-        extra_json=dict(extra),
-    )
-
-
-def _should_emit(key: str, *, min_interval_sec: int) -> bool:
-    global _LAST_STATUS_KEY, _LAST_STATUS_TS
-    now = time.time()
-    if key != _LAST_STATUS_KEY:
-        _LAST_STATUS_KEY = key
-        _LAST_STATUS_TS = now
-        return True
-    if (now - _LAST_STATUS_TS) >= float(min_interval_sec):
-        _LAST_STATUS_TS = now
-        return True
-    return False
-
-
 # =============================================================================
 # Core checks
 # =============================================================================
-def _check_ws_klines_strict(
+def _check_kline_rollback_strict(
     *,
     symbol: str,
     tfs: Tuple[str, ...],
-    min_buf: int,
-    max_delay_sec: float,
     last_seen: Dict[str, int],
 ) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
     """
-    Returns:
-      lens, last_ts_ms, age_ms
+    rollback 전용 검사.
+    stale 판단은 market_data_ws.get_health_snapshot()를 진실값으로 사용한다.
     """
     now_ms = _now_ms()
     lens: Dict[str, int] = {}
     last_ts: Dict[str, int] = {}
     ages: Dict[str, int] = {}
 
-    delay_ms = int(float(max_delay_sec) * 1000.0)
-    if delay_ms <= 0:
-        raise RuntimeError("max_delay_sec must be > 0 (STRICT)")
-
     for tf in tfs:
-        buf = ws_get_klines_with_volume(symbol, tf, limit=min_buf)
+        buf = ws_get_klines_with_volume(symbol, tf, limit=1)
         if not isinstance(buf, list):
             raise RuntimeError(f"ws kline buffer invalid type (STRICT): tf={tf} type={type(buf).__name__}")
-        if len(buf) < min_buf:
-            lens[tf] = int(len(buf))
-            last_ts[tf] = int(buf[-1][0]) if buf else 0
-            ages[tf] = int(now_ms - last_ts[tf]) if last_ts[tf] > 0 else -1
+
+        if not buf:
+            lens[tf] = 0
+            last_ts[tf] = 0
+            ages[tf] = -1
             continue
 
-        ts_ms = _positive_int(buf[-1][0], f"ws_kline[{tf}].openTime")
-        lens[tf] = int(len(buf))
-        last_ts[tf] = int(ts_ms)
-        ages[tf] = int(now_ms - ts_ms)
+        row = buf[-1]
+        if not isinstance(row, (list, tuple)) or len(row) < 1:
+            raise RuntimeError(f"ws kline row invalid shape (STRICT): tf={tf}")
 
+        ts_ms = _positive_int(row[0], f"ws_kline[{tf}].openTime")
         prev = int(last_seen.get(tf, 0))
         if prev > 0 and ts_ms < prev:
             raise RuntimeError(f"kline rollback detected (STRICT): tf={tf} prev={prev} now={ts_ms}")
-        last_seen[tf] = int(ts_ms)
 
-        allowed = _interval_ms(tf) + delay_ms
-        if ages[tf] < 0:
-            raise RuntimeError(f"kline ts in future (STRICT): tf={tf} age_ms={ages[tf]}")
-        if ages[tf] > allowed:
-            pass
+        last_seen[tf] = int(ts_ms)
+        lens[tf] = len(buf)
+        last_ts[tf] = int(ts_ms)
+        ages[tf] = int(now_ms - ts_ms)
 
     return lens, last_ts, ages
 
 
-def _check_orderbook_strict(
+def _check_orderbook_integrity_strict(
     *,
     symbol: str,
-    max_age_ms: int,
 ) -> Tuple[bool, Optional[int], Optional[int]]:
+    """
+    orderbook integrity 전용 검사.
+    stale/transport 판단은 market_data_ws.get_health_snapshot()를 진실값으로 사용한다.
+    """
     ob = ws_get_orderbook(symbol, limit=5)
     if not isinstance(ob, dict) or not ob:
         return False, None, None
@@ -265,16 +299,11 @@ def _check_orderbook_strict(
     except DataIntegrityError:
         return False, ts_ms, None
 
-    if ts_ms is None:
-        return False, None, None
+    age_ms: Optional[int] = None
+    if ts_ms is not None:
+        age_ms = _now_ms() - int(ts_ms)
 
-    age = _now_ms() - int(ts_ms)
-    if age < -2000:
-        return False, int(ts_ms), int(age)
-    if age > int(max_age_ms):
-        return False, int(ts_ms), int(age)
-
-    return True, int(ts_ms), int(age)
+    return True, ts_ms, age_ms
 
 
 def _check_db_ping_strict(*, max_ping_ms: int) -> Tuple[bool, int]:
@@ -291,6 +320,74 @@ def _check_db_ping_strict(*, max_ping_ms: int) -> Tuple[bool, int]:
     return True, dt
 
 
+def _classify_ws_fail_reason(snapshot: Dict[str, Any]) -> str:
+    orderbook = snapshot.get("orderbook")
+    if not isinstance(orderbook, dict):
+        raise RuntimeError("health snapshot orderbook must be dict (STRICT)")
+
+    ws = snapshot.get("ws")
+    if not isinstance(ws, dict):
+        raise RuntimeError("health snapshot ws must be dict (STRICT)")
+
+    kline_map = snapshot.get("klines")
+    if not isinstance(kline_map, dict):
+        raise RuntimeError("health snapshot klines must be dict (STRICT)")
+
+    if not bool(ws.get("transport_ok", False)):
+        return "ws_transport_fail"
+
+    for _, st in kline_map.items():
+        if not isinstance(st, dict):
+            raise RuntimeError("health snapshot kline item must be dict (STRICT)")
+        if not bool(st.get("ok", False)):
+            return "ws_kline_stale"
+
+    if not bool(orderbook.get("ok", False)):
+        payload_reasons = orderbook.get("payload_reasons")
+        if isinstance(payload_reasons, list) and payload_reasons:
+            return "orderbook_integrity_fail"
+        return "ws_orderbook_stale"
+
+    return "ws_health_fail"
+
+
+def _check_market_data_health_strict(
+    *,
+    symbol: str,
+) -> Tuple[WatchdogLevel, Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    market_data_ws health snapshot을 진실값으로 사용한다.
+
+    returns:
+        level, fail_reason, warning_reason, snapshot
+    """
+    snapshot = get_health_snapshot(symbol)
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("get_health_snapshot returned non-dict (STRICT)")
+
+    overall_ok = snapshot.get("overall_ok")
+    if not isinstance(overall_ok, bool):
+        raise RuntimeError("health snapshot overall_ok must be bool (STRICT)")
+
+    has_warning = snapshot.get("has_warning")
+    if not isinstance(has_warning, bool):
+        raise RuntimeError("health snapshot has_warning must be bool (STRICT)")
+
+    overall_reasons = _normalize_reason_list(snapshot.get("overall_reasons"), "health snapshot overall_reasons")
+    overall_warnings = _normalize_reason_list(snapshot.get("overall_warnings"), "health snapshot overall_warnings")
+
+    if not overall_ok:
+        fail_reason = _classify_ws_fail_reason(snapshot)
+        return "FAIL", fail_reason, None, snapshot
+
+    if has_warning:
+        if not overall_warnings:
+            raise RuntimeError("health snapshot has_warning=True but overall_warnings empty (STRICT)")
+        return "WARNING", None, "warning_market_feed", snapshot
+
+    return "OK", None, None, snapshot
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -300,8 +397,16 @@ def get_last_watchdog_snapshot() -> Optional[WatchdogSnapshot]:
 
 def stop_watchdog() -> None:
     global _WATCHDOG_STOP, _WATCHDOG_THREAD
-    if _WATCHDOG_STOP is not None:
-        _WATCHDOG_STOP.set()
+
+    stop_evt = _WATCHDOG_STOP
+    th = _WATCHDOG_THREAD
+
+    if stop_evt is not None:
+        stop_evt.set()
+
+    if th is not None and th.is_alive():
+        th.join(timeout=2.0)
+
     _WATCHDOG_STOP = None
     _WATCHDOG_THREAD = None
 
@@ -313,67 +418,28 @@ def start_watchdog(
     on_fatal: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> None:
     """
-    settings: settings.load_settings() 결과(SSOT)
+    settings: settings.SETTINGS 또는 load_settings() 결과(SSOT)
     on_fatal: 치명 감지 시 엔진 SAFE_STOP 등을 트리거하기 위한 콜백
               signature: on_fatal(reason: str, detail: dict)
 
     STRICT:
-    - 이미 실행 중이면 예외.
+    - 이미 실행 중이면 예외
+    - 숨은 기본값 금지
     """
     global _WATCHDOG_THREAD, _WATCHDOG_STOP
 
     if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
         raise RuntimeError("engine_watchdog already running (STRICT)")
 
-    sym = str(symbol or getattr(settings, "symbol", "")).replace("-", "").replace("/", "").upper().strip()
+    sym = str(symbol or _require_setting(settings, "symbol")).replace("-", "").replace("/", "").upper().strip()
     if not sym:
         raise RuntimeError("symbol is required (STRICT)")
 
-    interval_sec = getattr(settings, "engine_watchdog_interval_sec", None)
-    if interval_sec is None:
-        interval_sec = 5.0
-        log(f"[WATCHDOG][DEFAULT] settings.engine_watchdog_interval_sec missing -> using {interval_sec}s")
-    interval_sec_f = _finite_float(interval_sec, "settings.engine_watchdog_interval_sec")
-    if interval_sec_f <= 0:
-        raise RuntimeError("engine_watchdog_interval_sec must be > 0 (STRICT)")
-
-    min_buf = getattr(settings, "ws_min_kline_buffer", None)
-    if min_buf is None:
-        raise RuntimeError("settings.ws_min_kline_buffer missing (STRICT)")
-    min_buf_i = _positive_int(min_buf, "settings.ws_min_kline_buffer")
-
-    max_kline_delay_sec = getattr(settings, "ws_max_kline_delay_sec", None)
-    if max_kline_delay_sec is None:
-        max_kline_delay_sec = 120.0
-        log(f"[WATCHDOG][DEFAULT] settings.ws_max_kline_delay_sec missing -> using {max_kline_delay_sec}s")
-    max_kline_delay_sec_f = _finite_float(max_kline_delay_sec, "settings.ws_max_kline_delay_sec")
-    if max_kline_delay_sec_f <= 0:
-        raise RuntimeError("ws_max_kline_delay_sec must be > 0 (STRICT)")
-
-    max_ob_age_ms = getattr(settings, "max_orderbook_age_ms", None)
-    if max_ob_age_ms is None:
-        max_ob_age_ms = 3000
-        log(f"[WATCHDOG][DEFAULT] settings.max_orderbook_age_ms missing -> using {max_ob_age_ms}ms")
-    max_ob_age_ms_i = _positive_int(max_ob_age_ms, "settings.max_orderbook_age_ms")
-
-    max_db_ping_ms = getattr(settings, "engine_watchdog_max_db_ping_ms", None)
-    if max_db_ping_ms is None:
-        max_db_ping_ms = 1500
-        log(f"[WATCHDOG][DEFAULT] settings.engine_watchdog_max_db_ping_ms missing -> using {max_db_ping_ms}ms")
-    max_db_ping_ms_i = _positive_int(max_db_ping_ms, "settings.engine_watchdog_max_db_ping_ms")
-
-    emit_min_sec = getattr(settings, "engine_watchdog_emit_min_sec", None)
-    if emit_min_sec is None:
-        emit_min_sec = 30
-        log(f"[WATCHDOG][DEFAULT] settings.engine_watchdog_emit_min_sec missing -> using {emit_min_sec}s")
-    emit_min_sec_i = _positive_int(emit_min_sec, "settings.engine_watchdog_emit_min_sec")
-
-    tfs_raw = getattr(settings, "ws_subscribe_tfs", None)
-    if not isinstance(tfs_raw, (list, tuple)) or not tfs_raw:
-        raise RuntimeError("settings.ws_subscribe_tfs must be list-like and non-empty (STRICT)")
-    tfs = tuple(str(x).strip() for x in tfs_raw if str(x).strip())
-    if not tfs:
-        raise RuntimeError("settings.ws_subscribe_tfs normalized empty (STRICT)")
+    interval_sec = _require_setting_positive_float(settings, "engine_watchdog_interval_sec")
+    min_buf = _require_setting_positive_int(settings, "ws_min_kline_buffer")
+    max_db_ping_ms = _require_setting_positive_int(settings, "engine_watchdog_max_db_ping_ms")
+    emit_min_sec = _require_setting_positive_int(settings, "engine_watchdog_emit_min_sec")
+    tfs = _require_setting_tfs(settings, "ws_required_tfs")
 
     stop_evt = threading.Event()
     _WATCHDOG_STOP = stop_evt
@@ -384,94 +450,117 @@ def start_watchdog(
         global _LAST_SNAPSHOT
 
         try:
-            log(f"[WATCHDOG] started symbol={sym} interval_sec={interval_sec_f} tfs={list(tfs)} min_buf={min_buf_i}")
+            log(
+                f"[WATCHDOG] started symbol={sym} interval_sec={interval_sec} "
+                f"tfs={list(tfs)} min_buf={min_buf}"
+            )
+
             while not stop_evt.is_set():
                 t_loop0 = time.perf_counter()
                 checked_ms = _now_ms()
 
-                lens, last_ts, ages = _check_ws_klines_strict(
+                ws_level, ws_fail_reason, ws_warning_reason, ws_snapshot = _check_market_data_health_strict(
+                    symbol=sym
+                )
+
+                lens, last_ts, ages = _check_kline_rollback_strict(
                     symbol=sym,
                     tfs=tfs,
-                    min_buf=min_buf_i,
-                    max_delay_sec=max_kline_delay_sec_f,
                     last_seen=last_seen,
                 )
 
-                delay_ms = int(max_kline_delay_sec_f * 1000.0)
-                stale_tfs = []
-                for tf in tfs:
-                    if lens.get(tf, 0) < min_buf_i:
-                        stale_tfs.append(tf)
-                        continue
-                    age = int(ages.get(tf, -1))
-                    allowed = _interval_ms(tf) + delay_ms
-                    if age < 0 or age > allowed:
-                        stale_tfs.append(tf)
-
-                ob_ok, ob_ts, ob_age = _check_orderbook_strict(symbol=sym, max_age_ms=max_ob_age_ms_i)
-
-                db_ok, db_ms = _check_db_ping_strict(max_ping_ms=max_db_ping_ms_i)
+                ob_integrity_ok, ob_ts, ob_age = _check_orderbook_integrity_strict(symbol=sym)
+                db_ok, db_ms = _check_db_ping_strict(max_ping_ms=max_db_ping_ms)
 
                 loop_ms = int((time.perf_counter() - t_loop0) * 1000.0)
                 if loop_ms < 0:
                     loop_ms = 0
 
-                ok = (not stale_tfs) and ob_ok and db_ok
-                reason = None
                 detail: Dict[str, Any] = {
-                    "ws_min_kline_buffer": int(min_buf_i),
-                    "ws_max_kline_delay_sec": float(max_kline_delay_sec_f),
+                    "watchdog_interval_sec": float(interval_sec),
+                    "ws_min_kline_buffer": int(min_buf),
+                    "ws_required_tfs": list(tfs),
                     "kline_len": dict(lens),
                     "kline_last_ts_ms": dict(last_ts),
                     "kline_age_ms": dict(ages),
-                    "stale_tfs": list(stale_tfs),
-                    "orderbook_ok": bool(ob_ok),
+                    "orderbook_integrity_ok": bool(ob_integrity_ok),
                     "orderbook_ts_ms": ob_ts,
                     "orderbook_age_ms": ob_age,
-                    "max_orderbook_age_ms": int(max_ob_age_ms_i),
                     "db_ok": bool(db_ok),
                     "db_ping_ms": int(db_ms),
-                    "max_db_ping_ms": int(max_db_ping_ms_i),
+                    "max_db_ping_ms": int(max_db_ping_ms),
                     "watchdog_loop_ms": int(loop_ms),
+                    "ws_level": str(ws_level),
+                    "ws_fail_reason": ws_fail_reason,
+                    "ws_warning_reason": ws_warning_reason,
+                    "ws_overall_ok": bool(ws_snapshot.get("overall_ok", False)),
+                    "ws_has_warning": bool(ws_snapshot.get("has_warning", False)),
+                    "ws_overall_reasons": list(ws_snapshot.get("overall_reasons") or []),
+                    "ws_overall_warnings": list(ws_snapshot.get("overall_warnings") or []),
                 }
 
-                if ok:
-                    reason = "ok"
+                level: WatchdogLevel = "OK"
+                fail_reason: Optional[str] = None
+                warning_reason: Optional[str] = None
+
+                if ws_level == "FAIL":
+                    level = "FAIL"
+                    fail_reason = ws_fail_reason
+                elif not ob_integrity_ok:
+                    level = "FAIL"
+                    fail_reason = "orderbook_integrity_fail"
+                elif not db_ok:
+                    level = "FAIL"
+                    fail_reason = "db_lag"
+                elif ws_level == "WARNING":
+                    level = "WARNING"
+                    warning_reason = ws_warning_reason
                 else:
-                    if stale_tfs:
-                        reason = "ws_kline_stale"
-                    elif not ob_ok:
-                        reason = "ws_orderbook_stale"
-                    elif not db_ok:
-                        reason = "db_lag"
-                    else:
-                        reason = "unknown_fail"
+                    level = "OK"
 
                 snap = WatchdogSnapshot(
-                    ok=bool(ok),
+                    level=level,
+                    ok=level != "FAIL",
+                    has_warning=level == "WARNING",
                     checked_at_ms=int(checked_ms),
+                    ws_transport_ok=bool((ws_snapshot.get("ws") or {}).get("transport_ok", False)),
+                    ws_overall_ok=bool(ws_snapshot.get("overall_ok", False)),
+                    ws_overall_reasons=[str(x) for x in ws_snapshot.get("overall_reasons") or []],
+                    ws_overall_warnings=[str(x) for x in ws_snapshot.get("overall_warnings") or []],
                     kline_len=dict(lens),
                     kline_last_ts_ms=dict(last_ts),
                     kline_age_ms=dict(ages),
-                    orderbook_ok=bool(ob_ok),
+                    orderbook_ok=bool(ob_integrity_ok),
                     orderbook_ts_ms=ob_ts,
                     orderbook_age_ms=ob_age,
                     db_ok=bool(db_ok),
                     db_ping_ms=int(db_ms),
                     loop_ms=int(loop_ms),
-                    fail_reason=None if ok else str(reason),
-                    fail_detail=None if ok else dict(detail),
+                    fail_reason=fail_reason,
+                    warning_reason=warning_reason,
+                    detail=dict(detail),
                 )
                 _LAST_SNAPSHOT = snap
 
-                key = f"{reason}|stale={','.join(stale_tfs)}|ob={int(ob_ok)}|db={int(db_ok)}"
-                if _should_emit(key, min_interval_sec=emit_min_sec_i):
+                reason = "ok"
+                if level == "FAIL":
+                    reason = str(fail_reason)
+                elif level == "WARNING":
+                    reason = str(warning_reason)
+
+                key = (
+                    f"{level}|reason={reason}|"
+                    f"ws_fail={ws_fail_reason}|ws_warn={ws_warning_reason}|"
+                    f"ob_integrity={int(ob_integrity_ok)}|db={int(db_ok)}"
+                )
+
+                if _should_emit(key, min_interval_sec=emit_min_sec):
                     _safe_event(sym, reason, detail)
 
-                if (not ok) and on_fatal is not None:
-                    on_fatal(str(reason), dict(detail))
+                if level == "FAIL" and on_fatal is not None:
+                    on_fatal(str(fail_reason), dict(detail))
 
-                stop_evt.wait(timeout=float(interval_sec_f))
+                stop_evt.wait(timeout=float(interval_sec))
 
         except Exception as e:
             msg = f"[WATCHDOG][FATAL] {type(e).__name__}: {str(e)[:240]}"
@@ -490,10 +579,17 @@ def start_watchdog(
 
     th = threading.Thread(target=_loop, name=f"engine-watchdog-{sym}", daemon=True)
     _WATCHDOG_THREAD = th
-    th.start()
+
+    try:
+        th.start()
+    except Exception:
+        _WATCHDOG_THREAD = None
+        _WATCHDOG_STOP = None
+        raise
 
 
 __all__ = [
+    "WatchdogLevel",
     "WatchdogSnapshot",
     "start_watchdog",
     "stop_watchdog",

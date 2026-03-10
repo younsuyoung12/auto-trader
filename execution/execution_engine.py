@@ -5,6 +5,7 @@ ROLE:
 - 엔트리 실행 요청을 최종 정규화하고 주문 실행 SSOT(order_executor)로 위임한다
 - 실행 직전 계약(symbol/action/source/qty/tp/sl/client_order_id)을 엄격 검증한다
 - Trade 반환 계약을 검증해 상위 엔진에 안전한 실행 결과만 전달한다
+- 명시적으로 식별 가능한 거래소 비치명 주문 거절은 "트레이드 스킵"으로 정규화한다
 
 CORE RESPONSIBILITIES:
 - Signal / mapping / dataclass 입력 정규화
@@ -12,6 +13,7 @@ CORE RESPONSIBILITIES:
 - entry execution request strict contract 생성
 - order_executor.open_position_with_tp_sl() 호출
 - Trade 반환 계약 검증
+- 명시적 비치명 주문 거절(-2019) 감지 및 None 반환
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -21,6 +23,8 @@ IMPORTANT POLICY:
 - source 는 출처 필드만 허용하며 regime/reason 을 대체값으로 사용하지 않는다
 - tp_pct/sl_pct/risk_pct 는 ratio 계약(0,1] 을 강제한다
 - 주문 실행 / 체결 검증 / 보호주문 검증의 실제 SSOT 는 order_executor 이다
+- 단, 거래소가 명시적으로 "주문 자체를 거절"한 비치명 사유는 시스템 치명 오류로 승격하지 않는다
+- 현재 비치명 주문 거절로 허용하는 케이스는 Binance code=-2019 (Margin is insufficient) 뿐이다
 
 CHANGE HISTORY:
 - 2026-03-10:
@@ -29,6 +33,9 @@ CHANGE HISTORY:
   3) FIX(CONTRACT): source alias 에서 regime/reason 제거, 실제 출처 필드만 허용
   4) FIX(STRICT): tp_pct/sl_pct 를 ratio(0,1] 계약으로 강화
   5) CLEANUP: 상단 문서 구조를 ROLE / CORE RESPONSIBILITIES / IMPORTANT POLICY 형식으로 정리
+  6) FIX(ROOT-CAUSE): Binance code=-2019 (Margin is insufficient) 를 비치명 엔트리 거절로 정규화
+  7) FIX(CONTRACT): execute() 반환 계약을 Optional[Trade] 로 확장하여 "스킵된 트레이드"를 명시 표현
+  8) FIX(LOG): 비치명 주문 거절 시 예외 전파 대신 구조화 경고 로그를 남기고 None 반환
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): ExecutionEngine 클래스 복구
   2) FIX(CONTRACT): run_bot_ws Signal 구조(action/direction/risk_pct/meta)와 정합 복구
@@ -42,6 +49,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -69,6 +77,8 @@ from settings import load_settings
 from state.trader_state import Trade
 
 logger = logging.getLogger(__name__)
+
+_NONFATAL_BINANCE_ENTRY_REJECTION_CODES: frozenset[int] = frozenset({-2019})
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,6 +521,61 @@ def _enforce_or_generate_client_order_id_strict(
     return replace(req, entry_client_order_id=generated)
 
 
+def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+    out: list[BaseException] = []
+    seen: set[int] = set()
+    current: Optional[BaseException] = exc
+
+    while current is not None:
+        obj_id = id(current)
+        if obj_id in seen:
+            break
+        seen.add(obj_id)
+        out.append(current)
+
+        if current.__cause__ is not None:
+            current = current.__cause__
+            continue
+
+        if current.__context__ is not None and not current.__suppress_context__:
+            current = current.__context__
+            continue
+
+        current = None
+
+    return out
+
+
+def _extract_binance_error_code_from_text(text: str) -> Optional[int]:
+    match = re.search(r"code\s*=\s*(-?\d+)", text)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _is_nonfatal_entry_submission_rejection(exc: BaseException) -> bool:
+    for part in _iter_exception_chain(exc):
+        text = str(part)
+        code = _extract_binance_error_code_from_text(text)
+        if code in _NONFATAL_BINANCE_ENTRY_REJECTION_CODES:
+            return True
+        if "Margin is insufficient" in text:
+            return True
+    return False
+
+
+def _format_exception_chain_for_log(exc: BaseException) -> str:
+    parts: list[str] = []
+    for part in _iter_exception_chain(exc):
+        rendered = f"{type(part).__name__}: {part}"
+        if rendered not in parts:
+            parts.append(rendered)
+    return " | ".join(parts)
+
+
 def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutionRequest:
     signal_map = _signal_to_mapping_strict(signal)
     meta_map = _meta_to_mapping_strict(signal_map)
@@ -725,11 +790,13 @@ class ExecutionEngine:
     - Signal(action/direction/tp_pct/sl_pct/risk_pct/meta) 입력을 엄격하게 정규화한다.
     - qty 직접 입력 또는 risk_pct 기반 수량 계산 후 order_executor.open_position_with_tp_sl() 를 호출한다.
     - 주문 실행 / 체결 검증 / 보호주문 검증의 실제 SSOT 는 order_executor 이다.
+    - 명시적으로 식별 가능한 거래소 비치명 주문 거절은 None 으로 반환한다.
 
     절대 원칙
     - signal 누락/충돌/모호성은 즉시 예외
     - 임의 기본값/추정/폴백 금지
     - Trade 반환 계약은 PROTECTION_VERIFIED 까지 검증
+    - 단, 현재 허용된 명시적 비치명 주문 거절(code=-2019)은 시스템 치명 오류로 승격하지 않는다
     """
 
     def __init__(self, settings: Optional[Any] = None) -> None:
@@ -741,7 +808,7 @@ class ExecutionEngine:
     def settings(self) -> Any:
         return self._settings
 
-    def execute(self, signal: Any) -> Trade:
+    def execute(self, signal: Any) -> Optional[Trade]:
         req = _normalize_entry_request_strict(signal, self._settings)
         req = _enforce_or_generate_client_order_id_strict(
             signal=signal,
@@ -765,20 +832,34 @@ class ExecutionEngine:
             req.entry_client_order_id,
         )
 
-        trade = open_position_with_tp_sl(
-            self._settings,
-            symbol=req.symbol,
-            side_open=req.side_open,
-            qty=req.qty,
-            entry_price_hint=req.entry_price_hint,
-            tp_pct=req.tp_pct,
-            sl_pct=req.sl_pct,
-            source=req.source,
-            soft_mode=req.soft_mode,
-            sl_floor_ratio=req.sl_floor_ratio,
-            available_usdt=req.available_usdt,
-            entry_client_order_id=req.entry_client_order_id,
-        )
+        try:
+            trade = open_position_with_tp_sl(
+                self._settings,
+                symbol=req.symbol,
+                side_open=req.side_open,
+                qty=req.qty,
+                entry_price_hint=req.entry_price_hint,
+                tp_pct=req.tp_pct,
+                sl_pct=req.sl_pct,
+                source=req.source,
+                soft_mode=req.soft_mode,
+                sl_floor_ratio=req.sl_floor_ratio,
+                available_usdt=req.available_usdt,
+                entry_client_order_id=req.entry_client_order_id,
+            )
+        except OrderExecutionError as e:
+            if _is_nonfatal_entry_submission_rejection(e):
+                logger.warning(
+                    "ExecutionEngine.execute skipped non-fatal entry rejection "
+                    "(symbol=%s side=%s qty=%s source=%s reason=%s)",
+                    req.symbol,
+                    req.side_open,
+                    req.qty,
+                    req.source,
+                    _format_exception_chain_for_log(e),
+                )
+                return None
+            raise
 
         if trade is None:
             raise OrderExecutionError("open_position_with_tp_sl returned None (STRICT)")

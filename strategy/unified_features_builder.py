@@ -1,134 +1,63 @@
+from __future__ import annotations
+
 """
 ========================================================
 FILE: strategy/unified_features_builder.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
-역할
+ROLE:
 - WS 기반 market_features_ws 결과 + pattern_detection 결과 + 오더북(depth5)을 결합해
-  "통합 피처(unified_features)"를 생성한다.
-- 이 출력은 GPT(감사/해설) 입력 및 Quant Engine(결정권자) 로그/스냅샷 용도로 사용한다.
-  (본 파일은 매매 결정을 하지 않는다.)
+  통합 피처(unified_features)를 생성한다.
+- 이 출력은 GPT(감사/해설) 입력 및 Quant Engine 로그/스냅샷 용도로 사용한다.
+- 본 파일은 매매 결정을 하지 않는다.
 
-절대 원칙 (STRICT · NO-FALLBACK)
-- REST 백필/더미값/0 치환/None 묵살/조용한 continue 금지.
-- 필수 데이터가 없거나 손상/모호하면 즉시 예외로 실패한다.
-- 필수 타임프레임: 1m / 5m / 15m / 1h / 4h (없으면 즉시 실패)
-- 각 TF는 필수 raw OHLCV + indicators dict 를 반드시 포함해야 한다.
-- 오더북은 WS depth5 스냅샷(bids/asks)을 포함하며, 비어 있으면 즉시 실패한다.
-- pattern_features/summary 는 화이트리스트 기반 compact 형태로 축소(토큰 최적화).
-- microstructure(Funding/OI/LSR/DI)는 거래소 REST 기반으로 수집하며 누락/비정상은 즉시 실패한다.
-- volume_profile / orderflow_cvd / options_market 은 추가 외부/구조 피처로 결합되며
-  누락/비정상은 즉시 실패한다.
-- 성공 결과만 짧은 TTL 캐시를 허용한다. 캐시 만료 후 fetch 실패 시 stale 캐시 사용 금지.
-- 예외(TRADE-GRADE 규칙): 4h.regime은 WS warmup/지연에서 누락될 수 있으므로
-  누락 시 neutral(trend_strength=0.5)로 처리한다. (데이터 조작/폴백이 아닌 명시 규칙)
+CORE RESPONSIBILITIES:
+- 필수 타임프레임 WS 피처 계약 검증
+- authoritative orderbook scalar ↔ raw depth5 snapshot 교차 검증
+- pattern / microstructure / volume_profile / orderflow / options 결합
+- institutional multi-factor engine score 산출
+- compact unified_features 출력 계약 보장
 
-입력 계약(중요)
-- market_features_ws.timeframes[1m|5m|15m].raw_ohlcv_last20:
-  (ts_ms, open, high, low, close, volume) 형태의 sequence(list/tuple) 이어야 한다. dict 금지.
-- market_features_ws.timeframes[1h|4h].raw_ohlcv_last60:
-  (ts_ms, open, high, low, close, volume) 형태의 sequence(list/tuple) 이어야 한다. dict 금지.
-- market_features_ws.timeframes[*].indicators:
-  엔진 점수 계산에 필요한 scalar(rsi/ema_fast/ema_slow/atr_pct/macd_hist 등)를 포함해야 한다.
-- volume_profile:
-  - 1h raw_ohlcv_last60 기반으로 계산한다.
-- orderflow_cvd:
-  - Binance aggTrades 공개 REST를 사용해 최근 체결 흐름을 계산한다.
-- options_market:
-  - Deribit 공개 옵션시장 데이터를 사용한다.
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- REST 백필/더미값/0 치환/None 묵살/조용한 continue 금지
+- 필수 데이터가 없거나 손상/모호하면 즉시 예외로 실패
+- 필수 타임프레임: 1m / 5m / 15m / 1h / 4h
+- 각 TF는 필수 raw OHLCV + indicators dict 를 반드시 포함
+- 오더북은 WS depth5 raw snapshot + authoritative scalar 일관성이 모두 만족해야 함
+- success cache는 TTL 내 성공 결과만 허용, stale cache 재사용 금지
+- settings는 settings.SETTINGS 단일 객체만 사용
 
-변경 이력
+CHANGE HISTORY:
 --------------------------------------------------------
-- 2026-03-08:
-  1) FIX(TRADE-GRADE): 중복 top-level 함수 정의 제거
-     - _score_volume_profile_regime
-     - _score_orderflow_regime
-     - _score_options_regime
-  2) test_market_structure_debug_runner 의 AST duplicate scan 실패 원인 제거
-  3) 기존 기능/입력계약/점수식/출력 스키마는 삭제 없이 유지
-- 2026-03-06 TRADE-GRADE UPGRADE:
-  1) Engine scoring system upgraded to institutional multi-factor model.
-  2) Added regime engines:
-     - volatility_regime
-     - volume_regime
-     - liquidity_regime
-  3) Total engine score now combines:
-     - trend
-     - momentum
-     - structure
-     - timing
-     - orderbook
-     - volatility
-     - volume
-     - liquidity
-  4) This improves detection of:
-     - trend markets
-     - range markets
-     - volatility expansions
-     - liquidity sweeps
-     - volume spikes
-  5) Used by:
-     - run_bot_ws
-     - risk_physics_engine
-     - execution_engine
-- 2026-03-05:
-  1) FIX(TRADE-GRADE): 4h.regime missing/invalid로 unified_features가 크래시하던 문제 수정
-     - 4h.regime 누락 시 neutral trend_strength=0.5 적용
-     - regime가 dict인데 trend_strength가 누락/비정상인 경우는 기존대로 즉시 예외(STRICT 유지)
-- 2026-03-04:
-  1) Data Integrity Guard 연동:
-     - OHLCV 시계열에 timestamp rollback/미래 timestamp/ohlcv 관계식 STRICT 검증 추가
-     - 오더북 원시 스냅샷에 bestAsk>bestBid/레벨 price·qty>0/ts(exchTs|ts) 존재 STRICT 검증 추가
-  2) Invariant Guard 연동(최소):
-     - micro_score_risk 및 settings(tp/sl) 기반 최소 수학 invariant 검증(폴백 없음)
-  3) 모듈 docstring 위치 정합화(__future__ import보다 앞으로 이동)
-- 2026-03-03:
-  1) STRICT 강화: silent 예외 삼키기 제거(텔레그램 전송 포함)
-  2) STRICT 강화: 암묵적 기본값(or "", or "NONE") 제거 및 필수 키/형식 강제
-  3) STRICT 강화: symbol 결정 로직에서 빈 문자열/누락을 즉시 실패로 처리
-  4) TRADE-GRADE: microstructure(Funding/OI/LSR/Distortion Index) 스냅샷 생성/결합 추가(STRICT)
-- 2026-03-02:
-  1) FIX(STRICT): atr_pct / range_pct 스케일 정규화 규칙 추가
-     - 일부 upstream이 atr_pct, range_pct를 "비율(0~1)"로 제공함을 확인.
-     - 본 파일의 점수식은 "%(0~100)" 전제를 사용하므로,
-       아래 규칙으로 STRICT 정규화한다(폴백/추정 아님, 명시 규칙):
-       * 0.0 <= v <= 1.0  → v * 100.0 (ratio → percent)
-       * 1.0 < v <= 100.0 → 그대로 사용 (already percent)
-       * 그 외 범위       → 즉시 실패
-     - 적용 대상:
-       * _score_momentum_1h: indicators.atr_pct
-       * _score_timing_5m:   indicators.atr_pct
-       * _score_structure_15m: tf15m.range_pct
-  2) TUNING(TRADE-GRADE): engine_scores.total 가중치 재조정
-     - trend_4h 비중 ↓(0.15), orderbook_micro 비중 ↑(0.25)
+- 2026-03-10:
+  1) FIX(SSOT): load_settings() 재호출 제거, settings.SETTINGS 단일 객체 사용
+  2) FIX(ROOT-CAUSE): build_entry_features_ws() orderbook scalar ↔ WS raw depth5 snapshot 교차 검증 추가
+  3) FIX(STRICT): authoritative orderbook scalar(best_bid/ask/spread/depth_imbalance/ts_ms) 누락 즉시 예외
+  4) FIX(ARCH): orderbook 결합 경로를 _get_orderbook_strict(symbol, base_orderbook) 로 일원화
+  5) 기존 pattern/microstructure/volume_profile/orderflow/options 기능 삭제 없음
 - 2026-03-08:
   1) VolumeProfileEngine 연동 추가
   2) OrderFlowCvdEngine 연동 추가
   3) OptionsMarketFetcher 연동 추가
   4) unified_features 에 volume_profile / orderflow_cvd / options_market compact payload 추가
   5) engine_scores.total 에 volume_profile_regime / orderflow_regime / options_regime 점수 반영
-  6) 성공 결과만 TTL 캐시 허용(orderflow/options)
-  7) entry_score 유실 버그 제거
-  8) TOTAL_WEIGHTS 합=1.0 무결성 검증 추가
-  9) 기존 WS / pattern / orderbook / microstructure 기능 삭제 없이 유지
 ========================================================
 """
-
-from __future__ import annotations
 
 import math
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
 
-from settings import load_settings
+from settings import SETTINGS
 
 try:
     from infra.telelog import log, send_tg
 except Exception as e:  # pragma: no cover
     raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · TRADE-GRADE MODE)") from e
 
-from infra.market_data_ws import get_orderbook
+from infra.market_data_ws import get_orderbook as ws_get_orderbook
 from infra.market_features_ws import FeatureBuildError, build_entry_features_ws
 from strategy.pattern_detection import PatternError, build_pattern_features
 from strategy.microstructure_engine import MicrostructureError, build_microstructure_snapshot
@@ -138,22 +67,20 @@ from analysis.options_market_fetcher import OptionsMarketFetcher, OptionsMarketS
 from analysis.orderflow_cvd import OrderFlowCvdEngine, OrderFlowCvdReport
 from analysis.volume_profile import VolumeProfileEngine, VolumeProfileReport
 
-# NEW: Data Integrity Guard (TRADE-GRADE)
-from infra.data_integrity_guard import (  # noqa: E402
+from infra.data_integrity_guard import (
     DataIntegrityError,
     extract_orderbook_ts_ms_strict,
     validate_kline_series_strict,
     validate_orderbook_strict,
 )
 
-# NEW: Invariant Guard (TRADE-GRADE)
-from execution.invariant_guard import (  # noqa: E402
+from execution.invariant_guard import (
     InvariantViolation,
     SignalInvariantInputs,
     validate_signal_invariants_strict,
 )
 
-SET = load_settings()
+SET = SETTINGS
 
 REQUIRED_TFS: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
 PATTERN_TFS: Tuple[str, ...] = ("1m", "5m", "15m")
@@ -161,7 +88,7 @@ PATTERN_TFS: Tuple[str, ...] = ("1m", "5m", "15m")
 MAX_PATTERNS_PER_TF: int = 4
 MAX_SUMMARY_PATTERNS: int = 10
 
-# Microstructure config defaults (deterministic project defaults; not data fallback)
+# Internal algorithm policy constants (not runtime fallback)
 _MICRO_PERIOD_DEFAULT: str = "5m"
 _MICRO_LOOKBACK_DEFAULT: int = 30
 _MICRO_CACHE_TTL_SEC_DEFAULT: int = 15
@@ -180,7 +107,7 @@ _PATTERN_ITEM_KEYS: Tuple[str, ...] = (
     "target_price",
 )
 
-# Volume Profile / Order Flow / Options config
+# Volume Profile / Order Flow / Options internal policy constants
 _VOL_PROFILE_SOURCE_TF: str = "1h"
 _VOL_PROFILE_VALUE_AREA_PCT: float = 0.70
 _VOL_PROFILE_HVN_COUNT: int = 3
@@ -194,6 +121,8 @@ _ORDERFLOW_DIVERGENCE_DELTA_THRESHOLD_PCT: float = 8.0
 _ORDERFLOW_PATH_TAIL_SIZE: int = 20
 _ORDERFLOW_CACHE_TTL_SEC: int = 5
 _OPTIONS_CACHE_TTL_SEC: int = 60
+
+_ORDERBOOK_SCALAR_TOL: float = 1e-9
 
 # engine_scores.total 가중치 (합=1.0)
 _TOTAL_WEIGHTS: Dict[str, float] = {
@@ -230,7 +159,7 @@ class UnifiedFeaturesError(RuntimeError):
 
 def _notify_tg_best_effort(symbol: str, msg: str) -> None:
     """
-    텔레그램은 '부가 채널'이다.
+    텔레그램은 부가 채널이다.
     거래 판단/피처 생성은 텔레그램 장애로 중단시키지 않는다.
     단, 조용히 삼키지 않고 로그는 남긴다.
     """
@@ -417,9 +346,29 @@ def _ensure_timeframe_payloads_strict(symbol: str, timeframes: Dict[str, Any]) -
             _parse_ohlcv_rows(symbol, stage, raw60, min_len=60, name=f"{tf}.raw_ohlcv_last60")
 
 
-def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
+def _assert_float_close_strict(symbol: str, stage: str, a: float, b: float, name: str, tol: float = _ORDERBOOK_SCALAR_TOL) -> None:
+    if not math.isfinite(a) or not math.isfinite(b):
+        _fail_unified(symbol, stage, f"{name} compare values must be finite (got {a}, {b})")
+    if abs(a - b) > tol:
+        _fail_unified(symbol, stage, f"{name} mismatch (STRICT): base={a}, raw={b}, tol={tol}")
+
+
+def _get_orderbook_strict(symbol: str, base_orderbook: Dict[str, Any], limit: int = 5) -> Dict[str, Any]:
+    """
+    STRICT:
+    - market_features_ws 가 계산한 authoritative scalar(best/spread/depth_imbalance)를 기준으로
+      WS raw depth5 snapshot과 교차 검증한다.
+    """
     stage = "orderbook"
-    ob = get_orderbook(symbol, limit=limit)
+
+    base = _require_dict(symbol, stage, base_orderbook, "base.orderbook")
+    base_checked_at_ms = _require_int(symbol, stage, base.get("ts_ms"), "base.orderbook.ts_ms")
+    base_best_bid = _require_float(symbol, stage, base.get("best_bid"), "base.orderbook.best_bid")
+    base_best_ask = _require_float(symbol, stage, base.get("best_ask"), "base.orderbook.best_ask")
+    base_spread_pct = _require_float(symbol, stage, base.get("spread_pct"), "base.orderbook.spread_pct")
+    base_depth_imbalance = _require_float(symbol, stage, base.get("depth_imbalance"), "base.orderbook.depth_imbalance")
+
+    ob = ws_get_orderbook(symbol, limit=limit)
     if not isinstance(ob, dict) or not ob:
         _fail_unified(symbol, stage, "WS orderbook snapshot missing/invalid")
 
@@ -491,12 +440,25 @@ def _get_orderbook_strict(symbol: str, limit: int = 5) -> Dict[str, Any]:
         _fail_unified(symbol, stage, f"invalid depth_imbalance: {depth_imbalance}")
 
     try:
-        checked_at_ms = extract_orderbook_ts_ms_strict(ob, name="orderbook")
+        raw_checked_at_ms = extract_orderbook_ts_ms_strict(ob, name="orderbook")
     except DataIntegrityError as e:
         _fail_unified(symbol, stage, f"orderbook ts missing/invalid (STRICT): {e}", e)
 
+    _assert_float_close_strict(symbol, stage, base_best_bid, best_bid, "best_bid")
+    _assert_float_close_strict(symbol, stage, base_best_ask, best_ask, "best_ask")
+    _assert_float_close_strict(symbol, stage, base_spread_pct, spread_pct, "spread_pct")
+    _assert_float_close_strict(symbol, stage, base_depth_imbalance, depth_imbalance, "depth_imbalance")
+
+    if raw_checked_at_ms < base_checked_at_ms:
+        _fail_unified(
+            symbol,
+            stage,
+            f"raw orderbook ts rollback vs base scalar snapshot (STRICT): base_ts={base_checked_at_ms}, raw_ts={raw_checked_at_ms}",
+        )
+
     return {
-        "checked_at_ms": int(checked_at_ms),
+        "checked_at_ms": int(raw_checked_at_ms),
+        "authoritative_checked_at_ms": int(base_checked_at_ms),
         "best_bid": best_bid,
         "best_ask": best_ask,
         "spread": spread,
@@ -1628,7 +1590,8 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
 
     _ensure_timeframe_payloads_strict(sym, timeframes)
 
-    orderbook = _get_orderbook_strict(sym, limit=5)
+    base_orderbook = base.get("orderbook")
+    orderbook = _get_orderbook_strict(sym, base_orderbook, limit=5)
 
     pattern_features, pattern_summary = _build_pattern_bundle_strict(sym, timeframes, orderbook)
     volume_profile = _build_volume_profile_feature_strict(sym, timeframes)
@@ -1646,7 +1609,6 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
         options_market,
     )
 
-    # Microstructure (STRICT: required)
     micro_period, micro_lookback, micro_ttl = _load_microstructure_config(sym)
     try:
         microstructure = build_microstructure_snapshot(
@@ -1669,11 +1631,14 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if msr < 0.0 or msr > 100.0:
         _fail_unified(sym, "microstructure", f"micro_score_risk out of range [0,100] (STRICT): {msr}")
 
+    if not hasattr(SET, "tp_pct") or not hasattr(SET, "sl_pct"):
+        _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct required for invariant check (STRICT)")
+
     try:
-        tp_pct = float(getattr(SET, "tp_pct"))
-        sl_pct = float(getattr(SET, "sl_pct"))
+        tp_pct = float(SET.tp_pct)
+        sl_pct = float(SET.sl_pct)
     except Exception as e:
-        _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct required for invariant check (STRICT)", e)
+        _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct must be float-convertible (STRICT)", e)
 
     try:
         validate_signal_invariants_strict(

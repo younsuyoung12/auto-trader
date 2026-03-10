@@ -5,51 +5,41 @@ AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
-핵심 변경 요약
-- FIX(CONTRACT): payload 상단 키 / 섹션 symbol 계약 검증 강화
-- FIX(STRICT): OpenAI 응답은 순수 JSON object 1개 또는 fenced JSON 1개만 허용
-- FIX(INTEGRITY): answer_ko 문장 수 / root_causes / recommendations 개수 계약 검증 강화
-- OpenAI 요청 payload 계약 검증 강화 유지
-- market-only / full-analysis 입력 계약 분리 유지
-- OpenAI 응답의 scope / used_inputs / raw text 무결성 검증 강화 유지
-- 실제 미사용 temperature 설정 의존 제거 유지
-
-코드 정리 내용
-- payload top-level / section symbol 검증 로직 분리
-- output answer/list 계약 검증 함수 보강
-- JSON 단일 객체 추출 로직 엄격화
-- 최근 변경 이력 2일 기준으로 정리
-
-역할:
-- AI Quant Analyst / AI Market Analyst용 OpenAI 호출 전용 엔진.
+ROLE:
+- AI Quant Analyst / AI Market Analyst용 OpenAI 호출 전용 엔진
 - 내부 DB 분석 결과와 외부 시장 분석 결과를 받아
-  한국어 분석/원인/해결책 JSON 1개를 생성한다.
-- 주문 실행 / 포지션 변경 / TP·SL 수정은 절대 수행하지 않는다.
+  한국어 분석/원인/권고 JSON 1개를 생성한다
+- 주문 실행 / 포지션 변경 / TP·SL 수정은 절대 수행하지 않는다
 
-절대 원칙:
-- STRICT · NO-FALLBACK
+CORE RESPONSIBILITIES:
+- OpenAI 요청 payload 계약 검증
+- OpenAI Responses API 호출
+- 응답에서 JSON object 1개만 STRICT 추출
+- scope / used_inputs / answer_ko / list fields 무결성 검증
+- market-only / full-analysis 입력 계약 분리 유지
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
 - settings.py(SSOT) 외 환경변수 직접 접근 금지
 - print() 금지 / logging 사용
 - 응답 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
 - OpenAI Responses API 사용
 - 응답은 반드시 JSON object 1개여야 한다
+- structured output 후보가 여러 개거나 text 후보가 여러 개면 모호성으로 즉시 예외
+- settings alias 충돌 시 즉시 예외
 
-변경 이력:
-2026-03-09
-1) FIX(CONTRACT): payload 상단 키 / 섹션 symbol 계약 검증 강화
-2) FIX(STRICT): OpenAI 응답은 순수 JSON object 1개 또는 fenced JSON 1개만 허용
-3) FIX(INTEGRITY): answer_ko 문장 수 / root_causes / recommendations 개수 계약 검증 강화
-4) FIX(STRICT): market-only / full-analysis payload 계약 검증 강화
-5) FIX(INTEGRITY): OpenAI 응답 raw text / scope / used_inputs 무결성 검증 강화
-6) CLEANUP: 미사용 ANALYST_OPENAI_TEMPERATURE 의존 제거
-7) CLEANUP: payload / response validation 로직 정리
-
-2026-03-08
-1) Structured Outputs(JSON Schema) 강제 적용
-2) Responses API status / incomplete / refusal 선검증 강화
-3) output.message.content.output_text 우선 strict 추출 적용
-4) used_inputs 와 실제 payload 섹션 불일치 strict 검증 추가
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(SSOT): settings canonical/legacy alias를 명시 계약으로 통합하고 충돌 시 즉시 예외
+  2) FIX(STRICT): structured output 후보가 2개 이상이면 모호성으로 즉시 예외
+  3) FIX(STRICT): output_text 후보가 2개 이상이고 내용이 다르면 즉시 예외
+  4) FIX(CONTRACT): OpenAI 응답은 순수 JSON object 1개 또는 fenced JSON 1개만 허용
+  5) FIX(INTEGRITY): used_inputs / answer_ko / root_causes / recommendations 계약 검증 강화
+- 2026-03-09:
+  1) FIX(CONTRACT): payload 상단 키 / 섹션 symbol 계약 검증 강화
+  2) FIX(STRICT): OpenAI 응답은 순수 JSON object 1개 또는 fenced JSON 1개만 허용
+  3) FIX(INTEGRITY): answer_ko 문장 수 / root_causes / recommendations 개수 계약 검증 강화
 ========================================================
 """
 
@@ -61,7 +51,7 @@ import math
 import re
 from dataclasses import asdict, dataclass
 from decimal import Decimal
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from settings import SETTINGS
 
@@ -88,6 +78,16 @@ _ALLOWED_TOP_LEVEL_KEYS = {
 }
 
 _OUT_OF_SCOPE_MESSAGE = "이 질문은 트레이딩 시스템 범위를 벗어납니다."
+
+# settings canonical / compatibility aliases
+_SETTING_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "market_symbol": ("analyst_market_symbol", "ANALYST_MARKET_SYMBOL"),
+    "openai_api_key": ("openai_api_key", "OPENAI_API_KEY"),
+    "openai_model": ("analyst_openai_model", "ANALYST_OPENAI_MODEL"),
+    "openai_timeout_sec": ("analyst_openai_timeout_sec", "ANALYST_OPENAI_TIMEOUT_SEC"),
+    "openai_max_output_tokens": ("analyst_openai_max_output_tokens", "ANALYST_OPENAI_MAX_OUTPUT_TOKENS"),
+    "openai_reasoning_effort": ("analyst_openai_reasoning_effort", "ANALYST_OPENAI_REASONING_EFFORT"),
+}
 
 _SYSTEM_INSTRUCTIONS = """
 You are a professional Bitcoin quantitative analyst for an internal trading intelligence system.
@@ -154,19 +154,19 @@ class GptAnalystEngine:
 
     def __init__(self) -> None:
         self._symbol = self._normalize_symbol_or_raise(
-            self._require_str_setting("ANALYST_MARKET_SYMBOL"),
-            "ANALYST_MARKET_SYMBOL",
+            self._require_str_setting("market_symbol"),
+            "market_symbol",
         )
-        self._api_key = self._require_str_setting("OPENAI_API_KEY")
-        self._model = self._require_str_setting("ANALYST_OPENAI_MODEL")
-        self._timeout_sec = self._require_float_setting("ANALYST_OPENAI_TIMEOUT_SEC")
-        self._max_output_tokens = self._require_int_setting("ANALYST_OPENAI_MAX_OUTPUT_TOKENS")
-        self._reasoning_effort = self._optional_str_setting("ANALYST_OPENAI_REASONING_EFFORT")
+        self._api_key = self._require_str_setting("openai_api_key")
+        self._model = self._require_str_setting("openai_model")
+        self._timeout_sec = self._require_float_setting("openai_timeout_sec")
+        self._max_output_tokens = self._require_int_setting("openai_max_output_tokens")
+        self._reasoning_effort = self._optional_str_setting("openai_reasoning_effort")
 
         if self._timeout_sec <= 0.0:
-            raise RuntimeError("ANALYST_OPENAI_TIMEOUT_SEC must be > 0")
+            raise RuntimeError("openai_timeout_sec must be > 0")
         if self._max_output_tokens <= 0:
-            raise RuntimeError("ANALYST_OPENAI_MAX_OUTPUT_TOKENS must be > 0")
+            raise RuntimeError("openai_max_output_tokens must be > 0")
 
         self._client = self._make_client()
 
@@ -308,8 +308,7 @@ class GptAnalystEngine:
 
     def _validate_payload_top_level_keys_or_raise(self, payload: Mapping[str, Any]) -> None:
         actual_keys = set(payload.keys())
-        missing_question = "question" not in actual_keys
-        if missing_question:
+        if "question" not in actual_keys:
             raise RuntimeError("payload missing required key: question")
 
         unexpected_keys = actual_keys - _ALLOWED_TOP_LEVEL_KEYS
@@ -593,6 +592,8 @@ class GptAnalystEngine:
     def _extract_structured_output_dict_or_raise(self, response: Any) -> Optional[Dict[str, Any]]:
         dumped = self._response_to_python(response)
 
+        candidates: List[Dict[str, Any]] = []
+
         output_parsed = self._safe_get_any(
             dumped,
             [
@@ -602,7 +603,7 @@ class GptAnalystEngine:
         if output_parsed is not None:
             parsed = self._normalize_parsed_output(output_parsed)
             if parsed is not None:
-                return parsed
+                candidates.append(parsed)
 
         output_items = self._safe_get_any(
             dumped,
@@ -610,46 +611,41 @@ class GptAnalystEngine:
                 ("output",),
             ],
         )
-        if not isinstance(output_items, list):
-            return None
-
-        parsed_candidates: List[Any] = []
-
-        for item in output_items:
-            if not isinstance(item, Mapping):
-                continue
-
-            item_type = item.get("type")
-            if item_type != "message":
-                continue
-
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-
-            for content_item in content:
-                if not isinstance(content_item, Mapping):
+        if isinstance(output_items, list):
+            for item in output_items:
+                if not isinstance(item, Mapping):
                     continue
 
-                content_type = content_item.get("type")
+                item_type = item.get("type")
+                if item_type != "message":
+                    continue
 
-                if content_type in {"output_json", "json_schema"}:
-                    if "json" in content_item:
-                        parsed_candidates.append(content_item.get("json"))
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+
+                for content_item in content:
+                    if not isinstance(content_item, Mapping):
+                        continue
+
                     if "parsed" in content_item:
-                        parsed_candidates.append(content_item.get("parsed"))
+                        parsed = self._normalize_parsed_output(content_item.get("parsed"))
+                        if parsed is not None:
+                            candidates.append(parsed)
 
-                if "parsed" in content_item:
-                    parsed_candidates.append(content_item.get("parsed"))
-                if "json" in content_item:
-                    parsed_candidates.append(content_item.get("json"))
+                    if "json" in content_item:
+                        parsed = self._normalize_parsed_output(content_item.get("json"))
+                        if parsed is not None:
+                            candidates.append(parsed)
 
-        for candidate in parsed_candidates:
-            parsed = self._normalize_parsed_output(candidate)
-            if parsed is not None:
-                return parsed
+        if not candidates:
+            return None
 
-        return None
+        unique_candidates = self._dedupe_mapping_candidates_strict(candidates, field_name="structured_output_candidates")
+        if len(unique_candidates) != 1:
+            raise RuntimeError("OpenAI structured output must contain exactly one JSON object candidate")
+
+        return unique_candidates[0]
 
     def _normalize_parsed_output(self, value: Any) -> Optional[Dict[str, Any]]:
         if value is None:
@@ -679,12 +675,16 @@ class GptAnalystEngine:
         우선순위:
         1) response.output_text
         2) response.output[].content[] 중 type=output_text 의 text/value
-        3) SDK dump 내 output/message/content 범위에서만 제한 탐색
+
+        STRICT:
+        - 후보가 여러 개면 내용이 완전히 동일한 경우만 허용
+        - 서로 다른 후보가 2개 이상이면 즉시 예외
         """
 
-        raw_text = self._safe_get_attr(response, "output_text")
-        if isinstance(raw_text, str) and raw_text.strip():
-            return raw_text.strip()
+        output_text_direct = self._safe_get_attr(response, "output_text")
+        candidates: List[str] = []
+        if isinstance(output_text_direct, str) and output_text_direct.strip():
+            candidates.append(output_text_direct.strip())
 
         dumped = self._response_to_python(response)
 
@@ -694,59 +694,54 @@ class GptAnalystEngine:
                 ("output",),
             ],
         )
-        if not isinstance(output_items, list) or not output_items:
-            raise RuntimeError("OpenAI response contained no output items")
-
-        text_candidates: List[str] = []
-
-        for item in output_items:
-            if not isinstance(item, Mapping):
-                continue
-
-            item_type = item.get("type")
-            if item_type != "message":
-                continue
-
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-
-            for content_item in content:
-                if not isinstance(content_item, Mapping):
+        if isinstance(output_items, list):
+            for item in output_items:
+                if not isinstance(item, Mapping):
                     continue
 
-                content_type = content_item.get("type")
-                if content_type == "refusal":
-                    refusal_text = self._first_nonempty_string(
+                item_type = item.get("type")
+                if item_type != "message":
+                    continue
+
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+
+                for content_item in content:
+                    if not isinstance(content_item, Mapping):
+                        continue
+
+                    content_type = content_item.get("type")
+                    if content_type == "refusal":
+                        refusal_text = self._first_nonempty_string(
+                            [
+                                content_item.get("refusal"),
+                                content_item.get("text"),
+                                content_item.get("value"),
+                            ]
+                        )
+                        if refusal_text is not None:
+                            raise RuntimeError(f"OpenAI response refused request: {refusal_text}")
+
+                    if content_type != "output_text":
+                        continue
+
+                    candidate = self._first_nonempty_string(
                         [
-                            content_item.get("refusal"),
                             content_item.get("text"),
                             content_item.get("value"),
                         ]
                     )
-                    if refusal_text is not None:
-                        raise RuntimeError(f"OpenAI response refused request: {refusal_text}")
+                    if candidate is not None:
+                        candidates.append(candidate)
 
-                if content_type != "output_text":
-                    continue
-
-                candidate = self._first_nonempty_string(
-                    [
-                        content_item.get("text"),
-                        content_item.get("value"),
-                    ]
-                )
-                if candidate is not None:
-                    text_candidates.append(candidate)
-
-        if not text_candidates:
+        unique_candidates = self._dedupe_string_candidates_strict(candidates, field_name="output_text_candidates")
+        if not unique_candidates:
             raise RuntimeError("OpenAI response contained no text content")
+        if len(unique_candidates) != 1:
+            raise RuntimeError("OpenAI text output must contain exactly one unique text candidate")
 
-        best = self._choose_best_text_candidate(text_candidates)
-        if best is None:
-            raise RuntimeError("OpenAI response contained no usable text content")
-
-        return best
+        return unique_candidates[0]
 
     def _response_to_python(self, response: Any) -> Any:
         if response is None:
@@ -779,50 +774,6 @@ class GptAnalystEngine:
             return dict(response.__dict__)
 
         return response
-
-    def _choose_best_text_candidate(self, candidates: List[str]) -> Optional[str]:
-        json_like: List[str] = []
-        for item in candidates:
-            text = item.strip()
-            if text.startswith("{") and text.endswith("}"):
-                json_like.append(text)
-
-        for candidate in json_like:
-            if self._looks_like_required_json(candidate):
-                return candidate
-
-        fenced_json: List[str] = []
-        for item in candidates:
-            match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", item, flags=re.DOTALL)
-            if match is not None:
-                fenced_json.append(match.group(1).strip())
-
-        for candidate in fenced_json:
-            if self._looks_like_required_json(candidate):
-                return candidate
-
-        if not candidates:
-            return None
-
-        return max(candidates, key=len).strip()
-
-    def _looks_like_required_json(self, candidate: str) -> bool:
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            return False
-        if not isinstance(obj, dict):
-            return False
-
-        required_keys = {
-            "scope",
-            "answer_ko",
-            "root_causes",
-            "recommendations",
-            "confidence",
-            "used_inputs",
-        }
-        return set(obj.keys()) == required_keys
 
     def _extract_refusal_text(self, response: Any) -> Optional[str]:
         dumped = self._response_to_python(response)
@@ -981,6 +932,35 @@ class GptAnalystEngine:
                 return value.strip()
         return None
 
+    def _dedupe_string_candidates_strict(self, values: Sequence[str], field_name: str) -> List[str]:
+        unique: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise RuntimeError(f"{field_name} must contain strings only (STRICT)")
+            text = value.strip()
+            if not text:
+                continue
+            if text not in seen:
+                seen.add(text)
+                unique.append(text)
+        return unique
+
+    def _dedupe_mapping_candidates_strict(self, values: Sequence[Mapping[str, Any]], field_name: str) -> List[Dict[str, Any]]:
+        unique: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for value in values:
+            if not isinstance(value, Mapping):
+                raise RuntimeError(f"{field_name} must contain mappings only (STRICT)")
+            normalized = dict(value)
+            fingerprint = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                unique.append(normalized)
+
+        return unique
+
     # ========================================================
     # Strict output parsing
     # ========================================================
@@ -1084,6 +1064,11 @@ class GptAnalystEngine:
             raise RuntimeError("root_causes must contain 1 to 4 items for non-out_of_scope")
         if not (1 <= len(result.recommendations) <= 4):
             raise RuntimeError("recommendations must contain 1 to 4 items for non-out_of_scope")
+
+        if len(set(result.root_causes)) != len(result.root_causes):
+            raise RuntimeError("root_causes must not contain duplicates")
+        if len(set(result.recommendations)) != len(result.recommendations):
+            raise RuntimeError("recommendations must not contain duplicates")
 
     def _extract_single_json_object(self, raw_text: str) -> str:
         text = raw_text.strip()
@@ -1267,43 +1252,83 @@ class GptAnalystEngine:
     # Settings helpers
     # ========================================================
 
-    def _require_str_setting(self, name: str) -> str:
-        value = getattr(SETTINGS, name, None)
+    def _get_setting_alias_values_or_raise(self, logical_name: str) -> List[Tuple[str, Any]]:
+        if logical_name not in _SETTING_ALIASES:
+            raise RuntimeError(f"Unknown setting logical name: {logical_name}")
+
+        aliases = _SETTING_ALIASES[logical_name]
+        found: List[Tuple[str, Any]] = []
+        for alias in aliases:
+            if hasattr(SETTINGS, alias):
+                found.append((alias, getattr(SETTINGS, alias)))
+        if not found:
+            raise RuntimeError(f"Missing required setting aliases for {logical_name}: {aliases}")
+        return found
+
+    def _require_single_setting_value_or_raise(self, logical_name: str) -> Any:
+        found = self._get_setting_alias_values_or_raise(logical_name)
+
+        normalized_pairs: List[Tuple[str, Any]] = []
+        for alias, value in found:
+            if value is None:
+                continue
+            normalized_pairs.append((alias, value))
+
+        if not normalized_pairs:
+            aliases = _SETTING_ALIASES[logical_name]
+            raise RuntimeError(f"All candidate settings are None for {logical_name}: {aliases}")
+
+        first_value = normalized_pairs[0][1]
+        for alias, value in normalized_pairs[1:]:
+            if value != first_value:
+                raise RuntimeError(
+                    f"Conflicting setting aliases for {logical_name}: "
+                    f"{[(a, v) for a, v in normalized_pairs]}"
+                )
+
+        return first_value
+
+    def _require_str_setting(self, logical_name: str) -> str:
+        value = self._require_single_setting_value_or_raise(logical_name)
         if not isinstance(value, str) or not value.strip():
-            raise RuntimeError(f"Missing or invalid required setting: {name}")
+            raise RuntimeError(f"Missing or invalid required string setting: {logical_name}")
         return value.strip()
 
-    def _optional_str_setting(self, name: str) -> Optional[str]:
-        value = getattr(SETTINGS, name, None)
+    def _optional_str_setting(self, logical_name: str) -> Optional[str]:
+        try:
+            value = self._require_single_setting_value_or_raise(logical_name)
+        except RuntimeError:
+            return None
+
         if value is None:
             return None
         if not isinstance(value, str):
-            raise RuntimeError(f"Invalid optional string setting: {name}")
+            raise RuntimeError(f"Invalid optional string setting: {logical_name}")
         value_norm = value.strip()
         if not value_norm:
             return None
         return value_norm
 
-    def _require_int_setting(self, name: str) -> int:
-        value = getattr(SETTINGS, name, None)
+    def _require_int_setting(self, logical_name: str) -> int:
+        value = self._require_single_setting_value_or_raise(logical_name)
         if isinstance(value, bool):
-            raise RuntimeError(f"Invalid bool value for integer setting: {name}")
+            raise RuntimeError(f"Invalid bool value for integer setting: {logical_name}")
         try:
             parsed = int(value)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"Missing or invalid required int setting: {name}") from exc
+            raise RuntimeError(f"Missing or invalid required int setting: {logical_name}") from exc
         return parsed
 
-    def _require_float_setting(self, name: str) -> float:
-        value = getattr(SETTINGS, name, None)
+    def _require_float_setting(self, logical_name: str) -> float:
+        value = self._require_single_setting_value_or_raise(logical_name)
         if isinstance(value, bool):
-            raise RuntimeError(f"Invalid bool value for float setting: {name}")
+            raise RuntimeError(f"Invalid bool value for float setting: {logical_name}")
         try:
             parsed = float(value)
         except (TypeError, ValueError) as exc:
-            raise RuntimeError(f"Missing or invalid required float setting: {name}") from exc
+            raise RuntimeError(f"Missing or invalid required float setting: {logical_name}") from exc
         if not math.isfinite(parsed):
-            raise RuntimeError(f"{name} must be finite")
+            raise RuntimeError(f"{logical_name} must be finite")
         return parsed
 
     # ========================================================

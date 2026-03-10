@@ -25,10 +25,11 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): ws_orderbook_max_delay_sec → ws_market_event_max_delay_sec 로 설정 계약명 정정
-  2) FIX(COMPAT): WS_MARKET_EVENT_MAX_DELAY_SEC / WS_ORDERBOOK_MAX_DELAY_SEC 충돌 시 즉시 예외 처리
-  3) FIX(SSOT): market_data_ws.py 가 사용하는 숨은 설정들을 Settings 정식 필드로 승격
-  4) FIX(SSOT): analyst_auto_report_market_interval_sec dataclass 기본값 7200 → 300 정합화
+  1) FIX(SSOT): unified_features_builder / order_executor / engine_watchdog 가 요구하는 설정 필드를 정식 승격
+  2) FIX(SSOT): features_required_tfs / microstructure_* / low_vol_* / exit_fill_wait_sec / position_reflect_wait_sec 추가
+  3) FIX(SSOT): engine_watchdog_interval_sec / engine_watchdog_max_db_ping_ms / engine_watchdog_emit_min_sec 추가
+  4) FIX(ROOT-CAUSE): ALPHAVANTAGE_API_KEY 를 전역 부팅 필수에서 제거 (분석 계층 전용 optional)
+  5) FIX(COMPAT): 신규 설정들의 uppercase alias 접근 호환성 추가
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): max_exec_latency_ms dataclass / loader 기본값 2500 정합화
   2) CLEANUP: analyst_openai_temperature 호환성 필드 유지 주석 보강
@@ -85,6 +86,21 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "WS_NO_BUFFER_LOG_SUPPRESS_SEC": "ws_no_buffer_log_suppress_sec",
     "WS_PONG_MAX_DELAY_SEC": "ws_pong_max_delay_sec",
     "WS_PONG_STARTUP_GRACE_SEC": "ws_pong_startup_grace_sec",
+    # Unified features / market features
+    "FEATURES_REQUIRED_TFS": "features_required_tfs",
+    "FEATURES_ERROR_TG_COOLDOWN_SEC": "features_error_tg_cooldown_sec",
+    "LOW_VOL_RANGE_PCT_THRESHOLD": "low_vol_range_pct_threshold",
+    "LOW_VOL_ATR_PCT_THRESHOLD": "low_vol_atr_pct_threshold",
+    "MICROSTRUCTURE_PERIOD": "microstructure_period",
+    "MICROSTRUCTURE_LOOKBACK": "microstructure_lookback",
+    "MICROSTRUCTURE_CACHE_TTL_SEC": "microstructure_cache_ttl_sec",
+    # Execution / sync
+    "POSITION_REFLECT_WAIT_SEC": "position_reflect_wait_sec",
+    "EXIT_FILL_WAIT_SEC": "exit_fill_wait_sec",
+    # Watchdog
+    "ENGINE_WATCHDOG_INTERVAL_SEC": "engine_watchdog_interval_sec",
+    "ENGINE_WATCHDOG_MAX_DB_PING_MS": "engine_watchdog_max_db_ping_ms",
+    "ENGINE_WATCHDOG_EMIT_MIN_SEC": "engine_watchdog_emit_min_sec",
     # AI analyst
     "ANALYST_MARKET_SYMBOL": "analyst_market_symbol",
     "ANALYST_DB_MARKET_TIMEFRAME": "analyst_db_market_timeframe",
@@ -323,7 +339,25 @@ class Settings:
     # 실행/멱등성/체결 확정
     require_deterministic_client_order_id: bool = True
     entry_fill_wait_sec: float = 2.0
+    position_reflect_wait_sec: float = 1.2
+    exit_fill_wait_sec: float = 2.0
     max_entry_slippage_pct: Optional[float] = None
+
+    # Unified features / market features
+    features_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
+    features_error_tg_cooldown_sec: float = 60.0
+    low_vol_range_pct_threshold: float = 0.01
+    low_vol_atr_pct_threshold: float = 0.004
+
+    # Microstructure
+    microstructure_period: str = "5m"
+    microstructure_lookback: int = 30
+    microstructure_cache_ttl_sec: int = 15
+
+    # Engine watchdog
+    engine_watchdog_interval_sec: float = 5.0
+    engine_watchdog_max_db_ping_ms: int = 1500
+    engine_watchdog_emit_min_sec: int = 30
 
     # TEST controls
     test_dry_run: bool = False
@@ -727,6 +761,19 @@ def _validate_http_base_url(name: str, value: str) -> None:
         raise ValueError(f"{name} must start with http:// or https://")
 
 
+def _validate_tf_list(name: str, values: List[str]) -> None:
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"{name} must be non-empty list[str]")
+    cleaned: List[str] = []
+    for i, v in enumerate(values):
+        s = str(v).strip()
+        if not s:
+            raise ValueError(f"{name}[{i}] is empty")
+        cleaned.append(s)
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError(f"{name} contains duplicate intervals")
+
+
 def _validate_settings(s: Settings) -> None:
     if not s.api_key or not s.api_secret:
         raise RuntimeError("missing Binance credentials (BINANCE_API_KEY / BINANCE_API_SECRET)")
@@ -872,6 +919,17 @@ def _validate_settings(s: Settings) -> None:
     if s.position_resync_sec <= 0:
         raise ValueError("position_resync_sec must be > 0")
 
+    _validate_tf_list("ws_subscribe_tfs", s.ws_subscribe_tfs)
+    _validate_tf_list("ws_required_tfs", s.ws_required_tfs)
+    _validate_tf_list("ws_backfill_tfs", s.ws_backfill_tfs)
+    _validate_tf_list("md_store_tfs", s.md_store_tfs)
+    _validate_tf_list("features_required_tfs", s.features_required_tfs)
+
+    if not set(s.ws_required_tfs).issubset(set(s.ws_subscribe_tfs)):
+        raise ValueError("ws_required_tfs must be subset of ws_subscribe_tfs")
+    if not set(s.features_required_tfs).issubset(set(s.ws_subscribe_tfs)):
+        raise ValueError("features_required_tfs must be subset of ws_subscribe_tfs")
+
     if not (0.0 < float(s.drift_allocation_abs_jump) <= 1.0):
         raise ValueError("drift_allocation_abs_jump must be within (0,1]")
     if float(s.drift_allocation_spike_ratio) <= 1.0:
@@ -891,11 +949,44 @@ def _validate_settings(s: Settings) -> None:
     if float(s.entry_fill_wait_sec) <= 0:
         raise ValueError("entry_fill_wait_sec must be > 0")
 
+    if not (isinstance(s.position_reflect_wait_sec, (int, float)) and math.isfinite(float(s.position_reflect_wait_sec))):
+        raise ValueError("position_reflect_wait_sec must be finite number")
+    if float(s.position_reflect_wait_sec) <= 0:
+        raise ValueError("position_reflect_wait_sec must be > 0")
+
+    if not (isinstance(s.exit_fill_wait_sec, (int, float)) and math.isfinite(float(s.exit_fill_wait_sec))):
+        raise ValueError("exit_fill_wait_sec must be finite number")
+    if float(s.exit_fill_wait_sec) <= 0:
+        raise ValueError("exit_fill_wait_sec must be > 0")
+
     if s.max_entry_slippage_pct is not None:
         if not (isinstance(s.max_entry_slippage_pct, (int, float)) and math.isfinite(float(s.max_entry_slippage_pct))):
             raise ValueError("max_entry_slippage_pct must be finite number or None")
         if float(s.max_entry_slippage_pct) < 0:
             raise ValueError("max_entry_slippage_pct must be >= 0")
+
+    if s.features_error_tg_cooldown_sec <= 0:
+        raise ValueError("features_error_tg_cooldown_sec must be > 0")
+    if not (0.0 < float(s.low_vol_range_pct_threshold) <= 1.0):
+        raise ValueError("low_vol_range_pct_threshold must be within (0,1]")
+    if not (0.0 < float(s.low_vol_atr_pct_threshold) <= 1.0):
+        raise ValueError("low_vol_atr_pct_threshold must be within (0,1]")
+
+    if not str(s.microstructure_period or "").strip():
+        raise ValueError("microstructure_period is empty")
+    if s.microstructure_lookback < 2 or s.microstructure_lookback > 500:
+        raise ValueError("microstructure_lookback must be within 2..500")
+    if s.microstructure_cache_ttl_sec < 1 or s.microstructure_cache_ttl_sec > 300:
+        raise ValueError("microstructure_cache_ttl_sec must be within 1..300")
+
+    if not (isinstance(s.engine_watchdog_interval_sec, (int, float)) and math.isfinite(float(s.engine_watchdog_interval_sec))):
+        raise ValueError("engine_watchdog_interval_sec must be finite number")
+    if float(s.engine_watchdog_interval_sec) <= 0:
+        raise ValueError("engine_watchdog_interval_sec must be > 0")
+    if s.engine_watchdog_max_db_ping_ms < 1:
+        raise ValueError("engine_watchdog_max_db_ping_ms must be >= 1")
+    if s.engine_watchdog_emit_min_sec < 1:
+        raise ValueError("engine_watchdog_emit_min_sec must be >= 1")
 
     if not str(s.openai_api_key or "").strip():
         raise RuntimeError("missing OpenAI key (OPENAI_API_KEY)")
@@ -911,9 +1002,6 @@ def _validate_settings(s: Settings) -> None:
         and float(s.openai_max_latency_sec) > 0
     ):
         raise ValueError("openai_max_latency_sec must be finite > 0")
-
-    if not str(s.alphavantage_api_key or "").strip():
-        raise RuntimeError("missing Alpha Vantage key (ALPHAVANTAGE_API_KEY)")
 
     if s.test_bypass_guards and not s.test_dry_run:
         raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
@@ -1190,7 +1278,22 @@ def load_settings() -> Settings:
 
     require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
     entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
+    position_reflect_wait_sec = _as_float("POSITION_REFLECT_WAIT_SEC", 1.2)
+    exit_fill_wait_sec = _as_float("EXIT_FILL_WAIT_SEC", 2.0)
     max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
+
+    features_required_tfs = _as_csv_list("FEATURES_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
+    features_error_tg_cooldown_sec = _as_float("FEATURES_ERROR_TG_COOLDOWN_SEC", 60.0)
+    low_vol_range_pct_threshold = _as_float("LOW_VOL_RANGE_PCT_THRESHOLD", 0.01)
+    low_vol_atr_pct_threshold = _as_float("LOW_VOL_ATR_PCT_THRESHOLD", 0.004)
+
+    microstructure_period = _as_str("MICROSTRUCTURE_PERIOD", "5m")
+    microstructure_lookback = _as_int("MICROSTRUCTURE_LOOKBACK", 30)
+    microstructure_cache_ttl_sec = _as_int("MICROSTRUCTURE_CACHE_TTL_SEC", 15)
+
+    engine_watchdog_interval_sec = _as_float("ENGINE_WATCHDOG_INTERVAL_SEC", 5.0)
+    engine_watchdog_max_db_ping_ms = _as_int("ENGINE_WATCHDOG_MAX_DB_PING_MS", 1500)
+    engine_watchdog_emit_min_sec = _as_int("ENGINE_WATCHDOG_EMIT_MIN_SEC", 30)
 
     redis_url = _as_str("REDIS_URL", "redis://localhost:6379/0")
     dashboard_cache_prefix = _as_str("DASHBOARD_CACHE_PREFIX", "auto_trader_dashboard")
@@ -1360,7 +1463,19 @@ def load_settings() -> Settings:
         protection_mode_enabled=protection_mode_enabled,
         require_deterministic_client_order_id=require_deterministic_client_order_id,
         entry_fill_wait_sec=entry_fill_wait_sec,
+        position_reflect_wait_sec=position_reflect_wait_sec,
+        exit_fill_wait_sec=exit_fill_wait_sec,
         max_entry_slippage_pct=max_entry_slippage_pct,
+        features_required_tfs=features_required_tfs,
+        features_error_tg_cooldown_sec=features_error_tg_cooldown_sec,
+        low_vol_range_pct_threshold=low_vol_range_pct_threshold,
+        low_vol_atr_pct_threshold=low_vol_atr_pct_threshold,
+        microstructure_period=microstructure_period,
+        microstructure_lookback=microstructure_lookback,
+        microstructure_cache_ttl_sec=microstructure_cache_ttl_sec,
+        engine_watchdog_interval_sec=engine_watchdog_interval_sec,
+        engine_watchdog_max_db_ping_ms=engine_watchdog_max_db_ping_ms,
+        engine_watchdog_emit_min_sec=engine_watchdog_emit_min_sec,
         test_dry_run=test_dry_run,
         test_bypass_guards=test_bypass_guards,
         test_force_enter=test_force_enter,

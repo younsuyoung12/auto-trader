@@ -17,17 +17,17 @@ IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
 - 데이터 누락/손상/계약 불일치는 즉시 예외
 - 더미 값 생성, silent continue, 예외 삼키기 금지
-- 실시간 freshness 판단은 "payload 변경 유무"와 "WS transport 생존성"을 분리한다
-- orderbook payload 무결성과 WS 세션 freshness를 혼동하지 않는다
+- health 판단은 transport / payload / feed activity 를 분리한다
+- orderbook payload 무결성과 feed inactivity warning을 혼동하지 않는다
 - 환경변수 직접 접근 금지, settings.py(SSOT)만 사용
 
 CHANGE HISTORY:
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): orderbook health가 top-of-book 미변경만으로 FAIL 나던 구조 제거
-  2) ADD(OBSERVABILITY): ws session state(last_open/last_close/last_message/last_pong/error) 추적 추가
-  3) FIX(ARCH): orderbook payload health와 WS transport / market-feed freshness 판단 분리
-  4) FIX(STRICT): ws.close 실패를 더 이상 조용히 무시하지 않고 원인 로그를 남김
-  5) FIX(SSOT): settings.py 에 선언되지 않은 숨은 기본값(getattr default) 제거
+  1) FIX(ROOT-CAUSE): ws_status.ok 를 transport 상태만 의미하도록 정리
+  2) FIX(ROOT-CAUSE): orderbook health 에서 feed inactivity warning 과 payload fail 분리
+  3) ADD(OBSERVABILITY): orderbook 전용 last recv ts / recv_delay 상태 추적 추가
+  4) ADD(API): get_orderbook_buffer_status() 공개
+  5) FIX(ARCH): get_health_snapshot() 가 warning 때문에 overall FAIL 되지 않도록 정리
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): downstream EMA200 요구량과 WS bootstrap/min-buffer 정책 정합화
   2) FIX(STRICT): 5m / 15m / 1h / 4h interval에 최소 200개 캔들 강제
@@ -47,9 +47,9 @@ import requests
 import websocket  # pip install websocket-client
 
 from infra.telelog import log
-from settings import load_settings
+from settings import SETTINGS
 
-SET = load_settings()
+SET = SETTINGS
 
 
 class WSProtocolError(RuntimeError):
@@ -264,6 +264,7 @@ _kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
 
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 _orderbook_last_update_id: Dict[str, int] = {}
+_orderbook_last_recv_ts: Dict[str, int] = {}
 
 _ws_connection_open: Dict[str, bool] = {}
 _ws_last_open_ts: Dict[str, int] = {}
@@ -348,7 +349,22 @@ def _mark_ws_error(symbol: str, error: Any) -> None:
         _ws_last_error_text[sym] = msg
 
 
+def _mark_orderbook_message(symbol: str, received_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for orderbook message state")
+    with _orderbook_lock:
+        _orderbook_last_recv_ts[sym] = int(received_at_ms)
+
+
 def get_ws_status(symbol: str) -> Dict[str, Any]:
+    """
+    WS session status.
+
+    ok:
+    - transport 상태만 의미한다.
+    - market_feed inactivity는 warning 으로 분리한다.
+    """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
 
@@ -399,7 +415,8 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
                 f"market_event_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={market_event_delay_sec:.1f})"
             )
 
-    reasons = [f"transport:{r}" for r in transport_reasons] + [f"market_feed:{r}" for r in market_feed_reasons]
+    transport_reason_items = [f"transport:{r}" for r in transport_reasons]
+    warning_items = [f"market_feed:{r}" for r in market_feed_reasons]
 
     return {
         "symbol": sym,
@@ -414,8 +431,11 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
         "last_error": last_error,
         "transport_ok": len(transport_reasons) == 0,
         "market_feed_ok": len(market_feed_reasons) == 0,
-        "ok": len(reasons) == 0,
-        "reasons": reasons,
+        "ok": len(transport_reasons) == 0,
+        "reasons": transport_reason_items,
+        "warnings": warning_items,
+        "transport_reasons": transport_reason_items,
+        "market_feed_reasons": warning_items,
     }
 
 
@@ -656,6 +676,7 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
 
     now_ms = _now_ms()
     _mark_ws_message(sym, now_ms)
+    _mark_orderbook_message(sym, now_ms)
 
     best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
     spread_pct = _compute_spread_pct(best_bid, best_ask)
@@ -766,6 +787,7 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
     with _orderbook_lock:
         _orderbook_last_update_id.pop(sym, None)
         _orderbook_buffers.pop(sym, None)
+        _orderbook_last_recv_ts.pop(sym, None)
 
     _mark_ws_open(sym, _now_ms())
     log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
@@ -962,6 +984,40 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
     return result
 
 
+def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    now_ms = _now_ms()
+
+    with _orderbook_lock:
+        ob = _orderbook_buffers.get(sym)
+        last_recv_ts = _orderbook_last_recv_ts.get(sym)
+
+    payload_ts = None
+    last_update_id = None
+    has_orderbook = ob is not None
+    if ob is not None:
+        payload_ts = ob.get("ts")
+        last_update_id = ob.get("lastUpdateId")
+
+    recv_delay_ms = None
+    if last_recv_ts is not None:
+        recv_delay_ms = max(0, now_ms - int(last_recv_ts))
+
+    payload_delay_ms = None
+    if payload_ts is not None:
+        payload_delay_ms = max(0, now_ms - int(payload_ts))
+
+    return {
+        "symbol": sym,
+        "has_orderbook": has_orderbook,
+        "last_recv_ts": last_recv_ts,
+        "recv_delay_ms": recv_delay_ms,
+        "payload_ts": payload_ts,
+        "payload_delay_ms": payload_delay_ms,
+        "last_update_id": last_update_id,
+    }
+
+
 def _compute_kline_health(symbol: str, interval: str) -> Dict[str, Any]:
     status = get_kline_buffer_status(symbol, interval)
     buffer_len = status["buffer_len"]
@@ -991,80 +1047,104 @@ def _compute_kline_health(symbol: str, interval: str) -> Dict[str, Any]:
 
 
 def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
+    """
+    Orderbook health는 payload integrity와 WS transport만 FAIL 조건으로 본다.
+
+    feed inactivity는 warning 으로만 다룬다.
+    """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
     ws_status = get_ws_status(sym)
 
     with _orderbook_lock:
         ob = _orderbook_buffers.get(sym)
+        orderbook_last_recv_ts = _orderbook_last_recv_ts.get(sym)
+
+    transport_reasons: List[str] = list(ws_status.get("transport_reasons") or [])
+    payload_reasons: List[str] = []
+    warning_reasons: List[str] = []
 
     result: Dict[str, Any] = {
         "symbol": sym,
         "has_orderbook": ob is not None,
         "transport_ok": bool(ws_status.get("transport_ok", False)),
-        "market_feed_ok": bool(ws_status.get("market_feed_ok", False)),
+        "market_feed_ok": True,
+        "feed_activity_warning": False,
         "payload_ok": False,
+        "transport_reasons": transport_reasons,
+        "payload_reasons": payload_reasons,
+        "warnings": warning_reasons,
         "orderbook_update_delay_ms": None,
+        "orderbook_recv_delay_ms": None,
         "market_event_delay_ms": ws_status.get("market_event_delay_ms"),
         "last_ws_message_ts": ws_status.get("last_message_ts"),
+        "last_orderbook_recv_ts": orderbook_last_recv_ts,
         "last_pong_ts": ws_status.get("last_pong_ts"),
         "last_update_id": None,
         "ok": False,
         "reasons": [],
     }
 
-    reasons: List[str] = list(ws_status.get("reasons") or [])
-
     if ob is None:
-        reasons.append("payload:no_orderbook")
-        result["reasons"] = reasons
-        result["ok"] = False
-        result["payload_ok"] = False
-        return result
-
-    ts = ob.get("ts")
-    if ts is None:
-        reasons.append("payload:no_ts")
+        payload_reasons.append("payload:no_orderbook")
     else:
-        result["orderbook_update_delay_ms"] = max(0, now_ms - int(ts))
-
-    bids = ob.get("bids") or []
-    asks = ob.get("asks") or []
-    if not bids:
-        reasons.append("payload:empty_bids")
-    if not asks:
-        reasons.append("payload:empty_asks")
-
-    best_bid = ob.get("bestBid")
-    best_ask = ob.get("bestAsk")
-    if best_bid is None or best_ask is None:
-        reasons.append("payload:no_best_prices")
-    else:
-        try:
-            bb = float(best_bid)
-            ba = float(best_ask)
-            if ba <= bb:
-                reasons.append("payload:crossed_book(bestAsk<=bestBid)")
-        except Exception:
-            reasons.append("payload:invalid_best_prices")
-
-    last_update_id = ob.get("lastUpdateId")
-    if last_update_id is None:
-        reasons.append("payload:no_last_update_id")
-    else:
-        try:
-            parsed_update_id = int(last_update_id)
-        except Exception:
-            reasons.append("payload:invalid_last_update_id")
+        ts = ob.get("ts")
+        if ts is None:
+            payload_reasons.append("payload:no_ts")
         else:
-            if parsed_update_id <= 0:
-                reasons.append("payload:non_positive_last_update_id")
-            result["last_update_id"] = parsed_update_id
+            result["orderbook_update_delay_ms"] = max(0, now_ms - int(ts))
 
-    payload_reasons = [r for r in reasons if r.startswith("payload:")]
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+
+        if not bids:
+            payload_reasons.append("payload:empty_bids")
+        if not asks:
+            payload_reasons.append("payload:empty_asks")
+
+        best_bid = ob.get("bestBid")
+        best_ask = ob.get("bestAsk")
+        if best_bid is None or best_ask is None:
+            payload_reasons.append("payload:no_best_prices")
+        else:
+            try:
+                bb = float(best_bid)
+                ba = float(best_ask)
+                if ba <= bb:
+                    payload_reasons.append("payload:crossed_book(bestAsk<=bestBid)")
+            except Exception:
+                payload_reasons.append("payload:invalid_best_prices")
+
+        last_update_id = ob.get("lastUpdateId")
+        if last_update_id is None:
+            payload_reasons.append("payload:no_last_update_id")
+        else:
+            try:
+                parsed_update_id = int(last_update_id)
+            except Exception:
+                payload_reasons.append("payload:invalid_last_update_id")
+            else:
+                if parsed_update_id <= 0:
+                    payload_reasons.append("payload:non_positive_last_update_id")
+                result["last_update_id"] = parsed_update_id
+
+    if orderbook_last_recv_ts is None:
+        if ob is not None:
+            warning_reasons.append("feed:no_orderbook_recv_ts")
+    else:
+        recv_delay_ms = max(0, now_ms - int(orderbook_last_recv_ts))
+        result["orderbook_recv_delay_ms"] = recv_delay_ms
+        recv_delay_sec = recv_delay_ms / 1000.0
+        if recv_delay_sec > MARKET_EVENT_MAX_DELAY_SEC:
+            warning_reasons.append(
+                f"feed:orderbook_recv_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={recv_delay_sec:.1f})"
+            )
+
     result["payload_ok"] = len(payload_reasons) == 0
-    result["reasons"] = reasons
-    result["ok"] = bool(result["transport_ok"]) and bool(result["market_feed_ok"]) and bool(result["payload_ok"])
+    result["market_feed_ok"] = len(warning_reasons) == 0
+    result["feed_activity_warning"] = len(warning_reasons) > 0
+    result["reasons"] = transport_reasons + payload_reasons
+    result["ok"] = bool(result["transport_ok"]) and bool(result["payload_ok"])
     return result
 
 
@@ -1107,10 +1187,12 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
         "overall_ok": True,
         "overall_kline_ok": True,
         "overall_orderbook_ok": True,
+        "overall_transport_ok": True,
         "ws": {},
         "klines": {},
         "orderbook": {},
         "overall_reasons": [],
+        "overall_warnings": [],
         "checked_at_ms": _now_ms(),
         "required_intervals": list(REQUIRED_INTERVALS),
     }
@@ -1118,13 +1200,21 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
     overall_ok = True
     overall_kline_ok = True
     overall_orderbook_ok = True
+    overall_transport_ok = True
     overall_reasons: List[str] = []
+    overall_warnings: List[str] = []
 
     ws_status = get_ws_status(sym)
     snapshot["ws"] = ws_status
-    if not ws_status.get("ok", False):
+
+    if not ws_status.get("transport_ok", False):
         overall_ok = False
+        overall_transport_ok = False
         overall_reasons.append(f"ws:{'|'.join(ws_status.get('reasons') or [])}")
+
+    ws_warning_items = list(ws_status.get("warnings") or [])
+    if ws_warning_items:
+        overall_warnings.extend([f"ws:{w}" for w in ws_warning_items])
 
     kline_map: Dict[str, Any] = {}
     for iv in REQUIRED_INTERVALS:
@@ -1137,16 +1227,24 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
 
     ob_status = _compute_orderbook_health(sym)
     snapshot["orderbook"] = ob_status
+
     if not ob_status.get("ok", False):
         overall_ok = False
         overall_orderbook_ok = False
         overall_reasons.append(f"orderbook:{'|'.join(ob_status.get('reasons') or [])}")
 
+    ob_warning_items = list(ob_status.get("warnings") or [])
+    if ob_warning_items:
+        overall_warnings.extend([f"orderbook:{w}" for w in ob_warning_items])
+
     snapshot["klines"] = kline_map
     snapshot["overall_ok"] = overall_ok
     snapshot["overall_kline_ok"] = overall_kline_ok
     snapshot["overall_orderbook_ok"] = overall_orderbook_ok
+    snapshot["overall_transport_ok"] = overall_transport_ok
     snapshot["overall_reasons"] = overall_reasons
+    snapshot["overall_warnings"] = overall_warnings
+    snapshot["has_warning"] = len(overall_warnings) > 0
 
     _maybe_log_health_fail(snapshot)
     return snapshot
@@ -1266,6 +1364,7 @@ __all__ = [
     "get_last_kline_ts",
     "get_last_kline_delay_ms",
     "get_kline_buffer_status",
+    "get_orderbook_buffer_status",
     "get_orderbook",
     "get_ws_status",
     "get_health_snapshot",

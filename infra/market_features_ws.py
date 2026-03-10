@@ -11,6 +11,7 @@ CORE RESPONSIBILITIES:
 - 오더북(depth5) freshness / 무결성 검증
 - 타임프레임별 지표 및 multi-timeframe summary 생성
 - entry_flow 가 직접 사용할 수 있는 trading signal 생성
+- market_data_ws health snapshot 계약을 STRICT 검증하고 warning 정보를 보존한다
 
 IMPORTANT POLICY:
 - settings.py 는 단일 설정 소스(SSOT)다.
@@ -18,15 +19,15 @@ IMPORTANT POLICY:
 - 데이터 누락 / stale / NaN / 계약 불일치는 즉시 예외 처리한다.
 - orderbook timestamp 누락을 현재 시각으로 대체하지 않는다.
 - 비핵심 알림 실패는 로깅하되, 핵심 데이터 실패를 가리지 않는다.
+- market_data_ws 의 WARNING 상태는 관측 정보로 보존하되 feature 생성 실패로 오판하지 않는다.
 
 CHANGE HISTORY:
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): ORDERBOOK_MAX_DELAY_SEC / KLINE_MAX_DELAY_SEC / KLINE_MIN_BUFFER
-     를 market_data_ws 의존에서 제거하고 settings SSOT로 정렬
-  2) FIX(SSOT): load_settings() 재호출 제거, settings.SETTINGS 단일 객체 사용
-  3) FIX(STRICT): orderbook timestamp 누락 시 now_ms fallback 제거
-  4) FIX(STRICT): get_health_snapshot 예외를 로그 후 진행하지 않고 즉시 실패 처리
-  5) FIX(OBSERVABILITY): Telegram 알림 실패 pass 제거, 명시적 로그 기록
+  1) FIX(ROOT-CAUSE): market_data_ws health snapshot 계약(overall_ok / has_warning / overall_warnings)과 정합화
+  2) FIX(STRICT): settings getattr default 제거, 필요한 설정은 명시적으로 검증
+  3) ADD(OBSERVABILITY): feature 결과에 health summary(has_warning / warnings) 포함
+  4) FIX(STRICT): low-vol threshold 숨은 기본값 제거
+  5) FIX(STRICT): ws_min_kline_buffer_by_interval 계약 검증 강화
 =====================================================
 """
 
@@ -43,6 +44,7 @@ from infra.market_data_ws import (
     get_klines_with_volume,
     get_last_kline_delay_ms,
     get_orderbook,
+    get_orderbook_buffer_status,
 )
 from strategy.indicators import (
     Candle,
@@ -59,6 +61,92 @@ from strategy.indicators import (
 
 SET = SETTINGS
 
+
+def _require_setting_attr(name: str) -> Any:
+    if not hasattr(SET, name):
+        raise RuntimeError(f"settings.{name} is required (STRICT)")
+    return getattr(SET, name)
+
+
+def _require_positive_float_setting(name: str) -> float:
+    raw = _require_setting_attr(name)
+    if isinstance(raw, bool):
+        raise RuntimeError(f"settings.{name} must be float, bool is not allowed (STRICT)")
+    try:
+        value = float(raw)
+    except Exception as e:
+        raise RuntimeError(f"settings.{name} must be float-convertible (STRICT): {e}") from e
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError(f"settings.{name} must be finite > 0 (STRICT)")
+    return value
+
+
+def _require_positive_int_setting(name: str) -> int:
+    raw = _require_setting_attr(name)
+    if isinstance(raw, bool):
+        raise RuntimeError(f"settings.{name} must be int, bool is not allowed (STRICT)")
+    try:
+        value = int(raw)
+    except Exception as e:
+        raise RuntimeError(f"settings.{name} must be int-convertible (STRICT): {e}") from e
+    if value <= 0:
+        raise RuntimeError(f"settings.{name} must be > 0 (STRICT)")
+    return value
+
+
+def _require_str_list_setting(name: str) -> List[str]:
+    raw = _require_setting_attr(name)
+    if not isinstance(raw, (list, tuple)):
+        raise RuntimeError(f"settings.{name} must be list/tuple[str] (STRICT)")
+    out: List[str] = []
+    for idx, item in enumerate(raw):
+        s = str(item).strip()
+        if not s:
+            raise RuntimeError(f"settings.{name}[{idx}] must be non-empty string (STRICT)")
+        out.append(s)
+    if not out:
+        raise RuntimeError(f"settings.{name} must not be empty (STRICT)")
+    return out
+
+
+def _require_interval_buffer_mapping_setting(name: str) -> Dict[str, int]:
+    raw = _require_setting_attr(name)
+    if not isinstance(raw, dict):
+        raise RuntimeError(f"settings.{name} must be dict[str,int] (STRICT)")
+    out: Dict[str, int] = {}
+    for raw_interval, raw_value in raw.items():
+        interval = str(raw_interval).strip()
+        if not interval:
+            raise RuntimeError(f"settings.{name} contains empty interval key (STRICT)")
+        if isinstance(raw_value, bool):
+            raise RuntimeError(f"settings.{name}[{interval}] must be int, bool is not allowed (STRICT)")
+        try:
+            iv = int(raw_value)
+        except Exception as e:
+            raise RuntimeError(f"settings.{name}[{interval}] must be int-convertible (STRICT): {e}") from e
+        if iv <= 0:
+            raise RuntimeError(f"settings.{name}[{interval}] must be > 0 (STRICT)")
+        out[interval] = iv
+    return out
+
+
+def _resolve_runtime_positive_float(settings_obj: Any, attr_name: str) -> float:
+    if settings_obj is not None and hasattr(settings_obj, attr_name):
+        raw = getattr(settings_obj, attr_name)
+    else:
+        raw = _require_setting_attr(attr_name)
+
+    if isinstance(raw, bool):
+        raise FeatureBuildError(f"{attr_name} must be float, bool is not allowed (STRICT)")
+    try:
+        value = float(raw)
+    except Exception as e:
+        raise FeatureBuildError(f"{attr_name} must be float-convertible (STRICT): {e}") from e
+    if not math.isfinite(value) or value <= 0:
+        raise FeatureBuildError(f"{attr_name} must be finite > 0 (STRICT)")
+    return value
+
+
 EntrySignal = Tuple[
     str,                 # chosen_signal ("LONG"|"SHORT")
     str,                 # signal_source ("TREND"|"RANGE"|"GENERIC"...)
@@ -69,9 +157,7 @@ EntrySignal = Tuple[
     Dict[str, Any],      # extra (GPT/EntryScore용 메타)
 ]
 
-REQUIRED_TFS: List[str] = list(
-    getattr(SET, "features_required_tfs", ["1m", "5m", "15m", "1h", "4h"])
-)
+REQUIRED_TFS: List[str] = _require_str_list_setting("features_required_tfs")
 EXTRA_TFS: List[str] = []
 
 TF_CONFIG: Dict[str, Dict[str, int]] = {
@@ -83,14 +169,17 @@ TF_CONFIG: Dict[str, Dict[str, int]] = {
     "1d": {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
 }
 
-FEATURE_ERROR_TG_COOLDOWN_SEC: float = float(
-    getattr(SET, "features_error_tg_cooldown_sec", 60.0)
+FEATURE_ERROR_TG_COOLDOWN_SEC: float = _require_positive_float_setting(
+    "features_error_tg_cooldown_sec"
 )
 
 # SSOT-derived runtime thresholds
-KLINE_MAX_DELAY_SEC: float = float(SET.ws_max_kline_delay_sec)
-ORDERBOOK_MAX_DELAY_SEC: float = float(SET.ws_market_event_max_delay_sec)
-DEFAULT_KLINE_MIN_BUFFER: int = int(SET.ws_min_kline_buffer)
+KLINE_MAX_DELAY_SEC: float = _require_positive_float_setting("ws_max_kline_delay_sec")
+ORDERBOOK_MAX_DELAY_SEC: float = _require_positive_float_setting("ws_market_event_max_delay_sec")
+DEFAULT_KLINE_MIN_BUFFER: int = _require_positive_int_setting("ws_min_kline_buffer")
+KLINE_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = _require_interval_buffer_mapping_setting(
+    "ws_min_kline_buffer_by_interval"
+)
 
 
 class FeatureBuildError(RuntimeError):
@@ -216,22 +305,11 @@ def _clone_frozen_extra_for_return(
 
 
 def _resolve_min_kline_buffer(interval: str, cfg: Dict[str, int]) -> int:
-    per_interval = getattr(SET, "ws_min_kline_buffer_by_interval", {})
-    if not isinstance(per_interval, dict):
-        raise FeatureBuildError("ws_min_kline_buffer_by_interval must be dict (STRICT)")
-
-    interval_floor = per_interval.get(interval)
+    interval_floor = KLINE_MIN_BUFFER_BY_INTERVAL.get(interval)
     if interval_floor is None:
         interval_floor = DEFAULT_KLINE_MIN_BUFFER
 
-    try:
-        interval_floor_int = int(interval_floor)
-    except Exception:
-        raise FeatureBuildError(
-            f"invalid ws_min_kline_buffer for interval={interval!r} (STRICT)"
-        ) from None
-
-    if interval_floor_int <= 0:
+    if interval_floor <= 0:
         raise FeatureBuildError(
             f"ws_min_kline_buffer for interval={interval!r} must be > 0 (STRICT)"
         )
@@ -248,9 +326,40 @@ def _resolve_min_kline_buffer(interval: str, cfg: Dict[str, int]) -> int:
         rsi_len + 1,
         atr_len + 1,
         range_len,
-        interval_floor_int,
+        interval_floor,
         atr_len * 2,
     )
+
+
+def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(snap, dict):
+        _fail(symbol, "health_snapshot", "get_health_snapshot 결과가 dict 가 아닙니다.")
+
+    if "overall_ok" not in snap:
+        _fail(symbol, "health_snapshot", "health snapshot missing overall_ok (STRICT)")
+    if not isinstance(snap["overall_ok"], bool):
+        _fail(symbol, "health_snapshot", "health snapshot overall_ok must be bool (STRICT)")
+
+    if "has_warning" not in snap:
+        _fail(symbol, "health_snapshot", "health snapshot missing has_warning (STRICT)")
+    if not isinstance(snap["has_warning"], bool):
+        _fail(symbol, "health_snapshot", "health snapshot has_warning must be bool (STRICT)")
+
+    warnings = snap.get("overall_warnings")
+    if not isinstance(warnings, list):
+        _fail(symbol, "health_snapshot", "health snapshot overall_warnings must be list (STRICT)")
+
+    reasons = snap.get("overall_reasons")
+    if not isinstance(reasons, list):
+        _fail(symbol, "health_snapshot", "health snapshot overall_reasons must be list (STRICT)")
+
+    cleaned_warnings = [str(x).strip() for x in warnings if str(x).strip()]
+    return {
+        "overall_ok": bool(snap["overall_ok"]),
+        "has_warning": bool(snap["has_warning"]),
+        "overall_warnings": cleaned_warnings,
+        "overall_reasons": [str(x).strip() for x in reasons if str(x).strip()],
+    }
 
 
 def _fetch_candles_strict(
@@ -830,6 +939,10 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
             f"오더북 스냅샷이 {age_sec:.1f}초 동안 갱신되지 않았습니다 (허용 최대 {ORDERBOOK_MAX_DELAY_SEC:.1f}초).",
         )
 
+    ob_status = get_orderbook_buffer_status(symbol)
+    if not isinstance(ob_status, dict):
+        _fail(symbol, "orderbook", "get_orderbook_buffer_status 결과가 dict 가 아닙니다. (STRICT)")
+
     try:
         best_bid = float(bids[0][0])
         best_ask = float(asks[0][0])
@@ -897,6 +1010,9 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
         "depth_imbalance": depth_imbalance,
         "mark_price": mark_price,
         "last_price": last_price,
+        "recv_delay_ms": ob_status.get("recv_delay_ms"),
+        "payload_delay_ms": ob_status.get("payload_delay_ms"),
+        "last_update_id": ob_status.get("last_update_id"),
     }
 
 
@@ -972,20 +1088,25 @@ def build_entry_features_ws(
     checked_at_ms = _now_ms()
 
     try:
-        snap = get_health_snapshot(symbol)
+        raw_snap = get_health_snapshot(symbol)
     except FeatureBuildError:
         raise
     except Exception as e:
         _fail(symbol, "health_snapshot", f"get_health_snapshot 예외: {e}")
 
-    if not isinstance(snap, dict):
-        _fail(symbol, "health_snapshot", "get_health_snapshot 결과가 dict 가 아닙니다.")
+    health_summary = _validate_health_snapshot_contract(symbol, raw_snap)
 
-    if not snap.get("overall_ok", True):
+    if not health_summary["overall_ok"]:
         _fail(
             symbol,
             "health_snapshot",
             "WS 시세 데이터 헬스 체크 결과 overall_ok=False 입니다. market_data_ws.get_health_snapshot 로그를 확인해 주세요.",
+        )
+
+    if health_summary["has_warning"] and health_summary["overall_warnings"]:
+        log(
+            f"[MKT-FEAT] health warning preserved: symbol={symbol} "
+            f"warnings={' | '.join(health_summary['overall_warnings'])}"
         )
 
     timeframes: Dict[str, Dict[str, Any]] = {}
@@ -1030,6 +1151,7 @@ def build_entry_features_ws(
     return {
         "symbol": symbol,
         "checked_at_ms": checked_at_ms,
+        "health": health_summary,
         "timeframes": timeframes,
         "orderbook": ob_features,
         "multi_timeframe": mtf_summary,
@@ -1185,20 +1307,8 @@ def get_trading_signal(
         atr_pct_5 = tf5.get("atr_pct")
         is_low_vol_5 = tf5.get("is_low_volatility") == 1
 
-        low_range_th = float(
-            getattr(
-                settings,
-                "low_vol_range_pct_threshold",
-                getattr(SET, "low_vol_range_pct_threshold", 0.01),
-            )
-        )
-        low_atr_th = float(
-            getattr(
-                settings,
-                "low_vol_atr_pct_threshold",
-                getattr(SET, "low_vol_atr_pct_threshold", 0.004),
-            )
-        )
+        low_range_th = _resolve_runtime_positive_float(settings, "low_vol_range_pct_threshold")
+        low_atr_th = _resolve_runtime_positive_float(settings, "low_vol_atr_pct_threshold")
 
         is_low_range = (
             isinstance(range_pct_5, (int, float))
@@ -1364,6 +1474,7 @@ def get_trading_signal(
             )
             return None
 
+    health_info = features.get("health")
     extra: Dict[str, Any] = {
         "signal_score": float(signal_score),
         "atr_fast": atr_fast_val,
@@ -1388,6 +1499,8 @@ def get_trading_signal(
         "bias_5m": direction_meta.get("5m_bias"),
         "support_count": int(direction_meta.get("support_count") or 0),
         "oppose_count": int(direction_meta.get("oppose_count") or 0),
+        "health_has_warning": bool(health_info.get("has_warning")) if isinstance(health_info, dict) else False,
+        "health_warnings": list(health_info.get("overall_warnings") or []) if isinstance(health_info, dict) else [],
     }
 
     _set_signal_freeze_state(

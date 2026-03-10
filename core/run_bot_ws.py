@@ -2,64 +2,36 @@
 """
 ============================================================
 FILE: core/run_bot_ws.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-============================================================
+ROLE:
+- Binance USDT-M Futures WebSocket 기반 메인 엔진 루프
+- structured health / reconcile / risk / execution 계층을 연결해
+  실제 자동매매 런타임을 운영한다
 
-핵심 변경 요약
-- run_bot_ws 에서 Signal → ExecutionEngine 가격 계약을 명시적으로 보강
-- cand.meta 간접 의존을 제거하고 entry_price_hint 를 authoritative market_data 기준으로 주입
-- stale kline 경고 로그의 dead expression 제거
-- 미사용 import/상태 변수 정리
-- data_health_monitor / market_data_ws 의 신규 structured health 계약을 직접 소비하도록 보강
+CORE RESPONSIBILITIES:
+- market/account websocket 부팅 및 준비 확인
+- structured data health 상태 소비(OK/WARNING/FAIL)
+- entry candidate → risk physics → execution engine 오케스트레이션
+- protection guard / reconcile / fill check / safe stop 처리
+- WS/Execution latency 및 invariant/drift 감시
 
-코드 정리 내용
-- 미사용 import(EntryCandidate) 제거
-- 미사용 전역 상태(START_TS) 제거
-- execution price alias 정리 helper 추가
-- health snapshot 소비 helper 추가
-- 상단 변경 이력 최근 2일 기준으로 정리
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 시장데이터 의사결정은 WS 버퍼 기준
+- REST는 부팅 백필 / 계정·주문 상태 조회에만 사용
+- data_health_monitor의 WARNING 은 관측 상태이며 FAIL 과 동일 취급 금지
+- WS transport 실패만 치명 liveness failure 로 취급
+- settings는 SETTINGS 단일 객체만 사용
+- 숨은 기본값(getattr(..., default)) 금지
+- 비치명 엔트리 거절(None 반환)은 명시적 SKIP 처리
+- 치명 오류는 SAFE_STOP + 예외 전파
 
-run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
-
-핵심 원칙 (STRICT · NO-FALLBACK)
-- 시장데이터(캔들/오더북) 의사결정은 WS 버퍼 데이터만 사용한다.
-- REST는 (a) 부팅 WS 버퍼 백필, (b) 계정/주문 상태 조회에만 사용한다.
-- 폴백(REST 런타임 백필/더미 값/임의 보정/None→0 치환) 절대 금지.
-- 데이터가 없거나 손상되면 즉시 예외 또는 명시적 SKIP 처리한다.
-- 텔레그램/비핵심 I/O가 메인 루프를 블로킹하면 안 된다.
-
-중요 (TRADE-GRADE)
-- DB 접근 단일화: state/db_core(get_session) 경유. psycopg2 직접 연결 금지.
-- DB DSN 폴백 금지: TRADER_DB_URL 단일 소스(검증/정규화는 db_core가 수행).
-- 비핵심 루프라도 “조용한 실패” 금지: 치명 오류는 SAFE_STOP + 예외 전파.
-- health 계약은 단일 bool 이 아니라 structured snapshot 기준으로 소비한다.
-
-변경 이력
-------------------------------------------------------------
-- 2026-03-10 (TRADE-GRADE PATCH 9):
-  1) FIX(ROOT-CAUSE): structured health snapshot 계약을 run_bot_ws 에서 직접 소비하도록 보강
-     - data_health_monitor.get_health_state()/get_last_health_snapshot() 사용
-     - 단순 HEALTH_OK bool 기반 차단을 structured reason 기반 차단으로 정리
-  2) FIX(ARCH): _wait_market_ws_ready_or_raise() 를 market_data_ws.get_health_snapshot() 기반으로 일원화
-  3) FIX(ARCH): _ws_liveness_guard_or_raise() 를 market_data_ws.get_ws_status() 기반으로 전환
-  4) 기존 자동매매 기능 삭제 없음
-
-- 2026-03-10 (TRADE-GRADE PATCH 8):
-  1) FIX(ROOT-CAUSE): Signal → ExecutionEngine 가격 계약을 run_bot_ws 에서 명시적으로 보장
-     - entry_price_hint 를 authoritative market_data/cand.meta 실데이터에서 strict 추출 후 Signal.meta 에 주입
-     - 기존 cand.meta 가격 유무에 간접 의존하던 구조 제거
-     - 가격 계약 미충족 시 즉시 예외 처리
-  2) CLEANUP: execution price alias purge helper 추가, stale kline 경고 로그 dead expression 제거
-  3) CLEANUP: 미사용 import(EntryCandidate) / 미사용 전역 상태(START_TS) 제거
-  4) 기존 자동매매 기능 삭제 없음
-
-- 2026-03-09 (TRADE-GRADE PATCH 7):
-  1) FIX(ROOT-CAUSE): run_bot_ws 부팅 시 embedded market_researcher 자동 기동 제거
-     - 자동매매 엔진이 외부 시장 분석 워커를 암묵적으로 띄우지 않음
-     - 봇 재시작/부팅만으로 Alpha Vantage 등 외부 인텔리전스 소스가 호출되던 경로 제거
-     - 외부 시장 분석 기능 자체는 dashboard_server / analysis.market_researcher 전용 경로로 유지
-  2) CLEANUP: 미사용 MarketResearcher import 및 autostart bootstrap 코드 제거
-  3) 기존 자동매매 기능 삭제 없음
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): data_health_monitor 3단계 상태(OK/WARNING/FAIL)를 run_bot_ws 에서 직접 소비
+  2) FIX(ROOT-CAUSE): _ws_liveness_guard_or_raise() 가 market_feed warning 을 치명 장애로 승격하지 않도록 수정
+  3) FIX(SSOT): settings.load_settings() 재호출 제거, SETTINGS 단일 객체 사용
+  4) FIX(STRICT): market ws ready timeout 계산의 getattr default 제거
+  5) FIX(OBSERVABILITY): WARNING health reason 포맷 helper 추가
 ============================================================
 """
 
@@ -77,7 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
-from settings import load_settings
+from settings import SETTINGS
 from infra.telelog import log, send_tg
 from infra.async_worker import start_worker as start_async_worker, submit as submit_async
 
@@ -148,7 +120,7 @@ from infra.drift_detector import (
     DriftSnapshot,
 )
 
-SET = load_settings()
+SET = SETTINGS
 RUNNING: bool = True
 
 ENTRY_REQUIRED_TFS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
@@ -159,6 +131,40 @@ ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {
     "1h": 200,
     "4h": 200,
 }
+
+ENTRY_REQUIRED_RUNTIME_SETTINGS: tuple[str, ...] = (
+    "ws_enabled",
+    "ws_subscribe_tfs",
+    "ws_backfill_tfs",
+    "ws_backfill_limit",
+    "api_key",
+    "api_secret",
+    "leverage",
+    "isolated",
+    "allow_start_without_leverage_setup",
+    "signal_analysis_interval_sec",
+    "position_resync_sec",
+    "poll_fills_sec",
+    "max_signal_latency_ms",
+    "max_exec_latency_ms",
+    "drift_allocation_abs_jump",
+    "drift_allocation_spike_ratio",
+    "drift_multiplier_abs_jump",
+    "drift_micro_abs_jump",
+    "drift_stable_regime_steps",
+    "async_worker_threads",
+    "async_worker_queue_size",
+    "sigterm_grace_sec",
+    "reconcile_confirm_n",
+    "hard_consecutive_losses_limit",
+    "reconcile_interval_sec",
+    "force_close_on_desync",
+    "test_dry_run",
+    "test_fake_available_usdt",
+    "symbol",
+    "ws_max_kline_delay_sec",
+    "ws_market_event_max_delay_sec",
+)
 
 _LAST_ENTRY_BLOCK_TG_TS: float = 0.0
 _LAST_ENTRY_BLOCK_KEY: str = ""
@@ -206,6 +212,17 @@ ENGINE_EQUITY_CACHE_TTL_SEC: float = 1.00
 
 _EQUITY_CACHE_VALUE: Optional[float] = None
 _EQUITY_CACHE_TS: float = 0.0
+
+
+def _require_runtime_setting_exists(name: str) -> Any:
+    if not hasattr(SET, name):
+        raise RuntimeError(f"settings.{name} is required (STRICT)")
+    return getattr(SET, name)
+
+
+def _verify_runtime_settings_contract_or_raise() -> None:
+    for name in ENTRY_REQUIRED_RUNTIME_SETTINGS:
+        _require_runtime_setting_exists(name)
 
 
 def _as_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
@@ -256,6 +273,13 @@ def _join_reason_list_strict(v: Any, name: str) -> str:
     return " | ".join(cleaned)
 
 
+def _normalize_health_level_strict(v: Any, name: str) -> str:
+    s = str(v or "").strip().upper()
+    if s not in ("OK", "WARNING", "FAIL"):
+        raise RuntimeError(f"{name} must be OK/WARNING/FAIL (STRICT), got={v!r}")
+    return s
+
+
 def _format_data_health_snapshot_reason(snapshot: Dict[str, Any], fallback_reason: str) -> str:
     if not isinstance(snapshot, dict):
         fb = str(fallback_reason or "").strip()
@@ -296,7 +320,6 @@ def _format_data_health_snapshot_reason(snapshot: Dict[str, Any], fallback_reaso
             return fb
         raise RuntimeError("health fail reason missing (STRICT)")
 
-    # 중복 제거 + 순서 유지
     unique: List[str] = []
     seen: set[str] = set()
     for r in reasons:
@@ -306,18 +329,74 @@ def _format_data_health_snapshot_reason(snapshot: Dict[str, Any], fallback_reaso
     return " | ".join(unique)
 
 
-def _get_data_health_state_or_raise() -> Tuple[bool, str, Dict[str, Any]]:
-    ok, reason = data_health_monitor.get_health_state()
+def _format_data_health_warning_reason(snapshot: Dict[str, Any], fallback_warning: str) -> str:
+    if not isinstance(snapshot, dict):
+        fb = str(fallback_warning or "").strip()
+        if fb:
+            return fb
+        raise RuntimeError("data health snapshot must be dict (STRICT)")
+
+    reasons: List[str] = []
+
+    warning_reason = str(snapshot.get("warning_reason") or "").strip()
+    if warning_reason:
+        reasons.append(warning_reason)
+
+    ws = snapshot.get("ws")
+    if isinstance(ws, dict):
+        ws_warnings = ws.get("overall_warnings")
+        if isinstance(ws_warnings, list):
+            joined = _join_reason_list_strict(ws_warnings, "health_snapshot.ws.overall_warnings")
+            if joined:
+                reasons.append(f"ws={joined}")
+
+    if not reasons:
+        fb = str(fallback_warning or "").strip()
+        if fb:
+            return fb
+        raise RuntimeError("health warning reason missing (STRICT)")
+
+    unique: List[str] = []
+    seen: set[str] = set()
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return " | ".join(unique)
+
+
+def _get_data_health_state_or_raise() -> Tuple[str, str, str, Dict[str, Any]]:
+    level_state = data_health_monitor.get_health_level_state()
+    if not isinstance(level_state, dict):
+        raise RuntimeError("data_health_monitor.get_health_level_state() must return dict (STRICT)")
+
+    level = _normalize_health_level_strict(level_state.get("level"), "health_level_state.level")
+    ok = level_state.get("ok")
     if not isinstance(ok, bool):
-        raise RuntimeError("data_health_monitor.get_health_state()[0] must be bool (STRICT)")
-    if not isinstance(reason, str):
-        raise RuntimeError("data_health_monitor.get_health_state()[1] must be str (STRICT)")
+        raise RuntimeError("health_level_state.ok must be bool (STRICT)")
+    has_warning = level_state.get("has_warning")
+    if not isinstance(has_warning, bool):
+        raise RuntimeError("health_level_state.has_warning must be bool (STRICT)")
+
+    fail_reason = level_state.get("fail_reason")
+    if not isinstance(fail_reason, str):
+        raise RuntimeError("health_level_state.fail_reason must be str (STRICT)")
+    warning_reason = level_state.get("warning_reason")
+    if not isinstance(warning_reason, str):
+        raise RuntimeError("health_level_state.warning_reason must be str (STRICT)")
+
+    if level == "FAIL" and ok:
+        raise RuntimeError("health level FAIL but ok=True (STRICT)")
+    if level == "WARNING" and (not ok or not has_warning):
+        raise RuntimeError("health level WARNING must satisfy ok=True and has_warning=True (STRICT)")
+    if level == "OK" and (not ok or has_warning):
+        raise RuntimeError("health level OK must satisfy ok=True and has_warning=False (STRICT)")
 
     snapshot = data_health_monitor.get_last_health_snapshot()
     if not isinstance(snapshot, dict):
         raise RuntimeError("data_health_monitor.get_last_health_snapshot() must return dict (STRICT)")
 
-    return bool(ok), str(reason), snapshot
+    return level, fail_reason, warning_reason, snapshot
 
 
 def _entry_gate_lock_key(symbol: str) -> int:
@@ -1068,6 +1147,11 @@ def _protection_orders_guard_or_raise() -> None:
 
 
 def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
+    """
+    STRICT:
+    - transport failure만 치명적으로 본다.
+    - market_feed warning은 관측 정보이며 SAFE_STOP 사유가 아니다.
+    """
     global _WS_LIVENESS_CONSEC_FAILS, SAFE_STOP_REQUESTED
 
     _ = now_ts
@@ -1082,10 +1166,18 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
     if not isinstance(market_feed_ok, bool):
         raise RuntimeError("ws_status.market_feed_ok must be bool (STRICT)")
 
-    if transport_ok and market_feed_ok:
+    if transport_ok:
         if _WS_LIVENESS_CONSEC_FAILS != 0:
             log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
         _WS_LIVENESS_CONSEC_FAILS = 0
+
+        if not market_feed_ok:
+            warnings = ws_status.get("warnings")
+            if not isinstance(warnings, list):
+                raise RuntimeError("ws_status.warnings must be list (STRICT)")
+            joined = _join_reason_list_strict(warnings, "ws_status.warnings")
+            if joined:
+                log(f"[WS_LIVENESS][WARN] {joined}")
         return
 
     reasons = ws_status.get("reasons")
@@ -1102,7 +1194,7 @@ def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
     if _WS_LIVENESS_CONSEC_FAILS >= _WS_LIVENESS_FAIL_HARDSTOP_N:
         SAFE_STOP_REQUESTED = True
         msg = (
-            "[SAFE_STOP][WS_LIVENESS] structured ws liveness failure confirmed "
+            "[SAFE_STOP][WS_LIVENESS] transport failure confirmed "
             f"consecutive={_WS_LIVENESS_CONSEC_FAILS} reasons={joined}"
         )
         log(msg)
@@ -1590,6 +1682,8 @@ def main() -> None:
     global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
     global _BALANCE_CONSEC_FAILS, _EQUITY_CONSEC_FAILS, LAST_ENTRY_EVAL_SIGNAL_TS_MS
 
+    _verify_runtime_settings_contract_or_raise()
+
     start_async_worker(
         num_threads=int(SET.async_worker_threads),
         max_queue_size=int(SET.async_worker_queue_size),
@@ -1606,8 +1700,8 @@ def main() -> None:
 
         market_ws_ready_timeout_sec = max(
             30.0,
-            float(SET.ws_klines_stale_sec),
-            float(getattr(SET, "ws_market_event_max_delay_sec", 30.0)),
+            float(SET.ws_max_kline_delay_sec),
+            float(SET.ws_market_event_max_delay_sec),
         )
         _wait_market_ws_ready_or_raise(SET.symbol, market_ws_ready_timeout_sec)
 
@@ -1902,14 +1996,18 @@ def main() -> None:
                 interruptible_sleep(60)
                 continue
 
-            health_ok, health_reason, health_snapshot = _get_data_health_state_or_raise()
-            if not health_ok:
-                reason_text = _format_data_health_snapshot_reason(health_snapshot, health_reason)
+            health_level, health_fail_reason, health_warning_reason, health_snapshot = _get_data_health_state_or_raise()
+            if health_level == "FAIL":
+                reason_text = _format_data_health_snapshot_reason(health_snapshot, health_fail_reason)
                 msg = f"[SKIP][DATA_HEALTH_FAIL] {reason_text}"
                 log(msg)
                 _maybe_send_entry_block_tg("DATA_HEALTH_FAIL", msg, cooldown_sec=60)
                 interruptible_sleep(5)
                 continue
+
+            if health_level == "WARNING":
+                warning_text = _format_data_health_warning_reason(health_snapshot, health_warning_reason)
+                log(f"[WARN][DATA_HEALTH_WARNING] {warning_text}")
 
             authoritative_5m_gate_ts = _get_latest_ws_5m_signal_gate_ts_or_raise(SET.symbol)
             if not _claim_entry_signal_ts_or_skip(SET.symbol, authoritative_5m_gate_ts):
@@ -2120,9 +2218,23 @@ def main() -> None:
                 _maybe_send_error_tg("LATENCY_EXEC", msg, cooldown_sec=60)
                 raise RuntimeError(msg)
 
-            if trade:
-                OPEN_TRADES.append(trade)
-                _invalidate_equity_cache()
+            if trade is None:
+                msg = (
+                    "[SKIP][ENTRY_REJECTED_NONFATAL] "
+                    f"symbol={SET.symbol} direction={cand.direction} reason=nonfatal_entry_rejection"
+                )
+                log(msg)
+                _maybe_send_entry_block_tg("ENTRY_REJECTED_NONFATAL", msg, cooldown_sec=60)
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
+                continue
+
+            if not isinstance(trade, Trade):
+                raise RuntimeError(
+                    f"ExecutionEngine returned invalid type (STRICT): {type(trade).__name__}"
+                )
+
+            OPEN_TRADES.append(trade)
+            _invalidate_equity_cache()
 
             interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
 
