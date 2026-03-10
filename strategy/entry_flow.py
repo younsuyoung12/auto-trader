@@ -1,76 +1,34 @@
 """
 ========================================================
 FILE: strategy/entry_flow.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-
-역할
---------------------------------------------------------
+ROLE:
 - 엔트리 진입 여부를 결정한다.
-- ENTER 또는 SKIP 신호를 생성한다.
-- 실행 엔진(execution_engine.py)과 대시보드 Decision 패널이
-  바로 사용할 수 있도록 meta 필수 키를 엄격하게 채운다.
+- ENTER / SKIP 신호를 생성한다.
+- 대시보드와 상위 실행 계층이 사용할 수 있는 pre-entry Signal 계약을 엄격히 구성한다.
 
-출력
---------------------------------------------------------
-- strategy.signal.Signal 반환
-- action:
-  - ENTER
-  - SKIP
+CORE RESPONSIBILITIES:
+- features / settings 입력 계약 strict 검증
+- ENTER / SKIP 판단
+- Signal.meta 필수 진단 정보 구성
+- 실행 계층용 기본 entry_price_hint 제공
+- quant / decision 메타 일관성 검증
 
-필수 features 스키마
---------------------------------------------------------
-{
-  "symbol": "BTCUSDT",
-  "regime": "TREND",
-  "signal_source": "ws_signal_candidate",
-  "signal_ts_ms": 1772740500000,
-  "direction": "LONG" | "SHORT",
-  "last_price": 62300.5,
-  "entry_score": 1.92,
-  "trend_strength": 0.73,
-  "orderbook_imbalance": 0.41,
-  "spread": 0.00018,
-  "candles_5m": [...],
-  "candles_5m_raw": [...],
-  "equity_current_usdt": 1012.5,
-  "equity_peak_usdt": 1030.0,
-  "dd_pct": 1.70
-}
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 필수 features 누락 시 즉시 예외
+- 필수 settings 누락 시 즉시 예외
+- 더미값/기본값/자동보정 금지
+- 숫자형은 finite 이어야 한다
+- direction / action / reason 은 공백 불가
+- 이 파일이 넣는 entry_price_hint 는 features.last_price 기반 기본 힌트다
+- 최종 authoritative 실행 가격은 상위 계층(run_bot_ws)이 주입/정합화한다
 
-선택 features 스키마
---------------------------------------------------------
-{
-  "micro_score_risk": 22.0,
-  "extra": {...},
-  "guard_adjustments": {...},
-  "decision_id": "dec-...",
-  "quant_decision_pre": {...},
-  "quant_constraints": {...},
-  "quant_final_decision": "ENTER"
-}
-
-필수 settings 필드
---------------------------------------------------------
-- entry_score_threshold
-- entry_tp_pct
-- entry_sl_pct
-- entry_risk_pct
-- entry_max_spread_pct
-- entry_min_trend_strength
-- entry_min_abs_orderbook_imbalance
-
-절대 원칙 (STRICT · NO-FALLBACK)
---------------------------------------------------------
-- 필수 features 누락 시 즉시 예외.
-- 필수 settings 누락 시 즉시 예외.
-- 더미값/기본값/자동보정 금지.
-- 숫자형은 finite 이어야 한다.
-- direction / action / reason 은 공백 불가.
-- 실행 엔진이 요구하는 meta 필수 키는 반드시 포함한다.
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(CONTRACT): Signal.meta 에 entry_price_hint / entry_price_source 기본 계약 추가
+  2) FIX(STRICT): quant_final_decision 값/계산 decision 불일치 시 즉시 예외 처리
+  3) FIX(STRICT): equity / dd_pct / direction / feature contract 검증 강화
+  4) CLEANUP: 중복 meta 대입 제거, 상단 문서 구조 정리
 - 2026-03-06:
   1) 신규 생성: 엔트리 판단 파일 추가
   2) ENTER / SKIP 판정 및 Signal 생성 추가
@@ -88,6 +46,8 @@ from strategy.signal import Signal
 
 
 _ALLOWED_DIRECTIONS = ("LONG", "SHORT")
+_ALLOWED_ACTIONS = ("ENTER", "SKIP")
+_ALLOWED_QUANT_FINAL_DECISIONS = ("ENTER", "SKIP")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +102,20 @@ def _require_direction(value: Any, name: str) -> str:
     if direction not in _ALLOWED_DIRECTIONS:
         raise RuntimeError(f"{name} must be LONG/SHORT (STRICT)")
     return direction
+
+
+def _require_action(value: Any, name: str) -> str:
+    action = _require_nonempty_str(value, name).upper()
+    if action not in _ALLOWED_ACTIONS:
+        raise RuntimeError(f"{name} must be ENTER/SKIP (STRICT)")
+    return action
+
+
+def _require_quant_final_decision(value: Any, name: str) -> str:
+    decision = _require_nonempty_str(value, name).upper()
+    if decision not in _ALLOWED_QUANT_FINAL_DECISIONS:
+        raise RuntimeError(f"{name} must be ENTER/SKIP (STRICT)")
+    return decision
 
 
 def _require_int(value: Any, name: str) -> int:
@@ -242,26 +216,64 @@ def _read_setting_float(
     return _require_float(getattr(settings, key), f"settings.{key}", min_value=min_value, max_value=max_value)
 
 
+def _validate_core_feature_contract(features: Mapping[str, Any]) -> None:
+    _read_feature_str(features, "symbol")
+    _read_feature_str(features, "regime")
+    _read_feature_str(features, "signal_source")
+    _read_feature_int(features, "signal_ts_ms")
+    _require_direction(features.get("direction"), "features.direction")
+
+    last_price = _read_feature_float(features, "last_price", min_value=0.0)
+    if last_price <= 0.0:
+        raise RuntimeError("features.last_price must be > 0 (STRICT)")
+
+    _require_list(features.get("candles_5m"), "features.candles_5m")
+    _require_list(features.get("candles_5m_raw"), "features.candles_5m_raw")
+
+    equity_current_usdt = _read_feature_float(features, "equity_current_usdt", min_value=0.0)
+    equity_peak_usdt = _read_feature_float(features, "equity_peak_usdt", min_value=0.0)
+    dd_pct = _read_feature_float(features, "dd_pct", min_value=0.0, max_value=100.0)
+
+    if equity_current_usdt <= 0.0:
+        raise RuntimeError("features.equity_current_usdt must be > 0 (STRICT)")
+    if equity_peak_usdt <= 0.0:
+        raise RuntimeError("features.equity_peak_usdt must be > 0 (STRICT)")
+    if equity_current_usdt > equity_peak_usdt:
+        raise RuntimeError("features.equity_current_usdt must be <= equity_peak_usdt (STRICT)")
+    if dd_pct > 0.0 and equity_current_usdt == equity_peak_usdt:
+        raise RuntimeError("features.dd_pct > 0 but equity_current_usdt == equity_peak_usdt (STRICT)")
+
+    _read_feature_float(features, "entry_score")
+    _read_feature_float(features, "trend_strength")
+    _read_feature_float(features, "spread", min_value=0.0)
+    _read_feature_float(features, "orderbook_imbalance")
+
+
+def _validate_quant_contract(features: Mapping[str, Any], decision_action: str) -> None:
+    if "quant_final_decision" not in features:
+        return
+
+    quant_final_decision = _require_quant_final_decision(
+        features.get("quant_final_decision"),
+        "features.quant_final_decision",
+    )
+    if quant_final_decision != decision_action:
+        raise RuntimeError(
+            "features.quant_final_decision conflicts with computed entry decision "
+            f"(STRICT): quant_final_decision={quant_final_decision} decision_action={decision_action}"
+        )
+
+
 def evaluate_entry_flow_strict(
     *,
     features: Dict[str, Any],
     settings: Any,
 ) -> EntryFlowDecision:
     f = _require_mapping(features, "features")
-   
-    if "entry_score" not in f:
-        raise RuntimeError("features.entry_score missing (STRICT)")
-
-    if "trend_strength" not in f:
-        raise RuntimeError("features.trend_strength missing (STRICT)")
-
-    if "spread" not in f:
-        raise RuntimeError("features.spread missing (STRICT)")
-
-    if "orderbook_imbalance" not in f:
-        raise RuntimeError("features.orderbook_imbalance missing (STRICT)")
     if settings is None:
         raise RuntimeError("settings is required (STRICT)")
+
+    _validate_core_feature_contract(f)
 
     direction = _require_direction(f.get("direction"), "features.direction")
     entry_score = _read_feature_float(f, "entry_score")
@@ -321,55 +333,33 @@ def evaluate_entry_flow_strict(
     )
 
 
-def build_entry_signal_strict(
+def _build_signal_meta_strict(
     *,
     features: Dict[str, Any],
-    settings: Any,
-) -> Signal:
-    f = _require_mapping(features, "features")
-    if settings is None:
-        raise RuntimeError("settings is required (STRICT)")
+    decision: EntryFlowDecision,
+    entry_risk_pct: float,
+) -> Dict[str, Any]:
+    symbol = _read_feature_str(features, "symbol").upper()
+    regime = _read_feature_str(features, "regime")
+    signal_source = _read_feature_str(features, "signal_source")
+    signal_ts_ms = _read_feature_int(features, "signal_ts_ms")
+    last_price = _read_feature_float(features, "last_price", min_value=0.0)
+    candles_5m = _require_list(features.get("candles_5m"), "features.candles_5m")
+    candles_5m_raw = _require_list(features.get("candles_5m_raw"), "features.candles_5m_raw")
+    equity_current_usdt = _read_feature_float(features, "equity_current_usdt", min_value=0.0)
+    equity_peak_usdt = _read_feature_float(features, "equity_peak_usdt", min_value=0.0)
+    dd_pct = _read_feature_float(features, "dd_pct", min_value=0.0, max_value=100.0)
 
-    symbol = _read_feature_str(f, "symbol").upper()
-    regime = _read_feature_str(f, "regime")
-    signal_source = _read_feature_str(f, "signal_source")
-    signal_ts_ms = _read_feature_int(f, "signal_ts_ms")
-    direction = _require_direction(f.get("direction"), "features.direction")
-    last_price = _read_feature_float(f, "last_price", min_value=0.0)
-    if last_price <= 0.0:
-        raise RuntimeError("features.last_price must be > 0 (STRICT)")
-
-    candles_5m = _require_list(f.get("candles_5m"), "features.candles_5m")
-    candles_5m_raw = _require_list(f.get("candles_5m_raw"), "features.candles_5m_raw")
-
-    equity_current_usdt = _read_feature_float(f, "equity_current_usdt", min_value=0.0)
-    equity_peak_usdt = _read_feature_float(f, "equity_peak_usdt", min_value=0.0)
-    dd_pct = _read_feature_float(f, "dd_pct", min_value=0.0, max_value=100.0)
-
-    if equity_current_usdt <= 0.0:
-        raise RuntimeError("features.equity_current_usdt must be > 0 (STRICT)")
-    if equity_peak_usdt <= 0.0:
-        raise RuntimeError("features.equity_peak_usdt must be > 0 (STRICT)")
-
-    decision = evaluate_entry_flow_strict(features=f, settings=settings)
-
-    entry_tp_pct = _read_setting_float(settings, "entry_tp_pct", min_value=0.0, max_value=1.0)
-    entry_sl_pct = _read_setting_float(settings, "entry_sl_pct", min_value=0.0, max_value=1.0)
-    entry_risk_pct = _read_setting_float(settings, "entry_risk_pct", min_value=0.0, max_value=1.0)
-
-    if entry_tp_pct <= 0.0:
-        raise RuntimeError("settings.entry_tp_pct must be > 0 (STRICT)")
-    if entry_sl_pct <= 0.0:
-        raise RuntimeError("settings.entry_sl_pct must be > 0 (STRICT)")
-    if entry_risk_pct <= 0.0:
-        raise RuntimeError("settings.entry_risk_pct must be > 0 (STRICT)")
-
-    extra = _optional_dict(f.get("extra"), "features.extra")
-    guard_adjustments = _optional_dict(f.get("guard_adjustments"), "features.guard_adjustments")
-    quant_decision_pre = _optional_dict(f.get("quant_decision_pre"), "features.quant_decision_pre")
-    quant_constraints = _optional_dict(f.get("quant_constraints"), "features.quant_constraints")
-
-    micro_score_risk = _optional_float(f.get("micro_score_risk"), "features.micro_score_risk", min_value=0.0, max_value=100.0)
+    extra = _optional_dict(features.get("extra"), "features.extra")
+    guard_adjustments = _optional_dict(features.get("guard_adjustments"), "features.guard_adjustments")
+    quant_decision_pre = _optional_dict(features.get("quant_decision_pre"), "features.quant_decision_pre")
+    quant_constraints = _optional_dict(features.get("quant_constraints"), "features.quant_constraints")
+    micro_score_risk = _optional_float(
+        features.get("micro_score_risk"),
+        "features.micro_score_risk",
+        min_value=0.0,
+        max_value=100.0,
+    )
 
     meta: Dict[str, Any] = {
         "symbol": symbol,
@@ -377,6 +367,8 @@ def build_entry_signal_strict(
         "signal_source": signal_source,
         "signal_ts_ms": int(signal_ts_ms),
         "last_price": float(last_price),
+        "entry_price_hint": float(last_price),
+        "entry_price_source": "features.last_price",
         "candles_5m": candles_5m,
         "candles_5m_raw": candles_5m_raw,
         "equity_current_usdt": float(equity_current_usdt),
@@ -389,13 +381,9 @@ def build_entry_signal_strict(
         "entry_score_threshold": float(decision.threshold),
         "decision_summary": decision.summary,
         "decision_reasons": list(decision.reasons),
-        "dynamic_allocation_ratio": float(entry_risk_pct),
         "decision_action": decision.action,
+        "dynamic_allocation_ratio": float(entry_risk_pct),
     }
-    meta["entry_score"] = float(decision.entry_score)
-    meta["trend_strength"] = float(decision.trend_strength)
-    meta["orderbook_imbalance"] = float(decision.orderbook_imbalance)
-    meta["spread"] = float(decision.spread)
 
     if micro_score_risk is not None:
         meta["micro_score_risk"] = float(micro_score_risk)
@@ -404,22 +392,62 @@ def build_entry_signal_strict(
         meta["extra"] = extra
     if guard_adjustments is not None:
         meta["guard_adjustments"] = guard_adjustments
-    if "decision_id" in f:
-        meta["decision_id"] = _require_nonempty_str(f.get("decision_id"), "features.decision_id")
+    if "decision_id" in features:
+        meta["decision_id"] = _require_nonempty_str(features.get("decision_id"), "features.decision_id")
     if quant_decision_pre is not None:
         meta["quant_decision_pre"] = quant_decision_pre
     if quant_constraints is not None:
         meta["quant_constraints"] = quant_constraints
-    if "quant_final_decision" in f:
-        meta["quant_final_decision"] = _require_nonempty_str(f.get("quant_final_decision"), "features.quant_final_decision")
+    if "quant_final_decision" in features:
+        meta["quant_final_decision"] = _require_quant_final_decision(
+            features.get("quant_final_decision"),
+            "features.quant_final_decision",
+        )
+
+    return meta
+
+
+def build_entry_signal_strict(
+    *,
+    features: Dict[str, Any],
+    settings: Any,
+) -> Signal:
+    f = _require_mapping(features, "features")
+    if settings is None:
+        raise RuntimeError("settings is required (STRICT)")
+
+    _validate_core_feature_contract(f)
+
+    decision = evaluate_entry_flow_strict(features=f, settings=settings)
+    _validate_quant_contract(f, decision.action)
+
+    direction = _require_direction(f.get("direction"), "features.direction")
+
+    entry_tp_pct = _read_setting_float(settings, "entry_tp_pct", min_value=0.0, max_value=1.0)
+    entry_sl_pct = _read_setting_float(settings, "entry_sl_pct", min_value=0.0, max_value=1.0)
+    entry_risk_pct = _read_setting_float(settings, "entry_risk_pct", min_value=0.0, max_value=1.0)
+
+    if entry_tp_pct <= 0.0:
+        raise RuntimeError("settings.entry_tp_pct must be > 0 (STRICT)")
+    if entry_sl_pct <= 0.0:
+        raise RuntimeError("settings.entry_sl_pct must be > 0 (STRICT)")
+    if entry_risk_pct <= 0.0:
+        raise RuntimeError("settings.entry_risk_pct must be > 0 (STRICT)")
+
+    guard_adjustments = _optional_dict(f.get("guard_adjustments"), "features.guard_adjustments")
+    meta = _build_signal_meta_strict(
+        features=f,
+        decision=decision,
+        entry_risk_pct=float(entry_risk_pct),
+    )
 
     return Signal(
-        action=decision.action,
+        action=_require_action(decision.action, "decision.action"),
         direction=direction,
         risk_pct=float(entry_risk_pct),
         tp_pct=float(entry_tp_pct),
         sl_pct=float(entry_sl_pct),
-        reason=decision.reason,
+        reason=_require_nonempty_str(decision.reason, "decision.reason"),
         meta=meta,
         guard_adjustments=(guard_adjustments if guard_adjustments is not None else None),
     )

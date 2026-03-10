@@ -1,1313 +1,1274 @@
+# infra/market_data_ws.py
 """
 ========================================================
-FILE: settings.py
-AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+FILE: infra/market_data_ws.py
+ROLE:
+- Binance USDT-M Futures multiplex WebSocket 수신기
+- 멀티 타임프레임 kline + depth5 orderbook을 메모리 버퍼에 유지
+- 상위 레이어에 getter / atomic snapshot / health snapshot만 제공
 
-핵심 변경 요약
-- analyst_auto_report_market_interval_sec 기본값 불일치 수정 (30 → 300)
-- max_exec_latency_ms 기본값 불일치 수정 (6000 → 2500)
-- analyst_openai_temperature 는 호환성 필드로 유지하되 현행 Responses API 경로 비핵심임을 명시
-- 상단 변경 이력 최근 2일 기준으로 정리
+CORE RESPONSIBILITIES:
+- WS 수신 데이터의 STRICT 검증 및 메모리 버퍼링
+- 부팅 시 REST bootstrap으로 필수 캔들 preload
+- WS 세션 상태 / market-data freshness / orderbook payload 무결성 관측성 제공
+- strategy / execution / exit 책임과 완전 분리
 
-코드 정리 내용
-- dataclass 기본값과 load_settings 기본값 불일치 정리
-- 오래된 변경 이력 정리
-- 주석 구조 정리
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 데이터 누락/손상/계약 불일치는 즉시 예외
+- 더미 값 생성, silent continue, 예외 삼키기 금지
+- 실시간 freshness 판단은 "payload 변경 유무"와 "WS transport 생존성"을 분리한다
+- orderbook payload 무결성과 WS 세션 freshness를 혼동하지 않는다
+- 환경변수 직접 접근 금지, settings.py(SSOT)만 사용
 
-설계 원칙
-- settings.py 는 단일 설정 소스(SSOT)다.
-- env(os.environ) 우선, 로컬 .env는 옵션이며 env를 덮어쓰지 않는다.
-- 잘못된 설정은 즉시 예외(Fail-Fast).
-- 민감정보(API key/secret, DB URL 등) 로그 금지.
-- 테스트 토글은 settings에서만 읽는다(다른 모듈의 os.getenv 직접 접근 금지).
-- 구성 불변 규칙:
-  - Settings는 런타임 불변(frozen) 객체로 제공한다.
-  - 설정 변경은 명시적 재시작/재배포를 통해서만 반영한다.
-- 분석/대시보드/외부 시장 분석 설정도 본 파일에서만 로드한다.
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): orderbook health가 top-of-book 미변경만으로 FAIL 나던 구조 제거
+  2) ADD(OBSERVABILITY): ws session state(last_open/last_close/last_message/last_pong/error) 추적 추가
+  3) FIX(ARCH): orderbook payload health와 WS transport / market-feed freshness 판단 분리
+  4) FIX(STRICT): ws.close 실패를 더 이상 조용히 무시하지 않고 원인 로그를 남김
+  5) FIX(SSOT): settings.py 에 선언되지 않은 숨은 기본값(getattr default) 제거
 - 2026-03-09:
-  1) FIX(ROOT-CAUSE): analyst_auto_report_market_interval_sec loader 기본값 30 → 300 정합화
-  2) FIX(ROOT-CAUSE): max_exec_latency_ms dataclass 기본값 6000 → 2500 정합화
-  3) CLEANUP: analyst_openai_temperature 호환성 필드 유지 주석 보강
-  4) CLEANUP: 변경 이력 최근 2일 기준으로 정리
-
-- 2026-03-08:
-  1) Alpha Vantage / AI Analyst / Binance 외부 시장 분석 설정 추가
-  2) Trader OpenAI / Analyst OpenAI 설정 로딩 구조 분리
-  3) SETTINGS singleton / frozen dataclass / 대문자 alias 접근 지원
+  1) FIX(ROOT-CAUSE): downstream EMA200 요구량과 WS bootstrap/min-buffer 정책 정합화
+  2) FIX(STRICT): 5m / 15m / 1h / 4h interval에 최소 200개 캔들 강제
+  3) FIX(COMPAT): legacy get_klines() limit 미지정 시 지표 계산에 충분한 길이 반환
+  4) FIX(VALIDATION): MAX_KLINES 용량이 strict 최소 요구량보다 작으면 즉시 예외
 ========================================================
 """
 
 from __future__ import annotations
 
-import logging
-import math
-import os
-from dataclasses import dataclass, field
-from datetime import timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import json
+import threading
+import time
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+import requests
+import websocket  # pip install websocket-client
 
-# Korea Standard Time (UTC+9)
-KST = timezone(timedelta(hours=9))
+from infra.telelog import log
+from settings import load_settings
 
-
-# ---------------------------------------------------------------------
-# Alias map for strict uppercase access compatibility
-# ---------------------------------------------------------------------
-_SETTINGS_ALIAS_MAP: Dict[str, str] = {
-    # 기존 OpenAI / Trader OpenAI
-    "OPENAI_API_KEY": "openai_api_key",
-    "OPENAI_MODEL": "openai_model",
-    "OPENAI_TRADER_MODEL": "openai_model",
-    "OPENAI_SUPERVISOR_MODEL": "openai_model",
-    "OPENAI_MAX_TOKENS": "openai_max_tokens",
-    "OPENAI_TRADER_MAX_TOKENS": "openai_max_tokens",
-    "OPENAI_TEMPERATURE": "openai_temperature",
-    "OPENAI_TRADER_TEMPERATURE": "openai_temperature",
-    "OPENAI_SUPERVISOR_TEMPERATURE": "openai_temperature",
-    "OPENAI_MAX_LATENCY_SEC": "openai_max_latency_sec",
-    "OPENAI_TRADER_MAX_LATENCY_SEC": "openai_max_latency_sec",
-    "OPENAI_TRADER_MAX_LATENCY": "openai_max_latency_sec",
-    # External intelligence
-    "ALPHAVANTAGE_API_KEY": "alphavantage_api_key",
-    # AI analyst
-    "ANALYST_MARKET_SYMBOL": "analyst_market_symbol",
-    "ANALYST_DB_MARKET_TIMEFRAME": "analyst_db_market_timeframe",
-    "ANALYST_DB_MARKET_LOOKBACK_LIMIT": "analyst_db_market_lookback_limit",
-    "ANALYST_PATTERN_ENTRY_THRESHOLD": "analyst_pattern_entry_threshold",
-    "ANALYST_SPREAD_GUARD_BPS": "analyst_spread_guard_bps",
-    "ANALYST_IMBALANCE_GUARD_ABS": "analyst_imbalance_guard_abs",
-    "ANALYST_TRADE_LOOKBACK_LIMIT": "analyst_trade_lookback_limit",
-    "ANALYST_EVENT_LOOKBACK_LIMIT": "analyst_event_lookback_limit",
-    "ANALYST_INCLUDE_EXTERNAL_MARKET": "analyst_include_external_market",
-    "ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC": "analyst_auto_report_market_interval_sec",
-    "ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC": "analyst_auto_report_system_interval_sec",
-    "ANALYST_AUTO_REPORT_PERSIST": "analyst_auto_report_persist",
-    "ANALYST_AUTO_REPORT_NOTIFY": "analyst_auto_report_notify",
-    "ANALYST_OPENAI_MODEL": "analyst_openai_model",
-    "ANALYST_OPENAI_TIMEOUT_SEC": "analyst_openai_timeout_sec",
-    "ANALYST_OPENAI_MAX_OUTPUT_TOKENS": "analyst_openai_max_output_tokens",
-    "ANALYST_OPENAI_TEMPERATURE": "analyst_openai_temperature",
-    "ANALYST_OPENAI_REASONING_EFFORT": "analyst_openai_reasoning_effort",
-    # Binance market fetcher
-    "BINANCE_FUTURES_BASE_URL": "binance_futures_base_url",
-    "ANALYST_KLINE_INTERVAL": "analyst_kline_interval",
-    "ANALYST_KLINE_LIMIT": "analyst_kline_limit",
-    "ANALYST_HTTP_TIMEOUT_SEC": "analyst_http_timeout_sec",
-    "ANALYST_RATIO_PERIOD": "analyst_ratio_period",
-    "ANALYST_RATIO_LIMIT": "analyst_ratio_limit",
-    "ANALYST_DEPTH_LIMIT": "analyst_depth_limit",
-    "ANALYST_FUNDING_LIMIT": "analyst_funding_limit",
-    "ANALYST_FORCE_ORDER_LIMIT": "analyst_force_order_limit",
-    "ANALYST_MAX_SERVER_DRIFT_MS": "analyst_max_server_drift_ms",
-}
+SET = load_settings()
 
 
-# ---------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------
-@dataclass(frozen=True, slots=True)
-class Settings:
-    """Runtime settings for the trading engine (Binance USDT-M Futures)."""
-
-    # Binance credentials
-    api_key: str = ""
-    api_secret: str = ""
-
-    # Core trading
-    symbol: str = "BTCUSDT"
-    interval: str = "5m"
-
-    # Futures config
-    leverage: int = 1
-    isolated: bool = True
-    margin_mode: str = "ISOLATED"
-    futures_position_mode: str = "ONEWAY"
-
-    # HTTP / signing
-    recv_window_ms: int = 5000
-    request_timeout_sec: int = 10
-
-    # Symbol filters
-    qty_step: float = 0.001
-    min_qty: float = 0.001
-    price_tick: float = 0.1
-
-    # Strategy / sizing
-    allocation_ratio: float = 0.35
-    risk_pct: float = 0.35
-
-    # Default TP/SL
-    tp_pct: float = 0.006
-    sl_pct: float = 0.003
-
-    # TP/SL bounds
-    tp_pct_min: float = 0.0005
-    tp_pct_max: float = 0.05
-    sl_pct_min: float = 0.0005
-    sl_pct_max: float = 0.05
-
-    # Legacy
-    max_sl_pct: float = 0.015
-    max_trade_qty: float = 1.0
-
-    # Entry/exit cadence
-    entry_cooldown_sec: float = 8.0
-    cooldown_after_close: float = 3.0
-    min_entry_score_for_gpt: float = 28.0
-    gpt_entry_cooldown_sec: float = 10.0
-
-    # GPT safety
-    gpt_daily_call_limit: int = 2000
-    gpt_max_risk_pct: float = 0.02
-    gpt_min_confidence: float = 0.6
-    gpt_reject_if_over_pnl_pct: float = 0.02
-
-    # OpenAI (Trader engine)
-    openai_api_key: str = ""
-    openai_model: str = ""
-    openai_max_tokens: int = 1500
-    openai_temperature: float = 0.2
-    openai_max_latency_sec: float = 12.0
-
-    # External intelligence
-    alphavantage_api_key: str = ""
-
-    # Entry flow
-    entry_score_threshold: float = 0.55
-    entry_tp_pct: float = 0.01
-    entry_sl_pct: float = 0.005
-    entry_risk_pct: float = 0.02
-    entry_max_spread_pct: float = 0.002
-    entry_min_trend_strength: float = 0.2
-    entry_min_abs_orderbook_imbalance: float = 0.05
-
-    # Notifications
-    unrealized_notify_sec: int = 1800
-
-    # EXIT engine
-    enable_exit_gpt: bool = True
-
-    # Polling / order limits
-    poll_fills_sec: float = 3.0
-    max_open_orders: int = 5
-
-    # Daily entry cap
-    max_entry_per_day: int = 999
-    max_entry_per_day_reset_hour_kst: int = 9
-
-    # Logging
-    log_to_file: bool = False
-    log_file: str = "logs/bot.log"
-
-    # Telegram
-    telegram_bot_token: str = ""
-    telegram_chat_id: str = ""
-
-    # WebSocket buffering
-    ws_enabled: bool = True
-    ws_base: str = "wss://fstream.binance.com/ws"
-    ws_combined_base: str = "wss://fstream.binance.com/stream?streams="
-    ws_subscribe_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-    ws_required_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-    preflight_ws_wait_sec: int = 60
-    ws_min_kline_buffer: int = 300
-    ws_max_kline_delay_sec: float = 120.0
-    ws_orderbook_max_delay_sec: float = 10.0
-    ws_log_enabled: bool = False
-    ws_log_interval_sec: int = 60
-    ws_stale_reset_sec: float = 600.0
-    ws_klines_stale_sec: float = 180.0
-
-    # WS bootstrap/backfill
-    ws_backfill_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-    ws_backfill_limit: int = 500
-
-    # Market-data store worker settings
-    md_store_flush_sec: float = 2.0
-    ob_store_interval_sec: float = 1.0
-    md_store_tfs: List[str] = field(default_factory=lambda: ["1m", "5m", "15m", "1h", "4h"])
-
-    # Guards
-    max_spread_pct: float = 0.0015
-    max_spread_abs: float = 0.0
-    min_entry_volume_ratio: float = 0.15
-    max_price_jump_pct: float = 0.003
-    max_5m_delay_ms: int = 10 * 60 * 1000
-    max_orderbook_age_ms: int = 3000
-    min_bbo_notional_usdt: float = 0.0
-
-    depth_imbalance_enabled: bool = True
-    depth_imbalance_min_notional: float = 10.0
-    depth_imbalance_min_ratio: float = 2.0
-
-    price_deviation_guard_enabled: bool = True
-    price_deviation_max_pct: float = 0.0015
-
-    session_spread_mult_asia: float = 1.0
-    session_spread_mult_eu: float = 1.1
-    session_spread_mult_us: float = 1.2
-    session_jump_mult_asia: float = 1.0
-    session_jump_mult_eu: float = 1.1
-    session_jump_mult_us: float = 1.2
-
-    # Monitoring
-    data_health_notify_sec: int = 900
-    signal_analysis_interval_sec: int = 60
-    krw_per_usdt: float = 1400.0
-
-    # Operations / runtime safety
-    sigterm_grace_sec: int = 30
-    allow_start_without_leverage_setup: bool = False
-
-    # 운영 파라미터
-    async_worker_threads: int = 1
-    async_worker_queue_size: int = 2000
-    reconcile_interval_sec: int = 30
-    reconcile_confirm_n: int = 3
-    force_close_on_desync: bool = False
-    max_signal_latency_ms: int = 200
-    max_exec_latency_ms: int = 2500
-
-    # run_bot_ws
-    position_resync_sec: float = 20.0
-
-    # Drift detector
-    drift_allocation_abs_jump: float = 0.45
-    drift_allocation_spike_ratio: float = 3.0
-    drift_multiplier_abs_jump: float = 0.50
-    drift_micro_abs_jump: float = 40.0
-    drift_stable_regime_steps: int = 100
-
-    # Exchange endpoints
-    binance_futures_base: str = "https://fapi.binance.com"
-    binance_futures_base_url: str = "https://fapi.binance.com"
-
-    # Legacy aliases
-    binance_recv_window: int = 5000
-    binance_http_timeout_sec: int = 10
-
-    # Hard risk guards
-    hard_daily_loss_limit_usdt: float = 0.0
-    hard_consecutive_losses_limit: int = 0
-    hard_position_value_pct_cap: float = 100.0
-    hard_liquidation_distance_pct_min: float = 0.0
-
-    # Slippage / protection
-    slippage_block_pct: float = 0.002
-    slippage_stop_engine: bool = False
-    protection_mode_enabled: bool = True
-
-    # 실행/멱등성/체결 확정
-    require_deterministic_client_order_id: bool = True
-    entry_fill_wait_sec: float = 2.0
-    max_entry_slippage_pct: Optional[float] = None
-
-    # TEST controls
-    test_dry_run: bool = False
-    test_bypass_guards: bool = False
-    test_force_enter: bool = False
-    test_fake_available_usdt: float = 0.0
-
-    # Redis cache (Dashboard)
-    redis_url: str = "redis://localhost:6379/0"
-    dashboard_cache_prefix: str = "auto_trader_dashboard"
-    dashboard_cache_ttl_sec: int = 5
-    redis_socket_timeout_sec: float = 1.0
-    redis_socket_connect_timeout_sec: float = 1.0
-    redis_health_check_interval_sec: int = 30
-
-    # AI Trading Intelligence
-    analyst_market_symbol: str = "BTCUSDT"
-    analyst_db_market_timeframe: str = "5m"
-    analyst_db_market_lookback_limit: int = 60
-    analyst_pattern_entry_threshold: float = 0.55
-    analyst_spread_guard_bps: float = 15.0
-    analyst_imbalance_guard_abs: float = 0.60
-    analyst_trade_lookback_limit: int = 30
-    analyst_event_lookback_limit: int = 300
-    analyst_include_external_market: bool = True
-
-    analyst_auto_report_market_interval_sec: int = 7200
-    analyst_auto_report_system_interval_sec: int = 1800
-    analyst_auto_report_persist: bool = True
-    analyst_auto_report_notify: bool = False
-
-    analyst_openai_model: str = "gpt-5-mini"
-    analyst_openai_timeout_sec: float = 120.0
-    analyst_openai_max_output_tokens: int = 1200
-    # Responses API 경로에서는 temperature 미사용. 호환성/레거시 설정 유지용 필드.
-    analyst_openai_temperature: float = 0.1
-    analyst_openai_reasoning_effort: Optional[str] = None
-
-    analyst_kline_interval: str = "5m"
-    analyst_kline_limit: int = 300
-    analyst_http_timeout_sec: float = 10.0
-    analyst_ratio_period: str = "5m"
-    analyst_ratio_limit: int = 30
-    analyst_depth_limit: int = 20
-    analyst_funding_limit: int = 10
-    analyst_force_order_limit: int = 50
-    analyst_max_server_drift_ms: int = 5000
-
-    def __getattr__(self, name: str) -> object:
-        alias = _SETTINGS_ALIAS_MAP.get(name)
-        if alias is not None:
-            return object.__getattribute__(self, alias)
-        raise AttributeError(name)
+class WSProtocolError(RuntimeError):
+    """Binance multiplex payload protocol violation (STRICT)."""
 
 
-# Backward-compatible alias for legacy type hints
-BotSettings = Settings
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
-@dataclass(frozen=True, slots=True)
-class PatternStrengthSettings:
-    """Optional pattern-strength overrides used by pattern_detection."""
-    pattern_strengths: Dict[str, float] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------
-# Optional .env loader (no external deps)
-# ---------------------------------------------------------------------
-def _strip_inline_comment(s: str) -> str:
-    out: list[str] = []
-    in_single = False
-    in_double = False
-
-    for ch in s:
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            out.append(ch)
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            out.append(ch)
-            continue
-        if ch == "#" and not in_single and not in_double:
-            break
-        out.append(ch)
-
-    return "".join(out).strip()
-
-
-def _unquote(v: str) -> str:
-    v = v.strip()
-    if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
-        return v[1:-1]
-    return v
-
-
-def _load_env_file_into_environ(dotenv_path: Path) -> None:
+def _safe_dump_for_log(obj: Any, max_len: int = 2000) -> str:
     try:
-        text = dotenv_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return
-    except Exception as e:
-        raise RuntimeError(f"failed to read .env: {e.__class__.__name__}") from None
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-
-        line = _strip_inline_comment(line)
-        if not line:
-            continue
-
-        if "=" not in line:
-            raise ValueError(f"invalid .env line (missing '='): {raw_line}")
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = _unquote(value.strip())
-
-        if not key:
-            raise ValueError(f"invalid .env line (empty key): {raw_line}")
-
-        if key in os.environ:
-            continue
-
-        os.environ[key] = value
-
-
-def _try_load_local_dotenv() -> None:
-    candidates: list[Path] = [Path.cwd() / ".env"]
-
-    try:
-        here = Path(__file__).resolve()
-        base = here.parent
-        for _ in range(6):
-            candidates.append(base / ".env")
-            if base.parent == base:
-                break
-            base = base.parent
+        s = json.dumps(obj, ensure_ascii=False, default=str)
     except Exception:
-        pass
-
-    for p in candidates:
-        if p.is_file():
-            _load_env_file_into_environ(p)
-            logger.info(".env loaded (path=%s)", str(p))
-            return
-
-
-# ---------------------------------------------------------------------
-# Type conversion helpers
-# ---------------------------------------------------------------------
-def _get_env(key: str) -> Optional[str]:
-    v = os.environ.get(key)
-    if v is None:
-        return None
-    vv = str(v).strip()
-    return vv if vv != "" else None
-
-
-def _as_str(key: str, default: str) -> str:
-    v = _get_env(key)
-    return v if v is not None else default
-
-
-def _as_str_opt(key: str) -> Optional[str]:
-    v = _get_env(key)
-    return v if v is not None else None
-
-
-def _as_int(key: str, default: int) -> int:
-    v = _get_env(key)
-    if v is None:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        raise ValueError(f"invalid int for {key}") from None
-
-
-def _as_float(key: str, default: float) -> float:
-    v = _get_env(key)
-    if v is None:
-        return default
-    try:
-        x = float(v)
-    except Exception:
-        raise ValueError(f"invalid float for {key}") from None
-
-    if not math.isfinite(x):
-        raise RuntimeError(f"non-finite float for {key}")
-
-    return x
-
-
-def _as_float_opt(key: str) -> Optional[float]:
-    v = _get_env(key)
-    if v is None:
-        return None
-    try:
-        x = float(v)
-    except Exception:
-        raise ValueError(f"invalid float for {key}") from None
-    if not math.isfinite(x):
-        raise RuntimeError(f"non-finite float for {key}")
-    return x
-
-
-def _as_bool(key: str, default: bool) -> bool:
-    v = _get_env(key)
-    if v is None:
-        return default
-
-    vv = v.strip().lower()
-    if vv in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if vv in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise ValueError(f"invalid bool for {key}")
-
-
-def _as_csv_list(key: str, default: List[str]) -> List[str]:
-    v = _get_env(key)
-    if v is None:
-        return list(default)
-
-    parts = [p.strip() for p in v.split(",")]
-    out = [p for p in parts if p]
-    return out if out else list(default)
-
-
-def _resolve_unique_env_value(keys: List[str], label: str) -> Optional[str]:
-    hits: List[tuple[str, str]] = []
-
-    for key in keys:
-        value = _get_env(key)
-        if value is not None:
-            hits.append((key, value))
-
-    if not hits:
-        return None
-
-    distinct = {value for _, value in hits}
-    if len(distinct) > 1:
-        detail = ", ".join(f"{key}={value}" for key, value in hits)
-        raise RuntimeError(f"Conflicting environment values for {label}: {detail}")
-
-    return hits[0][1]
-
-
-def _resolve_str_env(keys: List[str], *, default: str, label: str) -> str:
-    value = _resolve_unique_env_value(keys, label)
-    return value if value is not None else default
-
-
-def _resolve_str_opt_env(keys: List[str], *, label: str) -> Optional[str]:
-    return _resolve_unique_env_value(keys, label)
-
-
-def _resolve_int_env(keys: List[str], *, default: int, label: str) -> int:
-    raw = _resolve_unique_env_value(keys, label)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        key_list = ", ".join(keys)
-        raise ValueError(f"invalid int for {label} from keys [{key_list}]") from None
-
-
-def _resolve_float_env(keys: List[str], *, default: float, label: str) -> float:
-    raw = _resolve_unique_env_value(keys, label)
-    if raw is None:
-        return default
-    try:
-        parsed = float(raw)
-    except Exception:
-        key_list = ", ".join(keys)
-        raise ValueError(f"invalid float for {label} from keys [{key_list}]") from None
-
-    if not math.isfinite(parsed):
-        raise RuntimeError(f"non-finite float for {label}")
-
-    return parsed
-
-
-# ---------------------------------------------------------------------
-# Structured role loaders
-# ---------------------------------------------------------------------
-def _load_trader_openai_settings() -> Dict[str, Any]:
-    return {
-        "openai_model": _resolve_str_env(
-            ["OPENAI_TRADER_MODEL", "OPENAI_MODEL", "OPENAI_SUPERVISOR_MODEL"],
-            default="",
-            label="trader_openai_model",
-        ),
-        "openai_max_tokens": _resolve_int_env(
-            ["OPENAI_TRADER_MAX_TOKENS", "OPENAI_MAX_TOKENS"],
-            default=1500,
-            label="trader_openai_max_tokens",
-        ),
-        "openai_temperature": _resolve_float_env(
-            ["OPENAI_TRADER_TEMPERATURE", "OPENAI_TEMPERATURE", "OPENAI_SUPERVISOR_TEMPERATURE"],
-            default=0.2,
-            label="trader_openai_temperature",
-        ),
-        "openai_max_latency_sec": _resolve_float_env(
-            ["OPENAI_TRADER_MAX_LATENCY_SEC", "OPENAI_TRADER_MAX_LATENCY", "OPENAI_MAX_LATENCY_SEC"],
-            default=12.0,
-            label="trader_openai_max_latency_sec",
-        ),
-    }
-
-
-def _load_analyst_openai_settings() -> Dict[str, Any]:
-    return {
-        "analyst_openai_model": _resolve_str_env(
-            ["ANALYST_OPENAI_MODEL"],
-            default="gpt-5-mini",
-            label="analyst_openai_model",
-        ),
-        "analyst_openai_timeout_sec": _resolve_float_env(
-            ["ANALYST_OPENAI_TIMEOUT_SEC"],
-            default=120.0,
-            label="analyst_openai_timeout_sec",
-        ),
-        "analyst_openai_max_output_tokens": _resolve_int_env(
-            ["ANALYST_OPENAI_MAX_OUTPUT_TOKENS"],
-            default=1200,
-            label="analyst_openai_max_output_tokens",
-        ),
-        # Responses API 경로에서는 현재 미사용이나, 레거시 호환을 위해 로딩 유지
-        "analyst_openai_temperature": _resolve_float_env(
-            ["ANALYST_OPENAI_TEMPERATURE"],
-            default=0.1,
-            label="analyst_openai_temperature",
-        ),
-        "analyst_openai_reasoning_effort": _resolve_str_opt_env(
-            ["ANALYST_OPENAI_REASONING_EFFORT"],
-            label="analyst_openai_reasoning_effort",
-        ),
-    }
-
-
-# ---------------------------------------------------------------------
-# Validation helpers
-# ---------------------------------------------------------------------
-def _validate_supported_ratio_period(period: str) -> None:
-    supported = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
-    if period not in supported:
-        raise ValueError(f"analyst_ratio_period must be one of {sorted(supported)}")
-
-
-def _validate_settings(s: Settings) -> None:
-    if not s.api_key or not s.api_secret:
-        raise RuntimeError("missing Binance credentials (BINANCE_API_KEY / BINANCE_API_SECRET)")
-
-    sym = str(s.symbol or "").strip().upper()
-    if not sym:
-        raise ValueError("symbol is empty")
-    if any(ch.isspace() for ch in sym):
-        raise ValueError("symbol contains whitespace")
-
-    interval = str(s.interval or "").strip()
-    if not interval:
-        raise ValueError("interval is empty")
-
-    if s.leverage < 1:
-        raise ValueError("leverage must be >= 1")
-
-    if s.recv_window_ms < 1:
-        raise ValueError("recv_window_ms must be >= 1")
-    if s.request_timeout_sec < 1:
-        raise ValueError("request_timeout_sec must be >= 1")
-
-    if s.qty_step <= 0:
-        raise ValueError("qty_step must be > 0")
-    if s.min_qty <= 0:
-        raise ValueError("min_qty must be > 0")
-    if s.price_tick <= 0:
-        raise ValueError("price_tick must be > 0")
-
-    mm = str(s.margin_mode or "").strip().upper()
-    if mm not in {"ISOLATED", "CROSSED"}:
-        raise ValueError("margin_mode must be ISOLATED or CROSSED")
-
-    if not (0.0 < float(s.allocation_ratio) <= 1.0):
-        raise ValueError("allocation_ratio must be within (0,1]")
-
-    if not (0.0 < float(s.risk_pct) <= 1.0):
-        raise ValueError("risk_pct must be within (0,1] (legacy alias)")
-    if abs(float(s.risk_pct) - float(s.allocation_ratio)) > 1e-12:
-        raise ValueError("risk_pct must equal allocation_ratio (do not set them differently)")
-
-    for name, v in [
-        ("tp_pct_min", s.tp_pct_min),
-        ("tp_pct_max", s.tp_pct_max),
-        ("sl_pct_min", s.sl_pct_min),
-        ("sl_pct_max", s.sl_pct_max),
-    ]:
-        if not (isinstance(v, (int, float)) and math.isfinite(float(v))):
-            raise ValueError(f"{name} must be finite number")
-        if float(v) <= 0:
-            raise ValueError(f"{name} must be > 0")
-
-    if float(s.tp_pct_min) > float(s.tp_pct_max):
-        raise ValueError("tp_pct_min must be <= tp_pct_max")
-    if float(s.sl_pct_min) > float(s.sl_pct_max):
-        raise ValueError("sl_pct_min must be <= sl_pct_max")
-
-    if s.hard_daily_loss_limit_usdt < 0:
-        raise ValueError("hard_daily_loss_limit_usdt must be >= 0")
-    if s.hard_consecutive_losses_limit < 0:
-        raise ValueError("hard_consecutive_losses_limit must be >= 0")
-    if not (0.0 <= s.hard_position_value_pct_cap <= 100.0):
-        raise ValueError("hard_position_value_pct_cap must be within 0..100")
-    if not (0.0 <= s.hard_liquidation_distance_pct_min <= 100.0):
-        raise ValueError("hard_liquidation_distance_pct_min must be within 0..100")
-
-    if not (0.0 <= float(s.max_spread_pct) <= 1.0):
-        raise ValueError("max_spread_pct must be within 0..1 (fraction)")
-    if float(s.max_spread_abs) < 0:
-        raise ValueError("max_spread_abs must be >= 0")
-    if float(s.min_entry_volume_ratio) < 0:
-        raise ValueError("min_entry_volume_ratio must be >= 0")
-    if not (0.0 <= float(s.max_price_jump_pct) <= 1.0):
-        raise ValueError("max_price_jump_pct must be within 0..1 (fraction)")
-    if s.max_5m_delay_ms < 1:
-        raise ValueError("max_5m_delay_ms must be >= 1")
-    if s.max_orderbook_age_ms < 1:
-        raise ValueError("max_orderbook_age_ms must be >= 1")
-    if float(s.min_bbo_notional_usdt) < 0:
-        raise ValueError("min_bbo_notional_usdt must be >= 0")
-
-    if float(s.depth_imbalance_min_notional) < 0:
-        raise ValueError("depth_imbalance_min_notional must be >= 0")
-    if float(s.depth_imbalance_min_ratio) <= 0:
-        raise ValueError("depth_imbalance_min_ratio must be > 0")
-
-    if not (0.0 <= float(s.price_deviation_max_pct) <= 1.0):
-        raise ValueError("price_deviation_max_pct must be within 0..1 (fraction)")
-
-    if s.slippage_block_pct < 0:
-        raise ValueError("slippage_block_pct must be >= 0")
-    if s.slippage_block_pct > 1.0:
-        raise ValueError("slippage_block_pct must be <= 1.0 (fraction)")
-    if s.sigterm_grace_sec <= 0:
-        raise ValueError("sigterm_grace_sec must be > 0")
-
-    if s.async_worker_threads < 1:
-        raise ValueError("async_worker_threads must be >= 1")
-    if s.async_worker_queue_size < 1:
-        raise ValueError("async_worker_queue_size must be >= 1")
-    if s.reconcile_interval_sec < 1:
-        raise ValueError("reconcile_interval_sec must be >= 1")
-    if s.reconcile_confirm_n < 1:
-        raise ValueError("reconcile_confirm_n must be >= 1")
-    if s.max_signal_latency_ms < 1:
-        raise ValueError("max_signal_latency_ms must be >= 1")
-    if s.max_exec_latency_ms < 1:
-        raise ValueError("max_exec_latency_ms must be >= 1")
-
-    if s.preflight_ws_wait_sec < 1:
-        raise ValueError("preflight_ws_wait_sec must be >= 1")
-    if s.ws_min_kline_buffer < 1:
-        raise ValueError("ws_min_kline_buffer must be >= 1")
-    if s.ws_max_kline_delay_sec <= 0:
-        raise ValueError("ws_max_kline_delay_sec must be > 0")
-    if s.ws_orderbook_max_delay_sec <= 0:
-        raise ValueError("ws_orderbook_max_delay_sec must be > 0")
-    if s.ws_log_interval_sec < 1:
-        raise ValueError("ws_log_interval_sec must be >= 1")
-    if s.ws_stale_reset_sec <= 0:
-        raise ValueError("ws_stale_reset_sec must be > 0")
-    if s.ws_klines_stale_sec <= 30:
-        raise ValueError("ws_klines_stale_sec must be > 30")
-    if s.ws_backfill_limit < 1:
-        raise ValueError("ws_backfill_limit must be >= 1")
-    if s.md_store_flush_sec <= 0:
-        raise ValueError("md_store_flush_sec must be > 0")
-    if s.ob_store_interval_sec <= 0:
-        raise ValueError("ob_store_interval_sec must be > 0")
-    if s.position_resync_sec <= 0:
-        raise ValueError("position_resync_sec must be > 0")
-
-    if not (0.0 < float(s.drift_allocation_abs_jump) <= 1.0):
-        raise ValueError("drift_allocation_abs_jump must be within (0,1]")
-    if float(s.drift_allocation_spike_ratio) <= 1.0:
-        raise ValueError("drift_allocation_spike_ratio must be > 1.0")
-    if not (0.0 < float(s.drift_multiplier_abs_jump) <= 1.0):
-        raise ValueError("drift_multiplier_abs_jump must be within (0,1]")
-    if not (0.0 < float(s.drift_micro_abs_jump) <= 100.0):
-        raise ValueError("drift_micro_abs_jump must be within (0,100]")
-    if s.drift_stable_regime_steps < 2:
-        raise ValueError("drift_stable_regime_steps must be >= 2")
-
-    if not isinstance(s.require_deterministic_client_order_id, bool):
-        raise ValueError("require_deterministic_client_order_id must be bool")
-
-    if not (isinstance(s.entry_fill_wait_sec, (int, float)) and math.isfinite(float(s.entry_fill_wait_sec))):
-        raise ValueError("entry_fill_wait_sec must be finite number")
-    if float(s.entry_fill_wait_sec) <= 0:
-        raise ValueError("entry_fill_wait_sec must be > 0")
-
-    if s.max_entry_slippage_pct is not None:
-        if not (isinstance(s.max_entry_slippage_pct, (int, float)) and math.isfinite(float(s.max_entry_slippage_pct))):
-            raise ValueError("max_entry_slippage_pct must be finite number or None")
-        if float(s.max_entry_slippage_pct) < 0:
-            raise ValueError("max_entry_slippage_pct must be >= 0")
-
-    if not str(s.openai_api_key or "").strip():
-        raise RuntimeError("missing OpenAI key (OPENAI_API_KEY)")
-    if not str(s.openai_model or "").strip():
-        raise RuntimeError("missing OpenAI model (OPENAI_MODEL or OPENAI_TRADER_MODEL or OPENAI_SUPERVISOR_MODEL)")
-    if not (1 <= int(s.openai_max_tokens) <= 4096):
-        raise ValueError("openai_max_tokens must be within 1..4096")
-    if not (0.0 <= float(s.openai_temperature) <= 2.0):
-        raise ValueError("openai_temperature must be within 0..2")
-    if not (
-        isinstance(s.openai_max_latency_sec, (int, float))
-        and math.isfinite(float(s.openai_max_latency_sec))
-        and float(s.openai_max_latency_sec) > 0
-    ):
-        raise ValueError("openai_max_latency_sec must be finite > 0")
-
-    if not str(s.alphavantage_api_key or "").strip():
-        raise RuntimeError("missing Alpha Vantage key (ALPHAVANTAGE_API_KEY)")
-
-    if s.test_bypass_guards and not s.test_dry_run:
-        raise RuntimeError("test_bypass_guards is only allowed with test_dry_run=True (STRICT)")
-    if s.test_force_enter and not s.test_dry_run:
-        raise RuntimeError("test_force_enter is only allowed with test_dry_run=True (STRICT)")
-    if float(s.test_fake_available_usdt) > 0 and not s.test_dry_run:
-        raise RuntimeError("test_fake_available_usdt is only allowed with test_dry_run=True (STRICT)")
-    if float(s.test_fake_available_usdt) < 0:
-        raise ValueError("test_fake_available_usdt must be >= 0 (STRICT)")
-
-    if not str(s.redis_url or "").strip():
-        raise RuntimeError("redis_url is required (STRICT)")
-    if not str(s.dashboard_cache_prefix or "").strip():
-        raise RuntimeError("dashboard_cache_prefix is required (STRICT)")
-    if s.dashboard_cache_ttl_sec < 1:
-        raise ValueError("dashboard_cache_ttl_sec must be >= 1")
-    if s.redis_socket_timeout_sec <= 0:
-        raise ValueError("redis_socket_timeout_sec must be > 0")
-    if s.redis_socket_connect_timeout_sec <= 0:
-        raise ValueError("redis_socket_connect_timeout_sec must be > 0")
-    if s.redis_health_check_interval_sec < 1:
-        raise ValueError("redis_health_check_interval_sec must be >= 1")
-
-    # AI Trading Intelligence validations
-    analyst_symbol = str(s.analyst_market_symbol or "").strip().upper()
-    if not analyst_symbol:
-        raise ValueError("analyst_market_symbol is empty")
-    if any(ch.isspace() for ch in analyst_symbol):
-        raise ValueError("analyst_market_symbol contains whitespace")
-
-    if not str(s.analyst_db_market_timeframe or "").strip():
-        raise ValueError("analyst_db_market_timeframe is empty")
-    if s.analyst_db_market_lookback_limit < 5:
-        raise ValueError("analyst_db_market_lookback_limit must be >= 5")
-    if s.analyst_trade_lookback_limit < 5:
-        raise ValueError("analyst_trade_lookback_limit must be >= 5")
-    if s.analyst_event_lookback_limit < 1:
-        raise ValueError("analyst_event_lookback_limit must be >= 1")
-    if s.analyst_pattern_entry_threshold <= 0:
-        raise ValueError("analyst_pattern_entry_threshold must be > 0")
-    if s.analyst_spread_guard_bps <= 0:
-        raise ValueError("analyst_spread_guard_bps must be > 0")
-    if s.analyst_imbalance_guard_abs <= 0:
-        raise ValueError("analyst_imbalance_guard_abs must be > 0")
-
-    if not str(s.analyst_openai_model or "").strip():
-        raise ValueError("analyst_openai_model is empty")
-    if s.analyst_openai_timeout_sec <= 0:
-        raise ValueError("analyst_openai_timeout_sec must be > 0")
-    if not (1 <= s.analyst_openai_max_output_tokens <= 8192):
-        raise ValueError("analyst_openai_max_output_tokens must be within 1..8192")
-    if not (0.0 <= float(s.analyst_openai_temperature) <= 2.0):
-        raise ValueError("analyst_openai_temperature must be within 0..2")
-    if s.analyst_openai_reasoning_effort is not None:
-        if s.analyst_openai_reasoning_effort not in {"low", "medium", "high"}:
-            raise ValueError("analyst_openai_reasoning_effort must be one of low/medium/high")
-
-    if s.analyst_auto_report_market_interval_sec < 1:
-        raise ValueError("analyst_auto_report_market_interval_sec must be >= 1")
-    if s.analyst_auto_report_system_interval_sec < 1:
-        raise ValueError("analyst_auto_report_system_interval_sec must be >= 1")
-
-    if not str(s.binance_futures_base_url or "").strip():
-        raise ValueError("binance_futures_base_url is empty")
-    if not str(s.analyst_kline_interval or "").strip():
-        raise ValueError("analyst_kline_interval is empty")
-    if s.analyst_kline_limit < 1:
-        raise ValueError("analyst_kline_limit must be >= 1")
-    if s.analyst_http_timeout_sec <= 0:
-        raise ValueError("analyst_http_timeout_sec must be > 0")
-    _validate_supported_ratio_period(s.analyst_ratio_period)
-    if s.analyst_ratio_limit < 1:
-        raise ValueError("analyst_ratio_limit must be >= 1")
-    if s.analyst_depth_limit < 1:
-        raise ValueError("analyst_depth_limit must be >= 1")
-    if s.analyst_funding_limit < 1:
-        raise ValueError("analyst_funding_limit must be >= 1")
-    if s.analyst_force_order_limit < 1:
-        raise ValueError("analyst_force_order_limit must be >= 1")
-    if s.analyst_max_server_drift_ms < 0:
-        raise ValueError("analyst_max_server_drift_ms must be >= 0")
-
-
-# ---------------------------------------------------------------------
-# Public loader
-# ---------------------------------------------------------------------
-def load_settings() -> Settings:
-    """Load and validate Settings (env-first, optional .env, then defaults)."""
-    _try_load_local_dotenv()
-
-    api_key = _as_str("BINANCE_API_KEY", "")
-    api_secret = _as_str("BINANCE_API_SECRET", "")
-
-    symbol = _as_str("SYMBOL", "BTCUSDT").upper().replace("-", "")
-    interval = _as_str("INTERVAL", "5m")
-
-    leverage = _as_int("LEVERAGE", 1)
-
-    margin_mode = _as_str("MARGIN_MODE", "ISOLATED").upper()
-    if margin_mode in {"CROSS", "CROSSED"}:
-        margin_mode = "CROSSED"
-    if margin_mode not in {"ISOLATED", "CROSSED"}:
-        raise ValueError("MARGIN_MODE must be ISOLATED or CROSSED")
-
-    isolated = margin_mode == "ISOLATED"
-    futures_position_mode = _as_str("FUTURES_POSITION_MODE", "ONEWAY").upper()
-
-    recv_window_ms = _as_int("RECV_WINDOW_MS", 5000)
-    request_timeout_sec = _as_int("REQUEST_TIMEOUT_SEC", 10)
-
-    qty_step = _as_float("QTY_STEP", 0.001)
-    min_qty = _as_float("MIN_QTY", 0.001)
-    price_tick = _as_float("PRICE_TICK", 0.1)
-
-    alloc_env = _as_float_opt("ALLOCATION_RATIO")
-    risk_env = _as_float_opt("RISK_PCT")
-
-    if alloc_env is None and risk_env is None:
-        allocation_ratio = 0.35
-    elif alloc_env is not None:
-        allocation_ratio = float(alloc_env)
-        if risk_env is not None and abs(float(risk_env) - allocation_ratio) > 1e-12:
-            raise ValueError("ALLOCATION_RATIO and RISK_PCT mismatch (set only one or make them equal)")
-    else:
-        allocation_ratio = float(risk_env)
-
-    risk_pct = float(allocation_ratio)
-
-    tp_pct = _as_float("TP_PCT", 0.006)
-    sl_pct = _as_float("SL_PCT", 0.003)
-
-    tp_pct_min = _as_float("TP_PCT_MIN", 0.0005)
-    tp_pct_max = _as_float("TP_PCT_MAX", 0.05)
-    sl_pct_min = _as_float("SL_PCT_MIN", 0.0005)
-    sl_pct_max = _as_float("SL_PCT_MAX", 0.05)
-
-    max_sl_pct = _as_float("MAX_SL_PCT", 0.015)
-    max_trade_qty = _as_float("MAX_TRADE_QTY", 1.0)
-
-    entry_cooldown_sec = _as_float("ENTRY_COOLDOWN_SEC", 8.0)
-    cooldown_after_close = _as_float("COOLDOWN_AFTER_CLOSE", 3.0)
-    min_entry_score_for_gpt = _as_float("MIN_ENTRY_SCORE_FOR_GPT", 28.0)
-    gpt_entry_cooldown_sec = _as_float("GPT_ENTRY_COOLDOWN_SEC", 10.0)
-
-    gpt_daily_call_limit = _as_int("GPT_DAILY_CALL_LIMIT", 2000)
-    gpt_max_risk_pct = _as_float("GPT_MAX_RISK_PCT", 0.02)
-    gpt_min_confidence = _as_float("GPT_MIN_CONFIDENCE", 0.6)
-    gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
-
-    openai_api_key = _as_str("OPENAI_API_KEY", "")
-    alphavantage_api_key = _as_str("ALPHAVANTAGE_API_KEY", "")
-    trader_openai = _load_trader_openai_settings()
-    openai_model = str(trader_openai["openai_model"])
-    openai_max_tokens = int(trader_openai["openai_max_tokens"])
-    openai_temperature = float(trader_openai["openai_temperature"])
-    openai_max_latency_sec = float(trader_openai["openai_max_latency_sec"])
-
-    unrealized_notify_sec = _as_int("UNREALIZED_NOTIFY_SEC", 1800)
-    enable_exit_gpt = _as_bool("ENABLE_EXIT_GPT", True)
-
-    poll_fills_sec = _as_float("POLL_FILLS_SEC", 3.0)
-    max_open_orders = _as_int("MAX_OPEN_ORDERS", 5)
-
-    max_entry_per_day = _as_int("MAX_ENTRY_PER_DAY", 999)
-    max_entry_per_day_reset_hour_kst = _as_int("MAX_ENTRY_PER_DAY_RESET_HOUR_KST", 9)
-
-    log_to_file = _as_bool("LOG_TO_FILE", False)
-    log_file = _as_str("LOG_FILE", "logs/bot.log")
-
-    telegram_bot_token = _as_str("TELEGRAM_BOT_TOKEN", "")
-    telegram_chat_id = _as_str("TELEGRAM_CHAT_ID", "")
-
-    ws_enabled = _as_bool("WS_ENABLED", True)
-    ws_base = _as_str("BINANCE_FUTURES_WS_BASE", "wss://fstream.binance.com/ws")
-    ws_combined_base = _as_str("BINANCE_FUTURES_WS_COMBINED_BASE", "wss://fstream.binance.com/stream?streams=")
-
-    ws_subscribe_tfs = _as_csv_list("WS_SUBSCRIBE_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_required_tfs = _as_csv_list("WS_REQUIRED_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    preflight_ws_wait_sec = _as_int("PREFLIGHT_WS_WAIT_SEC", 60)
-    ws_min_kline_buffer = _as_int("WS_MIN_KLINE_BUFFER", 300)
-    ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
-    ws_orderbook_max_delay_sec = _as_float("WS_ORDERBOOK_MAX_DELAY_SEC", 10.0)
-    ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)
-    ws_log_interval_sec = _as_int("WS_LOG_INTERVAL_SEC", 60)
-    ws_stale_reset_sec = _as_float("WS_STALE_RESET_SEC", 600.0)
-    ws_klines_stale_sec = _as_float("WS_KLINES_STALE_SEC", 180.0)
-
-    ws_backfill_tfs = _as_csv_list("WS_BACKFILL_TFS", ["1m", "5m", "15m", "1h", "4h"])
-    ws_backfill_limit = _as_int("WS_BACKFILL_LIMIT", 500)
-
-    md_store_flush_sec = _as_float("MD_STORE_FLUSH_SEC", 2.0)
-    ob_store_interval_sec = _as_float("OB_STORE_INTERVAL_SEC", 1.0)
-    md_store_tfs = _as_csv_list("MD_STORE_TFS", ["1m", "5m", "15m", "1h", "4h"])
-
-    max_spread_pct = _as_float("MAX_SPREAD_PCT", 0.0015)
-    max_spread_abs = _as_float("MAX_SPREAD_ABS", 0.0)
-    min_entry_volume_ratio = _as_float("MIN_ENTRY_VOLUME_RATIO", 0.15)
-    max_price_jump_pct = _as_float("MAX_PRICE_JUMP_PCT", 0.003)
-
-    max_5m_delay_ms = _as_int("MAX_5M_DELAY_MS", 10 * 60 * 1000)
-    max_orderbook_age_ms = _as_int("MAX_ORDERBOOK_AGE_MS", 3000)
-    min_bbo_notional_usdt = _as_float("MIN_BBO_NOTIONAL_USDT", 0.0)
-
-    depth_imbalance_enabled = _as_bool("DEPTH_IMBALANCE_ENABLED", True)
-    depth_imbalance_min_notional = _as_float("DEPTH_IMBALANCE_MIN_NOTIONAL", 10.0)
-    depth_imbalance_min_ratio = _as_float("DEPTH_IMBALANCE_MIN_RATIO", 2.0)
-
-    price_deviation_guard_enabled = _as_bool("PRICE_DEVIATION_GUARD_ENABLED", True)
-    price_deviation_max_pct = _as_float("PRICE_DEVIATION_MAX_PCT", 0.0015)
-
-    session_spread_mult_asia = _as_float("SESSION_SPREAD_MULT_ASIA", 1.0)
-    session_spread_mult_eu = _as_float("SESSION_SPREAD_MULT_EU", 1.1)
-    session_spread_mult_us = _as_float("SESSION_SPREAD_MULT_US", 1.2)
-
-    session_jump_mult_asia = _as_float("SESSION_JUMP_MULT_ASIA", 1.0)
-    session_jump_mult_eu = _as_float("SESSION_JUMP_MULT_EU", 1.1)
-    session_jump_mult_us = _as_float("SESSION_JUMP_MULT_US", 1.2)
-
-    data_health_notify_sec = _as_int("DATA_HEALTH_NOTIFY_SEC", 900)
-    signal_analysis_interval_sec = _as_int("SIGNAL_ANALYSIS_INTERVAL_SEC", 60)
-    krw_per_usdt = _as_float("KRW_PER_USDT", 1400.0)
-
-    sigterm_grace_sec = _as_int("SIGTERM_GRACE_SEC", 30)
-    allow_start_without_leverage_setup = _as_bool("ALLOW_START_WITHOUT_LEVERAGE_SETUP", False)
-
-    async_worker_threads = _as_int("ASYNC_WORKER_THREADS", 1)
-    async_worker_queue_size = _as_int("ASYNC_WORKER_QUEUE_SIZE", 2000)
-    reconcile_interval_sec = _as_int("RECONCILE_INTERVAL_SEC", 30)
-    reconcile_confirm_n = _as_int("RECONCILE_CONFIRM_N", 3)
-    force_close_on_desync = _as_bool("FORCE_CLOSE_ON_DESYNC", False)
-    max_signal_latency_ms = _as_int("MAX_SIGNAL_LATENCY_MS", 200)
-    max_exec_latency_ms = _as_int("MAX_EXEC_LATENCY_MS", 2500)
-
-    position_resync_sec = _as_float("POSITION_RESYNC_SEC", 20.0)
-
-    drift_allocation_abs_jump = _as_float("DRIFT_ALLOCATION_ABS_JUMP", 0.45)
-    drift_allocation_spike_ratio = _as_float("DRIFT_ALLOCATION_SPIKE_RATIO", 3.0)
-    drift_multiplier_abs_jump = _as_float("DRIFT_MULTIPLIER_ABS_JUMP", 0.50)
-    drift_micro_abs_jump = _as_float("DRIFT_MICRO_ABS_JUMP", 40.0)
-    drift_stable_regime_steps = _as_int("DRIFT_STABLE_REGIME_STEPS", 100)
-
-    binance_futures_base = _as_str("BINANCE_FUTURES_BASE", "https://fapi.binance.com")
-    binance_futures_base_url = _as_str("BINANCE_FUTURES_BASE_URL", binance_futures_base)
-    binance_recv_window = recv_window_ms
-    binance_http_timeout_sec = request_timeout_sec
-
-    hard_daily_loss_limit_usdt = _as_float("HARD_DAILY_LOSS_LIMIT_USDT", 0.0)
-    hard_consecutive_losses_limit = _as_int("HARD_CONSECUTIVE_LOSSES_LIMIT", 0)
-    hard_position_value_pct_cap = _as_float("HARD_POSITION_VALUE_PCT_CAP", 100.0)
-    hard_liquidation_distance_pct_min = _as_float("HARD_LIQUIDATION_DISTANCE_PCT_MIN", 0.0)
-
-    slippage_block_pct = _as_float("SLIPPAGE_BLOCK_PCT", 0.002)
-    slippage_stop_engine = _as_bool("SLIPPAGE_STOP_ENGINE", False)
-    protection_mode_enabled = _as_bool("PROTECTION_MODE_ENABLED", True)
-
-    require_deterministic_client_order_id = _as_bool("REQUIRE_DETERMINISTIC_CLIENT_ORDER_ID", True)
-    entry_fill_wait_sec = _as_float("ENTRY_FILL_WAIT_SEC", 2.0)
-    max_entry_slippage_pct = _as_float_opt("MAX_ENTRY_SLIPPAGE_PCT")
-
-    redis_url = _as_str("REDIS_URL", "redis://localhost:6379/0")
-    dashboard_cache_prefix = _as_str("DASHBOARD_CACHE_PREFIX", "auto_trader_dashboard")
-    dashboard_cache_ttl_sec = _as_int("DASHBOARD_CACHE_TTL_SEC", 5)
-    redis_socket_timeout_sec = _as_float("REDIS_SOCKET_TIMEOUT_SEC", 1.0)
-    redis_socket_connect_timeout_sec = _as_float("REDIS_SOCKET_CONNECT_TIMEOUT_SEC", 1.0)
-    redis_health_check_interval_sec = _as_int("REDIS_HEALTH_CHECK_INTERVAL_SEC", 30)
-
-    test_dry_run = _as_bool("TEST_DRY_RUN", False)
-    test_bypass_guards = _as_bool("TEST_BYPASS_GUARDS", False)
-    test_force_enter = _as_bool("TEST_FORCE_ENTER", False)
-    test_fake_available_usdt = _as_float("TEST_FAKE_AVAILABLE_USDT", 0.0)
-
-    # AI Trading Intelligence
-    analyst_market_symbol = _as_str("ANALYST_MARKET_SYMBOL", symbol).upper().replace("-", "")
-    analyst_db_market_timeframe = _as_str("ANALYST_DB_MARKET_TIMEFRAME", interval)
-    analyst_db_market_lookback_limit = _as_int("ANALYST_DB_MARKET_LOOKBACK_LIMIT", 60)
-    analyst_pattern_entry_threshold = _as_float("ANALYST_PATTERN_ENTRY_THRESHOLD", 0.55)
-    analyst_spread_guard_bps = _as_float("ANALYST_SPREAD_GUARD_BPS", 15.0)
-    analyst_imbalance_guard_abs = _as_float("ANALYST_IMBALANCE_GUARD_ABS", 0.60)
-    analyst_trade_lookback_limit = _as_int("ANALYST_TRADE_LOOKBACK_LIMIT", 30)
-    analyst_event_lookback_limit = _as_int("ANALYST_EVENT_LOOKBACK_LIMIT", 300)
-    analyst_include_external_market = _as_bool("ANALYST_INCLUDE_EXTERNAL_MARKET", True)
-
-    analyst_auto_report_market_interval_sec = _as_int("ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC", 300)
-    analyst_auto_report_system_interval_sec = _as_int("ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC", 1800)
-    analyst_auto_report_persist = _as_bool("ANALYST_AUTO_REPORT_PERSIST", True)
-    analyst_auto_report_notify = _as_bool("ANALYST_AUTO_REPORT_NOTIFY", False)
-
-    analyst_openai = _load_analyst_openai_settings()
-    analyst_openai_model = str(analyst_openai["analyst_openai_model"])
-    analyst_openai_timeout_sec = float(analyst_openai["analyst_openai_timeout_sec"])
-    analyst_openai_max_output_tokens = int(analyst_openai["analyst_openai_max_output_tokens"])
-    analyst_openai_temperature = float(analyst_openai["analyst_openai_temperature"])
-    analyst_openai_reasoning_effort = analyst_openai["analyst_openai_reasoning_effort"]
-
-    analyst_kline_interval = _as_str("ANALYST_KLINE_INTERVAL", "5m")
-    analyst_kline_limit = _as_int("ANALYST_KLINE_LIMIT", 300)
-    analyst_http_timeout_sec = _as_float("ANALYST_HTTP_TIMEOUT_SEC", 10.0)
-    analyst_ratio_period = _as_str("ANALYST_RATIO_PERIOD", "5m")
-    analyst_ratio_limit = _as_int("ANALYST_RATIO_LIMIT", 30)
-    analyst_depth_limit = _as_int("ANALYST_DEPTH_LIMIT", 20)
-    analyst_funding_limit = _as_int("ANALYST_FUNDING_LIMIT", 10)
-    analyst_force_order_limit = _as_int("ANALYST_FORCE_ORDER_LIMIT", 50)
-    analyst_max_server_drift_ms = _as_int("ANALYST_MAX_SERVER_DRIFT_MS", 5000)
-
-    s = Settings(
-        api_key=api_key,
-        api_secret=api_secret,
-        symbol=symbol,
-        interval=interval,
-        leverage=leverage,
-        isolated=isolated,
-        margin_mode=margin_mode,
-        futures_position_mode=futures_position_mode,
-        recv_window_ms=recv_window_ms,
-        request_timeout_sec=request_timeout_sec,
-        qty_step=qty_step,
-        min_qty=min_qty,
-        price_tick=price_tick,
-        allocation_ratio=float(allocation_ratio),
-        risk_pct=float(risk_pct),
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        tp_pct_min=tp_pct_min,
-        tp_pct_max=tp_pct_max,
-        sl_pct_min=sl_pct_min,
-        sl_pct_max=sl_pct_max,
-        max_sl_pct=max_sl_pct,
-        max_trade_qty=max_trade_qty,
-        entry_cooldown_sec=entry_cooldown_sec,
-        cooldown_after_close=cooldown_after_close,
-        min_entry_score_for_gpt=min_entry_score_for_gpt,
-        gpt_entry_cooldown_sec=gpt_entry_cooldown_sec,
-        gpt_daily_call_limit=gpt_daily_call_limit,
-        gpt_max_risk_pct=gpt_max_risk_pct,
-        gpt_min_confidence=gpt_min_confidence,
-        gpt_reject_if_over_pnl_pct=gpt_reject_if_over_pnl_pct,
-        openai_api_key=openai_api_key,
-        openai_model=openai_model,
-        openai_max_tokens=openai_max_tokens,
-        openai_temperature=openai_temperature,
-        openai_max_latency_sec=openai_max_latency_sec,
-        alphavantage_api_key=alphavantage_api_key,
-        unrealized_notify_sec=unrealized_notify_sec,
-        enable_exit_gpt=enable_exit_gpt,
-        poll_fills_sec=poll_fills_sec,
-        max_open_orders=max_open_orders,
-        max_entry_per_day=max_entry_per_day,
-        max_entry_per_day_reset_hour_kst=max_entry_per_day_reset_hour_kst,
-        log_to_file=log_to_file,
-        log_file=log_file,
-        telegram_bot_token=telegram_bot_token,
-        telegram_chat_id=telegram_chat_id,
-        ws_enabled=ws_enabled,
-        ws_base=ws_base,
-        ws_combined_base=ws_combined_base,
-        ws_subscribe_tfs=ws_subscribe_tfs,
-        ws_required_tfs=ws_required_tfs,
-        preflight_ws_wait_sec=preflight_ws_wait_sec,
-        ws_min_kline_buffer=ws_min_kline_buffer,
-        ws_max_kline_delay_sec=ws_max_kline_delay_sec,
-        ws_orderbook_max_delay_sec=ws_orderbook_max_delay_sec,
-        ws_log_enabled=ws_log_enabled,
-        ws_log_interval_sec=ws_log_interval_sec,
-        ws_stale_reset_sec=ws_stale_reset_sec,
-        ws_klines_stale_sec=ws_klines_stale_sec,
-        ws_backfill_tfs=ws_backfill_tfs,
-        ws_backfill_limit=ws_backfill_limit,
-        md_store_flush_sec=md_store_flush_sec,
-        ob_store_interval_sec=ob_store_interval_sec,
-        md_store_tfs=md_store_tfs,
-        max_spread_pct=max_spread_pct,
-        max_spread_abs=max_spread_abs,
-        min_entry_volume_ratio=min_entry_volume_ratio,
-        max_price_jump_pct=max_price_jump_pct,
-        max_5m_delay_ms=max_5m_delay_ms,
-        max_orderbook_age_ms=max_orderbook_age_ms,
-        min_bbo_notional_usdt=min_bbo_notional_usdt,
-        depth_imbalance_enabled=depth_imbalance_enabled,
-        depth_imbalance_min_notional=depth_imbalance_min_notional,
-        depth_imbalance_min_ratio=depth_imbalance_min_ratio,
-        price_deviation_guard_enabled=price_deviation_guard_enabled,
-        price_deviation_max_pct=price_deviation_max_pct,
-        session_spread_mult_asia=session_spread_mult_asia,
-        session_spread_mult_eu=session_spread_mult_eu,
-        session_spread_mult_us=session_spread_mult_us,
-        session_jump_mult_asia=session_jump_mult_asia,
-        session_jump_mult_eu=session_jump_mult_eu,
-        session_jump_mult_us=session_jump_mult_us,
-        data_health_notify_sec=data_health_notify_sec,
-        signal_analysis_interval_sec=signal_analysis_interval_sec,
-        krw_per_usdt=krw_per_usdt,
-        sigterm_grace_sec=sigterm_grace_sec,
-        allow_start_without_leverage_setup=allow_start_without_leverage_setup,
-        async_worker_threads=async_worker_threads,
-        async_worker_queue_size=async_worker_queue_size,
-        reconcile_interval_sec=reconcile_interval_sec,
-        reconcile_confirm_n=reconcile_confirm_n,
-        force_close_on_desync=force_close_on_desync,
-        max_signal_latency_ms=max_signal_latency_ms,
-        max_exec_latency_ms=max_exec_latency_ms,
-        position_resync_sec=position_resync_sec,
-        drift_allocation_abs_jump=drift_allocation_abs_jump,
-        drift_allocation_spike_ratio=drift_allocation_spike_ratio,
-        drift_multiplier_abs_jump=drift_multiplier_abs_jump,
-        drift_micro_abs_jump=drift_micro_abs_jump,
-        drift_stable_regime_steps=drift_stable_regime_steps,
-        binance_futures_base=binance_futures_base,
-        binance_futures_base_url=binance_futures_base_url,
-        binance_recv_window=binance_recv_window,
-        binance_http_timeout_sec=binance_http_timeout_sec,
-        hard_daily_loss_limit_usdt=hard_daily_loss_limit_usdt,
-        hard_consecutive_losses_limit=hard_consecutive_losses_limit,
-        hard_position_value_pct_cap=hard_position_value_pct_cap,
-        hard_liquidation_distance_pct_min=hard_liquidation_distance_pct_min,
-        slippage_block_pct=slippage_block_pct,
-        slippage_stop_engine=slippage_stop_engine,
-        protection_mode_enabled=protection_mode_enabled,
-        require_deterministic_client_order_id=require_deterministic_client_order_id,
-        entry_fill_wait_sec=entry_fill_wait_sec,
-        max_entry_slippage_pct=max_entry_slippage_pct,
-        test_dry_run=test_dry_run,
-        test_bypass_guards=test_bypass_guards,
-        test_force_enter=test_force_enter,
-        test_fake_available_usdt=test_fake_available_usdt,
-        redis_url=redis_url,
-        dashboard_cache_prefix=dashboard_cache_prefix,
-        dashboard_cache_ttl_sec=dashboard_cache_ttl_sec,
-        redis_socket_timeout_sec=redis_socket_timeout_sec,
-        redis_socket_connect_timeout_sec=redis_socket_connect_timeout_sec,
-        redis_health_check_interval_sec=redis_health_check_interval_sec,
-        analyst_market_symbol=analyst_market_symbol,
-        analyst_db_market_timeframe=analyst_db_market_timeframe,
-        analyst_db_market_lookback_limit=analyst_db_market_lookback_limit,
-        analyst_pattern_entry_threshold=analyst_pattern_entry_threshold,
-        analyst_spread_guard_bps=analyst_spread_guard_bps,
-        analyst_imbalance_guard_abs=analyst_imbalance_guard_abs,
-        analyst_trade_lookback_limit=analyst_trade_lookback_limit,
-        analyst_event_lookback_limit=analyst_event_lookback_limit,
-        analyst_include_external_market=analyst_include_external_market,
-        analyst_auto_report_market_interval_sec=analyst_auto_report_market_interval_sec,
-        analyst_auto_report_system_interval_sec=analyst_auto_report_system_interval_sec,
-        analyst_auto_report_persist=analyst_auto_report_persist,
-        analyst_auto_report_notify=analyst_auto_report_notify,
-        analyst_openai_model=analyst_openai_model,
-        analyst_openai_timeout_sec=analyst_openai_timeout_sec,
-        analyst_openai_max_output_tokens=analyst_openai_max_output_tokens,
-        analyst_openai_temperature=analyst_openai_temperature,
-        analyst_openai_reasoning_effort=analyst_openai_reasoning_effort,
-        analyst_kline_interval=analyst_kline_interval,
-        analyst_kline_limit=analyst_kline_limit,
-        analyst_http_timeout_sec=analyst_http_timeout_sec,
-        analyst_ratio_period=analyst_ratio_period,
-        analyst_ratio_limit=analyst_ratio_limit,
-        analyst_depth_limit=analyst_depth_limit,
-        analyst_funding_limit=analyst_funding_limit,
-        analyst_force_order_limit=analyst_force_order_limit,
-        analyst_max_server_drift_ms=analyst_max_server_drift_ms,
-    )
-
-    _validate_settings(s)
+        s = str(obj)
+    if len(s) > max_len:
+        return s[:max_len] + f"... (truncated, total_len={len(s)})"
     return s
 
 
-SETTINGS = load_settings()
+def _normalize_symbol(sym: str) -> str:
+    s = (sym or "").upper().strip()
+    if not s:
+        return ""
+    return s.replace("-", "").replace("/", "").replace("_", "")
+
+
+def _normalize_interval(iv: Any) -> str:
+    s = str(iv or "").strip()
+    if not s:
+        return ""
+    if s.endswith("M"):
+        return s
+    return s.lower()
+
+
+def _to_stream_symbol(sym: str) -> str:
+    return _normalize_symbol(sym).lower()
+
+
+def _require_int_ms(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise WSProtocolError(f"{name} must be int ms (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise WSProtocolError(f"{name} must be int ms: {e}") from e
+    if iv <= 0:
+        raise WSProtocolError(f"{name} must be > 0")
+    return iv
+
+
+def _require_float(v: Any, name: str, *, allow_zero: bool = False) -> float:
+    if v is None:
+        raise WSProtocolError(f"{name} missing")
+    if isinstance(v, bool):
+        raise WSProtocolError(f"{name} must be float (bool not allowed)")
+    try:
+        fv = float(v)
+    except Exception as e:
+        raise WSProtocolError(f"{name} must be float: {e}") from e
+    if not (fv == fv) or fv in (float("inf"), float("-inf")):
+        raise WSProtocolError(f"{name} must be finite")
+    if allow_zero:
+        if fv < 0:
+            raise WSProtocolError(f"{name} must be >= 0")
+    else:
+        if fv <= 0:
+            raise WSProtocolError(f"{name} must be > 0")
+    return float(fv)
+
+
+def _require_positive_int(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be int (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be int: {e}") from e
+    if iv <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return iv
+
+
+def _require_positive_float(v: Any, name: str) -> float:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be float (bool not allowed)")
+    try:
+        fv = float(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be float: {e}") from e
+    if not (fv == fv) or fv in (float("inf"), float("-inf")):
+        raise RuntimeError(f"{name} must be finite")
+    if fv <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return float(fv)
+
+
+def _require_interval_min_buffer_mapping(v: Any, name: str) -> Dict[str, int]:
+    if not isinstance(v, Mapping):
+        raise RuntimeError(f"{name} must be mapping[str,int] (STRICT)")
+    out: Dict[str, int] = {}
+    for raw_iv, raw_min in v.items():
+        iv = _normalize_interval(raw_iv)
+        if not iv:
+            raise RuntimeError(f"{name} contains empty/invalid interval key (STRICT)")
+        out[iv] = _require_positive_int(raw_min, f"{name}[{iv}]")
+    return out
+
+
+def _truncate_text(v: Any, max_len: int = 300) -> str:
+    s = str(v)
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + f"... (truncated, total_len={len(s)})"
+
+
+# ─────────────────────────────────────────────
+# Settings / SSOT
+# ─────────────────────────────────────────────
+WS_INTERVALS: List[str] = [_normalize_interval(x) for x in list(SET.ws_subscribe_tfs)]
+WS_INTERVALS = [x for x in WS_INTERVALS if x]
+
+REQUIRED_INTERVALS: List[str] = [_normalize_interval(x) for x in list(SET.ws_required_tfs)]
+REQUIRED_INTERVALS = [x for x in REQUIRED_INTERVALS if x]
+
+if not WS_INTERVALS:
+    raise RuntimeError("ws_subscribe_tfs is empty. At least one interval must be subscribed.")
+if not REQUIRED_INTERVALS:
+    raise RuntimeError("ws_required_tfs is empty. At least one required interval must be set.")
+
+_missing_required = [iv for iv in REQUIRED_INTERVALS if iv not in WS_INTERVALS]
+if _missing_required:
+    raise RuntimeError(
+        "ws_required_tfs contains intervals not present in ws_subscribe_tfs. "
+        f"missing={_missing_required}. Fix your settings to subscribe required intervals."
+    )
+
+_WS_COMBINED_BASE = str(SET.ws_combined_base or "").strip()
+if not _WS_COMBINED_BASE:
+    raise RuntimeError("settings.ws_combined_base is required (STRICT)")
+
+if "?streams=" not in _WS_COMBINED_BASE:
+    if _WS_COMBINED_BASE.endswith("/stream"):
+        _WS_COMBINED_BASE = _WS_COMBINED_BASE + "?streams="
+    else:
+        raise RuntimeError(f"settings.ws_combined_base must contain '?streams=' (STRICT): {_WS_COMBINED_BASE!r}")
+
+if not _WS_COMBINED_BASE.endswith("streams="):
+    raise RuntimeError(f"settings.ws_combined_base must end with 'streams=' (STRICT): {_WS_COMBINED_BASE!r}")
+
+_WS_REST_BASE = str(SET.binance_futures_rest_base or "").strip().rstrip("/")
+if not _WS_REST_BASE:
+    raise RuntimeError("settings.binance_futures_rest_base is required (STRICT)")
+if not (_WS_REST_BASE.startswith("http://") or _WS_REST_BASE.startswith("https://")):
+    raise RuntimeError(f"settings.binance_futures_rest_base invalid (STRICT): {_WS_REST_BASE!r}")
+
+_WS_BOOTSTRAP_REST_ENABLED: bool = bool(SET.ws_bootstrap_rest_enabled)
+_WS_REST_TIMEOUT_SEC: float = _require_positive_float(SET.ws_rest_timeout_sec, "ws_rest_timeout_sec")
+_WS_REST_KLINES_LIMIT_CAP: int = 1500
+
+KLINE_MIN_BUFFER: int = _require_positive_int(SET.ws_min_kline_buffer, "ws_min_kline_buffer")
+KLINE_MAX_DELAY_SEC: float = _require_positive_float(SET.ws_max_kline_delay_sec, "ws_max_kline_delay_sec")
+MARKET_EVENT_MAX_DELAY_SEC: float = _require_positive_float(
+    SET.ws_market_event_max_delay_sec,
+    "ws_market_event_max_delay_sec",
+)
+PONG_MAX_DELAY_SEC: float = _require_positive_float(SET.ws_pong_max_delay_sec, "ws_pong_max_delay_sec")
+PONG_STARTUP_GRACE_SEC: float = _require_positive_float(
+    SET.ws_pong_startup_grace_sec,
+    "ws_pong_startup_grace_sec",
+)
+
+_LONG_TF_MIN_BUFFER_DEFAULT: int = _require_positive_int(
+    SET.ws_min_kline_buffer_long_tf,
+    "ws_min_kline_buffer_long_tf",
+)
+
+_BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = {
+    "5m": 200,
+    "15m": 200,
+    "1h": 200,
+    "4h": 200,
+}
+
+_SETTINGS_INTERVAL_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = _require_interval_min_buffer_mapping(
+    SET.ws_min_kline_buffer_by_interval,
+    "ws_min_kline_buffer_by_interval",
+)
+
+_EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = dict(_BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL)
+for _iv, _min_buf in _SETTINGS_INTERVAL_MIN_BUFFER_BY_INTERVAL.items():
+    builtin_floor = _BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL.get(_iv)
+    if builtin_floor is not None and _min_buf < builtin_floor:
+        raise RuntimeError(
+            f"ws_min_kline_buffer_by_interval[{_iv}]={_min_buf} violates strict downstream requirement "
+            f"(need>={builtin_floor})"
+        )
+    prev = _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.get(_iv)
+    _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL[_iv] = max(_min_buf, prev or 0)
+
+_HEALTH_FAIL_LOG_SUPPRESS_SEC: float = _require_positive_float(
+    SET.ws_health_fail_log_suppress_sec,
+    "ws_health_fail_log_suppress_sec",
+)
+_last_health_fail_log_ts: float = 0.0
+_last_health_fail_key: str = ""
+_health_fail_lock = threading.Lock()
+
+_kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float, float]]] = {}
+_kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
+
+_orderbook_buffers: Dict[str, Dict[str, Any]] = {}
+_orderbook_last_update_id: Dict[str, int] = {}
+
+_ws_connection_open: Dict[str, bool] = {}
+_ws_last_open_ts: Dict[str, int] = {}
+_ws_last_close_ts: Dict[str, int] = {}
+_ws_last_close_text: Dict[str, str] = {}
+_ws_last_message_ts: Dict[str, int] = {}
+_ws_last_pong_ts: Dict[str, int] = {}
+_ws_last_error_text: Dict[str, str] = {}
+_ws_state_lock = threading.Lock()
+
+_kline_lock = threading.Lock()
+_orderbook_lock = threading.Lock()
+
+MAX_KLINES = 500
+
+_max_required_buffer = max(
+    [KLINE_MIN_BUFFER, _LONG_TF_MIN_BUFFER_DEFAULT, *_EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.values()]
+)
+if MAX_KLINES < _max_required_buffer:
+    raise RuntimeError(
+        f"MAX_KLINES({MAX_KLINES}) must be >= strict required min buffer ({_max_required_buffer})"
+    )
+
+_NO_BUF_LOG_SUPPRESS_SEC: float = _require_positive_float(
+    SET.ws_no_buffer_log_suppress_sec,
+    "ws_no_buffer_log_suppress_sec",
+)
+_no_buf_log_last: Dict[Tuple[str, str], float] = {}
+_no_buf_log_lock = threading.Lock()
+
+_started_ws_symbols: Dict[str, threading.Thread] = {}
+_start_ws_lock = threading.Lock()
+
+_rest_session = requests.Session()
+_rest_session.headers.update({"User-Agent": "auto-trader/market-data-ws-bootstrap"})
+
+
+def _mark_ws_open(symbol: str, opened_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws open state")
+    with _ws_state_lock:
+        _ws_connection_open[sym] = True
+        _ws_last_open_ts[sym] = int(opened_at_ms)
+        _ws_last_message_ts.pop(sym, None)
+        _ws_last_pong_ts.pop(sym, None)
+        _ws_last_error_text.pop(sym, None)
+
+
+def _mark_ws_closed(symbol: str, closed_at_ms: int, *, code: Any, msg: Any) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws close state")
+    with _ws_state_lock:
+        _ws_connection_open[sym] = False
+        _ws_last_close_ts[sym] = int(closed_at_ms)
+        _ws_last_close_text[sym] = f"code={code!r} msg={_truncate_text(msg)}"
+
+
+def _mark_ws_message(symbol: str, received_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws message state")
+    with _ws_state_lock:
+        _ws_last_message_ts[sym] = int(received_at_ms)
+
+
+def _mark_ws_pong(symbol: str, received_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws pong state")
+    with _ws_state_lock:
+        _ws_last_pong_ts[sym] = int(received_at_ms)
+
+
+def _mark_ws_error(symbol: str, error: Any) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws error state")
+    msg = _truncate_text(error)
+    with _ws_state_lock:
+        _ws_last_error_text[sym] = msg
+
+
+def get_ws_status(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    now_ms = _now_ms()
+
+    with _ws_state_lock:
+        connection_open = bool(_ws_connection_open.get(sym, False))
+        last_open_ts = _ws_last_open_ts.get(sym)
+        last_close_ts = _ws_last_close_ts.get(sym)
+        last_close_text = _ws_last_close_text.get(sym)
+        last_message_ts = _ws_last_message_ts.get(sym)
+        last_pong_ts = _ws_last_pong_ts.get(sym)
+        last_error = _ws_last_error_text.get(sym)
+
+    market_event_delay_ms = None
+    if last_message_ts is not None:
+        market_event_delay_ms = max(0, now_ms - int(last_message_ts))
+
+    pong_delay_ms = None
+    if last_pong_ts is not None:
+        pong_delay_ms = max(0, now_ms - int(last_pong_ts))
+
+    transport_reasons: List[str] = []
+    market_feed_reasons: List[str] = []
+
+    if not connection_open:
+        transport_reasons.append("connection_not_open")
+
+    if connection_open:
+        if last_pong_ts is None:
+            if last_open_ts is None:
+                transport_reasons.append("no_open_ts")
+            else:
+                open_age_sec = max(0, now_ms - int(last_open_ts)) / 1000.0
+                if open_age_sec > PONG_STARTUP_GRACE_SEC:
+                    transport_reasons.append(
+                        f"no_pong_after_open>{PONG_STARTUP_GRACE_SEC} (got={open_age_sec:.1f})"
+                    )
+        else:
+            pong_delay_sec = pong_delay_ms / 1000.0
+            if pong_delay_sec > PONG_MAX_DELAY_SEC:
+                transport_reasons.append(f"pong_delay_sec>{PONG_MAX_DELAY_SEC} (got={pong_delay_sec:.1f})")
+
+    if last_message_ts is None:
+        market_feed_reasons.append("no_market_event")
+    else:
+        market_event_delay_sec = market_event_delay_ms / 1000.0
+        if market_event_delay_sec > MARKET_EVENT_MAX_DELAY_SEC:
+            market_feed_reasons.append(
+                f"market_event_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={market_event_delay_sec:.1f})"
+            )
+
+    reasons = [f"transport:{r}" for r in transport_reasons] + [f"market_feed:{r}" for r in market_feed_reasons]
+
+    return {
+        "symbol": sym,
+        "connection_open": connection_open,
+        "last_open_ts": last_open_ts,
+        "last_close_ts": last_close_ts,
+        "last_close_text": last_close_text,
+        "last_message_ts": last_message_ts,
+        "market_event_delay_ms": market_event_delay_ms,
+        "last_pong_ts": last_pong_ts,
+        "pong_delay_ms": pong_delay_ms,
+        "last_error": last_error,
+        "transport_ok": len(transport_reasons) == 0,
+        "market_feed_ok": len(market_feed_reasons) == 0,
+        "ok": len(reasons) == 0,
+        "reasons": reasons,
+    }
+
+
+def _close_ws_with_log(ws: websocket.WebSocketApp, *, context: str) -> None:
+    try:
+        ws.close()
+    except Exception as e:
+        log(f"[MD_BINANCE_WS] close error after {context}: {type(e).__name__}: {e}")
+
+
+def _min_buffer_for_interval(iv: str) -> int:
+    s = _normalize_interval(iv)
+    if not s:
+        return max(1, KLINE_MIN_BUFFER)
+
+    strict_min = _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.get(s)
+
+    if s.endswith("d") or s.endswith("w") or s.endswith("M"):
+        base = max(1, _LONG_TF_MIN_BUFFER_DEFAULT)
+        if strict_min is not None:
+            return max(base, strict_min)
+        return base
+
+    base = max(1, KLINE_MIN_BUFFER)
+    if strict_min is not None:
+        return max(base, strict_min)
+    return base
+
+
+def _build_stream_names(symbol: str) -> List[str]:
+    s = _to_stream_symbol(symbol)
+    if not s:
+        raise RuntimeError("symbol is required to build WS streams")
+    streams: List[str] = [f"{s}@kline_{iv}" for iv in WS_INTERVALS]
+    streams.append(f"{s}@depth5@100ms")
+    return streams
+
+
+def _build_ws_url(symbol: str) -> str:
+    streams = _build_stream_names(symbol)
+    return f"{_WS_COMBINED_BASE}{'/'.join(streams)}"
+
+
+def _decode_msg(raw: Any) -> Any:
+    if isinstance(raw, (bytes, bytearray)):
+        txt = bytes(raw).decode("utf-8")
+        return json.loads(txt)
+    if isinstance(raw, str):
+        return json.loads(raw)
+    raise RuntimeError(f"unsupported ws message type: {type(raw)}")
+
+
+def _rest_fetch_klines_strict(symbol: str, interval: str, limit: int) -> List[Any]:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    lim = _require_positive_int(limit, "rest_klines.limit")
+
+    if lim > _WS_REST_KLINES_LIMIT_CAP:
+        raise RuntimeError(
+            f"rest klines limit exceeds cap (STRICT): interval={iv} limit={lim} cap={_WS_REST_KLINES_LIMIT_CAP}"
+        )
+
+    url = f"{_WS_REST_BASE}/fapi/v1/klines"
+    try:
+        resp = _rest_session.get(
+            url,
+            params={"symbol": sym, "interval": iv, "limit": lim},
+            timeout=_WS_REST_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        raise RuntimeError(f"REST klines request failed (STRICT): symbol={sym} interval={iv} limit={lim}") from e
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"REST klines HTTP {resp.status_code} (STRICT): symbol={sym} interval={iv} limit={lim} body={resp.text[:500]!r}"
+        )
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"REST klines response is not valid JSON (STRICT): symbol={sym} interval={iv}") from e
+
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"REST klines response root must be list (STRICT): symbol={sym} interval={iv} got={type(payload).__name__}"
+        )
+    if not payload:
+        raise RuntimeError(f"REST klines empty (STRICT): symbol={sym} interval={iv} limit={lim}")
+    if len(payload) < lim:
+        raise RuntimeError(
+            f"REST klines insufficient rows (STRICT): symbol={sym} interval={iv} need={lim} got={len(payload)}"
+        )
+    return payload
+
+
+def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]] = None) -> Dict[str, int]:
+    """
+    TRADE-GRADE startup bootstrap (explicit preload, not runtime fallback)
+
+    - 운영 시작 전에 필요한 캔들을 REST로 먼저 채운다.
+    - interval별 required buffer 길이만큼 정확히 받아오지 못하면 즉시 실패한다.
+    - bootstrap 성공 후에는 WS만으로 갱신한다.
+    """
+    if not _WS_BOOTSTRAP_REST_ENABLED:
+        raise RuntimeError("ws_bootstrap_rest_enabled is False. TRADE-GRADE startup requires explicit bootstrap.")
+
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for REST bootstrap")
+
+    targets = list(intervals or WS_INTERVALS)
+    targets = [_normalize_interval(x) for x in targets if _normalize_interval(x)]
+    if not targets:
+        raise RuntimeError("REST bootstrap intervals empty (STRICT)")
+
+    loaded: Dict[str, int] = {}
+    for iv in targets:
+        need = _min_buffer_for_interval(iv)
+        payload = _rest_fetch_klines_strict(sym, iv, need)
+        backfill_klines_from_rest(sym, iv, payload)
+        loaded[iv] = len(payload)
+
+    return loaded
+
+
+def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("empty symbol in kline push")
+
+    iv = _normalize_interval(interval)
+    if not iv:
+        raise WSProtocolError("empty interval in kline push")
+
+    key = (sym, iv)
+
+    ts = _require_int_ms(kline_obj.get("t"), "kline.t")
+    o = _require_float(kline_obj.get("o"), "kline.o")
+    h = _require_float(kline_obj.get("h"), "kline.h")
+    l = _require_float(kline_obj.get("l"), "kline.l")
+    c = _require_float(kline_obj.get("c"), "kline.c")
+    v = _require_float(kline_obj.get("v"), "kline.v", allow_zero=True)
+
+    is_closed = bool(kline_obj.get("x", False))
+
+    now_ms = _now_ms()
+    _mark_ws_message(sym, now_ms)
+
+    with _kline_lock:
+        _kline_last_recv_ts[key] = now_ms
+
+        buf = _kline_buffers.setdefault(key, [])
+        if is_closed:
+            if buf and buf[-1][0] == ts:
+                buf[-1] = (ts, o, h, l, c, v)
+            else:
+                buf.append((ts, o, h, l, c, v))
+                if len(buf) > MAX_KLINES:
+                    del buf[0 : len(buf) - MAX_KLINES]
+
+
+def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
+    if side_val is None:
+        raise WSProtocolError(f"{name} missing")
+    if not isinstance(side_val, (list, tuple)):
+        raise WSProtocolError(f"{name} must be list/tuple")
+
+    out: List[List[float]] = []
+    for i, row in enumerate(side_val):
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            p = _require_float(row[0], f"{name}[{i}].price")
+            q = _require_float(row[1], f"{name}[{i}].qty")
+            out.append([p, q])
+            continue
+        if isinstance(row, dict):
+            p = _require_float(row.get("price"), f"{name}[{i}].price")
+            q = _require_float(row.get("qty"), f"{name}[{i}].qty")
+            out.append([p, q])
+            continue
+        raise WSProtocolError(f"{name}[{i}] invalid level type: {type(row).__name__}")
+
+    if not out:
+        raise WSProtocolError(f"{name} empty after parse (STRICT)")
+    return out
+
+
+def _compute_best_prices_strict(bids: List[List[float]], asks: List[List[float]]) -> Tuple[float, float]:
+    if not bids or not asks:
+        raise WSProtocolError("bids/asks empty (STRICT)")
+    best_bid = max(float(r[0]) for r in bids)
+    best_ask = min(float(r[0]) for r in asks)
+    if best_bid <= 0 or best_ask <= 0:
+        raise WSProtocolError("best prices invalid (STRICT)")
+    if best_ask <= best_bid:
+        raise WSProtocolError("crossed book (bestAsk<=bestBid) (STRICT)")
+    return float(best_bid), float(best_ask)
+
+
+def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
+    if best_bid <= 0 or best_ask <= 0:
+        raise WSProtocolError("best prices invalid for spread (STRICT)")
+    if best_ask <= best_bid:
+        raise WSProtocolError("crossed book for spread (STRICT)")
+    mid = (best_bid + best_ask) / 2.0
+    if mid <= 0:
+        raise WSProtocolError("mid invalid (STRICT)")
+    return (best_ask - best_bid) / mid * 100.0
+
+
+def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("empty symbol in orderbook push")
+
+    raw_update_id = payload.get("u") if payload.get("u") is not None else payload.get("lastUpdateId")
+    if raw_update_id is None:
+        raise WSProtocolError("orderbook missing update id (u/lastUpdateId) (STRICT)")
+    try:
+        update_id = int(raw_update_id)
+    except Exception as e:
+        raise WSProtocolError(f"orderbook update id must be int (STRICT): {e}") from e
+    if update_id <= 0:
+        raise WSProtocolError("orderbook update id must be > 0 (STRICT)")
+
+    with _orderbook_lock:
+        prev_update_id = _orderbook_last_update_id.get(sym)
+
+    if prev_update_id is not None and update_id <= int(prev_update_id):
+        raise WSProtocolError(
+            f"orderbook outdated packet (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
+        )
+
+    raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
+    raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
+
+    normalized_bids = _normalize_depth_side_strict(raw_bids, name="orderbook.bids")
+    normalized_asks = _normalize_depth_side_strict(raw_asks, name="orderbook.asks")
+
+    now_ms = _now_ms()
+    _mark_ws_message(sym, now_ms)
+
+    best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
+    spread_pct = _compute_spread_pct(best_bid, best_ask)
+
+    ob: Dict[str, Any] = {
+        "bids": normalized_bids,
+        "asks": normalized_asks,
+        "ts": now_ms,
+        "bestBid": best_bid,
+        "bestAsk": best_ask,
+        "spreadPct": spread_pct,
+        "lastUpdateId": int(update_id),
+    }
+
+    exch_ts = payload.get("E") or payload.get("T")
+    if exch_ts is not None:
+        ob["exchTs"] = _require_int_ms(exch_ts, "orderbook.exchTs")
+
+    with _orderbook_lock:
+        prev2 = _orderbook_last_update_id.get(sym)
+        if prev2 is not None and update_id <= int(prev2):
+            raise WSProtocolError(
+                f"orderbook outdated packet (STRICT, race): prev={int(prev2)} new={int(update_id)}"
+            )
+
+        _orderbook_buffers[sym] = ob
+        _orderbook_last_update_id[sym] = int(update_id)
+
+
+def _handle_single_msg(expected_symbol: str, data: Any) -> None:
+    if not isinstance(data, dict):
+        raise WSProtocolError("message item must be dict (STRICT)")
+
+    stream = data.get("stream")
+    payload = data.get("data")
+    if not isinstance(stream, str) or not isinstance(payload, dict):
+        raise WSProtocolError("multiplex message missing stream/data (STRICT)")
+
+    sym = _normalize_symbol(expected_symbol)
+    if not sym:
+        raise WSProtocolError("expected_symbol normalized to empty")
+
+    if "@kline_" in stream:
+        k = payload.get("k")
+        if not isinstance(k, dict):
+            raise WSProtocolError(f"kline stream missing 'k': stream={stream} payload={_safe_dump_for_log(payload)}")
+
+        interval = str(k.get("i") or "").strip()
+        if not interval:
+            interval = stream.split("@kline_")[-1]
+        interval = _normalize_interval(interval)
+        if not interval:
+            raise WSProtocolError(f"kline interval parse failed: stream={stream} payload={_safe_dump_for_log(payload)}")
+
+        payload_symbol = _normalize_symbol(str(payload.get("s") or sym))
+        if payload_symbol and payload_symbol != sym:
+            raise WSProtocolError(f"unexpected symbol in stream (expected={sym}, got={payload_symbol})")
+
+        _push_kline(sym, interval, k)
+        return
+
+    if "@depth" in stream:
+        payload_symbol = _normalize_symbol(str(payload.get("s") or sym))
+        if payload_symbol and payload_symbol != sym:
+            raise WSProtocolError(f"unexpected symbol in depth stream (expected={sym}, got={payload_symbol})")
+        _push_orderbook(sym, payload)
+        return
+
+    raise WSProtocolError(f"unknown stream type (STRICT): {stream}")
+
+
+def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
+    try:
+        data = _decode_msg(message)
+    except Exception as e:
+        log(f"[MD_BINANCE_WS] decode error: {type(e).__name__}: {e}")
+        _close_ws_with_log(ws, context=f"decode_error symbol={_normalize_symbol(symbol)}")
+        return
+
+    try:
+        if isinstance(data, list):
+            for item in data:
+                _handle_single_msg(symbol, item)
+        else:
+            _handle_single_msg(symbol, data)
+    except WSProtocolError as e:
+        log(f"[MD_BINANCE_WS] protocol error: {e}")
+        _close_ws_with_log(ws, context=f"protocol_error symbol={_normalize_symbol(symbol)}")
+
+
+def _on_error(symbol: str, ws: websocket.WebSocketApp, error: Any) -> None:
+    _ = ws
+    _mark_ws_error(symbol, error)
+    log(f"[MD_BINANCE_WS] error: {error}")
+
+
+def _on_close(symbol: str, ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
+    _ = ws
+    _mark_ws_closed(symbol, _now_ms(), code=code, msg=msg)
+    log(f"[MD_BINANCE_WS] closed: {code} {msg}")
+
+
+def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
+    _ = ws
+    streams = _build_stream_names(symbol)
+    sym = _normalize_symbol(symbol)
+
+    with _orderbook_lock:
+        _orderbook_last_update_id.pop(sym, None)
+        _orderbook_buffers.pop(sym, None)
+
+    _mark_ws_open(sym, _now_ms())
+    log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
+
+
+def _on_pong(symbol: str, ws: websocket.WebSocketApp, data: Any) -> None:
+    _ = ws
+    _ = data
+    _mark_ws_pong(symbol, _now_ms())
+
+
+def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, float, float, float, float]]) -> None:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    if not sym:
+        raise ValueError("symbol is required")
+    if not iv:
+        raise ValueError("interval is required")
+
+    cleaned: List[Tuple[int, float, float, float, float, float]] = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, (list, tuple)) or len(r) != 6:
+            raise RuntimeError(f"preload row[{i}] must be 6-tuple (STRICT)")
+        ts = _require_int_ms(r[0], f"preload[{i}].ts")
+        o = _require_float(r[1], f"preload[{i}].o")
+        h = _require_float(r[2], f"preload[{i}].h")
+        l = _require_float(r[3], f"preload[{i}].l")
+        c = _require_float(r[4], f"preload[{i}].c")
+        v = _require_float(r[5], f"preload[{i}].v", allow_zero=True)
+        cleaned.append((ts, o, h, l, c, v))
+
+    key = (sym, iv)
+    with _kline_lock:
+        trimmed = list(cleaned[-MAX_KLINES:])
+        _kline_buffers[key] = trimmed
+        if trimmed:
+            _kline_last_recv_ts[key] = _now_ms()
+
+
+def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]) -> None:
+    """
+    STRICT:
+    - REST 입력이 불량이면 조용히 건너뛰지 않는다(부팅 무결성).
+    """
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    if not sym:
+        raise ValueError("symbol is required")
+    if not iv:
+        raise ValueError("interval is required")
+
+    if not isinstance(rest_klines, list):
+        raise RuntimeError("rest_klines must be list (STRICT)")
+    if not rest_klines:
+        raise RuntimeError("rest_klines empty (STRICT)")
+
+    converted: List[Tuple[int, float, float, float, float, float]] = []
+    for idx, row in enumerate(rest_klines):
+        if isinstance(row, (list, tuple)):
+            if len(row) < 6:
+                raise RuntimeError(f"rest_klines[{idx}] invalid len<{6} (STRICT)")
+            ts = _require_int_ms(row[0], f"rest_klines[{idx}].ts")
+            o = _require_float(row[1], f"rest_klines[{idx}].o")
+            h = _require_float(row[2], f"rest_klines[{idx}].h")
+            l = _require_float(row[3], f"rest_klines[{idx}].l")
+            c = _require_float(row[4], f"rest_klines[{idx}].c")
+            v = _require_float(row[5], f"rest_klines[{idx}].v", allow_zero=True)
+            converted.append((ts, o, h, l, c, v))
+            continue
+
+        if isinstance(row, dict):
+            ts = _require_int_ms(row.get("t") or row.get("openTime") or row.get("T"), f"rest_klines[{idx}].ts")
+            o = _require_float(row.get("o") or row.get("open"), f"rest_klines[{idx}].o")
+            h = _require_float(row.get("h") or row.get("high"), f"rest_klines[{idx}].h")
+            l = _require_float(row.get("l") or row.get("low"), f"rest_klines[{idx}].l")
+            c = _require_float(row.get("c") or row.get("close"), f"rest_klines[{idx}].c")
+            v = _require_float(row.get("v") or row.get("volume"), f"rest_klines[{idx}].v", allow_zero=True)
+            converted.append((ts, o, h, l, c, v))
+            continue
+
+        raise RuntimeError(f"rest_klines[{idx}] invalid type (STRICT): {type(row).__name__}")
+
+    converted.sort(key=lambda x: x[0])
+    preload_klines(sym, iv, converted)
+
+
+def _log_no_buffer_once(symbol: str, interval: str, requested: int) -> None:
+    if not SET.ws_log_enabled:
+        return
+
+    now = time.time()
+    key = (_normalize_symbol(symbol), _normalize_interval(interval))
+    with _no_buf_log_lock:
+        last = _no_buf_log_last.get(key, 0.0)
+        if (now - last) < _NO_BUF_LOG_SUPPRESS_SEC:
+            return
+        _no_buf_log_last[key] = now
+
+    log(f"[MD_BINANCE_WS KLINES] no kline buffer for {symbol} {interval} (requested={requested})")
+
+
+def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List[Tuple[int, float, float, float, float, float]]:
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    key = (sym, iv)
+
+    with _kline_lock:
+        buf = _kline_buffers.get(key, [])
+        if not buf:
+            _log_no_buffer_once(sym, iv, limit)
+            return []
+        return list(buf[-limit:])
+
+
+def get_klines(symbol: str, interval: str, limit: Optional[int] = None) -> List[Tuple[int, float, float, float, float]]:
+    if limit is None:
+        normalized_limit = max(300, _min_buffer_for_interval(interval))
+    else:
+        if limit <= 0:
+            raise ValueError("limit must be > 0")
+        normalized_limit = limit
+    rows = get_klines_with_volume(symbol, interval, limit=normalized_limit)
+    return [(ts, o, h, l, c) for (ts, o, h, l, c, v) in rows]
+
+
+def get_last_kline_ts(symbol: str, interval: str) -> Optional[int]:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    key = (sym, iv)
+    with _kline_lock:
+        buf = _kline_buffers.get(key, [])
+        if not buf:
+            return None
+        return int(buf[-1][0])
+
+
+def get_last_kline_delay_ms(symbol: str, interval: str) -> Optional[int]:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    key = (sym, iv)
+    now = _now_ms()
+    with _kline_lock:
+        recv_ts = _kline_last_recv_ts.get(key)
+    if recv_ts is None:
+        return None
+    return max(0, now - int(recv_ts))
+
+
+def get_kline_buffer_status(symbol: str, interval: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+    key = (sym, iv)
+
+    with _kline_lock:
+        buf = _kline_buffers.get(key, [])
+        last_ts = buf[-1][0] if buf else None
+        last_recv = _kline_last_recv_ts.get(key)
+
+    delay_ms = None
+    if last_recv is not None:
+        delay_ms = max(0, _now_ms() - int(last_recv))
+
+    return {
+        "symbol": sym,
+        "interval": iv,
+        "buffer_len": len(buf),
+        "last_ts": last_ts,
+        "last_recv_ts": last_recv,
+        "delay_ms": delay_ms,
+    }
+
+
+def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    sym = _normalize_symbol(symbol)
+    with _orderbook_lock:
+        ob = _orderbook_buffers.get(sym)
+        if not ob:
+            return None
+
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
+        if not bids or not asks:
+            return None
+        result = dict(ob)
+
+    result["bids"] = list((result.get("bids") or [])[:limit])
+    result["asks"] = list((result.get("asks") or [])[:limit])
+    return result
+
+
+def _compute_kline_health(symbol: str, interval: str) -> Dict[str, Any]:
+    status = get_kline_buffer_status(symbol, interval)
+    buffer_len = status["buffer_len"]
+    delay_ms = status["delay_ms"]
+
+    ok = True
+    reasons: List[str] = []
+
+    min_buf = _min_buffer_for_interval(interval)
+    if buffer_len < min_buf:
+        ok = False
+        reasons.append(f"buffer_len<{min_buf} (got={buffer_len})")
+
+    if delay_ms is None:
+        ok = False
+        reasons.append("no_recv_ts")
+    else:
+        delay_sec = delay_ms / 1000.0
+        if delay_sec > KLINE_MAX_DELAY_SEC:
+            ok = False
+            reasons.append(f"delay_sec>{KLINE_MAX_DELAY_SEC} (got={delay_sec:.1f})")
+
+    status["ok"] = ok
+    status["reasons"] = reasons
+    status["min_buffer_required"] = min_buf
+    return status
+
+
+def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    now_ms = _now_ms()
+    ws_status = get_ws_status(sym)
+
+    with _orderbook_lock:
+        ob = _orderbook_buffers.get(sym)
+
+    result: Dict[str, Any] = {
+        "symbol": sym,
+        "has_orderbook": ob is not None,
+        "transport_ok": bool(ws_status.get("transport_ok", False)),
+        "market_feed_ok": bool(ws_status.get("market_feed_ok", False)),
+        "payload_ok": False,
+        "orderbook_update_delay_ms": None,
+        "market_event_delay_ms": ws_status.get("market_event_delay_ms"),
+        "last_ws_message_ts": ws_status.get("last_message_ts"),
+        "last_pong_ts": ws_status.get("last_pong_ts"),
+        "last_update_id": None,
+        "ok": False,
+        "reasons": [],
+    }
+
+    reasons: List[str] = list(ws_status.get("reasons") or [])
+
+    if ob is None:
+        reasons.append("payload:no_orderbook")
+        result["reasons"] = reasons
+        result["ok"] = False
+        result["payload_ok"] = False
+        return result
+
+    ts = ob.get("ts")
+    if ts is None:
+        reasons.append("payload:no_ts")
+    else:
+        result["orderbook_update_delay_ms"] = max(0, now_ms - int(ts))
+
+    bids = ob.get("bids") or []
+    asks = ob.get("asks") or []
+    if not bids:
+        reasons.append("payload:empty_bids")
+    if not asks:
+        reasons.append("payload:empty_asks")
+
+    best_bid = ob.get("bestBid")
+    best_ask = ob.get("bestAsk")
+    if best_bid is None or best_ask is None:
+        reasons.append("payload:no_best_prices")
+    else:
+        try:
+            bb = float(best_bid)
+            ba = float(best_ask)
+            if ba <= bb:
+                reasons.append("payload:crossed_book(bestAsk<=bestBid)")
+        except Exception:
+            reasons.append("payload:invalid_best_prices")
+
+    last_update_id = ob.get("lastUpdateId")
+    if last_update_id is None:
+        reasons.append("payload:no_last_update_id")
+    else:
+        try:
+            parsed_update_id = int(last_update_id)
+        except Exception:
+            reasons.append("payload:invalid_last_update_id")
+        else:
+            if parsed_update_id <= 0:
+                reasons.append("payload:non_positive_last_update_id")
+            result["last_update_id"] = parsed_update_id
+
+    payload_reasons = [r for r in reasons if r.startswith("payload:")]
+    result["payload_ok"] = len(payload_reasons) == 0
+    result["reasons"] = reasons
+    result["ok"] = bool(result["transport_ok"]) and bool(result["market_feed_ok"]) and bool(result["payload_ok"])
+    return result
+
+
+def _maybe_log_health_fail(snapshot: Dict[str, Any]) -> None:
+    global _last_health_fail_log_ts, _last_health_fail_key
+
+    if snapshot.get("overall_ok", True):
+        return
+
+    parts: List[str] = []
+
+    ws_status = snapshot.get("ws") or {}
+    if not ws_status.get("ok", False):
+        parts.append(f"ws:{'|'.join(ws_status.get('reasons') or [])}")
+
+    for iv, st in (snapshot.get("klines") or {}).items():
+        if not st.get("ok", False):
+            parts.append(f"kline:{iv}:{'|'.join(st.get('reasons') or [])}")
+
+    ob = snapshot.get("orderbook") or {}
+    if not ob.get("ok", False):
+        parts.append(f"ob:{'|'.join(ob.get('reasons') or [])}")
+
+    key = ";".join(parts)[:600]
+    now = time.time()
+
+    with _health_fail_lock:
+        if key == _last_health_fail_key and (now - _last_health_fail_log_ts) < _HEALTH_FAIL_LOG_SUPPRESS_SEC:
+            return
+        _last_health_fail_key = key
+        _last_health_fail_log_ts = now
+
+    log(f"[MD_BINANCE_WS HEALTH_FAIL] {snapshot.get('symbol')} reasons={key}")
+
+
+def get_health_snapshot(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    snapshot: Dict[str, Any] = {
+        "symbol": sym,
+        "overall_ok": True,
+        "overall_kline_ok": True,
+        "overall_orderbook_ok": True,
+        "ws": {},
+        "klines": {},
+        "orderbook": {},
+        "overall_reasons": [],
+        "checked_at_ms": _now_ms(),
+        "required_intervals": list(REQUIRED_INTERVALS),
+    }
+
+    overall_ok = True
+    overall_kline_ok = True
+    overall_orderbook_ok = True
+    overall_reasons: List[str] = []
+
+    ws_status = get_ws_status(sym)
+    snapshot["ws"] = ws_status
+    if not ws_status.get("ok", False):
+        overall_ok = False
+        overall_reasons.append(f"ws:{'|'.join(ws_status.get('reasons') or [])}")
+
+    kline_map: Dict[str, Any] = {}
+    for iv in REQUIRED_INTERVALS:
+        k_status = _compute_kline_health(sym, iv)
+        kline_map[iv] = k_status
+        if not k_status.get("ok", False):
+            overall_ok = False
+            overall_kline_ok = False
+            overall_reasons.append(f"kline:{iv}:{'|'.join(k_status.get('reasons') or [])}")
+
+    ob_status = _compute_orderbook_health(sym)
+    snapshot["orderbook"] = ob_status
+    if not ob_status.get("ok", False):
+        overall_ok = False
+        overall_orderbook_ok = False
+        overall_reasons.append(f"orderbook:{'|'.join(ob_status.get('reasons') or [])}")
+
+    snapshot["klines"] = kline_map
+    snapshot["overall_ok"] = overall_ok
+    snapshot["overall_kline_ok"] = overall_kline_ok
+    snapshot["overall_orderbook_ok"] = overall_orderbook_ok
+    snapshot["overall_reasons"] = overall_reasons
+
+    _maybe_log_health_fail(snapshot)
+    return snapshot
+
+
+def is_data_healthy(symbol: str) -> bool:
+    return bool(get_health_snapshot(symbol).get("overall_ok", False))
+
+
+def start_ws_loop(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required")
+
+    with _start_ws_lock:
+        if sym in _started_ws_symbols:
+            log(f"[MD_BINANCE_WS] already started for {sym} → skip duplicate start")
+            return
+
+    bootstrap_counts = bootstrap_klines_from_rest_strict(sym, intervals=WS_INTERVALS)
+    url = _build_ws_url(sym)
+
+    def _runner() -> None:
+        retry_wait = 1.0
+        while True:
+            session_dur = 0.0
+            try:
+                log(f"[MD_BINANCE_WS] connecting ... url={url}")
+
+                ws = websocket.WebSocketApp(
+                    url,
+                    on_open=lambda ws_: _on_open(sym, ws_),
+                    on_message=lambda ws_, message: _on_message(sym, ws_, message),
+                    on_error=lambda ws_, error: _on_error(sym, ws_, error),
+                    on_close=lambda ws_, code, msg: _on_close(sym, ws_, code, msg),
+                    on_pong=lambda ws_, data: _on_pong(sym, ws_, data),
+                )
+
+                start_ts = time.time()
+                ws.run_forever(ping_interval=3, ping_timeout=2)
+                session_dur = time.time() - start_ts
+
+                with _ws_state_lock:
+                    still_open = bool(_ws_connection_open.get(sym, False))
+                if still_open:
+                    _mark_ws_closed(sym, _now_ms(), code="RUN_FOREVER_RETURN", msg="run_forever returned")
+
+                log("[MD_BINANCE_WS] WS disconnected → retrying ...")
+
+            except Exception as e:
+                _mark_ws_error(sym, f"run_forever_exception:{type(e).__name__}:{e}")
+                _mark_ws_closed(sym, _now_ms(), code="RUN_FOREVER_EXCEPTION", msg=str(e))
+                log(f"[MD_BINANCE_WS] run_forever exception: {type(e).__name__}: {e}")
+
+            retry_wait = 1.0 if session_dur > 60.0 else min(retry_wait * 2.0, 10.0)
+            log(f"[MD_BINANCE_WS] reconnecting after {retry_wait:.1f}s ...")
+            time.sleep(retry_wait)
+
+    th = threading.Thread(target=_runner, name=f"md-binance-ws-{sym}", daemon=True)
+
+    with _start_ws_lock:
+        if sym in _started_ws_symbols:
+            log(f"[MD_BINANCE_WS] already started for {sym} → skip duplicate start")
+            return
+        _started_ws_symbols[sym] = th
+
+    try:
+        th.start()
+    except Exception:
+        with _start_ws_lock:
+            _started_ws_symbols.pop(sym, None)
+        raise
+
+    log(f"[MD_BINANCE_WS] background ws started for {sym} bootstrap={bootstrap_counts}")
+
+
+def get_market_snapshot(symbol: str) -> Dict[str, Any]:
+    """
+    Atomic Market Snapshot (STRICT)
+
+    목적:
+    - strategy/feature builder가 kline + orderbook을 동일 시점으로 읽도록 한다.
+    - 개별 getter 조합 호출 시 발생 가능한 non-atomic read를 방지한다.
+
+    반환:
+    {
+        "symbol": str,
+        "orderbook": dict | None,
+        "klines": { "<interval>": [ (ts,o,h,l,c,v), ... ], ... }
+    }
+    """
+    sym = _normalize_symbol(symbol)
+
+    with _kline_lock, _orderbook_lock:
+        snapshot: Dict[str, Any] = {"symbol": sym, "orderbook": None, "klines": {}}
+
+        ob = _orderbook_buffers.get(sym)
+        if ob:
+            snapshot["orderbook"] = dict(ob)
+
+        kl_map: Dict[str, Any] = {}
+        for (s, iv), rows in _kline_buffers.items():
+            if s == sym:
+                kl_map[iv] = list(rows)
+        snapshot["klines"] = kl_map
+
+        return snapshot
 
 
 __all__ = [
-    "Settings",
-    "BotSettings",
-    "PatternStrengthSettings",
-    "SETTINGS",
-    "load_settings",
-    "KST",
+    "start_ws_loop",
+    "preload_klines",
+    "backfill_klines_from_rest",
+    "bootstrap_klines_from_rest_strict",
+    "get_klines",
+    "get_klines_with_volume",
+    "get_last_kline_ts",
+    "get_last_kline_delay_ms",
+    "get_kline_buffer_status",
+    "get_orderbook",
+    "get_ws_status",
+    "get_health_snapshot",
+    "is_data_healthy",
+    "get_market_snapshot",
 ]

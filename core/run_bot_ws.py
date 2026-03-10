@@ -10,11 +10,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - cand.meta 간접 의존을 제거하고 entry_price_hint 를 authoritative market_data 기준으로 주입
 - stale kline 경고 로그의 dead expression 제거
 - 미사용 import/상태 변수 정리
+- data_health_monitor / market_data_ws 의 신규 structured health 계약을 직접 소비하도록 보강
 
 코드 정리 내용
 - 미사용 import(EntryCandidate) 제거
 - 미사용 전역 상태(START_TS) 제거
 - execution price alias 정리 helper 추가
+- health snapshot 소비 helper 추가
 - 상단 변경 이력 최근 2일 기준으로 정리
 
 run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
@@ -30,9 +32,18 @@ run_bot_ws.py – Binance USDT-M Futures WebSocket 메인 루프
 - DB 접근 단일화: state/db_core(get_session) 경유. psycopg2 직접 연결 금지.
 - DB DSN 폴백 금지: TRADER_DB_URL 단일 소스(검증/정규화는 db_core가 수행).
 - 비핵심 루프라도 “조용한 실패” 금지: 치명 오류는 SAFE_STOP + 예외 전파.
+- health 계약은 단일 bool 이 아니라 structured snapshot 기준으로 소비한다.
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-10 (TRADE-GRADE PATCH 9):
+  1) FIX(ROOT-CAUSE): structured health snapshot 계약을 run_bot_ws 에서 직접 소비하도록 보강
+     - data_health_monitor.get_health_state()/get_last_health_snapshot() 사용
+     - 단순 HEALTH_OK bool 기반 차단을 structured reason 기반 차단으로 정리
+  2) FIX(ARCH): _wait_market_ws_ready_or_raise() 를 market_data_ws.get_health_snapshot() 기반으로 일원화
+  3) FIX(ARCH): _ws_liveness_guard_or_raise() 를 market_data_ws.get_ws_status() 기반으로 전환
+  4) 기존 자동매매 기능 삭제 없음
+
 - 2026-03-10 (TRADE-GRADE PATCH 8):
   1) FIX(ROOT-CAUSE): Signal → ExecutionEngine 가격 계약을 run_bot_ws 에서 명시적으로 보장
      - entry_price_hint 를 authoritative market_data/cand.meta 실데이터에서 strict 추출 후 Signal.meta 에 주입
@@ -92,8 +103,10 @@ from strategy.signal_analysis_worker import start_signal_analysis_thread
 
 from infra.market_data_ws import (
     backfill_klines_from_rest,
+    get_health_snapshot as ws_get_health_snapshot,
     get_klines_with_volume as ws_get_klines_with_volume,
     get_orderbook as ws_get_orderbook,
+    get_ws_status as ws_get_ws_status,
     start_ws_loop,
 )
 from infra.account_ws import (
@@ -223,11 +236,88 @@ def _require_int_ms(v: Any, name: str) -> int:
     return iv
 
 
+def _require_bool(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT)")
+    return bool(v)
+
+
 def _normalize_symbol_strict(symbol: Any, *, name: str = "symbol") -> str:
     s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
     if not s:
         raise RuntimeError(f"{name} is empty (STRICT)")
     return s
+
+
+def _join_reason_list_strict(v: Any, name: str) -> str:
+    if not isinstance(v, list):
+        raise RuntimeError(f"{name} must be list (STRICT)")
+    cleaned = [str(x).strip() for x in v if str(x).strip()]
+    return " | ".join(cleaned)
+
+
+def _format_data_health_snapshot_reason(snapshot: Dict[str, Any], fallback_reason: str) -> str:
+    if not isinstance(snapshot, dict):
+        fb = str(fallback_reason or "").strip()
+        if fb:
+            return fb
+        raise RuntimeError("data health snapshot must be dict (STRICT)")
+
+    reasons: List[str] = []
+
+    fail_reason = str(snapshot.get("fail_reason") or "").strip()
+    if fail_reason:
+        reasons.append(fail_reason)
+
+    ws = snapshot.get("ws")
+    if isinstance(ws, dict):
+        ws_reasons = ws.get("overall_reasons")
+        if isinstance(ws_reasons, list):
+            joined = _join_reason_list_strict(ws_reasons, "health_snapshot.ws.overall_reasons")
+            if joined:
+                reasons.append(f"ws={joined}")
+
+    feature = snapshot.get("feature")
+    if isinstance(feature, dict):
+        if not bool(feature.get("ok", False)):
+            missing_tfs = feature.get("missing_tfs")
+            if isinstance(missing_tfs, list) and missing_tfs:
+                reasons.append(f"feature_missing_tfs={missing_tfs}")
+            field = feature.get("field")
+            if field is not None and str(field).strip():
+                reasons.append(f"feature_field={field}")
+            err = feature.get("error_type")
+            if err is not None and str(err).strip():
+                reasons.append(f"feature_error_type={err}")
+
+    if not reasons:
+        fb = str(fallback_reason or "").strip()
+        if fb:
+            return fb
+        raise RuntimeError("health fail reason missing (STRICT)")
+
+    # 중복 제거 + 순서 유지
+    unique: List[str] = []
+    seen: set[str] = set()
+    for r in reasons:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return " | ".join(unique)
+
+
+def _get_data_health_state_or_raise() -> Tuple[bool, str, Dict[str, Any]]:
+    ok, reason = data_health_monitor.get_health_state()
+    if not isinstance(ok, bool):
+        raise RuntimeError("data_health_monitor.get_health_state()[0] must be bool (STRICT)")
+    if not isinstance(reason, str):
+        raise RuntimeError("data_health_monitor.get_health_state()[1] must be str (STRICT)")
+
+    snapshot = data_health_monitor.get_last_health_snapshot()
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("data_health_monitor.get_last_health_snapshot() must return dict (STRICT)")
+
+    return bool(ok), str(reason), snapshot
 
 
 def _entry_gate_lock_key(symbol: str) -> int:
@@ -679,30 +769,56 @@ def _wait_market_ws_ready_or_raise(symbol: str, timeout_sec: float) -> None:
     last_progress_log_ts = 0.0
 
     while True:
+        snap = ws_get_health_snapshot(sym)
+        if not isinstance(snap, dict):
+            raise RuntimeError("ws_get_health_snapshot returned non-dict (STRICT)")
+
         missing: List[str] = []
 
-        for iv in ENTRY_REQUIRED_TFS:
-            min_needed = ENTRY_REQUIRED_KLINES_MIN[iv]
-            buf = ws_get_klines_with_volume(sym, iv, limit=min_needed)
-            if not isinstance(buf, list):
-                raise RuntimeError(f"ws_get_klines_with_volume returned non-list (STRICT): interval={iv}")
-            got = len(buf)
-            if got < min_needed:
-                missing.append(f"{iv}:{got}/{min_needed}")
+        ws_status = snap.get("ws")
+        if not isinstance(ws_status, dict):
+            raise RuntimeError("market ws snapshot.ws must be dict (STRICT)")
+        if not _require_bool(ws_status.get("ok"), "market_ws_snapshot.ws.ok"):
+            reasons = ws_status.get("reasons")
+            if isinstance(reasons, list) and reasons:
+                missing.append(f"ws:{_join_reason_list_strict(reasons, 'market_ws_snapshot.ws.reasons')}")
+            else:
+                missing.append("ws:not_ok")
 
-        ob = ws_get_orderbook(sym, limit=1)
-        if not isinstance(ob, dict) or not ob:
-            missing.append("orderbook:missing")
-        else:
-            bids = ob.get("bids")
-            asks = ob.get("asks")
-            if not isinstance(bids, list) or not bids:
-                missing.append("orderbook:bids_empty")
-            if not isinstance(asks, list) or not asks:
-                missing.append("orderbook:asks_empty")
+        kline_map = snap.get("klines")
+        if not isinstance(kline_map, dict):
+            raise RuntimeError("market ws snapshot.klines must be dict (STRICT)")
+
+        for iv in ENTRY_REQUIRED_TFS:
+            st = kline_map.get(iv)
+            if not isinstance(st, dict):
+                missing.append(f"kline:{iv}:missing_status")
+                continue
+            ok = st.get("ok")
+            if not isinstance(ok, bool):
+                raise RuntimeError(f"market ws snapshot.klines[{iv}].ok must be bool (STRICT)")
+            if not ok:
+                reasons = st.get("reasons")
+                if isinstance(reasons, list) and reasons:
+                    missing.append(f"kline:{iv}:{_join_reason_list_strict(reasons, f'kline[{iv}].reasons')}")
+                else:
+                    missing.append(f"kline:{iv}:not_ok")
+
+        ob = snap.get("orderbook")
+        if not isinstance(ob, dict):
+            raise RuntimeError("market ws snapshot.orderbook must be dict (STRICT)")
+        ob_ok = ob.get("ok")
+        if not isinstance(ob_ok, bool):
+            raise RuntimeError("market ws snapshot.orderbook.ok must be bool (STRICT)")
+        if not ob_ok:
+            reasons = ob.get("reasons")
+            if isinstance(reasons, list) and reasons:
+                missing.append(f"orderbook:{_join_reason_list_strict(reasons, 'orderbook.reasons')}")
+            else:
+                missing.append("orderbook:not_ok")
 
         if not missing:
-            log(f"[BOOT] market ws ready: symbol={sym} requirements={ENTRY_REQUIRED_KLINES_MIN}")
+            log(f"[BOOT] market ws ready: symbol={sym} requirements={ENTRY_REQUIRED_TFS}")
             return
 
         now = time.time()
@@ -954,33 +1070,41 @@ def _protection_orders_guard_or_raise() -> None:
 def _ws_liveness_guard_or_raise(symbol: str, now_ts: float) -> None:
     global _WS_LIVENESS_CONSEC_FAILS, SAFE_STOP_REQUESTED
 
-    stale_sec_f = float(SET.ws_klines_stale_sec)
-    if stale_sec_f <= 30:
-        raise RuntimeError("settings.ws_klines_stale_sec must be > 30 sec (STRICT)")
+    _ = now_ts
+    ws_status = ws_get_ws_status(symbol)
+    if not isinstance(ws_status, dict):
+        raise RuntimeError("ws_get_ws_status returned non-dict (STRICT)")
 
-    buf = ws_get_klines_with_volume(symbol, "1m", limit=1)
-    if not isinstance(buf, list) or not buf:
-        _WS_LIVENESS_CONSEC_FAILS += 1
-        log(f"[WS_LIVENESS][FAIL] 1m kline buffer missing/empty consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
-    else:
-        ts_ms = buf[0][0]
-        t_ms = _require_int_ms(ts_ms, "ws.1m.openTime")
-        now_ms = int(float(now_ts) * 1000.0)
-        age_ms = now_ms - int(t_ms)
-        if age_ms < 0:
-            _WS_LIVENESS_CONSEC_FAILS += 1
-            log(f"[WS_LIVENESS][FAIL] future kline ts detected age_ms={age_ms} consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
-        elif age_ms > int(stale_sec_f * 1000.0):
-            _WS_LIVENESS_CONSEC_FAILS += 1
-            log(f"[WS_LIVENESS][FAIL] stale kline age_ms={age_ms} (> {int(stale_sec_f*1000)}ms) consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}")
-        else:
-            if _WS_LIVENESS_CONSEC_FAILS != 0:
-                log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
-            _WS_LIVENESS_CONSEC_FAILS = 0
+    transport_ok = ws_status.get("transport_ok")
+    market_feed_ok = ws_status.get("market_feed_ok")
+    if not isinstance(transport_ok, bool):
+        raise RuntimeError("ws_status.transport_ok must be bool (STRICT)")
+    if not isinstance(market_feed_ok, bool):
+        raise RuntimeError("ws_status.market_feed_ok must be bool (STRICT)")
+
+    if transport_ok and market_feed_ok:
+        if _WS_LIVENESS_CONSEC_FAILS != 0:
+            log(f"[WS_LIVENESS][RECOVER] consecutive={_WS_LIVENESS_CONSEC_FAILS} -> 0")
+        _WS_LIVENESS_CONSEC_FAILS = 0
+        return
+
+    reasons = ws_status.get("reasons")
+    if not isinstance(reasons, list):
+        raise RuntimeError("ws_status.reasons must be list (STRICT)")
+    joined = _join_reason_list_strict(reasons, "ws_status.reasons")
+
+    _WS_LIVENESS_CONSEC_FAILS += 1
+    log(
+        f"[WS_LIVENESS][FAIL] {joined} "
+        f"consecutive={_WS_LIVENESS_CONSEC_FAILS}/{_WS_LIVENESS_FAIL_HARDSTOP_N}"
+    )
 
     if _WS_LIVENESS_CONSEC_FAILS >= _WS_LIVENESS_FAIL_HARDSTOP_N:
         SAFE_STOP_REQUESTED = True
-        msg = f"[SAFE_STOP][WS_LIVENESS] stale/missing WS 1m data confirmed consecutive={_WS_LIVENESS_CONSEC_FAILS}"
+        msg = (
+            "[SAFE_STOP][WS_LIVENESS] structured ws liveness failure confirmed "
+            f"consecutive={_WS_LIVENESS_CONSEC_FAILS} reasons={joined}"
+        )
         log(msg)
         _maybe_send_error_tg("WS_LIVENESS", msg, cooldown_sec=60)
         raise RuntimeError(msg)
@@ -1480,7 +1604,11 @@ def main() -> None:
         start_ws_loop(SET.symbol)
         _start_market_data_store_thread()
 
-        market_ws_ready_timeout_sec = max(30.0, float(SET.ws_klines_stale_sec))
+        market_ws_ready_timeout_sec = max(
+            30.0,
+            float(SET.ws_klines_stale_sec),
+            float(getattr(SET, "ws_market_event_max_delay_sec", 30.0)),
+        )
         _wait_market_ws_ready_or_raise(SET.symbol, market_ws_ready_timeout_sec)
 
         start_health_monitor()
@@ -1774,8 +1902,10 @@ def main() -> None:
                 interruptible_sleep(60)
                 continue
 
-            if not bool(data_health_monitor.HEALTH_OK):
-                msg = f"[SKIP][DATA_HEALTH_FAIL] {data_health_monitor.LAST_FAIL_REASON}"
+            health_ok, health_reason, health_snapshot = _get_data_health_state_or_raise()
+            if not health_ok:
+                reason_text = _format_data_health_snapshot_reason(health_snapshot, health_reason)
+                msg = f"[SKIP][DATA_HEALTH_FAIL] {reason_text}"
                 log(msg)
                 _maybe_send_entry_block_tg("DATA_HEALTH_FAIL", msg, cooldown_sec=60)
                 interruptible_sleep(5)

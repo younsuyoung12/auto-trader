@@ -1,59 +1,37 @@
 """
 ========================================================
 FILE: execution/order_executor.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-Binance USDT-M Futures - Order Execution Layer (Production)
+ROLE:
+- Binance USDT-M Futures 실제 주문 실행 SSOT
+- 엔트리/익절/손절/청산 주문을 거래소 계약에 맞게 실행하고 검증한다
+- 체결/포지션/보호주문 가시성을 strict하게 확인한 뒤에만 결과를 상위 계층에 반환한다
 
-핵심:
-- REST endpoints: /fapi/*
-- Symbol filters enforced via /fapi/v1/exchangeInfo (tick/step/minQty)
-- Idempotency via newClientOrderId (openOrders + order lookup + in-process lock)
-- Timestamp error (-1021) recovery: sync_server_time() + single retry
-- No print(); logging only
+CORE RESPONSIBILITIES:
+- symbol filter / tick / step / minQty 강제
+- idempotency(newClientOrderId) 보장
+- ENTRY/EXIT MARKET 체결 STRICT 검증
+- 포지션 반영(positionAmt) STRICT 검증
+- TP/SL 보호주문 visibility STRICT 검증
+- Trade 반환 계약(strict fields / reconciliation_status) 보장
 
-PATCH NOTES — 2026-03-04 (TRADE-GRADE)
---------------------------------------------------------
-- 체결 안정성 강화(Partial fill/지연 체결/가시성 지연 대응)
-  - ENTRY/EXIT MARKET 주문 후 주문 상태(FILLED) + executedQty/avgPrice STRICT 검증
-  - 체결 수량 mismatch 시 즉시 예외(진행 금지)
-  - 포지션 반영(positionAmt) 확인 루프 추가(짧은 대기, 제한 횟수) 후 불일치 시 예외
-- 동시성/일관성 강화
-  - Idempotency 조회에서 비정상 타입 발견 시 즉시 예외(조용한 continue 금지)
-  - entry 주문 전 동일한 라운딩(필터 기반)으로 “예상 수량” 확정 후 전송
-- 예외 전파 구조 정비
-  - open_position_with_tp_sl()에서 예외를 삼키고 None 반환하던 흐름 제거(STRICT)
-  - 필요한 이벤트 기록 후 예외 전파(폴백/조용한 종료 금지)
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 누락/불일치/실패 시 즉시 예외
+- source/symbol/action 계약을 임의 보정하지 않는다
+- 체결 확인 없는 성공 처리 금지
+- 무보호 포지션 상태를 정상으로 취급하지 않는다
+- print 금지, logging만 사용
 
-PATCH NOTES — 2026-03-03 (TRADE-GRADE)
---------------------------------------------------------
-- Trade STRICT 필드 정합 보강:
-  - state.trader_state.Trade.__post_init__ 요구사항 충족:
-    * last_synced_at (tz-aware) 반드시 주입
-    * client_entry_id(=entry_client_order_id) 주입
-    * reconciliation_status 명시
-  - 결과: open_position_with_tp_sl() 반환 Trade가 STRICT 검증을 통과하도록 보장
-
-PATCH NOTES — 2026-03-02
---------------------------------------------------------
-- TP/SL 주문 생성 시 orderId를 반환/상위로 전달(set_tp_sl -> (tp_order_id, sl_order_id))
-- Entry/TP/SL에 결정적(deterministic) clientOrderId를 주입할 수 있도록 확장
-  - entry_client_order_id(kw-only) 지원
-  - settings.require_deterministic_client_order_id=True 인 경우 미지정 시 즉시 예외(폴백 금지)
-- Trade 객체 생성 시(레거시 호환) Trade 시그니처에 존재하는 필드만 주입(호환성 유지)
-  - entry_order_id/tp_order_id/sl_order_id/exchange_position_side/remaining_qty/realized_pnl_usdt 등
-- STRICT 유지: 누락/불일치/실패 시 즉시 예외 또는 명시적 실패 처리(추정/폴백 금지)
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): protection verification 완료 후 Trade.reconciliation_status 를 PROTECTION_VERIFIED 로 정합화
+  2) FIX(STRICT): source fallback 제거, 빈 source 즉시 예외
+  3) FIX(STRICT): tp_pct/sl_pct ratio 계약을 execution 계층에서도 (0,1] / soft_mode 시 sl만 [0,1] 로 강화
+  4) FIX(STRICT): close_all_positions_market()도 MARKET 체결 검증까지 수행하도록 강화
 - 2026-03-06:
   1) TP/SL 보호주문 가시성 검증 추가
-     - ENTRY 후 TP/SL 주문이 실제로 거래소에 존재하는지 polling 검증
-     - orderId / clientOrderId / side / type / positionSide / reduceOnly|closePosition / status 엄격 확인
   2) 보호주문 검증 실패 시 무보호 포지션 방지
-     - close_all_positions_market()로 즉시 정리 시도 후 예외 전파
-  3) 보호주문 검증 전용 예외 추가
-     - ProtectionOrderVerificationError
+  3) ProtectionOrderVerificationError 추가
 ========================================================
 """
 
@@ -205,6 +183,31 @@ def _normalize_position_side(position_side: Optional[str]) -> str:
     if ps in {"BOTH", "LONG", "SHORT"}:
         return ps
     raise ValueError(f"invalid position_side: {position_side!r}")
+
+
+def _require_nonempty_source(source: Any) -> str:
+    s = str(source or "").strip()
+    if not s:
+        raise ValueError("source is empty (STRICT)")
+    return s
+
+
+def _require_ratio_float(value: Any, name: str, *, allow_zero: bool) -> float:
+    try:
+        f = float(value)
+    except Exception as e:
+        raise ValueError(f"{name} must be numeric (STRICT)") from e
+    if not math.isfinite(f):
+        raise ValueError(f"{name} must be finite (STRICT)")
+    if allow_zero:
+        if f < 0.0:
+            raise ValueError(f"{name} must be >= 0 (STRICT)")
+    else:
+        if f <= 0.0:
+            raise ValueError(f"{name} must be > 0 (STRICT)")
+    if f > 1.0:
+        raise ValueError(f"{name} must be <= 1.0 (STRICT)")
+    return float(f)
 
 
 def _to_decimal(x: Any, *, name: str) -> Decimal:
@@ -1399,27 +1402,26 @@ def open_position_with_tp_sl(
     *,
     available_usdt: Optional[float] = None,
     entry_client_order_id: Optional[str] = None,
-) -> Optional["Trade"]:
+) -> "Trade":
     _ = available_usdt
 
     sym = _normalize_symbol(symbol)
     open_side = _normalize_side(side_open)
+    source_str = _require_nonempty_source(source)
 
     lev = _require_leverage(settings)
 
     final_qty_raw = _require_positive_float(qty, "qty")
 
-    tp_pct_f = float(tp_pct)
-    sl_pct_f = float(sl_pct)
-    if tp_pct_f < 0 or sl_pct_f < 0:
-        raise ValueError("tp_pct and sl_pct must be >= 0")
+    tp_pct_f = _require_ratio_float(tp_pct, "tp_pct", allow_zero=False)
+    sl_pct_f = _require_ratio_float(sl_pct, "sl_pct", allow_zero=bool(soft_mode))
 
-    if not bool(soft_mode) and sl_pct_f <= 0:
+    if not bool(soft_mode) and sl_pct_f <= 0.0:
         raise ValueError("sl_pct must be > 0 when soft_mode=False")
 
     eph = float(entry_price_hint)
-    if not math.isfinite(eph):
-        raise ValueError("entry_price_hint must be finite")
+    if not math.isfinite(eph) or eph <= 0.0:
+        raise ValueError("entry_price_hint must be finite > 0")
 
     require_det = bool(getattr(settings, "require_deterministic_client_order_id", False))
     if entry_client_order_id is not None:
@@ -1461,12 +1463,12 @@ def open_position_with_tp_sl(
             sym,
             open_side,
             expected_qty_f,
-            source,
+            source_str,
         )
         log_event(
             event_type="ERROR",
             symbol=sym,
-            regime=source,
+            regime=source_str,
             side=_event_side_from_open_side(open_side),
             reason=str(e) or "entry_order_failed",
             extra_json={"open_side": open_side, "qty": float(expected_qty_f), "clientOrderId": entry_cid},
@@ -1525,8 +1527,6 @@ def open_position_with_tp_sl(
         if max_slip_f < 0:
             raise ValueError("settings.max_entry_slippage_pct must be >= 0")
         if max_slip_f > 0:
-            if eph <= 0:
-                raise ValueError("entry_price_hint must be > 0 when max_entry_slippage_pct is enabled")
             slip_pct = abs(entry_price - eph) / eph * 100.0
             if slip_pct > max_slip_f:
                 logger.warning(
@@ -1540,7 +1540,7 @@ def open_position_with_tp_sl(
                 log_event(
                     event_type="ERROR",
                     symbol=sym,
-                    regime=source,
+                    regime=source_str,
                     side=_event_side_from_open_side(open_side),
                     reason="slippage_guard_force_close",
                     extra_json={
@@ -1564,7 +1564,7 @@ def open_position_with_tp_sl(
     log_event(
         event_type="ENTRY",
         symbol=sym,
-        regime=source,
+        regime=source_str,
         side=_event_side_from_open_side(open_side),
         price=float(entry_price),
         qty=float(expected_qty_f),
@@ -1616,7 +1616,7 @@ def open_position_with_tp_sl(
         log_event(
             event_type="ERROR",
             symbol=sym,
-            regime=source,
+            regime=source_str,
             side=_event_side_from_open_side(open_side),
             reason="tp_sl_set_failed",
             extra_json={
@@ -1659,7 +1659,7 @@ def open_position_with_tp_sl(
         log_event(
             event_type="ERROR",
             symbol=sym,
-            regime=source,
+            regime=source_str,
             side=_event_side_from_open_side(open_side),
             reason="protection_order_verification_failed",
             extra_json={
@@ -1689,7 +1689,7 @@ def open_position_with_tp_sl(
     log_event(
         event_type="TP_SL_SET",
         symbol=sym,
-        regime=source,
+        regime=source_str,
         side=_event_side_from_open_side(open_side),
         price=float(entry_price),
         qty=float(expected_qty_f),
@@ -1717,7 +1717,7 @@ def open_position_with_tp_sl(
         qty=float(expected_qty_f),
         entry_price=float(entry_price),
         leverage=int(float(lev)),
-        source=str(source or "MARKET"),
+        source=source_str,
         tp_price=float(tp_price) if tp_price > 0 else 0.0,
         sl_price=float(sl_price) if sl_price > 0 else 0.0,
         entry_order_id=entry_order_id,
@@ -1727,7 +1727,7 @@ def open_position_with_tp_sl(
         exchange_position_side="BOTH",
         remaining_qty=float(expected_qty_f),
         realized_pnl_usdt=0.0,
-        reconciliation_status="ENTRY_FILLED",
+        reconciliation_status="PROTECTION_VERIFIED",
         last_synced_at=now_sync,
     )
 
@@ -1803,6 +1803,8 @@ def close_all_positions_market(symbol: str) -> int:
     if not positions:
         return 0
 
+    ensure_trading_settings(sym, SET)
+    filt = get_symbol_filters(sym)
     submitted = 0
 
     for p in positions:
@@ -1834,24 +1836,45 @@ def close_all_positions_market(symbol: str) -> int:
 
         close_side = "SELL" if direction == "LONG" else "BUY"
         qty2 = abs(amt)
+        expected_qty_dec, _, _ = _round_qty_and_price(
+            filters=filt,
+            order_type="MARKET",
+            raw_qty=qty2,
+            raw_price=None,
+            raw_stop_price=None,
+        )
+        expected_qty_f = float(expected_qty_dec)
 
         client_id = _make_client_order_id(prefix="sigterm")
         logger.warning(
             "[FORCE_CLOSE] submit reduce-only market close: symbol=%s direction=%s qty=%s positionSide=%s",
             sym,
             direction,
-            qty2,
+            expected_qty_f,
             pos_side,
         )
 
         resp = place_market(
             symbol=sym,
             side=close_side,
-            qty=float(qty2),
+            qty=float(expected_qty_f),
             settings=SET,
             reduce_only=True,
             position_side=pos_side,
             client_order_id=client_id,
+        )
+
+        order_id = resp.get("orderId") if isinstance(resp, dict) else None
+        if order_id is None:
+            raise OrderExecutionError("force close response missing orderId (STRICT)")
+
+        _, _, avg_px = _wait_order_filled_strict(
+            symbol=sym,
+            order_id=str(order_id),
+            settings=SET,
+            expected_qty=expected_qty_dec,
+            qty_step=filt.market_step,
+            max_wait_sec=float(getattr(SET, "exit_fill_wait_sec", 2.0) or 2.0),
         )
 
         log_event(
@@ -1859,15 +1882,16 @@ def close_all_positions_market(symbol: str) -> int:
             symbol=sym,
             regime="SIGTERM_FORCE_CLOSE",
             side=_event_side_close(),
-            price=(resp.get("avgPrice") if isinstance(resp, dict) else "") or "",
-            qty=float(qty2),
+            price=float(avg_px),
+            qty=float(expected_qty_f),
             leverage=getattr(SET, "leverage", None),
-            reason="SIGTERM_DEADLINE_FORCE_CLOSE",
+            reason="SIGTERM_DEADLINE_FORCE_CLOSE_FILLED",
             extra_json={
                 "direction": direction,
                 "close_side": close_side,
                 "positionSide": pos_side,
-                "orderId": resp.get("orderId") if isinstance(resp, dict) else None,
+                "orderId": str(order_id),
+                "clientOrderId": client_id,
             },
         )
         submitted += 1

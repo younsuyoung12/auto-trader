@@ -2,55 +2,33 @@
 """
 ========================================================
 FILE: infra/market_data_ws.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-역할:
-- Binance USDT-M Futures WebSocket(multiplex /stream)으로부터
-  멀티 타임프레임 kline + depth5 오더북을 수신해 메모리 버퍼에 저장한다.
-- 상위 레이어(run_bot_ws, feature builder, health monitor)에
-  getter / health snapshot만 제공한다.
-- 주문/전략/EXIT 로직은 절대 포함하지 않는다.
+ROLE:
+- Binance USDT-M Futures multiplex WebSocket 수신기
+- 멀티 타임프레임 kline + depth5 orderbook을 메모리 버퍼에 유지
+- 상위 레이어에 getter / atomic snapshot / health snapshot만 제공
 
-핵심 원칙 (STRICT · NO-FALLBACK):
-- WS 원본 데이터는 보정/추정 없이 그대로 버퍼링한다.
-- 데이터 누락/손상은 "정상 상태"로 취급하지 않는다. (health에서 FAIL)
-- 더미 값 생성/None→0 치환/행 단위 조용한 skip 금지.
-- 환경변수 직접 접근 금지: 이 모듈은 settings(SSOT)만 사용한다.
-- TRADE-GRADE 부팅 규칙:
-  - 운영 시작 시점의 초기 캔들 적재는 "명시적 REST bootstrap"으로 수행한다.
-  - 이는 런타임 fallback이 아니라 시작 시점 preload이며, 실패 시 즉시 예외로 중단한다.
-  - bootstrap 성공 후에는 WS만으로 갱신한다.
+CORE RESPONSIBILITIES:
+- WS 수신 데이터의 STRICT 검증 및 메모리 버퍼링
+- 부팅 시 REST bootstrap으로 필수 캔들 preload
+- WS 세션 상태 / market-data freshness / orderbook payload 무결성 관측성 제공
+- strategy / execution / exit 책임과 완전 분리
 
-변경 이력
---------------------------------------------------------
-- 2026-03-03 (TRADE-GRADE):
-  1) ENV 직접 접근 제거:
-     - os.getenv("BINANCE_FUTURES_WS_BASE") 제거
-     - settings.ws_combined_base 를 단일 사용(SSOT)
-  2) 프로토콜 무결성 강화:
-     - kline/orderbook payload 불량(필수 필드 누락, 숫자 파싱 불가 등) 시 WSProtocolError로 연결 종료
-     - “로그만 남기고 무시” 방식 제거(조용한 데이터 손상 금지)
-  3) REST backfill 입력도 STRICT:
-     - backfill_klines_from_rest 에서 invalid row continue 제거 → 즉시 예외
-- 2026-03-04:
-  1) Atomic Market Snapshot 추가
-     - get_market_snapshot(symbol) 구현
-     - kline + orderbook 동시 snapshot 제공
-     - strategy layer에서 데이터 시점 불일치 방지
-- 2026-03-05 (TRADE-GRADE):
-  1) Orderbook updateId sequence validation 수정
-     - 기존: update_id == prev_update_id + 1 강제
-     - 문제: Binance depth stream은 updateId가 +1로 증가하지 않음(정상 jump 존재)
-     - 수정: outdated packet(update_id <= prev_update_id)만 오류 처리, jump 허용
-     - STRICT 정책 유지: fallback 없음 / silent skip 없음
-- 2026-03-08 (TRADE-GRADE PATCH):
-  1) 운영 부팅 규칙 추가:
-     - start_ws_loop 전에 Binance REST /fapi/v1/klines 로 초기 캔들 preload 수행
-     - interval별 required buffer 만큼 STRICT preload
-     - bootstrap 실패 시 WS 시작하지 않고 즉시 예외
-  2) 중복 WS 시작 방지:
-     - 동일 symbol 에 대해 start_ws_loop 중복 호출 차단
-- 2026-03-08 (TRADE-GRADE PATCH 2):
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 데이터 누락/손상/계약 불일치는 즉시 예외
+- 더미 값 생성, silent continue, 예외 삼키기 금지
+- 실시간 freshness 판단은 "payload 변경 유무"와 "WS transport 생존성"을 분리한다
+- orderbook payload 무결성과 WS 세션 freshness를 혼동하지 않는다
+- 환경변수 직접 접근 금지, settings.py(SSOT)만 사용
+
+CHANGE HISTORY:
+- 2026-03-10:
+  1) FIX(ROOT-CAUSE): orderbook health가 top-of-book 미변경만으로 FAIL 나던 구조 제거
+  2) ADD(OBSERVABILITY): ws session state(last_open/last_close/last_message/last_pong/error) 추적 추가
+  3) FIX(ARCH): orderbook payload health와 WS transport / market-feed freshness 판단 분리
+  4) FIX(STRICT): ws.close 실패를 더 이상 조용히 무시하지 않고 원인 로그를 남김
+  5) FIX(SSOT): settings.py 에 선언되지 않은 숨은 기본값(getattr default) 제거
+- 2026-03-09:
   1) FIX(ROOT-CAUSE): downstream EMA200 요구량과 WS bootstrap/min-buffer 정책 정합화
   2) FIX(STRICT): 5m / 15m / 1h / 4h interval에 최소 200개 캔들 강제
   3) FIX(COMPAT): legacy get_klines() limit 미지정 시 지표 계산에 충분한 길이 반환
@@ -72,23 +50,6 @@ from infra.telelog import log
 from settings import load_settings
 
 SET = load_settings()
-
-DEFAULT_INTERVALS: List[str] = [
-    "1m",
-    "3m",
-    "5m",
-    "15m",
-    "30m",
-    "1h",
-    "2h",
-    "4h",
-    "6h",
-    "12h",
-    "1d",
-    "3d",
-    "1w",
-    "1M",
-]
 
 
 class WSProtocolError(RuntimeError):
@@ -120,7 +81,6 @@ def _normalize_interval(iv: Any) -> str:
     s = str(iv or "").strip()
     if not s:
         return ""
-    # 월(M)은 Binance 표기상 1M (대문자 M) 유지
     if s.endswith("M"):
         return s
     return s.lower()
@@ -189,8 +149,6 @@ def _require_positive_float(v: Any, name: str) -> float:
 
 
 def _require_interval_min_buffer_mapping(v: Any, name: str) -> Dict[str, int]:
-    if v is None:
-        return {}
     if not isinstance(v, Mapping):
         raise RuntimeError(f"{name} must be mapping[str,int] (STRICT)")
     out: Dict[str, int] = {}
@@ -202,13 +160,20 @@ def _require_interval_min_buffer_mapping(v: Any, name: str) -> Dict[str, int]:
     return out
 
 
+def _truncate_text(v: Any, max_len: int = 300) -> str:
+    s = str(v)
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + f"... (truncated, total_len={len(s)})"
+
+
 # ─────────────────────────────────────────────
-# Streams / URL (SSOT)
+# Settings / SSOT
 # ─────────────────────────────────────────────
-WS_INTERVALS: List[str] = [_normalize_interval(x) for x in (list(getattr(SET, "ws_subscribe_tfs", None) or DEFAULT_INTERVALS))]
+WS_INTERVALS: List[str] = [_normalize_interval(x) for x in list(SET.ws_subscribe_tfs)]
 WS_INTERVALS = [x for x in WS_INTERVALS if x]
 
-REQUIRED_INTERVALS: List[str] = [_normalize_interval(x) for x in (list(getattr(SET, "ws_required_tfs", None) or ["1m", "5m", "15m"]))]
+REQUIRED_INTERVALS: List[str] = [_normalize_interval(x) for x in list(SET.ws_required_tfs)]
 REQUIRED_INTERVALS = [x for x in REQUIRED_INTERVALS if x]
 
 if not WS_INTERVALS:
@@ -223,44 +188,46 @@ if _missing_required:
         f"missing={_missing_required}. Fix your settings to subscribe required intervals."
     )
 
-# TRADE-GRADE: multiplex base는 settings에서만 받는다.
-_WS_COMBINED_BASE = str(getattr(SET, "ws_combined_base", "") or "").strip()
+_WS_COMBINED_BASE = str(SET.ws_combined_base or "").strip()
 if not _WS_COMBINED_BASE:
     raise RuntimeError("settings.ws_combined_base is required (STRICT)")
 
-# 기대 형태: ".../stream?streams="
 if "?streams=" not in _WS_COMBINED_BASE:
-    # 허용: ".../stream" 이면 suffix 부여
     if _WS_COMBINED_BASE.endswith("/stream"):
         _WS_COMBINED_BASE = _WS_COMBINED_BASE + "?streams="
     else:
         raise RuntimeError(f"settings.ws_combined_base must contain '?streams=' (STRICT): {_WS_COMBINED_BASE!r}")
 
 if not _WS_COMBINED_BASE.endswith("streams="):
-    # "?streams=" 다음에 아무 문자열이 붙어있으면 위험. (URL 구성 깨짐)
     raise RuntimeError(f"settings.ws_combined_base must end with 'streams=' (STRICT): {_WS_COMBINED_BASE!r}")
 
-# TRADE-GRADE: startup REST bootstrap base
-_WS_REST_BASE = str(getattr(SET, "binance_futures_rest_base", "https://fapi.binance.com") or "").strip().rstrip("/")
+_WS_REST_BASE = str(SET.binance_futures_rest_base or "").strip().rstrip("/")
 if not _WS_REST_BASE:
     raise RuntimeError("settings.binance_futures_rest_base is required (STRICT)")
 if not (_WS_REST_BASE.startswith("http://") or _WS_REST_BASE.startswith("https://")):
     raise RuntimeError(f"settings.binance_futures_rest_base invalid (STRICT): {_WS_REST_BASE!r}")
 
-_WS_BOOTSTRAP_REST_ENABLED: bool = bool(getattr(SET, "ws_bootstrap_rest_enabled", True))
-_WS_REST_TIMEOUT_SEC: float = _require_positive_float(getattr(SET, "ws_rest_timeout_sec", 10.0), "ws_rest_timeout_sec")
+_WS_BOOTSTRAP_REST_ENABLED: bool = bool(SET.ws_bootstrap_rest_enabled)
+_WS_REST_TIMEOUT_SEC: float = _require_positive_float(SET.ws_rest_timeout_sec, "ws_rest_timeout_sec")
 _WS_REST_KLINES_LIMIT_CAP: int = 1500
 
-KLINE_MIN_BUFFER: int = _require_positive_int(getattr(SET, "ws_min_kline_buffer", 120), "ws_min_kline_buffer")
-KLINE_MAX_DELAY_SEC: float = _require_positive_float(getattr(SET, "ws_max_kline_delay_sec", 120.0), "ws_max_kline_delay_sec")
-ORDERBOOK_MAX_DELAY_SEC: float = _require_positive_float(getattr(SET, "ws_orderbook_max_delay_sec", 10.0), "ws_orderbook_max_delay_sec")
+KLINE_MIN_BUFFER: int = _require_positive_int(SET.ws_min_kline_buffer, "ws_min_kline_buffer")
+KLINE_MAX_DELAY_SEC: float = _require_positive_float(SET.ws_max_kline_delay_sec, "ws_max_kline_delay_sec")
+MARKET_EVENT_MAX_DELAY_SEC: float = _require_positive_float(
+    SET.ws_market_event_max_delay_sec,
+    "ws_market_event_max_delay_sec",
+)
+PONG_MAX_DELAY_SEC: float = _require_positive_float(SET.ws_pong_max_delay_sec, "ws_pong_max_delay_sec")
+PONG_STARTUP_GRACE_SEC: float = _require_positive_float(
+    SET.ws_pong_startup_grace_sec,
+    "ws_pong_startup_grace_sec",
+)
 
 _LONG_TF_MIN_BUFFER_DEFAULT: int = _require_positive_int(
-    getattr(SET, "ws_min_kline_buffer_long_tf", 2),
+    SET.ws_min_kline_buffer_long_tf,
     "ws_min_kline_buffer_long_tf",
 )
 
-# downstream regime/feature layer의 EMA200 요구량과 정합화하는 strict 최소 버퍼
 _BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = {
     "5m": 200,
     "15m": 200,
@@ -269,7 +236,7 @@ _BUILTIN_STRICT_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = {
 }
 
 _SETTINGS_INTERVAL_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = _require_interval_min_buffer_mapping(
-    getattr(SET, "ws_min_kline_buffer_by_interval", None),
+    SET.ws_min_kline_buffer_by_interval,
     "ws_min_kline_buffer_by_interval",
 )
 
@@ -284,21 +251,28 @@ for _iv, _min_buf in _SETTINGS_INTERVAL_MIN_BUFFER_BY_INTERVAL.items():
     prev = _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.get(_iv)
     _EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL[_iv] = max(_min_buf, prev or 0)
 
-_HEALTH_FAIL_LOG_SUPPRESS_SEC: float = float(getattr(SET, "ws_health_fail_log_suppress_sec", 10.0))
+_HEALTH_FAIL_LOG_SUPPRESS_SEC: float = _require_positive_float(
+    SET.ws_health_fail_log_suppress_sec,
+    "ws_health_fail_log_suppress_sec",
+)
 _last_health_fail_log_ts: float = 0.0
 _last_health_fail_key: str = ""
 _health_fail_lock = threading.Lock()
 
-# { (symbol, interval): [(ts, o, h, l, c, v), ...] }  (닫힌 캔들만)
 _kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float, float]]] = {}
-# { (symbol, interval): last_recv_ts_ms }  (x 여부 무관)
 _kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
 
-# { symbol: {"bids": [...], "asks": [...], "ts": ..., "exchTs": ..., "bestBid": ..., "bestAsk": ..., "spreadPct": ...} }
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
+_orderbook_last_update_id: Dict[str, int] = {}
 
-# TRADE-GRADE PATCH: orderbook updateId sequence tracking (symbol -> lastUpdateId)
-_orderbook_last_update_id: Dict[str, int] = {}  # TRADE-GRADE PATCH
+_ws_connection_open: Dict[str, bool] = {}
+_ws_last_open_ts: Dict[str, int] = {}
+_ws_last_close_ts: Dict[str, int] = {}
+_ws_last_close_text: Dict[str, str] = {}
+_ws_last_message_ts: Dict[str, int] = {}
+_ws_last_pong_ts: Dict[str, int] = {}
+_ws_last_error_text: Dict[str, str] = {}
+_ws_state_lock = threading.Lock()
 
 _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
@@ -313,16 +287,143 @@ if MAX_KLINES < _max_required_buffer:
         f"MAX_KLINES({MAX_KLINES}) must be >= strict required min buffer ({_max_required_buffer})"
     )
 
-_NO_BUF_LOG_SUPPRESS_SEC: float = float(getattr(SET, "ws_no_buffer_log_suppress_sec", 30.0))
+_NO_BUF_LOG_SUPPRESS_SEC: float = _require_positive_float(
+    SET.ws_no_buffer_log_suppress_sec,
+    "ws_no_buffer_log_suppress_sec",
+)
 _no_buf_log_last: Dict[Tuple[str, str], float] = {}
 _no_buf_log_lock = threading.Lock()
 
-# 동일 symbol 중복 WS 시작 방지
 _started_ws_symbols: Dict[str, threading.Thread] = {}
 _start_ws_lock = threading.Lock()
 
 _rest_session = requests.Session()
 _rest_session.headers.update({"User-Agent": "auto-trader/market-data-ws-bootstrap"})
+
+
+def _mark_ws_open(symbol: str, opened_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws open state")
+    with _ws_state_lock:
+        _ws_connection_open[sym] = True
+        _ws_last_open_ts[sym] = int(opened_at_ms)
+        _ws_last_message_ts.pop(sym, None)
+        _ws_last_pong_ts.pop(sym, None)
+        _ws_last_error_text.pop(sym, None)
+
+
+def _mark_ws_closed(symbol: str, closed_at_ms: int, *, code: Any, msg: Any) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws close state")
+    with _ws_state_lock:
+        _ws_connection_open[sym] = False
+        _ws_last_close_ts[sym] = int(closed_at_ms)
+        _ws_last_close_text[sym] = f"code={code!r} msg={_truncate_text(msg)}"
+
+
+def _mark_ws_message(symbol: str, received_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws message state")
+    with _ws_state_lock:
+        _ws_last_message_ts[sym] = int(received_at_ms)
+
+
+def _mark_ws_pong(symbol: str, received_at_ms: int) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws pong state")
+    with _ws_state_lock:
+        _ws_last_pong_ts[sym] = int(received_at_ms)
+
+
+def _mark_ws_error(symbol: str, error: Any) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws error state")
+    msg = _truncate_text(error)
+    with _ws_state_lock:
+        _ws_last_error_text[sym] = msg
+
+
+def get_ws_status(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    now_ms = _now_ms()
+
+    with _ws_state_lock:
+        connection_open = bool(_ws_connection_open.get(sym, False))
+        last_open_ts = _ws_last_open_ts.get(sym)
+        last_close_ts = _ws_last_close_ts.get(sym)
+        last_close_text = _ws_last_close_text.get(sym)
+        last_message_ts = _ws_last_message_ts.get(sym)
+        last_pong_ts = _ws_last_pong_ts.get(sym)
+        last_error = _ws_last_error_text.get(sym)
+
+    market_event_delay_ms = None
+    if last_message_ts is not None:
+        market_event_delay_ms = max(0, now_ms - int(last_message_ts))
+
+    pong_delay_ms = None
+    if last_pong_ts is not None:
+        pong_delay_ms = max(0, now_ms - int(last_pong_ts))
+
+    transport_reasons: List[str] = []
+    market_feed_reasons: List[str] = []
+
+    if not connection_open:
+        transport_reasons.append("connection_not_open")
+
+    if connection_open:
+        if last_pong_ts is None:
+            if last_open_ts is None:
+                transport_reasons.append("no_open_ts")
+            else:
+                open_age_sec = max(0, now_ms - int(last_open_ts)) / 1000.0
+                if open_age_sec > PONG_STARTUP_GRACE_SEC:
+                    transport_reasons.append(
+                        f"no_pong_after_open>{PONG_STARTUP_GRACE_SEC} (got={open_age_sec:.1f})"
+                    )
+        else:
+            pong_delay_sec = pong_delay_ms / 1000.0
+            if pong_delay_sec > PONG_MAX_DELAY_SEC:
+                transport_reasons.append(f"pong_delay_sec>{PONG_MAX_DELAY_SEC} (got={pong_delay_sec:.1f})")
+
+    if last_message_ts is None:
+        market_feed_reasons.append("no_market_event")
+    else:
+        market_event_delay_sec = market_event_delay_ms / 1000.0
+        if market_event_delay_sec > MARKET_EVENT_MAX_DELAY_SEC:
+            market_feed_reasons.append(
+                f"market_event_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={market_event_delay_sec:.1f})"
+            )
+
+    reasons = [f"transport:{r}" for r in transport_reasons] + [f"market_feed:{r}" for r in market_feed_reasons]
+
+    return {
+        "symbol": sym,
+        "connection_open": connection_open,
+        "last_open_ts": last_open_ts,
+        "last_close_ts": last_close_ts,
+        "last_close_text": last_close_text,
+        "last_message_ts": last_message_ts,
+        "market_event_delay_ms": market_event_delay_ms,
+        "last_pong_ts": last_pong_ts,
+        "pong_delay_ms": pong_delay_ms,
+        "last_error": last_error,
+        "transport_ok": len(transport_reasons) == 0,
+        "market_feed_ok": len(market_feed_reasons) == 0,
+        "ok": len(reasons) == 0,
+        "reasons": reasons,
+    }
+
+
+def _close_ws_with_log(ws: websocket.WebSocketApp, *, context: str) -> None:
+    try:
+        ws.close()
+    except Exception as e:
+        log(f"[MD_BINANCE_WS] close error after {context}: {type(e).__name__}: {e}")
 
 
 def _min_buffer_for_interval(iv: str) -> int:
@@ -451,7 +552,6 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
 
     key = (sym, iv)
 
-    # STRICT: 필수 필드/파싱 실패는 프로토콜 에러로 처리
     ts = _require_int_ms(kline_obj.get("t"), "kline.t")
     o = _require_float(kline_obj.get("o"), "kline.o")
     h = _require_float(kline_obj.get("h"), "kline.h")
@@ -462,6 +562,8 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     is_closed = bool(kline_obj.get("x", False))
 
     now_ms = _now_ms()
+    _mark_ws_message(sym, now_ms)
+
     with _kline_lock:
         _kline_last_recv_ts[key] = now_ms
 
@@ -476,12 +578,6 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
 
 
 def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
-    """
-    STRICT:
-    - depth levels는 [price, qty] 또는 {"price":..., "qty":...} 형태만 허용
-    - price > 0, qty > 0, finite
-    - 파싱 불가/불량 값이 하나라도 있으면 프로토콜 에러
-    """
     if side_val is None:
         raise WSProtocolError(f"{name} missing")
     if not isinstance(side_val, (list, tuple)):
@@ -534,7 +630,6 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     if not sym:
         raise WSProtocolError("empty symbol in orderbook push")
 
-    # TRADE-GRADE PATCH: update id parse -> sequence validation (STRICT)
     raw_update_id = payload.get("u") if payload.get("u") is not None else payload.get("lastUpdateId")
     if raw_update_id is None:
         raise WSProtocolError("orderbook missing update id (u/lastUpdateId) (STRICT)")
@@ -545,20 +640,14 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     if update_id <= 0:
         raise WSProtocolError("orderbook update id must be > 0 (STRICT)")
 
-    # 1) sequence validation (read-only check first)
-    # NOTE:
-    # - Binance depth stream의 updateId는 +1 연속 증가가 보장되지 않는다(정상 jump 존재).
-    # - STRICT에서는 "역전(outdated)"만 프로토콜 오류로 처리한다.
     with _orderbook_lock:
         prev_update_id = _orderbook_last_update_id.get(sym)
 
-    if prev_update_id is not None:
-        if update_id <= int(prev_update_id):
-            raise WSProtocolError(
-                f"orderbook outdated packet (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
-            )
+    if prev_update_id is not None and update_id <= int(prev_update_id):
+        raise WSProtocolError(
+            f"orderbook outdated packet (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
+        )
 
-    # 2) normalization (STRICT)
     raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
     raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
 
@@ -566,37 +655,34 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     normalized_asks = _normalize_depth_side_strict(raw_asks, name="orderbook.asks")
 
     now_ms = _now_ms()
+    _mark_ws_message(sym, now_ms)
 
-    # 3) best price + spread (STRICT)
     best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
     spread_pct = _compute_spread_pct(best_bid, best_ask)
 
     ob: Dict[str, Any] = {
         "bids": normalized_bids,
         "asks": normalized_asks,
-        "ts": now_ms,  # 로컬 수신 시각(필수)
+        "ts": now_ms,
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spreadPct": spread_pct,
-        "lastUpdateId": int(update_id),  # TRADE-GRADE PATCH: always present
+        "lastUpdateId": int(update_id),
     }
 
-    # Binance depth event time
     exch_ts = payload.get("E") or payload.get("T")
     if exch_ts is not None:
         ob["exchTs"] = _require_int_ms(exch_ts, "orderbook.exchTs")
 
-    # 4) buffer update (atomic + re-validate to avoid race)
     with _orderbook_lock:
         prev2 = _orderbook_last_update_id.get(sym)
-        if prev2 is not None:
-            if update_id <= int(prev2):
-                raise WSProtocolError(
-                    f"orderbook outdated packet (STRICT, race): prev={int(prev2)} new={int(update_id)}"
-                )
+        if prev2 is not None and update_id <= int(prev2):
+            raise WSProtocolError(
+                f"orderbook outdated packet (STRICT, race): prev={int(prev2)} new={int(update_id)}"
+            )
 
         _orderbook_buffers[sym] = ob
-        _orderbook_last_update_id[sym] = int(update_id)  # TRADE-GRADE PATCH
+        _orderbook_last_update_id[sym] = int(update_id)
 
 
 def _handle_single_msg(expected_symbol: str, data: Any) -> None:
@@ -632,10 +718,12 @@ def _handle_single_msg(expected_symbol: str, data: Any) -> None:
         return
 
     if "@depth" in stream:
+        payload_symbol = _normalize_symbol(str(payload.get("s") or sym))
+        if payload_symbol and payload_symbol != sym:
+            raise WSProtocolError(f"unexpected symbol in depth stream (expected={sym}, got={payload_symbol})")
         _push_orderbook(sym, payload)
         return
 
-    # 알 수 없는 stream은 프로토콜 위반으로 처리
     raise WSProtocolError(f"unknown stream type (STRICT): {stream}")
 
 
@@ -644,10 +732,7 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
         data = _decode_msg(message)
     except Exception as e:
         log(f"[MD_BINANCE_WS] decode error: {type(e).__name__}: {e}")
-        try:
-            ws.close()
-        except Exception:
-            pass
+        _close_ws_with_log(ws, context=f"decode_error symbol={_normalize_symbol(symbol)}")
         return
 
     try:
@@ -658,33 +743,38 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
             _handle_single_msg(symbol, data)
     except WSProtocolError as e:
         log(f"[MD_BINANCE_WS] protocol error: {e}")
-        try:
-            ws.close()
-        except Exception:
-            pass
+        _close_ws_with_log(ws, context=f"protocol_error symbol={_normalize_symbol(symbol)}")
 
 
-def _on_error(ws: websocket.WebSocketApp, error: Any) -> None:
+def _on_error(symbol: str, ws: websocket.WebSocketApp, error: Any) -> None:
     _ = ws
+    _mark_ws_error(symbol, error)
     log(f"[MD_BINANCE_WS] error: {error}")
 
 
-def _on_close(ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
+def _on_close(symbol: str, ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
     _ = ws
+    _mark_ws_closed(symbol, _now_ms(), code=code, msg=msg)
     log(f"[MD_BINANCE_WS] closed: {code} {msg}")
 
 
 def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
     _ = ws
     streams = _build_stream_names(symbol)
-
-    # TRADE-GRADE PATCH: reconnect baseline reset (no fallback, no stale carryover)
     sym = _normalize_symbol(symbol)
+
     with _orderbook_lock:
         _orderbook_last_update_id.pop(sym, None)
         _orderbook_buffers.pop(sym, None)
 
+    _mark_ws_open(sym, _now_ms())
     log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
+
+
+def _on_pong(symbol: str, ws: websocket.WebSocketApp, data: Any) -> None:
+    _ = ws
+    _ = data
+    _mark_ws_pong(symbol, _now_ms())
 
 
 def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, float, float, float, float]]) -> None:
@@ -695,7 +785,6 @@ def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, floa
     if not iv:
         raise ValueError("interval is required")
 
-    # STRICT: preload rows 검증
     cleaned: List[Tuple[int, float, float, float, float, float]] = []
     for i, r in enumerate(rows):
         if not isinstance(r, (list, tuple)) or len(r) != 6:
@@ -764,7 +853,7 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
 
 
 def _log_no_buffer_once(symbol: str, interval: str, requested: int) -> None:
-    if not getattr(SET, "ws_log_enabled", False):
+    if not SET.ws_log_enabled:
         return
 
     now = time.time()
@@ -794,7 +883,6 @@ def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List
         return list(buf[-limit:])
 
 
-# 레거시 호환: (ts,o,h,l,c)
 def get_klines(symbol: str, interval: str, limit: Optional[int] = None) -> List[Tuple[int, float, float, float, float]]:
     if limit is None:
         normalized_limit = max(300, _min_buffer_for_interval(interval))
@@ -905,6 +993,7 @@ def _compute_kline_health(symbol: str, interval: str) -> Dict[str, Any]:
 def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
+    ws_status = get_ws_status(sym)
 
     with _orderbook_lock:
         ob = _orderbook_buffers.get(sym)
@@ -912,48 +1001,70 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "symbol": sym,
         "has_orderbook": ob is not None,
-        "delay_ms": None,
+        "transport_ok": bool(ws_status.get("transport_ok", False)),
+        "market_feed_ok": bool(ws_status.get("market_feed_ok", False)),
+        "payload_ok": False,
+        "orderbook_update_delay_ms": None,
+        "market_event_delay_ms": ws_status.get("market_event_delay_ms"),
+        "last_ws_message_ts": ws_status.get("last_message_ts"),
+        "last_pong_ts": ws_status.get("last_pong_ts"),
+        "last_update_id": None,
         "ok": False,
         "reasons": [],
     }
 
+    reasons: List[str] = list(ws_status.get("reasons") or [])
+
     if ob is None:
-        result["reasons"].append("no_orderbook")
+        reasons.append("payload:no_orderbook")
+        result["reasons"] = reasons
+        result["ok"] = False
+        result["payload_ok"] = False
         return result
 
     ts = ob.get("ts")
     if ts is None:
-        result["reasons"].append("no_ts")
-        return result
-
-    delay_ms = max(0, now_ms - int(ts))
-    delay_sec = delay_ms / 1000.0
-    result["delay_ms"] = delay_ms
+        reasons.append("payload:no_ts")
+    else:
+        result["orderbook_update_delay_ms"] = max(0, now_ms - int(ts))
 
     bids = ob.get("bids") or []
     asks = ob.get("asks") or []
     if not bids:
-        result["reasons"].append("empty_bids")
+        reasons.append("payload:empty_bids")
     if not asks:
-        result["reasons"].append("empty_asks")
+        reasons.append("payload:empty_asks")
 
     best_bid = ob.get("bestBid")
     best_ask = ob.get("bestAsk")
     if best_bid is None or best_ask is None:
-        result["reasons"].append("no_best_prices")
+        reasons.append("payload:no_best_prices")
     else:
         try:
             bb = float(best_bid)
             ba = float(best_ask)
             if ba <= bb:
-                result["reasons"].append("crossed_book(bestAsk<=bestBid)")
+                reasons.append("payload:crossed_book(bestAsk<=bestBid)")
         except Exception:
-            result["reasons"].append("invalid_best_prices")
+            reasons.append("payload:invalid_best_prices")
 
-    if delay_sec > ORDERBOOK_MAX_DELAY_SEC:
-        result["reasons"].append(f"delay_sec>{ORDERBOOK_MAX_DELAY_SEC} (got={delay_sec:.1f})")
+    last_update_id = ob.get("lastUpdateId")
+    if last_update_id is None:
+        reasons.append("payload:no_last_update_id")
+    else:
+        try:
+            parsed_update_id = int(last_update_id)
+        except Exception:
+            reasons.append("payload:invalid_last_update_id")
+        else:
+            if parsed_update_id <= 0:
+                reasons.append("payload:non_positive_last_update_id")
+            result["last_update_id"] = parsed_update_id
 
-    result["ok"] = len(result["reasons"]) == 0
+    payload_reasons = [r for r in reasons if r.startswith("payload:")]
+    result["payload_ok"] = len(payload_reasons) == 0
+    result["reasons"] = reasons
+    result["ok"] = bool(result["transport_ok"]) and bool(result["market_feed_ok"]) and bool(result["payload_ok"])
     return result
 
 
@@ -964,9 +1075,15 @@ def _maybe_log_health_fail(snapshot: Dict[str, Any]) -> None:
         return
 
     parts: List[str] = []
+
+    ws_status = snapshot.get("ws") or {}
+    if not ws_status.get("ok", False):
+        parts.append(f"ws:{'|'.join(ws_status.get('reasons') or [])}")
+
     for iv, st in (snapshot.get("klines") or {}).items():
         if not st.get("ok", False):
             parts.append(f"kline:{iv}:{'|'.join(st.get('reasons') or [])}")
+
     ob = snapshot.get("orderbook") or {}
     if not ob.get("ok", False):
         parts.append(f"ob:{'|'.join(ob.get('reasons') or [])}")
@@ -990,6 +1107,7 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
         "overall_ok": True,
         "overall_kline_ok": True,
         "overall_orderbook_ok": True,
+        "ws": {},
         "klines": {},
         "orderbook": {},
         "overall_reasons": [],
@@ -1002,6 +1120,12 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
     overall_orderbook_ok = True
     overall_reasons: List[str] = []
 
+    ws_status = get_ws_status(sym)
+    snapshot["ws"] = ws_status
+    if not ws_status.get("ok", False):
+        overall_ok = False
+        overall_reasons.append(f"ws:{'|'.join(ws_status.get('reasons') or [])}")
+
     kline_map: Dict[str, Any] = {}
     for iv in REQUIRED_INTERVALS:
         k_status = _compute_kline_health(sym, iv)
@@ -1012,13 +1136,13 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
             overall_reasons.append(f"kline:{iv}:{'|'.join(k_status.get('reasons') or [])}")
 
     ob_status = _compute_orderbook_health(sym)
+    snapshot["orderbook"] = ob_status
     if not ob_status.get("ok", False):
         overall_ok = False
         overall_orderbook_ok = False
         overall_reasons.append(f"orderbook:{'|'.join(ob_status.get('reasons') or [])}")
 
     snapshot["klines"] = kline_map
-    snapshot["orderbook"] = ob_status
     snapshot["overall_ok"] = overall_ok
     snapshot["overall_kline_ok"] = overall_kline_ok
     snapshot["overall_orderbook_ok"] = overall_orderbook_ok
@@ -1042,7 +1166,6 @@ def start_ws_loop(symbol: str) -> None:
             log(f"[MD_BINANCE_WS] already started for {sym} → skip duplicate start")
             return
 
-    # TRADE-GRADE: explicit startup bootstrap (REST preload) before WS
     bootstrap_counts = bootstrap_klines_from_rest_strict(sym, intervals=WS_INTERVALS)
     url = _build_ws_url(sym)
 
@@ -1057,16 +1180,25 @@ def start_ws_loop(symbol: str) -> None:
                     url,
                     on_open=lambda ws_: _on_open(sym, ws_),
                     on_message=lambda ws_, message: _on_message(sym, ws_, message),
-                    on_error=lambda ws_, error: _on_error(ws_, error),
-                    on_close=lambda ws_, code, msg: _on_close(ws_, code, msg),
+                    on_error=lambda ws_, error: _on_error(sym, ws_, error),
+                    on_close=lambda ws_, code, msg: _on_close(sym, ws_, code, msg),
+                    on_pong=lambda ws_, data: _on_pong(sym, ws_, data),
                 )
 
                 start_ts = time.time()
                 ws.run_forever(ping_interval=3, ping_timeout=2)
                 session_dur = time.time() - start_ts
+
+                with _ws_state_lock:
+                    still_open = bool(_ws_connection_open.get(sym, False))
+                if still_open:
+                    _mark_ws_closed(sym, _now_ms(), code="RUN_FOREVER_RETURN", msg="run_forever returned")
+
                 log("[MD_BINANCE_WS] WS disconnected → retrying ...")
 
             except Exception as e:
+                _mark_ws_error(sym, f"run_forever_exception:{type(e).__name__}:{e}")
+                _mark_ws_closed(sym, _now_ms(), code="RUN_FOREVER_EXCEPTION", msg=str(e))
                 log(f"[MD_BINANCE_WS] run_forever exception: {type(e).__name__}: {e}")
 
             retry_wait = 1.0 if session_dur > 60.0 else min(retry_wait * 2.0, 10.0)
@@ -1096,9 +1228,8 @@ def get_market_snapshot(symbol: str) -> Dict[str, Any]:
     Atomic Market Snapshot (STRICT)
 
     목적:
-    - strategy/feature builder가 kline + orderbook을 "동일 시점"으로 읽도록 한다.
-    - 개별 getter(get_klines*, get_orderbook) 조합 호출 시 발생 가능한
-      non-atomic read(데이터 시점 불일치)를 방지한다.
+    - strategy/feature builder가 kline + orderbook을 동일 시점으로 읽도록 한다.
+    - 개별 getter 조합 호출 시 발생 가능한 non-atomic read를 방지한다.
 
     반환:
     {
@@ -1109,10 +1240,6 @@ def get_market_snapshot(symbol: str) -> Dict[str, Any]:
     """
     sym = _normalize_symbol(symbol)
 
-    # NOTE:
-    # - STRICT 정책상 여기서 더미 값 생성/보정은 하지 않는다.
-    # - 데이터가 없으면 orderbook=None 또는 klines={} 로 반환한다.
-    #   (상위 레이어는 health snapshot으로 FAIL 처리 가능)
     with _kline_lock, _orderbook_lock:
         snapshot: Dict[str, Any] = {"symbol": sym, "orderbook": None, "klines": {}}
 
@@ -1140,6 +1267,7 @@ __all__ = [
     "get_last_kline_delay_ms",
     "get_kline_buffer_status",
     "get_orderbook",
+    "get_ws_status",
     "get_health_snapshot",
     "is_data_healthy",
     "get_market_snapshot",

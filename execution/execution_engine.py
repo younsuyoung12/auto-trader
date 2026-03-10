@@ -1,42 +1,38 @@
-# execution/execution_engine.py
 """
 ========================================================
 FILE: execution/execution_engine.py
-AUTO-TRADER — ENTRY EXECUTION ORCHESTRATOR
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- 엔트리 실행 요청을 최종 정규화하고 주문 실행 SSOT(order_executor)로 위임한다
+- 실행 직전 계약(symbol/action/source/qty/tp/sl/client_order_id)을 엄격 검증한다
+- Trade 반환 계약을 검증해 상위 엔진에 안전한 실행 결과만 전달한다
 
-핵심 변경 요약
-- FIX(ROOT-CAUSE): require_deterministic_client_order_id=True 환경에서
-  signal이 entry_client_order_id를 주지 않아도 deterministic client_order_id를 강제 생성
-- FIX(CONTRACT): run_bot_ws Signal 구조(action/direction/tp_pct/sl_pct/risk_pct/meta)와 정합 유지
-- FIX(EXECUTION): order_executor.open_position_with_tp_sl() 호출 계약에서
-  deterministic client_order_id 누락으로 실패하던 경로 복구
-- 기존 기능 삭제 없음: 실제 주문 실행 SSOT 는 order_executor.open_position_with_tp_sl() 유지
+CORE RESPONSIBILITIES:
+- Signal / mapping / dataclass 입력 정규화
+- deterministic client_order_id 강제 생성 및 검증
+- entry execution request strict contract 생성
+- order_executor.open_position_with_tp_sl() 호출
+- Trade 반환 계약 검증
 
-코드 정리 내용
-- deterministic client_order_id 생성 로직 추가
-- 불필요 import 제거
-- signal/meta 2계층 정규화 유지
-- action 을 side 로 오인하던 잘못된 해석 유지 차단
-- 사용 안 하는 중복 구현/죽은 로직 정리
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 실행 계층은 계약 누락을 임의 보정하지 않는다
+- symbol 누락 시 settings.symbol 로 폴백하지 않는다
+- action 은 반드시 ENTER 여야 하며 누락 시 즉시 예외
+- source 는 출처 필드만 허용하며 regime/reason 을 대체값으로 사용하지 않는다
+- tp_pct/sl_pct/risk_pct 는 ratio 계약(0,1] 을 강제한다
+- 주문 실행 / 체결 검증 / 보호주문 검증의 실제 SSOT 는 order_executor 이다
 
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): settings.require_deterministic_client_order_id=True 일 때
-     entry_client_order_id 누락 시 deterministic client_order_id 자동 생성 추가
-  2) FIX(CONTRACT): 생성된 client_order_id 를 Trade.client_entry_id 와 엄격 검증하도록 유지
-  3) CLEANUP: dead import 제거 및 해시용 canonicalization 유틸 추가
-
+  1) FIX(ROOT-CAUSE): signal.symbol 누락 시 settings.symbol 로 진행하던 숨은 fallback 제거
+  2) FIX(ROOT-CAUSE): action 필수화 및 ENTER 외 실행 금지
+  3) FIX(CONTRACT): source alias 에서 regime/reason 제거, 실제 출처 필드만 허용
+  4) FIX(STRICT): tp_pct/sl_pct 를 ratio(0,1] 계약으로 강화
+  5) CLEANUP: 상단 문서 구조를 ROLE / CORE RESPONSIBILITIES / IMPORTANT POLICY 형식으로 정리
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): ExecutionEngine 클래스 복구
-     - __init__(settings)
-     - execute(signal) -> Trade
   2) FIX(CONTRACT): run_bot_ws Signal 구조(action/direction/risk_pct/meta)와 정합 복구
-  3) FIX(SYNTAX): entry_client_order_id 대입 구문 오타 수정
-  4) FIX(SIZING): qty 누락 시 risk_pct 기반 수량 계산 복구
-  5) CLEANUP: execution_engine 내부 중복 실행 로직 제거, order_executor 단일 SSOT 유지
+  3) FIX(SIZING): qty 누락 시 risk_pct 기반 수량 계산 복구
 ========================================================
 """
 
@@ -157,6 +153,8 @@ def _normalize_action_strict(value: Any) -> str:
     s = str(value).upper().strip()
     if not s:
         raise OrderExecutionError("action is empty (STRICT)")
+    if s != "ENTER":
+        raise OrderExecutionError(f"ExecutionEngine only accepts ENTER action (STRICT): got={s!r}")
     return s
 
 
@@ -274,7 +272,7 @@ def _extract_normalized_value_strict(
     return first_value
 
 
-def _extract_symbol_with_settings_scope_strict(
+def _extract_symbol_strict(
     *,
     search_spaces: tuple[tuple[str, Mapping[str, Any]], ...],
     settings: Any,
@@ -284,35 +282,31 @@ def _extract_symbol_with_settings_scope_strict(
         field_name="symbol",
         aliases=("symbol",),
         normalizer=_normalize_symbol_strict,
-        required=False,
+        required=True,
     )
-    if symbol is not None:
-        return symbol
-
     settings_symbol = getattr(settings, "symbol", None)
     if settings_symbol is None:
-        raise OrderExecutionError("signal.symbol missing and settings.symbol missing (STRICT)")
-    return _normalize_symbol_strict(settings_symbol)
+        raise OrderExecutionError("settings.symbol missing (STRICT)")
+    normalized_settings_symbol = _normalize_symbol_strict(settings_symbol)
+    if symbol != normalized_settings_symbol:
+        raise OrderExecutionError(
+            f"signal.symbol mismatch vs settings.symbol "
+            f"(signal={symbol}, settings={normalized_settings_symbol}) (STRICT)"
+        )
+    return symbol
 
 
-def _extract_action_if_present_or_raise(
+def _extract_action_required_or_raise(
     *,
     search_spaces: tuple[tuple[str, Mapping[str, Any]], ...],
-) -> None:
-    action = _extract_normalized_value_strict(
+) -> str:
+    return _extract_normalized_value_strict(
         search_spaces=search_spaces,
         field_name="action",
         aliases=("action",),
         normalizer=_normalize_action_strict,
-        required=False,
+        required=True,
     )
-    if action is None:
-        return
-
-    if action != "ENTER":
-        raise OrderExecutionError(
-            f"ExecutionEngine only accepts ENTER action (STRICT): got={action!r}"
-        )
 
 
 def _compute_qty_from_risk_strict(
@@ -522,9 +516,9 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
     meta_map = _meta_to_mapping_strict(signal_map)
     search_spaces = (("signal", signal_map), ("signal.meta", meta_map))
 
-    _extract_action_if_present_or_raise(search_spaces=search_spaces)
+    _extract_action_required_or_raise(search_spaces=search_spaces)
 
-    symbol = _extract_symbol_with_settings_scope_strict(
+    symbol = _extract_symbol_strict(
         search_spaces=search_spaces,
         settings=settings,
     )
@@ -549,7 +543,7 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
         search_spaces=search_spaces,
         field_name="tp_pct",
         aliases=("tp_pct", "take_profit_pct", "target_pct"),
-        normalizer=lambda v: _normalize_nonnegative_float_strict(v, field_name="tp_pct"),
+        normalizer=lambda v: _normalize_ratio_float_strict(v, field_name="tp_pct"),
         required=True,
     )
 
@@ -557,14 +551,14 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
         search_spaces=search_spaces,
         field_name="sl_pct",
         aliases=("sl_pct", "stop_loss_pct", "stop_pct"),
-        normalizer=lambda v: _normalize_nonnegative_float_strict(v, field_name="sl_pct"),
+        normalizer=lambda v: _normalize_ratio_float_strict(v, field_name="sl_pct"),
         required=True,
     )
 
     source = _extract_normalized_value_strict(
         search_spaces=search_spaces,
         field_name="source",
-        aliases=("source", "regime", "signal_source", "strategy_source", "entry_source", "strategy_type", "reason"),
+        aliases=("source", "signal_source", "strategy_source", "entry_source", "strategy_type"),
         normalizer=_normalize_source_strict,
         required=True,
     )
