@@ -64,7 +64,7 @@ from infra.telelog import log
 SET = load_settings()
 SYMBOL: str = getattr(SET, "symbol", "BTC-USDT")
 ANALYSIS_TF: str = getattr(SET, "analysis_timeframe", "5m")
-ANALYSIS_CANDLE_COUNT: int = getattr(SET, "analysis_candle_count", 120)
+ANALYSIS_CANDLE_COUNT: int = getattr(SET, "analysis_candle_count", 300)
 
 
 # ─────────────────────────────────────────────
