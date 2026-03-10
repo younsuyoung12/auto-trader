@@ -28,16 +28,19 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 - 2026-03-11:
-  1) FIX(ROOT-CAUSE): orderbook DB/storage ts 를 local receive time 이 아닌 exchange event time(E/T)으로 교정
-  2) FIX(TRADE-GRADE): orderbook 는 event ts / recv ts 를 분리해 DB 정합성과 health 관측성을 동시에 유지
-  3) FIX(ROOT-CAUSE): WS kline / orderbook DB persistence path 추가
-  4) FIX(ROOT-CAUSE): kline close flag(k.x) 를 DB is_closed 계약까지 end-to-end 전달
-  5) FIX(TRADE-GRADE): DB 저장 실패를 fatal message handling error 로 승격, WS 세션 종료/재연결
-  6) FIX(ROOT-CAUSE): kline buffer contract now preserves is_closed state end-to-end
-  7) FIX(ROOT-CAUSE): WS open candle updates are stored instead of being discarded until close
-  8) FIX(STRICT): REST bootstrap derives current-candle closed state from explicit close_time only
-  9) ADD(API): get_klines_with_volume_and_closed() for downstream persistence path
-  10) FIX(CONTRACT): legacy public getters keep 5/6-tuple compatibility while internal buffer uses 7-tuple
+  1) FIX(ROOT-CAUSE): Binance multiplex WS 에서 pong callback 부재를 transport failure 로 오판하던 문제 제거
+  2) FIX(TRADE-GRADE): WS transport health 는 connection_open 기준으로만 판단하고 market-data activity 는 별도 warning 으로 유지
+  3) FIX(OBSERVABILITY): pong 시각은 참고용 메타데이터로만 보존하고 SAFE_STOP 근거에서 제외
+  4) FIX(ROOT-CAUSE): orderbook DB/storage ts 를 local receive time 이 아닌 exchange event time(E/T)으로 교정
+  5) FIX(TRADE-GRADE): orderbook 는 event ts / recv ts 를 분리해 DB 정합성과 health 관측성을 동시에 유지
+  6) FIX(ROOT-CAUSE): WS kline / orderbook DB persistence path 추가
+  7) FIX(ROOT-CAUSE): kline close flag(k.x) 를 DB is_closed 계약까지 end-to-end 전달
+  8) FIX(TRADE-GRADE): DB 저장 실패를 fatal message handling error 로 승격, WS 세션 종료/재연결
+  9) FIX(ROOT-CAUSE): kline buffer contract now preserves is_closed state end-to-end
+  10) FIX(ROOT-CAUSE): WS open candle updates are stored instead of being discarded until close
+  11) FIX(STRICT): REST bootstrap derives current-candle closed state from explicit close_time only
+  12) ADD(API): get_klines_with_volume_and_closed() for downstream persistence path
+  13) FIX(CONTRACT): legacy public getters keep 5/6-tuple compatibility while internal buffer uses 7-tuple
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): ws_status.ok 를 transport 상태만 의미하도록 정리
   2) FIX(ROOT-CAUSE): orderbook health 에서 feed inactivity warning 과 payload fail 분리
@@ -412,6 +415,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
 
     ok:
     - transport 상태만 의미한다.
+    - Binance multiplex WS 에서는 pong callback 부재를 transport failure 로 간주하지 않는다.
     - market_feed inactivity는 warning 으로 분리한다.
     """
     sym = _normalize_symbol(symbol)
@@ -436,24 +440,26 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
 
     transport_reasons: List[str] = []
     market_feed_reasons: List[str] = []
+    transport_observations: List[str] = []
 
     if not connection_open:
         transport_reasons.append("connection_not_open")
 
     if connection_open:
-        if last_pong_ts is None:
-            if last_open_ts is None:
-                transport_reasons.append("no_open_ts")
-            else:
-                open_age_sec = max(0, now_ms - int(last_open_ts)) / 1000.0
-                if open_age_sec > PONG_STARTUP_GRACE_SEC:
-                    transport_reasons.append(
-                        f"no_pong_after_open>{PONG_STARTUP_GRACE_SEC} (got={open_age_sec:.1f})"
-                    )
+        if last_open_ts is None:
+            transport_reasons.append("no_open_ts")
+        elif last_pong_ts is None:
+            open_age_sec = max(0, now_ms - int(last_open_ts)) / 1000.0
+            if open_age_sec > PONG_STARTUP_GRACE_SEC:
+                transport_observations.append(
+                    f"pong_not_observed_after_open>{PONG_STARTUP_GRACE_SEC} (got={open_age_sec:.1f})"
+                )
         else:
             pong_delay_sec = pong_delay_ms / 1000.0
             if pong_delay_sec > PONG_MAX_DELAY_SEC:
-                transport_reasons.append(f"pong_delay_sec>{PONG_MAX_DELAY_SEC} (got={pong_delay_sec:.1f})")
+                transport_observations.append(
+                    f"pong_delay_sec>{PONG_MAX_DELAY_SEC} (got={pong_delay_sec:.1f})"
+                )
 
     if last_message_ts is None:
         market_feed_reasons.append("no_market_event")
@@ -466,6 +472,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
 
     transport_reason_items = [f"transport:{r}" for r in transport_reasons]
     warning_items = [f"market_feed:{r}" for r in market_feed_reasons]
+    observation_items = [f"transport_observation:{r}" for r in transport_observations]
 
     return {
         "symbol": sym,
@@ -485,6 +492,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
         "warnings": warning_items,
         "transport_reasons": transport_reason_items,
         "market_feed_reasons": warning_items,
+        "transport_observations": observation_items,
     }
 
 
@@ -1486,7 +1494,10 @@ def start_ws_loop(symbol: str) -> None:
                 )
 
                 start_ts = time.time()
-                ws.run_forever(ping_interval=25, ping_timeout=10)
+                ws.run_forever(
+                    ping_interval=25,
+                    ping_timeout=10,
+                )
                 session_dur = time.time() - start_ts
 
                 with _ws_state_lock:
