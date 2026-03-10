@@ -9,6 +9,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - /api/engine/health, /api/engine/status에 runtime 상태 추가
 - DB orderbook snapshot 기준 SERVER_LIVE / SERVER_STOP 판정 추가
 - /api/engine/ws-status에도 runtime 상태 포함
+- 2026-03-11 FIX(ROOT-CAUSE): 대시보드 health는 DB 최신 orderbook snapshot freshness를 기준으로
+  ws_orderbook_stale watchdog warning을 정규화한다
+- 2026-03-11 ADD(OBSERVABILITY): runtime이 fresh / delayed / stale를 구분하고
+  delayed는 SERVER_LIVE + warning 플래그로 표현한다
 
 코드 정리 내용
 - 엔진 runtime 판정 로직 공통 함수로 정리
@@ -55,6 +59,13 @@ STRICT · NO-FALLBACK
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-11
+  1) FIX(ROOT-CAUSE): dashboard health는 DB 최신 orderbook snapshot freshness를 기준 진실원천으로 사용
+  2) FIX(ROOT-CAUSE): ws_orderbook_stale watchdog reason은 DB snapshot이 fresh/delayed면 ENGINE_WARNING으로 올리지 않음
+  3) ADD(OBSERVABILITY): runtime에 is_warning / warning_reason / freshness_state 추가
+  4) FIX(CONTRACT): runtime delayed는 SERVER_STOP이 아니라 SERVER_LIVE로 유지
+  5) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
+
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): /api/engine/health, /api/engine/status에 runtime 상태 추가
   2) FIX(STRICT): DB orderbook snapshot 기준 SERVER_LIVE / SERVER_STOP 판정 추가
@@ -134,7 +145,22 @@ logger = logging.getLogger(__name__)
 _ENGINE_RUNTIME_STATUS_SERVER_LIVE = "SERVER_LIVE"
 _ENGINE_RUNTIME_STATUS_SERVER_STOP = "SERVER_STOP"
 _ENGINE_RUNTIME_SOURCE_DATABASE = "database_orderbook_snapshot"
+
+# DB snapshot freshness 기준
+# - 5초 이내: fresh
+# - 5초 초과 ~ 120초 이하: delayed (서버는 살아있음, 경고만)
+# - 120초 초과: stale (실질적으로 중지/장애)
+_ENGINE_RUNTIME_DELAYED_THRESHOLD_MS = 5_000
 _ENGINE_RUNTIME_STALE_THRESHOLD_MS = 120_000
+
+_ENGINE_RUNTIME_FRESHNESS_FRESH = "fresh"
+_ENGINE_RUNTIME_FRESHNESS_DELAYED = "delayed"
+_ENGINE_RUNTIME_FRESHNESS_STALE = "stale"
+
+# watchdog reason 중 dashboard에서 DB 최신 snapshot으로 정규화 가능한 항목
+_DASHBOARD_DB_TRUTH_OVERRIDE_WATCHDOG_REASONS = {
+    "ws_orderbook_stale",
+}
 
 # =====================================================
 # FastAPI App
@@ -200,6 +226,12 @@ def _require_dict(value: Any, name: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
     return dict(value)
+
+
+def _require_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT)")
+    return value
 
 
 def _normalize_symbol(symbol: Any) -> str:
@@ -1153,32 +1185,45 @@ def _fetch_latest_orderbook_snapshot_strict(
     }
 
 
-
-
 def _build_engine_runtime_status(
     *,
     orderbook: Optional[Dict[str, Any]],
     now_ms: int,
+    delayed_threshold_ms: int = _ENGINE_RUNTIME_DELAYED_THRESHOLD_MS,
     stale_threshold_ms: int = _ENGINE_RUNTIME_STALE_THRESHOLD_MS,
 ) -> Dict[str, Any]:
     normalized_now_ms = _require_positive_int(now_ms, "now_ms")
-    normalized_threshold_ms = _require_positive_int(stale_threshold_ms, "stale_threshold_ms")
+    normalized_delayed_threshold_ms = _require_positive_int(
+        delayed_threshold_ms,
+        "delayed_threshold_ms",
+    )
+    normalized_stale_threshold_ms = _require_positive_int(
+        stale_threshold_ms,
+        "stale_threshold_ms",
+    )
+
+    if normalized_delayed_threshold_ms >= normalized_stale_threshold_ms:
+        raise RuntimeError("delayed_threshold_ms must be < stale_threshold_ms (STRICT)")
 
     if orderbook is None:
         return {
             "status": _ENGINE_RUNTIME_STATUS_SERVER_STOP,
             "reason": "orderbook_snapshot_not_found",
             "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
-            "threshold_ms": normalized_threshold_ms,
+            "freshness_state": _ENGINE_RUNTIME_FRESHNESS_STALE,
+            "delayed_threshold_ms": normalized_delayed_threshold_ms,
+            "threshold_ms": normalized_stale_threshold_ms,
             "snapshot_ts_ms": None,
             "stale_ms": None,
+            "is_warning": False,
+            "warning_reason": None,
         }
 
     normalized_orderbook = _require_dict(orderbook, "orderbook")
     orderbook_ok_raw = normalized_orderbook.get("ok")
-    if not isinstance(orderbook_ok_raw, bool):
-        raise RuntimeError("orderbook.ok must be bool (STRICT)")
-    if not orderbook_ok_raw:
+    orderbook_ok = _require_bool(orderbook_ok_raw, "orderbook.ok")
+
+    if not orderbook_ok:
         error_reason = normalized_orderbook.get("error")
         if error_reason is None:
             raise RuntimeError("orderbook.error is required when orderbook.ok is false (STRICT)")
@@ -1187,9 +1232,13 @@ def _build_engine_runtime_status(
             "status": _ENGINE_RUNTIME_STATUS_SERVER_STOP,
             "reason": normalized_error_reason,
             "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
-            "threshold_ms": normalized_threshold_ms,
+            "freshness_state": _ENGINE_RUNTIME_FRESHNESS_STALE,
+            "delayed_threshold_ms": normalized_delayed_threshold_ms,
+            "threshold_ms": normalized_stale_threshold_ms,
             "snapshot_ts_ms": None,
             "stale_ms": None,
+            "is_warning": False,
+            "warning_reason": None,
         }
 
     snapshot_ts_ms = _require_positive_int(normalized_orderbook.get("ts"), "orderbook.ts")
@@ -1197,24 +1246,81 @@ def _build_engine_runtime_status(
     if stale_ms < 0:
         raise RuntimeError("orderbook stale_ms must be >= 0 (STRICT)")
 
-    if stale_ms > normalized_threshold_ms:
+    if stale_ms > normalized_stale_threshold_ms:
         return {
             "status": _ENGINE_RUNTIME_STATUS_SERVER_STOP,
             "reason": "orderbook_snapshot_stale",
             "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
-            "threshold_ms": normalized_threshold_ms,
+            "freshness_state": _ENGINE_RUNTIME_FRESHNESS_STALE,
+            "delayed_threshold_ms": normalized_delayed_threshold_ms,
+            "threshold_ms": normalized_stale_threshold_ms,
             "snapshot_ts_ms": snapshot_ts_ms,
             "stale_ms": stale_ms,
+            "is_warning": False,
+            "warning_reason": None,
+        }
+
+    if stale_ms > normalized_delayed_threshold_ms:
+        return {
+            "status": _ENGINE_RUNTIME_STATUS_SERVER_LIVE,
+            "reason": "orderbook_snapshot_delayed",
+            "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
+            "freshness_state": _ENGINE_RUNTIME_FRESHNESS_DELAYED,
+            "delayed_threshold_ms": normalized_delayed_threshold_ms,
+            "threshold_ms": normalized_stale_threshold_ms,
+            "snapshot_ts_ms": snapshot_ts_ms,
+            "stale_ms": stale_ms,
+            "is_warning": True,
+            "warning_reason": "orderbook_snapshot_delayed",
         }
 
     return {
         "status": _ENGINE_RUNTIME_STATUS_SERVER_LIVE,
         "reason": "orderbook_snapshot_fresh",
         "source": _ENGINE_RUNTIME_SOURCE_DATABASE,
-        "threshold_ms": normalized_threshold_ms,
+        "freshness_state": _ENGINE_RUNTIME_FRESHNESS_FRESH,
+        "delayed_threshold_ms": normalized_delayed_threshold_ms,
+        "threshold_ms": normalized_stale_threshold_ms,
         "snapshot_ts_ms": snapshot_ts_ms,
         "stale_ms": stale_ms,
+        "is_warning": False,
+        "warning_reason": None,
     }
+
+
+def _normalize_watchdog_reason_for_dashboard(
+    *,
+    latest_watchdog_reason: str,
+    runtime: Dict[str, Any],
+) -> Tuple[str, Optional[str]]:
+    normalized_watchdog_reason = _require_nonempty_str(
+        latest_watchdog_reason,
+        "latest_watchdog_reason",
+    )
+    normalized_runtime = _require_dict(runtime, "runtime")
+    runtime_status = _require_nonempty_str(normalized_runtime.get("status"), "runtime.status")
+    runtime_reason = _require_nonempty_str(normalized_runtime.get("reason"), "runtime.reason")
+    freshness_state = _require_nonempty_str(normalized_runtime.get("freshness_state"), "runtime.freshness_state")
+
+    if normalized_watchdog_reason not in _DASHBOARD_DB_TRUTH_OVERRIDE_WATCHDOG_REASONS:
+        return normalized_watchdog_reason, None
+
+    if runtime_status != _ENGINE_RUNTIME_STATUS_SERVER_LIVE:
+        return normalized_watchdog_reason, None
+
+    if freshness_state not in {
+        _ENGINE_RUNTIME_FRESHNESS_FRESH,
+        _ENGINE_RUNTIME_FRESHNESS_DELAYED,
+    }:
+        return normalized_watchdog_reason, None
+
+    if runtime_reason not in {
+        "orderbook_snapshot_fresh",
+        "orderbook_snapshot_delayed",
+    }:
+        return normalized_watchdog_reason, None
+
+    return "ok", normalized_watchdog_reason
 
 
 def _ws_status(
@@ -1226,6 +1332,7 @@ def _ws_status(
 ) -> Dict[str, Any]:
     normalized_symbol = _normalize_symbol(symbol)
     normalized_min_buf = _require_positive_int(min_buf, "min_buf", max_value=100000)
+    now_ms = _now_ms()
 
     out: Dict[str, Any] = {
         "available": True,
@@ -1253,6 +1360,9 @@ def _ws_status(
     if latest_orderbook is None:
         out["orderbook"] = {"ok": False, "error": "not_found"}
     else:
+        stale_ms = now_ms - int(latest_orderbook["ts"])
+        if stale_ms < 0:
+            raise RuntimeError("orderbook stale_ms must be >= 0 (STRICT)")
         out["orderbook"] = {
             "ok": bool(latest_orderbook["has_bids"]) and bool(latest_orderbook["has_asks"]),
             "bestBid": latest_orderbook["bestBid"],
@@ -1260,11 +1370,12 @@ def _ws_status(
             "ts": latest_orderbook["ts"],
             "bids_len": latest_orderbook["bids_len"],
             "asks_len": latest_orderbook["asks_len"],
+            "stale_ms": stale_ms,
         }
 
     out["runtime"] = _build_engine_runtime_status(
         orderbook=out["orderbook"],
-        now_ms=_now_ms(),
+        now_ms=now_ms,
     )
     return out
 
@@ -1300,14 +1411,7 @@ def api_engine_health(
     recent_skips = _count_recent_events_strict(db, minutes=10, event_type="SKIP")
     latest_watchdog = get_latest_watchdog_snapshot(db, include_test=False)
     latest_watchdog = _require_dict(latest_watchdog, "latest_watchdog")
-    watchdog_reason = _require_nonempty_str(latest_watchdog.get("reason"), "latest_watchdog.reason")
-
-    status, reasons = _engine_status_from_signals(
-        db_latency_ms=db_ms,
-        recent_errors=recent_errors,
-        recent_skips=recent_skips,
-        latest_watchdog_reason=watchdog_reason,
-    )
+    watchdog_reason_raw = _require_nonempty_str(latest_watchdog.get("reason"), "latest_watchdog.reason")
 
     ws_status = _ws_status(
         db,
@@ -1316,6 +1420,18 @@ def api_engine_health(
         tfs=["1m", "5m", "15m", "1h", "4h"],
     )
     runtime = _require_dict(ws_status.get("runtime"), "ws_status.runtime")
+
+    watchdog_reason_effective, watchdog_reason_overridden = _normalize_watchdog_reason_for_dashboard(
+        latest_watchdog_reason=watchdog_reason_raw,
+        runtime=runtime,
+    )
+
+    status, reasons = _engine_status_from_signals(
+        db_latency_ms=db_ms,
+        recent_errors=recent_errors,
+        recent_skips=recent_skips,
+        latest_watchdog_reason=watchdog_reason_effective,
+    )
 
     return {
         "status": status,
@@ -1326,6 +1442,9 @@ def api_engine_health(
         "recent_errors": int(recent_errors),
         "recent_skips": int(recent_skips),
         "latest_watchdog": latest_watchdog,
+        "watchdog_reason_raw": watchdog_reason_raw,
+        "watchdog_reason_effective": watchdog_reason_effective,
+        "watchdog_reason_overridden": watchdog_reason_overridden,
         "ws_status": ws_status,
         "ts_ms": now_ms,
     }
