@@ -1486,7 +1486,7 @@ def start_ws_loop(symbol: str) -> None:
                 )
 
                 start_ts = time.time()
-                ws.run_forever(ping_interval=3, ping_timeout=2)
+                ws.run_forever(ping_interval=25, ping_timeout=10)
                 session_dur = time.time() - start_ts
 
                 with _ws_state_lock:
