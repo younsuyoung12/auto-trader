@@ -5,13 +5,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ============================================================
 
 핵심 변경 요약
-- FIX(ROOT-CAUSE): 5m confirmed momentum misaligned 를 엔진 종료 예외가 아닌 명시적 SKIP 사유로 전환
+- FIX(ROOT-CAUSE): entry_pipeline 단계 SKIP 사유를 bt_events 에 구조적으로 기록하도록 추가
 - KEEP(STRICT): 잘못된 방향 상태 / slope 누락 / signal contract 위반은 즉시 예외 유지
-- CLEANUP: 방향 상태 검증 로직 공통화, 상단 변경 이력 최근 2일 기준으로 정리
+- CLEANUP: bt_events 감사 로그 payload 정규화 helper 추가, 상단 변경 이력 최근 2일 기준으로 정리
 
 역할
 - run_bot_ws 엔진의 진입 후보 생성 전용 파이프라인을 분리한다.
 - WS 오더북/캔들 준비상태 검증, unified_features 적재, entry candidate 생성만 담당한다.
+- 진입 차단(SKIP) 사유를 bt_events 에 감사 로그로 기록한다.
 - 주문 실행 / SAFE_STOP / 텔레그램 전송 자체는 담당하지 않는다.
 
 설계 원칙
@@ -19,10 +20,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - WS 버퍼 데이터만 사용한다.
 - None→0, 조용한 continue, 임의 보정 금지.
 - 필수 데이터 누락/손상 시 즉시 예외 또는 명시적 SKIP 처리.
+- bt_events 감사 로그 기록 실패는 조용히 무시하지 않고 즉시 예외 전파한다.
 - 기존 run_bot_ws.py 의 로직을 분리만 하고 의미를 바꾸지 않는다.
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): entry_pipeline 단계 SKIP 사유(bt_events) 누락 수정
+     - WS_NOT_READY / FEATURE_BUILD_FAIL / STRUCTURE_FILTER / DIRECTION_STABILITY 를 bt_events 로 기록
+     - 대시보드의 '진입 왜 안 됐는지' 통계 공백 원인 제거
+  2) ADD(AUDIT): bt_events 감사 로그 payload 정규화 helper 추가
+     - JSON 직렬화 가능한 값만 허용
+     - 비정상/non-finite 값은 즉시 예외 처리
+  3) KEEP(STRICT): 감사 로그 실패 시 조용한 continue 금지
+
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): 5m confirmed momentum misaligned 를 RuntimeError 가 아닌 명시적 SKIP 사유로 전환
      - 전략 조건 불일치(NEUTRAL / 반대 방향)는 엔진 종료가 아니라 진입 차단으로 처리
@@ -58,6 +69,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence
 
+from events.signals_logger import log_signal
 from infra.data_integrity_guard import (
     DataIntegrityError,
     validate_entry_market_data_bundle_strict,
@@ -147,6 +159,61 @@ def _require_nonempty_str(v: Any, name: str) -> str:
     if not s:
         raise RuntimeError(f"{name} must be non-empty string (STRICT)")
     return s
+
+
+def _to_jsonable_strict(v: Any, name: str) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        if not math.isfinite(v):
+            raise RuntimeError(f"{name} must be finite for JSON payload")
+        return float(v)
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_to_jsonable_strict(item, f"{name}[]") for item in v]
+    if isinstance(v, dict):
+        out: Dict[str, Any] = {}
+        for k, item in v.items():
+            key = _require_nonempty_str(k, f"{name}.key")
+            out[key] = _to_jsonable_strict(item, f"{name}.{key}")
+        return out
+    raise RuntimeError(f"{name} must be JSON-serializable (STRICT), got={type(v).__name__}")
+
+
+def _emit_skip_event_strict(
+    *,
+    symbol: str,
+    strategy_type: str,
+    direction: str,
+    reason: str,
+    candle_ts: int,
+    extra_json: Optional[Dict[str, Any]] = None,
+) -> None:
+    symbol_s = _require_nonempty_str(symbol, "skip_event.symbol")
+    strategy_type_s = _require_nonempty_str(strategy_type, "skip_event.strategy_type")
+    direction_s = _require_nonempty_str(direction, "skip_event.direction").upper()
+    if direction_s not in ("LONG", "SHORT"):
+        raise RuntimeError(f"skip_event.direction invalid (STRICT): {direction_s!r}")
+    reason_s = _require_nonempty_str(reason, "skip_event.reason")
+    candle_ts_i = _require_int_ms(candle_ts, "skip_event.candle_ts")
+    payload = _to_jsonable_strict(extra_json or {}, "skip_event.extra_json")
+    if not isinstance(payload, dict):
+        raise RuntimeError("skip_event.extra_json must serialize to dict (STRICT)")
+
+    log_signal(
+        event="SKIP",
+        symbol=symbol_s,
+        strategy_type=strategy_type_s,
+        direction=direction_s,
+        reason=reason_s,
+        candle_ts=candle_ts_i,
+        extra_json=payload,
+    )
 
 
 def _normalize_price_location_strict(v: Any) -> str:
@@ -1035,6 +1102,19 @@ def _build_entry_market_data(
     if prereq_reason:
         msg = f"[SKIP][WS_NOT_READY] entry blocked: {symbol} ({prereq_reason})"
         log_fn(msg)
+        _emit_skip_event_strict(
+            symbol=symbol,
+            strategy_type=signal_source_s,
+            direction=direction,
+            reason="ws_not_ready",
+            candle_ts=ts_ms,
+            extra_json={
+                "stage": "WS_NOT_READY",
+                "signal_ts_ms": int(ts_ms),
+                "signal_source": signal_source_s,
+                "block_reason": prereq_reason,
+            },
+        )
         notify_entry_block_fn(f"WS_NOT_READY:{symbol}:{prereq_reason}", msg, 60)
         return None
 
@@ -1088,6 +1168,20 @@ def _build_entry_market_data(
     except (UnifiedFeaturesError, FeatureBuildError) as e:
         msg = f"[SKIP][FEATURE_BUILD_FAIL] entry blocked: {symbol} ({e})"
         log_fn(msg)
+        _emit_skip_event_strict(
+            symbol=symbol,
+            strategy_type=signal_source_s,
+            direction=direction,
+            reason="feature_build_fail",
+            candle_ts=ts_ms,
+            extra_json={
+                "stage": "FEATURE_BUILD_FAIL",
+                "signal_ts_ms": int(ts_ms),
+                "signal_source": signal_source_s,
+                "error_type": type(e).__name__,
+                "error": str(e),
+            },
+        )
         notify_entry_block_fn(f"FEATURE_BUILD_FAIL:{symbol}:{type(e).__name__}", msg, 60)
         return None
 
@@ -1174,6 +1268,29 @@ def _build_entry_market_data(
     if structural_block_reason is not None:
         msg = f"[SKIP][STRUCTURE_FILTER] entry blocked: {symbol} ({direction}) reason={structural_block_reason}"
         log_fn(msg)
+        _emit_skip_event_strict(
+            symbol=symbol,
+            strategy_type=signal_source_s,
+            direction=direction,
+            reason=structural_block_reason,
+            candle_ts=ts_ms,
+            extra_json={
+                "stage": "STRUCTURE_FILTER",
+                "signal_ts_ms": int(ts_ms),
+                "signal_source": signal_source_s,
+                "entry_score": float(out["entry_score"]),
+                "trend_strength": float(out["trend_strength"]),
+                "spread": float(out["spread"]),
+                "orderbook_imbalance": float(out["orderbook_imbalance"]),
+                "price_location": str(out["price_location"]),
+                "delta_ratio_pct": float(out["delta_ratio_pct"]),
+                "aggression_bias": str(out["aggression_bias"]),
+                "divergence": str(out["divergence"]),
+                "put_call_oi_ratio": float(out["put_call_oi_ratio"]),
+                "put_call_volume_ratio": float(out["put_call_volume_ratio"]),
+                "options_bias": str(out["options_bias"]),
+            },
+        )
         notify_entry_block_fn(f"STRUCTURE_FILTER:{symbol}:{structural_block_reason}", msg, 60)
         return None
 
@@ -1222,6 +1339,35 @@ def _build_entry_market_data(
             f"higher_tf_support={higher_tf_support_count} higher_tf_oppose={higher_tf_oppose_count}"
         )
         log_fn(msg)
+        _emit_skip_event_strict(
+            symbol=symbol,
+            strategy_type=signal_source_s,
+            direction=direction,
+            reason=direction_stability_guard_reason,
+            candle_ts=ts_ms,
+            extra_json={
+                "stage": "DIRECTION_STABILITY",
+                "signal_ts_ms": int(ts_ms),
+                "signal_source": signal_source_s,
+                "tf_states": direction_tf_states,
+                "tf_slopes_pct": direction_tf_slopes_pct,
+                "orderflow_state": direction_orderflow_state,
+                "options_state": direction_options_state,
+                "secondary_support_count": int(secondary_support_count),
+                "secondary_oppose_count": int(secondary_oppose_count),
+                "higher_tf_support_count": int(higher_tf_support_count),
+                "higher_tf_oppose_count": int(higher_tf_oppose_count),
+                "signal_direction_source": signal_direction_contract.get("direction_source"),
+                "signal_high_tf_bias_4h": signal_direction_contract.get("high_tf_bias_4h"),
+                "signal_high_tf_bias_1h": signal_direction_contract.get("high_tf_bias_1h"),
+                "signal_high_tf_bias_15m": signal_direction_contract.get("high_tf_bias_15m"),
+                "signal_bias_5m": signal_direction_contract.get("bias_5m"),
+                "entry_score": float(out["entry_score"]),
+                "trend_strength": float(out["trend_strength"]),
+                "spread": float(out["spread"]),
+                "orderbook_imbalance": float(out["orderbook_imbalance"]),
+            },
+        )
         notify_entry_block_fn(f"DIRECTION_STABILITY:{symbol}:{direction_stability_guard_reason}", msg, 60)
         return None
 

@@ -6,12 +6,14 @@ ROLE:
 - Trades / EntryScore / Events / Decision / Error / Position / Performance / System 분석 API 제공
 - Engine Watchdog / Runtime Health / Dashboard WebSocket 엔드포인트 제공
 - 초기 무데이터 상태(INIT)와 실제 장애를 구분해 UI에 전달
+- 고비용 AI 분석 API에 대한 provider block / route cooldown / in-flight guard를 적용한다
 
 CORE RESPONSIBILITIES:
 - 대시보드용 조회/집계 API 제공
 - 엔진 runtime 상태를 DB orderbook snapshot freshness 기준으로 판정
 - WATCHDOG/DECISION/PERFORMANCE INIT 상태를 대시보드 계약으로 정규화
 - 캐시/웹소켓/분석 API를 일관된 구조로 제공
+- 외부 AI/시장데이터 provider quota 초과 시 재호출 폭주를 차단한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -21,16 +23,22 @@ IMPORTANT POLICY:
 - 조용한 continue / 자동 보정 금지
 - runtime/INIT/경고 상태를 명시적으로 분리한다
 - WATCHDOG INIT는 엔진 장애로 취급하지 않는다
+- AI 분석 API는 exact cache hit 우선, cache miss 시 route cooldown / provider block / in-flight guard를 적용한다
+- provider quota 초과 상태는 route 단위가 아니라 provider scope 단위로 차단한다
 
 CHANGE HISTORY:
 - 2026-03-11
-  1) FIX(ROOT-CAUSE): dashboard health는 DB 최신 orderbook snapshot freshness를 기준 진실원천으로 사용
-  2) FIX(ROOT-CAUSE): ws_orderbook_stale watchdog reason은 DB snapshot이 fresh/delayed면 ENGINE_WARNING으로 올리지 않음
-  3) ADD(OBSERVABILITY): runtime에 is_warning / warning_reason / freshness_state 추가
-  4) FIX(CONTRACT): runtime delayed는 SERVER_STOP이 아니라 SERVER_LIVE로 유지
-  5) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
-  6) FIX(ROOT-CAUSE): WATCHDOG INIT 상태는 engine health에서 경고/치명 사유로 취급하지 않음
-  7) FIX(STRICT): recent trades enrich 경로의 None -> 0.0 보정 제거
+  1) FIX(ROOT-CAUSE): AI 분석 API에 provider block / route cooldown / in-flight guard 추가
+  2) FIX(ROOT-CAUSE): 외부 provider quota 초과 시 동일 provider scope 재호출 폭주 차단
+  3) FIX(STRICT): _raise_ai_provider_http_exception 의 잘못된 bare raise 제거
+  4) FIX(OBSERVABILITY): AI route reject 사유를 HTTP detail / structured log 로 명시
+  5) FIX(ROOT-CAUSE): dashboard health는 DB 최신 orderbook snapshot freshness를 기준 진실원천으로 사용
+  6) FIX(ROOT-CAUSE): ws_orderbook_stale watchdog reason은 DB snapshot이 fresh/delayed면 ENGINE_WARNING으로 올리지 않음
+  7) ADD(OBSERVABILITY): runtime에 is_warning / warning_reason / freshness_state 추가
+  8) FIX(CONTRACT): runtime delayed는 SERVER_STOP이 아니라 SERVER_LIVE로 유지
+  9) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
+  10) FIX(ROOT-CAUSE): WATCHDOG INIT 상태는 engine health에서 경고/치명 사유로 취급하지 않음
+  11) FIX(STRICT): recent trades enrich 경로의 None -> 0.0 보정 제거
 ========================================================
 """
 
@@ -39,8 +47,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket
@@ -118,6 +128,33 @@ _WATCHDOG_STATUS_INIT = "INIT"
 _DASHBOARD_DB_TRUTH_OVERRIDE_WATCHDOG_REASONS = {
     "ws_orderbook_stale",
 }
+
+# =====================================================
+# AI analysis guard constants
+# =====================================================
+
+_AI_PROVIDER_SCOPE_EXTERNAL_MARKET = "external_market_provider"
+_AI_PROVIDER_SCOPE_OPENAI_ANALYSIS = "openai_analysis_provider"
+
+_AI_ROUTE_SCOPE_MARKET_ANALYSIS = "market_analysis_external"
+_AI_ROUTE_SCOPE_QUANT_ANALYSIS_EXTERNAL = "quant_analysis_external"
+_AI_ROUTE_SCOPE_QUANT_ANALYSIS_INTERNAL = "quant_analysis_internal"
+
+# exact cache hit 전에는 이 간격보다 빠른 cache miss 재호출을 막는다.
+# - external provider 사용 경로는 더 보수적으로 제한
+# - internal-only quant path 는 상대적으로 짧게 유지
+_AI_ROUTE_COOLDOWN_MS_MARKET_ANALYSIS = 30_000
+_AI_ROUTE_COOLDOWN_MS_QUANT_ANALYSIS_EXTERNAL = 30_000
+_AI_ROUTE_COOLDOWN_MS_QUANT_ANALYSIS_INTERNAL = 10_000
+
+_AI_ANALYSIS_INFLIGHT_RETRY_AFTER_SEC = 2
+
+_AI_GUARD_PREFIX = "ai-guard"
+_AI_GUARD_PROVIDER_BLOCK = "provider-block"
+_AI_GUARD_ROUTE_COOLDOWN = "route-cooldown"
+
+_AI_INFLIGHT_LOCK = Lock()
+_AI_INFLIGHT_KEYS: set[str] = set()
 
 # =====================================================
 # FastAPI App
@@ -356,6 +393,14 @@ def _is_alpha_vantage_daily_quota_error(message: str) -> bool:
     return any(marker in text_norm for marker in quota_markers)
 
 
+def _extract_retry_after_sec_from_message(message: str) -> Optional[int]:
+    text = _require_nonempty_str(message, "message")
+    match = re.search(r"retry_after_sec\s*[:=]\s*(\d+)", text, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    return _require_positive_int(match.group(1), "retry_after_sec")
+
+
 def _seconds_until_next_utc_reset() -> int:
     now_utc = datetime.now(timezone.utc)
     next_reset = (now_utc + timedelta(days=1)).replace(
@@ -370,34 +415,437 @@ def _seconds_until_next_utc_reset() -> int:
     return seconds
 
 
+def _build_provider_quota_detail(
+    *,
+    route_name: str,
+    provider: str,
+    retry_after_sec: int,
+    reason: str,
+    message: str,
+) -> Dict[str, Any]:
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+    normalized_provider = _require_nonempty_str(provider, "provider")
+    normalized_retry_after_sec = _require_positive_int(retry_after_sec, "retry_after_sec")
+    normalized_reason = _require_nonempty_str(reason, "reason")
+    normalized_message = _require_nonempty_str(message, "message")
+
+    retry_at_utc = (
+        datetime.now(timezone.utc) + timedelta(seconds=normalized_retry_after_sec)
+    ).isoformat().replace("+00:00", "Z")
+
+    return {
+        "status": "unavailable",
+        "route": normalized_route_name,
+        "reason": normalized_reason,
+        "provider": normalized_provider,
+        "message": normalized_message,
+        "retry_after_sec": normalized_retry_after_sec,
+        "retry_at_utc": retry_at_utc,
+    }
+
+
 def _raise_ai_provider_http_exception(exc: Exception, *, route_name: str) -> None:
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
     message = str(exc)
+    text_norm = message.strip().lower()
 
     if _is_alpha_vantage_daily_quota_error(message):
         retry_after_sec = _seconds_until_next_utc_reset()
-        retry_at_utc = (
-            datetime.now(timezone.utc) + timedelta(seconds=retry_after_sec)
-        ).isoformat().replace("+00:00", "Z")
-
-        logger.warning(
-            "AI analysis provider quota exceeded: route=%s retry_after_sec=%s",
-            route_name,
-            retry_after_sec,
+        detail = _build_provider_quota_detail(
+            route_name=normalized_route_name,
+            provider="Alpha Vantage",
+            retry_after_sec=retry_after_sec,
+            reason="external_provider_quota_exceeded",
+            message=(
+                "External market analysis is temporarily unavailable because the external provider "
+                "daily quota has been exceeded."
+            ),
         )
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "status": "unavailable",
-                "route": route_name,
-                "reason": "external_provider_quota_exceeded",
-                "provider": "Alpha Vantage",
-                "message": "External market analysis is temporarily unavailable because the external provider daily quota has been exceeded.",
-                "retry_after_sec": retry_after_sec,
-                "retry_at_utc": retry_at_utc,
-            },
-        ) from exc
+        logger.warning(
+            "AI analysis provider quota exceeded: route=%s provider=%s retry_after_sec=%s",
+            normalized_route_name,
+            detail["provider"],
+            detail["retry_after_sec"],
+        )
+        raise HTTPException(status_code=503, detail=detail) from exc
 
-    raise
+    generic_retry_after_sec = _extract_retry_after_sec_from_message(message) if message.strip() else None
+    if generic_retry_after_sec is not None and (
+        "quota exceeded" in text_norm
+        or "rate limit" in text_norm
+        or "too many requests" in text_norm
+    ):
+        provider = "OpenAI" if "openai" in text_norm else "Unknown"
+        detail = _build_provider_quota_detail(
+            route_name=normalized_route_name,
+            provider=provider,
+            retry_after_sec=generic_retry_after_sec,
+            reason="analysis_provider_rate_limited",
+            message="AI analysis is temporarily unavailable because the upstream analysis provider is rate limited.",
+        )
+        logger.warning(
+            "AI analysis provider quota exceeded: route=%s provider=%s retry_after_sec=%s",
+            normalized_route_name,
+            detail["provider"],
+            detail["retry_after_sec"],
+        )
+        raise HTTPException(status_code=503, detail=detail) from exc
+
+    raise exc
+
+
+# =====================================================
+# AI guard helpers
+# =====================================================
+
+def _make_ai_guard_cache_key(*parts: str) -> str:
+    if not is_cache_initialized():
+        raise RuntimeError("Redis cache is not initialized (STRICT)")
+    normalized_parts = tuple(_require_nonempty_str(part, "guard_cache_part") for part in parts)
+    return make_cache_key(_AI_GUARD_PREFIX, *normalized_parts)
+
+
+def _get_ai_guard_state_optional(*parts: str) -> Optional[Dict[str, Any]]:
+    key = _make_ai_guard_cache_key(*parts)
+    cached = get_cache_json(key)
+    if cached is None:
+        return None
+    return _require_dict(cached, f"ai_guard_state[{key}]")
+
+
+def _set_ai_guard_state(*, parts: Tuple[str, ...], payload: Dict[str, Any]) -> None:
+    key = _make_ai_guard_cache_key(*parts)
+    normalized_payload = _require_dict(payload, "ai_guard_payload")
+    set_cache_json(key, normalized_payload)
+
+
+def _record_ai_route_started(
+    *,
+    route_scope: str,
+    route_name: str,
+    started_ms: int,
+) -> None:
+    normalized_route_scope = _require_nonempty_str(route_scope, "route_scope")
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+    normalized_started_ms = _require_positive_int(started_ms, "started_ms")
+
+    _set_ai_guard_state(
+        parts=(_AI_GUARD_ROUTE_COOLDOWN, normalized_route_scope),
+        payload={
+            "route_scope": normalized_route_scope,
+            "route": normalized_route_name,
+            "last_started_ms": normalized_started_ms,
+        },
+    )
+
+
+def _get_ai_route_last_started_ms(route_scope: str) -> Optional[int]:
+    normalized_route_scope = _require_nonempty_str(route_scope, "route_scope")
+    state = _get_ai_guard_state_optional(_AI_GUARD_ROUTE_COOLDOWN, normalized_route_scope)
+    if state is None:
+        return None
+
+    state_scope = _require_nonempty_str(state.get("route_scope"), "route_cooldown.route_scope")
+    if state_scope != normalized_route_scope:
+        raise RuntimeError(
+            f"route cooldown scope mismatch (STRICT): expected={normalized_route_scope} got={state_scope}"
+        )
+
+    return _require_positive_int(state.get("last_started_ms"), "route_cooldown.last_started_ms")
+
+
+def _raise_if_ai_route_cooldown_active(
+    *,
+    route_scope: str,
+    route_name: str,
+    cooldown_ms: int,
+) -> None:
+    normalized_route_scope = _require_nonempty_str(route_scope, "route_scope")
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+    normalized_cooldown_ms = _require_positive_int(cooldown_ms, "cooldown_ms")
+    now_ms = _now_ms()
+
+    last_started_ms = _get_ai_route_last_started_ms(normalized_route_scope)
+    if last_started_ms is None:
+        return
+
+    elapsed_ms = now_ms - last_started_ms
+    if elapsed_ms < 0:
+        raise RuntimeError("route cooldown elapsed_ms must be >= 0 (STRICT)")
+
+    if elapsed_ms >= normalized_cooldown_ms:
+        return
+
+    remaining_ms = normalized_cooldown_ms - elapsed_ms
+    if remaining_ms <= 0:
+        raise RuntimeError("route cooldown remaining_ms must be > 0 (STRICT)")
+
+    retry_after_sec = max(1, int(math.ceil(remaining_ms / 1000.0)))
+    logger.warning(
+        "AI route cooldown active: route=%s route_scope=%s cooldown_ms=%s retry_after_sec=%s",
+        normalized_route_name,
+        normalized_route_scope,
+        normalized_cooldown_ms,
+        retry_after_sec,
+    )
+    raise HTTPException(
+        status_code=429,
+        detail={
+            "status": "rejected",
+            "route": normalized_route_name,
+            "reason": "analysis_route_cooldown_active",
+            "message": "AI analysis request was rejected because the route cooldown window is still active.",
+            "retry_after_sec": retry_after_sec,
+        },
+    )
+
+
+def _require_http_exception_detail_dict(exc: HTTPException) -> Dict[str, Any]:
+    return _require_dict(exc.detail, "http_exception.detail")
+
+
+def _record_provider_block_from_http_exception(
+    *,
+    exc: HTTPException,
+    provider_scope: str,
+    route_name: str,
+) -> None:
+    normalized_provider_scope = _require_nonempty_str(provider_scope, "provider_scope")
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+    detail = _require_http_exception_detail_dict(exc)
+
+    reason = _require_nonempty_str(detail.get("reason"), "provider_block.reason")
+    provider = _require_nonempty_str(detail.get("provider"), "provider_block.provider")
+    retry_after_sec = _require_positive_int(detail.get("retry_after_sec"), "provider_block.retry_after_sec")
+    blocked_until_ms = _now_ms() + (retry_after_sec * 1000)
+
+    _set_ai_guard_state(
+        parts=(_AI_GUARD_PROVIDER_BLOCK, normalized_provider_scope),
+        payload={
+            "provider_scope": normalized_provider_scope,
+            "route": normalized_route_name,
+            "provider": provider,
+            "reason": reason,
+            "retry_after_sec": retry_after_sec,
+            "blocked_until_ms": blocked_until_ms,
+            "recorded_at_ms": _now_ms(),
+        },
+    )
+
+    logger.warning(
+        "AI provider block recorded: route=%s provider_scope=%s provider=%s retry_after_sec=%s reason=%s",
+        normalized_route_name,
+        normalized_provider_scope,
+        provider,
+        retry_after_sec,
+        reason,
+    )
+
+
+def _get_active_provider_block_state(provider_scope: str) -> Optional[Dict[str, Any]]:
+    normalized_provider_scope = _require_nonempty_str(provider_scope, "provider_scope")
+    state = _get_ai_guard_state_optional(_AI_GUARD_PROVIDER_BLOCK, normalized_provider_scope)
+    if state is None:
+        return None
+
+    state_scope = _require_nonempty_str(state.get("provider_scope"), "provider_block.provider_scope")
+    if state_scope != normalized_provider_scope:
+        raise RuntimeError(
+            f"provider block scope mismatch (STRICT): expected={normalized_provider_scope} got={state_scope}"
+        )
+
+    blocked_until_ms = _require_positive_int(state.get("blocked_until_ms"), "provider_block.blocked_until_ms")
+    now_ms = _now_ms()
+    if blocked_until_ms <= now_ms:
+        return None
+
+    _require_nonempty_str(state.get("provider"), "provider_block.provider")
+    _require_nonempty_str(state.get("reason"), "provider_block.reason")
+    _require_positive_int(state.get("retry_after_sec"), "provider_block.retry_after_sec")
+    _require_nonempty_str(state.get("route"), "provider_block.route")
+    return state
+
+
+def _raise_if_provider_blocked(
+    *,
+    provider_scope: Optional[str],
+    route_name: str,
+) -> None:
+    if provider_scope is None:
+        return
+
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+    normalized_provider_scope = _require_nonempty_str(provider_scope, "provider_scope")
+
+    state = _get_active_provider_block_state(normalized_provider_scope)
+    if state is None:
+        return
+
+    blocked_until_ms = _require_positive_int(state.get("blocked_until_ms"), "provider_block.blocked_until_ms")
+    now_ms = _now_ms()
+    remaining_ms = blocked_until_ms - now_ms
+    if remaining_ms <= 0:
+        return
+
+    retry_after_sec = max(1, int(math.ceil(remaining_ms / 1000.0)))
+    provider = _require_nonempty_str(state.get("provider"), "provider_block.provider")
+    reason = _require_nonempty_str(state.get("reason"), "provider_block.reason")
+
+    logger.warning(
+        "AI provider block active: route=%s provider_scope=%s provider=%s retry_after_sec=%s reason=%s",
+        normalized_route_name,
+        normalized_provider_scope,
+        provider,
+        retry_after_sec,
+        reason,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "status": "unavailable",
+            "route": normalized_route_name,
+            "reason": reason,
+            "provider": provider,
+            "message": "AI analysis is temporarily unavailable because the upstream provider is still blocked.",
+            "retry_after_sec": retry_after_sec,
+            "retry_at_utc": (
+                datetime.now(timezone.utc) + timedelta(seconds=retry_after_sec)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+
+def _is_provider_quota_http_exception(exc: HTTPException) -> bool:
+    detail = _require_http_exception_detail_dict(exc)
+    if exc.status_code != 503:
+        return False
+
+    reason = _require_nonempty_str(detail.get("reason"), "provider_quota.reason")
+    retry_after_sec = detail.get("retry_after_sec")
+    provider = detail.get("provider")
+
+    if retry_after_sec is None:
+        return False
+    _require_positive_int(retry_after_sec, "provider_quota.retry_after_sec")
+    _require_nonempty_str(provider, "provider_quota.provider")
+
+    return reason in {
+        "external_provider_quota_exceeded",
+        "analysis_provider_rate_limited",
+    }
+
+
+def _acquire_ai_inflight_key_or_raise(
+    *,
+    request_key: str,
+    route_name: str,
+) -> None:
+    normalized_request_key = _require_nonempty_str(request_key, "request_key")
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+
+    with _AI_INFLIGHT_LOCK:
+        if normalized_request_key in _AI_INFLIGHT_KEYS:
+            logger.warning(
+                "AI analysis request rejected because same request is already in-flight: route=%s request_key=%s",
+                normalized_route_name,
+                normalized_request_key,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "status": "rejected",
+                    "route": normalized_route_name,
+                    "reason": "analysis_request_in_progress",
+                    "message": "The same AI analysis request is already in progress.",
+                    "retry_after_sec": _AI_ANALYSIS_INFLIGHT_RETRY_AFTER_SEC,
+                },
+            )
+        _AI_INFLIGHT_KEYS.add(normalized_request_key)
+
+
+def _release_ai_inflight_key(request_key: str) -> None:
+    normalized_request_key = _require_nonempty_str(request_key, "request_key")
+    with _AI_INFLIGHT_LOCK:
+        if normalized_request_key not in _AI_INFLIGHT_KEYS:
+            logger.error(
+                "AI in-flight key release mismatch: request_key=%s was not registered",
+                normalized_request_key,
+            )
+            return
+        _AI_INFLIGHT_KEYS.remove(normalized_request_key)
+
+
+def _guarded_ai_cached_json(
+    *,
+    key_parts: Tuple[str, ...],
+    route_name: str,
+    route_scope: str,
+    cooldown_ms: int,
+    provider_scope: Optional[str],
+    builder: Callable[[], Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not is_cache_initialized():
+        raise RuntimeError("Redis cache is not initialized (STRICT)")
+
+    normalized_route_name = _require_nonempty_str(route_name, "route_name")
+    normalized_route_scope = _require_nonempty_str(route_scope, "route_scope")
+    normalized_cooldown_ms = _require_positive_int(cooldown_ms, "cooldown_ms")
+
+    payload_cache_key = make_cache_key(*key_parts)
+    cached = get_cache_json(payload_cache_key)
+    if cached is not None:
+        return _require_dict(cached, f"ai_payload_cache[{payload_cache_key}]")
+
+    _raise_if_provider_blocked(
+        provider_scope=provider_scope,
+        route_name=normalized_route_name,
+    )
+    _raise_if_ai_route_cooldown_active(
+        route_scope=normalized_route_scope,
+        route_name=normalized_route_name,
+        cooldown_ms=normalized_cooldown_ms,
+    )
+
+    _acquire_ai_inflight_key_or_raise(
+        request_key=payload_cache_key,
+        route_name=normalized_route_name,
+    )
+    try:
+        cached_retry = get_cache_json(payload_cache_key)
+        if cached_retry is not None:
+            return _require_dict(cached_retry, f"ai_payload_cache[{payload_cache_key}]")
+
+        _raise_if_provider_blocked(
+            provider_scope=provider_scope,
+            route_name=normalized_route_name,
+        )
+        _raise_if_ai_route_cooldown_active(
+            route_scope=normalized_route_scope,
+            route_name=normalized_route_name,
+            cooldown_ms=normalized_cooldown_ms,
+        )
+
+        _record_ai_route_started(
+            route_scope=normalized_route_scope,
+            route_name=normalized_route_name,
+            started_ms=_now_ms(),
+        )
+
+        data = _require_dict(builder(), "ai_builder.payload")
+        set_cache_json(payload_cache_key, data)
+        return data
+
+    except HTTPException as exc:
+        if provider_scope is not None and _is_provider_quota_http_exception(exc):
+            _record_provider_block_from_http_exception(
+                exc=exc,
+                provider_scope=provider_scope,
+                route_name=normalized_route_name,
+            )
+        raise
+
+    finally:
+        _release_ai_inflight_key(payload_cache_key)
 
 
 # =====================================================
@@ -455,6 +903,22 @@ def api_quant_analysis(
     normalized_question = _require_question(question)
     include_external_market_b = bool(include_external_market)
 
+    route_scope = (
+        _AI_ROUTE_SCOPE_QUANT_ANALYSIS_EXTERNAL
+        if include_external_market_b
+        else _AI_ROUTE_SCOPE_QUANT_ANALYSIS_INTERNAL
+    )
+    cooldown_ms = (
+        _AI_ROUTE_COOLDOWN_MS_QUANT_ANALYSIS_EXTERNAL
+        if include_external_market_b
+        else _AI_ROUTE_COOLDOWN_MS_QUANT_ANALYSIS_INTERNAL
+    )
+    provider_scope = (
+        _AI_PROVIDER_SCOPE_EXTERNAL_MARKET
+        if include_external_market_b
+        else None
+    )
+
     def _build() -> Dict[str, Any]:
         try:
             result = _QUANT_ANALYST.analyze(
@@ -472,13 +936,17 @@ def api_quant_analysis(
         )
         return payload
 
-    return _cached_json(
+    return _guarded_ai_cached_json(
         key_parts=(
             "ai",
             "quant-analysis",
             f"q-{_question_hash(normalized_question)}",
             f"ext-{_cache_token_bool(include_external_market_b)}",
         ),
+        route_name="/api/quant-analysis",
+        route_scope=route_scope,
+        cooldown_ms=cooldown_ms,
+        provider_scope=provider_scope,
         builder=_build,
     )
 
@@ -505,12 +973,16 @@ def api_market_analysis(
         )
         return payload
 
-    return _cached_json(
+    return _guarded_ai_cached_json(
         key_parts=(
             "ai",
             "market-analysis",
             f"q-{_question_hash(normalized_question)}",
         ),
+        route_name="/api/market-analysis",
+        route_scope=_AI_ROUTE_SCOPE_MARKET_ANALYSIS,
+        cooldown_ms=_AI_ROUTE_COOLDOWN_MS_MARKET_ANALYSIS,
+        provider_scope=_AI_PROVIDER_SCOPE_EXTERNAL_MARKET,
         builder=_build,
     )
 
