@@ -4,61 +4,36 @@ FILE: state/db_models.py
 AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
-설계 원칙:
-- Base는 state.db_core.Base 단일 소스를 사용한다.
-- 테이블명/컬럼명은 DB 스키마(bt_*)와 완전히 동일하게 유지한다.
-- timezone-aware(TIMESTAMPTZ) 컬럼은 timezone=True 로 유지한다.
-- JSON 컬럼은 Postgres JSON/JSONB 타입을 그대로 사용한다.
-- import 시점에 스키마 생성/변경을 수행하지 않는다.
-- 레거시 호환: 일부 모듈이 `Trade` ORM 심벌을 기대하므로 `Trade = TradeORM` alias를 제공한다.
-- 폴백 금지: 누락/불일치/모호성은 추정으로 메우지 않는다(즉시 예외/중단).
-- AI Trading Intelligence System용 분석 테이블/컬럼은 모두 additive 변경만 수행한다.
-- 구성 불변 규칙: 런타임 중 전략 설정 변경을 전제로 하는 스키마는 두지 않는다.
-- 데이터 무결성 규칙: 핵심 식별자/가격/수량/시간 정합성은 저장 레이어와 스키마 레벨에서 함께 강제한다.
+ROLE:
+- AUTO-TRADER ORM 스키마 정의 단일 소스
+- bt_* / 분석 테이블의 DB 계약을 코드 레벨에서 정합하게 유지한다
 
-변경 이력
+CORE RESPONSIBILITIES:
+- Base(state.db_core.Base) 기반 ORM 모델 정의
+- 테이블명/컬럼명/인덱스/제약조건을 운영 DB 계약과 일치시킨다
+- 저장 계층의 자연키 / 무결성 / idempotency 계약을 스키마 레벨에서 강제한다
+- import 시점에 스키마 생성/변경을 수행하지 않는다
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- Base는 state.db_core.Base 단일 소스를 사용한다
+- 테이블명/컬럼명은 DB 스키마(bt_*)와 완전히 동일하게 유지한다
+- timezone-aware(TIMESTAMPTZ) 컬럼은 timezone=True 로 유지한다
+- JSON 컬럼은 Postgres JSON/JSONB 타입을 그대로 사용한다
+- 폴백 금지: 누락/불일치/모호성은 추정으로 메우지 않는다
+- additive 변경 우선, 기존 기능 삭제 금지
+- 저장 계층 자연키 계약과 ORM unique/index/check 제약은 반드시 일치해야 한다
+
+CHANGE HISTORY
 --------------------------------------------------------
-- 2026-03-08:
-  1) Volume Profile / OrderFlow / Options 구조 피처 영속 컬럼 추가
-  2) 대상:
-     - bt_trade_snapshots
-     - market_features
-     - trade_context_snapshots
-  3) 추가 컬럼 예:
-     - poc_price / value_area_low / value_area_high / poc_distance_bps / price_location
-     - cvd / delta_ratio_pct / aggression_bias / divergence / orderflow_price_change_pct
-     - put_call_oi_ratio / put_call_volume_ratio / options_bias
-  4) 기존 테이블/컬럼 삭제 없음
-  5) nullable additive 확장만 수행
-
-- 2026-03-07:
-  1) AI Trading Intelligence System 지원용 market_features 테이블 추가
-  2) trade_context_snapshots 테이블 추가
-  3) bt_trades 호환 분석 컬럼 추가
-     - status
-     - opened_ts_ms
-     - closed_ts_ms
-     - realized_pnl
-     - exit_reason
-  4) bt_trade_snapshots 분석 컬럼 추가
-     - ts_ms
-     - spread_bps
-     - pattern_score
-     - market_regime
-     - orderbook_imbalance
-     - volatility_score
-- 2026-03-04:
-  1) 모듈 docstring 위치 정합화(문서/정적분석 인식 보장): docstring을 파일 최상단으로 이동
-  2) 헤더 표기 TRADE-GRADE로 정합(정책 문서와 일치)
-  3) 로직/스키마/컬럼 정의는 변경하지 않음(동작 동일)
-- 2026-03-03 (TRADE-GRADE):
-  1) bt_trade_snapshots(TradeSnapshot) 분석형 필드 확장(운영/감사/재현 목적)
-  2) decision_id UNIQUE 인덱스 추가(다중 NULL 허용: Postgres 특성)
-- 2026-03-03 (PATCH):
-  1) bt_trade_snapshots ORM 정합 수정(equity_current_usdt/equity_peak_usdt/dd_pct)
-  2) bt_trades updated_at onupdate=_utc_now 추가
-- 2026-03-02:
-  1) bt_trades 실행/복구 컬럼 추가(ORM 정합)
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): bt_candles에 is_closed(Boolean, nullable=False) 추가
+  2) FIX(ROOT-CAUSE): bt_candles 자연키를 (symbol, timeframe, ts, source)로 정합화
+  3) FIX(TRADE-GRADE): bt_candles OHLC / volume / quote_volume CHECK 제약 추가
+  4) FIX(ROOT-CAUSE): bt_orderbook_snapshots 자연키(symbol, ts) unique 정합화
+  5) FIX(TRADE-GRADE): bt_orderbook_snapshots best/spread CHECK 제약 추가
+- 2026-03-10:
+  1) 기존 분석/운영 스키마 유지
 ========================================================
 """
 
@@ -108,11 +83,28 @@ class Candle(Base):
     volume = Column(Numeric(24, 8), nullable=True)
     quote_volume = Column(Numeric(24, 8), nullable=True)
 
-    source = Column(String(20), nullable=False, default="ws")
+    source = Column(String(20), nullable=False)
+    is_closed = Column(Boolean, nullable=False)
+
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
-        Index("ix_bt_candles_symbol_tf_ts", "symbol", "timeframe", "ts", unique=True),
+        Index("ux_bt_candles_symbol_tf_ts_source", "symbol", "timeframe", "ts", "source", unique=True),
+        Index("ix_bt_candles_symbol_tf_closed_ts", "symbol", "timeframe", "is_closed", "ts"),
+        CheckConstraint("open > 0", name="ck_bt_candles_open_gt_zero"),
+        CheckConstraint("high > 0", name="ck_bt_candles_high_gt_zero"),
+        CheckConstraint("low > 0", name="ck_bt_candles_low_gt_zero"),
+        CheckConstraint("close > 0", name="ck_bt_candles_close_gt_zero"),
+        CheckConstraint("high >= low", name="ck_bt_candles_high_ge_low"),
+        CheckConstraint("high >= open", name="ck_bt_candles_high_ge_open"),
+        CheckConstraint("high >= close", name="ck_bt_candles_high_ge_close"),
+        CheckConstraint("low <= open", name="ck_bt_candles_low_le_open"),
+        CheckConstraint("low <= close", name="ck_bt_candles_low_le_close"),
+        CheckConstraint("(volume IS NULL) OR (volume >= 0)", name="ck_bt_candles_volume_ge_zero_when_present"),
+        CheckConstraint(
+            "(quote_volume IS NULL) OR (quote_volume >= 0)",
+            name="ck_bt_candles_quote_volume_ge_zero_when_present",
+        ),
     )
 
 
@@ -137,7 +129,15 @@ class OrderbookSnapshot(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
 
     __table_args__ = (
-        Index("ix_bt_ob_symbol_ts", "symbol", "ts"),
+        Index("ux_bt_ob_symbol_ts", "symbol", "ts", unique=True),
+        CheckConstraint("best_bid > 0", name="ck_bt_ob_best_bid_gt_zero"),
+        CheckConstraint("best_ask > 0", name="ck_bt_ob_best_ask_gt_zero"),
+        CheckConstraint("best_ask > best_bid", name="ck_bt_ob_best_ask_gt_best_bid"),
+        CheckConstraint("spread > 0", name="ck_bt_ob_spread_gt_zero"),
+        CheckConstraint(
+            "(depth_imbalance IS NULL) OR (depth_imbalance BETWEEN -1 AND 1)",
+            name="ck_bt_ob_depth_imbalance_range",
+        ),
     )
 
 

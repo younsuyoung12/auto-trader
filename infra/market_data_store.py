@@ -4,15 +4,15 @@
 FILE: infra/market_data_store.py
 ROLE:
 - WS 버퍼에서 추출한 캔들/호가를 bt_candles, bt_orderbook_snapshots 테이블에 기록한다.
-- 캔들: save_candles_bulk_from_ws(...) 로 다수의 K라인을 한 번에 INSERT.
+- 캔들: save_candles_bulk_from_ws(...) 로 다수의 K라인을 한 번에 저장/갱신한다.
 - 오더북: save_orderbook_from_ws(...) 로 depth5 스냅샷과 요약 지표
-  (best bid/ask, spread, depth imbalance)를 INSERT.
+  (best bid/ask, spread, depth imbalance)를 저장한다.
 
 CORE RESPONSIBILITIES:
 - 캔들/오더북 입력 도메인 무결성 STRICT 검증
 - 배치 입력 내부 중복/역순 검증
 - DB 자연키 기반 idempotent write 보장
-- 동일 키 기존 row와 내용 불일치 시 즉시 예외
+- open candle / closed candle 저장 계약 강제
 - DB 오류 전파
 
 IMPORTANT POLICY:
@@ -20,26 +20,23 @@ IMPORTANT POLICY:
 - 데이터 누락/손상/형식 오류는 즉시 예외(0/now 등 폴백 금지)
 - DB 오류는 예외로 전파(로그만 남기고 계속 진행 금지)
 - 부분 성공(행 단위 continue/skip) 금지: 배치 입력이 하나라도 깨지면 전체 실패
-- 단, 이미 저장된 동일 스냅샷의 재저장은 허용(no-op)하며, 같은 키 내용 불일치는 즉시 예외
+- 캔들 저장 규칙:
+  - is_closed=False: 진행중 캔들, 동일 자연키 row에 대해 STRICT mutable update 허용
+  - is_closed=True: 확정 캔들, 동일 자연키 row는 immutable로 취급
 - 저장 계층은 재시작에도 idempotent 해야 한다
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): open candle / closed candle 저장 계약 추가 (is_closed REQUIRED)
+  2) FIX(ROOT-CAUSE): open candle은 STRICT mutable update, closed candle은 STRICT immutable 검증으로 분리
+  3) FIX(TRADE-GRADE): open candle의 high/low/volume/quote_volume 단조성 검증 추가
+  4) FIX(TRADE-GRADE): closed candle 이후 reopen / mutate 즉시 예외 처리
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): 캔들/오더북 자연키 기반 idempotent write 추가
   2) FIX(ROOT-CAUSE): 재시작 후 동일 캔들/오더북 중복 INSERT 방지
   3) FIX(STRICT): OHLC/volume 도메인 검증 강화 (price>0, volume>=0, high/low 관계 검증)
   4) FIX(STRICT): 배치 입력 내부 duplicate / timestamp 역순 검증 추가
   5) FIX(STRICT): 같은 키 기존 row와 내용 불일치 시 즉시 예외
-- 2026-03-03:
-  1) 폴백 제거:
-     - ts_ms None/0 → now(UTC) 사용 제거 (즉시 예외)
-     - 잘못된 bids/asks 행은 continue/skip 제거 (즉시 예외)
-     - best/spread 계산 실패 시 return(무시) 제거 (즉시 예외)
-  2) DB 오류 전파:
-     - SQLAlchemyError를 로그만 남기고 삼키는 동작 제거 → 예외 전파
-  3) 트랜잭션 무결성:
-     - 배치 저장 시 입력 전체를 먼저 검증 후 INSERT
-     - 한 행이라도 불량이면 전체 실패(부분 커밋 금지)
 ====================================================
 """
 
@@ -48,6 +45,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sqlalchemy import tuple_
 from sqlalchemy.exc import SQLAlchemyError
 
 from infra.telelog import log
@@ -84,6 +82,12 @@ def _normalize_interval_strict(v: Any, name: str) -> str:
     if s.endswith("M"):
         return s
     return s.lower()
+
+
+def _require_bool_strict(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise MarketDataStoreError(f"{name} must be bool (STRICT)")
+    return v
 
 
 def _require_int_ms(v: Any, name: str) -> int:
@@ -208,7 +212,9 @@ def _compute_best_and_spread_strict(
     best_bid = float(bids[0][0])
     best_ask = float(asks[0][0])
     if best_ask <= best_bid:
-        raise MarketDataStoreError(f"orderbook crossed/invalid (best_ask={best_ask} <= best_bid={best_bid}) (STRICT)")
+        raise MarketDataStoreError(
+            f"orderbook crossed/invalid (best_ask={best_ask} <= best_bid={best_bid}) (STRICT)"
+        )
     spread = best_ask - best_bid
     if spread <= 0:
         raise MarketDataStoreError("spread must be > 0 (STRICT)")
@@ -248,7 +254,7 @@ def _compute_depth_imbalance_strict(
 def _levels_to_json_strict(
     levels: List[Tuple[float, float]],
 ) -> List[Dict[str, float]]:
-    """STRICT: normalized (price, qty) -> [{"price": p, "qty": q}, ...]."""
+    """STRICT: normalized (price, qty) -> [{'price': p, 'qty': q}, ...]."""
     return [{"price": float(p), "qty": float(q)} for (p, q) in levels]
 
 
@@ -261,7 +267,7 @@ def _float_equal_strict(a: Optional[float], b: Optional[float], *, tol: float = 
     return abs(float(a) - float(b)) <= tol
 
 
-def _require_same_candle_content_strict(existing: Candle, incoming: Dict[str, Any]) -> None:
+def _require_existing_candle_identity_same_strict(existing: Candle, incoming: Dict[str, Any]) -> None:
     existing_symbol = _normalize_symbol_strict(existing.symbol, "existing.symbol")
     incoming_symbol = _normalize_symbol_strict(incoming["symbol"], "incoming.symbol")
     if existing_symbol != incoming_symbol:
@@ -279,6 +285,10 @@ def _require_same_candle_content_strict(existing: Candle, incoming: Dict[str, An
     incoming_source = _require_nonempty_str(incoming["source"], "incoming.source")
     if existing_source != incoming_source:
         raise MarketDataStoreError("existing candle source mismatch (STRICT)")
+
+
+def _require_same_candle_content_strict(existing: Candle, incoming: Dict[str, Any]) -> None:
+    _require_existing_candle_identity_same_strict(existing, incoming)
 
     pairs = (
         ("open", float(existing.open), float(incoming["open"])),
@@ -299,6 +309,64 @@ def _require_same_candle_content_strict(existing: Candle, incoming: Dict[str, An
     incoming_qv = incoming["quote_volume"]
     if not _float_equal_strict(existing_qv, incoming_qv):
         raise MarketDataStoreError("existing candle content mismatch: quote_volume (STRICT)")
+
+
+def _require_open_candle_monotonic_update_strict(existing: Candle, incoming: Dict[str, Any]) -> None:
+    """
+    open candle update rules:
+    - identity must match
+    - existing row must not be closed
+    - open must remain constant
+    - high must not decrease
+    - low must not increase
+    - volume / quote_volume must not decrease
+    """
+    _require_existing_candle_identity_same_strict(existing, incoming)
+
+    if bool(existing.is_closed):
+        raise MarketDataStoreError("cannot mutate existing closed candle (STRICT)")
+
+    existing_open = float(existing.open)
+    incoming_open = float(incoming["open"])
+    if not _float_equal_strict(existing_open, incoming_open):
+        raise MarketDataStoreError("open candle update cannot change open price (STRICT)")
+
+    existing_high = float(existing.high)
+    incoming_high = float(incoming["high"])
+    if incoming_high + 1e-12 < existing_high:
+        raise MarketDataStoreError("open candle update cannot decrease high (STRICT)")
+
+    existing_low = float(existing.low)
+    incoming_low = float(incoming["low"])
+    if incoming_low - 1e-12 > existing_low:
+        raise MarketDataStoreError("open candle update cannot increase low (STRICT)")
+
+    existing_volume = None if existing.volume is None else float(existing.volume)
+    incoming_volume = incoming["volume"]
+    if existing_volume is not None and incoming_volume is None:
+        raise MarketDataStoreError("open candle update cannot drop existing volume to None (STRICT)")
+    if existing_volume is not None and incoming_volume is not None:
+        if float(incoming_volume) + 1e-12 < existing_volume:
+            raise MarketDataStoreError("open candle update cannot decrease volume (STRICT)")
+
+    existing_quote_volume = None if existing.quote_volume is None else float(existing.quote_volume)
+    incoming_quote_volume = incoming["quote_volume"]
+    if existing_quote_volume is not None and incoming_quote_volume is None:
+        raise MarketDataStoreError("open candle update cannot drop existing quote_volume to None (STRICT)")
+    if existing_quote_volume is not None and incoming_quote_volume is not None:
+        if float(incoming_quote_volume) + 1e-12 < existing_quote_volume:
+            raise MarketDataStoreError("open candle update cannot decrease quote_volume (STRICT)")
+
+
+def _apply_open_candle_update_strict(existing: Candle, incoming: Dict[str, Any]) -> None:
+    _require_open_candle_monotonic_update_strict(existing, incoming)
+
+    existing.high = incoming["high"]
+    existing.low = incoming["low"]
+    existing.close = incoming["close"]
+    existing.volume = incoming["volume"]
+    existing.quote_volume = incoming["quote_volume"]
+    existing.is_closed = bool(incoming["is_closed"])
 
 
 def _require_same_orderbook_content_strict(existing: OrderbookSnapshot, incoming: Dict[str, Any]) -> None:
@@ -336,6 +404,7 @@ def _normalize_candle_row_strict(row: Dict[str, Any], *, idx: str) -> Dict[str, 
     tf = _normalize_interval_strict(row.get("interval"), f"{idx}.interval")
     src = _require_nonempty_str(row.get("source"), f"{idx}.source")
     ts_dt = _to_utc_dt_from_ms_strict(row.get("ts_ms"))
+    is_closed = _require_bool_strict(row.get("is_closed"), f"{idx}.is_closed")
 
     c_open = _require_positive_float(row.get("open"), f"{idx}.open")
     c_high = _require_positive_float(row.get("high"), f"{idx}.high")
@@ -368,6 +437,7 @@ def _normalize_candle_row_strict(row: Dict[str, Any], *, idx: str) -> Dict[str, 
         "close": c_close,
         "volume": vol,
         "quote_volume": qv,
+        "is_closed": is_closed,
     }
 
 
@@ -411,13 +481,17 @@ def save_candle_from_ws(
     volume: Optional[float] = None,
     quote_volume: Optional[float] = None,
     source: str,
+    is_closed: bool,
 ) -> None:
     """
-    STRICT 단일 캔들 INSERT.
+    STRICT 단일 캔들 저장/갱신.
 
     - ts_ms는 반드시 int>0
     - symbol/interval/source는 반드시 non-empty
+    - is_closed는 반드시 bool
     - DB 자연키 기준 idempotent write
+    - open candle은 mutable update 허용
+    - closed candle은 immutable 검증
     - DB 오류는 예외 전파
     """
     save_candles_bulk_from_ws(
@@ -433,6 +507,7 @@ def save_candle_from_ws(
                 "volume": volume,
                 "quote_volume": quote_volume,
                 "source": source,
+                "is_closed": is_closed,
             }
         ]
     )
@@ -442,7 +517,7 @@ def save_candles_bulk_from_ws(
     candles: Iterable[Dict[str, Any]],
 ) -> None:
     """
-    STRICT bulk INSERT.
+    STRICT bulk candle write.
 
     기대 입력 포맷:
         {
@@ -455,14 +530,17 @@ def save_candles_bulk_from_ws(
           "close": ...,
           "volume": ... (optional),
           "quote_volume": ... (optional),
-          "source": "...",  # REQUIRED (STRICT)
+          "source": "...",     # REQUIRED
+          "is_closed": bool,   # REQUIRED
         }
 
     STRICT:
     - 한 행이라도 누락/불량이면 전체 실패(부분 commit 금지)
     - 배치 내부 duplicate / 역순 금지
     - DB 자연키(symbol, timeframe, ts, source) 기준 idempotent write
-    - 같은 자연키 기존 row와 내용 불일치 시 즉시 예외
+    - open candle(existing.is_closed=False)만 mutable update 허용
+    - closed candle(existing.is_closed=True)는 immutable
+    - closed candle 이후 reopen / mutate 금지
     - DB 오류는 예외 전파
     """
     rows_raw = list(candles)
@@ -497,27 +575,38 @@ def save_candles_bulk_from_ws(
                 existing_by_key[key] = row
 
             to_insert: List[Candle] = []
+
             for row in rows:
                 key = (row["symbol"], row["interval"], row["ts"], row["source"])
                 existing = existing_by_key.get(key)
-                if existing is not None:
+
+                if existing is None:
+                    to_insert.append(
+                        Candle(
+                            symbol=row["symbol"],
+                            timeframe=row["interval"],
+                            ts=row["ts"],
+                            open=row["open"],
+                            high=row["high"],
+                            low=row["low"],
+                            close=row["close"],
+                            volume=row["volume"],
+                            quote_volume=row["quote_volume"],
+                            source=row["source"],
+                            is_closed=row["is_closed"],
+                        )
+                    )
+                    continue
+
+                if bool(existing.is_closed):
+                    if not row["is_closed"]:
+                        raise MarketDataStoreError(
+                            "incoming open candle cannot reopen existing closed candle (STRICT)"
+                        )
                     _require_same_candle_content_strict(existing, row)
                     continue
 
-                to_insert.append(
-                    Candle(
-                        symbol=row["symbol"],
-                        timeframe=row["interval"],
-                        ts=row["ts"],
-                        open=row["open"],
-                        high=row["high"],
-                        low=row["low"],
-                        close=row["close"],
-                        volume=row["volume"],
-                        quote_volume=row["quote_volume"],
-                        source=row["source"],
-                    )
-                )
+                _apply_open_candle_update_strict(existing, row)
 
             if to_insert:
                 session.add_all(to_insert)
@@ -527,10 +616,6 @@ def save_candles_bulk_from_ws(
     except Exception as e:
         log(f"[MD-STORE][FAIL] save_candles_bulk_from_ws error={type(e).__name__}:{str(e)[:200]}")
         raise
-
-
-# SQLAlchemy tuple_ import 위치 고정(ORM query helper)
-from sqlalchemy import tuple_  # noqa: E402
 
 
 # ─────────────────────────────────────────────

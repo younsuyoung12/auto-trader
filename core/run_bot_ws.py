@@ -13,6 +13,7 @@ CORE RESPONSIBILITIES:
 - entry candidate → risk physics → execution engine 오케스트레이션
 - protection guard / reconcile / fill check / safe stop 처리
 - WS/Execution latency 및 invariant/drift 감시
+- WS candle(open/closed) 상태를 저장 계층까지 정합하게 전달
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -24,8 +25,14 @@ IMPORTANT POLICY:
 - 숨은 기본값(getattr(..., default)) 금지
 - 비치명 엔트리 거절(None 반환)은 명시적 SKIP 처리
 - 치명 오류는 SAFE_STOP + 예외 전파
+- candle 저장 경로는 is_closed 계약을 절대 유실하면 안 된다
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): md-store 경로를 ws_get_klines_with_volume_and_closed() 기반으로 변경
+  2) FIX(ROOT-CAUSE): 같은 ts의 open candle 갱신/close 전환도 저장 대상으로 재선정
+  3) FIX(CONTRACT): validate_kline_series_strict()는 legacy 6-tuple로 검증하고 저장은 7-tuple(is_closed 포함)로 전달
+  4) FIX(TRADE-GRADE): md-store의 마지막 저장 상태를 interval별로 추적해 중복/누락/동일 ts 갱신 누락 제거
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): data_health_monitor 3단계 상태(OK/WARNING/FAIL)를 run_bot_ws 에서 직접 소비
   2) FIX(ROOT-CAUSE): _ws_liveness_guard_or_raise() 가 market_feed warning 을 치명 장애로 승격하지 않도록 수정
@@ -77,6 +84,7 @@ from infra.market_data_ws import (
     backfill_klines_from_rest,
     get_health_snapshot as ws_get_health_snapshot,
     get_klines_with_volume as ws_get_klines_with_volume,
+    get_klines_with_volume_and_closed as ws_get_klines_with_volume_and_closed,
     get_orderbook as ws_get_orderbook,
     get_ws_status as ws_get_ws_status,
     start_ws_loop,
@@ -212,6 +220,9 @@ ENGINE_EQUITY_CACHE_TTL_SEC: float = 1.00
 
 _EQUITY_CACHE_VALUE: Optional[float] = None
 _EQUITY_CACHE_TS: float = 0.0
+
+WsStoreCandleRow = Tuple[int, float, float, float, float, float, bool]
+LegacyStoreCandleRow = Tuple[int, float, float, float, float, float]
 
 
 def _require_runtime_setting_exists(name: str) -> Any:
@@ -1382,13 +1393,85 @@ def _backfill_ws_kline_history(symbol: str) -> None:
             )
 
 
+def _coerce_ws_store_candle_row_strict(row: Any, *, interval: str, idx: int) -> WsStoreCandleRow:
+    if not isinstance(row, (list, tuple)):
+        raise RuntimeError(
+            f"[MD-STORE] ws candle row must be list/tuple (STRICT): interval={interval} idx={idx} type={type(row).__name__}"
+        )
+    if len(row) != 7:
+        raise RuntimeError(
+            f"[MD-STORE] ws candle row must be 7-tuple(ts,o,h,l,c,v,is_closed) (STRICT): interval={interval} idx={idx} len={len(row)}"
+        )
+
+    ts_ms = _require_int_ms(row[0], f"md_store.ws[{interval}][{idx}].ts_ms")
+    o = _as_float(row[1], f"md_store.ws[{interval}][{idx}].open", min_value=0.0)
+    h = _as_float(row[2], f"md_store.ws[{interval}][{idx}].high", min_value=0.0)
+    l = _as_float(row[3], f"md_store.ws[{interval}][{idx}].low", min_value=0.0)
+    c = _as_float(row[4], f"md_store.ws[{interval}][{idx}].close", min_value=0.0)
+    v = _as_float(row[5], f"md_store.ws[{interval}][{idx}].volume", min_value=0.0)
+    is_closed = _require_bool(row[6], f"md_store.ws[{interval}][{idx}].is_closed")
+
+    if o <= 0.0 or h <= 0.0 or l <= 0.0 or c <= 0.0:
+        raise RuntimeError(f"[MD-STORE] ws candle OHLC must be > 0 (STRICT): interval={interval} idx={idx}")
+    if h < l:
+        raise RuntimeError(f"[MD-STORE] ws candle high < low (STRICT): interval={interval} idx={idx}")
+    if h < o or h < c:
+        raise RuntimeError(f"[MD-STORE] ws candle high < open/close (STRICT): interval={interval} idx={idx}")
+    if l > o or l > c:
+        raise RuntimeError(f"[MD-STORE] ws candle low > open/close (STRICT): interval={interval} idx={idx}")
+
+    return (int(ts_ms), float(o), float(h), float(l), float(c), float(v), bool(is_closed))
+
+
+def _legacy_kline_rows_for_validator(rows: List[WsStoreCandleRow]) -> List[LegacyStoreCandleRow]:
+    return [(ts, o, h, l, c, v) for (ts, o, h, l, c, v, _is_closed) in rows]
+
+
+def _select_ws_rows_to_persist_strict(
+    rows_raw: List[Any],
+    *,
+    interval: str,
+    last_persisted_row: Optional[WsStoreCandleRow],
+) -> List[WsStoreCandleRow]:
+    typed_rows: List[WsStoreCandleRow] = [
+        _coerce_ws_store_candle_row_strict(row, interval=interval, idx=idx)
+        for idx, row in enumerate(rows_raw)
+    ]
+    if not typed_rows:
+        return []
+
+    for idx in range(1, len(typed_rows)):
+        prev_ts = int(typed_rows[idx - 1][0])
+        curr_ts = int(typed_rows[idx][0])
+        if curr_ts <= prev_ts:
+            raise RuntimeError(
+                f"[MD-STORE] ws candle buffer must be strictly increasing by ts (STRICT): "
+                f"interval={interval} prev_ts={prev_ts} curr_ts={curr_ts} idx={idx}"
+            )
+
+    if last_persisted_row is None:
+        return typed_rows
+
+    last_ts = int(last_persisted_row[0])
+    selected: List[WsStoreCandleRow] = [row for row in typed_rows if int(row[0]) > last_ts]
+
+    latest_row = typed_rows[-1]
+    if int(latest_row[0]) == last_ts and latest_row != last_persisted_row:
+        if selected and int(selected[-1][0]) == int(latest_row[0]):
+            selected[-1] = latest_row
+        else:
+            selected.append(latest_row)
+
+    return selected
+
+
 def _start_market_data_store_thread() -> None:
     symbol = SET.symbol
     flush_sec = float(SET.md_store_flush_sec)
     ob_interval_sec = float(SET.ob_store_interval_sec)
     store_tfs = _parse_tfs(SET.md_store_tfs)
 
-    last_candle_ts: Dict[str, int] = {iv: 0 for iv in store_tfs}
+    last_persisted_candle_row: Dict[str, Optional[WsStoreCandleRow]] = {iv: None for iv in store_tfs}
     last_ob_ts: float = 0.0
     last_ob_missing_log_ts: float = 0.0
 
@@ -1402,26 +1485,39 @@ def _start_market_data_store_thread() -> None:
                 now = time.time()
 
                 candles_to_save: List[Dict[str, Any]] = []
+                latest_persisted_candidate_by_iv: Dict[str, WsStoreCandleRow] = {}
+
                 for iv in store_tfs:
-                    buf = ws_get_klines_with_volume(symbol, iv, limit=500)
+                    buf = ws_get_klines_with_volume_and_closed(symbol, iv, limit=500)
                     if buf is None:
-                        raise RuntimeError(f"[MD-STORE] ws_get_klines_with_volume returned None (STRICT) interval={iv}")
+                        raise RuntimeError(
+                            f"[MD-STORE] ws_get_klines_with_volume_and_closed returned None (STRICT) interval={iv}"
+                        )
                     if not isinstance(buf, list):
-                        raise RuntimeError(f"[MD-STORE] kline buffer invalid type (STRICT) interval={iv} type={type(buf).__name__}")
+                        raise RuntimeError(
+                            f"[MD-STORE] kline buffer invalid type (STRICT) interval={iv} type={type(buf).__name__}"
+                        )
                     if not buf:
                         continue
 
-                    newest_ts = last_candle_ts.get(iv, 0)
-                    new_rows = [row for row in buf if row[0] > newest_ts]
+                    new_rows = _select_ws_rows_to_persist_strict(
+                        buf,
+                        interval=iv,
+                        last_persisted_row=last_persisted_candle_row.get(iv),
+                    )
                     if not new_rows:
                         continue
 
                     try:
-                        validate_kline_series_strict(new_rows, name=f"md_store.ws_kline[{iv}]", min_len=1)
+                        validate_kline_series_strict(
+                            _legacy_kline_rows_for_validator(new_rows),
+                            name=f"md_store.ws_kline[{iv}]",
+                            min_len=1,
+                        )
                     except DataIntegrityError as e:
                         raise RuntimeError(f"[MD-STORE] kline integrity fail (STRICT): {e}") from e
 
-                    for ts_ms, o, h, l, c, v in new_rows:
+                    for ts_ms, o, h, l, c, v, is_closed in new_rows:
                         candles_to_save.append(
                             {
                                 "symbol": symbol,
@@ -1434,12 +1530,16 @@ def _start_market_data_store_thread() -> None:
                                 "volume": float(v),
                                 "quote_volume": None,
                                 "source": "ws",
+                                "is_closed": bool(is_closed),
                             }
                         )
-                    last_candle_ts[iv] = int(new_rows[-1][0])
+
+                    latest_persisted_candidate_by_iv[iv] = new_rows[-1]
 
                 if candles_to_save:
                     save_candles_bulk_from_ws(candles_to_save)
+                    for iv, latest_row in latest_persisted_candidate_by_iv.items():
+                        last_persisted_candle_row[iv] = latest_row
 
                 if now - last_ob_ts >= ob_interval_sec:
                     ob = ws_get_orderbook(symbol, limit=5)
@@ -1499,7 +1599,7 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
             continue
         if "positionAmt" not in r:
             raise RuntimeError("positionRisk.positionAmt missing (STRICT)")
-        amt = _as_float(r["positionAmt"], "positionRisk.positionAmt")
+        amt = _as_float(r.get("positionAmt"), f"positionRisk.positionAmt")
         if abs(amt) > 1e-12:
             live.append(r)
 

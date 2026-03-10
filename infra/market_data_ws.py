@@ -23,6 +23,12 @@ IMPORTANT POLICY:
 - orderbook spreadPct/spread_pct 계약은 ratio(0..1) 기준으로 통일한다
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): kline buffer contract now preserves is_closed state end-to-end
+  2) FIX(ROOT-CAUSE): WS open candle updates are stored instead of being discarded until close
+  3) FIX(STRICT): REST bootstrap derives current-candle closed state from explicit close_time only
+  4) ADD(API): get_klines_with_volume_and_closed() for downstream persistence path
+  5) FIX(CONTRACT): legacy public getters keep 5/6-tuple compatibility while internal buffer uses 7-tuple
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): ws_status.ok 를 transport 상태만 의미하도록 정리
   2) FIX(ROOT-CAUSE): orderbook health 에서 feed inactivity warning 과 payload fail 분리
@@ -58,6 +64,11 @@ class WSProtocolError(RuntimeError):
     """Binance multiplex payload protocol violation (STRICT)."""
 
 
+KlineRow = Tuple[int, float, float, float, float, float, bool]
+LegacyKlineRowWithVolume = Tuple[int, float, float, float, float, float]
+LegacyKlineRow = Tuple[int, float, float, float, float]
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -90,6 +101,36 @@ def _normalize_interval(iv: Any) -> str:
 
 def _to_stream_symbol(sym: str) -> str:
     return _normalize_symbol(sym).lower()
+
+
+def _require_bool(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise WSProtocolError(f"{name} must be bool")
+    return v
+
+
+def _derive_rest_kline_closed_strict(row: Any, idx: int, now_ms: int) -> bool:
+    if isinstance(row, dict):
+        explicit_closed = row.get("x")
+        if explicit_closed is not None:
+            return _require_bool(explicit_closed, f"rest_klines[{idx}].x")
+        close_time_raw = row.get("T")
+        if close_time_raw is None:
+            close_time_raw = row.get("closeTime")
+        if close_time_raw is None:
+            close_time_raw = row.get("close_time")
+        if close_time_raw is None:
+            raise RuntimeError(f"rest_klines[{idx}] missing close time for closed-state derivation (STRICT)")
+        close_time_ms = _require_int_ms(close_time_raw, f"rest_klines[{idx}].close_time")
+        return bool(now_ms > close_time_ms)
+
+    if isinstance(row, (list, tuple)):
+        if len(row) < 7:
+            raise RuntimeError(f"rest_klines[{idx}] missing close time (need len>=7) (STRICT)")
+        close_time_ms = _require_int_ms(row[6], f"rest_klines[{idx}].close_time")
+        return bool(now_ms > close_time_ms)
+
+    raise RuntimeError(f"rest_klines[{idx}] invalid type for closed-state derivation (STRICT): {type(row).__name__}")
 
 
 def _require_int_ms(v: Any, name: str) -> int:
@@ -261,7 +302,7 @@ _last_health_fail_log_ts: float = 0.0
 _last_health_fail_key: str = ""
 _health_fail_lock = threading.Lock()
 
-_kline_buffers: Dict[Tuple[str, str], List[Tuple[int, float, float, float, float, float]]] = {}
+_kline_buffers: Dict[Tuple[str, str], List[KlineRow]] = {}
 _kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
 
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
@@ -563,6 +604,51 @@ def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]
     return loaded
 
 
+def _require_kline_progression_strict(prev: KlineRow, new_row: KlineRow, *, context: str) -> None:
+    prev_ts, prev_o, prev_h, prev_l, _prev_c, prev_v, prev_closed = prev
+    new_ts, new_o, new_h, new_l, _new_c, new_v, new_closed = new_row
+
+    if new_ts != prev_ts:
+        raise WSProtocolError(f"{context} ts mismatch during same-candle update (STRICT)")
+    if prev_closed and not new_closed:
+        raise WSProtocolError(f"{context} closed candle cannot reopen (STRICT)")
+    if abs(new_o - prev_o) > 1e-12:
+        raise WSProtocolError(f"{context} open price changed within same candle (STRICT)")
+    if new_h + 1e-12 < prev_h:
+        raise WSProtocolError(f"{context} high decreased within same candle (STRICT)")
+    if new_l - 1e-12 > prev_l:
+        raise WSProtocolError(f"{context} low increased within same candle (STRICT)")
+    if new_v + 1e-12 < prev_v:
+        raise WSProtocolError(f"{context} volume decreased within same candle (STRICT)")
+
+
+def _append_or_update_kline_row_strict(buf: List[KlineRow], row: KlineRow, *, context: str) -> None:
+    ts = int(row[0])
+    if not buf:
+        buf.append(row)
+        return
+
+    last = buf[-1]
+    last_ts = int(last[0])
+
+    if ts < last_ts:
+        raise WSProtocolError(f"{context} kline timestamp rollback (STRICT): new_ts={ts} last_ts={last_ts}")
+
+    if ts == last_ts:
+        _require_kline_progression_strict(last, row, context=context)
+        buf[-1] = row
+        return
+
+    if bool(last[6]) is False:
+        raise WSProtocolError(
+            f"{context} new candle arrived before previous candle closed (STRICT): prev_ts={last_ts} new_ts={ts}"
+        )
+
+    buf.append(row)
+    if len(buf) > MAX_KLINES:
+        del buf[0 : len(buf) - MAX_KLINES]
+
+
 def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -580,23 +666,17 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     l = _require_float(kline_obj.get("l"), "kline.l")
     c = _require_float(kline_obj.get("c"), "kline.c")
     v = _require_float(kline_obj.get("v"), "kline.v", allow_zero=True)
+    is_closed = _require_bool(kline_obj.get("x"), "kline.x")
 
-    is_closed = bool(kline_obj.get("x", False))
+    row: KlineRow = (ts, o, h, l, c, v, is_closed)
 
     now_ms = _now_ms()
     _mark_ws_message(sym, now_ms)
 
     with _kline_lock:
         _kline_last_recv_ts[key] = now_ms
-
         buf = _kline_buffers.setdefault(key, [])
-        if is_closed:
-            if buf and buf[-1][0] == ts:
-                buf[-1] = (ts, o, h, l, c, v)
-            else:
-                buf.append((ts, o, h, l, c, v))
-                if len(buf) > MAX_KLINES:
-                    del buf[0 : len(buf) - MAX_KLINES]
+        _append_or_update_kline_row_strict(buf, row, context=f"ws_kline[{sym}:{iv}]")
 
 
 def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
@@ -806,7 +886,7 @@ def _on_pong(symbol: str, ws: websocket.WebSocketApp, data: Any) -> None:
     _mark_ws_pong(symbol, _now_ms())
 
 
-def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, float, float, float, float]]) -> None:
+def preload_klines(symbol: str, interval: str, rows: List[KlineRow]) -> None:
     sym = _normalize_symbol(symbol)
     iv = _normalize_interval(interval)
     if not sym:
@@ -814,17 +894,24 @@ def preload_klines(symbol: str, interval: str, rows: List[Tuple[int, float, floa
     if not iv:
         raise ValueError("interval is required")
 
-    cleaned: List[Tuple[int, float, float, float, float, float]] = []
+    cleaned: List[KlineRow] = []
+    last_ts: Optional[int] = None
     for i, r in enumerate(rows):
-        if not isinstance(r, (list, tuple)) or len(r) != 6:
-            raise RuntimeError(f"preload row[{i}] must be 6-tuple (STRICT)")
+        if not isinstance(r, (list, tuple)) or len(r) != 7:
+            raise RuntimeError(f"preload row[{i}] must be 7-tuple(ts,o,h,l,c,v,is_closed) (STRICT)")
         ts = _require_int_ms(r[0], f"preload[{i}].ts")
         o = _require_float(r[1], f"preload[{i}].o")
         h = _require_float(r[2], f"preload[{i}].h")
         l = _require_float(r[3], f"preload[{i}].l")
         c = _require_float(r[4], f"preload[{i}].c")
         v = _require_float(r[5], f"preload[{i}].v", allow_zero=True)
-        cleaned.append((ts, o, h, l, c, v))
+        is_closed = _require_bool(r[6], f"preload[{i}].is_closed")
+        if last_ts is not None and ts <= last_ts:
+            raise RuntimeError(
+                f"preload rows must be strictly increasing by ts (STRICT): prev_ts={last_ts} now_ts={ts} idx={i}"
+            )
+        cleaned.append((ts, o, h, l, c, v, is_closed))
+        last_ts = ts
 
     key = (sym, iv)
     with _kline_lock:
@@ -838,6 +925,7 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
     """
     STRICT:
     - REST 입력이 불량이면 조용히 건너뛰지 않는다(부팅 무결성).
+    - REST close_time 또는 explicit x 로만 closed 상태를 결정한다.
     """
     sym = _normalize_symbol(symbol)
     iv = _normalize_interval(interval)
@@ -851,18 +939,20 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
     if not rest_klines:
         raise RuntimeError("rest_klines empty (STRICT)")
 
-    converted: List[Tuple[int, float, float, float, float, float]] = []
+    now_ms = _now_ms()
+    converted: List[KlineRow] = []
     for idx, row in enumerate(rest_klines):
         if isinstance(row, (list, tuple)):
-            if len(row) < 6:
-                raise RuntimeError(f"rest_klines[{idx}] invalid len<{6} (STRICT)")
+            if len(row) < 7:
+                raise RuntimeError(f"rest_klines[{idx}] invalid len<7 (STRICT)")
             ts = _require_int_ms(row[0], f"rest_klines[{idx}].ts")
             o = _require_float(row[1], f"rest_klines[{idx}].o")
             h = _require_float(row[2], f"rest_klines[{idx}].h")
             l = _require_float(row[3], f"rest_klines[{idx}].l")
             c = _require_float(row[4], f"rest_klines[{idx}].c")
             v = _require_float(row[5], f"rest_klines[{idx}].v", allow_zero=True)
-            converted.append((ts, o, h, l, c, v))
+            is_closed = _derive_rest_kline_closed_strict(row, idx, now_ms)
+            converted.append((ts, o, h, l, c, v, is_closed))
             continue
 
         if isinstance(row, dict):
@@ -872,7 +962,8 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
             l = _require_float(row.get("l") or row.get("low"), f"rest_klines[{idx}].l")
             c = _require_float(row.get("c") or row.get("close"), f"rest_klines[{idx}].c")
             v = _require_float(row.get("v") or row.get("volume"), f"rest_klines[{idx}].v", allow_zero=True)
-            converted.append((ts, o, h, l, c, v))
+            is_closed = _derive_rest_kline_closed_strict(row, idx, now_ms)
+            converted.append((ts, o, h, l, c, v, is_closed))
             continue
 
         raise RuntimeError(f"rest_klines[{idx}] invalid type (STRICT): {type(row).__name__}")
@@ -896,7 +987,7 @@ def _log_no_buffer_once(symbol: str, interval: str, requested: int) -> None:
     log(f"[MD_BINANCE_WS KLINES] no kline buffer for {symbol} {interval} (requested={requested})")
 
 
-def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List[Tuple[int, float, float, float, float, float]]:
+def get_klines_with_volume_and_closed(symbol: str, interval: str, limit: int = 300) -> List[KlineRow]:
     if limit <= 0:
         raise ValueError("limit must be > 0")
 
@@ -912,7 +1003,12 @@ def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List
         return list(buf[-limit:])
 
 
-def get_klines(symbol: str, interval: str, limit: Optional[int] = None) -> List[Tuple[int, float, float, float, float]]:
+def get_klines_with_volume(symbol: str, interval: str, limit: int = 300) -> List[LegacyKlineRowWithVolume]:
+    rows = get_klines_with_volume_and_closed(symbol, interval, limit=limit)
+    return [(ts, o, h, l, c, v) for (ts, o, h, l, c, v, _is_closed) in rows]
+
+
+def get_klines(symbol: str, interval: str, limit: Optional[int] = None) -> List[LegacyKlineRow]:
     if limit is None:
         normalized_limit = max(300, _min_buffer_for_interval(interval))
     else:
@@ -1342,6 +1438,10 @@ def get_market_snapshot(symbol: str) -> Dict[str, Any]:
         "orderbook": dict | None,
         "klines": { "<interval>": [ (ts,o,h,l,c,v), ... ], ... }
     }
+
+    주의:
+    - public snapshot 계약은 기존 호환성을 위해 6-tuple을 유지한다.
+    - closed state가 필요한 저장 경로는 get_klines_with_volume_and_closed()를 사용해야 한다.
     """
     sym = _normalize_symbol(symbol)
 
@@ -1355,7 +1455,7 @@ def get_market_snapshot(symbol: str) -> Dict[str, Any]:
         kl_map: Dict[str, Any] = {}
         for (s, iv), rows in _kline_buffers.items():
             if s == sym:
-                kl_map[iv] = list(rows)
+                kl_map[iv] = [(ts, o, h, l, c, v) for (ts, o, h, l, c, v, _is_closed) in rows]
         snapshot["klines"] = kl_map
 
         return snapshot
@@ -1368,6 +1468,7 @@ __all__ = [
     "bootstrap_klines_from_rest_strict",
     "get_klines",
     "get_klines_with_volume",
+    "get_klines_with_volume_and_closed",
     "get_last_kline_ts",
     "get_last_kline_delay_ms",
     "get_kline_buffer_status",
