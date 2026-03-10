@@ -4,6 +4,11 @@ FILE: core/entry_pipeline.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ============================================================
 
+핵심 변경 요약
+- FIX(ROOT-CAUSE): 5m confirmed momentum misaligned 를 엔진 종료 예외가 아닌 명시적 SKIP 사유로 전환
+- KEEP(STRICT): 잘못된 방향 상태 / slope 누락 / signal contract 위반은 즉시 예외 유지
+- CLEANUP: 방향 상태 검증 로직 공통화, 상단 변경 이력 최근 2일 기준으로 정리
+
 역할
 - run_bot_ws 엔진의 진입 후보 생성 전용 파이프라인을 분리한다.
 - WS 오더북/캔들 준비상태 검증, unified_features 적재, entry candidate 생성만 담당한다.
@@ -19,16 +24,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 변경 이력
 ------------------------------------------------------------
 - 2026-03-10:
-  1) FIX(ROOT-CAUSE): 5m-only 방향 진입 차단
+  1) FIX(ROOT-CAUSE): 5m confirmed momentum misaligned 를 RuntimeError 가 아닌 명시적 SKIP 사유로 전환
+     - 전략 조건 불일치(NEUTRAL / 반대 방향)는 엔진 종료가 아니라 진입 차단으로 처리
+     - 잘못된 방향 상태값 / slope 누락 / 비정상 payload 는 STRICT 예외 유지
+  2) FIX(ROOT-CAUSE): 5m-only 방향 진입 차단
      - market_features_ws 가 direction_source="5m_only" 로 판단한 신호는 진입 후보 생성 단계에서 차단
      - 저주기 흔들림이 상위 TF 합의 없이 실제 엔트리까지 내려오는 경로 제거
-  2) FIX(ROOT-CAUSE): higher timeframe alignment 가드 강화
+  3) FIX(ROOT-CAUSE): higher timeframe alignment 가드 강화
      - secondary support 계산에서 15m / 1h 를 orderflow/options 와 분리
      - 최소 1개 이상의 higher-TF(15m/1h) 지지 없으면 진입 차단
      - higher-TF(15m/1h) 반대 방향이 1개라도 있으면 진입 차단
-  3) ADD(TRADE-GRADE): signal extra.direction_source / high_tf_bias_* 계약 검증 추가
-     - signal 생성 레이어의 방향 결정 근거를 entry pipeline 에서도 명시적으로 검증
-  4) ADD(AUDIT): higher_tf_support/oppose 및 signal direction contract meta 추가
+  4) CLEANUP: 방향 상태 검증 helper 추가 및 오래된 변경 이력 정리
 
 - 2026-03-09:
   1) FIX(ROOT-CAUSE): signal payload 5m ts 와 authoritative WS 5m ts 를 강제 일치 검증
@@ -43,35 +49,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - 새 5m 캔들마다 LONG↔SHORT 교차 진입되는 whipsaw 완화
   4) ADD(AUDIT): direction stability 진단 메타 추가
      - tf slope pct / directional state / support-opposition count 를 candidate meta 에 기록
-
-- 2026-03-08:
-  1) FIX(TRADE-GRADE): duplicate top-level function 제거
-     - _require_tp_sl_from_settings_or_extra 중복 정의 제거
-  2) static_source_scan(AST duplicate scan) 실패 원인 제거
-  3) 기존 시그니처/기능/검증 규칙 삭제 없음
-
-- 2026-03-07:
-  1) run_bot_ws.py 에서 진입 파이프라인 로직 분리
-  2) EntryCandidate / WS 준비상태 검증 / unified_features 진입 후보 생성 분리
-
-- 2026-03-08:
-  1) unified_features 의 volume_profile / orderflow_cvd / options_market 필드 연동 추가
-  2) 진입 후보 생성 전 구조 피처 검증 강화
-     - volume_profile.price_location / poc_distance_bps
-     - orderflow_cvd.delta_ratio_pct / aggression_bias / divergence
-     - options_market.options_bias / put_call ratios
-  3) 방향 충돌 시 명시적 SKIP 처리 추가
-     - LONG:
-       * below_value_area
-       * aggressive_sell_dominant + 음수 delta
-       * bearish_divergence
-       * bearish options bias
-     - SHORT:
-       * above_value_area
-       * aggressive_buy_dominant + 양수 delta
-       * bullish_divergence
-       * bullish options bias
-  4) 기존 진입 파이프라인 구조/시그니처/기능 삭제 없음
 ============================================================
 """
 
@@ -81,18 +58,18 @@ import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence
 
-from infra.market_data_ws import (
-    get_klines_with_volume as ws_get_klines_with_volume,
-    get_orderbook as ws_get_orderbook,
-)
-from infra.market_features_ws import FeatureBuildError, get_trading_signal
-from strategy.unified_features_builder import UnifiedFeaturesError, build_unified_features
 from infra.data_integrity_guard import (
     DataIntegrityError,
     validate_entry_market_data_bundle_strict,
     validate_kline_series_strict,
     validate_orderbook_strict,
 )
+from infra.market_data_ws import (
+    get_klines_with_volume as ws_get_klines_with_volume,
+    get_orderbook as ws_get_orderbook,
+)
+from infra.market_features_ws import FeatureBuildError, get_trading_signal
+from strategy.unified_features_builder import UnifiedFeaturesError, build_unified_features
 
 ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 60, "5m": 60, "15m": 60, "1h": 60, "4h": 60}
 
@@ -244,6 +221,14 @@ def _normalize_direction_bias_int_strict(v: Any, name: str) -> int:
     if iv not in (-1, 0, 1):
         raise RuntimeError(f"{name} must be one of -1/0/1 (STRICT): {iv}")
     return int(iv)
+
+
+def _normalize_directional_state_strict(v: Any, name: str) -> str:
+    s = _require_nonempty_str(v, name).upper().strip()
+    allowed = {"LONG", "SHORT", "NEUTRAL"}
+    if s not in allowed:
+        raise RuntimeError(f"{name} invalid directional state (STRICT): {s!r}")
+    return s
 
 
 def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
@@ -514,12 +499,18 @@ def _evaluate_direction_stability_guard_strict(
     if dir_norm not in ("LONG", "SHORT"):
         raise RuntimeError(f"invalid direction for stability guard (STRICT): {direction!r}")
 
-    primary_state = str(tf_states.get("5m") or "").upper().strip()
+    if "5m" not in tf_states:
+        raise RuntimeError("tf_states[5m] missing (STRICT)")
+    if "5m" not in tf_slopes_pct:
+        raise RuntimeError("tf_slopes_pct[5m] missing (STRICT)")
+
+    primary_state = _normalize_directional_state_strict(tf_states.get("5m"), "tf_states[5m]")
+    primary_slope = _as_float(tf_slopes_pct.get("5m"), "tf_slopes_pct[5m]")
+
     if primary_state != dir_norm:
-        slope = tf_slopes_pct.get("5m")
-        raise RuntimeError(
-            f"5m confirmed momentum misaligned (STRICT): direction={dir_norm} state={primary_state} slope_pct={slope}"
-        )
+        if primary_state == "NEUTRAL":
+            return f"primary_5m_momentum_neutral:{dir_norm}:slope_pct={primary_slope:.12f}"
+        return f"primary_5m_momentum_opposed:{dir_norm}:state={primary_state}:slope_pct={primary_slope:.12f}"
 
     higher_tf_support_count = 0
     higher_tf_oppose_count = 0
@@ -527,19 +518,21 @@ def _evaluate_direction_stability_guard_strict(
     oppose_count = 0
 
     for label in ("15m", "1h"):
-        state = str(tf_states.get(label) or "").upper().strip()
+        state = _normalize_directional_state_strict(tf_states.get(label), f"tf_states[{label}]")
         if state == dir_norm:
             support_count += 1
             higher_tf_support_count += 1
-        elif state in ("LONG", "SHORT") and state != dir_norm:
+        elif state != "NEUTRAL":
             oppose_count += 1
             higher_tf_oppose_count += 1
 
-    for label, state in (("orderflow", orderflow_state), ("options", options_state)):
-        state_norm = str(state).upper().strip()
+    orderflow_state_norm = _normalize_directional_state_strict(orderflow_state, "orderflow_state")
+    options_state_norm = _normalize_directional_state_strict(options_state, "options_state")
+
+    for label, state_norm in (("orderflow", orderflow_state_norm), ("options", options_state_norm)):
         if state_norm == dir_norm:
             support_count += 1
-        elif state_norm in ("LONG", "SHORT") and state_norm != dir_norm:
+        elif state_norm != "NEUTRAL":
             oppose_count += 1
 
     if support_count < DIRECTION_CONFIRM_REQUIRED_SECONDARY_SUPPORTS:
@@ -1068,7 +1061,11 @@ def _build_entry_market_data(
     authoritative_5m = _load_authoritative_ohlcv_series_strict(
         symbol,
         "5m",
-        min_len=max(ENTRY_REQUIRED_KLINES_MIN["5m"], len(candles_5m_raw)),
+        min_len=max(
+            ENTRY_REQUIRED_KLINES_MIN["5m"],
+            DIRECTION_CONFIRM_MIN_LEN_BY_TF["5m"],
+            len(candles_5m_raw),
+        ),
         expected_latest_ts_ms=ts_ms,
     )
     confirm_15m = _load_authoritative_ohlcv_series_strict(
@@ -1200,12 +1197,12 @@ def _build_entry_market_data(
         ("orderflow", direction_orderflow_state),
         ("options", direction_options_state),
     ):
-        state_norm = str(state).upper().strip()
+        state_norm = _normalize_directional_state_strict(state, f"direction_state[{label}]")
         if state_norm == direction:
             secondary_support_count += 1
             if label in ("15m", "1h"):
                 higher_tf_support_count += 1
-        elif state_norm in ("LONG", "SHORT") and state_norm != direction:
+        elif state_norm != "NEUTRAL":
             secondary_oppose_count += 1
             if label in ("15m", "1h"):
                 higher_tf_oppose_count += 1
