@@ -10,11 +10,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 상단 헤더에 서버 런타임 상태칩 추가
 - ENGINE 상태와 SERVER LIVE/STOP 상태를 분리 표시
 - engine_status runtime payload strict 렌더링 추가
+- 2026-03-11 FIX(ROOT-CAUSE): INIT / READY / delayed / stale 상태를 UI에서 명시적으로 표시
+- 2026-03-11 FIX(ARCH): 무데이터 상태는 ERROR가 아니라 안내(note)로 렌더링
+- 2026-03-11 FIX(CONTRACT): WATCHDOG INIT / DECISION INIT / PERFORMANCE INIT 계약 반영
 
 코드 정리 내용
 --------------------------------------------------------
 - 상단 상태칩 렌더링 로직 정리
 - runtime tooltip 생성 로직 추가
+- INIT 상태 전용 note 렌더링 로직 추가
 - 불필요한 중복 없이 기존 UI 구조 유지
 
 설계 원칙
@@ -28,17 +32,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 기존 기능 삭제 금지. 기존 위젯/차트/테이블/실시간 반영 기능은 유지한다.
 - /api/engine/ws-status 와 /api/engine/health 는 엔진 메모리가 아니라 DB 스냅샷 기준으로 동작한다.
 - 서버 런타임 상태는 engine_status.runtime 기준으로 표시한다.
+- INIT 상태는 장애가 아니라 초기 무데이터 상태로 분리 표시한다.
 
 변경 이력
 --------------------------------------------------------
-- 2026-03-09:
-  1) FEAT(HEADER): ENGINE 상태 옆에 SERVER 런타임 상태칩 추가
-  2) FEAT(STRICT): engine_status.runtime payload 검증/렌더링 추가
-  3) FEAT(UI): SERVER_LIVE / SERVER_STOP tooltip 표시 추가
-
-- 2026-03-08:
-  1) AI 분석 검색 섹션 추가 유지
-  2) 상단 메뉴 가독성 개선 유지
+- 2026-03-11:
+  1) FEAT(UI): INIT 상태(성과/의사결정/감시) 전용 note 렌더링 추가
+  2) FIX(ROOT-CAUSE): 무데이터를 오류로 표시하던 경로 제거
+  3) FIX(CONTRACT): WATCHDOG INIT / DECISION INIT / PERFORMANCE INIT 반영
 ========================================================
 -->
 
@@ -289,6 +290,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       font-size: 0.78rem;
       margin-top: 0.55rem;
       font-weight: 800;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .panel-note {
+      color: #334155;
+      background: rgba(37, 99, 235, 0.06);
+      border: 1px solid rgba(37, 99, 235, 0.12);
+      border-radius: 0.9rem;
+      padding: 0.72rem 0.86rem;
+      font-size: 0.78rem;
+      margin-top: 0.55rem;
+      font-weight: 700;
       white-space: pre-wrap;
       word-break: break-word;
     }
@@ -1045,7 +1059,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     </section>
 
     <!-- 상단 핵심 지표 -->
-    <section class="grid grid-cols-2 xl:grid-cols-6 gap-3 md:gap-4 mb-6">
+    <section class="grid grid-cols-2 xl:grid-cols-6 gap-3 md:gap-4 mb-3">
       <div class="glass-card metric-card-dark rounded-2xl p-4">
         <div class="metric-label">총 거래 수</div>
         <div id="summary-total-trades" class="metric-value mt-2">-</div>
@@ -1072,6 +1086,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div id="summary-max-dd" class="metric-value mt-2">-</div>
       </div>
     </section>
+
+    <div id="summaryNote" class="panel-note hidden mb-6"></div>
 
     <!-- 엔진 상태 + 포지션 + 의사결정 -->
     <section class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
@@ -1122,6 +1138,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
               <div id="engine-best-ask" class="mt-1 font-semibold mono text-slate-900">-</div>
             </div>
           </div>
+          <div id="engineNote" class="panel-note hidden"></div>
           <div id="engineError" class="panel-error hidden"></div>
         </div>
       </div>
@@ -1176,6 +1193,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           </div>
         </div>
 
+        <div id="positionNote" class="panel-note hidden"></div>
         <div id="positionError" class="panel-error hidden"></div>
       </div>
 
@@ -1223,6 +1241,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           <div id="decision-reasons-box" class="flex flex-wrap gap-2"></div>
         </div>
 
+        <div id="decisionNote" class="panel-note hidden"></div>
         <div id="decisionError" class="panel-error hidden"></div>
       </div>
     </section>
@@ -1267,6 +1286,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
             </tbody>
           </table>
         </div>
+        <div id="errorMonitorNote" class="panel-note hidden"></div>
         <div id="errorMonitorError" class="panel-error hidden"></div>
       </div>
 
@@ -1296,6 +1316,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
             </tbody>
           </table>
         </div>
+        <div id="tradesNote" class="panel-note hidden"></div>
         <div id="tradesError" class="panel-error hidden"></div>
       </div>
     </section>
@@ -1313,6 +1334,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div class="chart-wrap">
           <canvas id="entryScoreHistChart"></canvas>
         </div>
+        <div id="entryScoreNote" class="panel-note hidden"></div>
         <div id="entryScoreError" class="panel-error hidden"></div>
       </div>
 
@@ -1325,6 +1347,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           <span class="text-xs text-slate-500">최근 7일</span>
         </div>
         <div id="skipReasonsBox" class="space-y-1 text-sm text-slate-800 min-h-[18rem]"></div>
+        <div id="skipReasonsNote" class="panel-note hidden"></div>
         <div id="skipReasonsError" class="panel-error hidden"></div>
       </div>
 
@@ -1339,6 +1362,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div class="chart-wrap">
           <canvas id="skipHourlyChart"></canvas>
         </div>
+        <div id="skipHourlyNote" class="panel-note hidden"></div>
         <div id="skipHourlyError" class="panel-error hidden"></div>
       </div>
     </section>
@@ -1356,6 +1380,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div class="chart-wrap">
           <canvas id="dailyPnlChart"></canvas>
         </div>
+        <div id="dailyPnlNote" class="panel-note hidden"></div>
         <div id="dailyPnlError" class="panel-error hidden"></div>
       </div>
 
@@ -1370,6 +1395,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div class="chart-wrap">
           <canvas id="equityCurveChart"></canvas>
         </div>
+        <div id="equityCurveNote" class="panel-note hidden"></div>
         <div id="equityCurveError" class="panel-error hidden"></div>
       </div>
 
@@ -1384,6 +1410,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div class="chart-wrap">
           <canvas id="drawdownChart"></canvas>
         </div>
+        <div id="drawdownNote" class="panel-note hidden"></div>
         <div id="drawdownError" class="panel-error hidden"></div>
       </div>
     </section>
@@ -1467,6 +1494,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     function clearWidgetError(elemId) {
+      const el = $(elemId);
+      if (!el) return;
+      el.classList.add("hidden");
+      el.textContent = "";
+    }
+
+    function setWidgetNote(elemId, msg) {
+      const el = $(elemId);
+      if (!el) return;
+      el.textContent = String(msg || "");
+      el.classList.remove("hidden");
+    }
+
+    function clearWidgetNote(elemId) {
       const el = $(elemId);
       if (!el) return;
       el.classList.add("hidden");
@@ -1604,11 +1645,16 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         s === "MARKET_ANALYSIS" ||
         s === "SERVER_LIVE" ||
         s === "RUNNING" ||
-        s === "LIVE"
+        s === "LIVE" ||
+        s === "READY"
       ) {
         cls = "status-ok";
         dot = "tiny-dot-ok";
-      } else if (s.includes("WARNING") || s.includes("WARN")) {
+      } else if (
+        s.includes("WARNING") ||
+        s.includes("WARN") ||
+        s.includes("DELAYED")
+      ) {
         cls = "status-warning";
         dot = "tiny-dot-warning";
       } else if (
@@ -1625,6 +1671,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       ) {
         cls = "status-fatal";
         dot = "tiny-dot-fatal";
+      } else if (s.includes("INIT")) {
+        cls = "status-neutral";
+        dot = "tiny-dot-neutral";
       }
 
       chip.className = `status-chip ${cls}`;
@@ -1681,7 +1730,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         ["dashboard_query", "대시보드 AI 질의"],
         ["market_query", "외부 시장 AI 질의"],
         ["market_report", "자동 시장 분석 리포트"],
-        ["system_report", "자동 시스템 분석 리포트"]
+        ["system_report", "자동 시스템 분석 리포트"],
+        ["no_watchdog_event", "초기 상태(아직 WATCHDOG 없음)"],
+        ["no_decision_event", "초기 상태(아직 DECISION 없음)"]
       ];
 
       for (const [key, label] of reasonMap) {
@@ -1712,6 +1763,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       if (lower === "exit_submit") return "청산 주문 조건 충족";
       if (lower === "risk_blocked") return "위험 조건으로 차단";
       if (lower === "no_entry") return "진입 안 함";
+      if (lower === "no_decision_event") return "초기 상태(아직 DECISION 없음)";
 
       return raw
         .replaceAll("_", " ")
@@ -1722,7 +1774,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         .replace(/\bpassed\b/gi, "통과");
     }
 
-    function normalizeWatchdogReason(reason) {
+    function normalizeWatchdogReason(reason, status = null) {
+      if (String(status || "").toUpperCase() === "INIT") {
+        return "초기 상태(아직 WATCHDOG 없음)";
+      }
       return normalizeReasonText(reason);
     }
 
@@ -1757,6 +1812,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       const reason = String(runtime.reason || "").trim();
       const staleMs = runtime.stale_ms;
       const thresholdMs = runtime.threshold_ms;
+      const delayedThresholdMs = runtime.delayed_threshold_ms;
       const runtimeTsMs = runtime.ts_ms;
 
       const parts = [];
@@ -1765,7 +1821,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       if (source) parts.push(`기준: ${source}`);
       if (reason) parts.push(`사유: ${reason}`);
       if (staleMs !== undefined && staleMs !== null) parts.push(`지연(ms): ${staleMs}`);
-      if (thresholdMs !== undefined && thresholdMs !== null) parts.push(`기준값(ms): ${thresholdMs}`);
+      if (delayedThresholdMs !== undefined && delayedThresholdMs !== null) parts.push(`경고 기준(ms): ${delayedThresholdMs}`);
+      if (thresholdMs !== undefined && thresholdMs !== null) parts.push(`중지 기준(ms): ${thresholdMs}`);
       if (runtimeTsMs !== undefined && runtimeTsMs !== null) parts.push(`판정시각(ms): ${runtimeTsMs}`);
 
       return parts.join(" | ");
@@ -1785,7 +1842,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         throw new Error("engine_status.runtime.status invalid");
       }
 
-      applyStatusChip(chip, status);
+      let chipText = status;
+      if (runtime.freshness_state === "delayed") chipText = `${status} (지연)`;
+
+      applyStatusChip(chip, chipText);
       chip.title = buildRuntimeTooltip(runtime);
     }
 
@@ -1841,7 +1901,28 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       });
     }
 
+    function destroyChart(chartRefName) {
+      if (chartRefName === "dailyPnlChart" && dailyPnlChart) {
+        dailyPnlChart.destroy();
+        dailyPnlChart = null;
+      } else if (chartRefName === "entryScoreHistChart" && entryScoreHistChart) {
+        entryScoreHistChart.destroy();
+        entryScoreHistChart = null;
+      } else if (chartRefName === "skipHourlyChart" && skipHourlyChart) {
+        skipHourlyChart.destroy();
+        skipHourlyChart = null;
+      } else if (chartRefName === "equityCurveChart" && equityCurveChart) {
+        equityCurveChart.destroy();
+        equityCurveChart = null;
+      } else if (chartRefName === "drawdownChart" && drawdownChart) {
+        drawdownChart.destroy();
+        drawdownChart = null;
+      }
+    }
+
     function renderSummary(data, perfSummary) {
+      clearWidgetNote("summaryNote");
+
       $("summary-total-trades").textContent = fmtNumber(data.total_trades, 0);
       $("summary-win-rate").textContent = `${fmtNumber(data.win_rate_pct, 1)}%`;
       $("summary-win-loss").textContent =
@@ -1862,9 +1943,16 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       const ddText = perfSummary
         ? `${fmtMaybe(perfSummary.max_drawdown_usdt, 2)} USDT / ${perfSummary.max_drawdown_pct !== null ? fmtNumber(perfSummary.max_drawdown_pct, 2) + "%" : "-"}` : "-";
       $("summary-max-dd").textContent = ddText;
+
+      const dataState = String((data && data.data_state) || (perfSummary && perfSummary.data_state) || "");
+      if (dataState === "INIT_NO_CLOSED_TRADES" || dataState === "INIT_NO_TRADES") {
+        setWidgetNote("summaryNote", "아직 종료 거래가 없어 성과 요약은 초기 상태입니다.");
+      }
     }
 
     function renderEngineStatus(data) {
+      clearWidgetNote("engineNote");
+
       state.engine = data;
       applyStatusChip("engine-status-chip", data.status || "대기");
       applyStatusChip("engine-top-status", data.status || "대기");
@@ -1875,11 +1963,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       $("engine-recent-errors").textContent = fmtMaybe(data.recent_errors, 0);
       $("engine-recent-skips").textContent = fmtMaybe(data.recent_skips, 0);
 
+      const watchdogStatus = data.latest_watchdog && data.latest_watchdog.status
+        ? String(data.latest_watchdog.status)
+        : null;
       const watchdogReason =
         data.latest_watchdog && data.latest_watchdog.reason
-          ? normalizeWatchdogReason(data.latest_watchdog.reason)
+          ? normalizeWatchdogReason(data.latest_watchdog.reason, watchdogStatus)
           : "-";
       $("engine-watchdog-reason").textContent = watchdogReason;
+
+      if (watchdogStatus === "INIT") {
+        setWidgetNote("engineNote", "감시 상태는 초기 상태입니다. 아직 첫 WATCHDOG 이벤트가 기록되지 않았습니다.");
+      }
 
       const wsStatus = data.ws_status;
       if (!wsStatus || typeof wsStatus !== "object") {
@@ -1925,6 +2020,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     function renderPosition(data) {
+      clearWidgetNote("positionNote");
+
       state.position = data;
       const status = data.status || "대기";
       applyStatusChip("position-status-chip", status);
@@ -1935,8 +2032,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       $("position-current-price").textContent = data.current_price !== undefined ? fmtMaybe(data.current_price, 4) : "-";
 
       const pnlEl = $("position-pnl");
-      pnlEl.textContent = `${fmtSigned(data.pnl_usdt, 2)} USDT / ${fmtSigned(data.pnl_pct, 2)}%`;
-      applyValueColor(pnlEl, data.pnl_usdt);
+      const pnlUsdt = data.pnl_usdt === null || data.pnl_usdt === undefined ? null : Number(data.pnl_usdt);
+      const pnlPct = data.pnl_pct === null || data.pnl_pct === undefined ? null : Number(data.pnl_pct);
+      if (pnlUsdt === null || Number.isNaN(pnlUsdt) || pnlPct === null || Number.isNaN(pnlPct)) {
+        pnlEl.textContent = "-";
+        pnlEl.classList.remove("value-positive", "value-negative", "value-neutral");
+      } else {
+        pnlEl.textContent = `${fmtSigned(pnlUsdt, 2)} USDT / ${fmtSigned(pnlPct, 2)}%`;
+        applyValueColor(pnlEl, pnlUsdt);
+      }
 
       $("position-leverage").textContent = data.leverage !== undefined ? `${fmtMaybe(data.leverage, 1)}x` : "-";
       $("position-qty").textContent = data.quantity !== undefined ? fmtMaybe(data.quantity, 6) : "-";
@@ -1947,7 +2051,30 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     function renderDecision(data) {
+      clearWidgetNote("decisionNote");
+
       state.decision = data;
+      const decisionStatus = String(data.status || "").toUpperCase();
+
+      if (decisionStatus === "INIT" || data.has_decision === false) {
+        applyStatusChip("decision-action-chip", "INIT");
+        $("decision-summary").textContent = "아직 DECISION 이벤트가 없습니다.";
+        $("decision-entry-score").textContent = "-";
+        $("decision-exit-score").textContent = "-";
+        $("decision-trend-strength").textContent = "-";
+        $("decision-spread").textContent = "-";
+        $("decision-orderbook").textContent = "호가창: -";
+
+        const reasonsBox = $("decision-reasons-box");
+        reasonsBox.innerHTML = "";
+        const span = document.createElement("span");
+        span.className = "reason-pill";
+        span.textContent = "초기 상태";
+        reasonsBox.appendChild(span);
+
+        setWidgetNote("decisionNote", "의사결정 패널은 초기 상태입니다. 아직 DECISION 이벤트가 기록되지 않았습니다.");
+        return;
+      }
 
       const action = data.action || "대기";
       applyStatusChip("decision-action-chip", action);
@@ -1996,12 +2123,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     function renderErrorsTable(items) {
+      clearWidgetNote("errorMonitorNote");
+
       state.recentErrors = Array.isArray(items) ? items.slice(0, 100) : [];
       const body = $("error-table-body");
       body.innerHTML = "";
 
       if (!state.recentErrors.length) {
         body.innerHTML = `<tr><td colspan="4" class="text-slate-500">표시할 문제가 없습니다.</td></tr>`;
+        setWidgetNote("errorMonitorNote", "최근 오류/감시 경고가 없습니다.");
         return;
       }
 
@@ -2030,17 +2160,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     function renderTradesTable(items) {
+      clearWidgetNote("tradesNote");
+
       state.recentTrades = Array.isArray(items) ? items.slice(0, 100) : [];
       const body = $("trades-table-body");
       body.innerHTML = "";
 
       if (!state.recentTrades.length) {
         body.innerHTML = `<tr><td colspan="6" class="text-slate-500">표시할 거래가 없습니다.</td></tr>`;
+        setWidgetNote("tradesNote", "아직 종료 거래가 없습니다.");
         return;
       }
 
       state.recentTrades.forEach((item) => {
-        const pnl = Number(item.pnl_usdt || 0);
+        const pnl = Number(item.pnl_usdt);
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td class="mono text-xs">${item.exit_ts || item.entry_ts || "-"}</td>
@@ -2062,10 +2195,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     function renderSkipReasons(items) {
+      clearWidgetNote("skipReasonsNote");
+
       const box = $("skipReasonsBox");
       box.innerHTML = "";
       if (!Array.isArray(items) || !items.length) {
         box.innerHTML = `<div class="text-slate-500 text-sm">표시할 데이터가 없습니다.</div>`;
+        setWidgetNote("skipReasonsNote", "최근 7일 기준 SKIP 이벤트가 없습니다.");
         return;
       }
 
@@ -2201,6 +2337,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     async function loadSummary() {
+      clearWidgetNote("summaryNote");
+
       try {
         const [summary, perfSummary] = await Promise.all([
           fetchJsonStrict(API.summary, "요약"),
@@ -2221,10 +2359,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadDailyPnlChart() {
       clearWidgetError("dailyPnlError");
+      clearWidgetNote("dailyPnlNote");
+
       try {
         const data = await fetchJsonStrict(API.dailyPnl, "일별 손익");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("일별 손익: items invalid");
+
+        if (!items.length) {
+          destroyChart("dailyPnlChart");
+          setWidgetNote("dailyPnlNote", "아직 최근 30일 기준 종료 거래가 없어 일별 손익 차트를 표시할 수 없습니다.");
+          return;
+        }
 
         const labels = items.map((x) => String(x.date));
         const pnls = items.map((x) => {
@@ -2249,10 +2395,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadEquityCurveChart() {
       clearWidgetError("equityCurveError");
+      clearWidgetNote("equityCurveNote");
+
       try {
         const data = await fetchJsonStrict(API.equityCurve, "누적 손익 흐름");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("누적 손익 흐름: items invalid");
+
+        if (!items.length) {
+          destroyChart("equityCurveChart");
+          setWidgetNote("equityCurveNote", "아직 종료 거래가 없어 누적 손익 흐름을 표시할 수 없습니다.");
+          return;
+        }
 
         const labels = items.map((x) => String(x.exit_ts || ""));
         const values = items.map((x) => {
@@ -2277,10 +2431,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadDrawdownChart() {
       clearWidgetError("drawdownError");
+      clearWidgetNote("drawdownNote");
+
       try {
         const data = await fetchJsonStrict(API.drawdownCurve, "하락폭 흐름");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("하락폭 흐름: items invalid");
+
+        if (!items.length) {
+          destroyChart("drawdownChart");
+          setWidgetNote("drawdownNote", "아직 종료 거래가 없어 하락폭 흐름을 표시할 수 없습니다.");
+          return;
+        }
 
         const labels = items.map((x) => String(x.exit_ts || ""));
         const values = items.map((x) => {
@@ -2305,12 +2467,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadEntryScoreHist() {
       clearWidgetError("entryScoreError");
+      clearWidgetNote("entryScoreNote");
+
       try {
         const data = await fetchJsonStrict(API.entryScores, "진입 점수 분포");
         const labels = Array.isArray(data.hist_labels) ? data.hist_labels : null;
         const counts = Array.isArray(data.hist_counts) ? data.hist_counts : null;
         if (!labels || !counts) throw new Error("진입 점수 분포: histogram invalid");
         if (labels.length !== counts.length) throw new Error("진입 점수 분포: histogram length mismatch");
+
+        if (!labels.length) {
+          destroyChart("entryScoreHistChart");
+          setWidgetNote("entryScoreNote", "아직 진입 점수 데이터가 없어 분포를 표시할 수 없습니다.");
+          return;
+        }
 
         entryScoreHistChart = createOrUpdateChart(
           entryScoreHistChart,
@@ -2328,6 +2498,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadSkipReasons() {
       clearWidgetError("skipReasonsError");
+      clearWidgetNote("skipReasonsNote");
+
       try {
         const data = await fetchJsonStrict(API.skipReasons, "진입 안 한 이유");
         const items = Array.isArray(data.items) ? data.items : null;
@@ -2341,10 +2513,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadSkipHourly() {
       clearWidgetError("skipHourlyError");
+      clearWidgetNote("skipHourlyNote");
+
       try {
         const data = await fetchJsonStrict(API.skipHourly, "시간대별 진입 안 함");
         const items = Array.isArray(data.items) ? data.items : null;
         if (!items) throw new Error("시간대별 진입 안 함: items invalid");
+
+        if (!items.length) {
+          destroyChart("skipHourlyChart");
+          setWidgetNote("skipHourlyNote", "최근 7일 기준 시간대별 SKIP 데이터가 없습니다.");
+          return;
+        }
 
         const labels = items.map((x) => String(x.hour_kst));
         const vals = items.map((x) => {
@@ -2369,6 +2549,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadEngineStatus() {
       clearWidgetError("engineError");
+      clearWidgetNote("engineNote");
       try {
         const data = await fetchJsonStrict(API.engineStatus, "핵심 상태");
         renderEngineStatus(data);
@@ -2380,6 +2561,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadPosition() {
       clearWidgetError("positionError");
+      clearWidgetNote("positionNote");
       try {
         const data = await fetchJsonStrict(API.positionCurrent, "현재 보유");
         renderPosition(data);
@@ -2391,6 +2573,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadDecision() {
       clearWidgetError("decisionError");
+      clearWidgetNote("decisionNote");
       try {
         const data = await fetchJsonStrict(API.decisionLatest, "판단 이유");
         renderDecision(data);
@@ -2402,6 +2585,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadErrors() {
       clearWidgetError("errorMonitorError");
+      clearWidgetNote("errorMonitorNote");
       try {
         const [counts, recent] = await Promise.all([
           fetchJsonStrict(API.errorCounts, "문제 개수"),
@@ -2425,6 +2609,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     async function loadTrades() {
       clearWidgetError("tradesError");
+      clearWidgetNote("tradesNote");
       try {
         const data = await fetchJsonStrict(API.tradesRecent, "최근 거래");
         if (!Array.isArray(data.items)) throw new Error("최근 거래: items invalid");

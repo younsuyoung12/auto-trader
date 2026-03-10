@@ -1,44 +1,33 @@
 """
 ========================================================
 FILE: services/system_monitor.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- 대시보드/관측 계층에서 프로세스 상태, DB latency,
+  최근 WATCHDOG / ERROR 상태를 수집·정규화한다.
+- 엔진 실행 초기(아직 WATCHDOG 미발행) 상태를 명시적 INIT로 표현한다.
 
-역할
---------------------------------------------------------
-- 현재 대시보드 서버 프로세스 상태를 수집한다.
-- DB latency(SELECT 1 왕복)를 측정한다.
-- bt_events 기준 최근 WATCHDOG / ERROR 상태를 조회한다.
-- 대시보드 "엔진 상태" 패널에 필요한 구조로 정규화한다.
-- 잘못된 컬럼 / 누락 필드 / 비정상 타입은 즉시 예외로 실패한다.
+CORE RESPONSIBILITIES:
+- 현재 대시보드 서버 프로세스 상태 수집
+- DB latency(SELECT 1 왕복) 측정
+- bt_events 기준 최근 WATCHDOG / ERROR 상태 조회
+- 대시보드 "엔진 상태" 패널용 시스템 상태 스냅샷 정규화
+- 스키마/타입/필수 필드 불일치 즉시 예외 처리
 
-지원 기능
---------------------------------------------------------
-- 시스템 상태 스냅샷 조회
-- 최근 WATCHDOG 이벤트 조회
-- 최근 ERROR 건수 조회
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- psutil 미설치 시 즉시 예외
+- WATCHDOG 이벤트 미존재는 대시보드 관측 계층에서 명시적 INIT 상태로 반환
+- WATCHDOG 이벤트가 존재하는데 필드/타입/스키마가 불일치하면 즉시 예외
+- extra_json은 Mapping(dict 계열) 이어야 하며, 이벤트 존재 시 null 금지
+- 숫자형 필드는 finite float/int 아니면 즉시 예외
+- 임의 기본값/자동 보정/오류 은닉 금지
 
-데이터 소스
---------------------------------------------------------
-- 로컬 프로세스: psutil
-- DB: bt_events
-- DB latency: SELECT 1
-
-절대 원칙 (STRICT · NO-FALLBACK)
---------------------------------------------------------
-- psutil 미설치 시 즉시 예외.
-- WATCHDOG 이벤트가 없으면 즉시 예외.
-- extra_json은 dict 여야 한다.
-- 필수 컬럼 누락 시 즉시 예외.
-- 숫자형 필드는 finite float/int 아니면 즉시 예외.
-- 임의 기본값/더미값/자동 보정 금지.
-
-변경 이력
---------------------------------------------------------
-- 2026-03-06:
-  1) 신규 생성: 시스템 모니터 서비스 추가
-  2) 프로세스/메모리/CPU/DB latency/WATCHDOG 상태 조회 기능 추가
-  3) 최근 ERROR 건수 및 최신 WATCHDOG 상세 조회 기능 추가
+CHANGE HISTORY:
+- 2026-03-11
+  1) FIX(ROOT-CAUSE): WATCHDOG 미존재를 RuntimeError가 아닌 명시적 INIT 상태로 모델링
+  2) FIX(ARCH): 엔진 STRICT와 대시보드 관측 계층의 초기 상태를 분리
+  3) FIX(CONTRACT): WATCHDOG snapshot에 status 필드(OK / INIT) 추가
+  4) FIX(STRICT): 이벤트가 존재하는 경우 필드/타입 검증은 기존처럼 fail-fast 유지
 ========================================================
 """
 
@@ -63,27 +52,34 @@ else:
     _PSUTIL_IMPORT_ERROR = None
 
 
+_WATCHDOG_STATUS_OK = "OK"
+_WATCHDOG_STATUS_INIT = "INIT"
+_WATCHDOG_INIT_REASON_NO_EVENT = "no_watchdog_event"
+
+
 @dataclass(frozen=True, slots=True)
 class WatchdogSnapshot:
-    id: int
-    ts_utc: str
-    symbol: str
+    status: str
     reason: str
+    ts_utc: Optional[str]
+    symbol: Optional[str]
     regime: Optional[str]
     source: Optional[str]
     side: Optional[str]
     extra_json: Dict[str, Any]
+    id: Optional[int]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "id": self.id,
+            "status": self.status,
+            "reason": self.reason,
             "ts_utc": self.ts_utc,
             "symbol": self.symbol,
-            "reason": self.reason,
             "regime": self.regime,
             "source": self.source,
             "side": self.side,
             "extra_json": dict(self.extra_json),
+            "id": self.id,
         }
 
 
@@ -208,9 +204,16 @@ def _to_iso(value: Any, name: str) -> str:
 def _require_mapping(value: Any, name: str) -> Dict[str, Any]:
     if value is None:
         raise RuntimeError(f"{name} is required (STRICT)")
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{name} must be mapping/dict (STRICT), got={type(value).__name__}")
     return dict(value)
+
+
+def _require_watchdog_status(value: Any, name: str) -> str:
+    status = _require_nonempty_str(value, name)
+    if status not in {_WATCHDOG_STATUS_OK, _WATCHDOG_STATUS_INIT}:
+        raise RuntimeError(f"{name} invalid watchdog status (STRICT): {status!r}")
+    return status
 
 
 def _db_latency_ms(db: Session) -> int:
@@ -227,6 +230,20 @@ def _db_latency_ms(db: Session) -> int:
     return latency_ms
 
 
+def _build_init_watchdog_snapshot() -> WatchdogSnapshot:
+    return WatchdogSnapshot(
+        status=_WATCHDOG_STATUS_INIT,
+        reason=_WATCHDOG_INIT_REASON_NO_EVENT,
+        ts_utc=None,
+        symbol=None,
+        regime=None,
+        source=None,
+        side=None,
+        extra_json={},
+        id=None,
+    )
+
+
 def _normalize_watchdog_row(row: Mapping[str, Any]) -> WatchdogSnapshot:
     row_id = _require_positive_int(row.get("id"), "bt_events.id")
     ts_utc = _to_iso(row.get("ts_utc"), "bt_events.ts_utc")
@@ -237,16 +254,19 @@ def _normalize_watchdog_row(row: Mapping[str, Any]) -> WatchdogSnapshot:
     side = _optional_nonempty_str(row.get("side"), "bt_events.side")
     extra_json = _require_mapping(row.get("extra_json"), "bt_events.extra_json")
 
-    return WatchdogSnapshot(
-        id=row_id,
+    snapshot = WatchdogSnapshot(
+        status=_WATCHDOG_STATUS_OK,
+        reason=reason,
         ts_utc=ts_utc,
         symbol=symbol,
-        reason=reason,
         regime=regime,
         source=source,
         side=side,
         extra_json=extra_json,
+        id=row_id,
     )
+    _require_watchdog_status(snapshot.status, "watchdog.status")
+    return snapshot
 
 
 def get_latest_watchdog_snapshot(db: Session, *, include_test: bool = False) -> Dict[str, Any]:
@@ -273,7 +293,7 @@ def get_latest_watchdog_snapshot(db: Session, *, include_test: bool = False) -> 
     )
     row = db.execute(sql, {"include_test": bool(include_test)}).mappings().one_or_none()
     if row is None:
-        raise RuntimeError("WATCHDOG event not found (STRICT)")
+        return _build_init_watchdog_snapshot().to_dict()
 
     return _normalize_watchdog_row(row).to_dict()
 
@@ -349,6 +369,8 @@ def get_system_status_snapshot(
         include_test=include_test,
     )
     latest_watchdog = get_latest_watchdog_snapshot(db, include_test=include_test)
+    _require_watchdog_status(latest_watchdog.get("status"), "latest_watchdog.status")
+    _require_nonempty_str(latest_watchdog.get("reason"), "latest_watchdog.reason")
 
     snapshot = SystemStatusSnapshot(
         ts_ms=now_ms,

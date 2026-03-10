@@ -1,83 +1,36 @@
 """
 ========================================================
 FILE: broadcast/dashboard_server.py
-AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- Auto-Trader 대시보드 API 서버
+- Trades / EntryScore / Events / Decision / Error / Position / Performance / System 분석 API 제공
+- Engine Watchdog / Runtime Health / Dashboard WebSocket 엔드포인트 제공
+- 초기 무데이터 상태(INIT)와 실제 장애를 구분해 UI에 전달
 
-핵심 변경 요약
-- /api/engine/health, /api/engine/status에 runtime 상태 추가
-- DB orderbook snapshot 기준 SERVER_LIVE / SERVER_STOP 판정 추가
-- /api/engine/ws-status에도 runtime 상태 포함
-- 2026-03-11 FIX(ROOT-CAUSE): 대시보드 health는 DB 최신 orderbook snapshot freshness를 기준으로
-  ws_orderbook_stale watchdog warning을 정규화한다
-- 2026-03-11 ADD(OBSERVABILITY): runtime이 fresh / delayed / stale를 구분하고
-  delayed는 SERVER_LIVE + warning 플래그로 표현한다
+CORE RESPONSIBILITIES:
+- 대시보드용 조회/집계 API 제공
+- 엔진 runtime 상태를 DB orderbook snapshot freshness 기준으로 판정
+- WATCHDOG/DECISION/PERFORMANCE INIT 상태를 대시보드 계약으로 정규화
+- 캐시/웹소켓/분석 API를 일관된 구조로 제공
 
-코드 정리 내용
-- 엔진 runtime 판정 로직 공통 함수로 정리
-- runtime 응답 구조를 engine/ws-status와 engine/health에서 일관화
-- 사용하지 않는 코드 추가 없이 기존 기능 유지
-
-역할
---------------------------------------------------------
-Auto-Trader 대시보드 API 서버.
-- Trades / EntryScore / Events 분석
-- Decision / Error / Position / Performance / System 분석
-- Engine Watchdog(실시간 진단) API 제공
-- Dashboard WebSocket 엔드포인트 제공
-- AI Quant Analyst / AI Market Analyst 검색 API 제공
-
-Engine API
---------------------------------------------------------
-- /api/engine/health
-- /api/engine/status
-- /api/engine/ws-status
-- /api/engine/latency
-
-AI Analysis API
---------------------------------------------------------
-- /api/quant-analysis
-- /api/market-analysis
-
-WebSocket
---------------------------------------------------------
-- /ws/dashboard
-
-상태 분류
---------------------------------------------------------
-ENGINE_OK / ENGINE_WARNING / ENGINE_FATAL
-
-STRICT · NO-FALLBACK
---------------------------------------------------------
-- DB 조회 실패/스키마 불일치 등은 즉시 예외(대시보드 healthz도 fail-fast)
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- DB 조회 실패/스키마 불일치/타입 불일치는 즉시 예외
 - 민감정보(DB URL/키 등)는 출력 금지
 - 잘못된 query parameter 는 즉시 예외
 - 조용한 continue / 자동 보정 금지
-- 런타임 설정 변경 금지(구성 불변 규칙)
-- 입력/출력 데이터 무결성 검증 실패 시 즉시 예외
+- runtime/INIT/경고 상태를 명시적으로 분리한다
+- WATCHDOG INIT는 엔진 장애로 취급하지 않는다
 
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
 - 2026-03-11
   1) FIX(ROOT-CAUSE): dashboard health는 DB 최신 orderbook snapshot freshness를 기준 진실원천으로 사용
   2) FIX(ROOT-CAUSE): ws_orderbook_stale watchdog reason은 DB snapshot이 fresh/delayed면 ENGINE_WARNING으로 올리지 않음
   3) ADD(OBSERVABILITY): runtime에 is_warning / warning_reason / freshness_state 추가
   4) FIX(CONTRACT): runtime delayed는 SERVER_STOP이 아니라 SERVER_LIVE로 유지
   5) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
-
-- 2026-03-09:
-  1) FIX(ROOT-CAUSE): /api/engine/health, /api/engine/status에 runtime 상태 추가
-  2) FIX(STRICT): DB orderbook snapshot 기준 SERVER_LIVE / SERVER_STOP 판정 추가
-  3) FIX(STRICT): /api/engine/ws-status에도 runtime 상태 포함
-  4) CLEANUP: runtime 판정 로직 공통 함수로 정리
-
-- 2026-03-08:
-  1) Redis 캐시 연동 추가(STRICT)
-  2) 엔진 WS 상태 조회를 DB 스냅샷 기반으로 변경
-  3) /api/quant-analysis, /api/market-analysis 추가
-  4) bt_events 분석 결과 기록 연동
-  5) 외부 provider quota 초과 시 명시적 503 응답 구조 도입
+  6) FIX(ROOT-CAUSE): WATCHDOG INIT 상태는 engine health에서 경고/치명 사유로 취급하지 않음
+  7) FIX(STRICT): recent trades enrich 경로의 None -> 0.0 보정 제거
 ========================================================
 """
 
@@ -85,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -157,6 +111,9 @@ _ENGINE_RUNTIME_FRESHNESS_FRESH = "fresh"
 _ENGINE_RUNTIME_FRESHNESS_DELAYED = "delayed"
 _ENGINE_RUNTIME_FRESHNESS_STALE = "stale"
 
+_WATCHDOG_STATUS_OK = "OK"
+_WATCHDOG_STATUS_INIT = "INIT"
+
 # watchdog reason 중 dashboard에서 DB 최신 snapshot으로 정규화 가능한 항목
 _DASHBOARD_DB_TRUTH_OVERRIDE_WATCHDOG_REASONS = {
     "ws_orderbook_stale",
@@ -209,6 +166,20 @@ def _require_positive_int(value: Any, name: str, *, max_value: Optional[int] = N
     return iv
 
 
+def _require_nonnegative_int(value: Any, name: str) -> int:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be int, bool not allowed (STRICT)")
+    try:
+        iv = int(value)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
+    if iv < 0:
+        raise RuntimeError(f"{name} must be >= 0 (STRICT)")
+    return iv
+
+
 def _require_nonempty_str(value: Any, name: str) -> str:
     if value is None:
         raise RuntimeError(f"{name} is required (STRICT)")
@@ -217,6 +188,17 @@ def _require_nonempty_str(value: Any, name: str) -> str:
     s = value.strip()
     if not s:
         raise RuntimeError(f"{name} must not be empty (STRICT)")
+    return s
+
+
+def _optional_nonempty_str(value: Any, name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError(f"{name} must be str or null (STRICT), got={type(value).__name__}")
+    s = value.strip()
+    if not s:
+        raise RuntimeError(f"{name} must not be blank when provided (STRICT)")
     return s
 
 
@@ -232,6 +214,20 @@ def _require_bool(value: Any, name: str) -> bool:
     if not isinstance(value, bool):
         raise RuntimeError(f"{name} must be bool (STRICT)")
     return value
+
+
+def _require_finite_float(value: Any, name: str) -> float:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be float, bool not allowed (STRICT)")
+    try:
+        fv = float(value)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be float (STRICT): {exc}") from exc
+    if not math.isfinite(fv):
+        raise RuntimeError(f"{name} must be finite (STRICT): {fv!r}")
+    return fv
 
 
 def _normalize_symbol(symbol: Any) -> str:
@@ -603,9 +599,12 @@ def api_recent_trades(
         trades: List[Dict[str, Any]] = get_recent_trades(db, limit=normalized_limit)
 
         enriched: List[Dict[str, Any]] = []
-        for t in trades:
-            pnl = float(t.get("pnl_usdt") or 0.0)
-            is_auto = bool(t.get("is_auto"))
+        for idx, t in enumerate(trades):
+            if not isinstance(t, dict):
+                raise RuntimeError(f"recent trade item must be dict (STRICT), idx={idx}")
+
+            pnl = _require_finite_float(t.get("pnl_usdt"), f"recent_trades[{idx}].pnl_usdt")
+            is_auto = _require_bool(t.get("is_auto"), f"recent_trades[{idx}].is_auto")
             strategy = t.get("strategy")
             side = t.get("side")
             close_reason = t.get("close_reason")
@@ -617,9 +616,9 @@ def api_recent_trades(
                     "regime_label": _map_regime_label(strategy),
                     "side_label": _map_side_label(side),
                     "close_reason_label": _map_close_reason_label(close_reason),
-                    "is_profit": pnl > 0,
-                    "is_loss": pnl < 0,
-                    "is_breakeven": pnl == 0,
+                    "is_profit": pnl > 0.0,
+                    "is_loss": pnl < 0.0,
+                    "is_breakeven": pnl == 0.0,
                 }
             )
             enriched.append(item)
@@ -1015,6 +1014,7 @@ def _engine_status_from_signals(
     db_latency_ms: int,
     recent_errors: int,
     recent_skips: int,
+    latest_watchdog_status: str,
     latest_watchdog_reason: str,
 ) -> Tuple[str, List[str]]:
     reasons: List[str] = []
@@ -1026,8 +1026,14 @@ def _engine_status_from_signals(
     if recent_skips >= 20:
         reasons.append(f"recent_skips_high:{recent_skips}")
 
+    watchdog_status = _require_nonempty_str(latest_watchdog_status, "latest_watchdog_status")
     watchdog_reason = _require_nonempty_str(latest_watchdog_reason, "latest_watchdog_reason")
-    if watchdog_reason != "ok":
+
+    if watchdog_status not in {_WATCHDOG_STATUS_OK, _WATCHDOG_STATUS_INIT}:
+        raise RuntimeError(f"unsupported latest_watchdog_status (STRICT): {watchdog_status!r}")
+
+    # INIT 상태는 대시보드 초기 상태이지 장애가 아니다.
+    if watchdog_status == _WATCHDOG_STATUS_OK and watchdog_reason != "ok":
         reasons.append(f"watchdog:{watchdog_reason}")
 
     fatal_watchdog_reasons = {"db_lag", "watchdog_internal_error"}
@@ -1038,10 +1044,16 @@ def _engine_status_from_signals(
         "kline_rollback",
     }
 
-    if db_latency_ms >= 3000 or recent_errors >= 3 or watchdog_reason in fatal_watchdog_reasons:
+    if db_latency_ms >= 3000 or recent_errors >= 3:
         return "ENGINE_FATAL", reasons
 
-    if db_latency_ms >= 1200 or recent_skips >= 20 or watchdog_reason in warning_watchdog_reasons:
+    if watchdog_status == _WATCHDOG_STATUS_OK and watchdog_reason in fatal_watchdog_reasons:
+        return "ENGINE_FATAL", reasons
+
+    if db_latency_ms >= 1200 or recent_skips >= 20:
+        return "ENGINE_WARNING", reasons
+
+    if watchdog_status == _WATCHDOG_STATUS_OK and watchdog_reason in warning_watchdog_reasons:
         return "ENGINE_WARNING", reasons
 
     return "ENGINE_OK", reasons
@@ -1176,8 +1188,8 @@ def _fetch_latest_orderbook_snapshot_strict(
     return {
         "symbol": normalized_symbol,
         "ts": ts_ms,
-        "bestBid": float(best_bid) if best_bid is not None else None,
-        "bestAsk": float(best_ask) if best_ask is not None else None,
+        "bestBid": None if best_bid is None else _require_finite_float(best_bid, "orderbook.best_bid"),
+        "bestAsk": None if best_ask is None else _require_finite_float(best_ask, "orderbook.best_ask"),
         "bids_len": len(bids_list) if bids_list is not None else None,
         "asks_len": len(asks_list) if asks_list is not None else None,
         "has_bids": bool(bids_list),
@@ -1288,39 +1300,52 @@ def _build_engine_runtime_status(
     }
 
 
-def _normalize_watchdog_reason_for_dashboard(
+def _normalize_watchdog_signal_for_dashboard(
     *,
+    latest_watchdog_status: str,
     latest_watchdog_reason: str,
     runtime: Dict[str, Any],
-) -> Tuple[str, Optional[str]]:
+) -> Tuple[str, str, Optional[str]]:
+    normalized_watchdog_status = _require_nonempty_str(
+        latest_watchdog_status,
+        "latest_watchdog_status",
+    )
     normalized_watchdog_reason = _require_nonempty_str(
         latest_watchdog_reason,
         "latest_watchdog_reason",
     )
     normalized_runtime = _require_dict(runtime, "runtime")
+
+    if normalized_watchdog_status not in {_WATCHDOG_STATUS_OK, _WATCHDOG_STATUS_INIT}:
+        raise RuntimeError(f"unsupported latest_watchdog_status (STRICT): {normalized_watchdog_status!r}")
+
+    # WATCHDOG INIT = 아직 첫 watchdog가 안 찍힌 초기 상태. 장애 아님.
+    if normalized_watchdog_status == _WATCHDOG_STATUS_INIT:
+        return normalized_watchdog_status, "ok", normalized_watchdog_reason
+
     runtime_status = _require_nonempty_str(normalized_runtime.get("status"), "runtime.status")
     runtime_reason = _require_nonempty_str(normalized_runtime.get("reason"), "runtime.reason")
     freshness_state = _require_nonempty_str(normalized_runtime.get("freshness_state"), "runtime.freshness_state")
 
     if normalized_watchdog_reason not in _DASHBOARD_DB_TRUTH_OVERRIDE_WATCHDOG_REASONS:
-        return normalized_watchdog_reason, None
+        return normalized_watchdog_status, normalized_watchdog_reason, None
 
     if runtime_status != _ENGINE_RUNTIME_STATUS_SERVER_LIVE:
-        return normalized_watchdog_reason, None
+        return normalized_watchdog_status, normalized_watchdog_reason, None
 
     if freshness_state not in {
         _ENGINE_RUNTIME_FRESHNESS_FRESH,
         _ENGINE_RUNTIME_FRESHNESS_DELAYED,
     }:
-        return normalized_watchdog_reason, None
+        return normalized_watchdog_status, normalized_watchdog_reason, None
 
     if runtime_reason not in {
         "orderbook_snapshot_fresh",
         "orderbook_snapshot_delayed",
     }:
-        return normalized_watchdog_reason, None
+        return normalized_watchdog_status, normalized_watchdog_reason, None
 
-    return "ok", normalized_watchdog_reason
+    return normalized_watchdog_status, "ok", normalized_watchdog_reason
 
 
 def _ws_status(
@@ -1409,8 +1434,10 @@ def api_engine_health(
     db_ms = _db_latency_ms(db)
     recent_errors = _count_recent_events_strict(db, minutes=10, event_type="ERROR")
     recent_skips = _count_recent_events_strict(db, minutes=10, event_type="SKIP")
+
     latest_watchdog = get_latest_watchdog_snapshot(db, include_test=False)
     latest_watchdog = _require_dict(latest_watchdog, "latest_watchdog")
+    watchdog_status_raw = _require_nonempty_str(latest_watchdog.get("status"), "latest_watchdog.status")
     watchdog_reason_raw = _require_nonempty_str(latest_watchdog.get("reason"), "latest_watchdog.reason")
 
     ws_status = _ws_status(
@@ -1421,15 +1448,19 @@ def api_engine_health(
     )
     runtime = _require_dict(ws_status.get("runtime"), "ws_status.runtime")
 
-    watchdog_reason_effective, watchdog_reason_overridden = _normalize_watchdog_reason_for_dashboard(
-        latest_watchdog_reason=watchdog_reason_raw,
-        runtime=runtime,
+    watchdog_status_effective, watchdog_reason_effective, watchdog_reason_overridden = (
+        _normalize_watchdog_signal_for_dashboard(
+            latest_watchdog_status=watchdog_status_raw,
+            latest_watchdog_reason=watchdog_reason_raw,
+            runtime=runtime,
+        )
     )
 
     status, reasons = _engine_status_from_signals(
         db_latency_ms=db_ms,
         recent_errors=recent_errors,
         recent_skips=recent_skips,
+        latest_watchdog_status=watchdog_status_effective,
         latest_watchdog_reason=watchdog_reason_effective,
     )
 
@@ -1442,6 +1473,8 @@ def api_engine_health(
         "recent_errors": int(recent_errors),
         "recent_skips": int(recent_skips),
         "latest_watchdog": latest_watchdog,
+        "watchdog_status_raw": watchdog_status_raw,
+        "watchdog_status_effective": watchdog_status_effective,
         "watchdog_reason_raw": watchdog_reason_raw,
         "watchdog_reason_effective": watchdog_reason_effective,
         "watchdog_reason_overridden": watchdog_reason_overridden,

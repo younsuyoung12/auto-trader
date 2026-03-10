@@ -1,60 +1,31 @@
 """
 ========================================================
 FILE: services/decision_service.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-
-역할
---------------------------------------------------------
+ROLE:
 - bt_events 테이블의 DECISION 이벤트를 조회한다.
 - 대시보드 "의사결정 이유" 패널에 필요한 구조로 정규화한다.
-- 잘못된 event payload / 누락 필드 / 비정상 타입은 즉시 예외로 실패한다.
+- DECISION 이벤트 미존재 초기 상태를 명시적 INIT 상태로 표현한다.
 
-지원 기능
---------------------------------------------------------
+CORE RESPONSIBILITIES:
 - 최신 DECISION 1건 조회
 - 최근 DECISION 목록 조회
+- DECISION extra_json 필수/선택 스키마 엄격 검증
+- 초기 무데이터 상태와 실제 데이터 이상을 구분 처리
 
-DECISION extra_json 필수 스키마
---------------------------------------------------------
-{
-  "action": "ENTRY" | "NO_ENTRY" | "HOLD" | "EXIT",
-  "summary": "현재 판단 요약",
-  "reasons": ["사유1", "사유2", ...],
-  "entry_score": 1.82,
-  "trend_strength": 0.64,
-  "spread": 1.25,
-  "orderbook_imbalance": 0.41
-}
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- DECISION 이벤트가 존재하는데 payload/필수 키/타입이 틀리면 즉시 예외
+- DECISION 이벤트가 아직 없으면 대시보드 조회 계층에서 명시적 INIT 상태 반환
+- extra_json이 dict가 아니면 즉시 예외
+- 숫자형 필드는 finite float/int 아니면 즉시 예외
+- 임의 기본값/더미값/자동 보정 금지
 
-DECISION extra_json 선택 스키마
---------------------------------------------------------
-{
-  "threshold": 1.80,
-  "exit_score": 0.42,
-  "current_price": 62450.5,
-  "entry_price": 62300.0,
-  "target_price": 63000.0,
-  "stop_price": 62000.0,
-  "pnl_pct": 0.84,
-  "position_qty": 0.01,
-  "signal_source": "ws_signal_candidate"
-}
-
-절대 원칙 (STRICT · NO-FALLBACK)
---------------------------------------------------------
-- DECISION 이벤트가 없으면 즉시 예외.
-- extra_json이 dict가 아니면 즉시 예외.
-- 필수 키 누락 시 즉시 예외.
-- 숫자형 필드는 finite float/int 아니면 즉시 예외.
-- 임의 기본값/더미값/자동 보정 금지.
-
-변경 이력
---------------------------------------------------------
-- 2026-03-06:
-  1) 신규 생성: DECISION 이벤트 조회/검증 서비스 추가
-  2) 최신 DECISION / 최근 DECISION 목록 조회 기능 추가
-  3) 대시보드용 엄격 스키마 정규화 추가
+CHANGE HISTORY:
+- 2026-03-11
+  1) FIX(ROOT-CAUSE): DECISION 미존재를 RuntimeError가 아닌 명시적 INIT 상태로 모델링
+  2) FIX(ARCH): 엔진 STRICT와 대시보드 조회 계층의 초기 상태를 분리
+  3) FIX(CONTRACT): latest decision 응답에 status / data_state / has_decision 필드 추가
+  4) FIX(CONTRACT): recent decisions는 무데이터 시 빈 배열 반환
 ========================================================
 """
 
@@ -63,13 +34,19 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
 _ALLOWED_ACTIONS = ("ENTRY", "NO_ENTRY", "HOLD", "EXIT")
+
+_DECISION_STATUS_READY = "READY"
+_DECISION_STATUS_INIT = "INIT"
+_DECISION_DATA_STATE_READY = "READY"
+_DECISION_DATA_STATE_INIT_NO_DECISION = "INIT_NO_DECISION"
+_DECISION_INIT_REASON_NO_EVENT = "no_decision_event"
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +76,9 @@ class DecisionRecord:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "status": _DECISION_STATUS_READY,
+            "data_state": _DECISION_DATA_STATE_READY,
+            "has_decision": True,
             "id": self.id,
             "ts_utc": self.ts_utc,
             "symbol": self.symbol,
@@ -210,8 +190,8 @@ def _require_str_list(value: Any, name: str) -> List[str]:
 def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:
     if value is None:
         raise RuntimeError(f"{name} is required (STRICT)")
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"{name} must be dict/mapping (STRICT), got={type(value).__name__}")
     return value
 
 
@@ -220,6 +200,36 @@ def _normalize_action(value: Any) -> str:
     if action not in _ALLOWED_ACTIONS:
         raise RuntimeError(f"unsupported DECISION action (STRICT): {action!r}")
     return action
+
+
+def _build_init_latest_decision() -> Dict[str, Any]:
+    return {
+        "status": _DECISION_STATUS_INIT,
+        "data_state": _DECISION_DATA_STATE_INIT_NO_DECISION,
+        "has_decision": False,
+        "id": None,
+        "ts_utc": None,
+        "symbol": None,
+        "action": None,
+        "reason_code": _DECISION_INIT_REASON_NO_EVENT,
+        "summary": None,
+        "reasons": [],
+        "entry_score": None,
+        "trend_strength": None,
+        "spread": None,
+        "orderbook_imbalance": None,
+        "regime": None,
+        "side": None,
+        "threshold": None,
+        "exit_score": None,
+        "current_price": None,
+        "entry_price": None,
+        "target_price": None,
+        "stop_price": None,
+        "pnl_pct": None,
+        "position_qty": None,
+        "signal_source": None,
+    }
 
 
 def _normalize_row(row: Mapping[str, Any]) -> DecisionRecord:
@@ -277,9 +287,10 @@ def _normalize_row(row: Mapping[str, Any]) -> DecisionRecord:
     )
 
 
-def _fetch_decision_rows(db: Session, *, limit: int, include_test: bool) -> Sequence[Mapping[str, Any]]:
+def _fetch_decision_rows(db: Session, *, limit: int, include_test: bool) -> List[Mapping[str, Any]]:
     if db is None:
         raise RuntimeError("db session is required (STRICT)")
+
     sql = text(
         """
         SELECT
@@ -305,13 +316,14 @@ def _fetch_decision_rows(db: Session, *, limit: int, include_test: bool) -> Sequ
         },
     ).mappings().all()
 
-    if not rows:
-        raise RuntimeError("DECISION event not found (STRICT)")
-    return rows
+    return list(rows)
 
 
 def get_latest_decision(db: Session, *, include_test: bool = False) -> Dict[str, Any]:
     rows = _fetch_decision_rows(db, limit=1, include_test=include_test)
+    if not rows:
+        return _build_init_latest_decision()
+
     record = _normalize_row(rows[0])
     return record.to_dict()
 
@@ -323,6 +335,9 @@ def get_recent_decisions(
     include_test: bool = False,
 ) -> List[Dict[str, Any]]:
     rows = _fetch_decision_rows(db, limit=limit, include_test=include_test)
+    if not rows:
+        return []
+
     out: List[Dict[str, Any]] = []
     for row in rows:
         out.append(_normalize_row(row).to_dict())

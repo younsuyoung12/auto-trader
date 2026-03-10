@@ -288,7 +288,7 @@ class Settings:
 
     depth_imbalance_enabled: bool = True
     depth_imbalance_min_notional: float = 10.0
-    depth_imbalance_min_ratio: float = 2.0
+    depth_imbalance_min_ratio: float = 1.35
 
     price_deviation_guard_enabled: bool = True
     price_deviation_max_pct: float = 0.0015

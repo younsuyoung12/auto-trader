@@ -1,59 +1,31 @@
 """
 ========================================================
 FILE: services/performance_service.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- v_trades_prod 기준 종료 거래 성과를 계산하고
+  대시보드 "성과 분석" 패널용 구조로 정규화한다.
+- 거래 데이터가 아직 없는 초기 상태를 명시적으로 INIT로 처리한다.
 
-역할
---------------------------------------------------------
-- v_trades_prod 기준으로 종료 거래 성과를 계산한다.
-- 대시보드 "성과 분석" 패널에 필요한 구조로 정규화한다.
-- 손익 요약 / Equity Curve / Drawdown Curve / 일별 손익을 계산한다.
-- 잘못된 컬럼 / 누락 필드 / 비정상 타입은 즉시 예외로 실패한다.
+CORE RESPONSIBILITIES:
+- v_trades_prod 필수 컬럼/스키마 검증
+- 종료 거래 성과 요약 계산
+- Equity Curve / Drawdown Curve / 최근 N일 일별 손익 계산
+- 거래 없음(초기 상태)과 스키마/데이터 이상을 구분 처리
 
-지원 기능
---------------------------------------------------------
-- 성과 요약 조회
-- Equity Curve 조회
-- Drawdown Curve 조회
-- 최근 N일 일별 손익 조회
-- 성과 번들(summary + equity + drawdown + daily_pnl) 조회
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 스키마/컬럼/타입/비정상 값 불일치는 즉시 예외
+- 거래 데이터 부재는 대시보드 조회 계층에서 명시적 INIT 상태로 처리
+- gross_loss_abs_usdt = 0 인 경우 profit_factor는 None
+- peak_equity <= 0 인 구간의 drawdown_pct는 None
+- 임의 보정/더미 데이터 생성 금지
 
-데이터 소스
---------------------------------------------------------
-- v_trades_prod
-  * 필수 컬럼:
-    - id
-    - exit_ts
-    - pnl_usdt
-
-절대 원칙 (STRICT · NO-FALLBACK)
---------------------------------------------------------
-- 종료 거래가 없으면 즉시 예외.
-- 필수 컬럼 누락 시 즉시 예외.
-- 숫자형 필드는 finite float/int 아니면 즉시 예외.
-- 임의 기본값/더미값/자동 보정 금지.
-- gross_loss_abs_usdt = 0 인 경우 profit_factor는 정의되지 않으므로 None 반환.
-- peak_equity <= 0 인 구간의 drawdown_pct는 정의되지 않으므로 None 반환.
-
-PATCH NOTES — 2026-03-07 (TRADE-GRADE)
---------------------------------------------------------
-- v_trades_prod 스키마/데이터 진단 강화
-  1) information_schema 기준 필수 컬럼(id / exit_ts / pnl_usdt) 존재 검증 추가
-  2) "뷰 자체가 비었는지" vs "행은 있는데 종료거래(exit_ts IS NOT NULL)가 없는지"를 구분해서 즉시 예외
-  3) 최근 N일 daily pnl 부재 시에도 전체 종료거래 존재 여부를 먼저 검증하여 원인 메시지 명확화
-- 기존 계산 로직(summary / equity / drawdown / daily pnl)은 변경하지 않음
-
-변경 이력
---------------------------------------------------------
-- 2026-03-07:
-  1) v_trades_prod 스키마 검증 추가
-  2) 종료거래 부재 원인 메시지 세분화
-  3) 기존 성과 계산 기능 변경 없음
-- 2026-03-06:
-  1) 신규 생성: 성과 분석 서비스 추가
-  2) summary / equity curve / drawdown curve / daily pnl 계산 기능 추가
-  3) 대시보드용 엄격 스키마 정규화 추가
+CHANGE HISTORY:
+- 2026-03-11
+  1) FIX(ROOT-CAUSE): 종료 거래 없음/거래 없음 상태를 RuntimeError가 아닌 INIT 상태로 모델링
+  2) FIX(ARCH): 엔진 STRICT와 대시보드 조회 계층의 초기 상태를 분리
+  3) FIX(SCHEMA): information_schema에 v_trades_prod가 없으면 즉시 예외 처리
+  4) FIX(CONTRACT): summary는 0 요약 + data_state 반환, curve/daily는 빈 배열 반환
 ========================================================
 """
 
@@ -70,6 +42,10 @@ from sqlalchemy.orm import Session
 
 _REQUIRED_V_TRADES_PROD_COLUMNS: Set[str] = {"id", "exit_ts", "pnl_usdt"}
 
+_DATA_STATE_READY = "READY"
+_DATA_STATE_INIT_NO_TRADES = "INIT_NO_TRADES"
+_DATA_STATE_INIT_NO_CLOSED_TRADES = "INIT_NO_CLOSED_TRADES"
+
 
 @dataclass(frozen=True, slots=True)
 class ClosedTradePoint:
@@ -82,6 +58,21 @@ class ClosedTradePoint:
             "id": self.id,
             "exit_ts": self.exit_ts,
             "pnl_usdt": self.pnl_usdt,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TradeDatasetState:
+    total_rows: int
+    closed_rows: int
+    data_state: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_rows": self.total_rows,
+            "closed_rows": self.closed_rows,
+            "data_state": self.data_state,
+            "has_closed_trades": self.closed_rows > 0,
         }
 
 
@@ -102,6 +93,8 @@ class PerformanceSummary:
     expectancy_usdt: float
     max_drawdown_usdt: float
     max_drawdown_pct: Optional[float]
+    data_state: str
+    has_closed_trades: bool
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -120,6 +113,8 @@ class PerformanceSummary:
             "expectancy_usdt": self.expectancy_usdt,
             "max_drawdown_usdt": self.max_drawdown_usdt,
             "max_drawdown_pct": self.max_drawdown_pct,
+            "data_state": self.data_state,
+            "has_closed_trades": self.has_closed_trades,
         }
 
 
@@ -134,6 +129,20 @@ def _require_int(value: Any, name: str) -> int:
         raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
     if iv <= 0:
         raise RuntimeError(f"{name} must be > 0 (STRICT)")
+    return iv
+
+
+def _require_nonnegative_int(value: Any, name: str) -> int:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be int, bool not allowed (STRICT)")
+    try:
+        iv = int(value)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
+    if iv < 0:
+        raise RuntimeError(f"{name} must be >= 0 (STRICT)")
     return iv
 
 
@@ -197,12 +206,7 @@ def _assert_v_trades_prod_required_columns(db: Session) -> None:
     )
     rows = db.execute(sql).mappings().all()
     if not rows:
-        return {
-            "total_trades": 0,
-            "wins": 0,
-            "losses": 0,
-            "total_pnl_usdt": 0
-        }
+        raise RuntimeError("v_trades_prod not found in information_schema (STRICT)")
 
     present = {str(row.get("column_name", "")).strip() for row in rows}
     missing = sorted(_REQUIRED_V_TRADES_PROD_COLUMNS - present)
@@ -213,25 +217,60 @@ def _assert_v_trades_prod_required_columns(db: Session) -> None:
 def _count_v_trades_prod_rows(db: Session) -> int:
     sql = text("SELECT COUNT(*) AS cnt FROM v_trades_prod")
     row = db.execute(sql).mappings().one()
-    cnt_raw = row.get("cnt")
-    if cnt_raw is None:
-        raise RuntimeError("COUNT(*) from v_trades_prod returned NULL (STRICT)")
-    if isinstance(cnt_raw, bool):
-        raise RuntimeError("COUNT(*) from v_trades_prod must be int, bool not allowed (STRICT)")
-    try:
-        cnt = int(cnt_raw)
-    except Exception as exc:
-        raise RuntimeError(f"COUNT(*) from v_trades_prod must be int (STRICT): {exc}") from exc
-    if cnt < 0:
-        raise RuntimeError("COUNT(*) from v_trades_prod must be >= 0 (STRICT)")
-    return cnt
+
+    return _require_nonnegative_int(row.get("cnt"), "COUNT(*) FROM v_trades_prod")
+
+
+def _count_closed_v_trades_prod_rows(db: Session) -> int:
+    sql = text(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM v_trades_prod
+        WHERE exit_ts IS NOT NULL
+        """
+    )
+    row = db.execute(sql).mappings().one()
+
+    return _require_nonnegative_int(row.get("cnt"), "COUNT(*) FROM v_trades_prod WHERE exit_ts IS NOT NULL")
+
+
+def _get_trade_dataset_state(db: Session) -> TradeDatasetState:
+    if db is None:
+        raise RuntimeError("db session is required (STRICT)")
+
+    _assert_v_trades_prod_required_columns(db)
+
+    total_rows = _count_v_trades_prod_rows(db)
+    closed_rows = _count_closed_v_trades_prod_rows(db)
+
+    if total_rows == 0:
+        return TradeDatasetState(
+            total_rows=0,
+            closed_rows=0,
+            data_state=_DATA_STATE_INIT_NO_TRADES,
+        )
+
+    if closed_rows == 0:
+        return TradeDatasetState(
+            total_rows=total_rows,
+            closed_rows=0,
+            data_state=_DATA_STATE_INIT_NO_CLOSED_TRADES,
+        )
+
+    return TradeDatasetState(
+        total_rows=total_rows,
+        closed_rows=closed_rows,
+        data_state=_DATA_STATE_READY,
+    )
 
 
 def _fetch_closed_trades(db: Session) -> List[ClosedTradePoint]:
     if db is None:
         raise RuntimeError("db session is required (STRICT)")
 
-    _assert_v_trades_prod_required_columns(db)
+    dataset_state = _get_trade_dataset_state(db)
+    if dataset_state.closed_rows == 0:
+        return []
 
     sql = text(
         """
@@ -246,19 +285,54 @@ def _fetch_closed_trades(db: Session) -> List[ClosedTradePoint]:
     )
     rows = db.execute(sql).mappings().all()
     if not rows:
-        total_rows = _count_v_trades_prod_rows(db)
-        if total_rows <= 0:
-            raise RuntimeError("v_trades_prod is empty (STRICT)")
-        raise RuntimeError("v_trades_prod has rows but no closed trades with exit_ts IS NOT NULL (STRICT)")
+        raise RuntimeError(
+            "v_trades_prod closed trade count > 0 but SELECT returned no rows (STRICT)"
+        )
 
     out: List[ClosedTradePoint] = []
     for row in rows:
         out.append(_normalize_closed_trade_row(row))
+
+    if len(out) != dataset_state.closed_rows:
+        raise RuntimeError(
+            "closed trade count mismatch between COUNT(*) and row fetch (STRICT)"
+        )
+
     return out
 
 
+def _build_empty_performance_summary(data_state: str) -> Dict[str, Any]:
+    if data_state not in {_DATA_STATE_INIT_NO_TRADES, _DATA_STATE_INIT_NO_CLOSED_TRADES}:
+        raise RuntimeError(f"invalid empty performance data_state (STRICT): {data_state!r}")
+
+    summary = PerformanceSummary(
+        total_trades=0,
+        wins=0,
+        losses=0,
+        breakevens=0,
+        win_rate_pct=0.0,
+        total_pnl_usdt=0.0,
+        avg_pnl_usdt=0.0,
+        gross_profit_usdt=0.0,
+        gross_loss_abs_usdt=0.0,
+        avg_win_usdt=None,
+        avg_loss_abs_usdt=None,
+        profit_factor=None,
+        expectancy_usdt=0.0,
+        max_drawdown_usdt=0.0,
+        max_drawdown_pct=None,
+        data_state=data_state,
+        has_closed_trades=False,
+    )
+    return summary.to_dict()
+
+
 def get_performance_summary(db: Session) -> Dict[str, Any]:
+    dataset_state = _get_trade_dataset_state(db)
     trades = _fetch_closed_trades(db)
+
+    if not trades:
+        return _build_empty_performance_summary(dataset_state.data_state)
 
     total_trades = len(trades)
     wins = 0
@@ -321,6 +395,8 @@ def get_performance_summary(db: Session) -> Dict[str, Any]:
         expectancy_usdt=expectancy_usdt,
         max_drawdown_usdt=max_drawdown_usdt,
         max_drawdown_pct=max_drawdown_pct,
+        data_state=_DATA_STATE_READY,
+        has_closed_trades=True,
     )
     return summary.to_dict()
 
@@ -328,6 +404,9 @@ def get_performance_summary(db: Session) -> Dict[str, Any]:
 def get_equity_curve(db: Session, *, limit: int = 1000) -> List[Dict[str, Any]]:
     normalized_limit = _require_int(limit, "limit")
     trades = _fetch_closed_trades(db)
+    if not trades:
+        return []
+
     if normalized_limit > len(trades):
         normalized_limit = len(trades)
 
@@ -347,13 +426,16 @@ def get_equity_curve(db: Session, *, limit: int = 1000) -> List[Dict[str, Any]]:
         )
 
     if not out:
-        raise RuntimeError("equity curve empty (STRICT)")
+        raise RuntimeError("equity curve empty despite closed trades existing (STRICT)")
     return out
 
 
 def get_drawdown_curve(db: Session, *, limit: int = 1000) -> List[Dict[str, Any]]:
     normalized_limit = _require_int(limit, "limit")
     trades = _fetch_closed_trades(db)
+    if not trades:
+        return []
+
     if normalized_limit > len(trades):
         normalized_limit = len(trades)
 
@@ -385,7 +467,7 @@ def get_drawdown_curve(db: Session, *, limit: int = 1000) -> List[Dict[str, Any]
         )
 
     if not out:
-        raise RuntimeError("drawdown curve empty (STRICT)")
+        raise RuntimeError("drawdown curve empty despite closed trades existing (STRICT)")
     return out
 
 
@@ -394,7 +476,9 @@ def get_daily_pnl_series(db: Session, *, days: int = 30) -> List[Dict[str, Any]]
         raise RuntimeError("db session is required (STRICT)")
 
     normalized_days = _require_int(days, "days")
-    _assert_v_trades_prod_required_columns(db)
+    dataset_state = _get_trade_dataset_state(db)
+    if dataset_state.closed_rows == 0:
+        return []
 
     sql = text(
         """
@@ -411,10 +495,7 @@ def get_daily_pnl_series(db: Session, *, days: int = 30) -> List[Dict[str, Any]]
     )
     rows = db.execute(sql, {"days": normalized_days}).mappings().all()
     if not rows:
-        closed_trades = _fetch_closed_trades(db)
-        if not closed_trades:
-            raise RuntimeError("daily pnl series not found because closed trades do not exist (STRICT)")
-        raise RuntimeError(f"daily pnl series not found in last {normalized_days} days (STRICT)")
+        return []
 
     out: List[Dict[str, Any]] = []
     for row in rows:
@@ -425,17 +506,9 @@ def get_daily_pnl_series(db: Session, *, days: int = 30) -> List[Dict[str, Any]]
             raise RuntimeError(f"trade_date must be date (STRICT), got={type(trade_date).__name__}")
 
         pnl_usdt = _require_float(row.get("pnl_usdt"), "SUM(pnl_usdt)")
-        trade_count_raw = row.get("trade_count")
-        if trade_count_raw is None:
-            raise RuntimeError("trade_count is required (STRICT)")
-        if isinstance(trade_count_raw, bool):
-            raise RuntimeError("trade_count must be int, bool not allowed (STRICT)")
-        try:
-            trade_count = int(trade_count_raw)
-        except Exception as exc:
-            raise RuntimeError(f"trade_count must be int (STRICT): {exc}") from exc
-        if trade_count <= 0:
-            raise RuntimeError("trade_count must be > 0 (STRICT)")
+        trade_count = _require_nonnegative_int(row.get("trade_count"), "trade_count")
+        if trade_count == 0:
+            raise RuntimeError("trade_count must be > 0 when grouped row exists (STRICT)")
 
         out.append(
             {
@@ -464,6 +537,7 @@ def get_performance_bundle(
 
 __all__ = [
     "ClosedTradePoint",
+    "TradeDatasetState",
     "PerformanceSummary",
     "get_performance_summary",
     "get_equity_curve",
