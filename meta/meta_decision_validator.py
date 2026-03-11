@@ -18,6 +18,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-11:
+  1) FIX(STRICT): RECOMMEND_SAFE_STOP action 불변식 강화
+     - allocation_ratio_cap=0.0 강제
+     - disable_directions=[LONG, SHORT] 강제
+     - risk_multiplier_delta>0 금지
+  2) FIX(STRICT): ADJUST_PARAMS에서 양방향 비활성화 금지
+  3) FIX(STRICT): tags 중복/공백/과다 길이 검증 추가
+  4) FIX(CONTRACT): version 문자열 형식 검증 추가
 - 2026-03-03:
   1) 신규 생성: Meta Strategy(레벨3) GPT 응답 검증기
   2) 스키마 고정(unknown key 금지) + 범위 검증 + 금지 행위 검증
@@ -29,8 +37,9 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 
 class MetaDecisionValidationError(RuntimeError):
@@ -122,6 +131,8 @@ _GUARD_KEYS: Set[str] = {
     "min_entry_volume_ratio_mult",
 }
 
+_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+
 
 def _fail(msg: str, exc: Optional[BaseException] = None) -> None:
     if exc is None:
@@ -133,6 +144,13 @@ def _require_nonempty_str(v: Any, name: str) -> str:
     s = str(v or "").strip()
     if not s:
         _fail(f"{name} is required (STRICT)")
+    return s
+
+
+def _require_version_str(v: Any, name: str) -> str:
+    s = _require_nonempty_str(v, name)
+    if not _VERSION_RE.fullmatch(s):
+        _fail(f"{name} format invalid (STRICT)")
     return s
 
 
@@ -183,10 +201,19 @@ def _require_list_str(v: Any, name: str, *, allow_empty: bool) -> List[str]:
         _fail(f"{name} must be list (STRICT)")
     if not allow_empty and not v:
         _fail(f"{name} must be non-empty list (STRICT)")
+
     out: List[str] = []
+    seen: Set[str] = set()
+
     for i, it in enumerate(v):
         s = _require_nonempty_str(it, f"{name}[{i}]")
+        if len(s) > 64:
+            _fail(f"{name}[{i}] too long (STRICT)")
+        if s in seen:
+            _fail(f"{name} contains duplicate value (STRICT): {s!r}")
+        seen.add(s)
         out.append(s)
+
     return out
 
 
@@ -250,7 +277,7 @@ def validate_meta_decision_dict(
         if k not in response_obj:
             _fail(f"response missing key (STRICT): {k}")
 
-    version = _require_nonempty_str(response_obj.get("version"), "resp.version")
+    version = _require_version_str(response_obj.get("version"), "resp.version")
     action = _require_nonempty_str(response_obj.get("action"), "resp.action").upper()
     if action not in _ALLOWED_ACTIONS:
         _fail(f"resp.action invalid (STRICT): {action!r}")
@@ -275,8 +302,18 @@ def validate_meta_decision_dict(
         if k not in rec:
             _fail(f"recommendation missing key (STRICT): {k}")
 
-    risk_delta = _require_float(rec.get("risk_multiplier_delta"), "rec.risk_multiplier_delta", min_value=-0.50, max_value=0.50)
-    allocation_cap = _require_float(rec.get("allocation_ratio_cap"), "rec.allocation_ratio_cap", min_value=0.0, max_value=1.0)
+    risk_delta = _require_float(
+        rec.get("risk_multiplier_delta"),
+        "rec.risk_multiplier_delta",
+        min_value=-0.50,
+        max_value=0.50,
+    )
+    allocation_cap = _require_float(
+        rec.get("allocation_ratio_cap"),
+        "rec.allocation_ratio_cap",
+        min_value=0.0,
+        max_value=1.0,
+    )
 
     disable_raw = rec.get("disable_directions")
     disable_list = _require_list_str(disable_raw, "rec.disable_directions", allow_empty=True)
@@ -294,9 +331,24 @@ def validate_meta_decision_dict(
         if k not in guard_mults:
             _fail(f"guard_multipliers missing key (STRICT): {k}")
 
-    max_spread_mult = _require_float(guard_mults.get("max_spread_pct_mult"), "guard.max_spread_pct_mult", min_value=0.50, max_value=2.00)
-    max_jump_mult = _require_float(guard_mults.get("max_price_jump_pct_mult"), "guard.max_price_jump_pct_mult", min_value=0.50, max_value=2.00)
-    min_vol_mult = _require_float(guard_mults.get("min_entry_volume_ratio_mult"), "guard.min_entry_volume_ratio_mult", min_value=0.50, max_value=2.00)
+    max_spread_mult = _require_float(
+        guard_mults.get("max_spread_pct_mult"),
+        "guard.max_spread_pct_mult",
+        min_value=0.50,
+        max_value=2.00,
+    )
+    max_jump_mult = _require_float(
+        guard_mults.get("max_price_jump_pct_mult"),
+        "guard.max_price_jump_pct_mult",
+        min_value=0.50,
+        max_value=2.00,
+    )
+    min_vol_mult = _require_float(
+        guard_mults.get("min_entry_volume_ratio_mult"),
+        "guard.min_entry_volume_ratio_mult",
+        min_value=0.50,
+        max_value=2.00,
+    )
 
     # Derived values (NO CLAMP)
     final_risk_mult = float(ctx.base_risk_multiplier) + float(risk_delta)
@@ -319,6 +371,8 @@ def validate_meta_decision_dict(
     if eff_min_vol > 1.0:
         _fail("effective_min_entry_volume_ratio > 1.0 (STRICT)")
 
+    disabled_both = set(disable_dirs) == {"LONG", "SHORT"}
+
     # Action-specific invariants
     if action == "NO_CHANGE":
         if abs(risk_delta) > 1e-12:
@@ -334,14 +388,23 @@ def validate_meta_decision_dict(
         if abs(min_vol_mult - 1.0) > 1e-12:
             _fail("NO_CHANGE requires min_entry_volume_ratio_mult=1 (STRICT)")
 
+    if action == "ADJUST_PARAMS":
+        if disabled_both:
+            _fail("ADJUST_PARAMS cannot disable both LONG and SHORT (STRICT)")
+
     if action == "RECOMMEND_SAFE_STOP":
         if severity < 2:
             _fail("RECOMMEND_SAFE_STOP requires severity>=2 (STRICT)")
+        if abs(allocation_cap - 0.0) > 1e-12:
+            _fail("RECOMMEND_SAFE_STOP requires allocation_ratio_cap=0 (STRICT)")
+        if not disabled_both:
+            _fail("RECOMMEND_SAFE_STOP requires disable_directions=[LONG, SHORT] (STRICT)")
+        if risk_delta > 0.0:
+            _fail("RECOMMEND_SAFE_STOP cannot increase risk_multiplier_delta (STRICT)")
 
     # If both directions are disabled, it is effectively safe-stop.
-    if set(disable_dirs) == {"LONG", "SHORT"}:
-        if action != "RECOMMEND_SAFE_STOP":
-            _fail("disable_directions=[LONG,SHORT] requires action=RECOMMEND_SAFE_STOP (STRICT)")
+    if disabled_both and action != "RECOMMEND_SAFE_STOP":
+        _fail("disable_directions=[LONG,SHORT] requires action=RECOMMEND_SAFE_STOP (STRICT)")
 
     return ValidatedMetaDecision(
         version=version,

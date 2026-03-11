@@ -27,6 +27,12 @@ IMPORTANT POLICY:
 - 현재 비치명 주문 거절로 허용하는 케이스는 Binance code=-2019 (Margin is insufficient) 뿐이다
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(STRICT): qty sizing 시 settings.max_leverage 기본값 fallback 제거
+  2) FIX(STRICT): qty sizing 시 settings.execution_price_slippage_guard 기본값 fallback 제거
+  3) FEAT(RISK): settings.max_risk_pct 상한 검증 추가
+  4) FIX(CONTRACT): qty 와 risk_pct 동시 입력 시 즉시 예외 처리
+  5) FIX(CONTRACT): entry_price_hint alias 우선순위를 mark_price 중심으로 정렬
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): signal.symbol 누락 시 settings.symbol 로 진행하던 숨은 fallback 제거
   2) FIX(ROOT-CAUSE): action 필수화 및 ENTER 외 실행 금지
@@ -244,6 +250,13 @@ def _normalize_optional_client_order_id_strict(value: Any) -> Optional[str]:
     return cid
 
 
+def _require_settings_value_strict(settings: Any, field_name: str) -> Any:
+    value = getattr(settings, field_name, None)
+    if value is None:
+        raise OrderExecutionError(f"settings.{field_name} missing (STRICT)")
+    return value
+
+
 def _extract_normalized_value_strict(
     *,
     search_spaces: tuple[tuple[str, Mapping[str, Any]], ...],
@@ -326,23 +339,57 @@ def _compute_qty_from_risk_strict(
     entry_price_hint: float,
     settings: Any,
 ) -> float:
-    leverage_raw = getattr(settings, "leverage", None)
-    if leverage_raw is None:
-        raise OrderExecutionError("settings.leverage missing for qty sizing (STRICT)")
+    normalized_capital_usdt = _normalize_positive_float_strict(
+        capital_usdt,
+        field_name="capital_usdt",
+    )
+    normalized_risk_pct = _normalize_ratio_float_strict(
+        risk_pct,
+        field_name="risk_pct",
+    )
+    normalized_entry_price_hint = _normalize_positive_float_strict(
+        entry_price_hint,
+        field_name="entry_price_hint",
+    )
 
-    try:
-        leverage = float(leverage_raw)
-    except Exception as e:
-        raise OrderExecutionError("settings.leverage must be numeric (STRICT)") from e
+    leverage = _normalize_positive_float_strict(
+        _require_settings_value_strict(settings, "leverage"),
+        field_name="settings.leverage",
+    )
+    max_leverage = _normalize_positive_float_strict(
+        _require_settings_value_strict(settings, "max_leverage"),
+        field_name="settings.max_leverage",
+    )
+    if leverage > max_leverage:
+        raise OrderExecutionError(
+            f"leverage exceeds max_leverage (STRICT): {leverage} > {max_leverage}"
+        )
 
-    if not math.isfinite(leverage) or leverage <= 0.0:
-        raise OrderExecutionError("settings.leverage must be finite > 0 (STRICT)")
+    max_risk_pct = _normalize_ratio_float_strict(
+        _require_settings_value_strict(settings, "max_risk_pct"),
+        field_name="settings.max_risk_pct",
+    )
+    if normalized_risk_pct > max_risk_pct:
+        raise OrderExecutionError(
+            f"risk_pct exceeds max_risk_pct (STRICT): {normalized_risk_pct} > {max_risk_pct}"
+        )
 
-    notional_usdt = capital_usdt * risk_pct * leverage
+    slippage_guard = _normalize_nonnegative_float_strict(
+        _require_settings_value_strict(settings, "execution_price_slippage_guard"),
+        field_name="settings.execution_price_slippage_guard",
+    )
+    if slippage_guard > 0.1:
+        raise OrderExecutionError("settings.execution_price_slippage_guard too large (STRICT)")
+
+    notional_usdt = normalized_capital_usdt * normalized_risk_pct * leverage
     if not math.isfinite(notional_usdt) or notional_usdt <= 0.0:
         raise OrderExecutionError("computed notional_usdt invalid (STRICT)")
 
-    qty = notional_usdt / entry_price_hint
+    effective_price = normalized_entry_price_hint * (1.0 + slippage_guard)
+    if not math.isfinite(effective_price) or effective_price <= 0.0:
+        raise OrderExecutionError("computed effective_price invalid (STRICT)")
+
+    qty = notional_usdt / effective_price
     if not math.isfinite(qty) or qty <= 0.0:
         raise OrderExecutionError("computed qty invalid (STRICT)")
 
@@ -599,7 +646,7 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
     entry_price_hint = _extract_normalized_value_strict(
         search_spaces=search_spaces,
         field_name="entry_price_hint",
-        aliases=("entry_price_hint", "entry_price", "price", "mark_price", "last_price", "close"),
+        aliases=("entry_price_hint", "mark_price", "last_price", "price", "entry_price", "close"),
         normalizer=lambda v: _normalize_positive_float_strict(v, field_name="entry_price_hint"),
         required=True,
     )
@@ -676,6 +723,9 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
         normalizer=lambda v: _normalize_ratio_float_strict(v, field_name="risk_pct"),
         required=False,
     )
+
+    if explicit_qty is not None and risk_pct is not None:
+        raise OrderExecutionError("qty and risk_pct cannot both be provided (STRICT)")
 
     if explicit_qty is not None:
         qty = explicit_qty

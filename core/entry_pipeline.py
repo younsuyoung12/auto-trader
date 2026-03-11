@@ -33,6 +33,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
      - JSON 직렬화 가능한 값만 허용
      - 비정상/non-finite 값은 즉시 예외 처리
   3) KEEP(STRICT): 감사 로그 실패 시 조용한 continue 금지
+  4) FIX(ROOT-CAUSE): market_features_ws strict 예외 전파와 정합화
+     - get_trading_signal() 의 FeatureBuildError 는 no-signal 이 아니라 즉시 예외로 승격
+     - None 반환은 전략상 no-signal 인 경우에만 허용
+  5) KEEP(COMPAT): downstream 연결 안정성을 위해 authoritative WS 5m OHLCV 재구성 계약 유지
+     - signal payload 의 5필드/6필드 차이는 검증만 수행
+     - entry_pipeline 내부 출력 candles_5m / candles_5m_raw 는 기존처럼 authoritative WS 5m OHLCV 로 유지
 
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): 5m confirmed momentum misaligned 를 RuntimeError 가 아닌 명시적 SKIP 사유로 전환
@@ -1077,17 +1083,23 @@ def _build_entry_market_data(
     notify_entry_block_fn: Callable[[str, str, int], None],
     log_fn: Callable[[str], None],
 ) -> Optional[Dict[str, Any]]:
-    signal_ctx = get_trading_signal(settings=settings, last_close_ts=last_close_ts)
+    symbol = str(getattr(settings, "symbol", "")).strip()
+    if not symbol:
+        raise RuntimeError("settings.symbol is required")
+
+    try:
+        signal_ctx = get_trading_signal(settings=settings, last_close_ts=last_close_ts, symbol=symbol)
+    except FeatureBuildError as e:
+        raise RuntimeError(f"get_trading_signal failed (STRICT): {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"get_trading_signal unexpected failure (STRICT): {e}") from e
+
     if signal_ctx is None:
         return None
     if not isinstance(signal_ctx, (tuple, list)) or len(signal_ctx) != 7:
         raise RuntimeError("get_trading_signal returned invalid tuple format")
 
     chosen_signal, signal_source, latest_ts, candles_5m, candles_5m_raw, last_price, extra = signal_ctx
-
-    symbol = str(getattr(settings, "symbol", "")).strip()
-    if not symbol:
-        raise RuntimeError("settings.symbol is required")
 
     direction = str(chosen_signal).upper().strip()
     if direction not in ("LONG", "SHORT"):

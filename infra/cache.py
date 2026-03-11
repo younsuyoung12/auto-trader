@@ -14,11 +14,17 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - Redis 설정 누락/오염/비정상 타입이면 즉시 예외.
 - 초기화 전 사용 시 즉시 예외.
 - JSON 직렬화 불가 데이터는 즉시 예외.
+- NaN / Infinity / -Infinity JSON 직렬화 금지.
 - Redis 연결/명령 실패는 즉시 예외.
 - 조용한 fallback 금지.
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-11:
+  1) FIX(STRICT): set_cache_json()에서 allow_nan=False 강제
+  2) FIX(STRICT): delete_cache_prefix() suffix에 Redis glob 문자 금지
+  3) FIX(ROOT-CAUSE): init_cache() 재초기화 시 기존 Redis client 정리 추가
+  4) FIX(STRICT): initialized state 조회를 lock 기반으로 정합화
 - 2026-03-07:
   1) 신규 생성: Redis 캐시 공통 모듈 추가
   2) settings(SSOT) 기반 초기화 지원
@@ -32,7 +38,7 @@ import json
 import math
 import threading
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from redis import Redis
 from redis.exceptions import RedisError
@@ -94,6 +100,20 @@ def _require_positive_float(value: Any, name: str) -> float:
     return fv
 
 
+def _require_key_component_str(value: Any, name: str) -> str:
+    s = _require_nonempty_str(value, name)
+    if ":" in s:
+        raise RuntimeError(f"{name} must not contain ':' (STRICT)")
+    return s
+
+
+def _require_prefix_suffix_str(value: Any, name: str) -> str:
+    s = _require_key_component_str(value, name)
+    if any(ch in s for ch in ("*", "?", "[", "]")):
+        raise RuntimeError(f"{name} must not contain Redis glob characters (STRICT)")
+    return s
+
+
 def build_cache_config_from_settings(settings: Any) -> RedisCacheConfig:
     """
     settings(SSOT)로부터 RedisCacheConfig를 구성한다.
@@ -139,6 +159,7 @@ def init_cache(*, config: RedisCacheConfig) -> None:
     STRICT:
     - config 누락/오염 시 즉시 예외
     - Redis ping 실패 시 즉시 예외
+    - 재초기화 시 기존 client는 정리한다.
     """
     global _CLIENT, _CONFIG
 
@@ -156,14 +177,30 @@ def init_cache(*, config: RedisCacheConfig) -> None:
     try:
         pong = client.ping()
     except RedisError as exc:
+        try:
+            client.close()
+        except Exception:
+            pass
         raise RuntimeError(f"Redis ping failed (STRICT): {exc}") from exc
 
     if pong is not True:
+        try:
+            client.close()
+        except Exception:
+            pass
         raise RuntimeError("Redis ping returned non-true response (STRICT)")
 
+    old_client: Optional[Redis] = None
     with _LOCK:
+        old_client = _CLIENT
         _CLIENT = client
         _CONFIG = config
+
+    if old_client is not None and old_client is not client:
+        try:
+            old_client.close()
+        except Exception:
+            pass
 
 
 def init_cache_from_settings(settings: Any) -> None:
@@ -171,12 +208,14 @@ def init_cache_from_settings(settings: Any) -> None:
 
 
 def is_cache_initialized() -> bool:
-    return _CLIENT is not None and _CONFIG is not None
+    with _LOCK:
+        return _CLIENT is not None and _CONFIG is not None
 
 
-def _require_initialized() -> tuple[Redis, RedisCacheConfig]:
-    client = _CLIENT
-    config = _CONFIG
+def _require_initialized() -> Tuple[Redis, RedisCacheConfig]:
+    with _LOCK:
+        client = _CLIENT
+        config = _CONFIG
     if client is None or config is None:
         raise RuntimeError("Redis cache is not initialized (STRICT)")
     return client, config
@@ -192,14 +231,7 @@ def make_cache_key(*parts: Any) -> str:
 
     normalized_parts: list[str] = []
     for idx, part in enumerate(parts):
-        if part is None:
-            raise RuntimeError(f"cache key part[{idx}] is required (STRICT)")
-        s = str(part).strip()
-        if not s:
-            raise RuntimeError(f"cache key part[{idx}] must not be empty (STRICT)")
-        if ":" in s:
-            raise RuntimeError(f"cache key part[{idx}] must not contain ':' (STRICT)")
-        normalized_parts.append(s)
+        normalized_parts.append(_require_key_component_str(part, f"cache key part[{idx}]"))
 
     if not normalized_parts:
         raise RuntimeError("cache key parts must not be empty (STRICT)")
@@ -255,6 +287,7 @@ def set_cache_json(key: str, data: Any, *, ttl_sec: Optional[int] = None) -> Non
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
+            allow_nan=False,
         )
     except Exception as exc:
         raise RuntimeError(f"cache JSON serialization failed (STRICT): {exc}") from exc
@@ -298,12 +331,9 @@ def delete_cache_prefix(prefix_suffix: str) -> int:
     -> "<key_prefix>:performance:*" 삭제
     """
     client, config = _require_initialized()
-    suffix = _require_nonempty_str(prefix_suffix, "prefix_suffix")
-    if ":" in suffix:
-        raise RuntimeError("prefix_suffix must not contain ':' (STRICT)")
+    suffix = _require_prefix_suffix_str(prefix_suffix, "prefix_suffix")
 
     pattern = f"{config.key_prefix}:{suffix}:*"
-    deleted_total = 0
 
     try:
         keys = list(client.scan_iter(match=pattern))

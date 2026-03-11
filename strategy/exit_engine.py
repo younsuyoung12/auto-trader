@@ -1,77 +1,38 @@
+from __future__ import annotations
+
 """
 ========================================================
 FILE: strategy/exit_engine.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-
-역할
---------------------------------------------------------
+ROLE:
 - 오픈 포지션의 EXIT 여부를 결정한다.
 - HOLD 또는 EXIT 판단을 생성한다.
 - 대시보드 "의사결정 이유" 패널이 바로 사용할 수 있도록
-  Decision payload를 엄격하게 생성한다.
+  decision payload를 엄격하게 생성한다.
 
-출력
---------------------------------------------------------
-- ExitFlowDecision 반환
-- action:
-  - HOLD
-  - EXIT
+CORE RESPONSIBILITIES:
+- features/settings 필수 계약 STRICT 검증
+- TP / SL / EXIT_SIGNAL / HOLD 판단 생성
+- LONG / SHORT 포지션의 target / stop / pnl 계산
+- 대시보드용 decision payload 생성
+- decision dataclass 자체 계약 검증
 
-필수 features 스키마
---------------------------------------------------------
-{
-  "symbol": "BTCUSDT",
-  "regime": "TREND",
-  "signal_source": "exit_engine",
-  "signal_ts_ms": 1772740500000,
-  "direction": "LONG" | "SHORT",
-  "entry_price": 62300.0,
-  "current_price": 62450.5,
-  "position_qty": 0.01,
-  "entry_score": 1.92,
-  "exit_score": 0.84,
-  "trend_strength": 0.73,
-  "spread": 0.00018,
-  "orderbook_imbalance": 0.41,
-  "tp_pct": 0.02,
-  "sl_pct": 0.01
-}
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 필수 features 누락 시 즉시 예외
+- 필수 settings 누락 시 즉시 예외
+- 더미값 / 기본값 / 자동보정 금지
+- 숫자형은 finite 이어야 한다
+- direction / action / reason / summary 는 공백 불가
+- trend_strength 는 방향 없는 강도값으로 취급한다
+- SHORT 반전 판정에서 음수 threshold 비교를 사용하지 않는다
 
-선택 features 스키마
---------------------------------------------------------
-{
-  "holding_seconds": 180.0,
-  "mark_price": 62451.0,
-  "decision_id": "dec-...",
-  "extra": {...}
-}
-
-필수 settings 필드
---------------------------------------------------------
-- exit_score_threshold
-- exit_max_spread_pct
-- exit_trend_reversal_threshold
-- exit_orderbook_reversal_threshold
-
-절대 원칙 (STRICT · NO-FALLBACK)
---------------------------------------------------------
-- 필수 features 누락 시 즉시 예외.
-- 필수 settings 누락 시 즉시 예외.
-- 더미값/기본값/자동보정 금지.
-- 숫자형은 finite 이어야 한다.
-- direction / action / reason / summary 는 공백 불가.
-
-변경 이력
---------------------------------------------------------
-- 2026-03-06:
-  1) 신규 생성: HOLD / EXIT 판단 파일 추가
-  2) TAKE_PROFIT / STOP_LOSS / EXIT_SIGNAL / HOLD 사유 생성 추가
-  3) 대시보드 Decision payload(action/summary/reasons/entry_score/exit_score 등) 생성 추가
+CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): SHORT 반전 판정 버그 수정, trend_strength 를 unsigned strength 로 일관 처리
+  2) FIX(STRICT): ExitFlowDecision.__post_init__ 추가로 action/reason/reasons/string/numeric 계약 검증
+  3) FIX(STRICT): exit_trend_reversal_threshold 입력을 non-negative 로 강제
 ========================================================
 """
-
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -114,6 +75,74 @@ class ExitFlowDecision:
     holding_seconds: Optional[float]
     mark_price: Optional[float]
     decision_id: Optional[str]
+
+    def __post_init__(self) -> None:
+        action = _require_nonempty_str(self.action, "decision.action").upper()
+        if action not in _ALLOWED_ACTIONS:
+            raise RuntimeError(f"decision.action must be one of {_ALLOWED_ACTIONS} (STRICT)")
+        object.__setattr__(self, "action", action)
+
+        reason_code = _require_nonempty_str(self.reason_code, "decision.reason_code").upper()
+        if reason_code not in _ALLOWED_REASON_CODES:
+            raise RuntimeError(f"decision.reason_code must be one of {_ALLOWED_REASON_CODES} (STRICT)")
+        object.__setattr__(self, "reason_code", reason_code)
+
+        direction = _require_direction(self.direction, "decision.direction")
+        object.__setattr__(self, "direction", direction)
+
+        summary = _require_nonempty_str(self.summary, "decision.summary")
+        object.__setattr__(self, "summary", summary)
+
+        signal_source = _require_nonempty_str(self.signal_source, "decision.signal_source")
+        regime = _require_nonempty_str(self.regime, "decision.regime")
+        symbol = _require_nonempty_str(self.symbol, "decision.symbol").upper()
+        object.__setattr__(self, "signal_source", signal_source)
+        object.__setattr__(self, "regime", regime)
+        object.__setattr__(self, "symbol", symbol)
+
+        if not isinstance(self.reasons, list):
+            raise RuntimeError("decision.reasons must be list[str] (STRICT)")
+        if not self.reasons:
+            raise RuntimeError("decision.reasons must not be empty (STRICT)")
+        normalized_reasons: List[str] = []
+        for idx, reason in enumerate(self.reasons):
+            normalized_reasons.append(_require_nonempty_str(reason, f"decision.reasons[{idx}]"))
+        object.__setattr__(self, "reasons", normalized_reasons)
+
+        _require_positive_int(self.signal_ts_ms, "decision.signal_ts_ms")
+
+        _require_float(self.entry_score, "decision.entry_score")
+        _require_float(self.exit_score, "decision.exit_score")
+        _require_float(self.exit_score_threshold, "decision.exit_score_threshold", min_value=0.0)
+        _require_float(self.trend_strength, "decision.trend_strength", min_value=0.0)
+        _require_float(self.spread, "decision.spread", min_value=0.0)
+        _require_float(self.orderbook_imbalance, "decision.orderbook_imbalance")
+        _require_float(self.entry_price, "decision.entry_price", min_value=0.0)
+        _require_float(self.current_price, "decision.current_price", min_value=0.0)
+        _require_float(self.target_price, "decision.target_price", min_value=0.0)
+        _require_float(self.stop_price, "decision.stop_price", min_value=0.0)
+        _require_float(self.pnl_pct, "decision.pnl_pct")
+        _require_float(self.position_qty, "decision.position_qty", min_value=0.0)
+
+        if self.entry_price <= 0.0:
+            raise RuntimeError("decision.entry_price must be > 0 (STRICT)")
+        if self.current_price <= 0.0:
+            raise RuntimeError("decision.current_price must be > 0 (STRICT)")
+        if self.target_price <= 0.0:
+            raise RuntimeError("decision.target_price must be > 0 (STRICT)")
+        if self.stop_price <= 0.0:
+            raise RuntimeError("decision.stop_price must be > 0 (STRICT)")
+        if self.position_qty <= 0.0:
+            raise RuntimeError("decision.position_qty must be > 0 (STRICT)")
+
+        if self.holding_seconds is not None:
+            _require_float(self.holding_seconds, "decision.holding_seconds", min_value=0.0)
+        if self.mark_price is not None:
+            _require_float(self.mark_price, "decision.mark_price", min_value=0.0)
+            if self.mark_price <= 0.0:
+                raise RuntimeError("decision.mark_price must be > 0 when provided (STRICT)")
+        if self.decision_id is not None:
+            _require_nonempty_str(self.decision_id, "decision.decision_id")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -311,11 +340,16 @@ def _is_reversal(
 ) -> bool:
     d = _require_direction(direction, "direction")
 
+    if trend_reversal_threshold < 0.0:
+        raise RuntimeError("trend_reversal_threshold must be >= 0 (STRICT)")
+    if orderbook_reversal_threshold < 0.0:
+        raise RuntimeError("orderbook_reversal_threshold must be >= 0 (STRICT)")
+
+    trend_reversal = trend_strength <= trend_reversal_threshold
+
     if d == "LONG":
-        trend_reversal = trend_strength <= trend_reversal_threshold
         orderbook_reversal = orderbook_imbalance <= -orderbook_reversal_threshold
     else:
-        trend_reversal = trend_strength >= -trend_reversal_threshold
         orderbook_reversal = orderbook_imbalance >= orderbook_reversal_threshold
 
     return bool(trend_reversal or orderbook_reversal)
@@ -348,7 +382,7 @@ def evaluate_exit_flow_strict(
 
     entry_score = _read_feature_float(f, "entry_score")
     exit_score = _read_feature_float(f, "exit_score")
-    trend_strength = _read_feature_float(f, "trend_strength")
+    trend_strength = _read_feature_float(f, "trend_strength", min_value=0.0)
     spread = _read_feature_float(f, "spread", min_value=0.0)
     orderbook_imbalance = _read_feature_float(f, "orderbook_imbalance")
     tp_pct = _read_feature_float(f, "tp_pct", min_value=0.0, max_value=1.0)
@@ -359,10 +393,18 @@ def evaluate_exit_flow_strict(
     if sl_pct <= 0.0:
         raise RuntimeError("features.sl_pct must be > 0 (STRICT)")
 
-    exit_score_threshold = _read_setting_float(settings, "exit_score_threshold")
+    exit_score_threshold = _read_setting_float(settings, "exit_score_threshold", min_value=0.0)
     exit_max_spread_pct = _read_setting_float(settings, "exit_max_spread_pct", min_value=0.0)
-    exit_trend_reversal_threshold = _read_setting_float(settings, "exit_trend_reversal_threshold")
-    exit_orderbook_reversal_threshold = _read_setting_float(settings, "exit_orderbook_reversal_threshold", min_value=0.0)
+    exit_trend_reversal_threshold = _read_setting_float(
+        settings,
+        "exit_trend_reversal_threshold",
+        min_value=0.0,
+    )
+    exit_orderbook_reversal_threshold = _read_setting_float(
+        settings,
+        "exit_orderbook_reversal_threshold",
+        min_value=0.0,
+    )
 
     target_price, stop_price, pnl_pct = _calc_prices_and_pnl_pct(
         direction=direction,
@@ -450,7 +492,7 @@ def evaluate_exit_flow_strict(
             if orderbook_imbalance <= -exit_orderbook_reversal_threshold:
                 reasons.append("orderbook_reversal")
         else:
-            if trend_strength >= -exit_trend_reversal_threshold:
+            if trend_strength <= exit_trend_reversal_threshold:
                 reasons.append("trend_reversal")
             if orderbook_imbalance >= exit_orderbook_reversal_threshold:
                 reasons.append("orderbook_reversal")
@@ -497,7 +539,7 @@ def evaluate_exit_flow_strict(
         if orderbook_imbalance > -exit_orderbook_reversal_threshold:
             hold_reasons.append("orderbook_not_reversed")
     else:
-        if trend_strength < -exit_trend_reversal_threshold:
+        if trend_strength > exit_trend_reversal_threshold:
             hold_reasons.append("trend_still_supportive")
         if orderbook_imbalance < exit_orderbook_reversal_threshold:
             hold_reasons.append("orderbook_not_reversed")

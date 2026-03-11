@@ -1,62 +1,40 @@
 """
 ========================================================
 FILE: execution/exchange_api.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-Design principles (Binance USDT-M Futures REST Adapter)
---------------------------------------------------------
+ROLE:
+- Binance USDT-M Futures REST Adapter SSOT
+- 서명/HTTP 요청/계정/포지션/주문 조회 및 레버리지/마진 모드 설정만 담당한다
+- 주문 실행(진입/청산/TP/SL/슬리피지 계산)은 order_executor.py가 담당한다
+
+CORE RESPONSIBILITIES:
+- Binance Futures private/public REST 요청 전송
+- timestamp/signature 생성 및 time sync 관리
+- account / balance / position / order 조회
+- leverage / margin mode 설정
+- user data stream listenKey lifecycle 관리
+- public microstructure 데이터 조회
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
 - Binance Futures endpoints only:
   - Trading/Account: /fapi/*
-  - Public market data (microstructure): /futures/data/*
-- Transport/Query layer only: signing, HTTP requests, account/position/order 조회 및
-  레버리지/마진 모드 설정만 제공한다.
-- 주문 실행(진입/청산/TP/SL 생성/슬리피지 계산)은 order_executor.py가 담당한다.
-- Fallback 금지: 오류/누락/비정상 응답은 즉시 예외(RuntimeError/ValueError).
-- 민감 정보(API key/secret/signature)는 로그/예외 메시지에 포함하지 않는다.
+  - Public microstructure: /futures/data/*
+- One-way mode only
+- Hedge mode is NOT supported
+- positionSide must always be BOTH in order layer
+- 오류/누락/비정상 응답은 즉시 예외
+- 민감정보(API key/secret/signature)는 로그/예외에 포함 금지
+- settings.py 단일 객체(SSOT)만 사용
+- stale signed URL 재사용 금지: private 재시도 시마다 timestamp/signature 재생성
 
-One-way mode only.
-Hedge mode is NOT supported.
-positionSide must always be BOTH in order layer.
-
-PATCH NOTES — 2026-03-04 (TRADE-GRADE)
---------------------------------------------------------
-- 네트워크 내구성 강화
-  - HTTP 5xx/429/Timeout 재시도 + exponential backoff(명시적, silent retry 금지)
-  - Circuit breaker(연속 실패 보호) 추가
-- 동시성 안전성 보강
-  - _SERVER_TIME_OFFSET_MS / _TIME_SYNCED / _LAST_TIME_SYNC_AT 접근 Lock 보호
-  - timestamp 계산 atomic 보장
-- -1021(timestamp) 대응 강화
-  - -1021 감지 시 강제 time sync 후 재시도(제한 횟수)
-- 예외 전파 구조 정비
-  - URL(서명 포함) 노출 금지 유지
-  - 모든 실패는 Custom Exception(RuntimeError 계열)로 즉시 전파
-
-PATCH NOTES — 2026-03-03 (TRADE-GRADE)
---------------------------------------------------------
-- Microstructure 데이터 계층 확장(STRICT, no fallback)
-  - /fapi/* 외에 /futures/data/* (public) 엔드포인트를 허용한다.
-  - Funding/OI/Long-Short Ratio 계열 조회 함수 추가:
-    * get_premium_index(symbol)                         : /fapi/v1/premiumIndex (public)
-    * get_current_funding_rate(symbol)                  : premiumIndex.lastFundingRate (float)
-    * get_funding_rate_history(symbol, ...)             : /fapi/v1/fundingRate (public)
-    * get_open_interest(symbol)                         : /fapi/v1/openInterest (public)
-    * get_open_interest_hist(symbol, period, ...)       : /futures/data/openInterestHist (public)
-    * get_global_long_short_account_ratio(symbol, ...)  : /futures/data/globalLongShortAccountRatio (public)
-    * get_top_long_short_account_ratio(symbol, ...)     : /futures/data/topLongShortAccountRatio (public)
-    * get_top_long_short_position_ratio(symbol, ...)    : /futures/data/topLongShortPositionRatio (public)
-- STRICT 강화
-  - settings 값(기본 URL/timeout/recvWindow) 누락/비정상 시 즉시 실패(Fail-Fast)
-
-PATCH NOTES — 2026-03-02 (PATCH)
---------------------------------------------------------
-- (9점대 기반) 주문/체결/복구를 위한 조회 함수 추가(STRICT, no fallback)
-  - get_order(symbol, order_id): /fapi/v1/order by orderId
-  - get_order_by_client_id(symbol, client_order_id): /fapi/v1/order by origClientOrderId
-  - get_user_trades(symbol, order_id=None, start_time_ms=None, end_time_ms=None, limit=1000)
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): private 요청 재시도 시 stale timestamp/signature URL 재사용 제거
+  2) FIX(STRUCTURE): _request_with_resilience()를 고정 URL 방식에서 request_factory 방식으로 변경
+  3) FIX(SSOT): load_settings() 직접 호출 제거, settings.SETTINGS 단일 객체 사용
+  4) FIX(STRICT): private 예약 파라미터(timestamp/signature/recvWindow) 외부 주입 금지
+  5) FIX(STRICT): BASE_URL trailing slash 정규화 및 스킴 검증 추가
+  6) FIX(CONTRACT): assert_one_way_mode() 응답 타입 계약 강화
 - 2026-03-06:
   1) USER DATA STREAM listenKey 전용 API 추가
      - create_user_data_listen_key()
@@ -67,6 +45,21 @@ PATCH NOTES — 2026-03-02 (PATCH)
   3) get_position() STRICT 강화
      - rows[0] 선택 제거
      - one-way 기준 유일 position row 선택 로직 추가
+- 2026-03-04:
+  1) 네트워크 내구성 강화
+     - HTTP 5xx/429/Timeout 재시도 + exponential backoff
+     - Circuit breaker 추가
+  2) 동시성 안전성 보강
+     - _SERVER_TIME_OFFSET_MS / _TIME_SYNCED / _LAST_TIME_SYNC_AT Lock 보호
+  3) -1021(timestamp) 대응 강화
+     - -1021 감지 시 강제 time sync 후 재시도
+  4) 예외 전파 구조 정비
+     - URL(서명 포함) 노출 금지 유지
+- 2026-03-03:
+  1) Microstructure 데이터 계층 확장
+  2) settings 값 누락/비정상 시 즉시 실패(Fail-Fast)
+- 2026-03-02:
+  1) 주문/체결/복구용 조회 함수 추가
 ========================================================
 """
 
@@ -79,20 +72,20 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 
 import requests
 
 from execution.retry_policy import execute_with_retry
-from settings import load_settings
+from settings import SETTINGS
 
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------#
-# Global settings / session (STRICT: fail-fast)
+# Global settings / session (STRICT: fail-fast / SSOT)
 # -----------------------------------------------------------------------------#
-SET = load_settings()
+SET = SETTINGS
 
 
 def _require_setting_str(name: str) -> str:
@@ -120,7 +113,17 @@ def _require_setting_int(name: str) -> int:
     return iv
 
 
-BASE_URL: str = _require_setting_str("binance_futures_base")
+def _require_base_url() -> str:
+    raw = _require_setting_str("binance_futures_base")
+    norm = raw.rstrip("/")
+    if not norm:
+        raise RuntimeError("settings.binance_futures_base normalized to empty (STRICT)")
+    if not (norm.startswith("https://") or norm.startswith("http://")):
+        raise RuntimeError("settings.binance_futures_base must start with http:// or https:// (STRICT)")
+    return norm
+
+
+BASE_URL: str = _require_base_url()
 DEFAULT_TIMEOUT_SEC: int = _require_setting_int("request_timeout_sec")
 RECV_WINDOW_MS: int = _require_setting_int("recv_window_ms")
 
@@ -149,6 +152,8 @@ _TIME_SYNC_LOCK = threading.Lock()
 _ALLOWED_PUBLIC_PREFIXES: Tuple[str, ...] = ("/fapi/", "/futures/data/")
 _ALLOWED_PRIVATE_PREFIX: str = "/fapi/"
 _ALLOWED_APIKEY_ONLY_PATHS: Tuple[str, ...] = ("/fapi/v1/listenKey",)
+
+_PRIVATE_RESERVED_PARAM_KEYS: Tuple[str, ...] = ("timestamp", "signature", "recvWindow")
 
 # -----------------------------------------------------------------------------#
 # Circuit breaker (TRADE-GRADE)
@@ -180,12 +185,19 @@ def _cb_on_failure(*, reason: str) -> None:
     now = time.time()
     with _CB_LOCK:
         _CB_FAILURES += 1
+        failures = _CB_FAILURES
         if _CB_FAILURES >= _CB_FAIL_THRESHOLD:
             extra = float(_CB_FAILURES - _CB_FAIL_THRESHOLD)
             open_sec = min(_CB_MAX_OPEN_SEC, _CB_OPEN_SEC * (1.0 + extra / 2.0))
             _CB_OPEN_UNTIL_TS = max(_CB_OPEN_UNTIL_TS, now + open_sec)
+        open_until = _CB_OPEN_UNTIL_TS
 
-    logger.warning("circuit failure recorded (failures=%s, reason=%s)", _CB_FAILURES, reason)
+    logger.warning(
+        "circuit failure recorded (failures=%s open_until_ts=%.3f reason=%s)",
+        failures,
+        open_until,
+        reason,
+    )
 
 
 # -----------------------------------------------------------------------------#
@@ -346,6 +358,18 @@ def _validate_period(period: str) -> str:
     return p
 
 
+def _build_request_url(path: str, query: str) -> str:
+    if not path.startswith("/"):
+        raise ValueError(f"path must start with '/' (got={path!r})")
+    return f"{BASE_URL}{path}" + (f"?{query}" if query else "")
+
+
+def _assert_no_reserved_private_params(params: Mapping[str, Any]) -> None:
+    for key in _PRIVATE_RESERVED_PARAM_KEYS:
+        if key in params:
+            raise ValueError(f"private req params must not include reserved key {key!r} (STRICT)")
+
+
 def sync_server_time() -> int:
     with _TIME_SYNC_LOCK:
         t0 = time.time()
@@ -392,11 +416,9 @@ def _parse_error_payload(resp: requests.Response) -> Dict[str, Any]:
 def _request_with_resilience(
     *,
     method: str,
-    url: str,
     path_for_logs: str,
-    headers: Optional[Dict[str, str]],
-    timeout: Tuple[float, float],
     policy: _NetRetryPolicy,
+    request_factory: Callable[[], requests.Response],
 ) -> requests.Response:
     now = time.time()
     if path_for_logs not in _CB_BYPASS_PATHS and _cb_is_open(now):
@@ -407,11 +429,8 @@ def _request_with_resilience(
     last_exc: Optional[BaseException] = None
 
     for attempt in range(policy.max_attempts):
-        def _do() -> requests.Response:
-            return _SESSION.request(method, url, headers=headers or None, timeout=timeout)
-
         try:
-            resp = execute_with_retry(_do)
+            resp = execute_with_retry(request_factory)
         except requests.Timeout as e:
             last_exc = e
             _cb_on_failure(reason=f"timeout:{path_for_logs}")
@@ -427,6 +446,7 @@ def _request_with_resilience(
             _sleep_backoff(policy, attempt, reason=f"request_exception:{e.__class__.__name__}:{path_for_logs}")
             continue
         except Exception as e:
+            _cb_on_failure(reason=f"unexpected_exception:{e.__class__.__name__}:{path_for_logs}")
             raise RuntimeError(f"{method} {path_for_logs} -> unexpected error: {e.__class__.__name__}") from e
 
         sc = int(getattr(resp, "status_code", 0) or 0)
@@ -502,17 +522,24 @@ def _req_api_key_only(
     if not isinstance(timeout_sec, int) or timeout_sec <= 0:
         raise ValueError("timeout_sec must be positive int")
 
-    query = _encode_query(params or None)
-    url = f"{BASE_URL}{p}" + (f"?{query}" if query else "")
     timeout = _timeout_tuple(timeout_sec)
+    base_params: Dict[str, Any] = dict(params or {})
+
+    def _do_request() -> requests.Response:
+        query = _encode_query(base_params or None)
+        url = _build_request_url(p, query)
+        return _SESSION.request(
+            m,
+            url,
+            headers={"X-MBX-APIKEY": _API_KEY},
+            timeout=timeout,
+        )
 
     resp = _request_with_resilience(
         method=m,
-        url=url,
         path_for_logs=p,
-        headers={"X-MBX-APIKEY": _API_KEY},
-        timeout=timeout,
         policy=_NetRetryPolicy(),
+        request_factory=_do_request,
     )
 
     try:
@@ -535,7 +562,8 @@ def req(
     private: bool = True,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
 ) -> Any:
-    _ = body
+    if body is not None:
+        raise ValueError("req(body=...) is not supported in this adapter (STRICT)")
 
     m = str(method).upper().strip()
     if m not in {"GET", "POST", "PUT", "DELETE"}:
@@ -555,31 +583,43 @@ def req(
     if not isinstance(timeout_sec, int) or timeout_sec <= 0:
         raise ValueError("timeout_sec must be positive int")
 
-    q_params: Dict[str, Any] = dict(params or {})
-    headers: Dict[str, str] = {}
+    timeout = _timeout_tuple(timeout_sec)
+    base_params: Dict[str, Any] = dict(params or {})
 
     if private:
+        _assert_no_reserved_private_params(base_params)
         _ensure_time_sync()
-        q_params.setdefault("recvWindow", RECV_WINDOW_MS)
-        q_params["timestamp"] = _ts_ms()
 
-        query = _encode_query(q_params)
-        sig = _sign(query)
-        url = f"{BASE_URL}{p}?{query}&signature={sig}"
-        headers["X-MBX-APIKEY"] = _API_KEY
+        def _do_request() -> requests.Response:
+            q_params: Dict[str, Any] = dict(base_params)
+            q_params["recvWindow"] = RECV_WINDOW_MS
+            q_params["timestamp"] = _ts_ms()
+            query = _encode_query(q_params)
+            sig = _sign(query)
+            url = f"{BASE_URL}{p}?{query}&signature={sig}"
+            return _SESSION.request(
+                m,
+                url,
+                headers={"X-MBX-APIKEY": _API_KEY},
+                timeout=timeout,
+            )
+
     else:
-        query = _encode_query(q_params)
-        url = f"{BASE_URL}{p}" + (f"?{query}" if query else "")
-
-    timeout = _timeout_tuple(timeout_sec)
+        def _do_request() -> requests.Response:
+            query = _encode_query(base_params or None)
+            url = _build_request_url(p, query)
+            return _SESSION.request(
+                m,
+                url,
+                headers=None,
+                timeout=timeout,
+            )
 
     resp = _request_with_resilience(
         method=m,
-        url=url,
         path_for_logs=p,
-        headers=headers or None,
-        timeout=timeout,
         policy=_NetRetryPolicy(),
+        request_factory=_do_request,
     )
 
     try:
@@ -590,21 +630,22 @@ def req(
     if isinstance(data, dict) and isinstance(data.get("code"), int) and int(data["code"]) < 0:
         code = data.get("code")
         msg = data.get("msg")
+
         if int(code) == -1021 and private:
             logger.warning("%s %s -> 200 payload has -1021, forcing time sync then re-request once", m, p)
             _ensure_time_sync(force=True)
+
             resp2 = _request_with_resilience(
                 method=m,
-                url=url,
                 path_for_logs=p,
-                headers=headers or None,
-                timeout=timeout,
                 policy=_NetRetryPolicy(max_attempts=2, base_delay_sec=0.4, max_delay_sec=1.2),
+                request_factory=_do_request,
             )
             try:
                 data2 = resp2.json()
             except Exception as e2:
                 raise RuntimeError(f"{m} {p} -> invalid json after -1021 recovery: {e2.__class__.__name__}") from None
+
             if isinstance(data2, dict) and isinstance(data2.get("code"), int) and int(data2["code"]) < 0:
                 raise RuntimeError(f"{m} {p} -> binance code={data2.get('code')}, msg={data2.get('msg')}")
             return data2
@@ -617,8 +658,13 @@ def req(
 def assert_one_way_mode() -> None:
     data = req("GET", "/fapi/v1/positionSide/dual", private=True)
     if not isinstance(data, dict):
-        raise RuntimeError("positionSide/dual unexpected response")
-    if data.get("dualSidePosition") is True:
+        raise RuntimeError("GET /fapi/v1/positionSide/dual -> unexpected response shape")
+
+    dual = data.get("dualSidePosition")
+    if not isinstance(dual, bool):
+        raise RuntimeError("positionSide/dual.dualSidePosition must be bool (STRICT)")
+
+    if dual is True:
         raise RuntimeError("Account is in HEDGE mode. Switch Binance Futures to ONE-WAY mode.")
 
 

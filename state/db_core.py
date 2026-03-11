@@ -150,6 +150,9 @@ engine: Engine = create_engine(
     pool_timeout=_POOL_TIMEOUT_SEC,
     pool_recycle=_POOL_RECYCLE_SEC,
     pool_pre_ping=True,
+    connect_args={
+        "application_name": "auto_trader",
+    },    
     future=True,
 )
 

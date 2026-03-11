@@ -20,6 +20,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-11:
+  1) FIX(STRICT): account_ws.position.event_time_ms / transaction_time_ms 를 양의 정수로 강제
+  2) FIX(CONTRACT): Trade.__post_init__ 에서 entry_ts <= last_synced_at 정합 검증 추가
+  3) CLEANUP: account ws snapshot row 검증 로컬 변수화로 필드 검증 가독성 정리
+  4) 기존 기능 삭제 없음
+
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): timezone-aware datetime strict helper 명칭을 단일화
      - _require_tzaware_dt 를 canonical helper 로 추가
@@ -138,6 +144,13 @@ def _require_int(v: Any, name: str) -> int:
         i = int(v)
     except Exception as e:
         raise OrderFailed(f"{name} must be int: {e} (STRICT)") from e
+    return i
+
+
+def _require_positive_int(v: Any, name: str) -> int:
+    i = _require_int(v, name)
+    if i <= 0:
+        raise OrderFailed(f"{name} must be > 0 (STRICT)")
     return i
 
 
@@ -267,7 +280,10 @@ class Trade:
 
         if self.last_synced_at is None:
             raise OrderFailed("trade.last_synced_at is required (STRICT)")
-        _require_tzaware_dt(self.last_synced_at, "trade.last_synced_at")
+        self.last_synced_at = _require_tzaware_dt(self.last_synced_at, "trade.last_synced_at")
+
+        if self.entry_ts is not None and self.entry_ts > self.last_synced_at:
+            raise OrderFailed("trade.entry_ts must be <= trade.last_synced_at (STRICT)")
 
         st = get_state(self)
         if self.is_open and st != TradeLifecycleState.ENTERED:
@@ -338,17 +354,41 @@ def _fetch_account_position_rows_strict(symbol: str) -> List[Dict[str, Any]]:
     for i, row in enumerate(rows):
         if not isinstance(row, dict):
             raise OrderFailed(f"account ws position row[{i}] must be dict (STRICT)")
+
         row_sym = _normalize_symbol(row.get("symbol"), f"account_ws.position[{i}].symbol")
         if row_sym != sym:
             raise OrderFailed(
                 f"account ws position symbol mismatch (STRICT): got={row_sym} expected={sym}"
             )
 
-        pos_side = _normalize_position_side(row.get("position_side"), f"account_ws.position[{i}].position_side")
-        pos_amt = _require_float(row.get("position_amt"), f"account_ws.position[{i}].position_amt")
-        entry_price = _require_float(row.get("entry_price"), f"account_ws.position[{i}].entry_price")
-        _ = _require_float(row.get("unrealized_pnl"), f"account_ws.position[{i}].unrealized_pnl")
-        _ = _require_nonempty_str(row.get("margin_type"), f"account_ws.position[{i}].margin_type")
+        pos_side = _normalize_position_side(
+            row.get("position_side"),
+            f"account_ws.position[{i}].position_side",
+        )
+        pos_amt = _require_float(
+            row.get("position_amt"),
+            f"account_ws.position[{i}].position_amt",
+        )
+        entry_price = _require_float(
+            row.get("entry_price"),
+            f"account_ws.position[{i}].entry_price",
+        )
+        unrealized_pnl = _require_float(
+            row.get("unrealized_pnl"),
+            f"account_ws.position[{i}].unrealized_pnl",
+        )
+        margin_type = _require_nonempty_str(
+            row.get("margin_type"),
+            f"account_ws.position[{i}].margin_type",
+        ).upper()
+        event_time_ms = _require_positive_int(
+            row.get("event_time_ms"),
+            f"account_ws.position[{i}].event_time_ms",
+        )
+        transaction_time_ms = _require_positive_int(
+            row.get("transaction_time_ms"),
+            f"account_ws.position[{i}].transaction_time_ms",
+        )
 
         if abs(pos_amt) > 1e-12 and entry_price <= 0:
             raise OrderFailed("live account ws position entry_price must be > 0 (STRICT)")
@@ -359,13 +399,10 @@ def _fetch_account_position_rows_strict(symbol: str) -> List[Dict[str, Any]]:
                 "position_side": pos_side,
                 "position_amt": float(pos_amt),
                 "entry_price": float(entry_price),
-                "unrealized_pnl": float(row["unrealized_pnl"]),
-                "margin_type": str(row["margin_type"]).upper(),
-                "event_time_ms": _require_int(row.get("event_time_ms"), f"account_ws.position[{i}].event_time_ms"),
-                "transaction_time_ms": _require_int(
-                    row.get("transaction_time_ms"),
-                    f"account_ws.position[{i}].transaction_time_ms",
-                ),
+                "unrealized_pnl": float(unrealized_pnl),
+                "margin_type": margin_type,
+                "event_time_ms": event_time_ms,
+                "transaction_time_ms": transaction_time_ms,
             }
         )
 
@@ -1043,7 +1080,10 @@ def check_closes(open_trades: List[Trade], trader_state: TraderState) -> Tuple[L
     if abs_qty < eps:
         reason, summary = build_close_summary_strict(t)
 
-        total_pnl_usdt = float(_require_float(t.realized_pnl_usdt, "trade.realized_pnl_usdt") + _float_strict(summary.get("pnl"), "summary.pnl"))
+        total_pnl_usdt = float(
+            _require_float(t.realized_pnl_usdt, "trade.realized_pnl_usdt")
+            + _float_strict(summary.get("pnl"), "summary.pnl")
+        )
         trade_id = _persist_close_to_db_strict(trade=t, reason=str(reason), summary=summary)
         if t.id <= 0:
             t.id = int(trade_id)

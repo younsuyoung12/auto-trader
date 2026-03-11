@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 =====================================================
 FILE: infra/market_features_ws.py
@@ -16,12 +18,13 @@ CORE RESPONSIBILITIES:
 IMPORTANT POLICY:
 - settings.py 는 단일 설정 소스(SSOT)다.
 - 설정 상수/임계값을 market_data_ws 내부 구현 상수에서 가져오지 않는다.
-- 데이터 누락 / stale / NaN / 계약 불일치는 즉시 예외 처리한다.
+- 데이터 누락 / stale / NaN / Inf / 계약 불일치는 즉시 예외 처리한다.
 - orderbook timestamp 누락을 현재 시각으로 대체하지 않는다.
 - 비핵심 알림 실패는 로깅하되, 핵심 데이터 실패를 가리지 않는다.
 - market_data_ws 의 WARNING 상태는 관측 정보로 보존하되 feature 생성 실패로 오판하지 않는다.
 - 방향 결정 계약은 entry_pipeline 과 정합해야 하며, 상위 TF 우선 편향으로
   저주기 confirmed momentum 을 무시하는 구조를 금지한다.
+- get_trading_signal() 은 데이터/계약 실패를 no-signal(None)로 숨기지 않는다.
 
 CHANGE HISTORY:
 - 2026-03-11:
@@ -31,6 +34,13 @@ CHANGE HISTORY:
      - 4h 는 방향 선택이 아닌 관측 메타(telemetry)로만 유지
   2) FIX(TRADE-GRADE): LONG 편향 완화
      - 4h/1h LONG 이 15m/5m SHORT 전환을 덮어써 LONG 생성→차단 반복되던 구조 제거
+  3) FIX(ROOT-CAUSE): strict indicators 계약과 정합화
+     - OHLCV 버퍼 STRICT 검증 추가
+     - 6필드 OHLCV → 5필드 Candle 변환 고정
+     - regime/EMA200 기준 최소 buffer 요구량 상향
+  4) FIX(STRICT): regime / low-vol / signal_source / signal_score 경로의 silent fail 제거
+  5) FIX(STRICT): low-vol threshold 로컬 상수 제거, settings SSOT만 사용
+  6) FIX(STRICT): get_trading_signal() 에서 데이터 실패와 no-signal 반환을 분리
 
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): market_data_ws health snapshot 계약(overall_ok / has_warning / overall_warnings)과 정합화
@@ -40,8 +50,6 @@ CHANGE HISTORY:
   5) FIX(STRICT): ws_min_kline_buffer_by_interval 계약 검증 강화
 =====================================================
 """
-
-from __future__ import annotations
 
 import math
 import time
@@ -183,25 +191,24 @@ FEATURE_ERROR_TG_COOLDOWN_SEC: float = _require_positive_float_setting(
     "features_error_tg_cooldown_sec"
 )
 
-# SSOT-derived runtime thresholds
 KLINE_MAX_DELAY_SEC: float = _require_positive_float_setting("ws_max_kline_delay_sec")
 ORDERBOOK_MAX_DELAY_SEC: float = _require_positive_float_setting("ws_market_event_max_delay_sec")
 DEFAULT_KLINE_MIN_BUFFER: int = _require_positive_int_setting("ws_min_kline_buffer")
 KLINE_MIN_BUFFER_BY_INTERVAL: Dict[str, int] = _require_interval_buffer_mapping_setting(
     "ws_min_kline_buffer_by_interval"
 )
+LOW_VOL_RANGE_PCT_THRESHOLD: float = _require_positive_float_setting("low_vol_range_pct_threshold")
+LOW_VOL_ATR_PCT_THRESHOLD: float = _require_positive_float_setting("low_vol_atr_pct_threshold")
+
+REGIME_INTERVALS = {"5m", "15m", "1h", "4h"}
 
 
 class FeatureBuildError(RuntimeError):
-    """필수 시세 데이터가 부족/지연된 경우 사용하는 예외."""
+    """필수 시세 데이터가 부족/지연/계약 위반인 경우 사용하는 예외."""
 
 
 _LAST_ERROR_SENT: Dict[str, float] = {}
 
-# 동일 5m 캔들(latest_ts) 동안 최초 결정 결과를 그대로 재사용한다.
-# - SIGNAL: chosen_signal / signal_source / extra 를 freeze
-# - NO_SIGNAL: no-signal 결정도 freeze (같은 캔들 동안 재계산 금지)
-# - last_price 는 freeze 하지 않는다(현재가 반영 유지)
 _SIGNAL_FREEZE_STATE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -214,6 +221,10 @@ def _normalize_symbol(symbol: Any) -> str:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
 
 
 def _notify_error_once(key: str, human_msg: str) -> None:
@@ -236,6 +247,42 @@ def _fail(symbol: str, location: str, reason: str) -> None:
     key = f"{symbol}|{location}|{reason}"
     _notify_error_once(key, msg)
     raise FeatureBuildError(msg)
+
+
+def _require_finite_float(
+    symbol: str,
+    location: str,
+    name: str,
+    value: Any,
+    *,
+    positive: bool = False,
+    non_negative: bool = False,
+) -> float:
+    if isinstance(value, bool):
+        _fail(symbol, location, f"{name} must be float-compatible, bool is not allowed (STRICT)")
+    try:
+        parsed = float(value)
+    except Exception:
+        _fail(symbol, location, f"{name} must be float-compatible (STRICT)")
+    if not math.isfinite(parsed):
+        _fail(symbol, location, f"{name} must be finite (STRICT)")
+    if positive and parsed <= 0:
+        _fail(symbol, location, f"{name} must be > 0 (STRICT)")
+    if non_negative and parsed < 0:
+        _fail(symbol, location, f"{name} must be >= 0 (STRICT)")
+    return parsed
+
+
+def _require_int_ms(symbol: str, location: str, name: str, value: Any) -> int:
+    if isinstance(value, bool):
+        _fail(symbol, location, f"{name} must be int-compatible milliseconds, bool is not allowed (STRICT)")
+    try:
+        parsed = int(value)
+    except Exception:
+        _fail(symbol, location, f"{name} must be int-compatible milliseconds (STRICT)")
+    if parsed <= 0:
+        _fail(symbol, location, f"{name} must be > 0 milliseconds (STRICT)")
+    return parsed
 
 
 def _get_signal_freeze_state(symbol: str) -> Optional[Dict[str, Any]]:
@@ -329,16 +376,20 @@ def _resolve_min_kline_buffer(interval: str, cfg: Dict[str, int]) -> int:
     rsi_len = int(cfg.get("rsi", 14))
     atr_len = int(cfg.get("atr", 14))
     range_len = int(cfg.get("range", 50))
+    vol_ma_len = int(cfg.get("vol_ma", 20))
 
-    return max(
+    regime_need = max(
         ema_fast_len,
         ema_slow_len,
+        100,
+        200,
         rsi_len + 1,
         atr_len + 1,
+        2 * atr_len,
         range_len,
-        interval_floor,
-        atr_len * 2,
     )
+
+    return max(interval_floor, regime_need, vol_ma_len, 6)
 
 
 def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dict[str, Any]:
@@ -372,6 +423,50 @@ def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dic
     }
 
 
+def _validate_ws_ohlcv_buffer_strict(
+    symbol: str,
+    interval: str,
+    rows: Any,
+) -> List[Tuple[int, float, float, float, float, float]]:
+    location = f"kline_{interval}"
+
+    if not isinstance(rows, list) or not rows:
+        _fail(symbol, location, f"{interval} 캔들 버퍼가 비어 있습니다. (STRICT)")
+
+    out: List[Tuple[int, float, float, float, float, float]] = []
+    prev_ts: Optional[int] = None
+
+    for idx, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            _fail(symbol, location, f"{interval}[{idx}] row malformed: expected len>=6 (STRICT)")
+
+        ts = _require_int_ms(symbol, location, f"{interval}[{idx}].ts_ms", row[0])
+        open_px = _require_finite_float(symbol, location, f"{interval}[{idx}].open", row[1], positive=True)
+        high_px = _require_finite_float(symbol, location, f"{interval}[{idx}].high", row[2], positive=True)
+        low_px = _require_finite_float(symbol, location, f"{interval}[{idx}].low", row[3], positive=True)
+        close_px = _require_finite_float(symbol, location, f"{interval}[{idx}].close", row[4], positive=True)
+        volume = _require_finite_float(symbol, location, f"{interval}[{idx}].volume", row[5], non_negative=True)
+
+        if high_px < low_px:
+            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: high < low (STRICT)")
+        if high_px < max(open_px, close_px):
+            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: high < max(open, close) (STRICT)")
+        if low_px > min(open_px, close_px):
+            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: low > min(open, close) (STRICT)")
+
+        if prev_ts is not None and ts <= prev_ts:
+            _fail(
+                symbol,
+                location,
+                f"{interval} timestamp must be strictly increasing "
+                f"(prev_ts={prev_ts}, ts={ts}, index={idx}) (STRICT)",
+            )
+        prev_ts = ts
+        out.append((ts, open_px, high_px, low_px, close_px, volume))
+
+    return out
+
+
 def _fetch_candles_strict(
     symbol: str,
     interval: str,
@@ -380,13 +475,12 @@ def _fetch_candles_strict(
     required: bool,
 ) -> List[Tuple[int, float, float, float, float, float]]:
     need_len = _resolve_min_kline_buffer(interval, cfg)
+    raw_buf = get_klines_with_volume(symbol, interval, limit=max(300, need_len * 2))
 
-    buf = get_klines_with_volume(symbol, interval, limit=max(300, need_len * 2))
-
-    if not buf or len(buf) < need_len:
+    if not raw_buf or len(raw_buf) < need_len:
         reason = (
             f"{interval} 캔들이 부족합니다 "
-            f"(필요 {need_len}개 이상, 현재 {0 if not buf else len(buf)}개). "
+            f"(필요 {need_len}개 이상, 현재 {0 if not raw_buf else len(raw_buf)}개). "
             "ws_subscribe_tfs / WS 백필 설정을 확인해 주세요."
         )
         if required:
@@ -412,19 +506,32 @@ def _fetch_candles_strict(
         log(f"[MKT-FEAT] optional {reason}")
         return []
 
-    return [r for r in buf[-max(300, need_len):] if len(r) >= 6]
+    sliced = raw_buf[-max(300, need_len):]
+    validated = _validate_ws_ohlcv_buffer_strict(symbol, interval, sliced)
+
+    if len(validated) < need_len:
+        reason = (
+            f"{interval} STRICT 검증 후 유효 캔들이 부족합니다 "
+            f"(필요 {need_len}개 이상, 현재 {len(validated)}개)."
+        )
+        if required:
+            _fail(symbol, f"kline_{interval}", reason)
+        log(f"[MKT-FEAT] optional {reason}")
+        return []
+
+    return validated
 
 
 def _candles_from_ws_buf(
     buf: List[Tuple[int, float, float, float, float, float]]
-) -> List[Tuple[int, float, float, float, float, float]]:
-    return buf
+) -> List[Candle]:
+    return [(int(ts), float(o), float(h), float(l), float(c)) for (ts, o, h, l, c, _v) in buf]
 
 
-def _last_two_valid(vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
-    valid = [v for v in vals if not math.isnan(v)]
+def _last_two_finite_or_fail(symbol: str, location: str, vals: List[float], name: str) -> Tuple[float, float]:
+    valid = [float(v) for v in vals if math.isfinite(float(v))]
     if len(valid) < 2:
-        return None, None
+        _fail(symbol, location, f"{name} has <2 finite values (STRICT)")
     return valid[-2], valid[-1]
 
 
@@ -441,9 +548,9 @@ def _detect_last_cross(
     prev_diff: Optional[float] = None
 
     for i in range(n):
-        f = ema_fast_vals[i]
-        s = ema_slow_vals[i]
-        if math.isnan(f) or math.isnan(s):
+        f = float(ema_fast_vals[i])
+        s = float(ema_slow_vals[i])
+        if not math.isfinite(f) or not math.isfinite(s):
             continue
         diff = f - s
         if prev_diff is not None:
@@ -467,11 +574,7 @@ def _volume_stats(values: List[float], ma_len: int) -> Tuple[float, float, float
         return math.nan, math.nan, math.nan, math.nan
 
     last = float(values[-1])
-
-    if len(values) < ma_len:
-        window = [float(v) for v in values]
-    else:
-        window = [float(v) for v in values[-ma_len:]]
+    window = [float(v) for v in (values[-ma_len:] if len(values) >= ma_len else values)]
 
     mean = sum(window) / len(window)
     var = sum((v - mean) ** 2 for v in window) / len(window) if len(window) > 1 else 0.0
@@ -511,22 +614,47 @@ def _validate_core_features(
 
     for key in core_keys:
         v = feats.get(key)
-        if not isinstance(v, (int, float)) or math.isnan(float(v)):
+        if not _is_finite_number(v):
             _fail(
                 symbol,
                 f"features_{interval}",
-                f"{interval} 핵심 피처 '{key}' 가 NaN/None 입니다.",
+                f"{interval} 핵심 피처 '{key}' 가 finite number 가 아닙니다.",
             )
 
     adx_val = feats.get("adx")
-    if adx_val is None or (
-        isinstance(adx_val, (int, float)) and math.isnan(float(adx_val))
-    ):
+    if not _is_finite_number(adx_val):
         _fail(
             symbol,
             f"features_{interval}",
-            f"{interval} 핵심 피처 'adx' 가 NaN/None 입니다.",
+            f"{interval} 핵심 피처 'adx' 가 finite number 가 아닙니다.",
         )
+
+
+def _validate_regime_features(
+    symbol: str,
+    interval: str,
+    feats: Dict[str, Any],
+) -> None:
+    regime = feats.get("regime")
+    if not isinstance(regime, dict):
+        _fail(symbol, f"features_{interval}", f"{interval} regime dict 가 없습니다. (STRICT)")
+
+    required_keys = [
+        "trend_strength",
+        "range_strength",
+        "_regime_hint",
+        "_regime_label",
+        "ema_200",
+        "ema_200_dist_pct",
+    ]
+    for key in required_keys:
+        value = regime.get(key)
+        if not _is_finite_number(value):
+            _fail(
+                symbol,
+                f"features_{interval}",
+                f"{interval} regime 핵심 피처 '{key}' 가 finite number 가 아닙니다.",
+            )
 
 
 def _build_timeframe_features(
@@ -535,11 +663,15 @@ def _build_timeframe_features(
     buf: List[Tuple[int, float, float, float, float, float]],
     cfg: Dict[str, int],
 ) -> Dict[str, Any]:
-    closes = [c[4] for c in buf]
-    highs = [c[2] for c in buf]
-    lows = [c[3] for c in buf]
-    vols = [c[5] for c in buf]
-    last_close = closes[-1] if closes else math.nan
+    location = f"features_{interval}"
+    validated_buf = _validate_ws_ohlcv_buffer_strict(symbol, interval, buf)
+
+    closes = [c[4] for c in validated_buf]
+    highs = [c[2] for c in validated_buf]
+    lows = [c[3] for c in validated_buf]
+    vols = [c[5] for c in validated_buf]
+
+    last_close = _require_finite_float(symbol, location, "last_close", closes[-1], positive=True)
 
     ema_fast_len = int(cfg.get("ema_fast", 20))
     ema_slow_len = int(cfg.get("ema_slow", 50))
@@ -548,160 +680,135 @@ def _build_timeframe_features(
     range_len = int(cfg.get("range", 50))
     vol_ma_len = int(cfg.get("vol_ma", 20))
 
-    candles_for_calc: List[Candle] = _candles_from_ws_buf(buf)
+    candles_for_calc: List[Candle] = _candles_from_ws_buf(validated_buf)
 
-    raw_ohlcv_last20: List[Tuple[int, float, float, float, float, float]] = []
-    raw_slice = buf[-20:] if len(buf) >= 20 else buf
-    for ts, o, h, l, c, v in raw_slice:
-        try:
-            raw_ohlcv_last20.append(
-                (int(ts), float(o), float(h), float(l), float(c), float(v))
-            )
-        except Exception as e:
-            _fail(symbol, f"raw_ohlcv_{interval}", f"raw_ohlcv_last20 build failed: {e}")
+    raw_ohlcv_last20: List[Tuple[int, float, float, float, float, float]] = list(
+        validated_buf[-20:] if len(validated_buf) >= 20 else validated_buf
+    )
 
     ema_fast_vals = ema(closes, ema_fast_len)
     ema_slow_vals = ema(closes, ema_slow_len)
-    ema_fast_val = ema_fast_vals[-1] if ema_fast_vals else math.nan
-    ema_slow_val = ema_slow_vals[-1] if ema_slow_vals else math.nan
+    ema_fast_val = _require_finite_float(symbol, location, "ema_fast", ema_fast_vals[-1])
+    ema_slow_val = _require_finite_float(symbol, location, "ema_slow", ema_slow_vals[-1])
 
-    ema_fast_prev, ema_fast_last = _last_two_valid(ema_fast_vals)
-    if math.isnan(ema_fast_val) or math.isnan(ema_slow_val) or last_close <= 0:
-        ema_dist_pct = math.nan
-    else:
-        ema_dist_pct = (ema_fast_val - ema_slow_val) / last_close
+    ema_fast_prev, ema_fast_last = _last_two_finite_or_fail(symbol, location, ema_fast_vals, "ema_fast_vals")
+    ema_fast_slope_pct = (ema_fast_last - ema_fast_prev) / last_close
+    if not math.isfinite(ema_fast_slope_pct):
+        _fail(symbol, location, "ema_fast_slope_pct is not finite (STRICT)")
 
-    if ema_fast_prev is None or ema_fast_last is None or last_close <= 0:
-        ema_fast_slope_pct = math.nan
-    else:
-        ema_fast_slope_pct = (ema_fast_last - ema_fast_prev) / last_close
+    ema_slow_prev, ema_slow_last = _last_two_finite_or_fail(symbol, location, ema_slow_vals, "ema_slow_vals")
+    ema_slow_slope_pct = (ema_slow_last - ema_slow_prev) / last_close
+    if not math.isfinite(ema_slow_slope_pct):
+        _fail(symbol, location, "ema_slow_slope_pct is not finite (STRICT)")
 
-    ema_slow_prev, ema_slow_last = _last_two_valid(ema_slow_vals)
-    if ema_slow_prev is None or ema_slow_last is None or last_close <= 0:
-        ema_slow_slope_pct = math.nan
-    else:
-        ema_slow_slope_pct = (ema_slow_last - ema_slow_prev) / last_close
+    ema_dist_pct = (ema_fast_val - ema_slow_val) / last_close
+    if not math.isfinite(ema_dist_pct):
+        _fail(symbol, location, "ema_dist_pct is not finite (STRICT)")
 
     def _ret(n_bars: int) -> float:
         if len(closes) <= n_bars:
-            return math.nan
-        past = closes[-(n_bars + 1)]
-        curr = closes[-1]
+            _fail(symbol, location, f"return_{n_bars} requires len>{n_bars} (STRICT)")
+        past = float(closes[-(n_bars + 1)])
+        curr = float(closes[-1])
         if past <= 0:
-            return math.nan
-        return (curr - past) / past
+            _fail(symbol, location, f"return_{n_bars} past close must be > 0 (STRICT)")
+        value = (curr - past) / past
+        if not math.isfinite(value):
+            _fail(symbol, location, f"return_{n_bars} is not finite (STRICT)")
+        return value
 
     ret_1 = _ret(1)
     ret_3 = _ret(3)
     ret_5 = _ret(5)
 
     atr_val = calc_atr(candles_for_calc[-(atr_len + 1):], length=atr_len)
-    atr_pct = (atr_val / last_close) if (atr_val is not None and last_close > 0) else math.nan
+    atr_val = _require_finite_float(symbol, location, "atr", atr_val, positive=True)
+    atr_pct = atr_val / last_close
+    if not math.isfinite(atr_pct) or atr_pct <= 0:
+        _fail(symbol, location, "atr_pct must be finite > 0 (STRICT)")
 
-    window_for_range = (
-        candles_for_calc[-range_len:]
-        if len(candles_for_calc) >= range_len
-        else candles_for_calc
-    )
-    if window_for_range:
-        high_recent = max(c[2] for c in window_for_range)
-        low_recent = min(c[3] for c in window_for_range)
-        range_pct = (high_recent - low_recent) / last_close if last_close > 0 else math.nan
-    else:
-        range_pct = math.nan
+    window_for_range = candles_for_calc[-range_len:] if len(candles_for_calc) >= range_len else candles_for_calc
+    if not window_for_range:
+        _fail(symbol, location, f"{interval} range window is empty (STRICT)")
+    high_recent = max(c[2] for c in window_for_range)
+    low_recent = min(c[3] for c in window_for_range)
+    range_pct = (high_recent - low_recent) / last_close
+    if not math.isfinite(range_pct) or range_pct <= 0:
+        _fail(symbol, location, "range_pct must be finite > 0 (STRICT)")
 
     rsi_vals = rsi(closes, rsi_len)
-    rsi_last = rsi_vals[-1] if rsi_vals else math.nan
+    rsi_last = _require_finite_float(symbol, location, "rsi", rsi_vals[-1])
 
     macd_line, macd_signal, macd_hist = macd(closes)
-    macd_last = macd_line[-1] if macd_line else math.nan
-    macd_signal_last = macd_signal[-1] if macd_signal else math.nan
-    macd_hist_last = macd_hist[-1] if macd_hist else math.nan
+    macd_last = _require_finite_float(symbol, location, "macd", macd_line[-1])
+    macd_signal_last = _require_finite_float(symbol, location, "macd_signal", macd_signal[-1])
+    macd_hist_last = _require_finite_float(symbol, location, "macd_hist", macd_hist[-1])
 
     _, bb_upper, bb_lower = bollinger_bands(closes)
-    bb_width_pct = math.nan
-    bb_pos = math.nan
-    if bb_upper and bb_lower:
-        u = bb_upper[-1]
-        l = bb_lower[-1]
-        if (
-            not math.isnan(u)
-            and not math.isnan(l)
-            and (u - l) > 0
-            and last_close > 0
-        ):
-            bb_width_pct = (u - l) / last_close
-            bb_pos = (last_close - l) / (u - l)
+    bb_upper_last = _require_finite_float(symbol, location, "bb_upper", bb_upper[-1])
+    bb_lower_last = _require_finite_float(symbol, location, "bb_lower", bb_lower[-1])
+    if bb_upper_last <= bb_lower_last:
+        _fail(symbol, location, "bb_upper must be > bb_lower (STRICT)")
+    bb_width_pct = (bb_upper_last - bb_lower_last) / last_close
+    bb_pos = (last_close - bb_lower_last) / (bb_upper_last - bb_lower_last)
+    if not math.isfinite(bb_width_pct) or not math.isfinite(bb_pos):
+        _fail(symbol, location, "bb_width_pct/bb_pos must be finite (STRICT)")
 
     stoch_k_vals, stoch_d_vals = stochastic_oscillator(highs, lows, closes)
-    stoch_k_last = stoch_k_vals[-1] if stoch_k_vals else math.nan
-    stoch_d_last = stoch_d_vals[-1] if stoch_d_vals else math.nan
+    stoch_k_last = _require_finite_float(symbol, location, "stoch_k", stoch_k_vals[-1])
+    stoch_d_last = _require_finite_float(symbol, location, "stoch_d", stoch_d_vals[-1])
 
     adx_val = adx(candles_for_calc, length=atr_len)
+    adx_val = _require_finite_float(symbol, location, "adx", adx_val, non_negative=True)
 
     vol_last, vol_ma, vol_ratio, vol_z = _volume_stats(vols, vol_ma_len)
     obv_vals = obv(closes, vols)
-    obv_last = obv_vals[-1] if obv_vals else math.nan
+    obv_last = _require_finite_float(symbol, location, "obv", obv_vals[-1])
+
+    if not _is_finite_number(vol_last):
+        _fail(symbol, location, "volume_last must be finite (STRICT)")
+    if not _is_finite_number(vol_ma):
+        _fail(symbol, location, "volume_ma must be finite (STRICT)")
+    if not _is_finite_number(vol_ratio):
+        _fail(symbol, location, "volume_ratio must be finite (STRICT)")
+    if not _is_finite_number(vol_z):
+        _fail(symbol, location, "volume_zscore must be finite (STRICT)")
 
     cross_type, cross_bars_ago = _detect_last_cross(ema_fast_vals, ema_slow_vals)
 
-    try:
-        if (
-            not math.isnan(range_pct)
-            and range_pct <= 0.0
-            and atr_val is not None
-            and atr_val <= 0.0
-            and isinstance(vol_ma, (int, float))
-            and vol_ma == 0.0
-        ):
-            reason = (
-                f"{interval} 최근 {range_len}개 구간 동안 가격 변동과 평균 거래량이 모두 0에 가깝습니다. "
-                "WS 시세가 멈췄거나 비정상일 수 있습니다."
-            )
-            _fail(symbol, f"flat_{interval}", reason)
-    except FeatureBuildError:
-        raise
-    except Exception as e:
-        log(f"[MKT-FEAT] flat-market check error interval={interval}: {e}")
+    if range_pct <= 0.0 and atr_val <= 0.0 and vol_ma == 0.0:
+        reason = (
+            f"{interval} 최근 {range_len}개 구간 동안 가격 변동과 평균 거래량이 모두 0에 가깝습니다. "
+            "WS 시세가 멈췄거나 비정상일 수 있습니다."
+        )
+        _fail(symbol, f"flat_{interval}", reason)
 
     def _flag(condition: bool) -> int:
         return 1 if condition else 0
 
-    rsi_overbought = _flag(rsi_last >= 70.0) if not math.isnan(rsi_last) else 0
-    rsi_oversold = _flag(rsi_last <= 30.0) if not math.isnan(rsi_last) else 0
-    stoch_overbought = _flag(stoch_k_last >= 80.0) if not math.isnan(stoch_k_last) else 0
-    stoch_oversold = _flag(stoch_k_last <= 20.0) if not math.isnan(stoch_k_last) else 0
+    rsi_overbought = _flag(rsi_last >= 70.0)
+    rsi_oversold = _flag(rsi_last <= 30.0)
+    stoch_overbought = _flag(stoch_k_last >= 80.0)
+    stoch_oversold = _flag(stoch_k_last <= 20.0)
 
-    if not math.isnan(macd_last) and not math.isnan(macd_signal_last):
-        macd_bias = 1 if macd_last > macd_signal_last else -1 if macd_last < macd_signal_last else 0
+    if macd_last > macd_signal_last:
+        macd_bias = 1
+    elif macd_last < macd_signal_last:
+        macd_bias = -1
     else:
         macd_bias = 0
 
-    if adx_val is not None:
-        strong_trend_flag = _flag(adx_val >= 25.0)
-    else:
-        strong_trend_flag = 0
+    strong_trend_flag = _flag(adx_val >= 25.0)
 
-    is_low_volatility = 0
-    try:
-        if (
-            isinstance(atr_pct, (int, float))
-            and not math.isnan(atr_pct)
-            and isinstance(range_pct, (int, float))
-            and not math.isnan(range_pct)
-        ):
-            low_range_th_local = 0.01
-            low_atr_th_local = 0.004
-            if atr_pct < low_atr_th_local and range_pct < low_range_th_local:
-                is_low_volatility = 1
-    except Exception as e:
-        log(f"[MKT-FEAT] is_low_volatility 계산 중 예외 interval={interval}: {e}")
+    is_low_volatility = _flag(
+        atr_pct < LOW_VOL_ATR_PCT_THRESHOLD and range_pct < LOW_VOL_RANGE_PCT_THRESHOLD
+    )
 
     tf_features: Dict[str, Any] = {
         "interval": interval,
-        "buffer_len": len(buf),
+        "buffer_len": len(validated_buf),
         "last_close": last_close,
-        "prev_close": closes[-2] if len(closes) >= 2 else math.nan,
+        "prev_close": float(closes[-2]) if len(closes) >= 2 else math.nan,
         "return_1": ret_1,
         "return_3": ret_3,
         "return_5": ret_5,
@@ -731,10 +838,10 @@ def _build_timeframe_features(
         "stoch_oversold": stoch_oversold,
         "adx": adx_val,
         "strong_trend_flag": strong_trend_flag,
-        "volume_last": vol_last,
-        "volume_ma": vol_ma,
-        "volume_ratio": vol_ratio,
-        "volume_zscore": vol_z,
+        "volume_last": float(vol_last),
+        "volume_ma": float(vol_ma),
+        "volume_ratio": float(vol_ratio),
+        "volume_zscore": float(vol_z),
         "obv": obv_last,
         "cross_type": cross_type,
         "cross_bars_ago": cross_bars_ago,
@@ -742,90 +849,64 @@ def _build_timeframe_features(
     }
 
     indicators: Dict[str, Any] = {
-        "ema_fast": float(ema_fast_val) if isinstance(ema_fast_val, (int, float)) else math.nan,
-        "ema_slow": float(ema_slow_val) if isinstance(ema_slow_val, (int, float)) else math.nan,
-        "ema_fast_slope_pct": float(ema_fast_slope_pct) if isinstance(ema_fast_slope_pct, (int, float)) else math.nan,
-        "ema_slow_slope_pct": float(ema_slow_slope_pct) if isinstance(ema_slow_slope_pct, (int, float)) else math.nan,
-        "rsi": float(rsi_last) if isinstance(rsi_last, (int, float)) else math.nan,
-        "atr": float(atr_val) if isinstance(atr_val, (int, float)) else math.nan,
-        "atr_pct": float(atr_pct) if isinstance(atr_pct, (int, float)) else math.nan,
-        "macd": float(macd_last) if isinstance(macd_last, (int, float)) else math.nan,
-        "macd_signal": float(macd_signal_last) if isinstance(macd_signal_last, (int, float)) else math.nan,
-        "macd_hist": float(macd_hist_last) if isinstance(macd_hist_last, (int, float)) else math.nan,
-        "adx": float(adx_val) if isinstance(adx_val, (int, float)) else math.nan,
-        "bb_width_pct": float(bb_width_pct) if isinstance(bb_width_pct, (int, float)) else math.nan,
-        "bb_pos": float(bb_pos) if isinstance(bb_pos, (int, float)) else math.nan,
-        "stoch_k": float(stoch_k_last) if isinstance(stoch_k_last, (int, float)) else math.nan,
-        "stoch_d": float(stoch_d_last) if isinstance(stoch_d_last, (int, float)) else math.nan,
-        "volume_ratio": float(vol_ratio) if isinstance(vol_ratio, (int, float)) else math.nan,
-        "volume_zscore": float(vol_z) if isinstance(vol_z, (int, float)) else math.nan,
+        "ema_fast": ema_fast_val,
+        "ema_slow": ema_slow_val,
+        "ema_fast_slope_pct": ema_fast_slope_pct,
+        "ema_slow_slope_pct": ema_slow_slope_pct,
+        "rsi": rsi_last,
+        "atr": atr_val,
+        "atr_pct": atr_pct,
+        "macd": macd_last,
+        "macd_signal": macd_signal_last,
+        "macd_hist": macd_hist_last,
+        "adx": adx_val,
+        "bb_width_pct": bb_width_pct,
+        "bb_pos": bb_pos,
+        "stoch_k": stoch_k_last,
+        "stoch_d": stoch_d_last,
+        "volume_ratio": float(vol_ratio),
+        "volume_zscore": float(vol_z),
+        "rsi_series": [float(v) for v in rsi_vals],
+        "macd_hist_series": [float(v) for v in macd_hist],
     }
-
-    try:
-        if rsi_vals:
-            rsi_clean = [
-                float(v)
-                for v in rsi_vals
-                if isinstance(v, (int, float)) and math.isfinite(float(v))
-            ]
-            if rsi_clean:
-                indicators["rsi_series"] = rsi_clean
-    except Exception as e:
-        log(f"[MKT-FEAT] rsi_series build error interval={interval}: {e}")
-
-    try:
-        if macd_hist:
-            macd_hist_clean = [
-                float(v)
-                for v in macd_hist
-                if isinstance(v, (int, float)) and math.isfinite(float(v))
-            ]
-            if macd_hist_clean:
-                indicators["macd_hist_series"] = macd_hist_clean
-    except Exception as e:
-        log(f"[MKT-FEAT] macd_hist_series build error interval={interval}: {e}")
-
     tf_features["indicators"] = indicators
 
     if interval in ("1m", "5m", "15m"):
         tf_features["raw_ohlcv_last20"] = raw_ohlcv_last20
 
-    if interval in ("5m", "15m", "1h", "4h"):
-        try:
-            regime = build_regime_features_from_candles(
-                candles_for_calc,
-                fast_ema_len=ema_fast_len,
-                slow_ema_len=ema_slow_len,
-                atr_len=atr_len,
-                rsi_len=rsi_len,
-                range_window=range_len,
-            )
-            if regime is not None:
-                tf_features["regime"] = _normalize_regime_keys(regime)
-        except Exception as e:
-            log(f"[MKT-FEAT] regime feature 계산 중 예외 interval={interval}: {e}")
+    if interval in REGIME_INTERVALS:
+        regime = build_regime_features_from_candles(
+            candles_for_calc,
+            fast_ema_len=ema_fast_len,
+            slow_ema_len=ema_slow_len,
+            atr_len=atr_len,
+            rsi_len=rsi_len,
+            range_window=range_len,
+        )
+        tf_features["regime"] = _normalize_regime_keys(regime)
 
-    tf_features["candles_raw"] = [
-        (int(ts), float(o), float(h), float(l), float(c), float(v))
-        for (ts, o, h, l, c, v) in buf
-    ]
-    tf_features["candles"] = list(tf_features["candles_raw"])
+    tf_features["candles_raw"] = list(validated_buf)
+    tf_features["candles"] = list(candles_for_calc)
     return tf_features
 
 
 def _compute_trend_bias(tf_features: Dict[str, Any]) -> int:
-    ema_fast_val = float(tf_features.get("ema_fast") or math.nan)
-    ema_slow_val = float(tf_features.get("ema_slow") or math.nan)
-    if math.isnan(ema_fast_val) or math.isnan(ema_slow_val):
-        return 0
-    if ema_fast_val > ema_slow_val:
+    ema_fast_val = tf_features.get("ema_fast")
+    ema_slow_val = tf_features.get("ema_slow")
+    if not _is_finite_number(ema_fast_val) or not _is_finite_number(ema_slow_val):
+        raise FeatureBuildError("trend bias requires finite ema_fast/ema_slow (STRICT)")
+
+    f = float(ema_fast_val)
+    s = float(ema_slow_val)
+    if f > s:
         return 1
-    if ema_fast_val < ema_slow_val:
+    if f < s:
         return -1
     return 0
 
 
 def _build_multi_timeframe_summary(
+    symbol: str,
     tf_map: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     trend_votes: Dict[str, int] = {}
@@ -852,26 +933,35 @@ def _build_multi_timeframe_summary(
     oversold_tfs = 0
     low_vol_tfs = 0
 
-    for feats in tf_map.values():
+    for iv, feats in tf_map.items():
         adx_val = feats.get("adx")
-        if isinstance(adx_val, (int, float)) and not math.isnan(adx_val) and adx_val >= 25.0:
-            adx_trend_tfs += 1
-
         rsi_val = feats.get("rsi")
         stoch_k_val = feats.get("stoch_k")
-
-        if isinstance(rsi_val, (int, float)) and not math.isnan(rsi_val) and rsi_val >= 70.0:
-            overbought_tfs += 1
-        elif isinstance(stoch_k_val, (int, float)) and not math.isnan(stoch_k_val) and stoch_k_val >= 80.0:
-            overbought_tfs += 1
-
-        if isinstance(rsi_val, (int, float)) and not math.isnan(rsi_val) and rsi_val <= 30.0:
-            oversold_tfs += 1
-        elif isinstance(stoch_k_val, (int, float)) and not math.isnan(stoch_k_val) and stoch_k_val <= 20.0:
-            oversold_tfs += 1
-
         is_lv = feats.get("is_low_volatility")
-        if isinstance(is_lv, int) and is_lv == 1:
+
+        if not _is_finite_number(adx_val):
+            _fail(symbol, f"summary_{iv}", "adx must be finite (STRICT)")
+        if not _is_finite_number(rsi_val):
+            _fail(symbol, f"summary_{iv}", "rsi must be finite (STRICT)")
+        if not _is_finite_number(stoch_k_val):
+            _fail(symbol, f"summary_{iv}", "stoch_k must be finite (STRICT)")
+        if not isinstance(is_lv, int):
+            _fail(symbol, f"summary_{iv}", "is_low_volatility must be int flag (STRICT)")
+
+        adx_num = float(adx_val)
+        rsi_num = float(rsi_val)
+        stoch_num = float(stoch_k_val)
+
+        if adx_num >= 25.0:
+            adx_trend_tfs += 1
+
+        if rsi_num >= 70.0 or stoch_num >= 80.0:
+            overbought_tfs += 1
+
+        if rsi_num <= 30.0 or stoch_num <= 20.0:
+            oversold_tfs += 1
+
+        if is_lv == 1:
             low_vol_tfs += 1
 
     return {
@@ -927,11 +1017,8 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
         raw_ts = ob.get(key)
         if raw_ts is None:
             continue
-        try:
-            ts_ms = int(raw_ts)
-            break
-        except Exception:
-            _fail(symbol, "orderbook", f"{key} must be int-compatible milliseconds (STRICT)")
+        ts_ms = _require_int_ms(symbol, "orderbook", key, raw_ts)
+        break
 
     if ts_ms is None:
         _fail(
@@ -953,16 +1040,9 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     if not isinstance(ob_status, dict):
         _fail(symbol, "orderbook", "get_orderbook_buffer_status 결과가 dict 가 아닙니다. (STRICT)")
 
-    try:
-        best_bid = float(bids[0][0])
-        best_ask = float(asks[0][0])
-    except Exception:
-        _fail(symbol, "orderbook", "best bid/ask 파싱에 실패했습니다. depth row 형식이 손상되었습니다.")
+    best_bid = _require_finite_float(symbol, "orderbook", "best_bid", bids[0][0], positive=True)
+    best_ask = _require_finite_float(symbol, "orderbook", "best_ask", asks[0][0], positive=True)
 
-    if not math.isfinite(best_bid) or best_bid <= 0:
-        _fail(symbol, "orderbook", "best_bid must be finite > 0 (STRICT)")
-    if not math.isfinite(best_ask) or best_ask <= 0:
-        _fail(symbol, "orderbook", "best_ask must be finite > 0 (STRICT)")
     if best_ask <= best_bid:
         _fail(symbol, "orderbook", "best_ask must be greater than best_bid (STRICT)")
 
@@ -979,19 +1059,8 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
                     "orderbook",
                     f"{side_name}[{idx}] depth row malformed (STRICT): expected [price, qty]",
                 )
-            try:
-                p = float(row[0])
-                q = float(row[1])
-            except Exception:
-                _fail(
-                    symbol,
-                    "orderbook",
-                    f"{side_name}[{idx}] depth row parse failed (STRICT)",
-                )
-            if not math.isfinite(p) or p <= 0:
-                _fail(symbol, "orderbook", f"{side_name}[{idx}] price must be finite > 0 (STRICT)")
-            if not math.isfinite(q) or q < 0:
-                _fail(symbol, "orderbook", f"{side_name}[{idx}] qty must be finite >= 0 (STRICT)")
+            p = _require_finite_float(symbol, "orderbook", f"{side_name}[{idx}].price", row[0], positive=True)
+            q = _require_finite_float(symbol, "orderbook", f"{side_name}[{idx}].qty", row[1], non_negative=True)
             total += p * q
         return total
 
@@ -1141,6 +1210,8 @@ def build_entry_features_ws(
             tf_features = _build_timeframe_features(symbol, iv, buf, cfg)
             if is_required:
                 _validate_core_features(symbol, iv, tf_features)
+                if iv in REGIME_INTERVALS:
+                    _validate_regime_features(symbol, iv, tf_features)
             timeframes[iv] = tf_features
         except FeatureBuildError:
             raise
@@ -1155,7 +1226,7 @@ def build_entry_features_ws(
         _fail(symbol, "features", "어떤 타임프레임에서도 피처를 생성하지 못했습니다.")
 
     ob_features = _compute_orderbook_features(symbol)
-    mtf_summary = _build_multi_timeframe_summary(timeframes)
+    mtf_summary = _build_multi_timeframe_summary(symbol, timeframes)
 
     return {
         "symbol": symbol,
@@ -1182,23 +1253,13 @@ def get_trading_signal(
         "5m",
         {"ema_fast": 20, "ema_slow": 50, "rsi": 14, "atr": 14, "range": 50, "vol_ma": 20},
     )
-    try:
-        buf_5m = _fetch_candles_strict(
-            symbol,
-            "5m",
-            cfg=cfg_5m,
-            required=True,
-        )
-    except FeatureBuildError as e:
-        log(f"[MKT-FEAT] get_trading_signal: 5m fetch FeatureBuildError: {e}")
-        return None
-    except Exception as e:
-        log(f"[MKT-FEAT] get_trading_signal: 5m fetch unexpected error: {e}")
-        return None
 
-    if not buf_5m:
-        log("[MKT-FEAT] get_trading_signal: 5m buf_5m 이 비어 있습니다.")
-        return None
+    buf_5m = _fetch_candles_strict(
+        symbol,
+        "5m",
+        cfg=cfg_5m,
+        required=True,
+    )
 
     candles_5m_raw: List[List[float]] = [
         [float(ts), float(o), float(h), float(l), float(c), float(v)]
@@ -1206,30 +1267,23 @@ def get_trading_signal(
     ]
     candles_5m: List[List[float]] = [
         [float(ts), float(o), float(h), float(l), float(c)]
-        for (ts, o, h, l, c, v) in buf_5m
+        for (ts, o, h, l, c, _v) in buf_5m
     ]
     latest_ts = int(buf_5m[-1][0])
 
-    try:
-        ob_now = _compute_orderbook_features(symbol)
-    except FeatureBuildError as e:
-        log(f"[MKT-FEAT] get_trading_signal: orderbook FeatureBuildError: {e}")
-        return None
-    except Exception as e:
-        log(f"[MKT-FEAT] get_trading_signal: orderbook unexpected error: {e}")
-        return None
+    ob_now = _compute_orderbook_features(symbol)
 
     last_price_candidates: List[float] = []
     ob_last = ob_now.get("last_price")
-    if isinstance(ob_last, (int, float)):
+    if _is_finite_number(ob_last):
         last_price_candidates.append(float(ob_last))
 
     ob_mark = ob_now.get("mark_price")
-    if isinstance(ob_mark, (int, float)):
+    if _is_finite_number(ob_mark):
         last_price_candidates.append(float(ob_mark))
 
     tf5_close_light = buf_5m[-1][4]
-    if isinstance(tf5_close_light, (int, float)):
+    if _is_finite_number(tf5_close_light):
         last_price_candidates.append(float(tf5_close_light))
 
     if last_price_candidates:
@@ -1273,106 +1327,70 @@ def get_trading_signal(
                     )
                 raise FeatureBuildError("signal freeze state payload invalid (STRICT)")
 
-    try:
-        features = build_entry_features_ws(symbol)
-    except FeatureBuildError as e:
-        log(f"[MKT-FEAT] get_trading_signal FeatureBuildError: {e}")
-        return None
-    except Exception as e:
-        msg = f"[MKT-FEAT] get_trading_signal unexpected error: {e}"
-        log(msg)
-        try:
-            send_tg("❌ [get_trading_signal 예외]\n" + msg)
-        except Exception as tg_error:
-            log(
-                f"[MKT-FEAT] get_trading_signal telegram notify failed: "
-                f"{tg_error.__class__.__name__}: {tg_error}"
-            )
-        return None
+    features = build_entry_features_ws(symbol)
 
     tfs: Dict[str, Dict[str, Any]] = features.get("timeframes", {})
     ob: Dict[str, Any] = features.get("orderbook", {})
     mtf: Dict[str, Any] = features.get("multi_timeframe", {})
 
     tf5 = tfs.get("5m")
-    if not tf5:
-        log("[MKT-FEAT] get_trading_signal: 5m timeframes 가 없습니다.")
+    if not isinstance(tf5, dict):
+        _fail(symbol, "get_trading_signal", "5m timeframe features 가 없습니다. (STRICT)")
+
+    tf15 = tfs.get("15m")
+    tf1h = tfs.get("1h")
+    tf4h = tfs.get("4h")
+
+    range_pct_5 = _require_finite_float(symbol, "get_trading_signal", "tf5.range_pct", tf5.get("range_pct"))
+    atr_pct_5 = _require_finite_float(symbol, "get_trading_signal", "tf5.atr_pct", tf5.get("atr_pct"))
+    is_low_vol_5_raw = tf5.get("is_low_volatility")
+    if not isinstance(is_low_vol_5_raw, int):
+        _fail(symbol, "get_trading_signal", "tf5.is_low_volatility must be int flag (STRICT)")
+    is_low_vol_5 = is_low_vol_5_raw == 1
+
+    low_range_th = _resolve_runtime_positive_float(settings, "low_vol_range_pct_threshold")
+    low_atr_th = _resolve_runtime_positive_float(settings, "low_vol_atr_pct_threshold")
+
+    is_low_range = range_pct_5 < low_range_th
+    is_low_atr = atr_pct_5 < low_atr_th
+
+    low_vol_tfs_raw = mtf.get("low_vol_tfs")
+    if isinstance(low_vol_tfs_raw, bool):
+        _fail(symbol, "get_trading_signal", "multi_timeframe.low_vol_tfs must be int (STRICT)")
+    try:
+        low_vol_tfs = int(low_vol_tfs_raw or 0)
+    except Exception:
+        _fail(symbol, "get_trading_signal", "multi_timeframe.low_vol_tfs must be int-compatible (STRICT)")
+
+    if (is_low_range and is_low_atr) or (is_low_vol_5 and low_vol_tfs >= 2):
+        log(
+            "[MKT-FEAT] get_trading_signal: 저변동성 구간 스킵 "
+            f"(5m range_pct={range_pct_5:.4f}, "
+            f"atr_pct={atr_pct_5:.4f}, "
+            f"th=({low_range_th:.4f}, {low_atr_th:.4f}), low_vol_tfs={low_vol_tfs})"
+        )
         _set_signal_freeze_state(
             symbol=symbol,
             latest_ts=latest_ts,
             chosen_signal=None,
             signal_source=None,
             extra=None,
-            blocked_reason="missing_5m_features",
+            blocked_reason="low_volatility",
         )
         return None
-
-    tf15 = tfs.get("15m")
-    tf1h = tfs.get("1h")
-    tf4h = tfs.get("4h")
-
-    try:
-        range_pct_5 = tf5.get("range_pct")
-        atr_pct_5 = tf5.get("atr_pct")
-        is_low_vol_5 = tf5.get("is_low_volatility") == 1
-
-        low_range_th = _resolve_runtime_positive_float(settings, "low_vol_range_pct_threshold")
-        low_atr_th = _resolve_runtime_positive_float(settings, "low_vol_atr_pct_threshold")
-
-        is_low_range = (
-            isinstance(range_pct_5, (int, float))
-            and not math.isnan(range_pct_5)
-            and range_pct_5 < low_range_th
-        )
-        is_low_atr = (
-            isinstance(atr_pct_5, (int, float))
-            and not math.isnan(atr_pct_5)
-            and atr_pct_5 < low_atr_th
-        )
-
-        low_vol_tfs = int(mtf.get("low_vol_tfs") or 0)
-
-        if (is_low_range and is_low_atr) or (is_low_vol_5 and low_vol_tfs >= 2):
-            range_str = (
-                f"{range_pct_5:.4f}"
-                if isinstance(range_pct_5, (int, float)) and not math.isnan(range_pct_5)
-                else "nan"
-            )
-            atr_str = (
-                f"{atr_pct_5:.4f}"
-                if isinstance(atr_pct_5, (int, float)) and not math.isnan(atr_pct_5)
-                else "nan"
-            )
-            log(
-                "[MKT-FEAT] get_trading_signal: 저변동성 구간 스킵 "
-                f"(5m range_pct={range_str}, "
-                f"atr_pct={atr_str}, "
-                f"th=({low_range_th:.4f}, {low_atr_th:.4f}), low_vol_tfs={low_vol_tfs})"
-            )
-            _set_signal_freeze_state(
-                symbol=symbol,
-                latest_ts=latest_ts,
-                chosen_signal=None,
-                signal_source=None,
-                extra=None,
-                blocked_reason="low_volatility",
-            )
-            return None
-    except Exception as e:
-        log(f"[MKT-FEAT] low-volatility filter 계산 중 예외 발생: {e}")
 
     last_price_candidates = []
 
     ob_last = ob.get("last_price")
-    if isinstance(ob_last, (int, float)):
+    if _is_finite_number(ob_last):
         last_price_candidates.append(float(ob_last))
 
     ob_mark = ob.get("mark_price")
-    if isinstance(ob_mark, (int, float)):
+    if _is_finite_number(ob_mark):
         last_price_candidates.append(float(ob_mark))
 
     tf5_close = tf5.get("last_close")
-    if isinstance(tf5_close, (int, float)):
+    if _is_finite_number(tf5_close):
         last_price_candidates.append(float(tf5_close))
 
     if last_price_candidates:
@@ -1413,19 +1431,25 @@ def get_trading_signal(
         )
         return None
 
-    signal_source = "GENERIC"
-    try:
-        adx_trend_tfs = int(mtf.get("adx_trend_tfs") or 0)
-        overbought_tfs = int(mtf.get("overbought_tfs") or 0)
-        oversold_tfs = int(mtf.get("oversold_tfs") or 0)
-        strong_trend_flag = tf5.get("strong_trend_flag")
+    adx_trend_tfs_raw = mtf.get("adx_trend_tfs")
+    overbought_tfs_raw = mtf.get("overbought_tfs")
+    oversold_tfs_raw = mtf.get("oversold_tfs")
+    strong_trend_flag = tf5.get("strong_trend_flag")
 
-        if direction_meta.get("support_count", 0) >= 2 and adx_trend_tfs >= 2 and strong_trend_flag == 1:
-            signal_source = "TREND"
-        elif (overbought_tfs + oversold_tfs) >= 1:
-            signal_source = "RANGE"
-    except Exception as e:
-        log(f"[MKT-FEAT] signal_source resolution error: {e}")
+    if not isinstance(strong_trend_flag, int):
+        _fail(symbol, "get_trading_signal", "tf5.strong_trend_flag must be int flag (STRICT)")
+    try:
+        adx_trend_tfs = int(adx_trend_tfs_raw or 0)
+        overbought_tfs = int(overbought_tfs_raw or 0)
+        oversold_tfs = int(oversold_tfs_raw or 0)
+    except Exception:
+        _fail(symbol, "get_trading_signal", "multi_timeframe counters must be int-compatible (STRICT)")
+
+    signal_source = "GENERIC"
+    if direction_meta.get("support_count", 0) >= 2 and adx_trend_tfs >= 2 and strong_trend_flag == 1:
+        signal_source = "TREND"
+    elif (overbought_tfs + oversold_tfs) >= 1:
+        signal_source = "RANGE"
 
     if signal_source == "TREND":
         regime_level = 1.0
@@ -1434,54 +1458,32 @@ def get_trading_signal(
     else:
         regime_level = 1.5
 
-    atr_fast = tf5.get("atr")
-    atr_fast_val = float(atr_fast) if isinstance(atr_fast, (int, float)) else float("nan")
-
-    atr_slow = tf15.get("atr") if tf15 else atr_fast
-    atr_slow_val = float(atr_slow) if isinstance(atr_slow, (int, float)) else float("nan")
+    atr_fast_val = _require_finite_float(symbol, "get_trading_signal", "tf5.atr", tf5.get("atr"))
+    if tf15 is not None:
+        atr_slow_val = _require_finite_float(symbol, "get_trading_signal", "tf15.atr", tf15.get("atr"))
+    else:
+        atr_slow_val = atr_fast_val
 
     signal_score = 0.5
-    try:
-        vol_z = tf5.get("volume_zscore")
-        support_count = int(direction_meta.get("support_count") or 0)
-        oppose_count = int(direction_meta.get("oppose_count") or 0)
-        if signal_source == "TREND":
-            signal_score += 1.5
-        if support_count > 0:
-            signal_score += min(float(support_count) * 0.75, 2.5)
-        if oppose_count > 0:
-            signal_score -= min(float(oppose_count) * 0.75, 2.0)
-        if isinstance(vol_z, (int, float)):
-            signal_score += min(abs(vol_z) * 0.5, 2.0)
-    except Exception as e:
-        log(f"[MKT-FEAT] signal_score resolution error: {e}")
-
+    vol_z = _require_finite_float(symbol, "get_trading_signal", "tf5.volume_zscore", tf5.get("volume_zscore"))
+    support_count = int(direction_meta.get("support_count") or 0)
+    oppose_count = int(direction_meta.get("oppose_count") or 0)
+    if signal_source == "TREND":
+        signal_score += 1.5
+    if support_count > 0:
+        signal_score += min(float(support_count) * 0.75, 2.5)
+    if oppose_count > 0:
+        signal_score -= min(float(oppose_count) * 0.75, 2.0)
+    signal_score += min(abs(vol_z) * 0.5, 2.0)
     signal_score = max(0.5, min(signal_score, 6.0))
 
-    reg5 = tf5.get("regime") or {}
-    trend_strength = reg5.get("trend_strength")
-    volatility = tf5.get("atr_pct")
-    volume_zscore = tf5.get("volume_zscore")
+    reg5 = tf5.get("regime")
+    if not isinstance(reg5, dict):
+        _fail(symbol, "get_trading_signal", "tf5.regime dict 가 없습니다. (STRICT)")
 
-    for name, value in (
-        ("trend_strength", trend_strength),
-        ("volatility", volatility),
-        ("volume_zscore", volume_zscore),
-    ):
-        if not isinstance(value, (int, float)) or math.isnan(float(value)):
-            log(
-                f"[MKT-FEAT] get_trading_signal: 핵심 피처 {name} 가 NaN/None 입니다. "
-                "엔트리 시그널 생성을 중단합니다."
-            )
-            _set_signal_freeze_state(
-                symbol=symbol,
-                latest_ts=latest_ts,
-                chosen_signal=None,
-                signal_source=None,
-                extra=None,
-                blocked_reason=f"invalid_{name}",
-            )
-            return None
+    trend_strength = _require_finite_float(symbol, "get_trading_signal", "tf5.regime.trend_strength", reg5.get("trend_strength"))
+    volatility = _require_finite_float(symbol, "get_trading_signal", "tf5.atr_pct", tf5.get("atr_pct"))
+    volume_zscore = _require_finite_float(symbol, "get_trading_signal", "tf5.volume_zscore", tf5.get("volume_zscore"))
 
     health_info = features.get("health")
     extra: Dict[str, Any] = {

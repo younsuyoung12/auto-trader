@@ -22,6 +22,7 @@ IMPORTANT POLICY:
 - execution dry-run 은 live no-trade 상태와 무관하게 명시적 probe signal 로 검증한다
 - Meta L3 는 별도 전략/분석 계층이며, trading-engine preflight의 필수 시작 게이트가 아니다
 - silent fail 금지, readiness 부족은 명시적 로그/결과 note 로 드러낸다
+- WS bootstrap / signal timestamp 계약은 runtime(run_bot_ws / entry_pipeline)과 정합해야 한다
 
 CHANGE HISTORY:
 --------------------------------------------------------
@@ -31,6 +32,12 @@ CHANGE HISTORY:
   3) FIX(CONTRACT): signal.risk_pct / meta.dynamic_risk_pct / dynamic_allocation_ratio 계약 일치화
   4) FIX(SSOT): settings.load_settings() 재호출 제거, SETTINGS 단일 객체 사용
   5) FIX(SSOT): meta_* / preflight_fake_usdt 를 SETTINGS 정식 필드로 직접 사용
+  6) FIX(ROOT-CAUSE): WS bootstrap 최소 버퍼 계약을 runtime 기준과 정합화
+     - 1m=120 / 5m=200 / 15m=200 / 1h=200 / 4h=200 으로 상향
+     - preflight 통과 후 runtime feature/entry 단계에서 뒤늦게 실패하던 구조 제거
+  7) FIX(CONTRACT): REST backfill fetch_limit 을 configured_limit 그대로 쓰지 않고 실제 required min 기준으로 상향
+  8) FIX(CONTRACT): preflight signal_ts_ms 를 authoritative 1m 이 아닌 authoritative 5m 기준으로 통일
+  9) FIX(STRICT): settings.preflight_ws_wait_sec 를 settings 단계에서 선검증
 - 2026-03-10:
   1) FIX(STRICT): PREFLIGHT dry-run Signal의 source 계열 필드 충돌 제거
   2) FIX(STRUCTURE): PREFLIGHT lifecycle 정보와 시장/신호 source 의미를 분리
@@ -108,7 +115,13 @@ from infra.data_integrity_guard import (  # noqa: E402
 SET = SETTINGS
 
 ENTRY_REQUIRED_TFS: Tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
-ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 20, "5m": 20, "15m": 20, "1h": 60, "4h": 60}
+ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {
+    "1m": 120,
+    "5m": 200,
+    "15m": 200,
+    "1h": 200,
+    "4h": 200,
+}
 
 PREFLIGHT_SIGNAL_SOURCE = "PREFLIGHT"
 PREFLIGHT_REASON = "PREFLIGHT"
@@ -309,6 +322,10 @@ def _stage_settings_strict() -> None:
     _ = _finite(SET.openai_max_latency_sec, "settings.openai_max_latency_sec")
     _ = _finite(SET.preflight_fake_usdt, "settings.preflight_fake_usdt")
 
+    preflight_ws_wait_sec = _finite(SET.preflight_ws_wait_sec, "settings.preflight_ws_wait_sec")
+    if preflight_ws_wait_sec <= 0:
+        raise PreflightError("settings.preflight_ws_wait_sec must be > 0 (STRICT)")
+
 
 def _stage_db_connectivity_strict() -> None:
     with get_session() as session:
@@ -386,13 +403,15 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
     if not symbol:
         raise PreflightError("settings.symbol empty (STRICT)")
 
-    limit = int(SET.ws_backfill_limit)
-    if limit <= 0:
+    configured_limit = int(SET.ws_backfill_limit)
+    if configured_limit <= 0:
         raise PreflightError("settings.ws_backfill_limit must be > 0 (STRICT)")
 
-    for tf in ("1m", "5m", "15m", "1h", "4h"):
-        rows = fetch_klines_rest(symbol, tf, limit=limit)
-        _validate_kline_rows_strict(rows, name=f"REST_KLINES_{tf}", min_len=200)
+    for tf in ENTRY_REQUIRED_TFS:
+        required_min = ENTRY_REQUIRED_KLINES_MIN[tf]
+        fetch_limit = max(configured_limit, required_min)
+        rows = fetch_klines_rest(symbol, tf, limit=fetch_limit)
+        _validate_kline_rows_strict(rows, name=f"REST_KLINES_{tf}", min_len=required_min)
         backfill_klines_from_rest(symbol, tf, rows)
 
     start_ws_loop(symbol)
@@ -432,21 +451,21 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
         except DataIntegrityError as e:
             raise PreflightError(f"WS kline integrity fail (STRICT): {iv} {e}") from e
 
-    candles_5m = ws_get_klines_with_volume(symbol, "5m", limit=60)
-    candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", limit=60)
-    if not isinstance(candles_5m, list) or len(candles_5m) < 20:
+    candles_5m = ws_get_klines_with_volume(symbol, "5m", limit=ENTRY_REQUIRED_KLINES_MIN["5m"])
+    candles_5m_raw = ws_get_klines_with_volume(symbol, "5m", limit=ENTRY_REQUIRED_KLINES_MIN["5m"])
+    if not isinstance(candles_5m, list) or len(candles_5m) < ENTRY_REQUIRED_KLINES_MIN["5m"]:
         raise PreflightError("WS candles_5m insufficient (STRICT)")
-    if not isinstance(candles_5m_raw, list) or len(candles_5m_raw) < 20:
+    if not isinstance(candles_5m_raw, list) or len(candles_5m_raw) < ENTRY_REQUIRED_KLINES_MIN["5m"]:
         raise PreflightError("WS candles_5m_raw insufficient (STRICT)")
 
-    k1 = ws_get_klines_with_volume(symbol, "1m", limit=1)
-    if not isinstance(k1, list) or not k1 or len(k1[0]) < 1:
-        raise PreflightError("WS 1m buffer missing for signal_ts_ms (STRICT)")
-    signal_ts_ms = int(k1[0][0])
+    k5 = ws_get_klines_with_volume(symbol, "5m", limit=1)
+    if not isinstance(k5, list) or not k5 or len(k5[0]) < 1:
+        raise PreflightError("WS 5m buffer missing for signal_ts_ms (STRICT)")
+    signal_ts_ms = int(k5[0][0])
     if signal_ts_ms <= 0:
         raise PreflightError("signal_ts_ms invalid (STRICT)")
 
-    last_price = float(_finite(k1[0][4], "WS_1m.last_close"))
+    last_price = float(_finite(k5[0][4], "WS_5m.last_close"))
     if last_price <= 0:
         raise PreflightError("last_price must be > 0 (STRICT)")
 

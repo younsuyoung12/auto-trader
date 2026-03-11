@@ -1,48 +1,39 @@
 """
 ========================================================
 FILE: broadcast/dashboard_ws.py
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
-
-핵심 변경 요약
-- engine_status 실시간 payload에 runtime 상태를 강제 포함
-- WebSocket 라이브 전송 시 SERVER_LIVE 상태를 명시적으로 전달
-- snapshot 재전송에도 runtime 포함된 최신 engine_status 유지
-
-코드 정리 내용
-- engine_status payload 정규화 로직 분리
-- runtime 필드 검증/보강 로직 추가
-- 불필요한 코드/주석 추가 없이 기존 구조 유지
-
-역할
---------------------------------------------------------
+ROLE:
 - 기관급 대시보드용 WebSocket 허브
 - 서버 내부에서 발생한 실시간 이벤트를 브라우저로 push
-- 지원 스트림:
-  - engine_status
-  - decision
-  - trade
-  - error
-  - position
-  - watchdog
-- 브라우저 polling 없이 WebSocket 단일 채널로 전달
+- engine_status / decision / trade / error / position / watchdog 스트림을 관리한다
+- engine_status 실시간 payload 계약을 STRICT 검증한다
 
-절대 원칙 (STRICT · NO-FALLBACK)
---------------------------------------------------------
+CORE RESPONSIBILITIES:
+- 대시보드 WebSocket 연결/해제/스냅샷/브로드캐스트 관리
+- 허용된 event_type/op만 처리
+- engine_status 실시간 payload에 runtime / ws_status / account_info 계약을 강제
+- 브라우저 polling 없이 WebSocket 단일 채널로 실시간 전달
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
 - 허용되지 않은 event_type 즉시 예외
 - payload는 dict 여야 하며, None/비정상 구조 즉시 예외
 - ts_ms는 양의 정수여야 하며, 비정상 값 즉시 예외
 - 연결 종료/전송 실패는 조용히 무시하지 않고 연결 상태를 정리
 - 민감정보(키/토큰/DB URL)는 절대 로그/메시지에 포함하지 않음
-- engine_status는 runtime 상태 없이 브로드캐스트하지 않음
+- engine_status는 runtime/ws_status/account_info 계약 없이 브로드캐스트하지 않음
+- runtime 누락 시 임의 기본값을 생성하지 않는다
+- REST와 WebSocket engine_status 계약은 동일해야 한다
 
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(STRICT): engine_status payload에 runtime / ws_status / account_info 계약 강제
+  2) FIX(ROOT-CAUSE): runtime 누락 시 임의 보정 제거, 즉시 예외 처리
+  3) FEAT(CONTRACT): ws_status.connection_status / data_freshness_sec / kline_latency_sec_by_tf / orderbook_latency_sec / last_ws_message_latency_sec / last_signal_ts_ms / last_trade_ts_ms 검증 추가
+  4) FEAT(CONTRACT): account_info nullable 계약 검증 추가
 - 2026-03-09:
   1) FIX(STRICT): engine_status payload에 runtime 상태 강제 포함
   2) FIX(ROOT-CAUSE): WebSocket 실시간 이벤트에서도 SERVER_LIVE 상태를 명시적으로 전달
   3) CLEANUP: engine_status payload 정규화 함수 분리
-
 - 2026-03-08:
   1) 실시간 스트림(engine_status/decision/trade/error/position/watchdog) 지원 유지
   2) 최신 이벤트 스냅샷 전송 및 클라이언트 연결 관리 유지
@@ -80,8 +71,7 @@ _ALLOWED_CLIENT_OPS: Final[Tuple[str, ...]] = (
 
 _WS_ROUTE_PATH: Final[str] = "/ws/dashboard"
 
-_RUNTIME_STATUS_SERVER_LIVE: Final[str] = "SERVER_LIVE"
-_RUNTIME_SOURCE_WEBSOCKET: Final[str] = "websocket_push"
+_REQUIRED_WS_TFS: Final[Tuple[str, ...]] = ("1m", "5m", "15m", "1h", "4h")
 
 
 def _now_ms() -> int:
@@ -95,11 +85,17 @@ def _require_positive_int(value: Any, name: str) -> int:
         raise RuntimeError(f"{name} must be int, bool is not allowed (STRICT)")
     try:
         ivalue = int(value)
-    except Exception as exc:  # pragma: no cover - strict type guard
+    except Exception as exc:
         raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
     if ivalue <= 0:
         raise RuntimeError(f"{name} must be > 0 (STRICT)")
     return ivalue
+
+
+def _require_nullable_positive_int(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    return _require_positive_int(value, name)
 
 
 def _require_nonempty_str(value: Any, name: str) -> str:
@@ -119,6 +115,32 @@ def _require_dict(value: Any, name: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
     return dict(value)
+
+
+def _require_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT)")
+    return value
+
+
+def _require_finite_float(value: Any, name: str) -> float:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be finite float (STRICT)")
+    try:
+        fvalue = float(value)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be finite float (STRICT): {exc}") from exc
+    if fvalue != fvalue or fvalue in (float("inf"), float("-inf")):
+        raise RuntimeError(f"{name} must be finite float (STRICT)")
+    return fvalue
+
+
+def _require_nullable_finite_float(value: Any, name: str) -> Optional[float]:
+    if value is None:
+        return None
+    return _require_finite_float(value, name)
 
 
 def _require_event_type(event_type: Any) -> str:
@@ -141,26 +163,21 @@ def _json_dumps_strict(data: Dict[str, Any]) -> str:
         raise RuntimeError(f"websocket payload json serialization failed (STRICT): {exc}") from exc
 
 
-def _normalize_runtime_payload(runtime_value: Any, *, ts_ms: int) -> Dict[str, Any]:
-    if runtime_value is None:
-        return {
-            "status": _RUNTIME_STATUS_SERVER_LIVE,
-            "source": _RUNTIME_SOURCE_WEBSOCKET,
-            "ts_ms": ts_ms,
-        }
-
+def _normalize_runtime_payload(runtime_value: Any) -> Dict[str, Any]:
     runtime = _require_dict(runtime_value, "engine_status.runtime")
 
     status = _require_nonempty_str(
-        runtime.get("status", _RUNTIME_STATUS_SERVER_LIVE),
+        runtime.get("status"),
         "engine_status.runtime.status",
     )
     source = _require_nonempty_str(
-        runtime.get("source", _RUNTIME_SOURCE_WEBSOCKET),
+        runtime.get("source"),
         "engine_status.runtime.source",
     )
-    runtime_ts_ms_raw = runtime.get("ts_ms", ts_ms)
-    runtime_ts_ms = _require_positive_int(runtime_ts_ms_raw, "engine_status.runtime.ts_ms")
+    runtime_ts_ms = _require_positive_int(
+        runtime.get("ts_ms"),
+        "engine_status.runtime.ts_ms",
+    )
 
     normalized_runtime = dict(runtime)
     normalized_runtime["status"] = status
@@ -169,12 +186,147 @@ def _normalize_runtime_payload(runtime_value: Any, *, ts_ms: int) -> Dict[str, A
     return normalized_runtime
 
 
+def _normalize_ws_status_payload(ws_status_value: Any) -> Dict[str, Any]:
+    ws_status = _require_dict(ws_status_value, "engine_status.ws_status")
+
+    source = _require_nonempty_str(
+        ws_status.get("source"),
+        "engine_status.ws_status.source",
+    )
+    connection_status = _require_nonempty_str(
+        ws_status.get("connection_status"),
+        "engine_status.ws_status.connection_status",
+    )
+    data_freshness_sec = _require_finite_float(
+        ws_status.get("data_freshness_sec"),
+        "engine_status.ws_status.data_freshness_sec",
+    )
+    kline_latency_sec_by_tf = _require_dict(
+        ws_status.get("kline_latency_sec_by_tf"),
+        "engine_status.ws_status.kline_latency_sec_by_tf",
+    )
+
+    normalized_latency_map: Dict[str, Optional[float]] = {}
+    for tf in _REQUIRED_WS_TFS:
+        if tf not in kline_latency_sec_by_tf:
+            raise RuntimeError(f"engine_status.ws_status.kline_latency_sec_by_tf[{tf}] missing (STRICT)")
+        normalized_latency_map[tf] = _require_nullable_finite_float(
+            kline_latency_sec_by_tf.get(tf),
+            f"engine_status.ws_status.kline_latency_sec_by_tf[{tf}]",
+        )
+
+    orderbook_latency_sec = _require_nullable_finite_float(
+        ws_status.get("orderbook_latency_sec"),
+        "engine_status.ws_status.orderbook_latency_sec",
+    )
+    last_ws_message_ts_ms = _require_nullable_positive_int(
+        ws_status.get("last_ws_message_ts_ms"),
+        "engine_status.ws_status.last_ws_message_ts_ms",
+    )
+    last_ws_message_latency_sec = _require_nullable_finite_float(
+        ws_status.get("last_ws_message_latency_sec"),
+        "engine_status.ws_status.last_ws_message_latency_sec",
+    )
+    last_signal_ts_ms = _require_nullable_positive_int(
+        ws_status.get("last_signal_ts_ms"),
+        "engine_status.ws_status.last_signal_ts_ms",
+    )
+    last_trade_ts_ms = _require_nullable_positive_int(
+        ws_status.get("last_trade_ts_ms"),
+        "engine_status.ws_status.last_trade_ts_ms",
+    )
+
+    normalized_ws_status = dict(ws_status)
+    normalized_ws_status["source"] = source
+    normalized_ws_status["connection_status"] = connection_status
+    normalized_ws_status["data_freshness_sec"] = data_freshness_sec
+    normalized_ws_status["kline_latency_sec_by_tf"] = normalized_latency_map
+    normalized_ws_status["orderbook_latency_sec"] = orderbook_latency_sec
+    normalized_ws_status["last_ws_message_ts_ms"] = last_ws_message_ts_ms
+    normalized_ws_status["last_ws_message_latency_sec"] = last_ws_message_latency_sec
+    normalized_ws_status["last_signal_ts_ms"] = last_signal_ts_ms
+    normalized_ws_status["last_trade_ts_ms"] = last_trade_ts_ms
+    return normalized_ws_status
+
+
+def _normalize_account_info_payload(account_info_value: Any) -> Optional[Dict[str, Any]]:
+    if account_info_value is None:
+        return None
+
+    account_info = _require_dict(account_info_value, "engine_status.account_info")
+
+    status = _require_nonempty_str(
+        account_info.get("status"),
+        "engine_status.account_info.status",
+    )
+    source = _require_nonempty_str(
+        account_info.get("source"),
+        "engine_status.account_info.source",
+    )
+    total_balance_usdt = _require_finite_float(
+        account_info.get("total_balance_usdt"),
+        "engine_status.account_info.total_balance_usdt",
+    )
+    available_balance_usdt = _require_finite_float(
+        account_info.get("available_balance_usdt"),
+        "engine_status.account_info.available_balance_usdt",
+    )
+    position_margin_usdt = _require_finite_float(
+        account_info.get("position_margin_usdt"),
+        "engine_status.account_info.position_margin_usdt",
+    )
+    balance_delta_usdt = _require_nullable_finite_float(
+        account_info.get("balance_delta_usdt"),
+        "engine_status.account_info.balance_delta_usdt",
+    )
+    balance_delta_pct = _require_nullable_finite_float(
+        account_info.get("balance_delta_pct"),
+        "engine_status.account_info.balance_delta_pct",
+    )
+
+    normalized_account_info = dict(account_info)
+    normalized_account_info["status"] = status
+    normalized_account_info["source"] = source
+    normalized_account_info["total_balance_usdt"] = total_balance_usdt
+    normalized_account_info["available_balance_usdt"] = available_balance_usdt
+    normalized_account_info["position_margin_usdt"] = position_margin_usdt
+    normalized_account_info["balance_delta_usdt"] = balance_delta_usdt
+    normalized_account_info["balance_delta_pct"] = balance_delta_pct
+    return normalized_account_info
+
+
 def _normalize_engine_status_payload(payload: Dict[str, Any], *, ts_ms: int) -> Dict[str, Any]:
     normalized_payload = _require_dict(payload, "engine_status.payload")
+
     normalized_payload["runtime"] = _normalize_runtime_payload(
         normalized_payload.get("runtime"),
-        ts_ms=ts_ms,
     )
+    normalized_payload["ws_status"] = _normalize_ws_status_payload(
+        normalized_payload.get("ws_status"),
+    )
+
+    if "account_info" not in normalized_payload:
+        raise RuntimeError("engine_status.account_info is required (STRICT)")
+    normalized_payload["account_info"] = _normalize_account_info_payload(
+        normalized_payload.get("account_info"),
+    )
+
+    if "last_signal_ts_ms" not in normalized_payload:
+        raise RuntimeError("engine_status.last_signal_ts_ms is required (STRICT)")
+    if "last_trade_ts_ms" not in normalized_payload:
+        raise RuntimeError("engine_status.last_trade_ts_ms is required (STRICT)")
+
+    normalized_payload["last_signal_ts_ms"] = _require_nullable_positive_int(
+        normalized_payload.get("last_signal_ts_ms"),
+        "engine_status.last_signal_ts_ms",
+    )
+    normalized_payload["last_trade_ts_ms"] = _require_nullable_positive_int(
+        normalized_payload.get("last_trade_ts_ms"),
+        "engine_status.last_trade_ts_ms",
+    )
+
+    # 최상위 ts_ms와 runtime.ts_ms 는 서로 독립이지만, runtime.ts_ms 누락/오염은 허용하지 않는다.
+    _require_positive_int(ts_ms, "engine_status.envelope.ts_ms")
     return normalized_payload
 
 
@@ -199,6 +351,7 @@ class _ClientConnection:
     client_id: str
     websocket: WebSocket
     connected_at_ms: int
+    heartbeat_task: Optional[asyncio.Task] = None
 
 
 class DashboardWebSocketHub:
@@ -251,8 +404,42 @@ class DashboardWebSocketHub:
         )
         await self.send_snapshot(client_id=client_id)
 
+        # 운영형 heartbeat 시작
+        conn.heartbeat_task = asyncio.create_task(self._heartbeat(conn))
+
         logger.info("[DASHBOARD_WS] connected client_id=%s total=%d", client_id, await self.client_count())
         return client_id
+    
+    async def _heartbeat(self, conn: _ClientConnection) -> None:
+        """
+        WebSocket heartbeat
+
+        역할
+        - proxy idle timeout 방지
+        - zombie websocket 제거
+        - 연결 상태 확인
+        """
+
+        while True:
+            await asyncio.sleep(30)           
+       
+            ws = conn.websocket
+
+            if ws.client_state != WebSocketState.CONNECTED:
+                return
+
+            try:
+                await ws.send_text(
+                    _json_dumps_strict({
+                        "type": "system",
+                        "event": "ping",
+                        "ts_ms": _now_ms(),
+                        "payload": {}
+                    })
+                )
+            except Exception:
+                await self.disconnect(conn.client_id)
+                return
 
     async def disconnect(self, client_id: str) -> None:
         if not isinstance(client_id, str) or not client_id.strip():
@@ -261,9 +448,18 @@ class DashboardWebSocketHub:
         conn: Optional[_ClientConnection]
         async with self._lock:
             conn = self._clients.pop(client_id, None)
-
+        
         if conn is None:
             return
+        
+        # heartbeat task 정리
+        if conn.heartbeat_task:
+            conn.heartbeat_task.cancel()
+
+            try:
+                await conn.heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
         ws = conn.websocket
         if ws.client_state != WebSocketState.DISCONNECTED:

@@ -25,8 +25,17 @@ IMPORTANT POLICY:
 - direct import 된 stale 상태 문제를 막기 위해 proxy 객체를 사용한다
 - WARNING 과 FAIL 을 분리한다
 - WARNING 은 관측성 상태이며 FAIL 과 동일하게 엔진 차단으로 취급하지 않는다
+- WS snapshot 계약 불일치는 즉시 FAIL 이다
 
 CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): WS snapshot transport flag extractor 추가
+     - overall_transport_ok / transport_ok / ws.transport_ok 허용 위치를 명시적으로 검사
+     - 복수 위치 존재 시 값 불일치면 즉시 예외 처리
+  2) FIX(SSOT): 필수 feature TF를 settings.features_required_tfs 에서 직접 로드
+  3) FIX(SSOT): full report 주기를 settings.data_health_notify_sec 와 정합화
+  4) FIX(STRICT): overall_ok=True 이면서 transport_ok=False 인 snapshot 불일치 즉시 예외 처리
+  5) FIX(STRICT): health snapshot 핵심 계약(ws dict / ws.ok / overall_reasons / overall_warnings) 검증 강화
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): WS health를 OK/WARNING/FAIL 3단계 상태로 분리
   2) FIX(ROOT-CAUSE): market_data_ws warning 정보를 버리지 않고 LAST_WARNING_REASON / HEALTH_WARNING 으로 노출
@@ -63,14 +72,38 @@ from settings import SETTINGS
 # -----------------------------------------------------
 SET = SETTINGS
 
-# 보고 주기 (초) — 10분
-REPORT_INTERVAL_SEC: int = 600
+# 보고 주기 (초) — settings SSOT
+REPORT_INTERVAL_SEC: int = int(SET.data_health_notify_sec)
 
 # 내부 검사 주기 (초)
 CHECK_INTERVAL_SEC: int = 5
 
-# 실제 엔진 진입 계약과 맞춘 필수 TF
-_REQUIRED_FEATURE_TFS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "4h")
+# 실제 엔진 진입 계약과 맞춘 필수 TF (settings SSOT)
+def _resolve_required_feature_tfs_from_settings() -> tuple[str, ...]:
+    raw = getattr(SET, "features_required_tfs", None)
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError("settings.features_required_tfs must be non-empty list[str] (STRICT)")
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw):
+        tf = str(item).strip()
+        if not tf:
+            raise RuntimeError(f"settings.features_required_tfs[{idx}] is empty (STRICT)")
+        if tf in seen:
+            raise RuntimeError(f"settings.features_required_tfs contains duplicate tf={tf!r} (STRICT)")
+        seen.add(tf)
+        cleaned.append(tf)
+
+    return tuple(cleaned)
+
+
+_REQUIRED_FEATURE_TFS: tuple[str, ...] = _resolve_required_feature_tfs_from_settings()
+
+if REPORT_INTERVAL_SEC <= 0:
+    raise RuntimeError("settings.data_health_notify_sec must be > 0 (STRICT)")
+if CHECK_INTERVAL_SEC <= 0:
+    raise RuntimeError("CHECK_INTERVAL_SEC must be > 0 (STRICT)")
 
 HealthLevel = Literal["OK", "WARNING", "FAIL"]
 
@@ -420,6 +453,87 @@ def _is_valid_number(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v))
 
 
+def _extract_transport_ok_strict(snapshot: Dict[str, Any]) -> bool:
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("health snapshot must be dict (STRICT)")
+
+    candidates: list[tuple[str, bool]] = []
+
+    if "overall_transport_ok" in snapshot:
+        raw = snapshot.get("overall_transport_ok")
+        if not isinstance(raw, bool):
+            raise RuntimeError("health snapshot overall_transport_ok must be bool (STRICT)")
+        candidates.append(("overall_transport_ok", raw))
+
+    if "transport_ok" in snapshot:
+        raw = snapshot.get("transport_ok")
+        if not isinstance(raw, bool):
+            raise RuntimeError("health snapshot transport_ok must be bool (STRICT)")
+        candidates.append(("transport_ok", raw))
+
+    ws = snapshot.get("ws")
+    if not isinstance(ws, dict):
+        raise RuntimeError("health snapshot ws must be dict (STRICT)")
+
+    if "transport_ok" in ws:
+        raw = ws.get("transport_ok")
+        if not isinstance(raw, bool):
+            raise RuntimeError("health snapshot.ws.transport_ok must be bool (STRICT)")
+        candidates.append(("ws.transport_ok", raw))
+
+    if not candidates:
+        raise RuntimeError("health snapshot transport_ok missing in approved locations (STRICT)")
+
+    values = {value for _, value in candidates}
+    if len(values) > 1:
+        detail = ", ".join(f"{name}={value}" for name, value in candidates)
+        raise RuntimeError(f"health snapshot transport_ok conflict (STRICT): {detail}")
+
+    return candidates[0][1]
+
+
+def _validate_ws_snapshot_contract_strict(snapshot: Dict[str, Any]) -> Tuple[bool, bool]:
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("get_health_snapshot returned non-dict (STRICT)")
+
+    overall_ok = snapshot.get("overall_ok")
+    if not isinstance(overall_ok, bool):
+        raise RuntimeError("health snapshot overall_ok must be bool (STRICT)")
+
+    has_warning = snapshot.get("has_warning")
+    if not isinstance(has_warning, bool):
+        raise RuntimeError("health snapshot has_warning must be bool (STRICT)")
+
+    overall_reasons = snapshot.get("overall_reasons")
+    if not isinstance(overall_reasons, list):
+        raise RuntimeError("health snapshot overall_reasons must be list (STRICT)")
+
+    overall_warnings = snapshot.get("overall_warnings")
+    if not isinstance(overall_warnings, list):
+        raise RuntimeError("health snapshot overall_warnings must be list (STRICT)")
+
+    ws = snapshot.get("ws")
+    if not isinstance(ws, dict):
+        raise RuntimeError("health snapshot ws must be dict (STRICT)")
+
+    ws_ok = ws.get("ok")
+    if not isinstance(ws_ok, bool):
+        raise RuntimeError("health snapshot.ws.ok must be bool (STRICT)")
+
+    transport_ok = _extract_transport_ok_strict(snapshot)
+
+    if overall_ok and not transport_ok:
+        raise RuntimeError("health snapshot inconsistent: overall_ok=True but transport_ok=False (STRICT)")
+
+    if not overall_ok and not any(str(x).strip() for x in overall_reasons):
+        raise RuntimeError("health snapshot FAIL without overall_reasons (STRICT)")
+
+    if has_warning and not any(str(x).strip() for x in overall_warnings):
+        raise RuntimeError("health snapshot WARNING without overall_warnings (STRICT)")
+
+    return overall_ok, has_warning
+
+
 # -----------------------------------------------------
 # 핵심 헬스 체크 함수
 # -----------------------------------------------------
@@ -434,28 +548,7 @@ def _check_ws_health(symbol: str) -> Tuple[HealthLevel, str, str, Dict[str, Any]
     - raw snapshot
     """
     snap = get_health_snapshot(symbol)
-    if not isinstance(snap, dict):
-        raise RuntimeError("get_health_snapshot returned non-dict (STRICT)")
-
-    overall_ok = snap.get("overall_ok")
-    if not isinstance(overall_ok, bool):
-        raise RuntimeError("health snapshot overall_ok must be bool (STRICT)")
-
-    transport_ok = snap.get("overall_transport_ok")
-    if not isinstance(transport_ok, bool):
-        raise RuntimeError("health snapshot overall_transport_ok must be bool (STRICT)")
-
-    has_warning = snap.get("has_warning")
-    if not isinstance(has_warning, bool):
-        raise RuntimeError("health snapshot has_warning must be bool (STRICT)")
-
-    overall_reasons = snap.get("overall_reasons")
-    if not isinstance(overall_reasons, list):
-        raise RuntimeError("health snapshot overall_reasons must be list (STRICT)")
-
-    overall_warnings = snap.get("overall_warnings")
-    if not isinstance(overall_warnings, list):
-        raise RuntimeError("health snapshot overall_warnings must be list (STRICT)")
+    overall_ok, has_warning = _validate_ws_snapshot_contract_strict(snap)
 
     if not overall_ok:
         return "FAIL", _format_ws_fail_reason(snap), "", snap
@@ -497,8 +590,13 @@ def _check_feature_health(symbol: str) -> Tuple[bool, str, Dict[str, Any]]:
             {"ok": False, "missing_tfs": missing_tfs},
         )
 
-    tf5 = tfs["5m"]
-    tf15 = tfs["15m"]
+    tf5 = tfs.get("5m")
+    tf15 = tfs.get("15m")
+
+    if not isinstance(tf5, dict):
+        return False, "5m feature 구조가 비정상", {"ok": False, "field": "timeframes.5m"}
+    if not isinstance(tf15, dict):
+        return False, "15m feature 구조가 비정상", {"ok": False, "field": "timeframes.15m"}
 
     regime = tf5.get("regime")
     if not isinstance(regime, dict):
@@ -608,7 +706,7 @@ def _send_tg_in_background(msg: str) -> None:
 
 def _send_full_report(symbol: str) -> None:
     """
-    10분마다 전체 상태 보고.
+    주기마다 전체 상태 보고.
     """
     now = time.time()
     if not _should_send_full_report(now):

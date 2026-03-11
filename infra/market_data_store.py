@@ -24,6 +24,9 @@ IMPORTANT POLICY:
   - is_closed=False: 진행중 캔들, 동일 자연키 row에 대해 STRICT mutable update 허용
   - is_closed=True: 확정 캔들, 동일 자연키 row는 immutable로 취급
 - 저장 계층은 재시작에도 idempotent 해야 한다
+- 오더북 자연키가 (symbol, ts) 인 현재 스키마에서는
+  동일 exchange event ms 내 서로 다른 스냅샷을 동시에 표현할 수 없다.
+  이런 충돌은 store 계층에서 즉시 예외로 폭로해야 하며, 더미 보정/타임시프트로 숨기지 않는다.
 
 CHANGE HISTORY:
 - 2026-03-11:
@@ -31,6 +34,10 @@ CHANGE HISTORY:
   2) FIX(ROOT-CAUSE): open candle은 STRICT mutable update, closed candle은 STRICT immutable 검증으로 분리
   3) FIX(TRADE-GRADE): open candle의 high/low/volume/quote_volume 단조성 검증 추가
   4) FIX(TRADE-GRADE): closed candle 이후 reopen / mutate 즉시 예외 처리
+  5) FIX(STRICT): orderbook natural key collision 진단 강화
+     - 동일 (symbol, ts) 에 서로 다른 payload 가 들어오면 단순 mismatch 가 아니라
+       현재 스키마 자연키 부족 문제임을 명시적으로 예외에 포함
+     - 더미 timestamp 보정/무시/overwrite 금지
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): 캔들/오더북 자연키 기반 idempotent write 추가
   2) FIX(ROOT-CAUSE): 재시작 후 동일 캔들/오더북 중복 INSERT 방지
@@ -267,6 +274,20 @@ def _float_equal_strict(a: Optional[float], b: Optional[float], *, tol: float = 
     return abs(float(a) - float(b)) <= tol
 
 
+def _raise_orderbook_natural_key_collision_strict(
+    *,
+    field_name: str,
+    existing: OrderbookSnapshot,
+    incoming: Dict[str, Any],
+) -> None:
+    raise MarketDataStoreError(
+        "orderbook natural-key collision with different payload (STRICT): "
+        f"field={field_name} symbol={existing.symbol} ts={existing.ts.isoformat()} "
+        "current schema natural key (symbol, ts) is insufficient for distinct snapshots sharing the same "
+        "exchange event millisecond. This requires DB/model migration to include exchange update id in the natural key."
+    )
+
+
 def _require_existing_candle_identity_same_strict(existing: Candle, incoming: Dict[str, Any]) -> None:
     existing_symbol = _normalize_symbol_strict(existing.symbol, "existing.symbol")
     incoming_symbol = _normalize_symbol_strict(incoming["symbol"], "incoming.symbol")
@@ -386,14 +407,26 @@ def _require_same_orderbook_content_strict(existing: OrderbookSnapshot, incoming
     )
     for name, a, b in scalar_pairs:
         if not _float_equal_strict(a, b):
-            raise MarketDataStoreError(f"existing orderbook content mismatch: {name} (STRICT)")
+            _raise_orderbook_natural_key_collision_strict(
+                field_name=name,
+                existing=existing,
+                incoming=incoming,
+            )
 
     existing_bids = list(existing.bids_raw or [])
     existing_asks = list(existing.asks_raw or [])
     if existing_bids != incoming["bids_raw"]:
-        raise MarketDataStoreError("existing orderbook content mismatch: bids_raw (STRICT)")
+        _raise_orderbook_natural_key_collision_strict(
+            field_name="bids_raw",
+            existing=existing,
+            incoming=incoming,
+        )
     if existing_asks != incoming["asks_raw"]:
-        raise MarketDataStoreError("existing orderbook content mismatch: asks_raw (STRICT)")
+        _raise_orderbook_natural_key_collision_strict(
+            field_name="asks_raw",
+            existing=existing,
+            incoming=incoming,
+        )
 
 
 def _normalize_candle_row_strict(row: Dict[str, Any], *, idx: str) -> Dict[str, Any]:
@@ -637,6 +670,11 @@ def save_orderbook_from_ws(
     - DB 자연키(symbol, ts) 기준 idempotent write
     - 같은 자연키 기존 row와 내용 불일치 시 즉시 예외
     - DB 오류는 예외 전파
+
+    주의:
+    - 현재 스키마 자연키는 (symbol, ts) 이다.
+    - 동일 exchange event millisecond 안에 서로 다른 orderbook snapshot 이 오면
+      store 계층은 이를 스키마 충돌로 간주하고 즉시 예외를 발생시킨다.
     """
     sym = _normalize_symbol_strict(symbol, "symbol")
     ts_dt = _to_utc_dt_from_ms_strict(ts_ms)

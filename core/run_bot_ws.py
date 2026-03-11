@@ -26,6 +26,7 @@ IMPORTANT POLICY:
 - 비치명 엔트리 거절(None 반환)은 명시적 SKIP 처리
 - 치명 오류는 SAFE_STOP + 예외 전파
 - candle 저장 경로는 is_closed 계약을 절대 유실하면 안 된다
+- authoritative 5m entry gate 는 치명 build 실패 전에 선점하지 않는다
 
 CHANGE HISTORY:
 - 2026-03-11:
@@ -33,6 +34,13 @@ CHANGE HISTORY:
   2) FIX(ROOT-CAUSE): 같은 ts의 open candle 갱신/close 전환도 저장 대상으로 재선정
   3) FIX(CONTRACT): validate_kline_series_strict()는 legacy 6-tuple로 검증하고 저장은 7-tuple(is_closed 포함)로 전달
   4) FIX(TRADE-GRADE): md-store의 마지막 저장 상태를 interval별로 추적해 중복/누락/동일 ts 갱신 누락 제거
+  5) FIX(ROOT-CAUSE): entry signal gate claim 시점을 entry_pipeline 완료 후로 이동
+     - _build_entry_market_data() 치명 실패 시 현재 5m candle 이 영구 소모되지 않도록 수정
+     - 전략상 no-signal / explicit SKIP 은 기존대로 현재 candle 을 1회 평가로 소모
+  6) ADD(STRICT): 이미 claim된 authoritative 5m candle 은 expensive entry build 단계 재진입 전에 fast-path 로 차단
+  7) ADD(OBSERVABILITY): entry pipeline build 실패를 stage-localized fatal error 문맥으로 승격
+  8) FIX(CONTRACT): typing import에 Callable 추가
+     - _build_entry_market_data_stage_or_raise() 타입 힌트와 import 선언 불일치 제거
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): data_health_monitor 3단계 상태(OK/WARNING/FAIL)를 run_bot_ws 에서 직접 소비
   2) FIX(ROOT-CAUSE): _ws_liveness_guard_or_raise() 가 market_feed warning 을 치명 장애로 승격하지 않도록 수정
@@ -52,7 +60,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import text
 
@@ -197,6 +205,9 @@ LAST_EXIT_CANDLE_TS_1M: Optional[int] = None
 LAST_ENTRY_GPT_CALL_TS: float = 0.0
 
 # 같은 authoritative 5m 캔들(openTime)에서는 진입 평가를 한 번만 수행한다.
+# - SIGNAL: chosen_signal / signal_source / extra 를 freeze
+# - NO_SIGNAL: no-signal 결정도 freeze (같은 캔들 동안 재계산 금지)
+# - last_price 는 freeze 하지 않는다(현재가 반영 유지)
 LAST_ENTRY_EVAL_SIGNAL_TS_MS: Optional[int] = None
 ENTRY_GATE_RUNTIME_STATE_SCOPE: str = "ENTRY_EVAL_SIGNAL_GATE"
 ENTRY_GATE_RUNTIME_STATE_TABLE: str = "bt_engine_runtime_state"
@@ -478,6 +489,22 @@ def _bootstrap_entry_signal_gate_or_raise(symbol: str) -> None:
         "[ENTRY_GATE][BOOT] persisted signal gate loaded: "
         f"symbol={_normalize_symbol_strict(symbol)} last_entry_eval_signal_ts_ms={persisted}"
     )
+
+
+def _is_current_entry_signal_gate_already_claimed_or_raise(symbol: str, signal_ts_ms: Any) -> bool:
+    global LAST_ENTRY_EVAL_SIGNAL_TS_MS
+
+    _normalize_symbol_strict(symbol, name="entry_gate.symbol")
+    current_ts = _require_int_ms(signal_ts_ms, "entry_gate.current_signal_ts_ms")
+    prev_mem_ts = LAST_ENTRY_EVAL_SIGNAL_TS_MS
+
+    if prev_mem_ts is None:
+        return False
+    if current_ts < prev_mem_ts:
+        raise RuntimeError(
+            f"entry signal ts rollback detected vs memory (STRICT): prev={prev_mem_ts} now={current_ts}"
+        )
+    return bool(current_ts == prev_mem_ts)
 
 
 def _invalidate_equity_cache() -> None:
@@ -1777,6 +1804,26 @@ def _on_safe_stop() -> None:
     _safe_send_tg("🛑 텔레그램 '종료' 요청: 포지션 정리 후 종료합니다.")
 
 
+def _build_entry_market_data_stage_or_raise(
+    settings: Any,
+    last_close_ts: float,
+    *,
+    notify_entry_block_fn: Callable[[str, str, int], None],
+    log_fn: Callable[[str], None],
+) -> Optional[Dict[str, Any]]:
+    try:
+        return _build_entry_market_data(
+            settings,
+            last_close_ts,
+            notify_entry_block_fn=notify_entry_block_fn,
+            log_fn=log_fn,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"entry_pipeline market_data build failed (STRICT): {type(e).__name__}: {e}"
+        ) from e
+
+
 def main() -> None:
     global RUNNING, OPEN_TRADES, LAST_CLOSE_TS, CONSEC_LOSSES, SAFE_STOP_REQUESTED, LAST_EXCHANGE_SYNC_TS
     global LAST_EXIT_CANDLE_TS_1M, LAST_ENTRY_GPT_CALL_TS, _SIGTERM_DEADLINE_HANDLED
@@ -2110,29 +2157,39 @@ def main() -> None:
                 log(f"[WARN][DATA_HEALTH_WARNING] {warning_text}")
 
             authoritative_5m_gate_ts = _get_latest_ws_5m_signal_gate_ts_or_raise(SET.symbol)
-            if not _claim_entry_signal_ts_or_skip(SET.symbol, authoritative_5m_gate_ts):
+            if _is_current_entry_signal_gate_already_claimed_or_raise(SET.symbol, authoritative_5m_gate_ts):
+                last_entry_cycle_wall_ts = now
+                last_entry_cycle_1m_ts = latest_1m_ts
+                last_entry_cycle_orderbook_ts = latest_orderbook_ts
                 interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
-            last_entry_cycle_wall_ts = now
-            last_entry_cycle_1m_ts = latest_1m_ts
-            last_entry_cycle_orderbook_ts = latest_orderbook_ts
-
-            market_data = _build_entry_market_data(
+            market_data = _build_entry_market_data_stage_or_raise(
                 SET,
                 LAST_CLOSE_TS,
                 notify_entry_block_fn=_maybe_send_entry_block_tg,
                 log_fn=log,
             )
-            if market_data is None:
+
+            last_entry_cycle_wall_ts = now
+            last_entry_cycle_1m_ts = latest_1m_ts
+            last_entry_cycle_orderbook_ts = latest_orderbook_ts
+
+            if market_data is not None:
+                signal_ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
+                if signal_ts_ms != authoritative_5m_gate_ts:
+                    raise RuntimeError(
+                        "market_data.signal_ts_ms != authoritative_5m_gate_ts (STRICT): "
+                        f"signal_ts_ms={signal_ts_ms} gate_ts={authoritative_5m_gate_ts}"
+                    )
+
+            if not _claim_entry_signal_ts_or_skip(SET.symbol, authoritative_5m_gate_ts):
                 interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
                 continue
 
-            signal_ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
-            if signal_ts_ms != authoritative_5m_gate_ts:
-                raise RuntimeError(
-                    f"market_data.signal_ts_ms != authoritative_5m_gate_ts (STRICT): signal_ts_ms={signal_ts_ms} gate_ts={authoritative_5m_gate_ts}"
-                )
+            if market_data is None:
+                interruptible_sleep(ENGINE_LOOP_TICK_SEC, tick=ENGINE_LOOP_TICK_SEC)
+                continue
 
             try:
                 validate_entry_market_data_bundle_strict(market_data)

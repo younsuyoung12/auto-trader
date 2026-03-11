@@ -15,6 +15,8 @@ CORE RESPONSIBILITIES:
 - 캐시/웹소켓/분석 API를 일관된 구조로 제공
 - 외부 AI/시장데이터 provider quota 초과 시 재호출 폭주를 차단한다
 - WS candle buffer 상태를 bt_candles(source='ws') + freshness 기준으로 판정한다
+- engine_status payload에 WS latency / 마지막 신호 / 마지막 거래 / 계좌 보유 계약을 제공한다
+- ws_status 패널 값은 infra.market_data_ws telemetry snapshot을 실제 연결해 제공한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -28,6 +30,8 @@ IMPORTANT POLICY:
 - provider quota 초과 상태는 route 단위가 아니라 provider scope 단위로 차단한다
 - candle buffer health는 bt_candles 전체가 아니라 source='ws' 진실값만 사용한다
 - candle buffer health는 개수뿐 아니라 latest candle freshness까지 함께 검증한다
+- runtime 진실원천은 DB 최신 orderbook snapshot이고, ws_status 패널은 infra.market_data_ws telemetry snapshot을 사용한다
+- account_info 는 명시적 계좌 진실원천이 연결되기 전까지 null 을 허용하며, 프론트는 이를 초기/미연결 상태로 렌더링한다
 
 CHANGE HISTORY:
 - 2026-03-11
@@ -46,6 +50,9 @@ CHANGE HISTORY:
   13) FIX(OBSERVABILITY): ws-status.orderbook에 stale_ms 추가
   14) FIX(ROOT-CAUSE): WATCHDOG INIT 상태는 engine health에서 경고/치명 사유로 취급하지 않음
   15) FIX(STRICT): recent trades enrich 경로의 None -> 0.0 보정 제거
+  16) FEAT(CONTRACT): engine_status.ws_status 에 connection_status / data_freshness_sec / kline_latency_sec_by_tf / orderbook_latency_sec / last_ws_message_latency_sec / last_signal_ts_ms / last_trade_ts_ms 추가
+  17) FEAT(CONTRACT): engine_status.account_info nullable 계약 추가
+  18) FIX(CONTRACT): ws_status 패널 값이 infra.market_data_ws telemetry snapshot을 실제 사용하도록 연결
 ========================================================
 """
 
@@ -90,6 +97,7 @@ from infra.cache import (
     ping_cache,
     set_cache_json,
 )
+from infra.market_data_ws import get_dashboard_ws_telemetry_snapshot
 from services.decision_service import get_latest_decision, get_recent_decisions
 from services.error_monitor import (
     get_latest_error_event,
@@ -251,6 +259,12 @@ def _require_finite_float(value: Any, name: str) -> float:
     return fv
 
 
+def _optional_finite_float(value: Any, name: str) -> Optional[float]:
+    if value is None:
+        return None
+    return _require_finite_float(value, name)
+
+
 def _normalize_symbol(symbol: Any) -> str:
     s = _require_nonempty_str(symbol, "symbol").replace("-", "").replace("/", "").upper()
     if not s:
@@ -310,6 +324,43 @@ def _datetime_to_epoch_ms_strict(value: Any, name: str) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000.0)
+
+
+def _datetime_to_epoch_ms_optional(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    return _datetime_to_epoch_ms_strict(value, name)
+
+
+def _parse_datetime_str_to_epoch_ms_optional(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    raw = _require_nonempty_str(value, name)
+    iso = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be ISO datetime string (STRICT): {exc}") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000.0)
+
+
+def _optional_epoch_ms_from_any(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _datetime_to_epoch_ms_strict(value, name)
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must not be bool (STRICT)")
+    if isinstance(value, (int, float)):
+        iv = int(value)
+        if iv <= 0:
+            raise RuntimeError(f"{name} must be > 0 when numeric (STRICT)")
+        return iv
+    if isinstance(value, str):
+        return _parse_datetime_str_to_epoch_ms_optional(value, name)
+    raise RuntimeError(f"{name} unsupported timestamp type (STRICT): {type(value).__name__}")
 
 
 def _now_ms() -> int:
@@ -1526,7 +1577,7 @@ def api_system_status(
 
 
 # =====================================================
-# Engine Watchdog / Health
+# Engine Watchdog / Health helpers
 # =====================================================
 
 def _engine_status_from_signals(
@@ -1901,6 +1952,292 @@ def _normalize_watchdog_signal_for_dashboard(
     return normalized_watchdog_status, "ok", normalized_watchdog_reason
 
 
+def _extract_timestamp_ms_from_mapping_optional(
+    payload: Optional[Dict[str, Any]],
+    *,
+    payload_name: str,
+    candidates: Tuple[str, ...],
+) -> Optional[int]:
+    if payload is None:
+        return None
+    normalized_payload = _require_dict(payload, payload_name)
+    for field in candidates:
+        if field not in normalized_payload:
+            continue
+        raw = normalized_payload.get(field)
+        if raw is None:
+            continue
+        return _optional_epoch_ms_from_any(raw, f"{payload_name}.{field}")
+    return None
+
+
+def _extract_last_signal_ts_ms_optional(db: Session) -> Optional[int]:
+    latest_decision = get_latest_decision(db, include_test=False)
+    normalized_decision = _require_dict(latest_decision, "latest_decision")
+    status = _optional_nonempty_str(normalized_decision.get("status"), "latest_decision.status")
+    if status is not None and status.upper() == "INIT":
+        return None
+
+    return _extract_timestamp_ms_from_mapping_optional(
+        normalized_decision,
+        payload_name="latest_decision",
+        candidates=(
+            "ts_ms",
+            "ts_utc",
+            "decision_ts_ms",
+            "decision_ts_utc",
+            "created_at_ms",
+            "created_at",
+            "created_at_utc",
+            "updated_at_ms",
+            "updated_at",
+        ),
+    )
+
+
+def _extract_last_trade_ts_ms_optional(db: Session) -> Optional[int]:
+    trades = get_recent_trades(db, limit=1)
+    if not isinstance(trades, list):
+        raise RuntimeError("recent trades must be list (STRICT)")
+    if not trades:
+        return None
+    latest_trade = trades[0]
+    if not isinstance(latest_trade, dict):
+        raise RuntimeError("recent trade item must be dict (STRICT)")
+
+    return _extract_timestamp_ms_from_mapping_optional(
+        latest_trade,
+        payload_name="latest_trade",
+        candidates=(
+            "exit_ts_ms",
+            "exit_ts_utc",
+            "exit_ts",
+            "closed_ts_ms",
+            "closed_ts_utc",
+            "closed_ts",
+            "ts_ms",
+            "ts_utc",
+            "entry_ts_ms",
+            "entry_ts_utc",
+            "entry_ts",
+        ),
+    )
+
+
+def _pick_optional_numeric_field(
+    payload: Dict[str, Any],
+    *,
+    payload_name: str,
+    candidates: Tuple[str, ...],
+) -> Optional[float]:
+    normalized_payload = _require_dict(payload, payload_name)
+    for field in candidates:
+        if field not in normalized_payload:
+            continue
+        raw = normalized_payload.get(field)
+        if raw is None:
+            continue
+        return _require_finite_float(raw, f"{payload_name}.{field}")
+    return None
+
+
+def _normalize_account_info_from_payload_optional(
+    payload: Optional[Dict[str, Any]],
+    *,
+    payload_name: str,
+    source_name: str,
+) -> Optional[Dict[str, Any]]:
+    if payload is None:
+        return None
+
+    normalized_payload = _require_dict(payload, payload_name)
+
+    total_balance_usdt = _pick_optional_numeric_field(
+        normalized_payload,
+        payload_name=payload_name,
+        candidates=(
+            "total_balance_usdt",
+            "wallet_balance",
+            "walletBalance",
+            "account_balance",
+            "total_wallet_balance",
+        ),
+    )
+    available_balance_usdt = _pick_optional_numeric_field(
+        normalized_payload,
+        payload_name=payload_name,
+        candidates=(
+            "available_balance_usdt",
+            "available_balance",
+            "availableBalance",
+        ),
+    )
+    position_margin_usdt = _pick_optional_numeric_field(
+        normalized_payload,
+        payload_name=payload_name,
+        candidates=(
+            "position_margin_usdt",
+            "position_margin",
+            "used_margin",
+            "total_position_initial_margin",
+            "positionInitialMargin",
+        ),
+    )
+    balance_delta_usdt = _pick_optional_numeric_field(
+        normalized_payload,
+        payload_name=payload_name,
+        candidates=(
+            "balance_delta_usdt",
+            "account_pnl",
+            "pnl_usdt",
+            "pnl",
+        ),
+    )
+    balance_delta_pct = _pick_optional_numeric_field(
+        normalized_payload,
+        payload_name=payload_name,
+        candidates=(
+            "balance_delta_pct",
+            "account_roi",
+            "pnl_pct",
+            "roi_pct",
+        ),
+    )
+
+    if total_balance_usdt is None or available_balance_usdt is None or position_margin_usdt is None:
+        return None
+
+    status = "INIT" if (balance_delta_usdt is None or balance_delta_pct is None) else "OK"
+
+    return {
+        "status": status,
+        "source": _require_nonempty_str(source_name, "source_name"),
+        "total_balance_usdt": total_balance_usdt,
+        "available_balance_usdt": available_balance_usdt,
+        "position_margin_usdt": position_margin_usdt,
+        "balance_delta_usdt": balance_delta_usdt,
+        "balance_delta_pct": balance_delta_pct,
+    }
+
+
+def _build_account_info_optional(db: Session) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    # 1) 시스템 스냅샷의 명시적 account_info/account 우선
+    system_status = get_system_status_snapshot(
+        db,
+        include_test=False,
+        error_window_minutes=10,
+    )
+    normalized_system_status = _require_dict(system_status, "system_status_snapshot")
+
+    explicit_account_info = normalized_system_status.get("account_info")
+    if explicit_account_info is None:
+        explicit_account_info = normalized_system_status.get("account")
+
+    account_info = _normalize_account_info_from_payload_optional(
+        explicit_account_info if isinstance(explicit_account_info, dict) else None,
+        payload_name="system_status_snapshot.account_info",
+        source_name="system_status_snapshot",
+    )
+    if account_info is not None:
+        return account_info, "system_status_snapshot"
+
+    # 2) 현재 오픈 포지션에서 계좌 필드가 있으면 사용
+    open_position = get_open_position(db, include_test=False)
+    if isinstance(open_position, dict):
+        account_info = _normalize_account_info_from_payload_optional(
+            open_position,
+            payload_name="open_position",
+            source_name="open_position",
+        )
+        if account_info is not None:
+            return account_info, "open_position"
+
+    # 3) 최신 포지션 기록에서 계좌 필드가 있으면 사용
+    latest_position = get_latest_position(db, include_test=False)
+    if isinstance(latest_position, dict):
+        account_info = _normalize_account_info_from_payload_optional(
+            latest_position,
+            payload_name="latest_position",
+            source_name="latest_position",
+        )
+        if account_info is not None:
+            return account_info, "latest_position"
+
+    return None, "account_snapshot_not_found"
+
+
+def _fetch_recent_ws_candle_buffer_status_from_db_strict(
+    db: Session,
+    *,
+    symbol: str,
+    timeframe: str,
+    row_limit: int,
+    now_ms: int,
+) -> Dict[str, Any]:
+    normalized_symbol = _normalize_symbol(symbol)
+    normalized_tf = _require_nonempty_str(timeframe, "timeframe")
+    normalized_limit = _require_positive_int(row_limit, "row_limit", max_value=100000)
+    normalized_now_ms = _require_positive_int(now_ms, "now_ms")
+    normalized_source = _normalize_candle_source("ws")
+
+    sql = text(
+        """
+        SELECT
+            COUNT(*) AS n,
+            MAX(ts) AS latest_ts
+        FROM (
+            SELECT ts
+            FROM bt_candles
+            WHERE symbol = :symbol
+              AND timeframe = :timeframe
+              AND source = :source
+            ORDER BY ts DESC
+            LIMIT :row_limit
+        ) q
+        """
+    )
+    row = db.execute(
+        sql,
+        {
+            "symbol": normalized_symbol,
+            "timeframe": normalized_tf,
+            "source": normalized_source,
+            "row_limit": normalized_limit,
+        },
+    ).mappings().one_or_none()
+
+    if row is None:
+        raise RuntimeError("recent ws candle buffer row not found (STRICT)")
+
+    buffer_len = _require_nonnegative_int(row.get("n"), "recent ws candle buffer len")
+    latest_ts_value = row.get("latest_ts")
+
+    latest_ts_ms: Optional[int] = None
+    stale_ms: Optional[int] = None
+    freshness_state = _ENGINE_KLINE_FRESHNESS_STALE
+    stale_threshold_ms = _timeframe_to_ms_strict(normalized_tf) + _ENGINE_KLINE_EXTRA_GRACE_MS
+
+    if latest_ts_value is not None:
+        latest_ts_ms = _datetime_to_epoch_ms_strict(latest_ts_value, "recent_ws_candle.latest_ts")
+        stale_ms = normalized_now_ms - latest_ts_ms
+        if stale_ms < 0:
+            raise RuntimeError("recent ws candle stale_ms must be >= 0 (STRICT)")
+        freshness_state = (
+            _ENGINE_KLINE_FRESHNESS_FRESH
+            if stale_ms <= stale_threshold_ms
+            else _ENGINE_KLINE_FRESHNESS_STALE
+        )
+
+    return {
+        "source": normalized_source,
+        "buffer_len": buffer_len,
+        "latest_ts_ms": latest_ts_ms,
+        "stale_ms": stale_ms,
+        "freshness_state": freshness_state,
+        "stale_threshold_ms": stale_threshold_ms,
+    }
+
+
 def _ws_status(
     db: Session,
     symbol: str,
@@ -1908,22 +2245,28 @@ def _ws_status(
     min_buf: int,
     tfs: List[str],
 ) -> Dict[str, Any]:
+    """
+    runtime 진실원천은 DB snapshot 유지.
+    ws_status 패널 값(connection_status / latency / data_freshness)은
+    infra.market_data_ws.get_dashboard_ws_telemetry_snapshot() 진실원천을 사용한다.
+    """
     normalized_symbol = _normalize_symbol(symbol)
     normalized_min_buf = _require_positive_int(min_buf, "min_buf", max_value=100000)
+    normalized_tfs = [_require_nonempty_str(tf, "tf") for tf in tfs]
     now_ms = _now_ms()
 
     out: Dict[str, Any] = {
         "available": True,
-        "source": "database",
+        "source": "ws",
         "symbol": normalized_symbol,
         "min_buf": normalized_min_buf,
-        "tfs": list(tfs),
+        "tfs": list(normalized_tfs),
         "buffers": {},
     }
 
-    for tf in tfs:
-        tf_name = _require_nonempty_str(tf, "tf")
-        buf_status = _fetch_recent_ws_candle_buffer_status_strict(
+    # 1) legacy / observability buffers 는 기존 DB 진실값 유지
+    for tf_name in normalized_tfs:
+        buf_status = _fetch_recent_ws_candle_buffer_status_from_db_strict(
             db,
             symbol=normalized_symbol,
             timeframe=tf_name,
@@ -1956,6 +2299,7 @@ def _ws_status(
             "reasons": reasons,
         }
 
+    # 2) runtime 진실원천 = DB 최신 orderbook snapshot
     latest_orderbook = _fetch_latest_orderbook_snapshot_strict(db, symbol=normalized_symbol)
     if latest_orderbook is None:
         out["orderbook"] = {"ok": False, "error": "not_found"}
@@ -1973,9 +2317,94 @@ def _ws_status(
             "stale_ms": stale_ms,
         }
 
-    out["runtime"] = _build_engine_runtime_status(
+    runtime = _build_engine_runtime_status(
         orderbook=out["orderbook"],
         now_ms=now_ms,
+    )
+    out["runtime"] = runtime
+
+    # 3) ws_status 패널 진실원천 = infra.market_data_ws telemetry snapshot
+    telemetry = get_dashboard_ws_telemetry_snapshot(
+        normalized_symbol,
+        intervals=normalized_tfs,
+    )
+    telemetry = _require_dict(telemetry, "dashboard_ws_telemetry")
+
+    telemetry_symbol = _normalize_symbol(telemetry.get("symbol"))
+    if telemetry_symbol != normalized_symbol:
+        raise RuntimeError(
+            f"dashboard_ws_telemetry symbol mismatch (STRICT): expected={normalized_symbol} got={telemetry_symbol}"
+        )
+
+    telemetry_source = _require_nonempty_str(telemetry.get("source"), "dashboard_ws_telemetry.source")
+    telemetry_connection_status = _require_nonempty_str(
+        telemetry.get("connection_status"),
+        "dashboard_ws_telemetry.connection_status",
+    )
+
+    telemetry_kline_latency_map = _require_dict(
+        telemetry.get("kline_latency_sec_by_tf"),
+        "dashboard_ws_telemetry.kline_latency_sec_by_tf",
+    )
+    telemetry_data_freshness_sec = _optional_finite_float(
+        telemetry.get("data_freshness_sec"),
+        "dashboard_ws_telemetry.data_freshness_sec",
+    )
+    telemetry_orderbook_latency_sec = _optional_finite_float(
+        telemetry.get("orderbook_latency_sec"),
+        "dashboard_ws_telemetry.orderbook_latency_sec",
+    )
+    telemetry_last_ws_message_ts_ms = _optional_epoch_ms_from_any(
+        telemetry.get("last_ws_message_ts_ms"),
+        "dashboard_ws_telemetry.last_ws_message_ts_ms",
+    )
+    telemetry_last_ws_message_latency_sec = _optional_finite_float(
+        telemetry.get("last_ws_message_latency_sec"),
+        "dashboard_ws_telemetry.last_ws_message_latency_sec",
+    )
+
+    normalized_kline_latency_sec_by_tf: Dict[str, Optional[float]] = {}
+    for tf_name in normalized_tfs:
+        if tf_name not in telemetry_kline_latency_map:
+            raise RuntimeError(f"dashboard_ws_telemetry.kline_latency_sec_by_tf[{tf_name}] missing (STRICT)")
+        normalized_kline_latency_sec_by_tf[tf_name] = _optional_finite_float(
+            telemetry_kline_latency_map.get(tf_name),
+            f"dashboard_ws_telemetry.kline_latency_sec_by_tf[{tf_name}]",
+        )
+
+    if telemetry_data_freshness_sec is None:
+        runtime_stale_ms = runtime.get("stale_ms")
+        if runtime_stale_ms is None:
+            raise RuntimeError("dashboard_ws_telemetry.data_freshness_sec missing and runtime.stale_ms unavailable (STRICT)")
+        telemetry_data_freshness_sec = _require_nonnegative_int(runtime_stale_ms, "runtime.stale_ms") / 1000.0
+
+    out.update(
+        {
+            "source": telemetry_source,
+            "connection_status": telemetry_connection_status,
+            "data_freshness_sec": telemetry_data_freshness_sec,
+            "kline_latency_sec_by_tf": normalized_kline_latency_sec_by_tf,
+            "orderbook_latency_sec": telemetry_orderbook_latency_sec,
+            "last_ws_message_ts_ms": telemetry_last_ws_message_ts_ms,
+            "last_ws_message_latency_sec": telemetry_last_ws_message_latency_sec,
+            "last_signal_ts_ms": None,
+            "last_trade_ts_ms": None,
+            "telemetry_source": telemetry_source,
+            "telemetry_checked_at_ms": _optional_epoch_ms_from_any(
+                telemetry.get("checked_at_ms"),
+                "dashboard_ws_telemetry.checked_at_ms",
+            ),
+            "telemetry_transport_ok": _require_bool(
+                telemetry.get("transport_ok"),
+                "dashboard_ws_telemetry.transport_ok",
+            ),
+            "telemetry_market_feed_ok": _require_bool(
+                telemetry.get("market_feed_ok"),
+                "dashboard_ws_telemetry.market_feed_ok",
+            ),
+            "telemetry_warnings": list(telemetry.get("warnings") or []),
+            "telemetry_reasons": list(telemetry.get("reasons") or []),
+        }
     )
     return out
 
@@ -1988,6 +2417,8 @@ def api_engine_ws_status(
 ) -> Dict[str, Any]:
     tfs = ["1m", "5m", "15m", "1h", "4h"]
     ws_status = _ws_status(db, symbol, min_buf=min_buf, tfs=tfs)
+    ws_status["last_signal_ts_ms"] = _extract_last_signal_ts_ms_optional(db)
+    ws_status["last_trade_ts_ms"] = _extract_last_trade_ts_ms_optional(db)
     ws_status["ts_ms"] = _now_ms()
     return ws_status
 
@@ -2021,6 +2452,14 @@ def api_engine_health(
         min_buf=300,
         tfs=["1m", "5m", "15m", "1h", "4h"],
     )
+
+    last_signal_ts_ms = _extract_last_signal_ts_ms_optional(db)
+    last_trade_ts_ms = _extract_last_trade_ts_ms_optional(db)
+    ws_status["last_signal_ts_ms"] = last_signal_ts_ms
+    ws_status["last_trade_ts_ms"] = last_trade_ts_ms
+
+    account_info, account_info_source = _build_account_info_optional(db)
+
     runtime = _require_dict(ws_status.get("runtime"), "ws_status.runtime")
 
     watchdog_status_effective, watchdog_reason_effective, watchdog_reason_overridden = (
@@ -2054,5 +2493,9 @@ def api_engine_health(
         "watchdog_reason_effective": watchdog_reason_effective,
         "watchdog_reason_overridden": watchdog_reason_overridden,
         "ws_status": ws_status,
+        "account_info": account_info,
+        "account_info_source": account_info_source,
+        "last_signal_ts_ms": last_signal_ts_ms,
+        "last_trade_ts_ms": last_trade_ts_ms,
         "ts_ms": now_ms,
     }

@@ -166,7 +166,13 @@ def _count_closed_trades(db: Session) -> int:
         """
     )
     row = db.execute(sql).mappings().one()
-    return _require_nonnegative_int(row.get("cnt"), "v_trades_prod.closed_trade_count")
+
+    cnt = row.get("cnt")
+
+    if cnt is None:
+        raise RuntimeError("v_trades_prod.closed_trade_count returned NULL (STRICT)")
+
+    return _require_nonnegative_int(cnt, "v_trades_prod.closed_trade_count")
 
 
 def _build_empty_summary() -> Dict[str, Any]:
@@ -395,7 +401,7 @@ def build_entry_score_hist(scores: List[Dict[str, Any]], step: float = 0.5) -> T
 
     buckets: Dict[float, int] = {}
     for idx, s in enumerate(scores):
-        if not isinstance(s, Mapping):
+        if not isinstance(s, dict):
             raise RuntimeError(f"scores[{idx}] must be mapping/dict (STRICT)")
         val = _require_finite_float(s.get("entry_score"), f"scores[{idx}].entry_score")
         bucket = round(val / normalized_step) * normalized_step
@@ -436,7 +442,7 @@ def events_skip_reason_top(db: Session, days: int = 7, limit: int = 15) -> List[
         out.append(
             {
                 "reason": _require_nonempty_str(r.get("reason"), f"skip_reason_top[{idx}].reason"),
-                "n": _require_positive_int(r.get("n"), f"skip_reason_top[{idx}].n"),
+                "n": _require_nonnegative_int(r.get("n"), f"skip_reason_top[{idx}].n"),
             }
         )
     return out
@@ -469,7 +475,7 @@ def events_skip_hourly(db: Session, days: int = 7) -> List[Dict[str, Any]]:
         out.append(
             {
                 "hour_kst": hour_kst,
-                "n": _require_positive_int(r.get("n"), f"skip_hourly[{idx}].n"),
+                "n": _require_nonnegative_int(r.get("n"), f"skip_hourly[{idx}].n"),
             }
         )
     return out

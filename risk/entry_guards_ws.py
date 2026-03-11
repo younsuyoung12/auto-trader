@@ -25,6 +25,7 @@ STRICT 정책
 -----------------------------------------------------
 - 데이터 부족/파싱 실패/비정상 값은 모두 차단 처리.
 - 보정/추정/폴백 금지.
+- settings 누락/오염은 즉시 예외.
 - 이 파일은 "가드 판단"만 수행하며 주문 실행은 포함하지 않는다.
 
 주의: manual_position_guard는 Binance /fapi/v2/balance 응답 구조에 100% 정합해야 한다.
@@ -33,6 +34,12 @@ STRICT 정책
 
 변경 이력
 -----------------------------------------------------
+- 2026-03-11:
+  1) FIX(STRICT): settings getattr(..., default) 기반 숨은 fallback 제거
+  2) FIX(ROOT-CAUSE): depth/mark/last 보조 가드의 파싱 실패 fail-open 제거 → 차단 처리
+  3) FIX(ROOT-CAUSE): orderbook.ts 누락/비정상 시 stale pass-through 제거 → 차단 처리
+  4) FIX(ROOT-CAUSE): 1m ts 파싱 실패 시 None 무시 제거 → 차단 처리
+  5) FIX(STRICT): BBO/orderbook/price/volume 유한성 검증 강화
 - 2026-03-06:
   1) FIX(TRADE-GRADE): signals_logger STRICT 정책 준수
      - log_signal 호출에서 extra(str) 전달 금지
@@ -49,7 +56,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from infra.telelog import send_skip_tg
 from events.signals_logger import log_signal
-from infra.market_data_ws import get_orderbook  # Binance WS 버퍼에서 depth 조회 (폴백 없음)
+from infra.market_data_ws import get_orderbook
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +81,123 @@ def _send_skip(message: str) -> None:
         _log(f"send_skip_tg_failed error={e}", level=logging.ERROR)
 
 
+def _require_finite_float(value: Any, name: str) -> float:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be numeric, bool is not allowed (STRICT)")
+    try:
+        out = float(value)
+    except Exception as e:
+        raise RuntimeError(f"{name} float parse failed: {e}") from e
+    if not math.isfinite(out):
+        raise RuntimeError(f"{name} must be finite (STRICT)")
+    return out
+
+
+def _require_nonnegative_finite_float(value: Any, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out < 0.0:
+        raise RuntimeError(f"{name} must be >= 0 (STRICT)")
+    return out
+
+
+def _require_positive_finite_float(value: Any, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out <= 0.0:
+        raise RuntimeError(f"{name} must be > 0 (STRICT)")
+    return out
+
+
+def _require_int(value: Any, name: str) -> int:
+    if value is None:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    if isinstance(value, bool):
+        raise RuntimeError(f"{name} must be int, bool is not allowed (STRICT)")
+    try:
+        out = int(value)
+    except Exception as e:
+        raise RuntimeError(f"{name} int parse failed: {e}") from e
+    return out
+
+
+def _require_positive_int(value: Any, name: str) -> int:
+    out = _require_int(value, name)
+    if out <= 0:
+        raise RuntimeError(f"{name} must be > 0 (STRICT)")
+    return out
+
+
+def _require_setting_present(settings: Any, name: str) -> Any:
+    if settings is None:
+        raise RuntimeError("settings is required (STRICT)")
+    if not hasattr(settings, name):
+        raise RuntimeError(f"settings.{name} missing (STRICT)")
+    return getattr(settings, name)
+
+
+def _require_setting_float(
+    settings: Any,
+    name: str,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
+    value = _require_finite_float(_require_setting_present(settings, name), f"settings.{name}")
+    if min_value is not None and value < min_value:
+        raise RuntimeError(f"settings.{name} must be >= {min_value} (STRICT)")
+    if max_value is not None and value > max_value:
+        raise RuntimeError(f"settings.{name} must be <= {max_value} (STRICT)")
+    return value
+
+
+def _require_setting_int(
+    settings: Any,
+    name: str,
+    *,
+    min_value: Optional[int] = None,
+) -> int:
+    value = _require_int(_require_setting_present(settings, name), f"settings.{name}")
+    if min_value is not None and value < min_value:
+        raise RuntimeError(f"settings.{name} must be >= {min_value} (STRICT)")
+    return value
+
+
+def _require_setting_bool(settings: Any, name: str) -> bool:
+    value = _require_setting_present(settings, name)
+    if not isinstance(value, bool):
+        raise RuntimeError(f"settings.{name} must be bool (STRICT)")
+    return value
+
+
+def _parse_bbo_row_strict(row: Any, row_name: str) -> Tuple[float, float]:
+    if isinstance(row, (list, tuple)):
+        if len(row) < 2:
+            raise RuntimeError(f"{row_name} must have len>=2 (STRICT)")
+        price = _require_positive_finite_float(row[0], f"{row_name}.price")
+        qty = _require_nonnegative_finite_float(row[1], f"{row_name}.qty")
+        return price, qty
+
+    if isinstance(row, dict):
+        price = _require_positive_finite_float(row.get("price"), f"{row_name}.price")
+        qty = _require_nonnegative_finite_float(row.get("qty"), f"{row_name}.qty")
+        return price, qty
+
+    raise RuntimeError(f"{row_name} unsupported type: {type(row).__name__} (STRICT)")
+
+
+def _depth_side_notional_strict(rows: List[Any], side_name: str) -> float:
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError(f"{side_name} rows missing/empty (STRICT)")
+    total = 0.0
+    for idx, row in enumerate(rows[:5]):
+        price, qty = _parse_bbo_row_strict(row, f"{side_name}[{idx}]")
+        total += price * qty
+    if not math.isfinite(total) or total < 0.0:
+        raise RuntimeError(f"{side_name} total notional invalid (STRICT)")
+    return total
+
+
 # ─────────────────────────────
 # 세션(시간대) 유틸
 # ─────────────────────────────
@@ -90,14 +214,14 @@ def _get_session_multipliers(settings: Any) -> Tuple[float, float]:
     h = now_utc.hour
 
     if 0 <= h < 7:  # 아시아
-        spread_mult = float(getattr(settings, "session_spread_mult_asia", 1.0))
-        jump_mult = float(getattr(settings, "session_jump_mult_asia", 1.0))
+        spread_mult = _require_setting_float(settings, "session_spread_mult_asia", min_value=0.0)
+        jump_mult = _require_setting_float(settings, "session_jump_mult_asia", min_value=0.0)
     elif 7 <= h < 13:  # 유럽
-        spread_mult = float(getattr(settings, "session_spread_mult_eu", 1.1))
-        jump_mult = float(getattr(settings, "session_jump_mult_eu", 1.1))
+        spread_mult = _require_setting_float(settings, "session_spread_mult_eu", min_value=0.0)
+        jump_mult = _require_setting_float(settings, "session_jump_mult_eu", min_value=0.0)
     else:  # 미국
-        spread_mult = float(getattr(settings, "session_spread_mult_us", 1.2))
-        jump_mult = float(getattr(settings, "session_jump_mult_us", 1.2))
+        spread_mult = _require_setting_float(settings, "session_spread_mult_us", min_value=0.0)
+        jump_mult = _require_setting_float(settings, "session_jump_mult_us", min_value=0.0)
 
     return spread_mult, jump_mult
 
@@ -130,34 +254,34 @@ def check_manual_position_guard(
     - float 변환 실패/NaN/inf 시 RuntimeError
     - used_margin > 0 → 신규 진입 차단(False)
     """
+    if not callable(get_balance_detail_func):
+        raise RuntimeError("get_balance_detail_func must be callable (STRICT)")
 
     ts_int = int(latest_ts)
 
     bal_detail = get_balance_detail_func()
     if not isinstance(bal_detail, dict):
         raise RuntimeError(
-            f"balance detail must be dict, got {type(bal_detail).__name__}"
+            f"balance detail must be dict, got {type(bal_detail).__name__} (STRICT)"
         )
 
     required = ("availableBalance", "crossWalletBalance", "crossUnPnl")
     missing = [k for k in required if k not in bal_detail]
     if missing:
-        raise RuntimeError(f"balance detail missing keys: {missing}")
+        raise RuntimeError(f"balance detail missing keys: {missing} (STRICT)")
 
-    try:
-        available_balance = float(bal_detail["availableBalance"])
-        cross_wallet_balance = float(bal_detail["crossWalletBalance"])
-        cross_un_pnl = float(bal_detail["crossUnPnl"])
-    except Exception as e:
-        raise RuntimeError(f"balance detail float parse failed: {e}") from e
-
-    for name, val in (
-        ("availableBalance", available_balance),
-        ("crossWalletBalance", cross_wallet_balance),
-        ("crossUnPnl", cross_un_pnl),
-    ):
-        if not math.isfinite(val):
-            raise RuntimeError(f"balance detail not finite: {name}={val}")
+    available_balance = _require_nonnegative_finite_float(
+        bal_detail["availableBalance"],
+        "balance.availableBalance",
+    )
+    cross_wallet_balance = _require_nonnegative_finite_float(
+        bal_detail["crossWalletBalance"],
+        "balance.crossWalletBalance",
+    )
+    cross_un_pnl = _require_finite_float(
+        bal_detail["crossUnPnl"],
+        "balance.crossUnPnl",
+    )
 
     equity = cross_wallet_balance + cross_un_pnl
     used_margin = max(cross_wallet_balance - available_balance, 0.0)
@@ -178,7 +302,7 @@ def check_manual_position_guard(
             event="on_risk_guard_trigger",
             symbol=symbol,
             strategy_type="UNKNOWN",
-            direction="CLOSE",  # ✅ 추가
+            direction="CLOSE",
             reason="manual_position_detected",
             candle_ts=ts_int,
             extra_json={
@@ -215,10 +339,10 @@ def check_volume_guard(
     STRICT:
     - 샘플 부족 / 파싱 실패 / 기준 평균<=0 → 모두 차단.
     """
-    sym = getattr(settings, "symbol", "UNKNOWN")
+    sym = _require_setting_present(settings, "symbol")
     _log(f"volume_guard_check symbol={sym} len={len(candles_5m_raw)}")
 
-    min_vol_ratio = float(getattr(settings, "min_entry_volume_ratio", 0.3))
+    min_vol_ratio = _require_setting_float(settings, "min_entry_volume_ratio", min_value=0.0, max_value=1.0)
 
     if len(candles_5m_raw) < 20:
         _log(f"volume_guard_insufficient_samples symbol={sym} len={len(candles_5m_raw)}", level=logging.WARNING)
@@ -235,8 +359,11 @@ def check_volume_guard(
         return False
 
     try:
-        last_vol = float(candles_5m_raw[-1][5])
-        vols_20 = [float(c[5]) for c in candles_5m_raw[-20:]]
+        last_vol = _require_nonnegative_finite_float(candles_5m_raw[-1][5], "candles_5m_raw[-1].volume")
+        vols_20 = [
+            _require_nonnegative_finite_float(c[5], f"candles_5m_raw[{idx}].volume")
+            for idx, c in enumerate(candles_5m_raw[-20:])
+        ]
         avg_vol_20 = sum(vols_20) / len(vols_20)
     except Exception as e:
         _log(f"volume_guard_parse_error symbol={sym} error={e}", level=logging.WARNING)
@@ -314,10 +441,11 @@ def check_5m_delay_guard(
     조건:
     - 5m 캔들 부재 → 차단
     - 5m ts 파싱 실패 → 차단
+    - 1m ts 파싱 실패 → 차단
     - 1m 대비 5m 누락이 2개 이상 추정 → 차단
     - now - last_5m_ts > max_5m_delay_ms → 차단
     """
-    sym = getattr(settings, "symbol", "UNKNOWN")
+    sym = _require_setting_present(settings, "symbol")
     _log(
         f"5m_delay_guard_check symbol={sym} len_1m={len(candles_1m)} len_5m={len(candles_5m)}"
     )
@@ -337,7 +465,7 @@ def check_5m_delay_guard(
         return False
 
     try:
-        last_5m_ts = int(candles_5m[-1][0])
+        last_5m_ts = _require_positive_int(candles_5m[-1][0], "candles_5m[-1].ts")
     except Exception as e:
         _log(f"5m_delay_ts_parse_error symbol={sym} target=last_5m_ts error={e}", level=logging.WARNING)
         _send_skip("[SKIP] 5m_delay_ts_parse_error: last_5m_ts")
@@ -348,21 +476,30 @@ def check_5m_delay_guard(
             direction=direction,
             reason="5m_delay_ts_parse_error",
             candle_ts=latest_ts,
-            extra_json={"error": str(e)},
+            extra_json={"target": "last_5m_ts", "error": str(e)},
         )
         return False
 
     last_1m_ts: Optional[int] = None
     if candles_1m:
         try:
-            last_1m_ts = int(candles_1m[-1][0])
-        except Exception:
-            last_1m_ts = None
+            last_1m_ts = _require_positive_int(candles_1m[-1][0], "candles_1m[-1].ts")
+        except Exception as e:
+            _log(f"5m_delay_ts_parse_error symbol={sym} target=last_1m_ts error={e}", level=logging.WARNING)
+            _send_skip("[SKIP] 5m_delay_ts_parse_error: last_1m_ts")
+            log_signal(
+                event="SKIP",
+                symbol=sym,
+                strategy_type=signal_source or "UNKNOWN",
+                direction=direction,
+                reason="5m_delay_ts_parse_error",
+                candle_ts=latest_ts,
+                extra_json={"target": "last_1m_ts", "error": str(e)},
+            )
+            return False
 
     now_ms = _now_ms_utc()
-
-    default_max_delay_ms = 2 * 5 * 60 * 1000  # 10분
-    max_delay_ms = int(getattr(settings, "max_5m_delay_ms", default_max_delay_ms))
+    max_delay_ms = _require_setting_int(settings, "max_5m_delay_ms", min_value=1)
 
     missing_5m_count = 0
     if last_1m_ts is not None and last_1m_ts > last_5m_ts:
@@ -429,7 +566,7 @@ def check_price_jump_guard(
     - prev_close 대비 last_close 이동률
     - last candle range(high-low) / last_close
     """
-    sym = getattr(settings, "symbol", "UNKNOWN")
+    sym = _require_setting_present(settings, "symbol")
     _log(f"price_jump_guard_check symbol={sym} len_5m={len(candles_5m)}")
 
     if len(candles_5m) < 2:
@@ -447,14 +584,14 @@ def check_price_jump_guard(
         return False
 
     _, jump_mult = _get_session_multipliers(settings)
-    base_jump = float(getattr(settings, "max_price_jump_pct", 0.003))
+    base_jump = _require_setting_float(settings, "max_price_jump_pct", min_value=0.0)
     max_jump_pct = base_jump * jump_mult
 
     try:
-        last_price = float(candles_5m[-1][4])
-        prev_price = float(candles_5m[-2][4])
-        last_high = float(candles_5m[-1][2])
-        last_low = float(candles_5m[-1][3])
+        last_price = _require_positive_finite_float(candles_5m[-1][4], "candles_5m[-1].close")
+        prev_price = _require_positive_finite_float(candles_5m[-2][4], "candles_5m[-2].close")
+        last_high = _require_positive_finite_float(candles_5m[-1][2], "candles_5m[-1].high")
+        last_low = _require_positive_finite_float(candles_5m[-1][3], "candles_5m[-1].low")
     except Exception as e:
         _log(f"price_jump_parse_error symbol={sym} error={e}", level=logging.WARNING)
         _send_skip("[SKIP] price_jump_parse_error")
@@ -469,20 +606,20 @@ def check_price_jump_guard(
         )
         return False
 
-    if prev_price <= 0 or last_price <= 0:
+    if last_high < last_low:
         _log(
-            f"price_jump_invalid_price symbol={sym} prev_price={prev_price} last_price={last_price}",
+            f"price_jump_invalid_range symbol={sym} last_high={last_high} last_low={last_low}",
             level=logging.WARNING,
         )
-        _send_skip("[SKIP] price_jump_invalid_price: prev/last<=0")
+        _send_skip("[SKIP] price_jump_invalid_range: high<low")
         log_signal(
             event="SKIP",
             symbol=sym,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
-            reason="price_jump_invalid_price",
+            reason="price_jump_invalid_range",
             candle_ts=latest_ts,
-            extra_json={"prev_price": float(prev_price), "last_price": float(last_price)},
+            extra_json={"last_high": float(last_high), "last_low": float(last_low)},
         )
         return False
 
@@ -506,7 +643,7 @@ def check_price_jump_guard(
         )
         return False
 
-    range_pct = (last_high - last_low) / last_price if last_low > 0 else 0.0
+    range_pct = (last_high - last_low) / last_price
     candle_vol_limit = max_jump_pct * 1.8
 
     if range_pct > candle_vol_limit:
@@ -536,50 +673,34 @@ def check_price_jump_guard(
 
 def _is_depth_imbalanced(settings: Any, orderbook: Dict[str, Any]) -> bool:
     """5레벨 depth에서 매수/매도 한쪽 명목가 쏠림이 과도한지 확인."""
-    enabled = bool(getattr(settings, "depth_imbalance_enabled", True))
+    enabled = _require_setting_bool(settings, "depth_imbalance_enabled")
     if not enabled:
         return False
 
-    min_notional = float(getattr(settings, "depth_imbalance_min_notional", 10.0))
-    min_ratio = float(getattr(settings, "depth_imbalance_min_ratio", 2.0))
+    min_notional = _require_setting_float(settings, "depth_imbalance_min_notional", min_value=0.0)
+    min_ratio = _require_setting_float(settings, "depth_imbalance_min_ratio", min_value=1.0)
 
-    bids = orderbook.get("bids") or []
-    asks = orderbook.get("asks") or []
+    bids = orderbook.get("bids")
+    asks = orderbook.get("asks")
+    if not isinstance(bids, list) or not isinstance(asks, list):
+        raise RuntimeError("orderbook.bids/asks must be list (STRICT)")
     if not bids or not asks:
-        return False
+        raise RuntimeError("orderbook.bids/asks empty (STRICT)")
 
-    def _side_notional(rows: List[Any]) -> float:
-        total = 0.0
-        for row in rows[:5]:
-            if isinstance(row, list) and len(row) >= 2:
-                price = float(row[0])
-                qty = float(row[1])
-            elif isinstance(row, tuple) and len(row) >= 2:
-                price = float(row[0])
-                qty = float(row[1])
-            elif isinstance(row, dict):
-                price = float(row["price"])
-                qty = float(row["qty"])
-            else:
-                raise ValueError(f"unsupported orderbook row type: {type(row).__name__}")
-            total += price * qty
-        return total
-
-    try:
-        bid_notional = _side_notional(bids)
-        ask_notional = _side_notional(asks)
-    except Exception:
-        return False
+    bid_notional = _depth_side_notional_strict(bids, "bids")
+    ask_notional = _depth_side_notional_strict(asks, "asks")
 
     if bid_notional < min_notional and ask_notional < min_notional:
         return False
 
     bigger = max(bid_notional, ask_notional)
     smaller = min(bid_notional, ask_notional)
-    if smaller == 0:
+    if smaller == 0.0:
         return True
 
     ratio = bigger / smaller
+    if not math.isfinite(ratio):
+        raise RuntimeError("depth imbalance ratio invalid (STRICT)")
     return ratio >= min_ratio
 
 
@@ -595,38 +716,32 @@ def _is_price_deviation_large(
     best_ask: float,
 ) -> bool:
     """markPrice / lastPrice 가 mid 대비 과도하게 이탈했는지 확인."""
-    enabled = bool(getattr(settings, "price_deviation_guard_enabled", True))
+    enabled = _require_setting_bool(settings, "price_deviation_guard_enabled")
     if not enabled:
         return False
 
-    max_pct = float(getattr(settings, "price_deviation_max_pct", 0.0015))
+    max_pct = _require_setting_float(settings, "price_deviation_max_pct", min_value=0.0)
     mark_price = orderbook.get("markPrice")
     last_price = orderbook.get("lastPrice")
 
     if mark_price is None and last_price is None:
-        return False
+        raise RuntimeError("markPrice and lastPrice both missing (STRICT)")
 
-    if best_bid <= 0 or best_ask <= 0:
-        return False
+    if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+        raise RuntimeError("best bid/ask invalid for price deviation check (STRICT)")
 
     mid = (best_bid + best_ask) / 2.0
     if mid <= 0:
-        return False
+        raise RuntimeError("mid price invalid (STRICT)")
 
     if mark_price is not None:
-        try:
-            mark_price_f = float(mark_price)
-            if abs(mark_price_f - mid) / mid > max_pct:
-                return True
-        except Exception:
+        mark_price_f = _require_positive_finite_float(mark_price, "orderbook.markPrice")
+        if abs(mark_price_f - mid) / mid > max_pct:
             return True
 
     if last_price is not None:
-        try:
-            last_price_f = float(last_price)
-            if abs(last_price_f - mid) / mid > max_pct:
-                return True
-        except Exception:
+        last_price_f = _require_positive_finite_float(last_price, "orderbook.lastPrice")
+        if abs(last_price_f - mid) / mid > max_pct:
             return True
 
     return False
@@ -649,7 +764,7 @@ def check_spread_guard(
     orderbook = get_orderbook(symbol, 5)
     _log(f"spread_guard_check symbol={symbol} ob_ok={bool(orderbook)}")
 
-    if not orderbook:
+    if not isinstance(orderbook, dict) or not orderbook:
         _log(f"orderbook_unavailable symbol={symbol}", level=logging.WARNING)
         _send_skip("[SKIP] orderbook_unavailable: WS depth empty")
         log_signal(
@@ -662,12 +777,41 @@ def check_spread_guard(
         )
         return False, None, None
 
-    now_ms = _now_ms_utc()
-    ob_ts = int(orderbook.get("ts") or 0)
-    ob_age_ms = now_ms - ob_ts if ob_ts > 0 else -1
-    max_ob_age = int(getattr(settings, "max_orderbook_age_ms", 3000))
+    try:
+        ob_ts = _require_positive_int(orderbook.get("ts"), "orderbook.ts")
+    except Exception as e:
+        _log(f"orderbook_ts_invalid symbol={symbol} error={e}", level=logging.WARNING)
+        _send_skip("[SKIP] orderbook_ts_invalid")
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="orderbook_ts_invalid",
+            candle_ts=latest_ts,
+            extra_json={"error": str(e)},
+        )
+        return False, None, None
 
-    if ob_age_ms >= 0 and ob_age_ms > max_ob_age:
+    now_ms = _now_ms_utc()
+    ob_age_ms = now_ms - ob_ts
+    max_ob_age = _require_setting_int(settings, "max_orderbook_age_ms", min_value=1)
+
+    if ob_age_ms < 0:
+        _log(f"orderbook_ts_future symbol={symbol} ob_ts={ob_ts} now_ms={now_ms}", level=logging.WARNING)
+        _send_skip("[SKIP] orderbook_ts_future")
+        log_signal(
+            event="SKIP",
+            symbol=symbol,
+            strategy_type=signal_source or "UNKNOWN",
+            direction=direction,
+            reason="orderbook_ts_future",
+            candle_ts=latest_ts,
+            extra_json={"ob_ts": int(ob_ts), "now_ms": int(now_ms)},
+        )
+        return False, None, None
+
+    if ob_age_ms > max_ob_age:
         _log(f"orderbook_stale symbol={symbol} ob_age_ms={ob_age_ms} max_ob_age={max_ob_age}", level=logging.WARNING)
         _send_skip("[SKIP] orderbook_stale")
         log_signal(
@@ -681,9 +825,9 @@ def check_spread_guard(
         )
         return False, None, None
 
-    bids = orderbook.get("bids") or []
-    asks = orderbook.get("asks") or []
-    if not bids or not asks:
+    bids = orderbook.get("bids")
+    asks = orderbook.get("asks")
+    if not isinstance(bids, list) or not isinstance(asks, list) or not bids or not asks:
         _log(f"orderbook_bbo_missing symbol={symbol}", level=logging.WARNING)
         _send_skip("[SKIP] orderbook_bbo_missing: no bids/asks")
         log_signal(
@@ -697,26 +841,8 @@ def check_spread_guard(
         return False, None, None
 
     try:
-        bid0 = bids[0]
-        ask0 = asks[0]
-
-        if isinstance(bid0, (list, tuple)) and len(bid0) >= 2:
-            best_bid = float(bid0[0])
-            bid_qty = float(bid0[1])
-        elif isinstance(bid0, dict):
-            best_bid = float(bid0["price"])
-            bid_qty = float(bid0["qty"])
-        else:
-            raise ValueError(f"unsupported bid row type: {type(bid0).__name__}")
-
-        if isinstance(ask0, (list, tuple)) and len(ask0) >= 2:
-            best_ask = float(ask0[0])
-            ask_qty = float(ask0[1])
-        elif isinstance(ask0, dict):
-            best_ask = float(ask0["price"])
-            ask_qty = float(ask0["qty"])
-        else:
-            raise ValueError(f"unsupported ask row type: {type(ask0).__name__}")
+        best_bid, bid_qty = _parse_bbo_row_strict(bids[0], "bids[0]")
+        best_ask, ask_qty = _parse_bbo_row_strict(asks[0], "asks[0]")
     except Exception as e:
         _log(f"spread_guard_parse_error symbol={symbol} error={e}", level=logging.WARNING)
         _send_skip("[SKIP] spread_guard_parse_error: BBO parse failed")
@@ -731,7 +857,7 @@ def check_spread_guard(
         )
         return False, None, None
 
-    if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+    if best_bid >= best_ask:
         _log(f"bbo_crossed_or_invalid symbol={symbol} best_bid={best_bid} best_ask={best_ask}", level=logging.WARNING)
         _send_skip("[SKIP] bbo_crossed_or_invalid")
         log_signal(
@@ -745,11 +871,11 @@ def check_spread_guard(
         )
         return False, best_bid, best_ask
 
-    min_bbo_notional = float(getattr(settings, "min_bbo_notional_usdt", 0.0))
+    min_bbo_notional = _require_setting_float(settings, "min_bbo_notional_usdt", min_value=0.0)
     top_bid_notional = best_bid * bid_qty
     top_ask_notional = best_ask * ask_qty
 
-    if min_bbo_notional > 0:
+    if min_bbo_notional > 0.0:
         if top_bid_notional < min_bbo_notional or top_ask_notional < min_bbo_notional:
             _log(
                 f"bbo_notional_too_small symbol={symbol} "
@@ -774,15 +900,15 @@ def check_spread_guard(
             return False, best_bid, best_ask
 
     spread_mult, _ = _get_session_multipliers(settings)
-    base_spread = float(getattr(settings, "max_spread_pct", 0.0008))
+    base_spread = _require_setting_float(settings, "max_spread_pct", min_value=0.0)
     max_spread_pct = base_spread * spread_mult
+    max_spread_abs = _require_setting_float(settings, "max_spread_abs", min_value=0.0)
 
     spread_abs = best_ask - best_bid
-    spread_pct = spread_abs / best_bid if best_bid > 0 else 0.0
+    spread_pct = spread_abs / best_bid
 
-    max_spread_abs = float(getattr(settings, "max_spread_abs", 0.0))
     too_wide_by_pct = spread_pct > max_spread_pct
-    too_wide_by_abs = max_spread_abs > 0 and spread_abs > max_spread_abs
+    too_wide_by_abs = max_spread_abs > 0.0 and spread_abs > max_spread_abs
 
     if too_wide_by_pct or too_wide_by_abs:
         _log(
@@ -794,7 +920,7 @@ def check_spread_guard(
             "[SKIP] spread_guard: "
             f"pct={spread_pct:.5f} (limit={max_spread_pct:.5f}), "
             f"abs={spread_abs:.2f}"
-            f"{' (limit='+str(max_spread_abs)+')' if max_spread_abs > 0 else ''}"
+            f"{' (limit=' + str(max_spread_abs) + ')' if max_spread_abs > 0 else ''}"
         )
         log_signal(
             event="SKIP",
@@ -816,31 +942,59 @@ def check_spread_guard(
         )
         return False, best_bid, best_ask
 
-    if _is_depth_imbalanced(settings, orderbook):
-        _log(f"depth_imbalance_guard symbol={symbol} ob_age_ms={ob_age_ms}", level=logging.WARNING)
-        _send_skip("[SKIP] depth_imbalance_guard: one side dominates 5-level depth")
+    try:
+        if _is_depth_imbalanced(settings, orderbook):
+            _log(f"depth_imbalance_guard symbol={symbol} ob_age_ms={ob_age_ms}", level=logging.WARNING)
+            _send_skip("[SKIP] depth_imbalance_guard: one side dominates 5-level depth")
+            log_signal(
+                event="SKIP",
+                symbol=symbol,
+                strategy_type=signal_source or "UNKNOWN",
+                direction=direction,
+                reason="depth_imbalance_guard",
+                candle_ts=latest_ts,
+                extra_json={"ob_age_ms": int(ob_age_ms)},
+            )
+            return False, best_bid, best_ask
+    except Exception as e:
+        _log(f"depth_imbalance_parse_error symbol={symbol} error={e}", level=logging.WARNING)
+        _send_skip("[SKIP] depth_imbalance_parse_error")
         log_signal(
             event="SKIP",
             symbol=symbol,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
-            reason="depth_imbalance_guard",
+            reason="depth_imbalance_parse_error",
             candle_ts=latest_ts,
-            extra_json={"ob_age_ms": int(ob_age_ms)},
+            extra_json={"error": str(e), "ob_age_ms": int(ob_age_ms)},
         )
         return False, best_bid, best_ask
 
-    if _is_price_deviation_large(settings, orderbook, best_bid, best_ask):
-        _log(f"price_deviation_guard symbol={symbol} ob_age_ms={ob_age_ms}", level=logging.WARNING)
-        _send_skip("[SKIP] price_deviation_guard: mark/last deviated from mid")
+    try:
+        if _is_price_deviation_large(settings, orderbook, best_bid, best_ask):
+            _log(f"price_deviation_guard symbol={symbol} ob_age_ms={ob_age_ms}", level=logging.WARNING)
+            _send_skip("[SKIP] price_deviation_guard: mark/last deviated from mid")
+            log_signal(
+                event="SKIP",
+                symbol=symbol,
+                strategy_type=signal_source or "UNKNOWN",
+                direction=direction,
+                reason="price_deviation_guard",
+                candle_ts=latest_ts,
+                extra_json={"ob_age_ms": int(ob_age_ms)},
+            )
+            return False, best_bid, best_ask
+    except Exception as e:
+        _log(f"price_deviation_parse_error symbol={symbol} error={e}", level=logging.WARNING)
+        _send_skip("[SKIP] price_deviation_parse_error")
         log_signal(
             event="SKIP",
             symbol=symbol,
             strategy_type=signal_source or "UNKNOWN",
             direction=direction,
-            reason="price_deviation_guard",
+            reason="price_deviation_parse_error",
             candle_ts=latest_ts,
-            extra_json={"ob_age_ms": int(ob_age_ms)},
+            extra_json={"error": str(e), "ob_age_ms": int(ob_age_ms)},
         )
         return False, best_bid, best_ask
 

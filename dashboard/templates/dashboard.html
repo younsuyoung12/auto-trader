@@ -1,45 +1,30 @@
 <!--
 ========================================================
 FILE: templates/dashboard.html
-AUTO-TRADER — AI TRADING INTELLIGENCE SYSTEM
-STRICT · NO-FALLBACK · TRADE-GRADE MODE
-========================================================
+ROLE:
+- Auto-Trader 운영 대시보드의 UI/실시간 렌더링을 담당한다.
+- 핵심 상태/현재 보유/계좌 보유/판단 이유/실시간 문제/최근 거래/분석 차트를 표시한다.
 
-핵심 변경 요약
---------------------------------------------------------
-- 상단 헤더에 서버 런타임 상태칩 추가
-- ENGINE 상태와 SERVER LIVE/STOP 상태를 분리 표시
-- engine_status runtime payload strict 렌더링 추가
-- 2026-03-11 FIX(ROOT-CAUSE): INIT / READY / delayed / stale 상태를 UI에서 명시적으로 표시
-- 2026-03-11 FIX(ARCH): 무데이터 상태는 ERROR가 아니라 안내(note)로 렌더링
-- 2026-03-11 FIX(CONTRACT): WATCHDOG INIT / DECISION INIT / PERFORMANCE INIT 계약 반영
+CORE RESPONSIBILITIES:
+- 초기 화면은 REST 1회 조회로 구성하고 이후 Dashboard WebSocket으로 실시간 갱신한다.
+- INIT / READY / delayed / stale 상태를 장애와 분리하여 명시적으로 렌더링한다.
+- 실시간 데이터 상태는 버퍼 개수 대신 latency 중심으로 표시한다.
+- 계좌 보유 카드와 계좌 손익/수익률을 운영형 UI로 표시한다.
 
-코드 정리 내용
---------------------------------------------------------
-- 상단 상태칩 렌더링 로직 정리
-- runtime tooltip 생성 로직 추가
-- INIT 상태 전용 note 렌더링 로직 추가
-- 불필요한 중복 없이 기존 UI 구조 유지
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- API 실패/JSON 파싱 오류/계약 불일치는 화면에 명시적으로 표시한다.
+- 실패를 정상처럼 보이게 하는 묵시적 유지/치환을 하지 않는다.
+- 민감정보(DB URL/키/토큰)는 화면과 콘솔에 출력하지 않는다.
+- 모바일은 차단하고, 실시간 갱신은 WebSocket 우선, 초기 로드는 1회성 REST만 허용한다.
+- 실시간 데이터 상태는 WebSocket 기준이 원칙이며 source=database 는 개선 필요 상태로 표시한다.
+- 기존 위젯/차트/테이블/실시간 반영 기능은 삭제하지 않는다.
 
-설계 원칙
---------------------------------------------------------
-- “조용한 실패” 금지: API 실패/JSON 파싱 실패/네트워크 오류는 화면에 명시적으로 표시한다.
-- 기존 값 유지(묵시적 폴백) 금지: 실패 시 해당 위젯은 ERROR 상태로 전환한다.
-- 민감정보 노출 금지: 화면/콘솔에 키/토큰/DB URL 등 출력 금지.
-- 모바일 접속 차단: PC 전용 대시보드만 허용한다.
-- Polling 금지: 실시간 갱신은 WebSocket만 사용한다.
-- 초기 화면 구성용 1회성 REST 조회는 허용한다.
-- 기존 기능 삭제 금지. 기존 위젯/차트/테이블/실시간 반영 기능은 유지한다.
-- /api/engine/ws-status 와 /api/engine/health 는 엔진 메모리가 아니라 DB 스냅샷 기준으로 동작한다.
-- 서버 런타임 상태는 engine_status.runtime 기준으로 표시한다.
-- INIT 상태는 장애가 아니라 초기 무데이터 상태로 분리 표시한다.
-
-변경 이력
---------------------------------------------------------
+CHANGE HISTORY:
 - 2026-03-11:
-  1) FEAT(UI): INIT 상태(성과/의사결정/감시) 전용 note 렌더링 추가
-  2) FIX(ROOT-CAUSE): 무데이터를 오류로 표시하던 경로 제거
-  3) FIX(CONTRACT): WATCHDOG INIT / DECISION INIT / PERFORMANCE INIT 반영
+  1) FEAT(UI): 핵심 상태 카드에 WS 상태 / 데이터 신선도 / 마지막 신호 / 마지막 거래 추가
+  2) FEAT(UI): 계좌 보유 카드 추가 및 계좌 손익/수익률 전용 색상 규칙 추가
+  3) FIX(ARCH): 실시간 버퍼/호가창을 실시간 데이터 상태로 전환하고 source 기반 안내로 교체
 ========================================================
 -->
 
@@ -282,8 +267,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     }
 
     .value-positive { color: #047857; }
+    .value-warning { color: #b45309; }
     .value-negative { color: #b91c1c; }
     .value-neutral { color: #334155; }
+
+    .value-rise { color: #dc2626; }
+    .value-fall { color: #2563eb; }
+    .value-flat { color: #334155; }
 
     .panel-error {
       color: #b91c1c;
@@ -813,7 +803,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           <div>
             <div class="text-xl font-bold tracking-tight header-title">트레이딩 대시보드</div>
             <div class="text-xs header-subtitle">
-              AI 분석 · 엔진 상태 · 현재 보유 · 판단 이유 · 문제 · 진입 분석 · 수익 분석
+              AI 분석 · 엔진 상태 · 현재 보유 · 계좌 보유 · 판단 이유 · 문제 · 진입 분석 · 수익 분석
             </div>
           </div>
         </div>
@@ -823,6 +813,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
             <a class="nav-link ai-link" href="#섹션-AI">AI 분석</a>
             <a class="nav-link" href="#섹션-엔진">핵심 상태</a>
             <a class="nav-link" href="#섹션-포지션">현재 보유</a>
+            <a class="nav-link" href="#섹션-계좌">계좌 보유</a>
             <a class="nav-link" href="#섹션-의사결정">판단 이유</a>
             <a class="nav-link" href="#섹션-실시간에러">실시간 문제</a>
             <a class="nav-link" href="#섹션-최근거래">최근 거래</a>
@@ -864,7 +855,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
 
       <div class="mt-2 text-[11px] header-meta">
-        `/api/engine/ws-status`와 `/api/engine/health`는 엔진 메모리가 아니라 DB 스냅샷을 기준으로 동작합니다.
+        실시간 데이터 상태는 WebSocket 기준이 원칙이며, source=database 로 오면 개선 필요 상태로 표시합니다.
       </div>
     </div>
   </div>
@@ -886,7 +877,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
     </div>
 
-    <!-- AI 분석 섹션 (추가) -->
+    <!-- AI 분석 섹션 -->
     <section id="섹션-AI" class="mb-6">
       <div class="section-headline">
         <span class="bar"></span>
@@ -899,7 +890,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
 
       <div class="ai-section-grid">
-        <!-- 통합 분석 -->
         <div class="ai-card">
           <div class="ai-card-head">
             <div>
@@ -979,7 +969,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           </div>
         </div>
 
-        <!-- 외부 시장 분석 -->
         <div class="ai-card">
           <div class="ai-card-head">
             <div>
@@ -1058,7 +1047,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
     </section>
 
-    <!-- 상단 핵심 지표 -->
     <section class="grid grid-cols-2 xl:grid-cols-6 gap-3 md:gap-4 mb-3">
       <div class="glass-card metric-card-dark rounded-2xl p-4">
         <div class="metric-label">총 거래 수</div>
@@ -1089,9 +1077,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     <div id="summaryNote" class="panel-note hidden mb-6"></div>
 
-    <!-- 엔진 상태 + 포지션 + 의사결정 -->
     <section class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
-      <div id="섹션-엔진" class="glass-card rounded-2xl p-4 xl:col-span-4">
+      <div id="섹션-엔진" class="glass-card rounded-2xl p-4 xl:col-span-3">
         <div class="flex items-center justify-between mb-3">
           <div class="section-headline">
             <span class="bar"></span>
@@ -1113,6 +1100,14 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
             <div id="engine-recent-errors" class="mt-2 text-lg font-bold text-slate-900">-</div>
           </div>
           <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">WS 상태</div>
+            <div id="engine-ws-status" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">데이터 신선도</div>
+            <div id="engine-data-freshness" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+          <div class="rounded-xl soft-box p-3">
             <div class="metric-label">최근 건너뜀</div>
             <div id="engine-recent-skips" class="mt-2 text-lg font-bold text-slate-900">-</div>
           </div>
@@ -1120,14 +1115,22 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
             <div class="metric-label">감시 상태</div>
             <div id="engine-watchdog-reason" class="mt-2 text-sm font-bold break-words text-slate-900">-</div>
           </div>
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">마지막 신호</div>
+            <div id="engine-last-signal" class="mt-2 text-sm font-bold break-words text-slate-900">-</div>
+          </div>
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">마지막 거래</div>
+            <div id="engine-last-trade" class="mt-2 text-sm font-bold break-words text-slate-900">-</div>
+          </div>
         </div>
 
         <div class="rounded-2xl soft-box-muted p-3">
           <div class="flex items-center justify-between mb-2">
-            <div class="text-sm font-semibold text-slate-900">실시간 버퍼 / 호가창</div>
-            <div id="engine-ws-available" class="text-xs text-slate-500">-</div>
+            <div class="text-sm font-semibold text-slate-900">실시간 데이터 상태</div>
+            <div id="engine-realtime-source" class="text-xs text-slate-500">-</div>
           </div>
-          <div id="engine-buffers-box" class="space-y-2 text-sm"></div>
+          <div id="engine-realtime-box" class="space-y-2 text-sm"></div>
           <div class="mt-3 grid grid-cols-2 gap-2 text-xs text-slate-700">
             <div class="rounded-xl soft-box p-2">
               <div class="text-slate-500">최고 매수가</div>
@@ -1143,7 +1146,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         </div>
       </div>
 
-      <div id="섹션-포지션" class="glass-card rounded-2xl p-4 xl:col-span-4">
+      <div id="섹션-포지션" class="glass-card rounded-2xl p-4 xl:col-span-3">
         <div class="flex items-center justify-between mb-3">
           <div class="section-headline">
             <span class="bar"></span>
@@ -1197,7 +1200,49 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         <div id="positionError" class="panel-error hidden"></div>
       </div>
 
-      <div id="섹션-의사결정" class="glass-card rounded-2xl p-4 xl:col-span-4">
+      <div id="섹션-계좌" class="glass-card rounded-2xl p-4 xl:col-span-3">
+        <div class="flex items-center justify-between mb-3">
+          <div class="section-headline">
+            <span class="bar"></span>
+            <h2 class="section-title">계좌 보유</h2>
+          </div>
+          <span id="account-status-chip" class="status-chip status-neutral">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            대기
+          </span>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">총 잔고</div>
+            <div id="account-total-balance" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">사용 가능 잔고</div>
+            <div id="account-available-balance" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">계좌 손익</div>
+            <div id="account-pnl" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">계좌 수익률</div>
+            <div id="account-roi" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 gap-3">
+          <div class="rounded-xl soft-box p-3">
+            <div class="metric-label">사용중 증거금</div>
+            <div id="account-position-margin" class="mt-2 text-lg font-bold text-slate-900">-</div>
+          </div>
+        </div>
+
+        <div id="accountNote" class="panel-note hidden"></div>
+        <div id="accountError" class="panel-error hidden"></div>
+      </div>
+
+      <div id="섹션-의사결정" class="glass-card rounded-2xl p-4 xl:col-span-3">
         <div class="flex items-center justify-between mb-3">
           <div class="section-headline">
             <span class="bar"></span>
@@ -1246,7 +1291,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
     </section>
 
-    <!-- 실시간 문제 + 최근 거래 -->
     <section class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
       <div id="섹션-실시간에러" class="glass-card rounded-2xl p-4 xl:col-span-5">
         <div class="flex items-center justify-between mb-3">
@@ -1321,7 +1365,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
     </section>
 
-    <!-- 진입 분석 -->
     <section id="섹션-전략" class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-6">
       <div class="glass-card rounded-2xl p-4 xl:col-span-4">
         <div class="flex items-center justify-between mb-2">
@@ -1367,7 +1410,6 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       </div>
     </section>
 
-    <!-- 수익 분석 -->
     <section id="섹션-성과" class="grid grid-cols-1 xl:grid-cols-12 gap-4 mb-8">
       <div class="glass-card rounded-2xl p-4 xl:col-span-6">
         <div class="flex items-center justify-between mb-2">
@@ -1418,8 +1460,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
   <script>
     const $ = (id) => document.getElementById(id);
-
+   
     let ws = null;
+    let wsReconnectTimer = null;
+
     let dailyPnlChart = null;
     let entryScoreHistChart = null;
     let skipHourlyChart = null;
@@ -1561,6 +1605,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       return data;
     }
 
+    function numberOrNull(v) {
+      if (v === null || v === undefined || v === "") return null;
+      const num = Number(v);
+      return Number.isFinite(num) ? num : null;
+    }
+
     function fmtNumber(v, digits = 2) {
       const num = Number(v);
       if (Number.isNaN(num)) return "오류";
@@ -1583,6 +1633,160 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     function fmtMaybe(v, digits = 2) {
       if (v === null || v === undefined) return "-";
       return fmtNumber(v, digits);
+    }
+
+    function parseDateLike(value) {
+      if (value === null || value === undefined || value === "") return null;
+      if (value instanceof Date) {
+        return Number.isNaN(value.getTime()) ? null : value;
+      }
+
+      let date;
+      if (typeof value === "number") {
+        date = new Date(value);
+      } else {
+        const raw = String(value).trim();
+        if (!raw) return null;
+        date = /^\d+$/.test(raw) ? new Date(Number(raw)) : new Date(raw);
+      }
+
+      return Number.isNaN(date.getTime()) ? null : date;
+    }
+
+    function formatTimestampKst(value, mode = "short") {
+      const date = parseDateLike(value);
+      if (!date) return "-";
+
+      const options = {
+        timeZone: "Asia/Seoul",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false
+      };
+
+      if (mode === "full") {
+        options.year = "numeric";
+        options.month = "2-digit";
+        options.day = "2-digit";
+      } else {
+        options.month = "2-digit";
+        options.day = "2-digit";
+      }
+
+      return new Intl.DateTimeFormat("ko-KR", options).format(date);
+    }
+
+    function formatLatencySec(valueMs) {
+      const n = numberOrNull(valueMs);
+      if (n === null) return "-";
+      return `${fmtNumber(n / 1000, 1)} sec`;
+    }
+
+    function removeValueToneClasses(el) {
+      if (!el) return;
+      el.classList.remove(
+        "value-positive",
+        "value-warning",
+        "value-negative",
+        "value-neutral",
+        "value-rise",
+        "value-fall",
+        "value-flat"
+      );
+    }
+
+    function applyValueColor(el, num) {
+      if (!el) return;
+      const n = Number(num);
+      removeValueToneClasses(el);
+      if (Number.isNaN(n)) return;
+      if (n > 0) el.classList.add("value-positive");
+      else if (n < 0) el.classList.add("value-negative");
+      else el.classList.add("value-neutral");
+    }
+
+    function applyLatencyColor(el, valueMs) {
+      if (!el) return;
+      const n = numberOrNull(valueMs);
+      removeValueToneClasses(el);
+
+      if (n === null) {
+        el.classList.add("value-neutral");
+        return;
+      }
+      if (n <= 2000) {
+        el.classList.add("value-positive");
+        return;
+      }
+      if (n <= 5000) {
+        el.classList.add("value-warning");
+        return;
+      }
+      el.classList.add("value-negative");
+    }
+
+    function applyRiseFallColor(el, num) {
+      if (!el) return;
+      const n = numberOrNull(num);
+      removeValueToneClasses(el);
+
+      if (n === null) {
+        el.classList.add("value-flat");
+        return;
+      }
+      if (n > 0) {
+        el.classList.add("value-rise");
+        return;
+      }
+      if (n < 0) {
+        el.classList.add("value-fall");
+        return;
+      }
+      el.classList.add("value-flat");
+    }
+
+    function applyConnectionStateValue(el, statusText) {
+      if (!el) return;
+      const s = String(statusText || "").toUpperCase();
+      removeValueToneClasses(el);
+
+      if (
+        s.includes("CONNECTED") ||
+        s.includes("RUNNING") ||
+        s.includes("READY") ||
+        s.includes("OK") ||
+        s.includes("정상") ||
+        s.includes("연결됨")
+      ) {
+        el.classList.add("value-positive");
+        return;
+      }
+
+      if (
+        s.includes("RECONNECT") ||
+        s.includes("DELAY") ||
+        s.includes("WARN") ||
+        s.includes("지연")
+      ) {
+        el.classList.add("value-warning");
+        return;
+      }
+
+      if (
+        s.includes("DISCONNECT") ||
+        s.includes("ERROR") ||
+        s.includes("STOP") ||
+        s.includes("FATAL") ||
+        s.includes("오류") ||
+        s.includes("중지") ||
+        s.includes("미연결")
+      ) {
+        el.classList.add("value-negative");
+        return;
+      }
+
+      el.classList.add("value-neutral");
     }
 
     function setLastUpdatedKST() {
@@ -1610,8 +1814,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         $("ws-last-message-label").textContent = "실시간 수신: -";
         return;
       }
-      const d = new Date(Number(tsMs));
-      if (Number.isNaN(d.getTime())) {
+      const d = parseDateLike(tsMs);
+      if (!d) {
         $("ws-last-message-label").textContent = "실시간 수신: 오류";
         return;
       }
@@ -1634,6 +1838,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       let cls = "status-neutral";
       let dot = "tiny-dot-neutral";
       const s = String(statusText || "").toUpperCase();
+      const raw = String(statusText || "");
 
       if (
         s.includes("OK") ||
@@ -1646,14 +1851,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         s === "SERVER_LIVE" ||
         s === "RUNNING" ||
         s === "LIVE" ||
-        s === "READY"
+        s === "READY" ||
+        raw.includes("정상") ||
+        raw.includes("연결됨")
       ) {
         cls = "status-ok";
         dot = "tiny-dot-ok";
       } else if (
         s.includes("WARNING") ||
         s.includes("WARN") ||
-        s.includes("DELAYED")
+        s.includes("DELAYED") ||
+        raw.includes("지연") ||
+        raw.includes("누락") ||
+        raw.includes("경고")
       ) {
         cls = "status-warning";
         dot = "tiny-dot-warning";
@@ -1667,30 +1877,20 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
         s.includes("OUT_OF_SCOPE") ||
         s === "SERVER_STOP" ||
         s === "STOP" ||
-        s === "STOPPED"
+        s === "STOPPED" ||
+        raw.includes("오류") ||
+        raw.includes("중지") ||
+        raw.includes("미연결")
       ) {
         cls = "status-fatal";
         dot = "tiny-dot-fatal";
-      } else if (s.includes("INIT")) {
+      } else if (s.includes("INIT") || raw.includes("초기") || raw.includes("대기")) {
         cls = "status-neutral";
         dot = "tiny-dot-neutral";
       }
 
       chip.className = `status-chip ${cls}`;
       chip.innerHTML = `<span class="tiny-dot ${dot}"></span>${statusText || "-"}`;
-    }
-
-    function applyValueColor(el, num) {
-      if (!el) return;
-      const n = Number(num);
-      if (Number.isNaN(n)) {
-        el.classList.remove("value-positive", "value-negative", "value-neutral");
-        return;
-      }
-      el.classList.remove("value-positive", "value-negative", "value-neutral");
-      if (n > 0) el.classList.add("value-positive");
-      else if (n < 0) el.classList.add("value-negative");
-      else el.classList.add("value-neutral");
     }
 
     function normalizeReasonText(reason) {
@@ -1950,7 +2150,207 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       }
     }
 
+    function resolveRealtimeSourceLabel(source) {
+      const s = String(source || "").trim().toLowerCase();
+      if (!s) return "-";
+      if (s === "database") return "DB 기준(개선 필요)";
+      if (s === "websocket" || s === "ws" || s === "engine_memory" || s === "memory") {
+        return "WS 기준 확인";
+      }
+      return `${source} 기준`;
+    }
+
+    function renderRealtimeRows(wsStatus) {
+      const box = $("engine-realtime-box");
+      if (!box) return;
+
+      box.innerHTML = "";
+
+      const tfLatency = wsStatus && typeof wsStatus.kline_latency_ms_by_tf === "object"
+        ? wsStatus.kline_latency_ms_by_tf
+        : {};
+
+      const rows = [
+        ["1분 캔들 지연", tfLatency["1m"]],
+        ["5분 캔들 지연", tfLatency["5m"]],
+        ["15분 캔들 지연", tfLatency["15m"]],
+        ["1시간 캔들 지연", tfLatency["1h"]],
+        ["4시간 캔들 지연", tfLatency["4h"]],
+        ["오더북 지연", wsStatus ? wsStatus.orderbook_latency_ms : null],
+        ["마지막 WS 메시지", wsStatus ? wsStatus.last_ws_message_latency_ms : null]
+      ];
+
+      rows.forEach(([label, valueMs]) => {
+        const div = document.createElement("div");
+        div.className = "mini-row";
+
+        const valueText = formatLatencySec(valueMs);
+        const valueSpanClass = valueText === "-" ? "value-neutral" : "";
+
+        div.innerHTML = `
+          <div class="flex items-center gap-2">
+            <span class="tiny-dot tiny-dot-neutral"></span>
+            <span>${label}</span>
+          </div>
+          <div class="${valueSpanClass} mono">${valueText}</div>
+        `;
+
+        box.appendChild(div);
+        const valueEl = div.querySelector("div:last-child");
+        applyLatencyColor(valueEl, valueMs);
+      });
+    }
+
+    function resetAccountCard(noteMessage = null) {
+      clearWidgetError("accountError");
+      clearWidgetNote("accountNote");
+
+      $("account-total-balance").textContent = "-";
+      $("account-available-balance").textContent = "-";
+      $("account-pnl").textContent = "-";
+      $("account-roi").textContent = "-";
+      $("account-position-margin").textContent = "-";
+
+      removeValueToneClasses($("account-pnl"));
+      removeValueToneClasses($("account-roi"));
+
+      applyStatusChip("account-status-chip", "대기");
+
+      if (noteMessage) {
+        setWidgetNote("accountNote", noteMessage);
+      }
+    }
+
+    function resolveAccountValue(accountInfo, keys) {
+      if (!accountInfo || typeof accountInfo !== "object") return null;
+      for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(accountInfo, key)) {
+          const value = numberOrNull(accountInfo[key]);
+          if (value !== null) return value;
+        }
+      }
+      return null;
+    }
+
+    function renderAccountCard(accountInfo) {
+      clearWidgetError("accountError");
+      clearWidgetNote("accountNote");
+
+      if (accountInfo === null || accountInfo === undefined) {
+        resetAccountCard("계좌 보유 데이터가 아직 연결되지 않았습니다.");
+        applyStatusChip("account-status-chip", "미연결");
+        return;
+      }
+
+      if (typeof accountInfo !== "object") {
+        throw new Error("account_info invalid");
+      }
+
+      const notes = [];
+
+      const totalBalance = resolveAccountValue(accountInfo, [
+        "total_balance",
+        "wallet_balance",
+        "account_balance",
+        "total_wallet_balance"
+      ]);
+
+      const availableBalance = resolveAccountValue(accountInfo, [
+        "available_balance",
+        "availableBalance"
+      ]);
+
+      const positionMargin = resolveAccountValue(accountInfo, [
+        "position_margin",
+        "used_margin",
+        "total_position_initial_margin",
+        "positionInitialMargin"
+      ]);
+
+      let accountPnl = resolveAccountValue(accountInfo, [
+        "account_pnl",
+        "pnl",
+        "delta_balance"
+      ]);
+
+      let accountRoi = resolveAccountValue(accountInfo, [
+        "account_roi",
+        "roi_pct",
+        "pnl_pct"
+      ]);
+
+      const referenceBalance = resolveAccountValue(accountInfo, [
+        "reference_balance",
+        "previous_balance",
+        "base_balance",
+        "starting_balance"
+      ]);
+
+      if (accountPnl === null && totalBalance !== null && referenceBalance !== null) {
+        accountPnl = totalBalance - referenceBalance;
+      }
+
+      if (accountRoi === null && accountPnl !== null && referenceBalance !== null) {
+        if (referenceBalance === 0) {
+          notes.push("계좌 수익률 기준 잔고가 0이라 수익률을 계산할 수 없습니다.");
+        } else {
+          accountRoi = (accountPnl / referenceBalance) * 100;
+        }
+      }
+
+      $("account-total-balance").textContent =
+        totalBalance === null ? "-" : `${fmtNumber(totalBalance, 2)} USDT`;
+
+      $("account-available-balance").textContent =
+        availableBalance === null ? "-" : `${fmtNumber(availableBalance, 2)} USDT`;
+
+      $("account-position-margin").textContent =
+        positionMargin === null ? "-" : `${fmtNumber(positionMargin, 2)} USDT`;
+
+      const pnlEl = $("account-pnl");
+      if (accountPnl === null) {
+        pnlEl.textContent = "-";
+        applyRiseFallColor(pnlEl, null);
+        notes.push("계좌 손익 계산 기준이 아직 연결되지 않았습니다.");
+      } else {
+        pnlEl.textContent = `${fmtSigned(accountPnl, 2)} USDT`;
+        applyRiseFallColor(pnlEl, accountPnl);
+      }
+
+      const roiEl = $("account-roi");
+      if (accountRoi === null) {
+        roiEl.textContent = "-";
+        applyRiseFallColor(roiEl, null);
+      } else {
+        roiEl.textContent = `${fmtSigned(accountRoi, 2)}%`;
+        applyRiseFallColor(roiEl, accountRoi);
+      }
+
+      if (totalBalance === null) {
+        notes.push("총 잔고 필드가 아직 연결되지 않았습니다.");
+      }
+      if (availableBalance === null) {
+        notes.push("사용 가능 잔고 필드가 아직 연결되지 않았습니다.");
+      }
+      if (positionMargin === null) {
+        notes.push("사용중 증거금 필드가 아직 연결되지 않았습니다.");
+      }
+
+      if (totalBalance === null) {
+        applyStatusChip("account-status-chip", "데이터 누락");
+      } else if (notes.length) {
+        applyStatusChip("account-status-chip", "경고");
+      } else {
+        applyStatusChip("account-status-chip", "정상");
+      }
+
+      if (notes.length) {
+        setWidgetNote("accountNote", notes.join("\n"));
+      }
+    }
+
     function renderEngineStatus(data) {
+      clearWidgetError("engineError");
       clearWidgetNote("engineNote");
 
       state.engine = data;
@@ -1963,6 +2363,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       $("engine-recent-errors").textContent = fmtMaybe(data.recent_errors, 0);
       $("engine-recent-skips").textContent = fmtMaybe(data.recent_skips, 0);
 
+      const wsStatus = data.ws_status;
+      if (!wsStatus || typeof wsStatus !== "object") {
+        throw new Error("engine_status: ws_status invalid");
+      }
+
+      const notes = [];
+
       const watchdogStatus = data.latest_watchdog && data.latest_watchdog.status
         ? String(data.latest_watchdog.status)
         : null;
@@ -1973,18 +2380,38 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       $("engine-watchdog-reason").textContent = watchdogReason;
 
       if (watchdogStatus === "INIT") {
-        setWidgetNote("engineNote", "감시 상태는 초기 상태입니다. 아직 첫 WATCHDOG 이벤트가 기록되지 않았습니다.");
+        notes.push("감시 상태는 초기 상태입니다. 아직 첫 WATCHDOG 이벤트가 기록되지 않았습니다.");
       }
 
-      const wsStatus = data.ws_status;
-      if (!wsStatus || typeof wsStatus !== "object") {
-        throw new Error("engine_status: ws_status invalid");
-      }
+      const connectionStatus = String(
+        data.ws_connection_status ||
+        wsStatus.connection_status ||
+        "-"
+      );
+      const wsStatusEl = $("engine-ws-status");
+      wsStatusEl.textContent = connectionStatus;
+      applyConnectionStateValue(wsStatusEl, connectionStatus);
 
-      const sourceLabel = wsStatus.source === "database"
-        ? "DB 기준 확인"
-        : (wsStatus.available ? "확인 가능" : "확인 불가");
-      $("engine-ws-available").textContent = sourceLabel;
+      const dataFreshnessMs =
+        numberOrNull(data.data_freshness_ms) !== null
+          ? numberOrNull(data.data_freshness_ms)
+          : numberOrNull(wsStatus.data_freshness_ms);
+
+      const dataFreshnessEl = $("engine-data-freshness");
+      dataFreshnessEl.textContent = formatLatencySec(dataFreshnessMs);
+      applyLatencyColor(dataFreshnessEl, dataFreshnessMs);
+
+      const lastSignalValue = data.last_signal_ts ?? data.last_signal_time ?? null;
+      const lastTradeValue = data.last_trade_ts ?? data.last_trade_time ?? null;
+
+      $("engine-last-signal").textContent = formatTimestampKst(lastSignalValue, "short");
+      $("engine-last-trade").textContent = formatTimestampKst(lastTradeValue, "short");
+
+      const sourceLabel = resolveRealtimeSourceLabel(wsStatus.source);
+      $("engine-realtime-source").textContent = sourceLabel;
+      if (String(wsStatus.source || "").toLowerCase() === "database") {
+        notes.push("실시간 데이터 상태가 아직 DB 기준입니다. WS 기준으로 전환이 필요합니다.");
+      }
 
       $("engine-best-bid").textContent =
         wsStatus.orderbook && wsStatus.orderbook.bestBid !== undefined && wsStatus.orderbook.bestBid !== null
@@ -1995,28 +2422,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           ? fmtMaybe(wsStatus.orderbook.bestAsk, 4)
           : "-";
 
-      const buffersBox = $("engine-buffers-box");
-      buffersBox.innerHTML = "";
+      renderRealtimeRows(wsStatus);
+      renderAccountCard(data.account_info ?? null);
 
-      const buffers = wsStatus.buffers;
-      if (!buffers || typeof buffers !== "object") {
-        throw new Error("engine_status: buffers invalid");
+      if (notes.length) {
+        setWidgetNote("engineNote", notes.join("\n"));
       }
-
-      Object.entries(buffers).forEach(([tf, v]) => {
-        const ok = !!(v && v.ok);
-        const len = v && v.len !== undefined && v.len !== null ? String(v.len) : "오류";
-        const div = document.createElement("div");
-        div.className = "mini-row";
-        div.innerHTML = `
-          <div class="flex items-center gap-2">
-            <span class="tiny-dot ${ok ? "tiny-dot-ok" : "tiny-dot-fatal"}"></span>
-            <span>${tf} 버퍼</span>
-          </div>
-          <div class="${ok ? "value-positive" : "value-negative"} mono">${len}</div>
-        `;
-        buffersBox.appendChild(div);
-      });
     }
 
     function renderPosition(data) {
@@ -2036,7 +2447,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       const pnlPct = data.pnl_pct === null || data.pnl_pct === undefined ? null : Number(data.pnl_pct);
       if (pnlUsdt === null || Number.isNaN(pnlUsdt) || pnlPct === null || Number.isNaN(pnlPct)) {
         pnlEl.textContent = "-";
-        pnlEl.classList.remove("value-positive", "value-negative", "value-neutral");
+        removeValueToneClasses(pnlEl);
       } else {
         pnlEl.textContent = `${fmtSigned(pnlUsdt, 2)} USDT / ${fmtSigned(pnlPct, 2)}%`;
         applyValueColor(pnlEl, pnlUsdt);
@@ -2550,10 +2961,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
     async function loadEngineStatus() {
       clearWidgetError("engineError");
       clearWidgetNote("engineNote");
+      clearWidgetError("accountError");
+      clearWidgetNote("accountNote");
+
       try {
         const data = await fetchJsonStrict(API.engineStatus, "핵심 상태");
         renderEngineStatus(data);
       } catch (e) {
+        resetAccountCard("핵심 상태 조회 실패로 계좌 보유를 표시할 수 없습니다.");
+        applyStatusChip("account-status-chip", "오류");
         setWidgetError("engineError", `ERROR: ${e.message || String(e)}`);
         showBannerError(e.message || String(e));
       }
@@ -2624,7 +3040,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const url = `${protocol}//${window.location.host}/ws/dashboard`;
 
-      if (ws) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.close(); } catch (_) {}
       }
 
@@ -2634,12 +3050,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
       ws.onopen = () => {
         applyStatusChip("ws-status-chip", "WebSocket 연결됨");
-        try {
-          ws.send(JSON.stringify({ op: "snapshot" }));
-        } catch (e) {
-          showBannerError(`websocket snapshot request failed: ${e.message || String(e)}`);
+
+        if (wsReconnectTimer !== null) {
+          clearTimeout(wsReconnectTimer);
+          wsReconnectTimer = null;
         }
-      };
+
+      try {
+        ws.send(JSON.stringify({ op: "snapshot" }));
+      } catch (e) {
+        showBannerError(`websocket snapshot request failed: ${e.message || String(e)}`);
+      }
+    };
 
       ws.onmessage = (event) => {
         let data;
@@ -2679,11 +3101,21 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
       ws.onerror = () => {
         applyStatusChip("ws-status-chip", "WebSocket 오류");
       };
-
+         
       ws.onclose = () => {
-        applyStatusChip("ws-status-chip", "WebSocket 종료");
+        applyStatusChip("ws-status-chip", "WebSocket 재연결 대기");
+
+        if (wsReconnectTimer !== null) {
+          clearTimeout(wsReconnectTimer);
+          wsReconnectTimer = null;
+        }
+
+        wsReconnectTimer = setTimeout(() => {
+          connectDashboardWebSocket();
+        }, 3000);
       };
-    }
+
+      }  
 
     function applyLiveEnvelope(envelope) {
       if (!envelope || typeof envelope !== "object") {
@@ -2721,7 +3153,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
           prependLiveTrade(payload);
           break;
         default:
-          showBannerError(`websocket: unsupported type ${type}`);
+          // 대시보드가 처리하지 않는 이벤트는 무시
+          // (서버 확장 이벤트 대응)
+          console.debug("dashboard: ignored websocket event", type);
           break;
       }
     }
@@ -2767,6 +3201,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
     window.addEventListener("DOMContentLoaded", async () => {
       if (!enforceDesktopOnly()) return;
+
+      resetAccountCard("계좌 보유 데이터가 아직 연결되지 않았습니다.");
 
       $("refresh-btn").addEventListener("click", () => {
         loadAll();

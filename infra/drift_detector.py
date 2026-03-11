@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 """
 ========================================================
 FILE: infra/drift_detector.py
 STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ========================================================
 
-역할
+ROLE:
 - 런타임에서 “급변(Drift)”을 감지한다.
   - allocation(리스크 비중) 급변
   - risk_multiplier(레벨3 포함) 급변
@@ -13,29 +15,38 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 임계치 초과 시 DriftDetectedError를 발생시킨다.
   (SAFE_STOP 결정/텔레그램/로그는 호출자 책임)
 
-설계 원칙:
+CORE RESPONSIBILITIES:
+- allocation / multiplier / regime / micro drift STRICT 감지
+- rolling median 기반 allocation spike ratio 탐지
+- 안정 구간 이후 regime 변경 감지
+- symbol 단위 단일 상태기계 보장
+- 내부 상태 원자적 반영 보장
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
 - 폴백 금지(None→0 등 금지)
 - 데이터 누락/비정상 값(NaN/inf/범위초과) 발견 시 즉시 예외
 - 예외 삼키기 금지
 - 환경변수 직접 접근 금지(settings.py 불필요: 순수 검증 모듈)
 - DB 접근 금지(순수 상태/순수 가드)
 - 시간 역전(timestamp rollback)은 data_integrity_guard가 담당(여기는 drift)
+- 모든 drift 판정은 min_history 충족 이후에만 수행한다
+- 상태 반영은 원자적으로 수행하며 partial commit 을 허용하지 않는다
+- 하나의 DriftDetector 인스턴스는 하나의 symbol 에만 사용한다
 
-변경 이력
---------------------------------------------------------
-- 2026-03-04:
-  1) 신규 생성: allocation/multiplier/regime/micro_score_risk drift 감지
-  2) rolling median 기반 ratio spike 탐지(폴백 없이 finite/범위 검증)
-  3) “안정 구간 이후 regime 변경”을 급변으로 감지(운영 사고 방지)
+CHANGE HISTORY:
+- 2026-03-11:
+  1) FIX(ROOT-CAUSE): regime drift 도 min_history 충족 이후에만 판정하도록 정책/구현 통일
+  2) FIX(ATOMICITY): drift 감지 시 내부 상태가 부분 반영되지 않도록 원자적 상태 반영 구조로 수정
+  3) FIX(STRICT): 1 detector = 1 symbol 강제, symbol 혼합 입력 차단
+  4) FIX(STRICT): symbol / regime_band 문자열 타입 검증 강화(str() 강제변환 제거)
 ========================================================
 """
-
-from __future__ import annotations
 
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence
 
 
 class DriftDetectorError(RuntimeError):
@@ -49,7 +60,9 @@ class DriftDetectedError(RuntimeError):
 def _require_nonempty_str(v: Any, name: str) -> str:
     if v is None:
         raise DriftDetectorError(f"{name} is required (STRICT)")
-    s = str(v).strip()
+    if not isinstance(v, str):
+        raise DriftDetectorError(f"{name} must be str (STRICT), got={type(v).__name__}")
+    s = v.strip()
     if not s:
         raise DriftDetectorError(f"{name} is required (STRICT)")
     return s
@@ -100,8 +113,6 @@ class DriftDetectorConfig:
       - history buffer length. (>=10 권장)
     min_history:
       - drift 판정을 시작하는 최소 히스토리 수.
-    allowed_future_fields:
-      - 없음. 이 모듈은 timestamp를 다루지 않는다.
 
     allocation_spike_ratio:
       - rolling median 대비 현재 allocation 비율 임계치.
@@ -114,6 +125,7 @@ class DriftDetectorConfig:
       - micro_score_risk 직전 대비 절대 점프 임계치(0~100 스케일).
     stable_regime_steps:
       - 동일 regime_band가 이 횟수 이상 유지된 뒤 변경되면 drift로 간주.
+      - 단, 실제 판정은 min_history 충족 이후에만 수행한다.
     """
 
     window_size: int = 50
@@ -135,7 +147,6 @@ class DriftDetectorConfig:
         if self.min_history > self.window_size:
             raise DriftDetectorError("min_history must be <= window_size (STRICT)")
 
-        # allocation thresholds
         if not math.isfinite(float(self.allocation_spike_ratio)) or float(self.allocation_spike_ratio) <= 1.0:
             raise DriftDetectorError("allocation_spike_ratio must be finite > 1.0 (STRICT)")
         if not math.isfinite(float(self.allocation_abs_jump)) or float(self.allocation_abs_jump) <= 0.0:
@@ -143,19 +154,16 @@ class DriftDetectorConfig:
         if float(self.allocation_abs_jump) > 1.0:
             raise DriftDetectorError("allocation_abs_jump must be <= 1.0 (STRICT)")
 
-        # multiplier thresholds
         if not math.isfinite(float(self.multiplier_abs_jump)) or float(self.multiplier_abs_jump) <= 0.0:
             raise DriftDetectorError("multiplier_abs_jump must be finite > 0 (STRICT)")
         if float(self.multiplier_abs_jump) > 1.0:
             raise DriftDetectorError("multiplier_abs_jump must be <= 1.0 (STRICT)")
 
-        # micro thresholds
         if not math.isfinite(float(self.micro_abs_jump)) or float(self.micro_abs_jump) <= 0.0:
             raise DriftDetectorError("micro_abs_jump must be finite > 0 (STRICT)")
         if float(self.micro_abs_jump) > 100.0:
             raise DriftDetectorError("micro_abs_jump must be <= 100 (STRICT)")
 
-        # regime stability
         if not isinstance(self.stable_regime_steps, int) or self.stable_regime_steps < 2:
             raise DriftDetectorError("stable_regime_steps must be int >= 2 (STRICT)")
 
@@ -185,6 +193,7 @@ class DriftDetector:
     - update_and_check(snapshot) 호출 시, 임계치 초과 drift를 발견하면 DriftDetectedError를 발생.
     - 히스토리 부족(min_history 미만)인 경우 drift 판정 자체는 하지 않지만,
       입력 값의 범위/finite 검증은 항상 수행한다(데이터 오염 차단).
+    - 하나의 인스턴스는 하나의 symbol 에만 사용한다.
     """
 
     def __init__(self, cfg: DriftDetectorConfig):
@@ -196,6 +205,7 @@ class DriftDetector:
         self._mult_hist: Deque[float] = deque(maxlen=cfg.window_size)
         self._micro_hist: Deque[float] = deque(maxlen=cfg.window_size)
 
+        self._symbol: Optional[str] = None
         self._last_regime: Optional[str] = None
         self._regime_stable_count: int = 0
 
@@ -211,6 +221,7 @@ class DriftDetector:
         self._alloc_hist.clear()
         self._mult_hist.clear()
         self._micro_hist.clear()
+        self._symbol = None
         self._last_regime = None
         self._regime_stable_count = 0
         self._last_alloc = None
@@ -248,101 +259,138 @@ class DriftDetector:
         - 입력 검증은 항상 수행
         - 히스토리(min_history) 충족 시 drift 감지 수행
         - drift 감지 시 DriftDetectedError raise
+        - 상태 반영은 원자적으로 수행한다
         """
         s = self._validate_snapshot_strict(snapshot)
 
-        # regime stability tracking
-        if self._last_regime is None:
-            self._last_regime = s.regime_band
-            self._regime_stable_count = 1
+        if self._symbol is None:
+            next_symbol = s.symbol
         else:
-            if s.regime_band == self._last_regime:
-                self._regime_stable_count += 1
-            else:
-                # changed
-                prev = self._last_regime
-                stable = int(self._regime_stable_count)
-                self._last_regime = s.regime_band
-                self._regime_stable_count = 1
+            next_symbol = self._symbol
+            if s.symbol != self._symbol:
+                raise DriftDetectorError(
+                    f"symbol mismatch for detector instance (STRICT): expected={self._symbol} got={s.symbol}"
+                )
 
-                # Only treat as drift when it changed after stable period
-                if stable >= int(self._cfg.stable_regime_steps):
-                    ev = DriftEvent(
+        next_alloc_hist = list(self._alloc_hist)
+        next_alloc_hist.append(float(s.allocation_ratio))
+
+        next_mult_hist = list(self._mult_hist)
+        next_mult_hist.append(float(s.risk_multiplier))
+
+        next_micro_hist = list(self._micro_hist)
+        next_micro_hist.append(float(s.micro_score_risk))
+
+        enough_history = len(next_alloc_hist) >= int(self._cfg.min_history)
+
+        next_last_regime: Optional[str]
+        next_regime_stable_count: int
+        events: List[DriftEvent] = []
+
+        if self._last_regime is None:
+            next_last_regime = s.regime_band
+            next_regime_stable_count = 1
+        elif s.regime_band == self._last_regime:
+            next_last_regime = self._last_regime
+            next_regime_stable_count = self._regime_stable_count + 1
+        else:
+            prev_regime = self._last_regime
+            prev_stable_count = int(self._regime_stable_count)
+            next_last_regime = s.regime_band
+            next_regime_stable_count = 1
+
+            if enough_history and prev_stable_count >= int(self._cfg.stable_regime_steps):
+                events.append(
+                    DriftEvent(
                         kind="REGIME_BAND_DRIFT",
                         message="regime band changed after stable period (STRICT)",
-                        details={"prev": prev, "now": s.regime_band, "stable_steps": stable},
+                        details={
+                            "prev": prev_regime,
+                            "now": s.regime_band,
+                            "stable_steps": prev_stable_count,
+                        },
                     )
-                    raise DriftDetectedError(self._format_events([ev]))
+                )
 
-        # push histories
+        if enough_history:
+            alloc_med = _median(next_alloc_hist)
+            if alloc_med <= 0.0:
+                raise DriftDetectorError(f"allocation median invalid (STRICT): {alloc_med}")
+
+            alloc_ratio = float(s.allocation_ratio) / float(alloc_med)
+            if not math.isfinite(alloc_ratio):
+                raise DriftDetectorError("allocation_ratio/median not finite (STRICT)")
+
+            if alloc_ratio >= float(self._cfg.allocation_spike_ratio):
+                events.append(
+                    DriftEvent(
+                        kind="ALLOCATION_SPIKE_RATIO",
+                        message="allocation spike vs rolling median (STRICT)",
+                        details={
+                            "alloc": s.allocation_ratio,
+                            "median": alloc_med,
+                            "ratio": alloc_ratio,
+                            "threshold": self._cfg.allocation_spike_ratio,
+                        },
+                    )
+                )
+
+            if self._last_alloc is not None:
+                alloc_jump = _abs(float(s.allocation_ratio) - float(self._last_alloc))
+                if alloc_jump >= float(self._cfg.allocation_abs_jump):
+                    events.append(
+                        DriftEvent(
+                            kind="ALLOCATION_ABS_JUMP",
+                            message="allocation abs jump vs previous (STRICT)",
+                            details={
+                                "prev": self._last_alloc,
+                                "now": s.allocation_ratio,
+                                "jump": alloc_jump,
+                                "threshold": self._cfg.allocation_abs_jump,
+                            },
+                        )
+                    )
+
+            if self._last_mult is not None:
+                multiplier_jump = _abs(float(s.risk_multiplier) - float(self._last_mult))
+                if multiplier_jump >= float(self._cfg.multiplier_abs_jump):
+                    events.append(
+                        DriftEvent(
+                            kind="MULTIPLIER_ABS_JUMP",
+                            message="risk_multiplier abs jump vs previous (STRICT)",
+                            details={
+                                "prev": self._last_mult,
+                                "now": s.risk_multiplier,
+                                "jump": multiplier_jump,
+                                "threshold": self._cfg.multiplier_abs_jump,
+                            },
+                        )
+                    )
+
+            if self._last_micro is not None:
+                micro_jump = _abs(float(s.micro_score_risk) - float(self._last_micro))
+                if micro_jump >= float(self._cfg.micro_abs_jump):
+                    events.append(
+                        DriftEvent(
+                            kind="MICRO_ABS_JUMP",
+                            message="micro_score_risk abs jump vs previous (STRICT)",
+                            details={
+                                "prev": self._last_micro,
+                                "now": s.micro_score_risk,
+                                "jump": micro_jump,
+                                "threshold": self._cfg.micro_abs_jump,
+                            },
+                        )
+                    )
+
+        self._symbol = next_symbol
+        self._last_regime = next_last_regime
+        self._regime_stable_count = next_regime_stable_count
+
         self._alloc_hist.append(float(s.allocation_ratio))
         self._mult_hist.append(float(s.risk_multiplier))
         self._micro_hist.append(float(s.micro_score_risk))
 
-        events: List[DriftEvent] = []
-
-        # If insufficient history, do not decide drift, but still store last values.
-        if len(self._alloc_hist) < int(self._cfg.min_history):
-            self._last_alloc = float(s.allocation_ratio)
-            self._last_mult = float(s.risk_multiplier)
-            self._last_micro = float(s.micro_score_risk)
-            return
-
-        # Allocation drift: median-ratio spike + abs jump vs previous
-        alloc_med = _median(list(self._alloc_hist))
-        if alloc_med <= 0:
-            # allocation median should never be <=0 due to validation; treat as internal corruption
-            raise DriftDetectorError(f"allocation median invalid (STRICT): {alloc_med}")
-
-        alloc_ratio = float(s.allocation_ratio) / float(alloc_med)
-        if not math.isfinite(alloc_ratio):
-            raise DriftDetectorError("allocation_ratio/median not finite (STRICT)")
-
-        if alloc_ratio >= float(self._cfg.allocation_spike_ratio):
-            events.append(
-                DriftEvent(
-                    kind="ALLOCATION_SPIKE_RATIO",
-                    message="allocation spike vs rolling median (STRICT)",
-                    details={"alloc": s.allocation_ratio, "median": alloc_med, "ratio": alloc_ratio, "threshold": self._cfg.allocation_spike_ratio},
-                )
-            )
-
-        if self._last_alloc is not None:
-            jump = _abs(float(s.allocation_ratio) - float(self._last_alloc))
-            if jump >= float(self._cfg.allocation_abs_jump):
-                events.append(
-                    DriftEvent(
-                        kind="ALLOCATION_ABS_JUMP",
-                        message="allocation abs jump vs previous (STRICT)",
-                        details={"prev": self._last_alloc, "now": s.allocation_ratio, "jump": jump, "threshold": self._cfg.allocation_abs_jump},
-                    )
-                )
-
-        # Multiplier drift: abs jump vs previous
-        if self._last_mult is not None:
-            mj = _abs(float(s.risk_multiplier) - float(self._last_mult))
-            if mj >= float(self._cfg.multiplier_abs_jump):
-                events.append(
-                    DriftEvent(
-                        kind="MULTIPLIER_ABS_JUMP",
-                        message="risk_multiplier abs jump vs previous (STRICT)",
-                        details={"prev": self._last_mult, "now": s.risk_multiplier, "jump": mj, "threshold": self._cfg.multiplier_abs_jump},
-                    )
-                )
-
-        # Micro drift: abs jump vs previous
-        if self._last_micro is not None:
-            dj = _abs(float(s.micro_score_risk) - float(self._last_micro))
-            if dj >= float(self._cfg.micro_abs_jump):
-                events.append(
-                    DriftEvent(
-                        kind="MICRO_ABS_JUMP",
-                        message="micro_score_risk abs jump vs previous (STRICT)",
-                        details={"prev": self._last_micro, "now": s.micro_score_risk, "jump": dj, "threshold": self._cfg.micro_abs_jump},
-                    )
-                )
-
-        # Update last values
         self._last_alloc = float(s.allocation_ratio)
         self._last_mult = float(s.risk_multiplier)
         self._last_micro = float(s.micro_score_risk)
@@ -354,7 +402,6 @@ class DriftDetector:
     def _format_events(events: Sequence[DriftEvent]) -> str:
         if not events:
             raise DriftDetectorError("format_events requires non-empty events (STRICT)")
-        # Keep it compact; caller can log details dict separately if needed.
         parts: List[str] = ["[DRIFT_DETECTED]"]
         for e in events:
             parts.append(f"{e.kind}: {e.message} | {e.details}")

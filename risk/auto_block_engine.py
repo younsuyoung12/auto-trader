@@ -11,6 +11,9 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 - 반환부 reasons=tuple(reasons) 제거, STRICT 계약에 맞게 reasons=list 그대로 반환
 - 미사용 import(Dict, Tuple) 제거
 - 미사용 지역변수(ev_val) 제거로 코드 정리
+- 첫 줄 import 오타(rom → from) 수정
+- STRICT 강화: bool/int/float 입력 검증 정합화
+- 정책 정합화: heatmap BLOCK이어도 micro 원인이 있으면 reasons에 함께 남기도록 개선
 
 코드 정리 내용
 - 사용하지 않는 import 정리
@@ -55,6 +58,11 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-11:
+  1) FIX(STRICT): import 오타 수정
+  2) FIX(STRICT): _require_float/_require_int 에서 bool 입력 금지
+  3) FIX(CONTRACT): heatmap BLOCK과 micro block/penalty가 동시에 존재하면 reasons에 모두 반영
+  4) CLEANUP: 미사용 지역 연산 제거
 - 2026-03-09:
   1) STRICT 계약 불일치 수정: reasons 반환 타입을 tuple → list로 변경
   2) 미사용 import 및 미사용 지역변수 정리
@@ -82,6 +90,10 @@ def _fail(stage: str, reason: str) -> None:
 
 
 def _require_float(stage: str, v: Any, name: str) -> float:
+    if v is None:
+        _fail(stage, f"{name} is required")
+    if isinstance(v, bool):
+        _fail(stage, f"{name} must be float (bool not allowed)")
     try:
         fv = float(v)
     except Exception:
@@ -92,6 +104,12 @@ def _require_float(stage: str, v: Any, name: str) -> float:
 
 
 def _require_int(stage: str, v: Any, name: str) -> int:
+    if v is None:
+        _fail(stage, f"{name} is required")
+    if isinstance(v, bool):
+        _fail(stage, f"{name} must be int (bool not allowed)")
+    if isinstance(v, float) and not v.is_integer():
+        _fail(stage, f"{name} must be int (got non-integer float={v!r})")
     try:
         iv = int(v)
     except Exception:
@@ -171,27 +189,28 @@ def decide_auto_block(
 
     reasons: List[str] = []
 
-    # 1) Heatmap block has priority
-    if st == "BLOCK":
-        reasons.append("ev_block")
-        # Multiplier is still computed internally for rule consistency,
-        # but block overrides final entry decision and multiplier.
-        _micro_multiplier(msr)
+    # 1) Microstructure rule is always evaluated and recorded.
+    micro_mul = _micro_multiplier(msr)
+    if micro_mul == 0.0:
+        reasons.append("micro_block")
+    elif micro_mul < 1.0:
+        reasons.append("micro_penalty")
+
+    # 2) Base decision from microstructure
+    block_entry = False
+    risk_mul = float(micro_mul)
+
+    if micro_mul == 0.0:
         block_entry = True
         risk_mul = 0.0
-    else:
-        mul = _micro_multiplier(msr)
-        block_entry = False
-        risk_mul = float(mul)
 
-        if mul == 0.0:
-            block_entry = True
-            risk_mul = 0.0
-            reasons.append("micro_block")
-        elif mul < 1.0:
-            reasons.append("micro_penalty")
+    # 3) Heatmap block has higher priority, but reasons keep all applicable causes.
+    if st == "BLOCK":
+        reasons.append("ev_block")
+        block_entry = True
+        risk_mul = 0.0
 
-    # 2) Optional overlays (only if both value and threshold provided)
+    # 4) Optional overlays (only if both value and threshold provided)
     if consecutive_losses is not None and consec_loss_penalty_threshold is not None:
         cl = _require_int("overlay", consecutive_losses, "consecutive_losses")
         th = _require_int("overlay", consec_loss_penalty_threshold, "consec_loss_penalty_threshold")
@@ -212,16 +231,24 @@ def decide_auto_block(
             risk_mul *= 0.7
             reasons.append("dd_penalty")
 
-    # 3) Final sanitize
+    # 5) Final sanitize
     if not math.isfinite(risk_mul):
         _fail("compute", f"risk_multiplier not finite: {risk_mul}")
     if risk_mul < 0.0 or risk_mul > 1.0:
         _fail("compute", f"risk_multiplier out of range [0,1]: {risk_mul}")
 
+    # 중복 reason 방지
+    dedup_reasons: List[str] = []
+    seen = set()
+    for r in reasons:
+        if r not in seen:
+            dedup_reasons.append(r)
+            seen.add(r)
+
     return AutoBlockDecision(
         block_entry=bool(block_entry),
         risk_multiplier=float(risk_mul),
-        reasons=reasons,
+        reasons=list(dedup_reasons),
     )
 
 

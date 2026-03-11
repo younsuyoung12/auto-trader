@@ -60,6 +60,12 @@ STRICT · NO-FALLBACK · PRODUCTION MODE
 
 PATCH NOTES
 --------------------------------------------------------
+- 2026-03-11
+  - FIX(ROOT-CAUSE): hysteresis band 전이 로직 수정
+    * 이전 상태에서 점수가 여러 경계를 한 번에 넘는 경우 raw_band로 즉시 점프
+    * NO_TRADE -> HIGH, HIGH -> NO_TRADE 급변 상황에서 한 단계씩만 이동하던 오판 제거
+    * allocation 오판 및 entry/no-entry 판단 지연 문제 제거
+  - 기존 기능 삭제 없음
 - 2026-03-10
   - FIX(ROOT-CAUSE): typing import 계약 누락 수정
     * snapshot_decision_state() 추가 후 Dict import 누락으로 Pylance reportUndefinedVariable 발생
@@ -208,7 +214,8 @@ def _band_with_hysteresis(score: float, prev_band: Optional[str], margin: float)
     """
     STRICT:
     - 이전 band 가 있으면 경계 전이를 hysteresis margin 기준으로 판단
-    - 이전 band 가 없으면 절대 기준 그대로 사용
+    - 단, score가 여러 경계를 한 번에 넘는 경우 raw_band로 즉시 점프해야 한다.
+      (한 단계씩만 이동시키면 allocation 오판이 발생함)
     """
     raw_band, _ = _band_and_allocation_by_absolute_threshold(score)
     if prev_band is None:
@@ -221,30 +228,28 @@ def _band_with_hysteresis(score: float, prev_band: Optional[str], margin: float)
     if margin <= 0.0 or not math.isfinite(margin):
         raise RegimeEngineError(f"hysteresis margin invalid: {margin}")
 
-    # 경계: 35 / 50 / 65
+    # NO_TRADE 유지 구간: score < 35 + margin
     if b == "NO_TRADE":
-        if score >= 35.0 + margin:
-            return "LOW"
-        return "NO_TRADE"
-
-    if b == "LOW":
-        if score < 35.0 - margin:
+        if score < 35.0 + margin:
             return "NO_TRADE"
-        if score >= 50.0 + margin:
-            return "MID"
-        return "LOW"
+        return raw_band
 
-    if b == "MID":
-        if score < 50.0 - margin:
+    # LOW 유지 구간: [35 - margin, 50 + margin)
+    if b == "LOW":
+        if 35.0 - margin <= score < 50.0 + margin:
             return "LOW"
-        if score >= 65.0 + margin:
-            return "HIGH"
-        return "MID"
+        return raw_band
 
-    # HIGH
-    if score < 65.0 - margin:
-        return "MID"
-    return "HIGH"
+    # MID 유지 구간: [50 - margin, 65 + margin)
+    if b == "MID":
+        if 50.0 - margin <= score < 65.0 + margin:
+            return "MID"
+        return raw_band
+
+    # HIGH 유지 구간: score >= 65 - margin
+    if score >= 65.0 - margin:
+        return "HIGH"
+    return raw_band
 
 
 def _micro_multiplier(micro_score_risk: float) -> float:

@@ -6,13 +6,14 @@ ROLE:
 - Binance USDT-M Futures multiplex WebSocket 수신기
 - 멀티 타임프레임 kline + depth5 orderbook을 메모리 버퍼에 유지
 - WS primary market-data를 bt_candles / bt_orderbook_snapshots 에 지속 기록한다
-- 상위 레이어에 getter / atomic snapshot / health snapshot만 제공
+- 상위 레이어에 getter / atomic snapshot / health snapshot / dashboard telemetry snapshot 을 제공한다
 
 CORE RESPONSIBILITIES:
 - WS 수신 데이터의 STRICT 검증 및 메모리 버퍼링
 - WS kline / depth5 orderbook의 DB 영속화(STRICT, fail-fast)
 - 부팅 시 REST bootstrap으로 필수 캔들 preload
 - WS 세션 상태 / market-data freshness / orderbook payload 무결성 관측성 제공
+- dashboard 가 직접 사용할 수 있는 WS telemetry snapshot 제공
 - strategy / execution / exit 책임과 완전 분리
 
 IMPORTANT POLICY:
@@ -25,6 +26,7 @@ IMPORTANT POLICY:
 - orderbook spreadPct/spread_pct 계약은 ratio(0..1) 기준으로 통일한다
 - WS primary feed 의 DB 저장 실패는 치명적 오류로 간주하며 세션을 종료/재연결한다
 - orderbook DB timestamp 는 반드시 거래소 이벤트 시각(E/T)을 사용한다
+- 계좌/포지션 데이터는 이 파일 책임이 아니다. dashboard telemetry 는 시장데이터 전용으로만 제공한다
 
 CHANGE HISTORY:
 - 2026-03-11:
@@ -41,6 +43,12 @@ CHANGE HISTORY:
   11) FIX(STRICT): REST bootstrap derives current-candle closed state from explicit close_time only
   12) ADD(API): get_klines_with_volume_and_closed() for downstream persistence path
   13) FIX(CONTRACT): legacy public getters keep 5/6-tuple compatibility while internal buffer uses 7-tuple
+  14) ADD(API): get_dashboard_ws_telemetry_snapshot() 추가
+  15) ADD(CONTRACT): dashboard 용 connection_status / data_freshness_sec / kline_latency_sec_by_tf / orderbook_latency_sec / last_ws_message_latency_sec 제공
+  16) FIX(SSOT): REST bootstrap 대상 interval 을 ws_backfill_tfs 기준으로 정렬
+  17) FIX(CONTRACT): health snapshot required_intervals 를 ws_required_tfs ∪ features_required_tfs 로 통일
+  18) FIX(CONTRACT): health snapshot top-level transport_ok / market_feed_ok 명시적 노출 추가
+  19) FIX(STRICT): internal MAX_KLINES capacity 를 strict required min buffer 와 정합화
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): ws_status.ok 를 transport 상태만 의미하도록 정리
   2) FIX(ROOT-CAUSE): orderbook health 에서 feed inactivity warning 과 payload fail 분리
@@ -76,6 +84,10 @@ KlineRow = Tuple[int, float, float, float, float, float, bool]
 LegacyKlineRowWithVolume = Tuple[int, float, float, float, float, float]
 LegacyKlineRow = Tuple[int, float, float, float, float]
 
+_DASHBOARD_WS_STATUS_CONNECTED = "CONNECTED"
+_DASHBOARD_WS_STATUS_RECONNECTING = "RECONNECTING"
+_DASHBOARD_WS_STATUS_DISCONNECTED = "DISCONNECTED"
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -109,6 +121,37 @@ def _normalize_interval(iv: Any) -> str:
 
 def _to_stream_symbol(sym: str) -> str:
     return _normalize_symbol(sym).lower()
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        s = str(item).strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _normalize_interval_list_from_settings(raw: Any, *, name: str) -> List[str]:
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError(f"settings.{name} must be non-empty list[str] (STRICT)")
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(raw):
+        iv = _normalize_interval(item)
+        if not iv:
+            raise RuntimeError(f"settings.{name}[{idx}] invalid/empty interval (STRICT)")
+        if iv in seen:
+            raise RuntimeError(f"settings.{name} contains duplicate interval={iv!r} (STRICT)")
+        seen.add(iv)
+        out.append(iv)
+    return out
 
 
 def _require_bool(v: Any, name: str) -> bool:
@@ -185,6 +228,18 @@ def _require_positive_int(v: Any, name: str) -> int:
     return iv
 
 
+def _require_nonnegative_int(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise RuntimeError(f"{name} must be int (bool not allowed)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise RuntimeError(f"{name} must be int: {e}") from e
+    if iv < 0:
+        raise RuntimeError(f"{name} must be >= 0")
+    return iv
+
+
 def _require_positive_float(v: Any, name: str) -> float:
     if isinstance(v, bool):
         raise RuntimeError(f"{name} must be float (bool not allowed)")
@@ -227,19 +282,42 @@ def _extract_orderbook_event_ts_ms_strict(payload: Dict[str, Any]) -> int:
     return _require_int_ms(raw_event_ts, "orderbook.event_ts")
 
 
+def _ms_to_sec_optional(v: Optional[int], name: str) -> Optional[float]:
+    if v is None:
+        return None
+    iv = _require_nonnegative_int(v, name)
+    return iv / 1000.0
+
+
+def _normalize_required_intervals_for_dashboard(intervals: Optional[List[str]]) -> List[str]:
+    if intervals is None:
+        return list(HEALTH_REQUIRED_INTERVALS)
+
+    if not isinstance(intervals, list):
+        raise RuntimeError("intervals must be list[str] or None (STRICT)")
+
+    normalized: List[str] = []
+    for idx, raw in enumerate(intervals):
+        iv = _normalize_interval(raw)
+        if not iv:
+            raise RuntimeError(f"intervals[{idx}] invalid/empty (STRICT)")
+        normalized.append(iv)
+
+    if not normalized:
+        raise RuntimeError("intervals must not be empty (STRICT)")
+    return normalized
+
+
 # ─────────────────────────────────────────────
 # Settings / SSOT
 # ─────────────────────────────────────────────
-WS_INTERVALS: List[str] = [_normalize_interval(x) for x in list(SET.ws_subscribe_tfs)]
-WS_INTERVALS = [x for x in WS_INTERVALS if x]
-
-REQUIRED_INTERVALS: List[str] = [_normalize_interval(x) for x in list(SET.ws_required_tfs)]
-REQUIRED_INTERVALS = [x for x in REQUIRED_INTERVALS if x]
-
-if not WS_INTERVALS:
-    raise RuntimeError("ws_subscribe_tfs is empty. At least one interval must be subscribed.")
-if not REQUIRED_INTERVALS:
-    raise RuntimeError("ws_required_tfs is empty. At least one required interval must be set.")
+WS_INTERVALS: List[str] = _normalize_interval_list_from_settings(SET.ws_subscribe_tfs, name="ws_subscribe_tfs")
+REQUIRED_INTERVALS: List[str] = _normalize_interval_list_from_settings(SET.ws_required_tfs, name="ws_required_tfs")
+WS_BACKFILL_INTERVALS: List[str] = _normalize_interval_list_from_settings(SET.ws_backfill_tfs, name="ws_backfill_tfs")
+FEATURE_REQUIRED_INTERVALS: List[str] = _normalize_interval_list_from_settings(
+    SET.features_required_tfs,
+    name="features_required_tfs",
+)
 
 _missing_required = [iv for iv in REQUIRED_INTERVALS if iv not in WS_INTERVALS]
 if _missing_required:
@@ -247,6 +325,24 @@ if _missing_required:
         "ws_required_tfs contains intervals not present in ws_subscribe_tfs. "
         f"missing={_missing_required}. Fix your settings to subscribe required intervals."
     )
+
+_missing_backfill = [iv for iv in WS_BACKFILL_INTERVALS if iv not in WS_INTERVALS]
+if _missing_backfill:
+    raise RuntimeError(
+        "ws_backfill_tfs contains intervals not present in ws_subscribe_tfs. "
+        f"missing={_missing_backfill}. Fix your settings to backfill only subscribed intervals."
+    )
+
+_missing_feature = [iv for iv in FEATURE_REQUIRED_INTERVALS if iv not in WS_INTERVALS]
+if _missing_feature:
+    raise RuntimeError(
+        "features_required_tfs contains intervals not present in ws_subscribe_tfs. "
+        f"missing={_missing_feature}. Fix your settings to subscribe feature-required intervals."
+    )
+
+HEALTH_REQUIRED_INTERVALS: List[str] = _dedupe_keep_order(REQUIRED_INTERVALS + FEATURE_REQUIRED_INTERVALS)
+if not HEALTH_REQUIRED_INTERVALS:
+    raise RuntimeError("health required intervals empty (STRICT)")
 
 _WS_COMBINED_BASE = str(SET.ws_combined_base or "").strip()
 if not _WS_COMBINED_BASE:
@@ -338,15 +434,10 @@ _ws_state_lock = threading.Lock()
 _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
 
-MAX_KLINES = 500
-
 _max_required_buffer = max(
     [KLINE_MIN_BUFFER, _LONG_TF_MIN_BUFFER_DEFAULT, *_EFFECTIVE_INTERVAL_MIN_BUFFER_BY_INTERVAL.values()]
 )
-if MAX_KLINES < _max_required_buffer:
-    raise RuntimeError(
-        f"MAX_KLINES({MAX_KLINES}) must be >= strict required min buffer ({_max_required_buffer})"
-    )
+MAX_KLINES = max(500, _max_required_buffer)
 
 _NO_BUF_LOG_SUPPRESS_SEC: float = _require_positive_float(
     SET.ws_no_buffer_log_suppress_sec,
@@ -496,6 +587,25 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
     }
 
 
+def _derive_dashboard_connection_status(symbol: str) -> str:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for dashboard connection status")
+
+    ws_status = get_ws_status(sym)
+    transport_ok = bool(ws_status.get("transport_ok", False))
+    if transport_ok:
+        return _DASHBOARD_WS_STATUS_CONNECTED
+
+    with _start_ws_lock:
+        runner = _started_ws_symbols.get(sym)
+
+    if runner is not None and runner.is_alive():
+        return _DASHBOARD_WS_STATUS_RECONNECTING
+
+    return _DASHBOARD_WS_STATUS_DISCONNECTED
+
+
 def _close_ws_with_log(ws: websocket.WebSocketApp, *, context: str) -> None:
     try:
         ws.close()
@@ -603,7 +713,7 @@ def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]
     if not sym:
         raise RuntimeError("symbol is required for REST bootstrap")
 
-    targets = list(intervals or WS_INTERVALS)
+    targets = list(intervals or WS_BACKFILL_INTERVALS)
     targets = [_normalize_interval(x) for x in targets if _normalize_interval(x)]
     if not targets:
         raise RuntimeError("REST bootstrap intervals empty (STRICT)")
@@ -1398,19 +1508,24 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
         "overall_kline_ok": True,
         "overall_orderbook_ok": True,
         "overall_transport_ok": True,
+        "transport_ok": True,
+        "market_feed_ok": True,
         "ws": {},
         "klines": {},
         "orderbook": {},
         "overall_reasons": [],
         "overall_warnings": [],
         "checked_at_ms": _now_ms(),
-        "required_intervals": list(REQUIRED_INTERVALS),
+        "required_intervals": list(HEALTH_REQUIRED_INTERVALS),
+        "ws_required_intervals": list(REQUIRED_INTERVALS),
+        "feature_required_intervals": list(FEATURE_REQUIRED_INTERVALS),
     }
 
     overall_ok = True
     overall_kline_ok = True
     overall_orderbook_ok = True
     overall_transport_ok = True
+    overall_market_feed_ok = True
     overall_reasons: List[str] = []
     overall_warnings: List[str] = []
 
@@ -1424,10 +1539,11 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
 
     ws_warning_items = list(ws_status.get("warnings") or [])
     if ws_warning_items:
+        overall_market_feed_ok = False
         overall_warnings.extend([f"ws:{w}" for w in ws_warning_items])
 
     kline_map: Dict[str, Any] = {}
-    for iv in REQUIRED_INTERVALS:
+    for iv in HEALTH_REQUIRED_INTERVALS:
         k_status = _compute_kline_health(sym, iv)
         kline_map[iv] = k_status
         if not k_status.get("ok", False):
@@ -1445,16 +1561,19 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
 
     ob_warning_items = list(ob_status.get("warnings") or [])
     if ob_warning_items:
+        overall_market_feed_ok = False
         overall_warnings.extend([f"orderbook:{w}" for w in ob_warning_items])
 
     snapshot["klines"] = kline_map
-    snapshot["overall_ok"] = overall_ok
-    snapshot["overall_kline_ok"] = overall_kline_ok
-    snapshot["overall_orderbook_ok"] = overall_orderbook_ok
-    snapshot["overall_transport_ok"] = overall_transport_ok
-    snapshot["overall_reasons"] = overall_reasons
-    snapshot["overall_warnings"] = overall_warnings
-    snapshot["has_warning"] = len(overall_warnings) > 0
+    snapshot["overall_ok"] = bool(overall_ok)
+    snapshot["overall_kline_ok"] = bool(overall_kline_ok)
+    snapshot["overall_orderbook_ok"] = bool(overall_orderbook_ok)
+    snapshot["overall_transport_ok"] = bool(overall_transport_ok)
+    snapshot["transport_ok"] = bool(overall_transport_ok)
+    snapshot["market_feed_ok"] = bool(overall_market_feed_ok)
+    snapshot["overall_reasons"] = _dedupe_keep_order(overall_reasons)
+    snapshot["overall_warnings"] = _dedupe_keep_order(overall_warnings)
+    snapshot["has_warning"] = len(snapshot["overall_warnings"]) > 0
 
     _maybe_log_health_fail(snapshot)
     return snapshot
@@ -1462,6 +1581,90 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
 
 def is_data_healthy(symbol: str) -> bool:
     return bool(get_health_snapshot(symbol).get("overall_ok", False))
+
+
+def get_dashboard_ws_telemetry_snapshot(
+    symbol: str,
+    *,
+    intervals: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Dashboard 전용 WS telemetry snapshot.
+
+    목적:
+    - 대시보드가 buffer len 같은 간접 지표가 아니라
+      connection_status / data_freshness / kline latency / orderbook latency 를 직접 표시하게 한다.
+    - 시장데이터 레이어 책임만 제공한다. 계좌/포지션 정보는 여기서 다루지 않는다.
+    """
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required (STRICT)")
+
+    normalized_intervals = _normalize_required_intervals_for_dashboard(intervals)
+    now_ms = _now_ms()
+
+    ws_status = get_ws_status(sym)
+    orderbook_status = get_orderbook_buffer_status(sym)
+
+    kline_latency_sec_by_tf: Dict[str, Optional[float]] = {}
+    kline_last_ts_ms_by_tf: Dict[str, Optional[int]] = {}
+    kline_recv_ts_ms_by_tf: Dict[str, Optional[int]] = {}
+
+    for iv in normalized_intervals:
+        k_status = get_kline_buffer_status(sym, iv)
+        kline_latency_sec_by_tf[iv] = _ms_to_sec_optional(k_status.get("delay_ms"), f"kline[{iv}].delay_ms")
+        last_ts = k_status.get("last_ts")
+        if last_ts is not None:
+            last_ts = _require_positive_int(last_ts, f"kline[{iv}].last_ts")
+        last_recv_ts = k_status.get("last_recv_ts")
+        if last_recv_ts is not None:
+            last_recv_ts = _require_positive_int(last_recv_ts, f"kline[{iv}].last_recv_ts")
+
+        kline_last_ts_ms_by_tf[iv] = last_ts
+        kline_recv_ts_ms_by_tf[iv] = last_recv_ts
+
+    last_ws_message_ts_ms = ws_status.get("last_message_ts")
+    if last_ws_message_ts_ms is not None:
+        last_ws_message_ts_ms = _require_positive_int(last_ws_message_ts_ms, "ws_status.last_message_ts")
+
+    last_ws_message_latency_sec = _ms_to_sec_optional(
+        ws_status.get("market_event_delay_ms"),
+        "ws_status.market_event_delay_ms",
+    )
+
+    orderbook_latency_sec = _ms_to_sec_optional(
+        orderbook_status.get("payload_delay_ms"),
+        "orderbook.payload_delay_ms",
+    )
+
+    data_freshness_sec: Optional[float]
+    if last_ws_message_latency_sec is not None:
+        data_freshness_sec = last_ws_message_latency_sec
+    else:
+        candidate_values = [v for v in kline_latency_sec_by_tf.values() if v is not None]
+        if orderbook_latency_sec is not None:
+            candidate_values.append(orderbook_latency_sec)
+        data_freshness_sec = min(candidate_values) if candidate_values else None
+
+    return {
+        "symbol": sym,
+        "source": "ws",
+        "checked_at_ms": now_ms,
+        "connection_status": _derive_dashboard_connection_status(sym),
+        "transport_ok": bool(ws_status.get("transport_ok", False)),
+        "market_feed_ok": bool(ws_status.get("market_feed_ok", False)),
+        "warnings": list(ws_status.get("warnings") or []),
+        "reasons": list(ws_status.get("reasons") or []),
+        "last_ws_message_ts_ms": last_ws_message_ts_ms,
+        "last_ws_message_latency_sec": last_ws_message_latency_sec,
+        "data_freshness_sec": data_freshness_sec,
+        "kline_latency_sec_by_tf": kline_latency_sec_by_tf,
+        "kline_last_ts_ms_by_tf": kline_last_ts_ms_by_tf,
+        "kline_recv_ts_ms_by_tf": kline_recv_ts_ms_by_tf,
+        "orderbook_latency_sec": orderbook_latency_sec,
+        "orderbook_payload_ts_ms": orderbook_status.get("payload_ts"),
+        "orderbook_recv_ts_ms": orderbook_status.get("last_recv_ts"),
+    }
 
 
 def start_ws_loop(symbol: str) -> None:
@@ -1474,7 +1677,7 @@ def start_ws_loop(symbol: str) -> None:
             log(f"[MD_BINANCE_WS] already started for {sym} → skip duplicate start")
             return
 
-    bootstrap_counts = bootstrap_klines_from_rest_strict(sym, intervals=WS_INTERVALS)
+    bootstrap_counts = bootstrap_klines_from_rest_strict(sym, intervals=WS_BACKFILL_INTERVALS)
     url = _build_ws_url(sym)
 
     def _runner() -> None:
@@ -1496,7 +1699,7 @@ def start_ws_loop(symbol: str) -> None:
                 start_ts = time.time()
                 ws.run_forever(
                     ping_interval=25,
-                    ping_timeout=10,
+                    ping_timeout=30,
                 )
                 session_dur = time.time() - start_ts
 
@@ -1531,7 +1734,10 @@ def start_ws_loop(symbol: str) -> None:
             _started_ws_symbols.pop(sym, None)
         raise
 
-    log(f"[MD_BINANCE_WS] background ws started for {sym} bootstrap={bootstrap_counts}")
+    log(
+        f"[MD_BINANCE_WS] background ws started for {sym} "
+        f"bootstrap={bootstrap_counts} backfill_intervals={WS_BACKFILL_INTERVALS}"
+    )
 
 
 def get_market_snapshot(symbol: str) -> Dict[str, Any]:
@@ -1585,6 +1791,7 @@ __all__ = [
     "get_orderbook_buffer_status",
     "get_orderbook",
     "get_ws_status",
+    "get_dashboard_ws_telemetry_snapshot",
     "get_health_snapshot",
     "is_data_healthy",
     "get_market_snapshot",

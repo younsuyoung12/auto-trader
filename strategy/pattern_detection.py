@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+# pattern_detection.py
 # PATCH NOTES — 2026-03-01
 # -----------------------------------------------------
 # 1) raw_ohlcv_last20 입력 포맷 변경 대응
@@ -20,6 +20,13 @@ from __future__ import annotations
 #    적용 패턴: doji, doji_long_legged, triangle_sym, pennant, volume_climax
 # 2) FIX: add_pattern 호출부의 쉼표 누락으로 인한 SyntaxError를 모두 제거한다.
 # 3) STRICT: add_pattern()에서 direction이 None/비허용 값이면 PatternError로 즉시 실패한다.
+# -----------------------------------------------------
+
+# PATCH NOTES — 2026-03-11
+# -----------------------------------------------------
+# 1) FIX(STRICT): infra.telelog import fallback 제거
+# 2) FIX(STRICT): print 기반 로컬 stub 제거
+# 3) CLEANUP: 운영 경로(infra.telelog)만 사용하도록 정리
 # -----------------------------------------------------
 
 
@@ -52,15 +59,7 @@ dict 포맷은 금지한다.
 import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-
-try:
-    from infra.telelog import log, send_tg
-except Exception:  # 로컬 테스트/단일 모듈 실행 시 대비
-    def log(msg: str) -> None:  # type: ignore[override]
-        print(msg)
-
-    def send_tg(msg: str) -> None:  # type: ignore[override]
-        print(f"[TG-STUB] {msg}")
+from infra.telelog import log, send_tg
 
 
 # ─────────────────────────────────────────────────────
@@ -272,7 +271,6 @@ def _ohlc_lists(
     vols: List[float] = []
 
     for row in raw_ohlcv_last20:
-        # _require_ohlcv에서 이미 길이/타입 검증 완료 전제
         opens.append(float(row[1]))
         highs.append(float(row[2]))
         lows.append(float(row[3]))
@@ -841,8 +839,6 @@ def build_pattern_features(
 
     iv_txt = f" ({interval})" if interval else ""
 
-    # 이하 add_pattern(...) 블록은 기존 로직 그대로 유지 (생략 없이 유지)
-    # ---- 캔들 패턴
     add_pattern(
         key="bullish_engulfing",
         enabled=bullish_engulfing,

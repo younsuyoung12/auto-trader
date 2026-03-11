@@ -35,9 +35,20 @@ from sqlalchemy.orm import Session
 
 from state.db_core import get_session
 
+import logging
+
+logger = logging.getLogger(__name__)
 
 def get_db() -> Generator[Session, None, None]:
-    with get_session() as db:
-        if not isinstance(db, Session):
-            raise RuntimeError("state.db_core.get_session() must yield sqlalchemy.orm.Session (STRICT)")
-        yield db
+    try:
+        with get_session() as db:
+            if not isinstance(db, Session):
+                raise RuntimeError(
+                    "state.db_core.get_session() must yield sqlalchemy.orm.Session (STRICT)"
+                )
+            yield db
+    except Exception:
+        logger.exception("dashboard_db.get_db session failure")
+        raise
+
+

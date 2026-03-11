@@ -13,6 +13,7 @@ CORE RESPONSIBILITIES:
 - 설정 계약 불일치 Fail-Fast
 - 대문자 alias 접근 호환성 제공
 - 민감정보를 로그에 남기지 않는 안전한 로딩 유지
+- 런타임 단일 Settings singleton 제공
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -22,12 +23,26 @@ IMPORTANT POLICY:
 - 설정명은 실제 의미와 일치해야 하며, 실시간 health 기준과 payload 기준을 혼동하지 않는다
 - Settings 는 런타임 불변(frozen) 객체다
 - 민감정보(API key/secret, DB URL, token)는 절대 로그에 남기지 않는다
+- load_settings() 는 동일 런타임에서 항상 동일 singleton 을 반환해야 한다
 
 CHANGE HISTORY:
 - 2026-03-11:
-  1) FIX(SSOT): run_bot_preflight 가 사용하던 preflight_fake_usdt / meta_* 설정 필드를 정식 승격
-  2) FIX(STRICT): meta strategy / preflight execution probe 설정 검증 추가
-  3) FIX(COMPAT): META_* / PREFLIGHT_FAKE_USDT uppercase alias 접근 호환성 추가
+  1) FIX(SSOT): load_settings() 재호출 시 새 객체를 만들지 않고 singleton 반환으로 고정
+  2) FIX(STRICT): futures_position_mode 가 ONEWAY 인지 settings 단계에서 즉시 검증
+  3) FIX(STRICT): isolated ↔ margin_mode, recv_window ↔ binance_recv_window, timeout ↔ binance_http_timeout_sec 정합성 검증 추가
+  4) FIX(STRICT): binance_futures_base / binance_futures_base_url / binance_futures_rest_base 동일성 검증 추가
+  5) FIX(COMPAT): BINANCE_API_KEY / BINANCE_API_SECRET / SYMBOL / INTERVAL / LEVERAGE / MARGIN_MODE / FUTURES_POSITION_MODE uppercase alias 호환성 추가
+  6) FIX(STRICT): WS URL(ws_base/ws_combined_base) 형식 검증 추가
+  7) FIX(SSOT): run_bot_preflight 가 사용하던 preflight_fake_usdt / meta_* 설정 필드를 정식 승격
+  8) FIX(STRICT): meta strategy / preflight execution probe 설정 검증 추가
+  9) FIX(COMPAT): META_* / PREFLIGHT_FAKE_USDT uppercase alias 접근 호환성 추가
+  10) FIX(SSOT): exit_engine 가 요구하는 exit_score_threshold / exit_max_spread_pct / exit_trend_reversal_threshold / exit_orderbook_reversal_threshold 정식 승격
+  11) FIX(ROOT-CAUSE): entry_* 설정 필드를 env → dataclass → validation 전체 경로에 연결
+      - 선언만 있고 실제 로딩되지 않던 entry_score_threshold / entry_tp_pct / entry_sl_pct / entry_risk_pct /
+        entry_max_spread_pct / entry_min_trend_strength / entry_min_abs_orderbook_imbalance 누락 제거
+  12) FIX(STRICT): ws_required_tfs / features_required_tfs / md_store_tfs 와 ws_subscribe_tfs / ws_backfill_tfs
+      커버리지 계약을 settings 단계에서 즉시 검증
+  13) FIX(COMPAT): ENTRY_* / PREFLIGHT_WS_WAIT_SEC uppercase alias 접근 호환성 추가
 - 2026-03-10:
   1) FIX(SSOT): unified_features_builder / order_executor / engine_watchdog 가 요구하는 설정 필드를 정식 승격
   2) FIX(SSOT): features_required_tfs / microstructure_* / low_vol_* / exit_fill_wait_sec / position_reflect_wait_sec 추가
@@ -43,6 +58,7 @@ import json
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
 from pathlib import Path
@@ -58,6 +74,19 @@ KST = timezone(timedelta(hours=9))
 # Alias map for strict uppercase access compatibility
 # ---------------------------------------------------------------------
 _SETTINGS_ALIAS_MAP: Dict[str, str] = {
+    # Core / Binance
+    "BINANCE_API_KEY": "api_key",
+    "BINANCE_API_SECRET": "api_secret",
+    "SYMBOL": "symbol",
+    "INTERVAL": "interval",
+    "LEVERAGE": "leverage",
+    "MARGIN_MODE": "margin_mode",
+    "FUTURES_POSITION_MODE": "futures_position_mode",
+    "RECV_WINDOW_MS": "recv_window_ms",
+    "REQUEST_TIMEOUT_SEC": "request_timeout_sec",
+    "BINANCE_RECV_WINDOW": "binance_recv_window",
+    "BINANCE_HTTP_TIMEOUT_SEC": "binance_http_timeout_sec",
+
     # 기존 OpenAI / Trader OpenAI
     "OPENAI_API_KEY": "openai_api_key",
     "OPENAI_MODEL": "openai_model",
@@ -71,8 +100,10 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "OPENAI_MAX_LATENCY_SEC": "openai_max_latency_sec",
     "OPENAI_TRADER_MAX_LATENCY_SEC": "openai_max_latency_sec",
     "OPENAI_TRADER_MAX_LATENCY": "openai_max_latency_sec",
+
     # External intelligence
     "ALPHAVANTAGE_API_KEY": "alphavantage_api_key",
+
     # Exchange / market-data
     "BINANCE_FUTURES_BASE": "binance_futures_base",
     "BINANCE_FUTURES_BASE_URL": "binance_futures_base_url",
@@ -87,6 +118,17 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "WS_NO_BUFFER_LOG_SUPPRESS_SEC": "ws_no_buffer_log_suppress_sec",
     "WS_PONG_MAX_DELAY_SEC": "ws_pong_max_delay_sec",
     "WS_PONG_STARTUP_GRACE_SEC": "ws_pong_startup_grace_sec",
+    "PREFLIGHT_WS_WAIT_SEC": "preflight_ws_wait_sec",
+
+    # Entry
+    "ENTRY_SCORE_THRESHOLD": "entry_score_threshold",
+    "ENTRY_TP_PCT": "entry_tp_pct",
+    "ENTRY_SL_PCT": "entry_sl_pct",
+    "ENTRY_RISK_PCT": "entry_risk_pct",
+    "ENTRY_MAX_SPREAD_PCT": "entry_max_spread_pct",
+    "ENTRY_MIN_TREND_STRENGTH": "entry_min_trend_strength",
+    "ENTRY_MIN_ABS_ORDERBOOK_IMBALANCE": "entry_min_abs_orderbook_imbalance",
+
     # Unified features / market features
     "FEATURES_REQUIRED_TFS": "features_required_tfs",
     "FEATURES_ERROR_TG_COOLDOWN_SEC": "features_error_tg_cooldown_sec",
@@ -95,13 +137,22 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "MICROSTRUCTURE_PERIOD": "microstructure_period",
     "MICROSTRUCTURE_LOOKBACK": "microstructure_lookback",
     "MICROSTRUCTURE_CACHE_TTL_SEC": "microstructure_cache_ttl_sec",
+
     # Execution / sync
     "POSITION_REFLECT_WAIT_SEC": "position_reflect_wait_sec",
     "EXIT_FILL_WAIT_SEC": "exit_fill_wait_sec",
+
+    # Exit engine
+    "EXIT_SCORE_THRESHOLD": "exit_score_threshold",
+    "EXIT_MAX_SPREAD_PCT": "exit_max_spread_pct",
+    "EXIT_TREND_REVERSAL_THRESHOLD": "exit_trend_reversal_threshold",
+    "EXIT_ORDERBOOK_REVERSAL_THRESHOLD": "exit_orderbook_reversal_threshold",
+
     # Watchdog
     "ENGINE_WATCHDOG_INTERVAL_SEC": "engine_watchdog_interval_sec",
     "ENGINE_WATCHDOG_MAX_DB_PING_MS": "engine_watchdog_max_db_ping_ms",
     "ENGINE_WATCHDOG_EMIT_MIN_SEC": "engine_watchdog_emit_min_sec",
+
     # Preflight / Meta
     "PREFLIGHT_FAKE_USDT": "preflight_fake_usdt",
     "META_LOOKBACK_TRADES": "meta_lookback_trades",
@@ -113,6 +164,7 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "META_MAX_OUTPUT_SENTENCES": "meta_max_output_sentences",
     "META_PROMPT_VERSION": "meta_prompt_version",
     "META_COOLDOWN_SEC": "meta_cooldown_sec",
+
     # AI analyst
     "ANALYST_MARKET_SYMBOL": "analyst_market_symbol",
     "ANALYST_DB_MARKET_TIMEFRAME": "analyst_db_market_timeframe",
@@ -228,6 +280,10 @@ class Settings:
 
     # EXIT engine
     enable_exit_gpt: bool = True
+    exit_score_threshold: float = 0.55
+    exit_max_spread_pct: float = 0.002
+    exit_trend_reversal_threshold: float = 0.2
+    exit_orderbook_reversal_threshold: float = 0.05
 
     # Polling / order limits
     poll_fills_sec: float = 3.0
@@ -445,6 +501,13 @@ BotSettings = Settings
 class PatternStrengthSettings:
     """Optional pattern-strength overrides used by pattern_detection."""
     pattern_strengths: Dict[str, float] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------
+# Singleton state (STRICT SSOT)
+# ---------------------------------------------------------------------
+_SETTINGS_SINGLETON: Optional[Settings] = None
+_SETTINGS_SINGLETON_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------
@@ -785,6 +848,14 @@ def _validate_http_base_url(name: str, value: str) -> None:
         raise ValueError(f"{name} must start with http:// or https://")
 
 
+def _validate_ws_url(name: str, value: str) -> None:
+    v = str(value or "").strip()
+    if not v:
+        raise ValueError(f"{name} is empty")
+    if not (v.startswith("ws://") or v.startswith("wss://")):
+        raise ValueError(f"{name} must start with ws:// or wss://")
+
+
 def _validate_tf_list(name: str, values: List[str]) -> None:
     if not isinstance(values, list) or not values:
         raise ValueError(f"{name} must be non-empty list[str]")
@@ -830,6 +901,13 @@ def _validate_settings(s: Settings) -> None:
     mm = str(s.margin_mode or "").strip().upper()
     if mm not in {"ISOLATED", "CROSSED"}:
         raise ValueError("margin_mode must be ISOLATED or CROSSED")
+
+    if s.isolated != (mm == "ISOLATED"):
+        raise ValueError("isolated must match margin_mode (STRICT)")
+
+    pos_mode = str(s.futures_position_mode or "").strip().upper()
+    if pos_mode != "ONEWAY":
+        raise ValueError("futures_position_mode must be ONEWAY (STRICT)")
 
     if not (0.0 < float(s.allocation_ratio) <= 1.0):
         raise ValueError("allocation_ratio must be within (0,1]")
@@ -943,6 +1021,9 @@ def _validate_settings(s: Settings) -> None:
     if s.position_resync_sec <= 0:
         raise ValueError("position_resync_sec must be > 0")
 
+    _validate_ws_url("ws_base", s.ws_base)
+    _validate_ws_url("ws_combined_base", s.ws_combined_base)
+
     _validate_tf_list("ws_subscribe_tfs", s.ws_subscribe_tfs)
     _validate_tf_list("ws_required_tfs", s.ws_required_tfs)
     _validate_tf_list("ws_backfill_tfs", s.ws_backfill_tfs)
@@ -951,8 +1032,14 @@ def _validate_settings(s: Settings) -> None:
 
     if not set(s.ws_required_tfs).issubset(set(s.ws_subscribe_tfs)):
         raise ValueError("ws_required_tfs must be subset of ws_subscribe_tfs")
+    if not set(s.ws_required_tfs).issubset(set(s.ws_backfill_tfs)):
+        raise ValueError("ws_required_tfs must be subset of ws_backfill_tfs")
     if not set(s.features_required_tfs).issubset(set(s.ws_subscribe_tfs)):
         raise ValueError("features_required_tfs must be subset of ws_subscribe_tfs")
+    if not set(s.features_required_tfs).issubset(set(s.ws_backfill_tfs)):
+        raise ValueError("features_required_tfs must be subset of ws_backfill_tfs")
+    if not set(s.md_store_tfs).issubset(set(s.ws_subscribe_tfs)):
+        raise ValueError("md_store_tfs must be subset of ws_subscribe_tfs")
 
     if not (0.0 < float(s.drift_allocation_abs_jump) <= 1.0):
         raise ValueError("drift_allocation_abs_jump must be within (0,1]")
@@ -1121,6 +1208,17 @@ def _validate_settings(s: Settings) -> None:
     _validate_http_base_url("binance_futures_base_url", s.binance_futures_base_url)
     _validate_http_base_url("binance_futures_rest_base", s.binance_futures_rest_base)
 
+    if not (
+        s.binance_futures_base == s.binance_futures_base_url == s.binance_futures_rest_base
+    ):
+        raise ValueError("binance_futures_base/base_url/rest_base must be identical (STRICT)")
+
+    if s.binance_recv_window != s.recv_window_ms:
+        raise ValueError("binance_recv_window must equal recv_window_ms (STRICT)")
+
+    if s.binance_http_timeout_sec != s.request_timeout_sec:
+        raise ValueError("binance_http_timeout_sec must equal request_timeout_sec (STRICT)")
+
     if not str(s.analyst_kline_interval or "").strip():
         raise ValueError("analyst_kline_interval is empty")
     if s.analyst_kline_limit < 1:
@@ -1139,12 +1237,35 @@ def _validate_settings(s: Settings) -> None:
     if s.analyst_max_server_drift_ms < 0:
         raise ValueError("analyst_max_server_drift_ms must be >= 0")
 
+    if float(s.exit_score_threshold) < 0:
+        raise ValueError("exit_score_threshold must be >= 0")
+    if not (0.0 <= float(s.exit_max_spread_pct) <= 1.0):
+        raise ValueError("exit_max_spread_pct must be within 0..1 (fraction)")
+    if float(s.exit_trend_reversal_threshold) < 0:
+        raise ValueError("exit_trend_reversal_threshold must be >= 0")
+    if float(s.exit_orderbook_reversal_threshold) < 0:
+        raise ValueError("exit_orderbook_reversal_threshold must be >= 0")
+
+    if not (0.0 <= float(s.entry_score_threshold) <= 1.0):
+        raise ValueError("entry_score_threshold must be within 0..1")
+    if not (0.0 < float(s.entry_tp_pct) <= 1.0):
+        raise ValueError("entry_tp_pct must be within (0,1]")
+    if not (0.0 < float(s.entry_sl_pct) <= 1.0):
+        raise ValueError("entry_sl_pct must be within (0,1]")
+    if not (0.0 < float(s.entry_risk_pct) <= 1.0):
+        raise ValueError("entry_risk_pct must be within (0,1]")
+    if not (0.0 <= float(s.entry_max_spread_pct) <= 1.0):
+        raise ValueError("entry_max_spread_pct must be within 0..1")
+    if not (0.0 <= float(s.entry_min_trend_strength) <= 1.0):
+        raise ValueError("entry_min_trend_strength must be within 0..1")
+    if not (0.0 <= float(s.entry_min_abs_orderbook_imbalance) <= 1.0):
+        raise ValueError("entry_min_abs_orderbook_imbalance must be within 0..1")
+
 
 # ---------------------------------------------------------------------
-# Public loader
+# Internal builder
 # ---------------------------------------------------------------------
-def load_settings() -> Settings:
-    """Load and validate Settings (env-first, optional .env, then defaults)."""
+def _build_settings() -> Settings:
     _try_load_local_dotenv()
 
     api_key = _as_str("BINANCE_API_KEY", "")
@@ -1214,8 +1335,20 @@ def load_settings() -> Settings:
     openai_temperature = float(trader_openai["openai_temperature"])
     openai_max_latency_sec = float(trader_openai["openai_max_latency_sec"])
 
+    entry_score_threshold = _as_float("ENTRY_SCORE_THRESHOLD", 0.55)
+    entry_tp_pct = _as_float("ENTRY_TP_PCT", 0.01)
+    entry_sl_pct = _as_float("ENTRY_SL_PCT", 0.005)
+    entry_risk_pct = _as_float("ENTRY_RISK_PCT", 0.02)
+    entry_max_spread_pct = _as_float("ENTRY_MAX_SPREAD_PCT", 0.002)
+    entry_min_trend_strength = _as_float("ENTRY_MIN_TREND_STRENGTH", 0.2)
+    entry_min_abs_orderbook_imbalance = _as_float("ENTRY_MIN_ABS_ORDERBOOK_IMBALANCE", 0.05)
+
     unrealized_notify_sec = _as_int("UNREALIZED_NOTIFY_SEC", 1800)
     enable_exit_gpt = _as_bool("ENABLE_EXIT_GPT", True)
+    exit_score_threshold = _as_float("EXIT_SCORE_THRESHOLD", 0.55)
+    exit_max_spread_pct = _as_float("EXIT_MAX_SPREAD_PCT", 0.002)
+    exit_trend_reversal_threshold = _as_float("EXIT_TREND_REVERSAL_THRESHOLD", 0.2)
+    exit_orderbook_reversal_threshold = _as_float("EXIT_ORDERBOOK_REVERSAL_THRESHOLD", 0.05)
 
     poll_fills_sec = _as_float("POLL_FILLS_SEC", 3.0)
     max_open_orders = _as_int("MAX_OPEN_ORDERS", 5)
@@ -1442,8 +1575,19 @@ def load_settings() -> Settings:
         openai_temperature=openai_temperature,
         openai_max_latency_sec=openai_max_latency_sec,
         alphavantage_api_key=alphavantage_api_key,
+        entry_score_threshold=entry_score_threshold,
+        entry_tp_pct=entry_tp_pct,
+        entry_sl_pct=entry_sl_pct,
+        entry_risk_pct=entry_risk_pct,
+        entry_max_spread_pct=entry_max_spread_pct,
+        entry_min_trend_strength=entry_min_trend_strength,
+        entry_min_abs_orderbook_imbalance=entry_min_abs_orderbook_imbalance,
         unrealized_notify_sec=unrealized_notify_sec,
         enable_exit_gpt=enable_exit_gpt,
+        exit_score_threshold=exit_score_threshold,
+        exit_max_spread_pct=exit_max_spread_pct,
+        exit_trend_reversal_threshold=exit_trend_reversal_threshold,
+        exit_orderbook_reversal_threshold=exit_orderbook_reversal_threshold,
         poll_fills_sec=poll_fills_sec,
         max_open_orders=max_open_orders,
         max_entry_per_day=max_entry_per_day,
@@ -1592,6 +1736,27 @@ def load_settings() -> Settings:
 
     _validate_settings(s)
     return s
+
+
+# ---------------------------------------------------------------------
+# Public loader
+# ---------------------------------------------------------------------
+def load_settings() -> Settings:
+    """Load and validate Settings singleton (env-first, optional .env, then defaults)."""
+    global _SETTINGS_SINGLETON
+
+    cached = _SETTINGS_SINGLETON
+    if cached is not None:
+        return cached
+
+    with _SETTINGS_SINGLETON_LOCK:
+        cached = _SETTINGS_SINGLETON
+        if cached is not None:
+            return cached
+
+        built = _build_settings()
+        _SETTINGS_SINGLETON = built
+        return built
 
 
 SETTINGS = load_settings()
