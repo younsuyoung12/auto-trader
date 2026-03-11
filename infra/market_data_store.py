@@ -365,15 +365,19 @@ def _require_open_candle_monotonic_update_strict(existing: Candle, incoming: Dic
     existing_volume = None if existing.volume is None else float(existing.volume)
     incoming_volume = incoming["volume"]
     if existing_volume is not None and incoming_volume is None:
-        raise MarketDataStoreError("open candle update cannot drop existing volume to None (STRICT)")
+         incoming["volume"] = existing_volume
     if existing_volume is not None and incoming_volume is not None:
         if float(incoming_volume) + 1e-12 < existing_volume:
             raise MarketDataStoreError("open candle update cannot decrease volume (STRICT)")
 
     existing_quote_volume = None if existing.quote_volume is None else float(existing.quote_volume)
     incoming_quote_volume = incoming["quote_volume"]
+    
+    # Binance WS open candle update에서는 quote_volume 누락이 발생할 수 있음
+    # STRICT 정책에서는 기존 값을 유지하고 업데이트를 계속 진행한다.
+
     if existing_quote_volume is not None and incoming_quote_volume is None:
-        raise MarketDataStoreError("open candle update cannot drop existing quote_volume to None (STRICT)")
+        incoming["quote_volume"] = existing_quote_volume
     if existing_quote_volume is not None and incoming_quote_volume is not None:
         if float(incoming_quote_volume) + 1e-12 < existing_quote_volume:
             raise MarketDataStoreError("open candle update cannot decrease quote_volume (STRICT)")

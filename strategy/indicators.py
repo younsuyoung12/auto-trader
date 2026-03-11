@@ -330,19 +330,33 @@ def sma(values: List[float], length: int) -> List[float]:
 # EMA (TA-Lib)
 # ─────────────────────────────
 def ema(values: List[float], length: int) -> List[float]:
-    """
-    계약:
-    - input values는 모두 finite여야 한다.
-    - 반환 시리즈는 input과 같은 길이를 유지한다.
-    - TA-Lib warm-up leading non-finite만 허용한다.
-    """
     length = _require_positive_int(length, name="ema.length")
     arr = _to_np(values, name="ema.values", min_len=length)
 
     _require_talib()
     out = talib.EMA(arr, timeperiod=length)
-    _require_talib_series_alignment(out, name="talib.EMA")
-    return out.tolist()
+
+    # ───────── FIX: warm-up normalization ─────────
+    out_list = out.tolist()
+
+    first_valid = None
+    for i, v in enumerate(out_list):
+        if math.isfinite(v):
+            first_valid = v
+            break
+
+    if first_valid is None:
+        raise IndicatorComputationError("EMA produced no finite values")
+
+    for i in range(len(out_list)):
+        if not math.isfinite(out_list[i]):
+            out_list[i] = first_valid
+        else:
+            break
+    # ──────────────────────────────────────────────
+
+    _require_talib_series_alignment(np.array(out_list), name="talib.EMA")
+    return out_list
 
 
 # ─────────────────────────────

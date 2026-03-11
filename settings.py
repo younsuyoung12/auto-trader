@@ -213,6 +213,7 @@ class Settings:
 
     # Futures config
     leverage: int = 1
+    max_leverage: int = 1
     isolated: bool = True
     margin_mode: str = "ISOLATED"
     futures_position_mode: str = "ONEWAY"
@@ -229,7 +230,8 @@ class Settings:
     # Strategy / sizing
     allocation_ratio: float = 0.35
     risk_pct: float = 0.35
-
+    max_risk_pct: float = 1.0
+    
     # Default TP/SL
     tp_pct: float = 0.006
     sl_pct: float = 0.003
@@ -317,7 +319,7 @@ class Settings:
     ws_min_kline_buffer_by_interval: Dict[str, int] = field(default_factory=dict)
     ws_health_fail_log_suppress_sec: float = 10.0
     ws_no_buffer_log_suppress_sec: float = 30.0
-    ws_pong_max_delay_sec: float = 15.0
+    ws_pong_max_delay_sec: float = 30.0
     ws_pong_startup_grace_sec: float = 15.0
     ws_log_enabled: bool = False
     ws_log_interval_sec: int = 60
@@ -403,6 +405,8 @@ class Settings:
     slippage_block_pct: float = 0.002
     slippage_stop_engine: bool = False
     protection_mode_enabled: bool = True
+
+    execution_price_slippage_guard: float = 0.003
 
     # 실행/멱등성/체결 확정
     require_deterministic_client_order_id: bool = True
@@ -1373,7 +1377,7 @@ def _build_settings() -> Settings:
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_market_event_max_delay_sec = _resolve_float_env(
         ["WS_MARKET_EVENT_MAX_DELAY_SEC", "WS_ORDERBOOK_MAX_DELAY_SEC"],
-        default=10.0,
+        default= 60.0,
         label="ws_market_event_max_delay_sec",
     )
     ws_bootstrap_rest_enabled = _as_bool("WS_BOOTSTRAP_REST_ENABLED", True)

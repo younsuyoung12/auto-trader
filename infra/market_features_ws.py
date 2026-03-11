@@ -887,6 +887,13 @@ def _build_timeframe_features(
 
     tf_features["candles_raw"] = list(validated_buf)
     tf_features["candles"] = list(candles_for_calc)
+
+    # unified_features_builder STRICT 계약 대응
+    if interval in ("1h", "4h"):
+        tf_features["raw_ohlcv_last60"] = [
+            [ts, o, h, l, c, v]
+            for (ts, o, h, l, c, v) in validated_buf[-60:]
+        ]
     return tf_features
 
 
@@ -992,6 +999,30 @@ def _strict_optional_float(symbol: str, location: str, name: str, value: Any) ->
 
 def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     ob = get_orderbook(symbol, limit=5)
+
+    # WS 초기 구간에서는 orderbook payload가 아직 도착하지 않을 수 있음
+    # STRICT 정책: 일정 시간 이후에도 payload가 없으면 실패
+    if ob is None:
+
+        ob_status = get_orderbook_buffer_status(symbol)
+
+        recv_ts = ob_status.get("last_recv_ts")
+
+        if recv_ts is None:
+            # WS start 이후 첫 payload 대기 구간
+            age_sec = ob_status.get("payload_delay_ms")
+
+            # 초기 구간은 skip (engine startup protection)
+            raise FeatureBuildError(
+                f"{symbol} orderbook payload not received yet (startup phase)"
+            )
+
+        else:
+            _fail(
+                symbol,
+                "orderbook",
+                "orderbook payload missing after WS start (STRICT)"
+            )
 
     if not isinstance(ob, dict):
         _fail(symbol, "orderbook", "오더북 스냅샷 타입이 dict 가 아닙니다.")

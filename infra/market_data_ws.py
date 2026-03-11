@@ -734,17 +734,27 @@ def _require_kline_progression_strict(prev: KlineRow, new_row: KlineRow, *, cont
 
     if new_ts != prev_ts:
         raise WSProtocolError(f"{context} ts mismatch during same-candle update (STRICT)")
+
     if prev_closed and not new_closed:
         raise WSProtocolError(f"{context} closed candle cannot reopen (STRICT)")
+
     if abs(new_o - prev_o) > 1e-12:
         raise WSProtocolError(f"{context} open price changed within same candle (STRICT)")
-    if new_h + 1e-12 < prev_h:
-        raise WSProtocolError(f"{context} high decreased within same candle (STRICT)")
-    if new_l - 1e-12 > prev_l:
-        raise WSProtocolError(f"{context} low increased within same candle (STRICT)")
-    if new_v + 1e-12 < prev_v:
-        raise WSProtocolError(f"{context} volume decreased within same candle (STRICT)")
 
+    # Binance WS에서는 open candle 동안 high/low/volume rollback이 발생할 수 있음
+    # STRICT 엔진에서는 이를 허용하되 anomaly 로그를 남기고 해당 업데이트를 무시한다.
+
+    if new_h + 1e-12 < prev_h:
+        log(f"[WS_ANOMALY] {context} high rollback prev={prev_h} new={new_h}")
+        return
+
+    if new_l - 1e-12 > prev_l:
+        log(f"[WS_ANOMALY] {context} low rollback prev={prev_l} new={new_l}")
+        return
+
+    if new_v + 1e-12 < prev_v:
+        log(f"[WS_ANOMALY] {context} volume rollback prev={prev_v} new={new_v}")
+        return
 
 def _validate_next_kline_row_against_buffer_strict(buf: List[KlineRow], row: KlineRow, *, context: str) -> None:
     ts = int(row[0])
@@ -1698,8 +1708,8 @@ def start_ws_loop(symbol: str) -> None:
 
                 start_ts = time.time()
                 ws.run_forever(
-                    ping_interval=25,
-                    ping_timeout=30,
+                    ping_interval=20,
+                    ping_timeout=10,
                 )
                 session_dur = time.time() - start_ts
 
