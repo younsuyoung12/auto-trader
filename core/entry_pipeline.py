@@ -128,9 +128,9 @@ DIRECTION_CONFIRM_LOOKBACK_CLOSED_BARS_BY_TF: Dict[str, int] = {
     "1h": 3,
 }
 DIRECTION_CONFIRM_MIN_SLOPE_PCT_BY_TF: Dict[str, float] = {
-    "5m": 0.0004,
-    "15m": 0.0008,
-    "1h": 0.0015,
+    "5m": 0.0001,
+    "15m": 0.0006,
+    "1h": 0.0012,
 }
 DIRECTION_CONFIRM_REQUIRED_SECONDARY_SUPPORTS: int = 1
 DIRECTION_CONFIRM_MAX_SECONDARY_OPPOSE: int = 1
@@ -803,7 +803,7 @@ def _evaluate_direction_stability_guard_strict(
                 return f"signal_contract_higher_tf_oppose:{tf_label}:{tf_bias}"
 
         # 4h 는 veto 금지 (context only)
-        
+
     slope_bias_5m = signal_direction_contract.get("slope_bias_5m")
     if slope_bias_5m is not None:
         slope_bias_5m_i = _normalize_direction_bias_int_strict(
