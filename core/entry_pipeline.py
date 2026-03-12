@@ -137,7 +137,7 @@ DIRECTION_CONFIRM_MAX_SECONDARY_OPPOSE: int = 1
 # - higher timeframe 합의 없는 5m-only 신호는 엔트리 차단
 # - higher timeframe 반대가 1개라도 있으면 차단
 DIRECTION_CONFIRM_REQUIRED_HIGHER_TF_SUPPORTS: int = 1
-DIRECTION_CONFIRM_MAX_HIGHER_TF_OPPOSE: int = 0
+DIRECTION_CONFIRM_MAX_HIGHER_TF_OPPOSE: int = 1
 DIRECTION_CONFIRM_BLOCK_5M_ONLY_SOURCE: bool = True
 
 # 2026-03-12 candidate telemetry guard

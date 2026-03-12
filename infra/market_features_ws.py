@@ -1603,6 +1603,14 @@ def get_trading_signal(
     short_score = float(short_candidate["score"])
     selection_margin = abs(long_score - short_score)
 
+    log(
+    f"[DIRECTION_SCORE] {symbol} "
+    f"long_score={long_score:.3f} "
+    f"short_score={short_score:.3f} "
+    f"margin={selection_margin:.3f} "
+    f"majority_trend={majority_trend}"
+    )
+
     min_candidate_score = 1.25
     min_selection_margin = 0.55
 
