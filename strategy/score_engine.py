@@ -19,10 +19,11 @@ IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
 - REST 호출/백필/외부 폴백 금지
 - 더미값 생성/0 치환/None 반환 금지
-- 필수 입력 누락/손상/타입 불일치 시 즉시 예외(ScoreEngineError)
+- 필수 입력 누락/손상/타입 불일치 시 즉시 예외
 - 예외 삼키기 금지(조용히 진행 금지)
 - orderbook spreadPct / spread_pct 계약은 ratio(0..1) 기준으로 통일
 - 점수는 0~100로 클램핑하며, total은 고정 가중치로 합산한다
+- 프로젝트 공통 STRICT 예외 계층을 사용한다
 
 INPUT CONTRACT:
 - timeframes: "4h","1h","15m","5m" 키 포함
@@ -33,6 +34,11 @@ INPUT CONTRACT:
 
 CHANGE HISTORY
 --------------------------------------------------------
+- 2026-03-13:
+  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  2) FIX(STRICT): symbol / orderbook spread ratio / total weight invariant 검증 강화
+  3) FIX(STATE): TOTAL_WEIGHTS key/sum 불변식 위반을 ScoreEngineStateError로 분리
+  4) FIX(CONTRACT): orderbook spread_pct 상한(<=1.0) 검증 추가
 - 2026-03-10:
   1) FIX(CONTRACT): orderbook spreadPct / spread_pct 를 ratio(0..1) 기준으로 통일
   2) FIX(ROOT-CAUSE): orderbook fallback spread 재계산에서 *100 제거
@@ -40,13 +46,13 @@ CHANGE HISTORY
 ========================================================
 """
 
+from __future__ import annotations
+
 import math
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
 
-try:
-    from infra.telelog import log
-except Exception as e:  # pragma: no cover
-    raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK)") from e
+from common.exceptions_strict import StrictDataError, StrictStateError
+from infra.telelog import log
 
 
 TOTAL_WEIGHTS: Dict[str, float] = {
@@ -65,8 +71,12 @@ _ORDERBOOK_SPREAD_BAND_3: float = 0.0010
 _ORDERBOOK_SPREAD_BAND_4: float = 0.0020
 
 
-class ScoreEngineError(RuntimeError):
-    """엔진 점수 계산(멀티 TF/오더북/패턴) 단계에서 사용하는 예외."""
+class ScoreEngineError(StrictDataError):
+    """엔진 점수 계산 입력/데이터 계약 위반."""
+
+
+class ScoreEngineStateError(StrictStateError):
+    """엔진 내부 불변식/상태 계약 위반."""
 
 
 def _fail(symbol: str, stage: str, reason: str, exc: Optional[BaseException] = None) -> NoReturn:
@@ -77,12 +87,27 @@ def _fail(symbol: str, stage: str, reason: str, exc: Optional[BaseException] = N
     raise ScoreEngineError(msg) from exc
 
 
+def _fail_state(symbol: str, stage: str, reason: str, exc: Optional[BaseException] = None) -> NoReturn:
+    msg = f"[SCORE_ENGINE][{symbol}] {stage} 상태 실패: {reason}"
+    log(msg)
+    if exc is None:
+        raise ScoreEngineStateError(msg)
+    raise ScoreEngineStateError(msg) from exc
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     if v < lo:
         return lo
     if v > hi:
         return hi
     return v
+
+
+def _normalize_symbol_strict(symbol: Any) -> str:
+    s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        _fail("UNKNOWN", "normalize_symbol", "symbol is empty")
+    return s
 
 
 def _pick_first_key(d: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
@@ -324,6 +349,8 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
     spread_pct = _require_float(symbol, stage, spread_pct, "orderbook.spread_pct")
     if spread_pct < 0 or not math.isfinite(spread_pct):
         _fail(symbol, stage, f"invalid spread_pct: {spread_pct}")
+    if spread_pct > 1.0:
+        _fail(symbol, stage, f"spread_pct must be <= 1.0 ratio (STRICT), got={spread_pct}")
 
     depth_imbalance = _pick_first_key(orderbook, ("depth_imbalance", "depthImbalance"))
     if depth_imbalance is None:
@@ -397,6 +424,37 @@ def _orderbook_metrics_strict(symbol: str, orderbook: Dict[str, Any]) -> Dict[st
         "depth_imbalance": float(depth_imbalance),
         "imbalance_qty_pct": float(imbalance_qty_pct),
     }
+
+
+def _validate_total_weights_strict(symbol: str) -> None:
+    required_keys = {
+        "trend_4h",
+        "momentum_1h",
+        "structure_15m",
+        "timing_5m",
+        "orderbook_micro",
+    }
+    actual_keys = set(TOTAL_WEIGHTS.keys())
+    if actual_keys != required_keys:
+        _fail_state(
+            symbol,
+            "build_engine_scores",
+            f"TOTAL_WEIGHTS keys mismatch (got={sorted(actual_keys)} expected={sorted(required_keys)})",
+        )
+
+    total = 0.0
+    for key, value in TOTAL_WEIGHTS.items():
+        if not isinstance(value, (int, float)):
+            _fail_state(symbol, "build_engine_scores", f"TOTAL_WEIGHTS[{key}] must be numeric")
+        fv = float(value)
+        if not math.isfinite(fv):
+            _fail_state(symbol, "build_engine_scores", f"TOTAL_WEIGHTS[{key}] must be finite")
+        if fv <= 0.0 or fv > 1.0:
+            _fail_state(symbol, "build_engine_scores", f"TOTAL_WEIGHTS[{key}] out of range (0,1]: {fv}")
+        total += fv
+
+    if not math.isfinite(total) or abs(total - 1.0) > 1e-9:
+        _fail_state(symbol, "build_engine_scores", f"TOTAL_WEIGHTS sum must be 1.0 (got={total})")
 
 
 def score_trend_4h(symbol: str, tf4h: Dict[str, Any]) -> Dict[str, Any]:
@@ -703,15 +761,8 @@ def build_engine_scores(
     pattern_summary: Dict[str, Any],
     orderbook: Dict[str, Any],
 ) -> Dict[str, Any]:
-    sym = str(symbol or "").strip()
-    if not sym:
-        _fail("UNKNOWN", "build_engine_scores", "symbol is empty")
-
-    # TRADE-GRADE: total weight 무결성 체크
-    w = TOTAL_WEIGHTS
-    wsum = float(sum(w.values()))
-    if not math.isfinite(wsum) or abs(wsum - 1.0) > 1e-9:
-        _fail(sym, "build_engine_scores", f"TOTAL_WEIGHTS sum must be 1.0 (got={wsum})")
+    sym = _normalize_symbol_strict(symbol)
+    _validate_total_weights_strict(sym)
 
     tfs = _require_dict(sym, "build_engine_scores", timeframes, "timeframes")
     pf = _require_dict(sym, "build_engine_scores", pattern_features, "pattern_features")
@@ -734,11 +785,11 @@ def build_engine_scores(
     orderbook_micro = score_orderbook_micro(sym, ob)
 
     total_score = (
-        float(trend_4h["score"]) * w["trend_4h"]
-        + float(momentum_1h["score"]) * w["momentum_1h"]
-        + float(structure_15m["score"]) * w["structure_15m"]
-        + float(timing_5m["score"]) * w["timing_5m"]
-        + float(orderbook_micro["score"]) * w["orderbook_micro"]
+        float(trend_4h["score"]) * TOTAL_WEIGHTS["trend_4h"]
+        + float(momentum_1h["score"]) * TOTAL_WEIGHTS["momentum_1h"]
+        + float(structure_15m["score"]) * TOTAL_WEIGHTS["structure_15m"]
+        + float(timing_5m["score"]) * TOTAL_WEIGHTS["timing_5m"]
+        + float(orderbook_micro["score"]) * TOTAL_WEIGHTS["orderbook_micro"]
     )
     total_score = _clamp(total_score, 0.0, 100.0)
 
@@ -748,12 +799,13 @@ def build_engine_scores(
         "structure_15m": structure_15m,
         "timing_5m": timing_5m,
         "orderbook_micro": orderbook_micro,
-        "total": {"score": total_score, "weights": dict(w)},
+        "total": {"score": total_score, "weights": dict(TOTAL_WEIGHTS)},
     }
 
 
 __all__ = [
     "ScoreEngineError",
+    "ScoreEngineStateError",
     "build_engine_scores",
     "score_trend_4h",
     "score_momentum_1h",

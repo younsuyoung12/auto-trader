@@ -1,4 +1,3 @@
-# meta/meta_decision_validator.py
 """
 ========================================================
 FILE: meta/meta_decision_validator.py
@@ -18,6 +17,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-13:
+  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  2) FEAT(CONTRACT): MetaDecisionContext / ValidatedMetaDecision dataclass 자체 검증 추가
+  3) FIX(STRICT): contract 오류와 state 불변식 오류 분리
+  4) FIX(CONTRACT): guard_multipliers / tags / disable_directions 검증 강화
 - 2026-03-11:
   1) FIX(STRICT): RECOMMEND_SAFE_STOP action 불변식 강화
      - allocation_ratio_cap=0.0 강제
@@ -41,9 +45,19 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 
+from common.exceptions_strict import StrictDataError, StrictStateError
+
 
 class MetaDecisionValidationError(RuntimeError):
-    """STRICT: meta decision validation failure."""
+    """STRICT meta decision validation base error."""
+
+
+class MetaDecisionContractError(StrictDataError):
+    """GPT 응답/컨텍스트/결과 객체 계약 위반."""
+
+
+class MetaDecisionStateError(StrictStateError):
+    """액션별 불변식/정책 상태 위반."""
 
 
 # ─────────────────────────────────────────────
@@ -76,6 +90,44 @@ class MetaDecisionContext:
     max_rationale_sentences: int = 3
     max_rationale_len: int = 800
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "symbol", _normalize_symbol_strict(self.symbol, "ctx.symbol"))
+        object.__setattr__(
+            self,
+            "base_risk_multiplier",
+            _require_float(self.base_risk_multiplier, "ctx.base_risk_multiplier", min_value=0.0, max_value=1.0),
+        )
+        object.__setattr__(
+            self,
+            "base_allocation_ratio",
+            _require_float(self.base_allocation_ratio, "ctx.base_allocation_ratio", min_value=0.0, max_value=1.0),
+        )
+        object.__setattr__(
+            self,
+            "base_max_spread_pct",
+            _require_float(self.base_max_spread_pct, "ctx.base_max_spread_pct", min_value=0.0),
+        )
+        object.__setattr__(
+            self,
+            "base_max_price_jump_pct",
+            _require_float(self.base_max_price_jump_pct, "ctx.base_max_price_jump_pct", min_value=0.0),
+        )
+        object.__setattr__(
+            self,
+            "base_min_entry_volume_ratio",
+            _require_float(self.base_min_entry_volume_ratio, "ctx.base_min_entry_volume_ratio", min_value=0.0, max_value=1.0),
+        )
+        object.__setattr__(
+            self,
+            "max_rationale_sentences",
+            _require_int(self.max_rationale_sentences, "ctx.max_rationale_sentences", min_value=1, max_value=10),
+        )
+        object.__setattr__(
+            self,
+            "max_rationale_len",
+            _require_int(self.max_rationale_len, "ctx.max_rationale_len", min_value=1, max_value=5000),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ValidatedMetaDecision:
@@ -99,6 +151,115 @@ class ValidatedMetaDecision:
     effective_max_spread_pct: float
     effective_max_price_jump_pct: float
     effective_min_entry_volume_ratio: float
+
+    def __post_init__(self) -> None:
+        version = _require_version_str(self.version, "validated.version")
+        action = _require_nonempty_str(self.action, "validated.action").upper()
+        if action not in _ALLOWED_ACTIONS:
+            _fail_contract(f"validated.action invalid (STRICT): {action!r}")
+
+        severity = _require_int(self.severity, "validated.severity", min_value=0, max_value=3)
+        confidence = _require_float(self.confidence, "validated.confidence", min_value=0.0, max_value=1.0)
+        ttl_sec = _require_int(self.ttl_sec, "validated.ttl_sec", min_value=60, max_value=86400)
+
+        risk_delta = _require_float(
+            self.risk_multiplier_delta,
+            "validated.risk_multiplier_delta",
+            min_value=-0.50,
+            max_value=0.50,
+        )
+        allocation_cap = _require_float(
+            self.allocation_ratio_cap,
+            "validated.allocation_ratio_cap",
+            min_value=0.0,
+            max_value=1.0,
+        )
+        rationale = _require_nonempty_str(self.rationale_short, "validated.rationale_short")
+
+        final_risk_multiplier = _require_float(
+            self.final_risk_multiplier,
+            "validated.final_risk_multiplier",
+            min_value=0.0,
+            max_value=1.0,
+        )
+        effective_max_spread_pct = _require_float(
+            self.effective_max_spread_pct,
+            "validated.effective_max_spread_pct",
+            min_value=0.0,
+        )
+        effective_max_price_jump_pct = _require_float(
+            self.effective_max_price_jump_pct,
+            "validated.effective_max_price_jump_pct",
+            min_value=0.0,
+            max_value=1.0,
+        )
+        effective_min_entry_volume_ratio = _require_float(
+            self.effective_min_entry_volume_ratio,
+            "validated.effective_min_entry_volume_ratio",
+            min_value=0.0,
+            max_value=1.0,
+        )
+
+        tags = _require_list_str(self.tags, "validated.tags", allow_empty=False)
+        if len(tags) > 24:
+            _fail_contract("validated.tags too many (STRICT)")
+
+        disable_dirs = _require_list_str(self.disable_directions, "validated.disable_directions", allow_empty=True)
+        normalized_dirs: List[str] = []
+        for i, d in enumerate(disable_dirs):
+            dd = _require_nonempty_str(d, f"validated.disable_directions[{i}]").upper()
+            if dd not in _ALLOWED_DIRECTIONS:
+                _fail_contract(f"validated.disable_directions[{i}] invalid (STRICT): {dd!r}")
+            if dd not in normalized_dirs:
+                normalized_dirs.append(dd)
+
+        guard_mults = _require_dict(self.guard_multipliers, "validated.guard_multipliers", non_empty=True)
+        _ensure_no_unknown_keys(guard_mults, _GUARD_KEYS, "validated.guard_multipliers")
+        for k in _GUARD_KEYS:
+            if k not in guard_mults:
+                _fail_contract(f"validated.guard_multipliers missing key (STRICT): {k}")
+        max_spread_mult = _require_float(
+            guard_mults["max_spread_pct_mult"],
+            "validated.guard_multipliers.max_spread_pct_mult",
+            min_value=0.50,
+            max_value=2.00,
+        )
+        max_jump_mult = _require_float(
+            guard_mults["max_price_jump_pct_mult"],
+            "validated.guard_multipliers.max_price_jump_pct_mult",
+            min_value=0.50,
+            max_value=2.00,
+        )
+        min_vol_mult = _require_float(
+            guard_mults["min_entry_volume_ratio_mult"],
+            "validated.guard_multipliers.min_entry_volume_ratio_mult",
+            min_value=0.50,
+            max_value=2.00,
+        )
+
+        object.__setattr__(self, "version", version)
+        object.__setattr__(self, "action", action)
+        object.__setattr__(self, "severity", severity)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "ttl_sec", ttl_sec)
+        object.__setattr__(self, "risk_multiplier_delta", risk_delta)
+        object.__setattr__(self, "allocation_ratio_cap", allocation_cap)
+        object.__setattr__(self, "rationale_short", rationale)
+        object.__setattr__(self, "final_risk_multiplier", final_risk_multiplier)
+        object.__setattr__(self, "effective_max_spread_pct", effective_max_spread_pct)
+        object.__setattr__(self, "effective_max_price_jump_pct", effective_max_price_jump_pct)
+        object.__setattr__(self, "effective_min_entry_volume_ratio", effective_min_entry_volume_ratio)
+        object.__setattr__(self, "tags", tags)
+        object.__setattr__(self, "disable_directions", normalized_dirs)
+        object.__setattr__(
+            self,
+            "guard_multipliers",
+            {
+                "max_spread_pct_mult": max_spread_mult,
+                "max_price_jump_pct_mult": max_jump_mult,
+                "min_entry_volume_ratio_mult": min_vol_mult,
+            },
+        )
 
 
 # ─────────────────────────────────────────────
@@ -134,73 +295,86 @@ _GUARD_KEYS: Set[str] = {
 _VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
 
 
-def _fail(msg: str, exc: Optional[BaseException] = None) -> None:
+def _fail_contract(msg: str, exc: Optional[BaseException] = None) -> None:
     if exc is None:
-        raise MetaDecisionValidationError(msg)
-    raise MetaDecisionValidationError(msg) from exc
+        raise MetaDecisionContractError(msg)
+    raise MetaDecisionContractError(msg) from exc
+
+
+def _fail_state(msg: str, exc: Optional[BaseException] = None) -> None:
+    if exc is None:
+        raise MetaDecisionStateError(msg)
+    raise MetaDecisionStateError(msg) from exc
 
 
 def _require_nonempty_str(v: Any, name: str) -> str:
     s = str(v or "").strip()
     if not s:
-        _fail(f"{name} is required (STRICT)")
+        _fail_contract(f"{name} is required (STRICT)")
+    return s
+
+
+def _normalize_symbol_strict(v: Any, name: str) -> str:
+    s = str(v or "").replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        _fail_contract(f"{name} is required (STRICT)")
     return s
 
 
 def _require_version_str(v: Any, name: str) -> str:
     s = _require_nonempty_str(v, name)
     if not _VERSION_RE.fullmatch(s):
-        _fail(f"{name} format invalid (STRICT)")
+        _fail_contract(f"{name} format invalid (STRICT)")
     return s
 
 
 def _require_int(v: Any, name: str, *, min_value: Optional[int] = None, max_value: Optional[int] = None) -> int:
     if v is None:
-        _fail(f"{name} is required (STRICT)")
+        _fail_contract(f"{name} is required (STRICT)")
     if isinstance(v, bool):
-        _fail(f"{name} must be int (bool not allowed) (STRICT)")
+        _fail_contract(f"{name} must be int (bool not allowed) (STRICT)")
     try:
         iv = int(v)
     except Exception as e:
-        _fail(f"{name} must be int (STRICT)", e)
+        _fail_contract(f"{name} must be int (STRICT)", e)
     if min_value is not None and iv < min_value:
-        _fail(f"{name} must be >= {min_value} (STRICT)")
+        _fail_contract(f"{name} must be >= {min_value} (STRICT)")
     if max_value is not None and iv > max_value:
-        _fail(f"{name} must be <= {max_value} (STRICT)")
+        _fail_contract(f"{name} must be <= {max_value} (STRICT)")
     return int(iv)
 
 
 def _require_float(v: Any, name: str, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
     if v is None:
-        _fail(f"{name} is required (STRICT)")
+        _fail_contract(f"{name} is required (STRICT)")
     if isinstance(v, bool):
-        _fail(f"{name} must be float (bool not allowed) (STRICT)")
+        _fail_contract(f"{name} must be float (bool not allowed) (STRICT)")
     try:
         fv = float(v)
     except Exception as e:
-        _fail(f"{name} must be float (STRICT)", e)
+        _fail_contract(f"{name} must be float (STRICT)", e)
     if not math.isfinite(fv):
-        _fail(f"{name} must be finite (STRICT)")
+        _fail_contract(f"{name} must be finite (STRICT)")
     if min_value is not None and fv < min_value:
-        _fail(f"{name} must be >= {min_value} (STRICT)")
+        _fail_contract(f"{name} must be >= {min_value} (STRICT)")
     if max_value is not None and fv > max_value:
-        _fail(f"{name} must be <= {max_value} (STRICT)")
+        _fail_contract(f"{name} must be <= {max_value} (STRICT)")
     return float(fv)
 
 
 def _require_dict(v: Any, name: str, *, non_empty: bool = False) -> Dict[str, Any]:
     if not isinstance(v, dict):
-        _fail(f"{name} must be dict (STRICT)")
+        _fail_contract(f"{name} must be dict (STRICT)")
     if non_empty and not v:
-        _fail(f"{name} must be non-empty dict (STRICT)")
-    return v
+        _fail_contract(f"{name} must be non-empty dict (STRICT)")
+    return dict(v)
 
 
 def _require_list_str(v: Any, name: str, *, allow_empty: bool) -> List[str]:
     if not isinstance(v, list):
-        _fail(f"{name} must be list (STRICT)")
+        _fail_contract(f"{name} must be list (STRICT)")
     if not allow_empty and not v:
-        _fail(f"{name} must be non-empty list (STRICT)")
+        _fail_contract(f"{name} must be non-empty list (STRICT)")
 
     out: List[str] = []
     seen: Set[str] = set()
@@ -208,9 +382,9 @@ def _require_list_str(v: Any, name: str, *, allow_empty: bool) -> List[str]:
     for i, it in enumerate(v):
         s = _require_nonempty_str(it, f"{name}[{i}]")
         if len(s) > 64:
-            _fail(f"{name}[{i}] too long (STRICT)")
+            _fail_contract(f"{name}[{i}] too long (STRICT)")
         if s in seen:
-            _fail(f"{name} contains duplicate value (STRICT): {s!r}")
+            _fail_contract(f"{name} contains duplicate value (STRICT): {s!r}")
         seen.add(s)
         out.append(s)
 
@@ -237,7 +411,7 @@ def _count_sentences_rough(text: str) -> int:
 def _ensure_no_unknown_keys(obj: Dict[str, Any], allowed: Set[str], where: str) -> None:
     unknown = [k for k in obj.keys() if k not in allowed]
     if unknown:
-        _fail(f"{where} contains unknown keys (STRICT): {sorted(unknown)}")
+        _fail_contract(f"{where} contains unknown keys (STRICT): {sorted(unknown)}")
 
 
 # ─────────────────────────────────────────────
@@ -254,53 +428,39 @@ def validate_meta_decision_dict(
     """
 
     if not isinstance(response_obj, dict):
-        _fail("response_obj must be dict (STRICT)")
+        _fail_contract("response_obj must be dict (STRICT)")
     if not isinstance(ctx, MetaDecisionContext):
-        _fail("ctx must be MetaDecisionContext (STRICT)")
+        _fail_contract("ctx must be MetaDecisionContext (STRICT)")
 
-    # ctx basic validation
-    _ = _require_nonempty_str(ctx.symbol, "ctx.symbol")
-    _require_float(ctx.base_risk_multiplier, "ctx.base_risk_multiplier", min_value=0.0, max_value=1.0)
-    _require_float(ctx.base_allocation_ratio, "ctx.base_allocation_ratio", min_value=0.0, max_value=1.0)
-    _require_float(ctx.base_max_spread_pct, "ctx.base_max_spread_pct", min_value=0.0)
-    _require_float(ctx.base_max_price_jump_pct, "ctx.base_max_price_jump_pct", min_value=0.0)
-    _require_float(ctx.base_min_entry_volume_ratio, "ctx.base_min_entry_volume_ratio", min_value=0.0, max_value=1.0)
-
-    if ctx.max_rationale_sentences <= 0 or ctx.max_rationale_sentences > 10:
-        _fail("ctx.max_rationale_sentences must be 1..10 (STRICT)")
-    if ctx.max_rationale_len <= 0 or ctx.max_rationale_len > 5000:
-        _fail("ctx.max_rationale_len out of range (STRICT)")
-
-    # schema: top-level keys fixed
     _ensure_no_unknown_keys(response_obj, _TOP_KEYS, "response")
     for k in _TOP_KEYS:
         if k not in response_obj:
-            _fail(f"response missing key (STRICT): {k}")
+            _fail_contract(f"response missing key (STRICT): {k}")
 
     version = _require_version_str(response_obj.get("version"), "resp.version")
     action = _require_nonempty_str(response_obj.get("action"), "resp.action").upper()
     if action not in _ALLOWED_ACTIONS:
-        _fail(f"resp.action invalid (STRICT): {action!r}")
+        _fail_contract(f"resp.action invalid (STRICT): {action!r}")
 
     severity = _require_int(response_obj.get("severity"), "resp.severity", min_value=0, max_value=3)
     tags = _require_list_str(response_obj.get("tags"), "resp.tags", allow_empty=False)
     if len(tags) > 24:
-        _fail("resp.tags too many (STRICT)")
+        _fail_contract("resp.tags too many (STRICT)")
 
     confidence = _require_float(response_obj.get("confidence"), "resp.confidence", min_value=0.0, max_value=1.0)
     ttl_sec = _require_int(response_obj.get("ttl_sec"), "resp.ttl_sec", min_value=60, max_value=86400)
 
     rationale = _require_nonempty_str(response_obj.get("rationale_short"), "resp.rationale_short")
     if len(rationale) > ctx.max_rationale_len:
-        _fail("resp.rationale_short too long (STRICT)")
+        _fail_contract("resp.rationale_short too long (STRICT)")
     if _count_sentences_rough(rationale) > int(ctx.max_rationale_sentences):
-        _fail("resp.rationale_short exceeds sentence limit (STRICT)")
+        _fail_contract("resp.rationale_short exceeds sentence limit (STRICT)")
 
     rec = _require_dict(response_obj.get("recommendation"), "resp.recommendation", non_empty=True)
     _ensure_no_unknown_keys(rec, _REC_KEYS, "recommendation")
     for k in _REC_KEYS:
         if k not in rec:
-            _fail(f"recommendation missing key (STRICT): {k}")
+            _fail_contract(f"recommendation missing key (STRICT): {k}")
 
     risk_delta = _require_float(
         rec.get("risk_multiplier_delta"),
@@ -321,7 +481,7 @@ def validate_meta_decision_dict(
     for i, d in enumerate(disable_list):
         dd = _require_nonempty_str(d, f"rec.disable_directions[{i}]").upper()
         if dd not in _ALLOWED_DIRECTIONS:
-            _fail(f"rec.disable_directions[{i}] invalid (STRICT): {dd!r}")
+            _fail_contract(f"rec.disable_directions[{i}] invalid (STRICT): {dd!r}")
         if dd not in disable_dirs:
             disable_dirs.append(dd)
 
@@ -329,7 +489,7 @@ def validate_meta_decision_dict(
     _ensure_no_unknown_keys(guard_mults, _GUARD_KEYS, "guard_multipliers")
     for k in _GUARD_KEYS:
         if k not in guard_mults:
-            _fail(f"guard_multipliers missing key (STRICT): {k}")
+            _fail_contract(f"guard_multipliers missing key (STRICT): {k}")
 
     max_spread_mult = _require_float(
         guard_mults.get("max_spread_pct_mult"),
@@ -353,58 +513,56 @@ def validate_meta_decision_dict(
     # Derived values (NO CLAMP)
     final_risk_mult = float(ctx.base_risk_multiplier) + float(risk_delta)
     if final_risk_mult < 0.0 or final_risk_mult > 1.0 or not math.isfinite(final_risk_mult):
-        _fail("final_risk_multiplier out of range 0..1 (STRICT)")
+        _fail_state("final_risk_multiplier out of range 0..1 (STRICT)")
 
     eff_spread = float(ctx.base_max_spread_pct) * float(max_spread_mult)
     if eff_spread < 0.0 or not math.isfinite(eff_spread):
-        _fail("effective_max_spread_pct invalid (STRICT)")
+        _fail_state("effective_max_spread_pct invalid (STRICT)")
 
     eff_jump = float(ctx.base_max_price_jump_pct) * float(max_jump_mult)
     if eff_jump < 0.0 or not math.isfinite(eff_jump):
-        _fail("effective_max_price_jump_pct invalid (STRICT)")
+        _fail_state("effective_max_price_jump_pct invalid (STRICT)")
     if eff_jump > 1.0:
-        _fail("effective_max_price_jump_pct > 1.0 (STRICT)")
+        _fail_state("effective_max_price_jump_pct > 1.0 (STRICT)")
 
     eff_min_vol = float(ctx.base_min_entry_volume_ratio) * float(min_vol_mult)
     if eff_min_vol < 0.0 or not math.isfinite(eff_min_vol):
-        _fail("effective_min_entry_volume_ratio invalid (STRICT)")
+        _fail_state("effective_min_entry_volume_ratio invalid (STRICT)")
     if eff_min_vol > 1.0:
-        _fail("effective_min_entry_volume_ratio > 1.0 (STRICT)")
+        _fail_state("effective_min_entry_volume_ratio > 1.0 (STRICT)")
 
     disabled_both = set(disable_dirs) == {"LONG", "SHORT"}
 
-    # Action-specific invariants
     if action == "NO_CHANGE":
         if abs(risk_delta) > 1e-12:
-            _fail("NO_CHANGE requires risk_multiplier_delta=0 (STRICT)")
+            _fail_state("NO_CHANGE requires risk_multiplier_delta=0 (STRICT)")
         if abs(allocation_cap - 1.0) > 1e-12:
-            _fail("NO_CHANGE requires allocation_ratio_cap=1 (STRICT)")
+            _fail_state("NO_CHANGE requires allocation_ratio_cap=1 (STRICT)")
         if disable_dirs:
-            _fail("NO_CHANGE requires disable_directions=[] (STRICT)")
+            _fail_state("NO_CHANGE requires disable_directions=[] (STRICT)")
         if abs(max_spread_mult - 1.0) > 1e-12:
-            _fail("NO_CHANGE requires max_spread_pct_mult=1 (STRICT)")
+            _fail_state("NO_CHANGE requires max_spread_pct_mult=1 (STRICT)")
         if abs(max_jump_mult - 1.0) > 1e-12:
-            _fail("NO_CHANGE requires max_price_jump_pct_mult=1 (STRICT)")
+            _fail_state("NO_CHANGE requires max_price_jump_pct_mult=1 (STRICT)")
         if abs(min_vol_mult - 1.0) > 1e-12:
-            _fail("NO_CHANGE requires min_entry_volume_ratio_mult=1 (STRICT)")
+            _fail_state("NO_CHANGE requires min_entry_volume_ratio_mult=1 (STRICT)")
 
     if action == "ADJUST_PARAMS":
         if disabled_both:
-            _fail("ADJUST_PARAMS cannot disable both LONG and SHORT (STRICT)")
+            _fail_state("ADJUST_PARAMS cannot disable both LONG and SHORT (STRICT)")
 
     if action == "RECOMMEND_SAFE_STOP":
         if severity < 2:
-            _fail("RECOMMEND_SAFE_STOP requires severity>=2 (STRICT)")
+            _fail_state("RECOMMEND_SAFE_STOP requires severity>=2 (STRICT)")
         if abs(allocation_cap - 0.0) > 1e-12:
-            _fail("RECOMMEND_SAFE_STOP requires allocation_ratio_cap=0 (STRICT)")
+            _fail_state("RECOMMEND_SAFE_STOP requires allocation_ratio_cap=0 (STRICT)")
         if not disabled_both:
-            _fail("RECOMMEND_SAFE_STOP requires disable_directions=[LONG, SHORT] (STRICT)")
+            _fail_state("RECOMMEND_SAFE_STOP requires disable_directions=[LONG, SHORT] (STRICT)")
         if risk_delta > 0.0:
-            _fail("RECOMMEND_SAFE_STOP cannot increase risk_multiplier_delta (STRICT)")
+            _fail_state("RECOMMEND_SAFE_STOP cannot increase risk_multiplier_delta (STRICT)")
 
-    # If both directions are disabled, it is effectively safe-stop.
     if disabled_both and action != "RECOMMEND_SAFE_STOP":
-        _fail("disable_directions=[LONG,SHORT] requires action=RECOMMEND_SAFE_STOP (STRICT)")
+        _fail_state("disable_directions=[LONG,SHORT] requires action=RECOMMEND_SAFE_STOP (STRICT)")
 
     return ValidatedMetaDecision(
         version=version,
@@ -413,7 +571,6 @@ def validate_meta_decision_dict(
         tags=[str(x).strip() for x in tags],
         confidence=float(confidence),
         ttl_sec=int(ttl_sec),
-
         risk_multiplier_delta=float(risk_delta),
         allocation_ratio_cap=float(allocation_cap),
         disable_directions=disable_dirs,
@@ -422,9 +579,7 @@ def validate_meta_decision_dict(
             "max_price_jump_pct_mult": float(max_jump_mult),
             "min_entry_volume_ratio_mult": float(min_vol_mult),
         },
-
         rationale_short=rationale,
-
         final_risk_multiplier=float(final_risk_mult),
         effective_max_spread_pct=float(eff_spread),
         effective_max_price_jump_pct=float(eff_jump),
@@ -444,22 +599,24 @@ def validate_meta_decision_text(
     """
     s = str(response_text or "").strip()
     if not s:
-        _fail("response_text empty (STRICT)")
+        _fail_contract("response_text empty (STRICT)")
     if not (s.startswith("{") and s.endswith("}")):
-        _fail("response must be a single JSON object only (STRICT)")
+        _fail_contract("response must be a single JSON object only (STRICT)")
 
     try:
         obj = json.loads(s)
     except Exception as e:
-        _fail("json.loads failed (STRICT)", e)
+        _fail_contract("json.loads failed (STRICT)", e)
 
     if not isinstance(obj, dict):
-        _fail("response json root must be object (STRICT)")
+        _fail_contract("response json root must be object (STRICT)")
     return validate_meta_decision_dict(response_obj=obj, ctx=ctx)
 
 
 __all__ = [
     "MetaDecisionValidationError",
+    "MetaDecisionContractError",
+    "MetaDecisionStateError",
     "MetaDecisionContext",
     "ValidatedMetaDecision",
     "validate_meta_decision_dict",

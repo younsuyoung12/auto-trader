@@ -27,6 +27,12 @@ IMPORTANT POLICY:
 - thread start 실패 시 started 상태 rollback 보장
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(STRICT): ws health snapshot parsing 에서 dict.get(..., default) 제거
+  2) FIX(OBSERVABILITY): ws_min_kline_buffer 실제 관측 반영(limit=min_buf)
+  3) FEAT(WARNING): kline buffer depth 부족 시 warning_kline_buffer_short 분류 추가
+  4) FIX(CONTRACT): snapshot/ws/klines/orderbook 구조 계약 검증 강화
+  5) FIX(STATE): stop_watchdog() 시 last snapshot 정리 추가
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): market_data_ws 와 다른 stale/orderbook 판정 기준 제거
   2) FIX(ARCH): get_health_snapshot() 를 진실값으로 사용하도록 재설계
@@ -151,6 +157,30 @@ def _positive_int(v: Any, name: str) -> int:
     return int(i)
 
 
+def _require_bool(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT)")
+    return bool(v)
+
+
+def _require_dict(v: Any, name: str) -> Dict[str, Any]:
+    if not isinstance(v, dict):
+        raise RuntimeError(f"{name} must be dict (STRICT)")
+    return v
+
+
+def _require_list(v: Any, name: str) -> List[Any]:
+    if not isinstance(v, list):
+        raise RuntimeError(f"{name} must be list (STRICT)")
+    return v
+
+
+def _require_key(d: Dict[str, Any], key: str, owner: str) -> Any:
+    if key not in d:
+        raise RuntimeError(f"{owner}.{key} is required (STRICT)")
+    return d[key]
+
+
 def _require_setting(settings: Any, attr_name: str) -> Any:
     if not hasattr(settings, attr_name):
         raise RuntimeError(f"settings.{attr_name} is required (STRICT)")
@@ -178,11 +208,20 @@ def _require_setting_tfs(settings: Any, attr_name: str) -> Tuple[str, ...]:
     return out
 
 
+def _normalize_symbol_strict(symbol: Any, name: str) -> str:
+    s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
+    if not s:
+        raise RuntimeError(f"{name} is required (STRICT)")
+    return s
+
+
 def _safe_event(symbol: str, reason: str, extra: Dict[str, Any]) -> None:
     """
     STRICT:
     - 이벤트 기록 실패는 감추지 않는다.
     """
+    if not isinstance(extra, dict):
+        raise RuntimeError("watchdog event extra must be dict (STRICT)")
     log_event(
         event_type="WATCHDOG",
         symbol=str(symbol),
@@ -209,10 +248,8 @@ def _should_emit(key: str, *, min_interval_sec: int) -> bool:
 
 
 def _normalize_reason_list(values: Any, name: str) -> List[str]:
-    if not isinstance(values, list):
-        raise RuntimeError(f"{name} must be list (STRICT)")
-    out = [str(x).strip() for x in values if str(x).strip()]
-    return out
+    rows = _require_list(values, name)
+    return [str(x).strip() for x in rows if str(x).strip()]
 
 
 def _interval_ms(tf: str) -> int:
@@ -230,6 +267,19 @@ def _interval_ms(tf: str) -> int:
     raise RuntimeError(f"unsupported tf (STRICT): {tf!r}")
 
 
+def _extract_health_snapshot_strict(snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    ws = _require_dict(_require_key(snapshot, "ws", "health_snapshot"), "health_snapshot.ws")
+    orderbook = _require_dict(
+        _require_key(snapshot, "orderbook", "health_snapshot"),
+        "health_snapshot.orderbook",
+    )
+    klines = _require_dict(
+        _require_key(snapshot, "klines", "health_snapshot"),
+        "health_snapshot.klines",
+    )
+    return ws, orderbook, klines
+
+
 # =============================================================================
 # Core checks
 # =============================================================================
@@ -237,27 +287,34 @@ def _check_kline_rollback_strict(
     *,
     symbol: str,
     tfs: Tuple[str, ...],
+    min_buf: int,
     last_seen: Dict[str, int],
-) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
+) -> Tuple[Dict[str, int], Dict[str, int], Dict[str, int], List[str]]:
     """
-    rollback 전용 검사.
+    rollback + buffer depth 전용 검사.
     stale 판단은 market_data_ws.get_health_snapshot()를 진실값으로 사용한다.
     """
     now_ms = _now_ms()
     lens: Dict[str, int] = {}
     last_ts: Dict[str, int] = {}
     ages: Dict[str, int] = {}
+    short_tfs: List[str] = []
 
     for tf in tfs:
-        buf = ws_get_klines_with_volume(symbol, tf, limit=1)
+        buf = ws_get_klines_with_volume(symbol, tf, limit=min_buf)
         if not isinstance(buf, list):
             raise RuntimeError(f"ws kline buffer invalid type (STRICT): tf={tf} type={type(buf).__name__}")
 
+        lens[tf] = len(buf)
+
         if not buf:
-            lens[tf] = 0
             last_ts[tf] = 0
             ages[tf] = -1
+            short_tfs.append(tf)
             continue
+
+        if len(buf) < min_buf:
+            short_tfs.append(tf)
 
         row = buf[-1]
         if not isinstance(row, (list, tuple)) or len(row) < 1:
@@ -269,11 +326,10 @@ def _check_kline_rollback_strict(
             raise RuntimeError(f"kline rollback detected (STRICT): tf={tf} prev={prev} now={ts_ms}")
 
         last_seen[tf] = int(ts_ms)
-        lens[tf] = len(buf)
         last_ts[tf] = int(ts_ms)
         ages[tf] = int(now_ms - ts_ms)
 
-    return lens, last_ts, ages
+    return lens, last_ts, ages, short_tfs
 
 
 def _check_orderbook_integrity_strict(
@@ -289,10 +345,10 @@ def _check_orderbook_integrity_strict(
         return False, None, None
 
     ts_ms: Optional[int] = None
-    if ob.get("exchTs") is not None:
-        ts_ms = _positive_int(ob.get("exchTs"), "orderbook.exchTs")
-    elif ob.get("ts") is not None:
-        ts_ms = _positive_int(ob.get("ts"), "orderbook.ts")
+    if "exchTs" in ob and ob["exchTs"] is not None:
+        ts_ms = _positive_int(ob["exchTs"], "orderbook.exchTs")
+    elif "ts" in ob and ob["ts"] is not None:
+        ts_ms = _positive_int(ob["ts"], "orderbook.ts")
 
     try:
         validate_orderbook_strict(ob, symbol=str(symbol), require_ts=bool(ts_ms))
@@ -321,29 +377,21 @@ def _check_db_ping_strict(*, max_ping_ms: int) -> Tuple[bool, int]:
 
 
 def _classify_ws_fail_reason(snapshot: Dict[str, Any]) -> str:
-    orderbook = snapshot.get("orderbook")
-    if not isinstance(orderbook, dict):
-        raise RuntimeError("health snapshot orderbook must be dict (STRICT)")
+    ws, orderbook, kline_map = _extract_health_snapshot_strict(snapshot)
 
-    ws = snapshot.get("ws")
-    if not isinstance(ws, dict):
-        raise RuntimeError("health snapshot ws must be dict (STRICT)")
-
-    kline_map = snapshot.get("klines")
-    if not isinstance(kline_map, dict):
-        raise RuntimeError("health snapshot klines must be dict (STRICT)")
-
-    if not bool(ws.get("transport_ok", False)):
+    transport_ok = _require_bool(_require_key(ws, "transport_ok", "health_snapshot.ws"), "health_snapshot.ws.transport_ok")
+    if not transport_ok:
         return "ws_transport_fail"
 
     for _, st in kline_map.items():
-        if not isinstance(st, dict):
-            raise RuntimeError("health snapshot kline item must be dict (STRICT)")
-        if not bool(st.get("ok", False)):
+        st_dict = _require_dict(st, "health_snapshot.klines.item")
+        ok = _require_bool(_require_key(st_dict, "ok", "health_snapshot.klines.item"), "health_snapshot.klines.item.ok")
+        if not ok:
             return "ws_kline_stale"
 
-    if not bool(orderbook.get("ok", False)):
-        payload_reasons = orderbook.get("payload_reasons")
+    ob_ok = _require_bool(_require_key(orderbook, "ok", "health_snapshot.orderbook"), "health_snapshot.orderbook.ok")
+    if not ob_ok:
+        payload_reasons = _require_key(orderbook, "payload_reasons", "health_snapshot.orderbook")
         if isinstance(payload_reasons, list) and payload_reasons:
             return "orderbook_integrity_fail"
         return "ws_orderbook_stale"
@@ -365,16 +413,23 @@ def _check_market_data_health_strict(
     if not isinstance(snapshot, dict):
         raise RuntimeError("get_health_snapshot returned non-dict (STRICT)")
 
-    overall_ok = snapshot.get("overall_ok")
-    if not isinstance(overall_ok, bool):
-        raise RuntimeError("health snapshot overall_ok must be bool (STRICT)")
+    overall_ok = _require_bool(
+        _require_key(snapshot, "overall_ok", "health_snapshot"),
+        "health_snapshot.overall_ok",
+    )
+    has_warning = _require_bool(
+        _require_key(snapshot, "has_warning", "health_snapshot"),
+        "health_snapshot.has_warning",
+    )
 
-    has_warning = snapshot.get("has_warning")
-    if not isinstance(has_warning, bool):
-        raise RuntimeError("health snapshot has_warning must be bool (STRICT)")
-
-    overall_reasons = _normalize_reason_list(snapshot.get("overall_reasons"), "health snapshot overall_reasons")
-    overall_warnings = _normalize_reason_list(snapshot.get("overall_warnings"), "health snapshot overall_warnings")
+    overall_reasons = _normalize_reason_list(
+        _require_key(snapshot, "overall_reasons", "health_snapshot"),
+        "health_snapshot.overall_reasons",
+    )
+    overall_warnings = _normalize_reason_list(
+        _require_key(snapshot, "overall_warnings", "health_snapshot"),
+        "health_snapshot.overall_warnings",
+    )
 
     if not overall_ok:
         fail_reason = _classify_ws_fail_reason(snapshot)
@@ -396,7 +451,7 @@ def get_last_watchdog_snapshot() -> Optional[WatchdogSnapshot]:
 
 
 def stop_watchdog() -> None:
-    global _WATCHDOG_STOP, _WATCHDOG_THREAD
+    global _WATCHDOG_STOP, _WATCHDOG_THREAD, _LAST_SNAPSHOT
 
     stop_evt = _WATCHDOG_STOP
     th = _WATCHDOG_THREAD
@@ -409,6 +464,7 @@ def stop_watchdog() -> None:
 
     _WATCHDOG_STOP = None
     _WATCHDOG_THREAD = None
+    _LAST_SNAPSHOT = None
 
 
 def start_watchdog(
@@ -431,9 +487,13 @@ def start_watchdog(
     if _WATCHDOG_THREAD is not None and _WATCHDOG_THREAD.is_alive():
         raise RuntimeError("engine_watchdog already running (STRICT)")
 
-    sym = str(symbol or _require_setting(settings, "symbol")).replace("-", "").replace("/", "").upper().strip()
-    if not sym:
-        raise RuntimeError("symbol is required (STRICT)")
+    if settings is None:
+        raise RuntimeError("settings is required (STRICT)")
+
+    if symbol is None:
+        sym = _normalize_symbol_strict(_require_setting(settings, "symbol"), "settings.symbol")
+    else:
+        sym = _normalize_symbol_strict(symbol, "symbol")
 
     interval_sec = _require_setting_positive_float(settings, "engine_watchdog_interval_sec")
     min_buf = _require_setting_positive_int(settings, "ws_min_kline_buffer")
@@ -462,10 +522,12 @@ def start_watchdog(
                 ws_level, ws_fail_reason, ws_warning_reason, ws_snapshot = _check_market_data_health_strict(
                     symbol=sym
                 )
+                ws_dict, _, _ = _extract_health_snapshot_strict(ws_snapshot)
 
-                lens, last_ts, ages = _check_kline_rollback_strict(
+                lens, last_ts, ages, short_tfs = _check_kline_rollback_strict(
                     symbol=sym,
                     tfs=tfs,
+                    min_buf=min_buf,
                     last_seen=last_seen,
                 )
 
@@ -483,6 +545,7 @@ def start_watchdog(
                     "kline_len": dict(lens),
                     "kline_last_ts_ms": dict(last_ts),
                     "kline_age_ms": dict(ages),
+                    "kline_short_tfs": list(short_tfs),
                     "orderbook_integrity_ok": bool(ob_integrity_ok),
                     "orderbook_ts_ms": ob_ts,
                     "orderbook_age_ms": ob_age,
@@ -493,10 +556,22 @@ def start_watchdog(
                     "ws_level": str(ws_level),
                     "ws_fail_reason": ws_fail_reason,
                     "ws_warning_reason": ws_warning_reason,
-                    "ws_overall_ok": bool(ws_snapshot.get("overall_ok", False)),
-                    "ws_has_warning": bool(ws_snapshot.get("has_warning", False)),
-                    "ws_overall_reasons": list(ws_snapshot.get("overall_reasons") or []),
-                    "ws_overall_warnings": list(ws_snapshot.get("overall_warnings") or []),
+                    "ws_overall_ok": _require_bool(
+                        _require_key(ws_snapshot, "overall_ok", "health_snapshot"),
+                        "health_snapshot.overall_ok",
+                    ),
+                    "ws_has_warning": _require_bool(
+                        _require_key(ws_snapshot, "has_warning", "health_snapshot"),
+                        "health_snapshot.has_warning",
+                    ),
+                    "ws_overall_reasons": _normalize_reason_list(
+                        _require_key(ws_snapshot, "overall_reasons", "health_snapshot"),
+                        "health_snapshot.overall_reasons",
+                    ),
+                    "ws_overall_warnings": _normalize_reason_list(
+                        _require_key(ws_snapshot, "overall_warnings", "health_snapshot"),
+                        "health_snapshot.overall_warnings",
+                    ),
                 }
 
                 level: WatchdogLevel = "OK"
@@ -515,18 +590,38 @@ def start_watchdog(
                 elif ws_level == "WARNING":
                     level = "WARNING"
                     warning_reason = ws_warning_reason
+                elif short_tfs:
+                    level = "WARNING"
+                    warning_reason = "warning_kline_buffer_short"
                 else:
                     level = "OK"
+
+                ws_transport_ok = _require_bool(
+                    _require_key(ws_dict, "transport_ok", "health_snapshot.ws"),
+                    "health_snapshot.ws.transport_ok",
+                )
+                ws_overall_ok = _require_bool(
+                    _require_key(ws_snapshot, "overall_ok", "health_snapshot"),
+                    "health_snapshot.overall_ok",
+                )
+                ws_overall_reasons = _normalize_reason_list(
+                    _require_key(ws_snapshot, "overall_reasons", "health_snapshot"),
+                    "health_snapshot.overall_reasons",
+                )
+                ws_overall_warnings = _normalize_reason_list(
+                    _require_key(ws_snapshot, "overall_warnings", "health_snapshot"),
+                    "health_snapshot.overall_warnings",
+                )
 
                 snap = WatchdogSnapshot(
                     level=level,
                     ok=level != "FAIL",
                     has_warning=level == "WARNING",
                     checked_at_ms=int(checked_ms),
-                    ws_transport_ok=bool((ws_snapshot.get("ws") or {}).get("transport_ok", False)),
-                    ws_overall_ok=bool(ws_snapshot.get("overall_ok", False)),
-                    ws_overall_reasons=[str(x) for x in ws_snapshot.get("overall_reasons") or []],
-                    ws_overall_warnings=[str(x) for x in ws_snapshot.get("overall_warnings") or []],
+                    ws_transport_ok=ws_transport_ok,
+                    ws_overall_ok=ws_overall_ok,
+                    ws_overall_reasons=ws_overall_reasons,
+                    ws_overall_warnings=ws_overall_warnings,
                     kline_len=dict(lens),
                     kline_last_ts_ms=dict(last_ts),
                     kline_age_ms=dict(ages),
@@ -551,7 +646,8 @@ def start_watchdog(
                 key = (
                     f"{level}|reason={reason}|"
                     f"ws_fail={ws_fail_reason}|ws_warn={ws_warning_reason}|"
-                    f"ob_integrity={int(ob_integrity_ok)}|db={int(db_ok)}"
+                    f"ob_integrity={int(ob_integrity_ok)}|db={int(db_ok)}|"
+                    f"short_tfs={','.join(short_tfs)}"
                 )
 
                 if _should_emit(key, min_interval_sec=emit_min_sec):

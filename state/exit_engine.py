@@ -20,6 +20,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-13:
+  1) FIX(CONTRACT): canonical runtime 함수 maybe_exit_quant_strict() 추가, maybe_exit_with_gpt()는 호환 wrapper로 유지
+  2) FIX(STRICT): trade.source / settings.exit_supervisor_enabled / settings.exit_supervisor_cooldown_sec 필수 계약화
+  3) FIX(STRICT): UNKNOWN / 기본 쿨다운 값 등 숨은 fallback 제거
+  4) FIX(BOUNDARY): supervisor는 감사/해설 전용, 청산 결정 경로와 명확히 분리
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): 현재 포지션 손익/청산 수량을 trade.qty가 아니라 trade.remaining_qty 기준으로 수정
   2) FIX(ROOT-CAUSE): 최종 청산 DB 기록 손익을 trade.realized_pnl_usdt + 남은 수량 청산 손익으로 집계
@@ -55,16 +60,24 @@ from infra.market_data_ws import (
     get_klines_with_volume as ws_get_klines_with_vol,
 )
 from infra.telelog import log, send_tg
-from execution.order_executor import close_position_market, cancel_order_safe
-from events.signals_logger import log_event, log_signal, log_skip_event, log_candle_snapshot
-from state.db_writer import close_latest_open_trade_returning_id, record_trade_exit_snapshot
+from execution.order_executor import cancel_order_safe, close_position_market
+from events.signals_logger import (
+    log_candle_snapshot,
+    log_event,
+    log_signal,
+    log_skip_event,
+)
+from state.db_writer import (
+    close_latest_open_trade_returning_id,
+    record_trade_exit_snapshot,
+)
 from state.trader_state import Trade
 
 # (옵션) GPT Supervisor: 감사/해설 전용
-from strategy.gpt_supervisor import run_gpt_supervisor, GptSupervisorError
+from strategy.gpt_supervisor import GptSupervisorError, run_gpt_supervisor
 
 # (옵션) unified features: supervisor 입력용(없으면 해설 생략)
-from strategy.unified_features_builder import build_unified_features, UnifiedFeaturesError
+from strategy.unified_features_builder import UnifiedFeaturesError, build_unified_features
 
 
 LOG_PW = "[PW_BINANCE]"
@@ -130,6 +143,44 @@ def _as_float(v: Any, name: str, *, min_value: Optional[float] = None) -> float:
     return float(x)
 
 
+def _as_bool(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT)")
+    return bool(v)
+
+
+def _require_nonempty_str(v: Any, name: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        raise RuntimeError(f"{name} must not be empty (STRICT)")
+    return s
+
+
+def _require_setting_bool(settings: Any, name: str) -> bool:
+    if settings is None:
+        raise RuntimeError("settings is required (STRICT)")
+    if not hasattr(settings, name):
+        raise RuntimeError(f"settings.{name} missing (STRICT)")
+    return _as_bool(getattr(settings, name), f"settings.{name}")
+
+
+def _require_setting_float(settings: Any, name: str, *, min_value: Optional[float] = None) -> float:
+    if settings is None:
+        raise RuntimeError("settings is required (STRICT)")
+    if not hasattr(settings, name):
+        raise RuntimeError(f"settings.{name} missing (STRICT)")
+    return _as_float(getattr(settings, name), f"settings.{name}", min_value=min_value)
+
+
+def _trade_symbol_strict(trade: Trade) -> str:
+    sym = _require_nonempty_str(getattr(trade, "symbol", None), "trade.symbol").replace("-", "").replace("/", "").upper()
+    return sym
+
+
+def _trade_source_strict(trade: Trade) -> str:
+    return _require_nonempty_str(getattr(trade, "source", None), "trade.source")
+
+
 def _open_side_strict(side: Any) -> str:
     s = str(side or "").upper().strip()
     if s in ("BUY", "SELL"):
@@ -150,6 +201,10 @@ def _dir_strict(side: Any) -> str:
     if s == "SELL":
         return "SHORT"
     raise RuntimeError(f"invalid direction (STRICT): {side!r}")
+
+
+def _trade_direction_strict(trade: Trade) -> str:
+    return _dir_strict(getattr(trade, "side", None))
 
 
 def _pnl_usdt(open_side: str, entry: float, last: float, qty: float) -> float:
@@ -288,14 +343,17 @@ def _runtime_thresholds(settings: Any) -> Dict[str, float]:
     return {"op_profit": float(op_profit), "op_loss": float(op_loss), "hard_stop": float(hard_stop)}
 
 
-def _exit_supervisor_enabled(settings: Any) -> bool:
+def _exit_supervisor_enabled_strict(settings: Any) -> bool:
     """
     STRICT:
-    - ENV 직접 접근 금지
-    - settings.exit_supervisor_enabled만 사용
-    - 설정 키가 없으면 False(옵션 기능 기본 OFF)
+    - settings.exit_supervisor_enabled는 반드시 명시되어야 한다.
+    - 옵션 기능은 caller가 명시적으로 False를 넣어 꺼야 한다.
     """
-    return bool(getattr(settings, "exit_supervisor_enabled", False))
+    return _require_setting_bool(settings, "exit_supervisor_enabled")
+
+
+def _exit_supervisor_cooldown_sec_strict(settings: Any) -> float:
+    return _require_setting_float(settings, "exit_supervisor_cooldown_sec", min_value=0.0)
 
 
 def _trade_key_strict(trade: Trade) -> str:
@@ -308,13 +366,8 @@ def _trade_key_strict(trade: Trade) -> str:
     if isinstance(tid, int) and tid > 0:
         return f"id:{tid}"
 
-    sym = str(getattr(trade, "symbol", "")).strip()
-    if not sym:
-        raise RuntimeError("trade.symbol missing (STRICT)")
-
-    side = str(getattr(trade, "side", "")).strip()
-    if not side:
-        raise RuntimeError("trade.side missing (STRICT)")
+    sym = _trade_symbol_strict(trade)
+    side = _require_nonempty_str(getattr(trade, "side", None), "trade.side")
 
     entry = _as_float(getattr(trade, "entry", None), "trade.entry", min_value=0.0)
     qty = _as_float(getattr(trade, "qty", None), "trade.qty", min_value=0.0)
@@ -415,9 +468,7 @@ def _cancel_attached_orders_best_effort(*, trade: Trade, settings: Any) -> None:
     - 포지션 청산 시 남아있는 TP/SL 주문이 이후에 오동작하지 않도록 취소 시도.
     - 실패해도 거래 흐름(청산)을 깨지 않는다.
     """
-    sym = str(getattr(trade, "symbol", "")).strip()
-    if not sym:
-        raise RuntimeError("trade.symbol missing (STRICT)")
+    sym = _trade_symbol_strict(trade)
 
     for name in ("tp_order_id", "sl_order_id"):
         oid = getattr(trade, name, None)
@@ -441,9 +492,9 @@ def _cancel_tp_for_trend_extension_strict(*, trade: Trade, settings: Any) -> boo
     - tp_order_id가 없으면 확장 불가 -> False 반환.
     - 취소 실패(미정의 오류) 시 확장 금지 -> False 반환(조용한 진행 금지, 로그/이벤트 기록).
     """
-    sym = str(getattr(trade, "symbol", "")).strip()
-    if not sym:
-        raise RuntimeError("trade.symbol missing (STRICT)")
+    sym = _trade_symbol_strict(trade)
+    regime_label = _trade_source_strict(trade)
+    side_dir = _trade_direction_strict(trade)
 
     tp_oid = getattr(trade, "tp_order_id", None)
     if tp_oid is None or not str(tp_oid).strip():
@@ -454,9 +505,9 @@ def _cancel_tp_for_trend_extension_strict(*, trade: Trade, settings: Any) -> boo
         log_event(
             "trend_ext_tp_cancelled",
             symbol=sym,
-            regime=str(getattr(trade, "source", "") or "UNKNOWN"),
+            regime=regime_label,
             source="exit_engine.trend_extension",
-            side=_dir_strict(getattr(trade, "side", "")),
+            side=side_dir,
             price=None,
             reason="tp_cancelled_for_trend_extension",
             extra_json={"tp_order_id": str(tp_oid).strip()},
@@ -469,9 +520,9 @@ def _cancel_tp_for_trend_extension_strict(*, trade: Trade, settings: Any) -> boo
         log_event(
             "trend_ext_tp_cancel_fail",
             symbol=sym,
-            regime=str(getattr(trade, "source", "") or "UNKNOWN"),
+            regime=regime_label,
             source="exit_engine.trend_extension",
-            side=_dir_strict(getattr(trade, "side", "")),
+            side=side_dir,
             price=None,
             reason="tp_cancel_failed",
             extra_json={"err": f"{type(e).__name__}:{str(e)[:200]}", "tp_order_id": str(tp_oid).strip()},
@@ -505,7 +556,7 @@ def _run_exit_supervisor_best_effort(
     GPT Supervisor는 '감사/해설'만 한다.
     실패해도 거래 흐름을 깨지 않는다(옵션).
     """
-    if not _exit_supervisor_enabled(settings):
+    if not _exit_supervisor_enabled_strict(settings):
         return
 
     try:
@@ -515,13 +566,13 @@ def _run_exit_supervisor_best_effort(
         return
 
     now = time.time()
-    cooldown = float(getattr(settings, "exit_supervisor_cooldown_sec", 180.0) or 180.0)
+    cooldown = _exit_supervisor_cooldown_sec_strict(settings)
     last = _EXIT_SUP_LAST_CALL_TS.get(key)
     if last is not None and (now - last) < cooldown:
         return
 
     try:
-        unified = build_unified_features(trade.symbol)
+        unified = build_unified_features(_trade_symbol_strict(trade))
     except (UnifiedFeaturesError, Exception) as e:
         log(f"{LOG_EXIT}[SUP] unified_features build failed -> narration skip: {type(e).__name__}:{e}")
         return
@@ -535,11 +586,15 @@ def _run_exit_supervisor_best_effort(
         log(f"{LOG_EXIT}[SUP] invalid entry/qty/remaining_qty -> narration skip")
         return
 
-    decision_id = f"exit-{trade.symbol}-{int(candle_ts_ms)}"
+    symbol = _trade_symbol_strict(trade)
+    side_dir = _trade_direction_strict(trade)
+    regime_label = _trade_source_strict(trade)
+
+    decision_id = f"exit-{symbol}-{int(candle_ts_ms)}"
     quant_pre = {
         "scenario": scenario,
-        "symbol": trade.symbol,
-        "side": str(trade.side),
+        "symbol": symbol,
+        "side": str(getattr(trade, "side", None)),
         "entry_price": float(entry_price),
         "qty_total": float(qty_total),
         "remaining_qty": float(remaining_qty),
@@ -572,10 +627,10 @@ def _run_exit_supervisor_best_effort(
     except GptSupervisorError as e:
         log_event(
             "on_exit_supervisor_fail",
-            symbol=trade.symbol,
-            regime=str(getattr(trade, "source", "") or "UNKNOWN"),
+            symbol=symbol,
+            regime=regime_label,
             source="exit_engine.supervisor",
-            side=_dir_strict(trade.side),
+            side=side_dir,
             price=float(last_price),
             reason="supervisor_failed",
             extra_json={"error": str(e)[:240]},
@@ -586,10 +641,10 @@ def _run_exit_supervisor_best_effort(
 
     log_event(
         "on_exit_supervisor",
-        symbol=trade.symbol,
-        regime=str(getattr(trade, "source", "") or "UNKNOWN"),
+        symbol=symbol,
+        regime=regime_label,
         source="exit_engine.supervisor",
-        side=_dir_strict(trade.side),
+        side=side_dir,
         price=float(last_price),
         reason="exit_supervisor_audit",
         extra_json={
@@ -626,11 +681,8 @@ def _close_and_record_strict(
     - 시장가 청산 → bt_trades close → bt_trade_exit_snapshots 기록
     - 부분청산 누적 손익이 있으면 최종 손익에 반드시 합산
     """
-    symbol = str(getattr(trade, "symbol", "")).strip()
-    if not symbol:
-        raise RuntimeError("trade.symbol missing (STRICT)")
-
-    open_side = _open_side_strict(getattr(trade, "side", ""))
+    symbol = _trade_symbol_strict(trade)
+    open_side = _open_side_strict(getattr(trade, "side", None))
     entry = _as_float(getattr(trade, "entry", None), "trade.entry", min_value=0.0)
     qty_total = _as_float(getattr(trade, "qty", None), "trade.qty", min_value=0.0)
     remaining_qty = _remaining_qty_strict(trade)
@@ -676,7 +728,7 @@ def _close_and_record_strict(
     )
 
 
-def maybe_exit_with_gpt(
+def maybe_exit_quant_strict(
     trade: Trade,
     settings: Any,
     *,
@@ -689,7 +741,10 @@ def maybe_exit_with_gpt(
       True  -> 실제 청산 실행
       False -> HOLD
     """
-    regime_label = getattr(trade, "source", "") or "UNKNOWN"
+    regime_label = _trade_source_strict(trade)
+    symbol = _trade_symbol_strict(trade)
+    open_side = _open_side_strict(getattr(trade, "side", None))
+    side_dir = _trade_direction_strict(trade)
 
     qty_total = _as_float(getattr(trade, "qty", None), "trade.qty", min_value=0.0)
     remaining_qty = _remaining_qty_strict(trade)
@@ -697,20 +752,20 @@ def maybe_exit_with_gpt(
     if qty_total <= 0 or remaining_qty <= 0 or entry <= 0:
         raise RuntimeError("trade.qty/trade.remaining_qty/trade.entry must be > 0 (STRICT)")
 
-    last_candle = _get_last_candle_with_volume(trade.symbol)
+    last_candle = _get_last_candle_with_volume(symbol)
     if last_candle is None:
         try:
             log_skip_event(
-                symbol=trade.symbol,
+                symbol=symbol,
                 regime=regime_label,
                 source="exit_engine",
-                side=getattr(trade, "side", ""),
+                side=side_dir,
                 reason="ws_candle_not_ready",
                 extra={"scenario": scenario},
             )
         except Exception as e:
-            log(f"{LOG_EXIT}[HOLD][SKIP_LOG] failed symbol={trade.symbol}: {e}")
-        log(f"{LOG_EXIT} no recent WS candle → HOLD (symbol={trade.symbol})")
+            log(f"{LOG_EXIT}[HOLD][SKIP_LOG] failed symbol={symbol}: {e}")
+        log(f"{LOG_EXIT} no recent WS candle → HOLD (symbol={symbol})")
         return False
 
     candle_ts, o, h, l, c, v = last_candle
@@ -719,7 +774,7 @@ def maybe_exit_with_gpt(
 
     try:
         log_candle_snapshot(
-            symbol=trade.symbol,
+            symbol=symbol,
             tf="1m",
             candle_ts=int(candle_ts),
             open_=o,
@@ -728,29 +783,28 @@ def maybe_exit_with_gpt(
             close=c,
             volume=v,
             strategy_type=regime_label,
-            direction=getattr(trade, "side", ""),
+            direction=side_dir,
             extra=f"exit_check=1;scenario={scenario};market=binance_futures_ws",
         )
     except Exception as e:
-        log(f"{LOG_EXIT} candle snapshot log failed symbol={trade.symbol}: {e}")
+        log(f"{LOG_EXIT} candle snapshot log failed symbol={symbol}: {e}")
 
-    open_side = _open_side_strict(getattr(trade, "side", ""))
     pnl = _pnl_usdt(open_side=open_side, entry=float(entry), last=float(c), qty=float(remaining_qty))
     pnl_pct_val = _pnl_pct(pnl=pnl, entry=float(entry), qty=float(qty_total))
 
-    trend15_dir = _get_15m_trend_dir(trade.symbol)
-    opposite = _is_opposite(getattr(trade, "side", ""), trend15_dir) if trend15_dir else False
+    trend15_dir = _get_15m_trend_dir(symbol)
+    opposite = _is_opposite(getattr(trade, "side", None), trend15_dir) if trend15_dir else False
 
     th = _runtime_thresholds(settings)
 
     if th["hard_stop"] > 0.0 and pnl_pct_val <= -float(th["hard_stop"]):
         reason = "runtime_hard_stop_loss"
-        _submit_tg(f"🧯 [EXIT][HARD_STOP] {trade.symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+        _submit_tg(f"🧯 [EXIT][HARD_STOP] {symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
         log_signal(
             event="CLOSE",
-            symbol=trade.symbol,
+            symbol=symbol,
             strategy_type=regime_label,
-            direction=getattr(trade, "side", ""),
+            direction=side_dir,
             price=float(c),
             qty=float(remaining_qty),
             reason=reason,
@@ -773,12 +827,12 @@ def maybe_exit_with_gpt(
 
     if opposite and pnl_pct_val >= float(th["op_profit"]):
         reason = "runtime_opposite_profit_take"
-        _submit_tg(f"✅ [EXIT][OPPOSITE_TAKE] {trade.symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+        _submit_tg(f"✅ [EXIT][OPPOSITE_TAKE] {symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
         log_signal(
             event="CLOSE",
-            symbol=trade.symbol,
+            symbol=symbol,
             strategy_type=regime_label,
-            direction=getattr(trade, "side", ""),
+            direction=side_dir,
             price=float(c),
             qty=float(remaining_qty),
             reason=reason,
@@ -801,12 +855,12 @@ def maybe_exit_with_gpt(
 
     if opposite and pnl_pct_val <= -float(th["op_loss"]):
         reason = "runtime_opposite_loss_cut"
-        _submit_tg(f"⚠️ [EXIT][OPPOSITE_CUT] {trade.symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+        _submit_tg(f"⚠️ [EXIT][OPPOSITE_CUT] {symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
         log_signal(
             event="CLOSE",
-            symbol=trade.symbol,
+            symbol=symbol,
             strategy_type=regime_label,
-            direction=getattr(trade, "side", ""),
+            direction=side_dir,
             price=float(c),
             qty=float(remaining_qty),
             reason=reason,
@@ -830,12 +884,12 @@ def maybe_exit_with_gpt(
     sl_pct = _sl_pct_strict(settings)
     if pnl_pct_val <= -float(sl_pct):
         reason = "runtime_sl_fixed"
-        _submit_tg(f"❌ [EXIT][SL] {trade.symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+        _submit_tg(f"❌ [EXIT][SL] {symbol} {open_side} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
         log_signal(
             event="CLOSE",
-            symbol=trade.symbol,
+            symbol=symbol,
             strategy_type=regime_label,
-            direction=getattr(trade, "side", ""),
+            direction=side_dir,
             price=float(c),
             qty=float(remaining_qty),
             reason=reason,
@@ -871,12 +925,12 @@ def maybe_exit_with_gpt(
 
         if pnl_pct_val <= floor_pct:
             reason = "trend_ext_floor_exit"
-            _submit_tg(f"💰 [EXIT][TREND_EXT_FLOOR] {trade.symbol} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+            _submit_tg(f"💰 [EXIT][TREND_EXT_FLOOR] {symbol} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
             log_signal(
                 event="CLOSE",
-                symbol=trade.symbol,
+                symbol=symbol,
                 strategy_type=regime_label,
-                direction=getattr(trade, "side", ""),
+                direction=side_dir,
                 price=float(c),
                 qty=float(remaining_qty),
                 reason=reason,
@@ -897,12 +951,12 @@ def maybe_exit_with_gpt(
             rs, msr = scores
             if not _trend_strong_from_scores(rs, msr):
                 reason = "trend_ext_exit_on_weakness"
-                _submit_tg(f"💰 [EXIT][TREND_EXT_WEAK] {trade.symbol} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
+                _submit_tg(f"💰 [EXIT][TREND_EXT_WEAK] {symbol} pnl={pnl:.4f}USDT ({pnl_pct_val*100:.2f}%)")
                 log_signal(
                     event="CLOSE",
-                    symbol=trade.symbol,
+                    symbol=symbol,
                     strategy_type=regime_label,
-                    direction=getattr(trade, "side", ""),
+                    direction=side_dir,
                     price=float(c),
                     qty=float(remaining_qty),
                     reason=reason,
@@ -921,10 +975,10 @@ def maybe_exit_with_gpt(
 
         try:
             log_skip_event(
-                symbol=trade.symbol,
+                symbol=symbol,
                 regime=regime_label,
                 source="exit_engine.trend_extension",
-                side=getattr(trade, "side", ""),
+                side=side_dir,
                 reason="trend_ext_hold",
                 extra={
                     "scenario": scenario,
@@ -936,7 +990,7 @@ def maybe_exit_with_gpt(
                 },
             )
         except Exception as e:
-            log(f"{LOG_EXIT}[HOLD][TREND_EXT][SKIP_LOG] failed symbol={trade.symbol}: {e}")
+            log(f"{LOG_EXIT}[HOLD][TREND_EXT][SKIP_LOG] failed symbol={symbol}: {e}")
         return False
 
     arm_pct = float(tp_pct) * float(_TREND_EXT_ARM_RATIO)
@@ -957,18 +1011,18 @@ def maybe_exit_with_gpt(
                 }
                 _trend_ext_notice_once(
                     key,
-                    f"🟦 [HOLD][TREND_EXT] {trade.symbol} 추세 강함 감지 → TP 취소 후 홀딩 "
+                    f"🟦 [HOLD][TREND_EXT] {symbol} 추세 강함 감지 → TP 취소 후 홀딩 "
                     f"(pnl={pnl_pct_val*100:.2f}%, floor≈{floor_pct*100:.2f}%, remaining_qty={remaining_qty:.6f})",
                 )
                 return False
-            log(f"{LOG_EXIT}[TREND_EXT] arm met but tp cancel failed/not-possible -> no extension (symbol={trade.symbol})")
+            log(f"{LOG_EXIT}[TREND_EXT] arm met but tp cancel failed/not-possible -> no extension (symbol={symbol})")
 
     try:
         log_skip_event(
-            symbol=trade.symbol,
+            symbol=symbol,
             regime=regime_label,
-            source="exit_engine.maybe_exit_with_gpt",
-            side=getattr(trade, "side", ""),
+            source="exit_engine.quant",
+            side=side_dir,
             reason="runtime_hold",
             extra={
                 "scenario": scenario,
@@ -981,7 +1035,7 @@ def maybe_exit_with_gpt(
             },
         )
     except Exception as e:
-        log(f"{LOG_EXIT}[HOLD][SKIP_LOG] failed symbol={trade.symbol}: {e}")
+        log(f"{LOG_EXIT}[HOLD][SKIP_LOG] failed symbol={symbol}: {e}")
 
     _run_exit_supervisor_best_effort(
         trade=trade,
@@ -997,7 +1051,25 @@ def maybe_exit_with_gpt(
     return False
 
 
+def maybe_exit_with_gpt(
+    trade: Trade,
+    settings: Any,
+    *,
+    scenario: str = "GENERIC_EXIT_CHECK",
+) -> bool:
+    """
+    호환 wrapper.
+    실제 청산 판단은 maybe_exit_quant_strict()가 수행한다.
+    """
+    return maybe_exit_quant_strict(
+        trade=trade,
+        settings=settings,
+        scenario=scenario,
+    )
+
+
 __all__ = [
+    "maybe_exit_quant_strict",
     "maybe_exit_with_gpt",
     "EXIT_CHECK_INTERVAL_SEC",
 ]

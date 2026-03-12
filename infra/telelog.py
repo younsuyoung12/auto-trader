@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """
 ========================================================
-infra/telelog.py
+FILE: infra/telelog.py
 STRICT · NO-FALLBACK · IMPORT-SAFE
 ========================================================
 역할:
@@ -16,14 +16,22 @@ STRICT · NO-FALLBACK · IMPORT-SAFE
 - 민감정보(키/토큰/시크릿) 로그 출력 금지
 - 텔레그램 전송 실패/네트워크 오류는 봇 전체를 멈추게 하지 않는다(유틸 보호)
 - 파일 로그 쓰기 실패도 봇을 멈추게 하지 않는다(유틸 보호)
+- print() 금지 / logging 사용
+- env-first 정책 유지 (이 파일은 운영 유틸 예외 모듈)
 
 설정 소스:
 - 환경변수(env-first)만 사용한다.
   - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   - LOG_TO_FILE (true/false), LOG_FILE
   - SKIP_TG_COOLDOWN_SEC, BALANCE_SKIP_COOLDOWN_SEC
+  - TELEGRAM_TIMEOUT_SEC
 
 변경 이력:
+- 2026-03-13
+  1) FIX(LOGGING): print() 제거, logging 기반 콘솔/파일 로그로 전환
+  2) FIX(CONCURRENCY): LAST_SKIP_TG 접근에 RLock 적용
+  3) FIX(IMPORT-SAFE): env-first / import-safe 유지하면서 logger lazy configure 구조로 정리
+  4) FIX(UTILITY): telegram/file logging 실패는 유틸 보호 원칙대로 유지
 - 2026-03-11
   1) 텔레그램 원문 로그를 사람이 읽기 쉬운 한글 운영 메시지로 변환하는
      _humanize_telegram_text(...) 파이프라인 추가
@@ -35,8 +43,10 @@ STRICT · NO-FALLBACK · IMPORT-SAFE
 ========================================================
 """
 
+import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -49,6 +59,15 @@ KST = timezone(timedelta(hours=9))
 # 스킵 텔레그램 쿨다운 관리용 딕셔너리
 # key: reason 문자열, value: 마지막으로 이 reason 을 전송한 epoch 시각(float)
 LAST_SKIP_TG: Dict[str, float] = {}
+
+# internal logger state
+_LOGGER = logging.getLogger("auto_trader.telelog")
+_LOGGER.setLevel(logging.INFO)
+_LOGGER.propagate = False
+
+_STREAM_HANDLER_INSTALLED = False
+_FILE_HANDLER_PATH: Optional[str] = None
+_STATE_LOCK = threading.RLock()
 
 
 # ─────────────────────────────────────────────────────
@@ -79,36 +98,77 @@ def _env_float(key: str, default: float) -> float:
     if v is None or str(v).strip() == "":
         return default
     try:
-        return float(str(v).strip())
+        out = float(str(v).strip())
     except Exception as e:
         raise RuntimeError(f"invalid float env: {key}") from e
+    return out
 
 
 # ─────────────────────────────────────────────────────
-# logging
+# logging (IMPORT-SAFE / lazy configure)
 # ─────────────────────────────────────────────────────
+def _ensure_logger_configured() -> None:
+    global _STREAM_HANDLER_INSTALLED, _FILE_HANDLER_PATH
+
+    with _STATE_LOCK:
+        if not _STREAM_HANDLER_INSTALLED:
+            stream_handler = logging.StreamHandler()
+            stream_handler.setLevel(logging.INFO)
+            stream_handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+            _LOGGER.addHandler(stream_handler)
+            _STREAM_HANDLER_INSTALLED = True
+
+        log_to_file = _env_bool("LOG_TO_FILE", False)
+        desired_path = _env_str("LOG_FILE", "logs/bot.log") if log_to_file else None
+
+        if _FILE_HANDLER_PATH == desired_path:
+            return
+
+        # remove old file handlers if path changed or disabled
+        for handler in list(_LOGGER.handlers):
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    _LOGGER.removeHandler(handler)
+                    handler.close()
+                except Exception:
+                    pass
+
+        _FILE_HANDLER_PATH = None
+
+        if desired_path is None:
+            return
+
+        try:
+            os.makedirs(os.path.dirname(desired_path) or ".", exist_ok=True)
+            file_handler = logging.FileHandler(desired_path, encoding="utf-8")
+            file_handler.setLevel(logging.INFO)
+            file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
+            _LOGGER.addHandler(file_handler)
+            _FILE_HANDLER_PATH = desired_path
+        except Exception:
+            # 유틸 보호: 파일 로그 실패로 봇을 멈추지 않는다.
+            _FILE_HANDLER_PATH = None
+
+
 def log(msg: str) -> None:
-    """콘솔에 로그를 남기고, 필요하면 파일에도 남긴다.
+    """
+    콘솔에 로그를 남기고, 필요하면 파일에도 남긴다.
 
     - 시간 포맷: "YYYY-MM-DD HH:MM:SS"
-    - flush=True
+    - print 금지 / logging 사용
     - 파일 로그 쓰기 실패는 유틸 보호 차원에서만 무시(봇 중단 방지)
     """
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
-
-    log_to_file = _env_bool("LOG_TO_FILE", False)
-    if not log_to_file:
-        return
-
-    log_file = _env_str("LOG_FILE", "logs/bot.log")
     try:
-        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        _ensure_logger_configured()
     except Exception:
-        # 유틸 보호: 파일 로그 때문에 봇이 죽으면 안 됨
+        # logger configure 실패도 유틸 보호
+        pass
+
+    line = str(msg if isinstance(msg, str) else repr(msg))
+    try:
+        _LOGGER.info(line)
+    except Exception:
+        # 최후 보호: 로깅 실패가 엔진을 멈추지 않게 한다.
         pass
 
 
@@ -506,7 +566,6 @@ def _humanize_telegram_text(text: str) -> str:
     if raw == "":
         return raw
 
-    # 이미 사람이 읽기 좋은 구조 메시지는 그대로 유지
     if raw.startswith("📌 "):
         return raw
 
@@ -533,7 +592,8 @@ def _humanize_telegram_text(text: str) -> str:
 # telegram send
 # ─────────────────────────────────────────────────────
 def send_tg(text: str) -> None:
-    """중요 알림을 텔레그램으로 보낸다.
+    """
+    중요 알림을 텔레그램으로 보낸다.
 
     - 토큰/chat_id 없으면 콘솔 로그로 대체
     - 네트워크 오류는 유틸 보호 차원에서만 무시
@@ -541,7 +601,11 @@ def send_tg(text: str) -> None:
     """
     bot_token = _env_str("TELEGRAM_BOT_TOKEN", "")
     chat_id = _env_str("TELEGRAM_CHAT_ID", "")
+    timeout_sec = _env_float("TELEGRAM_TIMEOUT_SEC", 8.0)
     final_text = _humanize_telegram_text(text)
+
+    if timeout_sec <= 0:
+        timeout_sec = 8.0
 
     if not (bot_token and chat_id):
         log("[TG SKIP] " + final_text)
@@ -550,7 +614,7 @@ def send_tg(text: str) -> None:
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": final_text}
-        resp = requests.post(url, json=payload, timeout=8)
+        resp = requests.post(url, json=payload, timeout=timeout_sec)
         if resp.status_code != 200:
             raise RuntimeError(
                 f"telegram send failed status={resp.status_code} body={resp.text[:300]}"
@@ -612,10 +676,13 @@ def _localize_skip_reason(reason: str) -> str:
 
 def send_skip_tg(reason: str) -> None:
     """스킵 사유 전송 (reason 별 쿨다운 적용)."""
+    localized_reason_key = str(reason).strip()
+    if localized_reason_key == "":
+        log("[SKIP_TG_SUPPRESS] empty_reason")
+        return
+
     now = time.time()
 
-    # 쿨다운 설정 (env-first)
-    # - 기본값: 일반 스킵 30초 / 잔고 스킵 3600초
     default_skip_cooldown = _env_float("SKIP_TG_COOLDOWN_SEC", 30.0)
     balance_skip_cooldown = _env_float("BALANCE_SKIP_COOLDOWN_SEC", 3600.0)
 
@@ -629,18 +696,20 @@ def send_skip_tg(reason: str) -> None:
         cooldown = default_skip_cooldown
         title = "스킵"
 
-    last_ts = LAST_SKIP_TG.get(reason, 0.0)
-    if now - last_ts >= cooldown:
-        localized_reason = _localize_skip_reason(reason)
-        text = build_tg_template(
-            title=title,
-            cooldown_sec=float(cooldown),
-            cooldown_reason=localized_reason,
-        )
-        send_tg(text)
-        LAST_SKIP_TG[reason] = now
-    else:
-        log(f"[SKIP_TG_SUPPRESS] {reason}")
+    with _STATE_LOCK:
+        last_ts = LAST_SKIP_TG.get(localized_reason_key, 0.0)
+        if now - last_ts >= cooldown:
+            localized_reason = _localize_skip_reason(reason)
+            text = build_tg_template(
+                title=title,
+                cooldown_sec=float(cooldown),
+                cooldown_reason=localized_reason,
+            )
+            send_tg(text)
+            LAST_SKIP_TG[localized_reason_key] = now
+            return
+
+    log(f"[SKIP_TG_SUPPRESS] {reason}")
 
 
 __all__ = [

@@ -1,38 +1,77 @@
 # events/commentary_engine.py
-# =============================================================================
-# AUTO-TRADER - Commentary Engine (STRICT / NO-FALLBACK)
-# -----------------------------------------------------------------------------
-# 목적:
-# - 이벤트(EventBus) 발생 시, 엔진의 "근거(reason/indicators/리스크태그)"를 기반으로
-#   GPT 해설 텍스트를 생성한다.
-# - 생성된 해설은 CommentaryQueue에 저장한다.
-# - 데이터가 부족하면 즉시 예외 -> Render 로그에 에러가 그대로 보이도록 한다.
-#
-# 구현 범위:
-# - OpenAI 호출부는 "환경변수 기반"으로 동작한다.
-#   (OPENAI_API_KEY, OPENAI_MODEL)
-# - 폴백 금지: 키/모델/필수 입력이 없으면 즉시 예외
-#
-# NOTE:
-# - 이 엔진은 "시장 판단"을 하지 않는다.
-# - 오직 "엔진이 이미 결정한 이유"를 설명한다.
-# =============================================================================
+"""
+========================================================
+FILE: events/commentary_engine.py
+AUTO-TRADER - Commentary Engine
+STRICT · NO-FALLBACK · TRADE-GRADE MODE
+========================================================
+
+목적:
+- 이벤트(EventBus) 발생 시, 엔진의 근거(reason/indicators/리스크태그)를 기반으로
+  GPT 해설 텍스트를 생성한다.
+- 생성된 해설은 CommentaryQueue에 저장한다.
+- 데이터가 부족하면 즉시 예외를 발생시킨다.
+
+절대 원칙:
+- STRICT · NO-FALLBACK
+- settings.py(SSOT) 외 환경변수 직접 접근 금지
+- print() 금지 / logging 사용
+- 필수 입력/설정/응답 누락 시 즉시 예외
+- OpenAI 호출 실패는 즉시 예외
+- 시장 판단/매매 결정 금지, 해설만 수행
+
+변경 이력:
+- 2026-03-13:
+  1) FIX(SSOT): os.getenv 제거, load_settings() 기반 설정 사용으로 변경
+  2) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  3) FIX(CONTRACT): Event payload / OpenAI response strict 검증 강화
+  4) FIX(ARCH): settings 주입 가능 구조로 변경
+- 2026-03-07:
+  1) 초기 구현
+========================================================
+"""
 
 from __future__ import annotations
 
 import json
-import os
+import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import requests
 
-from events.event_bus import Event, subscribe
+from common.exceptions_strict import (
+    StrictConfigError,
+    StrictDataError,
+    StrictExternalError,
+)
 from events.commentary_queue import CommentaryItem, GLOBAL_COMMENTARY_QUEUE
+from events.event_bus import Event, subscribe
+from settings import load_settings
+
+logger = logging.getLogger(__name__)
+
+_TARGET_EVENT_TYPES: Set[str] = {
+    "on_entry_filled",
+    "on_exit_filled",
+    "on_slippage_block",
+    "on_risk_guard_trigger",
+    "on_tp_sl_reset_failed",
+    "on_exchange_sync_error",
+    "on_hold_update",
+}
 
 
-class CommentaryEngineError(RuntimeError):
-    """Raised when commentary generation fails (strict)."""
+class CommentaryConfigError(StrictConfigError):
+    """commentary engine 설정 계약 위반."""
+
+
+class CommentaryContractError(StrictDataError):
+    """event payload / commentary item / OpenAI response 계약 위반."""
+
+
+class CommentaryExternalError(StrictExternalError):
+    """OpenAI 외부 호출 실패."""
 
 
 def _now_ms() -> int:
@@ -40,60 +79,84 @@ def _now_ms() -> int:
 
 
 def _require_str(v: Any, name: str) -> str:
-    s = str(v or "").strip()
+    if not isinstance(v, str):
+        raise CommentaryContractError(f"{name} must be str (STRICT), got={type(v).__name__}")
+    s = v.strip()
     if not s:
-        raise CommentaryEngineError(f"missing required field: {name}")
+        raise CommentaryContractError(f"{name} must not be empty (STRICT)")
     return s
 
 
 def _require_dict(v: Any, name: str) -> Dict[str, Any]:
     if not isinstance(v, dict):
-        raise CommentaryEngineError(f"{name} must be dict")
-    return v
+        raise CommentaryContractError(f"{name} must be dict (STRICT), got={type(v).__name__}")
+    if not v:
+        raise CommentaryContractError(f"{name} must not be empty (STRICT)")
+    return dict(v)
 
 
-def _openai_api_key() -> str:
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
-        raise CommentaryEngineError("OPENAI_API_KEY missing")
-    return key
+def _require_positive_int(v: Any, name: str) -> int:
+    if isinstance(v, bool):
+        raise CommentaryContractError(f"{name} must be int (STRICT), bool not allowed")
+    try:
+        iv = int(v)
+    except Exception as exc:
+        raise CommentaryContractError(f"{name} must be int (STRICT): {exc}") from exc
+    if iv <= 0:
+        raise CommentaryContractError(f"{name} must be > 0 (STRICT)")
+    return iv
 
 
-def _openai_model() -> str:
-    model = os.getenv("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
-    # 모델명 폴백 자체는 괜찮지만 "키가 없으면"은 폴백 금지로 예외
-    return model
+def _resolve_settings(settings: Optional[Any]) -> Any:
+    st = settings if settings is not None else load_settings()
+    if st is None:
+        raise CommentaryConfigError("settings resolution failed (STRICT)")
+    return st
 
 
-def _openai_base_url() -> str:
-    return os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+def _require_setting_str(settings: Any, name: str) -> str:
+    if not hasattr(settings, name):
+        raise CommentaryConfigError(f"settings.{name} missing (STRICT)")
+    return _require_str(getattr(settings, name), f"settings.{name}")
+
+
+def _require_setting_int(settings: Any, name: str) -> int:
+    if not hasattr(settings, name):
+        raise CommentaryConfigError(f"settings.{name} missing (STRICT)")
+    return _require_positive_int(getattr(settings, name), f"settings.{name}")
 
 
 def _build_prompt(ev: Event) -> Dict[str, Any]:
     """Build a strict prompt payload. Raises if required info missing."""
+    if not isinstance(ev, Event):
+        raise CommentaryContractError(f"ev must be Event (STRICT), got={type(ev).__name__}")
+
     payload = _require_dict(ev.payload, "event.payload")
 
     symbol = _require_str(payload.get("symbol"), "payload.symbol")
     reason = _require_str(payload.get("reason"), "payload.reason")
+    event_type = _require_str(ev.event_type, "event.event_type")
+    event_id = _require_str(ev.event_id, "event.event_id")
+    ts_ms = _require_positive_int(ev.ts_ms, "event.ts_ms")
 
-    # optional but recommended
     side = str(payload.get("side") or "").strip()
-    price = payload.get("price", None)
-    confidence = payload.get("confidence", None)
-    risk_tags = payload.get("risk_tags", None)
-    indicators = payload.get("indicators", None)
-    timeframe = payload.get("timeframe", None)
+    price = payload.get("price")
+    confidence = payload.get("confidence")
+    risk_tags = payload.get("risk_tags")
+    indicators = payload.get("indicators")
+    timeframe = payload.get("timeframe")
 
     system_msg = (
-        "너는 자동매매 엔진의 '해설자'다. "
-        "너는 시장을 예측하거나 투자 조언을 하지 않는다. "
-        "오직 제공된 엔진 이벤트/근거를 한국어로 간결하고 명확하게 설명한다. "
+        "너는 자동매매 엔진의 해설자다. "
+        "시장 예측이나 투자 조언을 하지 않는다. "
+        "오직 제공된 엔진 이벤트와 근거를 한국어로 간결하고 명확하게 설명한다. "
         "확정적 표현(무조건/확실히/반드시/수익 보장)을 금지한다. "
         "마지막 문장은 항상 '투자 판단과 책임은 본인에게 있습니다.'로 끝낸다."
     )
 
     user_obj = {
-        "event_type": ev.event_type,
+        "event_id": event_id,
+        "event_type": event_type,
         "symbol": symbol,
         "side": side,
         "price": price,
@@ -102,7 +165,7 @@ def _build_prompt(ev: Event) -> Dict[str, Any]:
         "timeframe": timeframe,
         "risk_tags": risk_tags,
         "indicators": indicators,
-        "ts_ms": ev.ts_ms,
+        "ts_ms": ts_ms,
     }
 
     user_msg = (
@@ -117,15 +180,21 @@ def _build_prompt(ev: Event) -> Dict[str, Any]:
     return {"system": system_msg, "user": user_msg, "symbol": symbol}
 
 
-def _call_openai_chat(system: str, user: str) -> str:
+def _call_openai_chat(
+    *,
+    settings: Any,
+    system: str,
+    user: str,
+) -> str:
     """Call OpenAI Chat Completions via HTTP. STRICT."""
-    key = _openai_api_key()
-    base_url = _openai_base_url()
-    model = _openai_model()
+    api_key = _require_setting_str(settings, "openai_api_key")
+    model = _require_setting_str(settings, "openai_model")
+    base_url = _require_setting_str(settings, "openai_base_url")
+    timeout_sec = _require_setting_int(settings, "request_timeout_sec")
 
-    url = f"{base_url}/chat/completions"
+    url = f"{base_url.rstrip('/')}/chat/completions"
     headers = {
-        "Authorization": f"Bearer {key}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
@@ -133,49 +202,60 @@ def _call_openai_chat(system: str, user: str) -> str:
         "model": model,
         "temperature": 0.4,
         "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "system", "content": _require_str(system, "system")},
+            {"role": "user", "content": _require_str(user, "user")},
         ],
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=20)
+        resp = requests.post(url, headers=headers, json=body, timeout=timeout_sec)
     except Exception as e:
-        raise CommentaryEngineError(f"OpenAI request failed: {e.__class__.__name__}") from e
+        raise CommentaryExternalError(f"OpenAI request failed (STRICT): {type(e).__name__}") from e
 
     if resp.status_code != 200:
-        # STRICT: no fallback. Raise with non-sensitive info.
         txt = (resp.text or "")[:500]
-        raise CommentaryEngineError(f"OpenAI HTTP {resp.status_code}: {txt}")
+        raise CommentaryExternalError(f"OpenAI HTTP {resp.status_code}: {txt}")
 
     try:
         data = resp.json()
     except Exception as e:
-        raise CommentaryEngineError(f"OpenAI invalid JSON: {e.__class__.__name__}") from e
+        raise CommentaryExternalError(f"OpenAI invalid JSON (STRICT): {type(e).__name__}") from e
+
+    if not isinstance(data, dict):
+        raise CommentaryContractError("OpenAI response must be dict (STRICT)")
 
     try:
         content = data["choices"][0]["message"]["content"]
-    except Exception:
-        raise CommentaryEngineError("OpenAI response missing choices[0].message.content")
+    except Exception as e:
+        raise CommentaryContractError("OpenAI response missing choices[0].message.content (STRICT)") from e
 
-    out = str(content or "").strip()
-    if not out:
-        raise CommentaryEngineError("OpenAI returned empty content")
+    out = _require_str(content, "openai.content")
     return out
 
 
-def generate_commentary_for_event(ev: Event) -> CommentaryItem:
+def generate_commentary_for_event(
+    ev: Event,
+    *,
+    settings: Optional[Any] = None,
+) -> CommentaryItem:
     """Generate commentary for a single event and store it in queue."""
+    st = _resolve_settings(settings)
     prompt = _build_prompt(ev)
-    text = _call_openai_chat(prompt["system"], prompt["user"])
+    text = _call_openai_chat(
+        settings=st,
+        system=prompt["system"],
+        user=prompt["user"],
+    )
+
+    model = _require_setting_str(st, "openai_model")
 
     item = CommentaryItem(
         ts_ms=_now_ms(),
-        event_id=ev.event_id,
-        event_type=ev.event_type,
-        symbol=str(prompt["symbol"]),
+        event_id=_require_str(ev.event_id, "event.event_id"),
+        event_type=_require_str(ev.event_type, "event.event_type"),
+        symbol=_require_str(prompt["symbol"], "prompt.symbol"),
         text=text,
-        meta={"source": "gpt", "model": _openai_model()},
+        meta={"source": "gpt", "model": model},
     )
     GLOBAL_COMMENTARY_QUEUE.push(item)
     return item
@@ -183,39 +263,27 @@ def generate_commentary_for_event(ev: Event) -> CommentaryItem:
 
 def handle_event(ev: Event) -> None:
     """Default subscriber hook: generates commentary for selected events only."""
-    # STRICT: if event is one of these, we require reason/symbol etc (validated earlier).
-    target_types = {
-        "on_entry_filled",
-        "on_exit_filled",
-        "on_slippage_block",
-        "on_risk_guard_trigger",
-        "on_tp_sl_reset_failed",
-        "on_exchange_sync_error",
-        "on_hold_update",
-    }
-    if ev.event_type not in target_types:
+    if not isinstance(ev, Event):
+        raise CommentaryContractError(f"ev must be Event (STRICT), got={type(ev).__name__}")
+
+    event_type = _require_str(ev.event_type, "event.event_type")
+    if event_type not in _TARGET_EVENT_TYPES:
         return
 
-    # No swallow; if it fails, crash and show error in Render logs.
+    # STRICT: 실패 시 예외 전파
     generate_commentary_for_event(ev)
 
 
 def init_commentary_engine() -> None:
     """Register event handlers. Call this once on startup."""
-    for et in [
-        "on_entry_filled",
-        "on_exit_filled",
-        "on_slippage_block",
-        "on_risk_guard_trigger",
-        "on_tp_sl_reset_failed",
-        "on_exchange_sync_error",
-        "on_hold_update",
-    ]:
+    for et in sorted(_TARGET_EVENT_TYPES):
         subscribe(et, handle_event)
 
 
 __all__ = [
-    "CommentaryEngineError",
+    "CommentaryConfigError",
+    "CommentaryContractError",
+    "CommentaryExternalError",
     "init_commentary_engine",
     "generate_commentary_for_event",
     "handle_event",

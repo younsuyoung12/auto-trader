@@ -23,9 +23,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - AI 분석 이벤트는 event_type='QUANT_ANALYSIS' 로 저장하며
   bt_events side 정책에 따라 side='CLOSE' 를 사용한다.
   report_type 은 source 에 저장한다.
+- 공통 STRICT 예외 계층을 사용한다.
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-13:
+  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  2) FIX(STRICT): regime/source 공백 문자열은 즉시 예외 처리
+  3) FIX(CONTRACT): is_test bool 계약 검증 추가
+  4) FIX(DB): DB insert 실패를 EventStoreDBError 로 분리
 - 2026-03-07:
   1) 헤더를 AI TRADING INTELLIGENCE SYSTEM 규약으로 정합화
   2) logging 추가(print 금지 정책 정합)
@@ -66,6 +72,7 @@ from typing import Any, Dict, Optional
 
 from sqlalchemy import text
 
+from common.exceptions_strict import StrictDBError, StrictDataError
 from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
@@ -75,57 +82,79 @@ _QUANT_ANALYSIS_EVENT_TYPE = "QUANT_ANALYSIS"
 _NON_TRADE_ANALYSIS_SIDE = "CLOSE"
 
 
+class EventStoreError(RuntimeError):
+    """event_store base error."""
+
+
+class EventStoreContractError(StrictDataError):
+    """bt_events payload / field contract violation."""
+
+
+class EventStoreDBError(StrictDBError):
+    """bt_events database write failure."""
+
+
 def _require_tz_aware_datetime(v: Any, name: str) -> datetime:
     if not isinstance(v, datetime):
-        raise RuntimeError(f"{name} must be datetime (STRICT)")
+        raise EventStoreContractError(f"{name} must be datetime (STRICT)")
     if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
-        raise RuntimeError(f"{name} must be timezone-aware datetime (STRICT)")
+        raise EventStoreContractError(f"{name} must be timezone-aware datetime (STRICT)")
     return v
 
 
 def _require_nonempty_str(v: Any, name: str) -> str:
-    s = str(v or "").strip()
+    if not isinstance(v, str):
+        raise EventStoreContractError(f"{name} must be str (STRICT), got={type(v).__name__}")
+    s = v.strip()
     if not s:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise EventStoreContractError(f"{name} is required (STRICT)")
     return s
 
 
 def _normalize_symbol(v: Any, name: str) -> str:
     s = _require_nonempty_str(v, name).replace("-", "").replace("/", "").upper().strip()
     if not s:
-        raise RuntimeError(f"{name} normalized empty (STRICT)")
+        raise EventStoreContractError(f"{name} normalized empty (STRICT)")
     return s
 
 
 def _optional_nonempty_str(v: Any, name: str) -> Optional[str]:
     if v is None:
         return None
-    s = str(v).strip()
+    if not isinstance(v, str):
+        raise EventStoreContractError(f"{name} must be str when provided (STRICT), got={type(v).__name__}")
+    s = v.strip()
     if not s:
-        return None
+        raise EventStoreContractError(f"{name} must not be blank when provided (STRICT)")
     return s
+
+
+def _require_bool(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise EventStoreContractError(f"{name} must be bool (STRICT)")
+    return bool(v)
 
 
 def _normalize_side(side: Any) -> str:
     s = str(side or "").upper().strip()
     if s in ("LONG", "SHORT", "CLOSE"):
         return s
-    raise RuntimeError("payload.side must be LONG/SHORT/CLOSE (STRICT)")
+    raise EventStoreContractError("payload.side must be LONG/SHORT/CLOSE (STRICT)")
 
 
 def _opt_float_strict(v: Any, name: str) -> Optional[float]:
     if v is None:
         return None
     if isinstance(v, str) and not v.strip():
-        return None
+        raise EventStoreContractError(f"{name} blank string is not allowed (STRICT)")
     if isinstance(v, bool):
-        raise RuntimeError(f"{name} must be numeric (bool not allowed) (STRICT)")
+        raise EventStoreContractError(f"{name} must be numeric (bool not allowed) (STRICT)")
     try:
         x = float(v)
     except Exception as e:
-        raise RuntimeError(f"{name} must be numeric: {e} (STRICT)") from e
+        raise EventStoreContractError(f"{name} must be numeric: {e} (STRICT)") from e
     if not math.isfinite(x):
-        raise RuntimeError(f"{name} must be finite (STRICT)")
+        raise EventStoreContractError(f"{name} must be finite (STRICT)")
     return float(x)
 
 
@@ -134,7 +163,7 @@ def _opt_positive_float_strict(v: Any, name: str) -> Optional[float]:
     if x is None:
         return None
     if x <= 0.0:
-        raise RuntimeError(f"{name} must be > 0 when provided (STRICT)")
+        raise EventStoreContractError(f"{name} must be > 0 when provided (STRICT)")
     return x
 
 
@@ -143,21 +172,23 @@ def _ensure_dict(v: Any, name: str) -> Dict[str, Any]:
         return {}
 
     if isinstance(v, dict):
-        return v
+        return dict(v)
 
     if isinstance(v, str):
         ss = v.strip()
         if not ss:
-            raise RuntimeError(f"{name} blank string is not allowed (STRICT)")
+            raise EventStoreContractError(f"{name} blank string is not allowed (STRICT)")
         try:
             obj = json.loads(ss)
         except Exception as e:
-            raise RuntimeError(f"{name} string must be valid JSON object: {e} (STRICT)") from e
+            raise EventStoreContractError(f"{name} string must be valid JSON object: {e} (STRICT)") from e
         if not isinstance(obj, dict):
-            raise RuntimeError(f"{name} JSON must decode to object/dict (STRICT)")
+            raise EventStoreContractError(f"{name} JSON must decode to object/dict (STRICT)")
         return obj
 
-    raise RuntimeError(f"{name} must be dict, JSON object string, or None (STRICT)")
+    raise EventStoreContractError(
+        f"{name} must be dict, JSON object string, or None (STRICT)"
+    )
 
 
 def _ensure_json_serializable_dict(v: Any, name: str) -> Dict[str, Any]:
@@ -165,7 +196,7 @@ def _ensure_json_serializable_dict(v: Any, name: str) -> Dict[str, Any]:
     try:
         json.dumps(obj, ensure_ascii=False)
     except (TypeError, ValueError) as e:
-        raise RuntimeError(f"{name} must be JSON serializable object: {e} (STRICT)") from e
+        raise EventStoreContractError(f"{name} must be JSON serializable object: {e} (STRICT)") from e
     return obj
 
 
@@ -201,6 +232,8 @@ def _insert_bt_event(
 
     regime_norm = _optional_nonempty_str(regime, "regime")
     source_norm = _optional_nonempty_str(source, "source")
+    extra_norm = _ensure_json_serializable_dict(extra, "extra")
+    is_test_bool = _require_bool(is_test, "is_test")
     kst_date, kst_hour = _kst_date_hour(ts)
 
     sql = text(
@@ -236,8 +269,8 @@ def _insert_bt_event(
         "risk_pct": risk_pct,
         "pnl_pct": pnl_pct,
         "reason": rsn,
-        "extra_json": json.dumps(extra, ensure_ascii=False),
-        "is_test": bool(is_test),
+        "extra_json": json.dumps(extra_norm, ensure_ascii=False),
+        "is_test": is_test_bool,
     }
 
     try:
@@ -253,7 +286,9 @@ def _insert_bt_event(
             sd,
             e.__class__.__name__,
         )
-        raise
+        raise EventStoreDBError(
+            f"bt_events insert failed (STRICT): event_type={et} symbol={sym} source={source_norm} side={sd}"
+        ) from e
 
 
 def record_event_db(
@@ -303,7 +338,7 @@ def record_event_db(
         pnl_pct=_opt_float_strict(pnl_pct, "pnl_pct"),
         reason=reason,
         extra=extra,
-        is_test=is_test,
+        is_test=_require_bool(is_test, "is_test"),
     )
 
 
@@ -323,18 +358,13 @@ def record_quant_analysis_event_db(
     저장 규칙:
     - event_type = QUANT_ANALYSIS
     - source     = report_type
-    - side       = CLOSE  (bt_events side 정책 준수용 비거래 분석 이벤트 표준값)
+    - side       = CLOSE
     - extra_json = 분석 payload 전체(JSON object)
-
-    report_type 예:
-    - market_report
-    - system_report
-    - dashboard_query
     """
     report_type_norm = _require_nonempty_str(report_type, "report_type")
     payload = _ensure_json_serializable_dict(analysis_payload, "analysis_payload")
     if not payload:
-        raise RuntimeError("analysis_payload must not be empty (STRICT)")
+        raise EventStoreContractError("analysis_payload must not be empty (STRICT)")
 
     _insert_bt_event(
         ts_utc=ts_utc,
@@ -352,11 +382,14 @@ def record_quant_analysis_event_db(
         pnl_pct=None,
         reason=reason,
         extra=payload,
-        is_test=is_test,
+        is_test=_require_bool(is_test, "is_test"),
     )
 
 
 __all__ = [
+    "EventStoreError",
+    "EventStoreContractError",
+    "EventStoreDBError",
     "record_event_db",
     "record_quant_analysis_event_db",
 ]

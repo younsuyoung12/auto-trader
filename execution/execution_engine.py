@@ -6,6 +6,7 @@ ROLE:
 - 실행 직전 계약(symbol/action/source/qty/tp/sl/client_order_id)을 엄격 검증한다
 - Trade 반환 계약을 검증해 상위 엔진에 안전한 실행 결과만 전달한다
 - 명시적으로 식별 가능한 거래소 비치명 주문 거절은 "트레이드 스킵"으로 정규화한다
+- 실행 성공 후 State Layer(DB insert)와 Execution Quality snapshot 생성을 수행한다
 
 CORE RESPONSIBILITIES:
 - Signal / mapping / dataclass 입력 정규화
@@ -13,6 +14,8 @@ CORE RESPONSIBILITIES:
 - entry execution request strict contract 생성
 - order_executor.open_position_with_tp_sl() 호출
 - Trade 반환 계약 검증
+- bt_trades INSERT 및 trade.db_id 연결
+- execution quality snapshot 생성 및 trade 객체에 부착
 - 명시적 비치명 주문 거절(-2019) 감지 및 None 반환
 
 IMPORTANT POLICY:
@@ -25,8 +28,15 @@ IMPORTANT POLICY:
 - 주문 실행 / 체결 검증 / 보호주문 검증의 실제 SSOT 는 order_executor 이다
 - 단, 거래소가 명시적으로 "주문 자체를 거절"한 비치명 사유는 시스템 치명 오류로 승격하지 않는다
 - 현재 비치명 주문 거절로 허용하는 케이스는 Binance code=-2019 (Margin is insufficient) 뿐이다
+- state_writer / execution_quality_engine 연결 실패는 즉시 예외 처리한다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FEAT(STATE): execution.state_writer.insert_trade_row() 정식 연결
+  2) FEAT(QUALITY): execution.execution_quality_engine execution snapshot 생성/부착 추가
+  3) FEAT(FSM): execution.order_state.OrderState 기반 lifecycle 상태 기록 추가
+  4) FIX(STRICT): trade.meta dict strict 정규화 및 execution snapshot 저장 추가
+  5) FIX(STRICT): state persistence / quality snapshot 실패 시 즉시 예외 처리
 - 2026-03-11:
   1) FIX(STRICT): qty sizing 시 settings.max_leverage 기본값 fallback 제거
   2) FIX(STRICT): qty sizing 시 settings.execution_price_slippage_guard 기본값 fallback 제거
@@ -57,10 +67,14 @@ import logging
 import math
 import re
 from dataclasses import asdict, dataclass, is_dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
 
+from execution.execution_quality_engine import (
+    ExecutionQualityError,
+    build_execution_quality_snapshot,
+)
 from execution.order_executor import (
     OrderExecutionError,
     OrderFillTimeoutError,
@@ -79,6 +93,8 @@ from execution.order_executor import (
     place_market,
     set_tp_sl,
 )
+from execution.order_state import OrderState
+from execution.state_writer import StateWriterError, insert_trade_row
 from settings import load_settings
 from state.trader_state import Trade
 
@@ -831,6 +847,163 @@ def _validate_trade_contract_strict(trade: Trade, req: EntryExecutionRequest) ->
             )
 
 
+def _extract_optional_regime_strict(signal: Any, req: EntryExecutionRequest) -> str:
+    signal_map = _signal_to_mapping_strict(signal)
+    meta_map = _meta_to_mapping_strict(signal_map)
+    search_spaces = (("signal", signal_map), ("signal.meta", meta_map))
+
+    regime = _extract_normalized_value_strict(
+        search_spaces=search_spaces,
+        field_name="regime",
+        aliases=("regime", "market_regime", "regime_at_entry"),
+        normalizer=_normalize_source_strict,
+        required=False,
+    )
+    if regime is None:
+        return req.source
+    return regime
+
+
+def _trade_entry_ts_ms_strict(trade: Trade) -> int:
+    entry_ts = getattr(trade, "entry_ts", None)
+    if not isinstance(entry_ts, datetime):
+        raise OrderExecutionError("Trade.entry_ts must be datetime (STRICT)")
+    if entry_ts.tzinfo is None or entry_ts.utcoffset() is None:
+        raise OrderExecutionError("Trade.entry_ts must be timezone-aware (STRICT)")
+    ts_ms = int(entry_ts.astimezone(timezone.utc).timestamp() * 1000)
+    if ts_ms <= 0:
+        raise OrderExecutionError("Trade.entry_ts converted ts_ms invalid (STRICT)")
+    return ts_ms
+
+
+def _ensure_trade_meta_dict_strict(trade: Trade) -> dict[str, Any]:
+    meta = getattr(trade, "meta", None)
+    if meta is None:
+        try:
+            setattr(trade, "meta", {})
+        except Exception as e:
+            raise OrderExecutionError("Trade.meta missing and cannot be initialized (STRICT)") from e
+        meta = getattr(trade, "meta", None)
+
+    if not isinstance(meta, dict):
+        raise OrderExecutionError("Trade.meta must be dict when present (STRICT)")
+    return meta
+
+
+def _set_trade_attr_strict(trade: Trade, attr_name: str, value: Any) -> None:
+    try:
+        setattr(trade, attr_name, value)
+    except Exception as e:
+        raise OrderExecutionError(f"failed to set trade.{attr_name} (STRICT)") from e
+
+
+def _set_trade_order_state_strict(trade: Trade, state: OrderState) -> None:
+    if not isinstance(state, OrderState):
+        raise OrderExecutionError("state must be OrderState (STRICT)")
+    _set_trade_attr_strict(trade, "order_state", state.value)
+
+
+def _persist_trade_strict(
+    *,
+    trade: Trade,
+    req: EntryExecutionRequest,
+    settings: Any,
+    signal: Any,
+) -> None:
+    leverage = _normalize_positive_float_strict(
+        _require_settings_value_strict(settings, "leverage"),
+        field_name="settings.leverage",
+    )
+
+    regime_at_entry = _extract_optional_regime_strict(signal, req)
+    strategy = req.source
+    ts_ms = _trade_entry_ts_ms_strict(trade)
+
+    try:
+        insert_trade_row(
+            trade=trade,
+            symbol=req.symbol,
+            ts_ms=ts_ms,
+            regime_at_entry=regime_at_entry,
+            strategy=strategy,
+            risk_pct=req.risk_pct if req.risk_pct is not None else req.tp_pct,
+            tp_pct=req.tp_pct,
+            sl_pct=req.sl_pct,
+            leverage=leverage,
+        )
+    except StateWriterError as e:
+        raise OrderExecutionError(f"state_writer insert failed (STRICT): {e}") from e
+    except Exception as e:
+        raise OrderExecutionError(f"state_writer unexpected failure (STRICT): {e}") from e
+
+
+def _extract_post_prices_optional_strict(signal: Any) -> Optional[dict[str, float]]:
+    signal_map = _signal_to_mapping_strict(signal)
+    meta_map = _meta_to_mapping_strict(signal_map)
+    search_spaces = (("signal", signal_map), ("signal.meta", meta_map))
+
+    post_prices = _extract_normalized_value_strict(
+        search_spaces=search_spaces,
+        field_name="execution_post_prices",
+        aliases=("execution_post_prices", "execution_quality_post_prices", "post_prices"),
+        normalizer=lambda v: v,
+        required=False,
+    )
+    if post_prices is None:
+        return None
+
+    if not isinstance(post_prices, Mapping):
+        raise OrderExecutionError("execution_post_prices must be mapping (STRICT)")
+
+    required_keys = ("t+1s", "t+3s", "t+5s")
+    out: dict[str, float] = {}
+    for key in required_keys:
+        if key not in post_prices:
+            raise OrderExecutionError(f"execution_post_prices missing key: {key} (STRICT)")
+        out[key] = _normalize_positive_float_strict(post_prices[key], field_name=f"execution_post_prices[{key}]")
+
+    return out
+
+
+def _attach_execution_quality_snapshot_if_available_strict(
+    *,
+    trade: Trade,
+    req: EntryExecutionRequest,
+    signal: Any,
+) -> None:
+    post_prices = _extract_post_prices_optional_strict(signal)
+    if post_prices is None:
+        return
+
+    entry_price_raw = getattr(trade, "entry_price", None)
+    if entry_price_raw is None:
+        entry_price_raw = getattr(trade, "entry", None)
+    filled_avg_price = _normalize_positive_float_strict(
+        entry_price_raw,
+        field_name="trade.entry_price",
+    )
+
+    try:
+        snapshot = build_execution_quality_snapshot(
+            symbol=req.symbol,
+            side=req.side_open,
+            expected_price=req.entry_price_hint,
+            filled_avg_price=filled_avg_price,
+            post_prices=post_prices,
+        )
+    except ExecutionQualityError as e:
+        raise OrderExecutionError(f"execution quality build failed (STRICT): {e}") from e
+    except Exception as e:
+        raise OrderExecutionError(f"execution quality unexpected failure (STRICT): {e}") from e
+
+    meta = _ensure_trade_meta_dict_strict(trade)
+    if "execution_quality" in meta:
+        raise OrderExecutionError("trade.meta.execution_quality already exists (STRICT)")
+    meta["execution_quality"] = snapshot
+
+    _set_trade_attr_strict(trade, "execution_quality_status", "ATTACHED")
+
+
 class ExecutionEngine:
     """
     Entry execution orchestrator.
@@ -915,16 +1088,30 @@ class ExecutionEngine:
             raise OrderExecutionError("open_position_with_tp_sl returned None (STRICT)")
 
         _validate_trade_contract_strict(trade, req)
+        _set_trade_order_state_strict(trade, OrderState.FILLED)
+        _persist_trade_strict(
+            trade=trade,
+            req=req,
+            settings=self._settings,
+            signal=signal,
+        )
+        _attach_execution_quality_snapshot_if_available_strict(
+            trade=trade,
+            req=req,
+            signal=signal,
+        )
 
         logger.info(
             "ExecutionEngine.execute success "
-            "(symbol=%s side=%s qty=%s entry=%s entry_order_id=%s client_entry_id=%s)",
+            "(symbol=%s side=%s qty=%s entry=%s entry_order_id=%s client_entry_id=%s db_id=%s order_state=%s)",
             getattr(trade, "symbol", None),
             getattr(trade, "side", None),
             getattr(trade, "qty", None),
             getattr(trade, "entry_price", getattr(trade, "entry", None)),
             getattr(trade, "entry_order_id", None),
             getattr(trade, "client_entry_id", None),
+            getattr(trade, "db_id", None),
+            getattr(trade, "order_state", None),
         )
         return trade
 

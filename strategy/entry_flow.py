@@ -24,6 +24,11 @@ IMPORTANT POLICY:
 - 최종 authoritative 실행 가격은 상위 계층(run_bot_ws)이 주입/정합화한다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  2) FEAT(CONTRACT): EntryFlowDecision.__post_init__ 추가로 action/direction/reason/reasons/numeric 계약 검증 강화
+  3) FIX(STRICT): settings/features 오류를 Config/Data/State 계층으로 분리
+  4) FIX(STRICT): Signal.meta 및 quant decision 정합성 검증 강화
 - 2026-03-10:
   1) FIX(CONTRACT): Signal.meta 에 entry_price_hint / entry_price_source 기본 계약 추가
   2) FIX(STRICT): quant_final_decision 값/계산 decision 불일치 시 즉시 예외 처리
@@ -42,12 +47,29 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from common.exceptions_strict import (
+    StrictConfigError,
+    StrictDataError,
+    StrictStateError,
+)
 from strategy.signal import Signal
 
 
 _ALLOWED_DIRECTIONS = ("LONG", "SHORT")
 _ALLOWED_ACTIONS = ("ENTER", "SKIP")
 _ALLOWED_QUANT_FINAL_DECISIONS = ("ENTER", "SKIP")
+
+
+class EntryFlowConfigError(StrictConfigError):
+    """settings 계약 위반."""
+
+
+class EntryFlowContractError(StrictDataError):
+    """features / signal / decision 계약 위반."""
+
+
+class EntryFlowStateError(StrictStateError):
+    """decision / quant state 불일치."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +84,37 @@ class EntryFlowDecision:
     trend_strength: float
     spread: float
     orderbook_imbalance: float
+
+    def __post_init__(self) -> None:
+        action = _require_action(self.action, "decision.action")
+        direction = _require_direction(self.direction, "decision.direction")
+        reason = _require_nonempty_str(self.reason, "decision.reason")
+        summary = _require_nonempty_str(self.summary, "decision.summary")
+
+        if not isinstance(self.reasons, list):
+            raise EntryFlowContractError("decision.reasons must be list[str] (STRICT)")
+        if not self.reasons:
+            raise EntryFlowContractError("decision.reasons must not be empty (STRICT)")
+        normalized_reasons: List[str] = []
+        for idx, item in enumerate(self.reasons):
+            normalized_reasons.append(_require_nonempty_str(item, f"decision.reasons[{idx}]"))
+
+        entry_score = _require_float(self.entry_score, "decision.entry_score")
+        threshold = _require_float(self.threshold, "decision.threshold")
+        trend_strength = _require_float(self.trend_strength, "decision.trend_strength")
+        spread = _require_float(self.spread, "decision.spread", min_value=0.0)
+        orderbook_imbalance = _require_float(self.orderbook_imbalance, "decision.orderbook_imbalance")
+
+        object.__setattr__(self, "action", action)
+        object.__setattr__(self, "direction", direction)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "summary", summary)
+        object.__setattr__(self, "reasons", normalized_reasons)
+        object.__setattr__(self, "entry_score", entry_score)
+        object.__setattr__(self, "threshold", threshold)
+        object.__setattr__(self, "trend_strength", trend_strength)
+        object.__setattr__(self, "spread", spread)
+        object.__setattr__(self, "orderbook_imbalance", orderbook_imbalance)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -80,55 +133,58 @@ class EntryFlowDecision:
 
 def _require_mapping(value: Any, name: str) -> Dict[str, Any]:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
-    return dict(value)
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
+    if not isinstance(value, Mapping):
+        raise EntryFlowContractError(f"{name} must be mapping (STRICT), got={type(value).__name__}")
+    data = dict(value)
+    if not data:
+        raise EntryFlowContractError(f"{name} must not be empty (STRICT)")
+    return data
 
 
 def _require_nonempty_str(value: Any, name: str) -> str:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
     if not isinstance(value, str):
-        raise RuntimeError(f"{name} must be str (STRICT), got={type(value).__name__}")
+        raise EntryFlowContractError(f"{name} must be str (STRICT), got={type(value).__name__}")
     s = value.strip()
     if not s:
-        raise RuntimeError(f"{name} must not be empty (STRICT)")
+        raise EntryFlowContractError(f"{name} must not be empty (STRICT)")
     return s
 
 
 def _require_direction(value: Any, name: str) -> str:
     direction = _require_nonempty_str(value, name).upper()
     if direction not in _ALLOWED_DIRECTIONS:
-        raise RuntimeError(f"{name} must be LONG/SHORT (STRICT)")
+        raise EntryFlowContractError(f"{name} must be LONG/SHORT (STRICT)")
     return direction
 
 
 def _require_action(value: Any, name: str) -> str:
     action = _require_nonempty_str(value, name).upper()
     if action not in _ALLOWED_ACTIONS:
-        raise RuntimeError(f"{name} must be ENTER/SKIP (STRICT)")
+        raise EntryFlowContractError(f"{name} must be ENTER/SKIP (STRICT)")
     return action
 
 
 def _require_quant_final_decision(value: Any, name: str) -> str:
     decision = _require_nonempty_str(value, name).upper()
     if decision not in _ALLOWED_QUANT_FINAL_DECISIONS:
-        raise RuntimeError(f"{name} must be ENTER/SKIP (STRICT)")
+        raise EntryFlowContractError(f"{name} must be ENTER/SKIP (STRICT)")
     return decision
 
 
 def _require_int(value: Any, name: str) -> int:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
     if isinstance(value, bool):
-        raise RuntimeError(f"{name} must be int (STRICT), bool not allowed")
+        raise EntryFlowContractError(f"{name} must be int (STRICT), bool not allowed")
     try:
         iv = int(value)
     except Exception as exc:
-        raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
+        raise EntryFlowContractError(f"{name} must be int (STRICT): {exc}") from exc
     if iv <= 0:
-        raise RuntimeError(f"{name} must be > 0 (STRICT)")
+        raise EntryFlowContractError(f"{name} must be > 0 (STRICT)")
     return iv
 
 
@@ -140,19 +196,19 @@ def _require_float(
     max_value: Optional[float] = None,
 ) -> float:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
     if isinstance(value, bool):
-        raise RuntimeError(f"{name} must be numeric (STRICT), bool not allowed")
+        raise EntryFlowContractError(f"{name} must be numeric (STRICT), bool not allowed")
     try:
         fv = float(value)
     except Exception as exc:
-        raise RuntimeError(f"{name} must be numeric (STRICT): {exc}") from exc
+        raise EntryFlowContractError(f"{name} must be numeric (STRICT): {exc}") from exc
     if not math.isfinite(fv):
-        raise RuntimeError(f"{name} must be finite (STRICT)")
+        raise EntryFlowContractError(f"{name} must be finite (STRICT)")
     if min_value is not None and fv < min_value:
-        raise RuntimeError(f"{name} must be >= {min_value} (STRICT)")
+        raise EntryFlowContractError(f"{name} must be >= {min_value} (STRICT)")
     if max_value is not None and fv > max_value:
-        raise RuntimeError(f"{name} must be <= {max_value} (STRICT)")
+        raise EntryFlowContractError(f"{name} must be <= {max_value} (STRICT)")
     return fv
 
 
@@ -170,19 +226,19 @@ def _optional_float(
 
 def _require_list(value: Any, name: str) -> list:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
     if not isinstance(value, list):
-        raise RuntimeError(f"{name} must be list (STRICT), got={type(value).__name__}")
+        raise EntryFlowContractError(f"{name} must be list (STRICT), got={type(value).__name__}")
     if not value:
-        raise RuntimeError(f"{name} must not be empty (STRICT)")
+        raise EntryFlowContractError(f"{name} must not be empty (STRICT)")
     return value
 
 
 def _optional_dict(value: Any, name: str) -> Optional[Dict[str, Any]]:
     if value is None:
         return None
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{name} must be dict when provided (STRICT)")
+    if not isinstance(value, Mapping):
+        raise EntryFlowContractError(f"{name} must be mapping when provided (STRICT)")
     return dict(value)
 
 
@@ -211,8 +267,10 @@ def _read_setting_float(
     min_value: Optional[float] = None,
     max_value: Optional[float] = None,
 ) -> float:
+    if settings is None:
+        raise EntryFlowConfigError("settings is required (STRICT)")
     if not hasattr(settings, key):
-        raise RuntimeError(f"settings.{key} is required (STRICT)")
+        raise EntryFlowConfigError(f"settings.{key} is required (STRICT)")
     return _require_float(getattr(settings, key), f"settings.{key}", min_value=min_value, max_value=max_value)
 
 
@@ -225,7 +283,7 @@ def _validate_core_feature_contract(features: Mapping[str, Any]) -> None:
 
     last_price = _read_feature_float(features, "last_price", min_value=0.0)
     if last_price <= 0.0:
-        raise RuntimeError("features.last_price must be > 0 (STRICT)")
+        raise EntryFlowContractError("features.last_price must be > 0 (STRICT)")
 
     _require_list(features.get("candles_5m"), "features.candles_5m")
     _require_list(features.get("candles_5m_raw"), "features.candles_5m_raw")
@@ -235,13 +293,13 @@ def _validate_core_feature_contract(features: Mapping[str, Any]) -> None:
     dd_pct = _read_feature_float(features, "dd_pct", min_value=0.0, max_value=100.0)
 
     if equity_current_usdt <= 0.0:
-        raise RuntimeError("features.equity_current_usdt must be > 0 (STRICT)")
+        raise EntryFlowContractError("features.equity_current_usdt must be > 0 (STRICT)")
     if equity_peak_usdt <= 0.0:
-        raise RuntimeError("features.equity_peak_usdt must be > 0 (STRICT)")
+        raise EntryFlowContractError("features.equity_peak_usdt must be > 0 (STRICT)")
     if equity_current_usdt > equity_peak_usdt:
-        raise RuntimeError("features.equity_current_usdt must be <= equity_peak_usdt (STRICT)")
+        raise EntryFlowContractError("features.equity_current_usdt must be <= equity_peak_usdt (STRICT)")
     if dd_pct > 0.0 and equity_current_usdt == equity_peak_usdt:
-        raise RuntimeError("features.dd_pct > 0 but equity_current_usdt == equity_peak_usdt (STRICT)")
+        raise EntryFlowStateError("features.dd_pct > 0 but equity_current_usdt == equity_peak_usdt (STRICT)")
 
     _read_feature_float(features, "entry_score")
     _read_feature_float(features, "trend_strength")
@@ -258,7 +316,7 @@ def _validate_quant_contract(features: Mapping[str, Any], decision_action: str) 
         "features.quant_final_decision",
     )
     if quant_final_decision != decision_action:
-        raise RuntimeError(
+        raise EntryFlowStateError(
             "features.quant_final_decision conflicts with computed entry decision "
             f"(STRICT): quant_final_decision={quant_final_decision} decision_action={decision_action}"
         )
@@ -271,7 +329,7 @@ def evaluate_entry_flow_strict(
 ) -> EntryFlowDecision:
     f = _require_mapping(features, "features")
     if settings is None:
-        raise RuntimeError("settings is required (STRICT)")
+        raise EntryFlowConfigError("settings is required (STRICT)")
 
     _validate_core_feature_contract(f)
 
@@ -414,7 +472,7 @@ def build_entry_signal_strict(
 ) -> Signal:
     f = _require_mapping(features, "features")
     if settings is None:
-        raise RuntimeError("settings is required (STRICT)")
+        raise EntryFlowConfigError("settings is required (STRICT)")
 
     _validate_core_feature_contract(f)
 
@@ -428,11 +486,11 @@ def build_entry_signal_strict(
     entry_risk_pct = _read_setting_float(settings, "entry_risk_pct", min_value=0.0, max_value=1.0)
 
     if entry_tp_pct <= 0.0:
-        raise RuntimeError("settings.entry_tp_pct must be > 0 (STRICT)")
+        raise EntryFlowConfigError("settings.entry_tp_pct must be > 0 (STRICT)")
     if entry_sl_pct <= 0.0:
-        raise RuntimeError("settings.entry_sl_pct must be > 0 (STRICT)")
+        raise EntryFlowConfigError("settings.entry_sl_pct must be > 0 (STRICT)")
     if entry_risk_pct <= 0.0:
-        raise RuntimeError("settings.entry_risk_pct must be > 0 (STRICT)")
+        raise EntryFlowConfigError("settings.entry_risk_pct must be > 0 (STRICT)")
 
     guard_adjustments = _optional_dict(f.get("guard_adjustments"), "features.guard_adjustments")
     meta = _build_signal_meta_strict(
@@ -454,6 +512,9 @@ def build_entry_signal_strict(
 
 
 __all__ = [
+    "EntryFlowConfigError",
+    "EntryFlowContractError",
+    "EntryFlowStateError",
     "EntryFlowDecision",
     "evaluate_entry_flow_strict",
     "build_entry_signal_strict",

@@ -25,8 +25,15 @@ IMPORTANT POLICY:
 - direction / action / reason / summary 는 공백 불가
 - trend_strength 는 방향 없는 강도값으로 취급한다
 - SHORT 반전 판정에서 음수 threshold 비교를 사용하지 않는다
+- 이 파일은 보조 판단/설명용 EXIT decision 엔진이다.
+- 실제 청산 SSOT는 state/exit_engine.py 이다.
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  2) FIX(CONTRACT): ExitFlowDecision / feature / setting 검증을 Config/Data/State 계층으로 분리
+  3) FIX(ARCH): strategy/exit_engine 는 decision payload 전용 레이어임을 명시
+  4) FIX(STRICT): payload builder 계약 검증 강화
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): SHORT 반전 판정 버그 수정, trend_strength 를 unsigned strength 로 일관 처리
   2) FIX(STRICT): ExitFlowDecision.__post_init__ 추가로 action/reason/reasons/string/numeric 계약 검증
@@ -38,6 +45,12 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from common.exceptions_strict import (
+    StrictConfigError,
+    StrictDataError,
+    StrictStateError,
+)
+
 
 _ALLOWED_DIRECTIONS: Tuple[str, ...] = ("LONG", "SHORT")
 _ALLOWED_ACTIONS: Tuple[str, ...] = ("HOLD", "EXIT")
@@ -47,6 +60,18 @@ _ALLOWED_REASON_CODES: Tuple[str, ...] = (
     "EXIT_SIGNAL",
     "HOLD",
 )
+
+
+class ExitFlowConfigError(StrictConfigError):
+    """settings 계약 위반."""
+
+
+class ExitFlowContractError(StrictDataError):
+    """features / payload / decision 계약 위반."""
+
+
+class ExitFlowStateError(StrictStateError):
+    """decision 상태/불변식 위반."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,12 +104,12 @@ class ExitFlowDecision:
     def __post_init__(self) -> None:
         action = _require_nonempty_str(self.action, "decision.action").upper()
         if action not in _ALLOWED_ACTIONS:
-            raise RuntimeError(f"decision.action must be one of {_ALLOWED_ACTIONS} (STRICT)")
+            raise ExitFlowContractError(f"decision.action must be one of {_ALLOWED_ACTIONS} (STRICT)")
         object.__setattr__(self, "action", action)
 
         reason_code = _require_nonempty_str(self.reason_code, "decision.reason_code").upper()
         if reason_code not in _ALLOWED_REASON_CODES:
-            raise RuntimeError(f"decision.reason_code must be one of {_ALLOWED_REASON_CODES} (STRICT)")
+            raise ExitFlowContractError(f"decision.reason_code must be one of {_ALLOWED_REASON_CODES} (STRICT)")
         object.__setattr__(self, "reason_code", reason_code)
 
         direction = _require_direction(self.direction, "decision.direction")
@@ -101,9 +126,9 @@ class ExitFlowDecision:
         object.__setattr__(self, "symbol", symbol)
 
         if not isinstance(self.reasons, list):
-            raise RuntimeError("decision.reasons must be list[str] (STRICT)")
+            raise ExitFlowContractError("decision.reasons must be list[str] (STRICT)")
         if not self.reasons:
-            raise RuntimeError("decision.reasons must not be empty (STRICT)")
+            raise ExitFlowContractError("decision.reasons must not be empty (STRICT)")
         normalized_reasons: List[str] = []
         for idx, reason in enumerate(self.reasons):
             normalized_reasons.append(_require_nonempty_str(reason, f"decision.reasons[{idx}]"))
@@ -125,22 +150,22 @@ class ExitFlowDecision:
         _require_float(self.position_qty, "decision.position_qty", min_value=0.0)
 
         if self.entry_price <= 0.0:
-            raise RuntimeError("decision.entry_price must be > 0 (STRICT)")
+            raise ExitFlowContractError("decision.entry_price must be > 0 (STRICT)")
         if self.current_price <= 0.0:
-            raise RuntimeError("decision.current_price must be > 0 (STRICT)")
+            raise ExitFlowContractError("decision.current_price must be > 0 (STRICT)")
         if self.target_price <= 0.0:
-            raise RuntimeError("decision.target_price must be > 0 (STRICT)")
+            raise ExitFlowContractError("decision.target_price must be > 0 (STRICT)")
         if self.stop_price <= 0.0:
-            raise RuntimeError("decision.stop_price must be > 0 (STRICT)")
+            raise ExitFlowContractError("decision.stop_price must be > 0 (STRICT)")
         if self.position_qty <= 0.0:
-            raise RuntimeError("decision.position_qty must be > 0 (STRICT)")
+            raise ExitFlowContractError("decision.position_qty must be > 0 (STRICT)")
 
         if self.holding_seconds is not None:
             _require_float(self.holding_seconds, "decision.holding_seconds", min_value=0.0)
         if self.mark_price is not None:
             _require_float(self.mark_price, "decision.mark_price", min_value=0.0)
             if self.mark_price <= 0.0:
-                raise RuntimeError("decision.mark_price must be > 0 when provided (STRICT)")
+                raise ExitFlowContractError("decision.mark_price must be > 0 when provided (STRICT)")
         if self.decision_id is not None:
             _require_nonempty_str(self.decision_id, "decision.decision_id")
 
@@ -175,20 +200,23 @@ class ExitFlowDecision:
 
 def _require_mapping(value: Any, name: str) -> Dict[str, Any]:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
-    if not isinstance(value, dict):
-        raise RuntimeError(f"{name} must be dict (STRICT), got={type(value).__name__}")
-    return dict(value)
+        raise ExitFlowContractError(f"{name} is required (STRICT)")
+    if not isinstance(value, Mapping):
+        raise ExitFlowContractError(f"{name} must be mapping (STRICT), got={type(value).__name__}")
+    data = dict(value)
+    if not data:
+        raise ExitFlowContractError(f"{name} must not be empty (STRICT)")
+    return data
 
 
 def _require_nonempty_str(value: Any, name: str) -> str:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise ExitFlowContractError(f"{name} is required (STRICT)")
     if not isinstance(value, str):
-        raise RuntimeError(f"{name} must be str (STRICT), got={type(value).__name__}")
+        raise ExitFlowContractError(f"{name} must be str (STRICT), got={type(value).__name__}")
     s = value.strip()
     if not s:
-        raise RuntimeError(f"{name} must not be empty (STRICT)")
+        raise ExitFlowContractError(f"{name} must not be empty (STRICT)")
     return s
 
 
@@ -196,31 +224,31 @@ def _optional_nonempty_str(value: Any, name: str) -> Optional[str]:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise RuntimeError(f"{name} must be str when provided (STRICT), got={type(value).__name__}")
+        raise ExitFlowContractError(f"{name} must be str when provided (STRICT), got={type(value).__name__}")
     s = value.strip()
     if not s:
-        raise RuntimeError(f"{name} must not be blank when provided (STRICT)")
+        raise ExitFlowContractError(f"{name} must not be blank when provided (STRICT)")
     return s
 
 
 def _require_direction(value: Any, name: str) -> str:
     direction = _require_nonempty_str(value, name).upper()
     if direction not in _ALLOWED_DIRECTIONS:
-        raise RuntimeError(f"{name} must be LONG/SHORT (STRICT)")
+        raise ExitFlowContractError(f"{name} must be LONG/SHORT (STRICT)")
     return direction
 
 
 def _require_positive_int(value: Any, name: str) -> int:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise ExitFlowContractError(f"{name} is required (STRICT)")
     if isinstance(value, bool):
-        raise RuntimeError(f"{name} must be int (STRICT), bool not allowed")
+        raise ExitFlowContractError(f"{name} must be int (STRICT), bool not allowed")
     try:
         iv = int(value)
     except Exception as exc:
-        raise RuntimeError(f"{name} must be int (STRICT): {exc}") from exc
+        raise ExitFlowContractError(f"{name} must be int (STRICT): {exc}") from exc
     if iv <= 0:
-        raise RuntimeError(f"{name} must be > 0 (STRICT)")
+        raise ExitFlowContractError(f"{name} must be > 0 (STRICT)")
     return iv
 
 
@@ -232,19 +260,19 @@ def _require_float(
     max_value: Optional[float] = None,
 ) -> float:
     if value is None:
-        raise RuntimeError(f"{name} is required (STRICT)")
+        raise ExitFlowContractError(f"{name} is required (STRICT)")
     if isinstance(value, bool):
-        raise RuntimeError(f"{name} must be numeric (STRICT), bool not allowed")
+        raise ExitFlowContractError(f"{name} must be numeric (STRICT), bool not allowed")
     try:
         fv = float(value)
     except Exception as exc:
-        raise RuntimeError(f"{name} must be numeric (STRICT): {exc}") from exc
+        raise ExitFlowContractError(f"{name} must be numeric (STRICT): {exc}") from exc
     if not math.isfinite(fv):
-        raise RuntimeError(f"{name} must be finite (STRICT)")
+        raise ExitFlowContractError(f"{name} must be finite (STRICT)")
     if min_value is not None and fv < min_value:
-        raise RuntimeError(f"{name} must be >= {min_value} (STRICT)")
+        raise ExitFlowContractError(f"{name} must be >= {min_value} (STRICT)")
     if max_value is not None and fv > max_value:
-        raise RuntimeError(f"{name} must be <= {max_value} (STRICT)")
+        raise ExitFlowContractError(f"{name} must be <= {max_value} (STRICT)")
     return fv
 
 
@@ -290,9 +318,9 @@ def _read_setting_float(
     max_value: Optional[float] = None,
 ) -> float:
     if settings is None:
-        raise RuntimeError("settings is required (STRICT)")
+        raise ExitFlowConfigError("settings is required (STRICT)")
     if not hasattr(settings, key):
-        raise RuntimeError(f"settings.{key} is required (STRICT)")
+        raise ExitFlowConfigError(f"settings.{key} is required (STRICT)")
     return _require_float(getattr(settings, key), f"settings.{key}", min_value=min_value, max_value=max_value)
 
 
@@ -305,13 +333,13 @@ def _calc_prices_and_pnl_pct(
     sl_pct: float,
 ) -> Tuple[float, float, float]:
     if entry_price <= 0.0:
-        raise RuntimeError("entry_price must be > 0 (STRICT)")
+        raise ExitFlowContractError("entry_price must be > 0 (STRICT)")
     if current_price <= 0.0:
-        raise RuntimeError("current_price must be > 0 (STRICT)")
+        raise ExitFlowContractError("current_price must be > 0 (STRICT)")
     if tp_pct <= 0.0:
-        raise RuntimeError("tp_pct must be > 0 (STRICT)")
+        raise ExitFlowContractError("tp_pct must be > 0 (STRICT)")
     if sl_pct <= 0.0:
-        raise RuntimeError("sl_pct must be > 0 (STRICT)")
+        raise ExitFlowContractError("sl_pct must be > 0 (STRICT)")
 
     d = _require_direction(direction, "direction")
 
@@ -325,7 +353,7 @@ def _calc_prices_and_pnl_pct(
         stop_price = entry_price * (1.0 + sl_pct)
 
     if target_price <= 0.0 or stop_price <= 0.0:
-        raise RuntimeError("target_price/stop_price invalid (STRICT)")
+        raise ExitFlowStateError("target_price/stop_price invalid (STRICT)")
 
     return float(target_price), float(stop_price), float(pnl_pct)
 
@@ -341,9 +369,9 @@ def _is_reversal(
     d = _require_direction(direction, "direction")
 
     if trend_reversal_threshold < 0.0:
-        raise RuntimeError("trend_reversal_threshold must be >= 0 (STRICT)")
+        raise ExitFlowConfigError("trend_reversal_threshold must be >= 0 (STRICT)")
     if orderbook_reversal_threshold < 0.0:
-        raise RuntimeError("orderbook_reversal_threshold must be >= 0 (STRICT)")
+        raise ExitFlowConfigError("orderbook_reversal_threshold must be >= 0 (STRICT)")
 
     trend_reversal = trend_strength <= trend_reversal_threshold
 
@@ -362,7 +390,7 @@ def evaluate_exit_flow_strict(
 ) -> ExitFlowDecision:
     f = _require_mapping(features, "features")
     if settings is None:
-        raise RuntimeError("settings is required (STRICT)")
+        raise ExitFlowConfigError("settings is required (STRICT)")
 
     symbol = _read_feature_str(f, "symbol").upper()
     regime = _read_feature_str(f, "regime")
@@ -374,11 +402,11 @@ def evaluate_exit_flow_strict(
     current_price = _read_feature_float(f, "current_price", min_value=0.0)
     position_qty = _read_feature_float(f, "position_qty", min_value=0.0)
     if entry_price <= 0.0:
-        raise RuntimeError("features.entry_price must be > 0 (STRICT)")
+        raise ExitFlowContractError("features.entry_price must be > 0 (STRICT)")
     if current_price <= 0.0:
-        raise RuntimeError("features.current_price must be > 0 (STRICT)")
+        raise ExitFlowContractError("features.current_price must be > 0 (STRICT)")
     if position_qty <= 0.0:
-        raise RuntimeError("features.position_qty must be > 0 (STRICT)")
+        raise ExitFlowContractError("features.position_qty must be > 0 (STRICT)")
 
     entry_score = _read_feature_float(f, "entry_score")
     exit_score = _read_feature_float(f, "exit_score")
@@ -389,9 +417,9 @@ def evaluate_exit_flow_strict(
     sl_pct = _read_feature_float(f, "sl_pct", min_value=0.0, max_value=1.0)
 
     if tp_pct <= 0.0:
-        raise RuntimeError("features.tp_pct must be > 0 (STRICT)")
+        raise ExitFlowContractError("features.tp_pct must be > 0 (STRICT)")
     if sl_pct <= 0.0:
-        raise RuntimeError("features.sl_pct must be > 0 (STRICT)")
+        raise ExitFlowContractError("features.sl_pct must be > 0 (STRICT)")
 
     exit_score_threshold = _read_setting_float(settings, "exit_score_threshold", min_value=0.0)
     exit_max_spread_pct = _read_setting_float(settings, "exit_max_spread_pct", min_value=0.0)
@@ -611,6 +639,9 @@ def build_exit_decision_payload_strict(
 
 
 __all__ = [
+    "ExitFlowConfigError",
+    "ExitFlowContractError",
+    "ExitFlowStateError",
     "ExitFlowDecision",
     "evaluate_exit_flow_strict",
     "build_exit_decision_payload_strict",

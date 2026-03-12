@@ -5,23 +5,37 @@ FILE: engine/cycles/entry_cycle.py
 ROLE:
 - trading engine entry cycle
 - idle 상태에서 진입 후보 생성 전용 계층
+- Feature Layer → Signal Layer 연결을 수행한다
 
 CORE RESPONSIBILITIES:
 - entry cadence / cooldown 제어
 - data health(OK/WARNING/FAIL) 상태 소비
 - authoritative 5m entry gate 사전 차단
 - entry market_data build 수행
-- entry candidate 생성 및 STRICT 검증
+- score_engine 재계산 및 strict 정합성 검증
+- entry_flow 기반 strategy signal 생성
+- legacy candidate 와 strategy signal 간 계약 정합성 검증
 - 다음 계층(risk_cycle)으로 전달할 pending entry packet 생성
 - entry skip / warning / contract violation 을 명시적으로 처리
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
-- entry cycle 은 market data build / candidate 생성만 담당한다
+- entry cycle 은 market data build / signal build / candidate compatibility 검증만 담당한다
 - risk sizing / execution submit 은 이 파일에서 수행하지 않는다
 - authoritative 5m entry gate 는 market_data build 성공 후에만 claim 한다
 - NO_SIGNAL / explicit SKIP 은 명시적 skip 으로 처리한다
 - hidden default / silent continue / 예외 삼키기 금지
+- score_engine / entry_flow / common.exceptions_strict 를 정식 연결한다
+============================================================
+
+CHANGE HISTORY:
+- 2026-03-13
+  1) ADD(SIGNAL-LAYER): strategy.entry_flow.build_entry_signal_strict 정식 연결
+  2) ADD(SCORE-VERIFY): strategy.score_engine.build_engine_scores 정식 연결 및 market_features.engine_scores 재검증 추가
+  3) ADD(CONTRACT): legacy candidate vs strategy signal action/direction strict 정합성 검증 추가
+  4) ADD(PACKET): EntryCyclePacket 에 strategy_signal / engine_scores 포함
+  5) FIX(STRICT): common.exceptions_strict 기반 entry 예외 계층 연결
+  6) FIX(SAFE_STOP): signal/data contract mismatch 시 runtime.request_safe_stop() 사용
 ============================================================
 """
 
@@ -29,9 +43,10 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+from common.exceptions_strict import StrictExternalError, StrictStateError
 from infra.telelog import log, send_tg
 from infra.async_worker import submit as submit_async
 import infra.data_health_monitor as data_health_monitor
@@ -48,17 +63,20 @@ from strategy.engine_runtime_state import (
     bootstrap_last_entry_signal_ts_ms,
     claim_entry_signal_ts_or_skip,
 )
-from engine.engine_loop import EngineLoopRuntime
+from strategy.entry_flow import build_entry_signal_strict
+from strategy.score_engine import ScoreEngineError, build_engine_scores
+from strategy.signal import Signal
+from engine.engine_loop import ENGINE_STATE_RUNNING, EngineLoopRuntime
 
 
 PENDING_ENTRY_PACKET_KEY: str = "pending_entry_packet"
 
 
-class EntryCycleError(RuntimeError):
+class EntryCycleError(StrictExternalError):
     """Base error for entry cycle."""
 
 
-class EntryCycleContractError(EntryCycleError):
+class EntryCycleContractError(StrictStateError):
     """Raised when entry cycle contract is violated."""
 
 
@@ -71,10 +89,26 @@ class EntryCycleConfig:
     entry_cooldown_sec: float
 
     def validate_or_raise(self) -> None:
-        _require_float(self.engine_entry_ob_min_interval_sec, "config.engine_entry_ob_min_interval_sec", min_value=0.001)
-        _require_float(self.engine_entry_force_interval_sec, "config.engine_entry_force_interval_sec", min_value=0.001)
-        _require_float(self.engine_loop_tick_sec, "config.engine_loop_tick_sec", min_value=0.001)
-        _require_int(self.entry_block_tg_cooldown_sec, "config.entry_block_tg_cooldown_sec", min_value=1)
+        _require_float(
+            self.engine_entry_ob_min_interval_sec,
+            "config.engine_entry_ob_min_interval_sec",
+            min_value=0.001,
+        )
+        _require_float(
+            self.engine_entry_force_interval_sec,
+            "config.engine_entry_force_interval_sec",
+            min_value=0.001,
+        )
+        _require_float(
+            self.engine_loop_tick_sec,
+            "config.engine_loop_tick_sec",
+            min_value=0.001,
+        )
+        _require_int(
+            self.entry_block_tg_cooldown_sec,
+            "config.entry_block_tg_cooldown_sec",
+            min_value=1,
+        )
         _require_float(self.entry_cooldown_sec, "config.entry_cooldown_sec", min_value=0.0)
 
 
@@ -93,9 +127,15 @@ class EntryCycleState:
     def validate_or_raise(self) -> None:
         _require_float(self.last_entry_cycle_wall_ts, "state.last_entry_cycle_wall_ts", min_value=0.0)
         _require_optional_positive_int(self.last_entry_cycle_1m_ts, "state.last_entry_cycle_1m_ts")
-        _require_optional_positive_int(self.last_entry_cycle_orderbook_ts, "state.last_entry_cycle_orderbook_ts")
+        _require_optional_positive_int(
+            self.last_entry_cycle_orderbook_ts,
+            "state.last_entry_cycle_orderbook_ts",
+        )
         _require_float(self.last_entry_gpt_call_ts, "state.last_entry_gpt_call_ts", min_value=0.0)
-        _require_optional_positive_int(self.last_entry_eval_signal_ts_ms, "state.last_entry_eval_signal_ts_ms")
+        _require_optional_positive_int(
+            self.last_entry_eval_signal_ts_ms,
+            "state.last_entry_eval_signal_ts_ms",
+        )
         _require_bool(self.entry_gate_bootstrapped, "state.entry_gate_bootstrapped")
         _require_float(self.last_entry_block_tg_ts, "state.last_entry_block_tg_ts", min_value=0.0)
         if not isinstance(self.last_entry_block_key, str):
@@ -108,6 +148,8 @@ class EntryCyclePacket:
     authoritative_signal_ts_ms: int
     market_data: Dict[str, Any]
     candidate: Any
+    strategy_signal: Signal
+    engine_scores: Dict[str, Any]
     created_at_ts: float
 
 
@@ -120,6 +162,8 @@ class EntryCycleContext:
     last_close_ts_getter: Callable[[], float]
     build_entry_market_data_fn: Callable[..., Optional[Dict[str, Any]]] = _build_entry_market_data
     decide_entry_candidate_fn: Callable[[Dict[str, Any], Any], Any] = _decide_entry_candidate_strict
+    build_entry_signal_fn: Callable[..., Signal] = build_entry_signal_strict
+    build_engine_scores_fn: Callable[..., Dict[str, Any]] = build_engine_scores
 
     def validate_or_raise(self) -> None:
         _ = _normalize_symbol_strict(self.symbol, name="context.symbol")
@@ -134,11 +178,22 @@ class EntryCycleContext:
             raise EntryCycleContractError("context.build_entry_market_data_fn is required (STRICT)")
         if not callable(self.decide_entry_candidate_fn):
             raise EntryCycleContractError("context.decide_entry_candidate_fn is required (STRICT)")
+        if not callable(self.build_entry_signal_fn):
+            raise EntryCycleContractError("context.build_entry_signal_fn is required (STRICT)")
+        if not callable(self.build_engine_scores_fn):
+            raise EntryCycleContractError("context.build_engine_scores_fn is required (STRICT)")
 
         required_setting_names = (
             "entry_cooldown_sec",
             "engine_loop_tick_sec",
             "symbol",
+            "entry_tp_pct",
+            "entry_sl_pct",
+            "entry_risk_pct",
+            "entry_score_threshold",
+            "entry_max_spread_pct",
+            "entry_min_trend_strength",
+            "entry_min_abs_orderbook_imbalance",
         )
         for name in required_setting_names:
             if not hasattr(self.settings, name):
@@ -191,6 +246,11 @@ def run_entry_cycle_or_raise(
     if runtime.safe_stop_requested:
         return
 
+    if runtime.engine_state != ENGINE_STATE_RUNNING:
+        raise EntryCycleContractError(
+            f"entry cycle requires RUNNING state (STRICT), current={runtime.engine_state}"
+        )
+
     if _is_entry_cooldown_active(now_f, ctx):
         return
 
@@ -230,7 +290,10 @@ def run_entry_cycle_or_raise(
         ctx.settings,
         _get_last_close_ts_or_raise(ctx),
         notify_entry_block_fn=lambda key, msg, cooldown_sec: _maybe_send_entry_block_tg(
-            ctx, key, msg, cooldown_sec
+            ctx,
+            key,
+            msg,
+            cooldown_sec,
         ),
         log_fn=log,
         build_fn=ctx.build_entry_market_data_fn,
@@ -257,11 +320,43 @@ def run_entry_cycle_or_raise(
     try:
         validate_entry_market_data_bundle_strict(market_data)
     except DataIntegrityError as e:
-        runtime.safe_stop_requested = True
+        runtime.request_safe_stop("ENTRY_DATA_INTEGRITY", now_ts=now_f)
         msg = f"[SAFE_STOP][DATA_INTEGRITY] {e}"
         log(msg)
         _safe_send_tg(msg)
         raise EntryCycleError(msg) from e
+
+    engine_scores = _recompute_engine_scores_stage_or_raise(
+        market_data,
+        build_fn=ctx.build_engine_scores_fn,
+    )
+    _validate_engine_scores_consistency_or_raise(market_data, engine_scores)
+
+    signal_features = _build_entry_signal_features_from_market_data_or_raise(
+        market_data,
+        engine_scores=engine_scores,
+    )
+    strategy_signal = _build_strategy_signal_stage_or_raise(
+        signal_features,
+        ctx.settings,
+        build_fn=ctx.build_entry_signal_fn,
+    )
+
+    signal_action = _require_nonempty_str(strategy_signal.action, "strategy_signal.action").upper()
+    signal_direction = _require_nonempty_str(strategy_signal.direction, "strategy_signal.direction").upper()
+
+    if signal_action == "SKIP":
+        reason = _require_nonempty_str(strategy_signal.reason, "strategy_signal.reason")
+        msg = f"[SKIP][ENTRY_FLOW] {reason}"
+        log(msg)
+        _maybe_send_entry_block_tg(ctx, "ENTRY_FLOW_SKIP", msg)
+        return
+
+    if signal_action != "ENTER":
+        runtime.request_safe_stop("ENTRY_SIGNAL_INVALID_ACTION", now_ts=now_f)
+        raise EntryCycleContractError(
+            f"strategy_signal.action must be ENTER/SKIP (STRICT), got={signal_action!r}"
+        )
 
     candidate = _decide_entry_candidate_stage_or_raise(
         market_data,
@@ -269,13 +364,12 @@ def run_entry_cycle_or_raise(
         decide_fn=ctx.decide_entry_candidate_fn,
     )
 
-    action = _require_nonempty_str(getattr(candidate, "action", None), "candidate.action").upper()
-    if action != "ENTER":
-        reason = _require_nonempty_str(getattr(candidate, "reason", None), "candidate.reason")
-        msg = f"[SKIP][CANDIDATE] {reason}"
-        log(msg)
-        _maybe_send_entry_block_tg(ctx, "CANDIDATE_SKIP", msg)
-        return
+    _validate_candidate_vs_strategy_signal_or_raise(
+        candidate=candidate,
+        strategy_signal=strategy_signal,
+        runtime=runtime,
+        now_ts=now_f,
+    )
 
     ctx.state.last_entry_gpt_call_ts = now_f
 
@@ -284,6 +378,8 @@ def run_entry_cycle_or_raise(
         authoritative_signal_ts_ms=int(authoritative_5m_gate_ts),
         market_data=market_data,
         candidate=candidate,
+        strategy_signal=strategy_signal,
+        engine_scores=engine_scores,
         created_at_ts=now_f,
     )
     runtime.extra[PENDING_ENTRY_PACKET_KEY] = packet
@@ -378,6 +474,28 @@ def _require_optional_positive_int(v: Any, name: str) -> Optional[int]:
     if v is None:
         return None
     return _require_int(v, name, min_value=1)
+
+
+def _require_dict(v: Any, name: str) -> Dict[str, Any]:
+    if not isinstance(v, dict):
+        raise EntryCycleContractError(f"{name} must be dict (STRICT)")
+    if not v:
+        raise EntryCycleContractError(f"{name} must not be empty (STRICT)")
+    return v
+
+
+def _require_list(v: Any, name: str) -> List[Any]:
+    if not isinstance(v, list):
+        raise EntryCycleContractError(f"{name} must be list (STRICT)")
+    if not v:
+        raise EntryCycleContractError(f"{name} must not be empty (STRICT)")
+    return v
+
+
+def _require_mapping_key(d: Dict[str, Any], key: str, ctx_name: str) -> Any:
+    if key not in d:
+        raise EntryCycleContractError(f"{ctx_name}.{key} is required (STRICT)")
+    return d[key]
 
 
 def _normalize_symbol_strict(symbol: Any, *, name: str = "symbol") -> str:
@@ -706,6 +824,327 @@ def _decide_entry_candidate_stage_or_raise(
     if action == "ENTER":
         _ = _require_nonempty_str(getattr(candidate, "direction", None), "candidate.direction")
     return candidate
+
+
+def _recompute_engine_scores_stage_or_raise(
+    market_data: Dict[str, Any],
+    *,
+    build_fn: Callable[..., Dict[str, Any]],
+) -> Dict[str, Any]:
+    market_data_dict = _require_dict(market_data, "market_data")
+    symbol = _normalize_symbol_strict(
+        _require_mapping_key(market_data_dict, "symbol", "market_data"),
+        name="market_data.symbol",
+    )
+    market_features = _require_dict(
+        _require_mapping_key(market_data_dict, "market_features", "market_data"),
+        "market_data.market_features",
+    )
+
+    timeframes = _require_dict(
+        _require_mapping_key(market_features, "timeframes", "market_features"),
+        "market_features.timeframes",
+    )
+    pattern_features = _require_dict(
+        _require_mapping_key(market_features, "pattern_features", "market_features"),
+        "market_features.pattern_features",
+    )
+    pattern_summary = _require_dict(
+        _require_mapping_key(market_features, "pattern_summary", "market_features"),
+        "market_features.pattern_summary",
+    )
+    orderbook = _require_dict(
+        _require_mapping_key(market_features, "orderbook", "market_features"),
+        "market_features.orderbook",
+    )
+
+    try:
+        scores = build_fn(
+            symbol,
+            timeframes,
+            pattern_features,
+            pattern_summary,
+            orderbook,
+        )
+    except ScoreEngineError as e:
+        raise EntryCycleError(
+            f"score_engine recompute failed (STRICT): {type(e).__name__}: {e}"
+        ) from e
+    except Exception as e:
+        raise EntryCycleError(
+            f"score_engine unexpected failure (STRICT): {type(e).__name__}: {e}"
+        ) from e
+
+    return _require_dict(scores, "recomputed_engine_scores")
+
+
+def _validate_engine_scores_consistency_or_raise(
+    market_data: Dict[str, Any],
+    recomputed_engine_scores: Dict[str, Any],
+) -> None:
+    market_data_dict = _require_dict(market_data, "market_data")
+    market_features = _require_dict(
+        _require_mapping_key(market_data_dict, "market_features", "market_data"),
+        "market_data.market_features",
+    )
+    upstream_scores = _require_dict(
+        _require_mapping_key(market_features, "engine_scores", "market_features"),
+        "market_features.engine_scores",
+    )
+
+    required_blocks = (
+        "trend_4h",
+        "momentum_1h",
+        "structure_15m",
+        "timing_5m",
+        "orderbook_micro",
+        "total",
+    )
+    for key in required_blocks:
+        upstream_block = _require_dict(
+            _require_mapping_key(upstream_scores, key, "market_features.engine_scores"),
+            f"market_features.engine_scores.{key}",
+        )
+        recomputed_block = _require_dict(
+            _require_mapping_key(recomputed_engine_scores, key, "recomputed_engine_scores"),
+            f"recomputed_engine_scores.{key}",
+        )
+
+        upstream_score = _require_float(
+            _require_mapping_key(upstream_block, "score", f"market_features.engine_scores.{key}"),
+            f"market_features.engine_scores.{key}.score",
+        )
+        recomputed_score = _require_float(
+            _require_mapping_key(recomputed_block, "score", f"recomputed_engine_scores.{key}"),
+            f"recomputed_engine_scores.{key}.score",
+        )
+
+        if abs(upstream_score - recomputed_score) > 1e-9:
+            raise EntryCycleContractError(
+                "engine_scores mismatch detected (STRICT): "
+                f"block={key} upstream={upstream_score} recomputed={recomputed_score}"
+            )
+
+    market_data_entry_score = _require_float(
+        _require_mapping_key(market_data_dict, "entry_score", "market_data"),
+        "market_data.entry_score",
+        min_value=0.0,
+        max_value=1.0,
+    )
+    recomputed_total = _require_dict(
+        _require_mapping_key(recomputed_engine_scores, "total", "recomputed_engine_scores"),
+        "recomputed_engine_scores.total",
+    )
+    recomputed_entry_score = _require_float(
+        _require_mapping_key(recomputed_total, "score", "recomputed_engine_scores.total"),
+        "recomputed_engine_scores.total.score",
+        min_value=0.0,
+        max_value=100.0,
+    ) / 100.0
+
+    if abs(market_data_entry_score - recomputed_entry_score) > 1e-9:
+        raise EntryCycleContractError(
+            "market_data.entry_score mismatch detected (STRICT): "
+            f"market_data.entry_score={market_data_entry_score} "
+            f"recomputed_entry_score={recomputed_entry_score}"
+        )
+
+
+def _build_entry_signal_features_from_market_data_or_raise(
+    market_data: Dict[str, Any],
+    *,
+    engine_scores: Dict[str, Any],
+) -> Dict[str, Any]:
+    market_data_dict = _require_dict(market_data, "market_data")
+    market_features = _require_dict(
+        _require_mapping_key(market_data_dict, "market_features", "market_data"),
+        "market_data.market_features",
+    )
+
+    symbol = _normalize_symbol_strict(
+        _require_mapping_key(market_data_dict, "symbol", "market_data"),
+        name="market_data.symbol",
+    )
+    regime = _require_nonempty_str(
+        _require_mapping_key(market_data_dict, "regime", "market_data"),
+        "market_data.regime",
+    )
+    signal_source = _require_nonempty_str(
+        _require_mapping_key(market_data_dict, "signal_source", "market_data"),
+        "market_data.signal_source",
+    )
+    signal_ts_ms = _require_int_ms(
+        _require_mapping_key(market_data_dict, "signal_ts_ms", "market_data"),
+        "market_data.signal_ts_ms",
+    )
+    direction = _require_nonempty_str(
+        _require_mapping_key(market_data_dict, "direction", "market_data"),
+        "market_data.direction",
+    ).upper()
+    if direction not in ("LONG", "SHORT"):
+        raise EntryCycleContractError(f"market_data.direction invalid (STRICT): {direction!r}")
+
+    last_price = _require_float(
+        _require_mapping_key(market_data_dict, "last_price", "market_data"),
+        "market_data.last_price",
+        min_value=0.0,
+    )
+    candles_5m = _require_list(
+        _require_mapping_key(market_data_dict, "candles_5m", "market_data"),
+        "market_data.candles_5m",
+    )
+    candles_5m_raw = _require_list(
+        _require_mapping_key(market_data_dict, "candles_5m_raw", "market_data"),
+        "market_data.candles_5m_raw",
+    )
+
+    equity_current_usdt = _require_float(
+        _require_mapping_key(market_features, "equity_current_usdt", "market_features"),
+        "market_features.equity_current_usdt",
+        min_value=0.0,
+    )
+    equity_peak_usdt = _require_float(
+        _require_mapping_key(market_features, "equity_peak_usdt", "market_features"),
+        "market_features.equity_peak_usdt",
+        min_value=0.0,
+    )
+    dd_pct = _require_float(
+        _require_mapping_key(market_features, "dd_pct", "market_features"),
+        "market_features.dd_pct",
+        min_value=0.0,
+        max_value=100.0,
+    )
+
+    total_block = _require_dict(
+        _require_mapping_key(engine_scores, "total", "engine_scores"),
+        "engine_scores.total",
+    )
+    recomputed_entry_score = _require_float(
+        _require_mapping_key(total_block, "score", "engine_scores.total"),
+        "engine_scores.total.score",
+        min_value=0.0,
+        max_value=100.0,
+    ) / 100.0
+
+    trend_strength = _require_float(
+        _require_mapping_key(market_data_dict, "trend_strength", "market_data"),
+        "market_data.trend_strength",
+    )
+    spread = _require_float(
+        _require_mapping_key(market_data_dict, "spread", "market_data"),
+        "market_data.spread",
+        min_value=0.0,
+    )
+    orderbook_imbalance = _require_float(
+        _require_mapping_key(market_data_dict, "orderbook_imbalance", "market_data"),
+        "market_data.orderbook_imbalance",
+    )
+
+    features: Dict[str, Any] = {
+        "symbol": symbol,
+        "regime": regime,
+        "signal_source": signal_source,
+        "signal_ts_ms": int(signal_ts_ms),
+        "direction": direction,
+        "last_price": float(last_price),
+        "candles_5m": list(candles_5m),
+        "candles_5m_raw": list(candles_5m_raw),
+        "equity_current_usdt": float(equity_current_usdt),
+        "equity_peak_usdt": float(equity_peak_usdt),
+        "dd_pct": float(dd_pct),
+        "entry_score": float(recomputed_entry_score),
+        "trend_strength": float(trend_strength),
+        "spread": float(spread),
+        "orderbook_imbalance": float(orderbook_imbalance),
+    }
+
+    if "guard_adjustments" in market_features and market_features["guard_adjustments"] is not None:
+        features["guard_adjustments"] = _require_dict(
+            market_features["guard_adjustments"],
+            "market_features.guard_adjustments",
+        )
+
+    return features
+
+
+def _build_strategy_signal_stage_or_raise(
+    signal_features: Dict[str, Any],
+    settings: Any,
+    *,
+    build_fn: Callable[..., Signal],
+) -> Signal:
+    features = _require_dict(signal_features, "signal_features")
+    if settings is None:
+        raise EntryCycleContractError("settings is required for strategy signal (STRICT)")
+
+    try:
+        signal = build_fn(features=features, settings=settings)
+    except Exception as e:
+        raise EntryCycleError(
+            f"entry_flow signal build failed (STRICT): {type(e).__name__}: {e}"
+        ) from e
+
+    if not isinstance(signal, Signal):
+        raise EntryCycleContractError(
+            f"build_entry_signal_fn must return strategy.signal.Signal (STRICT), got={type(signal).__name__}"
+        )
+
+    action = _require_nonempty_str(signal.action, "strategy_signal.action").upper()
+    direction = _require_nonempty_str(signal.direction, "strategy_signal.direction").upper()
+    if action not in ("ENTER", "SKIP"):
+        raise EntryCycleContractError(f"strategy_signal.action invalid (STRICT): {action!r}")
+    if direction not in ("LONG", "SHORT"):
+        raise EntryCycleContractError(f"strategy_signal.direction invalid (STRICT): {direction!r}")
+
+    _ = _require_nonempty_str(signal.reason, "strategy_signal.reason")
+    _ = _require_float(signal.risk_pct, "strategy_signal.risk_pct", min_value=0.0)
+    _ = _require_float(signal.tp_pct, "strategy_signal.tp_pct", min_value=0.0)
+    _ = _require_float(signal.sl_pct, "strategy_signal.sl_pct", min_value=0.0)
+
+    return signal
+
+
+def _validate_candidate_vs_strategy_signal_or_raise(
+    *,
+    candidate: Any,
+    strategy_signal: Signal,
+    runtime: EngineLoopRuntime,
+    now_ts: float,
+) -> None:
+    candidate_action = _require_nonempty_str(getattr(candidate, "action", None), "candidate.action").upper()
+    candidate_reason = _require_nonempty_str(getattr(candidate, "reason", None), "candidate.reason")
+    signal_action = _require_nonempty_str(strategy_signal.action, "strategy_signal.action").upper()
+    signal_reason = _require_nonempty_str(strategy_signal.reason, "strategy_signal.reason")
+
+    if candidate_action != signal_action:
+        runtime.request_safe_stop("ENTRY_SIGNAL_ACTION_MISMATCH", now_ts=now_ts)
+        raise EntryCycleContractError(
+            "legacy candidate action != strategy signal action (STRICT): "
+            f"candidate_action={candidate_action} signal_action={signal_action} "
+            f"candidate_reason={candidate_reason} signal_reason={signal_reason}"
+        )
+
+    if signal_action != "ENTER":
+        runtime.request_safe_stop("ENTRY_SIGNAL_NON_ENTER_CONTRACT", now_ts=now_ts)
+        raise EntryCycleContractError(
+            f"candidate validation requires ENTER action (STRICT), got={signal_action}"
+        )
+
+    candidate_direction = _require_nonempty_str(
+        getattr(candidate, "direction", None),
+        "candidate.direction",
+    ).upper()
+    signal_direction = _require_nonempty_str(
+        strategy_signal.direction,
+        "strategy_signal.direction",
+    ).upper()
+
+    if candidate_direction != signal_direction:
+        runtime.request_safe_stop("ENTRY_SIGNAL_DIRECTION_MISMATCH", now_ts=now_ts)
+        raise EntryCycleContractError(
+            "legacy candidate direction != strategy signal direction (STRICT): "
+            f"candidate_direction={candidate_direction} signal_direction={signal_direction}"
+        )
 
 
 __all__ = [

@@ -12,6 +12,7 @@ CORE RESPONSIBILITIES:
 - periodic sync / balance check / fill close reconciliation 을 수행한다
 - SAFE_STOP / HALTED 상태 전이를 관리한다
 - cycle 계층 간 shared runtime state 를 단일 루프에서 유지한다
+- async worker / commentary engine / watchdog / auto reporter 를 실제 런타임에 연결한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -20,8 +21,15 @@ IMPORTANT POLICY:
 - hidden default / silent continue / 예외 삼키기 금지
 - runtime state rollback 금지
 - 치명 오류는 SAFE_STOP + 예외 전파
+- 공통 인프라(async/commentary/watchdog/reporting)는 main()에서 명시적으로 부팅/종료한다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FEAT(WIRING): async_worker.start_worker() 실제 부팅 연결
+  2) FEAT(WIRING): init_commentary_engine() 1회 초기화 연결
+  3) FEAT(WIRING): start_watchdog() + on_fatal SAFE_STOP 콜백 연결
+  4) FEAT(WIRING): AutoReporter 주기 실행 및 bt_events 기록 연결
+  5) FIX(STRICT): main() finally 에서 watchdog / async worker 종료 정리 추가
 - 2026-03-12:
   1) FIX(ROOT-CAUSE): import 누락(time, Callable) 수정
   2) KEEP(STRUCTURE): bootstrap / engine_loop / cycles orchestration 구조 유지
@@ -31,7 +39,6 @@ CHANGE HISTORY:
 from __future__ import annotations
 
 import datetime
-import hashlib
 import math
 import signal
 import time
@@ -41,7 +48,11 @@ from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from settings import SETTINGS
 from infra.telelog import log, send_tg
-from infra.async_worker import submit as submit_async
+from infra.async_worker import start_worker, stop_worker, submit as submit_async
+from infra.engine_watchdog import start_watchdog, stop_watchdog
+from analysis.auto_reporter import AutoReporter
+from events.commentary_engine import init_commentary_engine
+from events.event_store import record_quant_analysis_event_db
 
 from execution.exchange_api import get_available_usdt
 from execution.order_executor import close_all_positions_market
@@ -52,7 +63,6 @@ from events.signals_logger import log_signal
 from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder
 from strategy.ev_heatmap_engine import EvHeatmapEngine
-from infra.market_data_ws import get_klines_with_volume as ws_get_klines_with_volume
 
 from engine.engine_bootstrap import EngineBootstrapArtifacts, bootstrap_engine_runtime_or_raise
 from engine.engine_loop import (
@@ -90,6 +100,7 @@ SIGTERM_REQUESTED_AT: Optional[float] = None
 SIGTERM_DEADLINE_TS: Optional[float] = None
 _SIGTERM_NOTICE_SENT: bool = False
 _HALT_NOTICE_SENT: bool = False
+_COMMENTARY_ENGINE_INITIALIZED: bool = False
 
 OPEN_TRADES: List[Trade] = []
 TRADER_STATE: TraderState = TraderState()
@@ -110,10 +121,15 @@ ENGINE_OPEN_POSITION_TICK_SEC: float = 0.20
 ENGINE_IDLE_TICK_SEC: float = 0.20
 ENGINE_SAFE_STOP_TICK_SEC: float = 0.20
 
+ASYNC_WORKER_THREADS: int = 1
+ASYNC_WORKER_MAX_QUEUE_SIZE: int = 2000
+ASYNC_WORKER_THREAD_NAME_PREFIX: str = "engine-async"
+
 _EQUITY_CACHE_VALUE: Optional[float] = None
 _EQUITY_CACHE_TS: float = 0.0
 
 CLOSED_TRADES_CACHE = deque(maxlen=50)
+_AUTO_REPORTER: Optional[AutoReporter] = None
 
 
 class _SettingsLoopView:
@@ -164,6 +180,27 @@ def _require_int(v: Any, name: str, *, min_value: Optional[int] = None) -> int:
     if min_value is not None and iv < min_value:
         raise RuntimeError(f"{name} must be >= {min_value}")
     return int(iv)
+
+
+def _require_bool(v: Any, name: str) -> bool:
+    if not isinstance(v, bool):
+        raise RuntimeError(f"{name} must be bool (STRICT)")
+    return bool(v)
+
+
+def _require_nonempty_str(v: Any, name: str) -> str:
+    s = str(v or "").strip()
+    if not s:
+        raise RuntimeError(f"{name} is empty (STRICT)")
+    return s
+
+
+def _require_dict(v: Any, name: str) -> Dict[str, Any]:
+    if not isinstance(v, dict):
+        raise RuntimeError(f"{name} must be dict (STRICT)")
+    if not v:
+        raise RuntimeError(f"{name} must not be empty (STRICT)")
+    return dict(v)
 
 
 def _normalize_symbol_strict(symbol: Any, *, name: str = "symbol") -> str:
@@ -409,6 +446,73 @@ def _normalize_direction_for_events_strict(v: Any) -> str:
     raise RuntimeError(f"invalid trade side for events: {v!r}")
 
 
+def _auto_report_event_writer(event_type: str, report_type: str, payload: Dict[str, Any]) -> None:
+    et = _require_nonempty_str(event_type, "event_type")
+    if et != "QUANT_ANALYSIS":
+        raise RuntimeError(f"unexpected auto report event_type (STRICT): {et}")
+    rt = _require_nonempty_str(report_type, "report_type")
+    data = _require_dict(payload, "payload")
+    generated_ts_ms = _require_int(data.get("generated_ts_ms"), "payload.generated_ts_ms", min_value=1)
+    ts_utc = datetime.datetime.fromtimestamp(generated_ts_ms / 1000.0, tz=datetime.timezone.utc)
+    record_quant_analysis_event_db(
+        ts_utc=ts_utc,
+        symbol=_normalize_symbol_strict(SET.symbol),
+        report_type=rt,
+        reason="auto_report_generated",
+        analysis_payload=data,
+        regime=None,
+        is_test=False,
+    )
+
+
+def _auto_report_notifier(report_type: str, payload: Dict[str, Any]) -> None:
+    rt = _require_nonempty_str(report_type, "report_type")
+    data = _require_dict(payload, "payload")
+    generated_ts_ms = _require_int(data.get("generated_ts_ms"), "payload.generated_ts_ms", min_value=1)
+    dt_kst = datetime.datetime.fromtimestamp(generated_ts_ms / 1000.0, tz=datetime.timezone.utc).astimezone(
+        datetime.timezone(datetime.timedelta(hours=9))
+    )
+    _safe_send_tg(
+        f"🧠 자동 분석 리포트 생성\n"
+        f"- 유형: {rt}\n"
+        f"- 종목: {_normalize_symbol_strict(SET.symbol)}\n"
+        f"- 시각: {dt_kst.strftime('%Y-%m-%d %H:%M:%S KST')}"
+    )
+
+
+def _build_auto_reporter_or_raise() -> AutoReporter:
+    return AutoReporter(
+        settings=SET,
+        event_writer=_auto_report_event_writer,
+        notifier=_auto_report_notifier,
+    )
+
+
+def _maybe_auto_report_or_raise(now_ts: float) -> None:
+    global _AUTO_REPORTER
+    if _AUTO_REPORTER is None:
+        raise RuntimeError("auto reporter is not initialized (STRICT)")
+    now_ms = _require_int(now_ts * 1000.0, "now_ms", min_value=1)
+    _AUTO_REPORTER.run_due_reports(now_ms=now_ms)
+
+
+def _ensure_commentary_engine_initialized_or_raise() -> None:
+    global _COMMENTARY_ENGINE_INITIALIZED
+    if _COMMENTARY_ENGINE_INITIALIZED:
+        return
+    init_commentary_engine()
+    _COMMENTARY_ENGINE_INITIALIZED = True
+
+
+def _on_watchdog_fatal(reason: str, detail: Dict[str, Any]) -> None:
+    global SAFE_STOP_REQUESTED
+    reason_s = _require_nonempty_str(reason, "reason")
+    detail_d = _require_dict(detail, "detail")
+    SAFE_STOP_REQUESTED = True
+    log(f"[WATCHDOG][FATAL][CALLBACK] reason={reason_s} detail={detail_d}")
+    _safe_send_tg(f"⛔ WATCHDOG 치명 상태 감지: {reason_s}")
+
+
 def _monitoring_cycle_wrapper(
     now_ts: float,
     runtime: EngineLoopRuntime,
@@ -422,6 +526,7 @@ def _monitoring_cycle_wrapper(
     _maybe_position_resync_or_raise(now_ts)
     _maybe_balance_check_or_raise(now_ts, runtime)
     _maybe_fill_check_or_raise(now_ts, runtime)
+    _maybe_auto_report_or_raise(now_ts)
 
     if runtime.safe_stop_requested:
         _request_safe_stop(runtime)
@@ -487,124 +592,142 @@ def _idle_safe_stop_fn(now_ts: float, runtime: EngineLoopRuntime) -> bool:
 
 
 def main() -> None:
-    global OPEN_TRADES, LAST_EXCHANGE_SYNC_TS, LAST_EXIT_CANDLE_TS_1M, SAFE_STOP_REQUESTED
+    global OPEN_TRADES, LAST_EXCHANGE_SYNC_TS, LAST_EXIT_CANDLE_TS_1M, SAFE_STOP_REQUESTED, _AUTO_REPORTER
+
+    start_worker(
+        num_threads=ASYNC_WORKER_THREADS,
+        max_queue_size=ASYNC_WORKER_MAX_QUEUE_SIZE,
+        thread_name_prefix=ASYNC_WORKER_THREAD_NAME_PREFIX,
+    )
+    _ensure_commentary_engine_initialized_or_raise()
 
     settings_view = _SettingsLoopView(
         SET,
         engine_loop_tick_sec=ENGINE_LOOP_TICK_SEC,
     )
 
-    boot: EngineBootstrapArtifacts = bootstrap_engine_runtime_or_raise(
-        settings_view,
-        on_safe_stop=_on_safe_stop_command,
-        stop_flag_getter=_stop_flag_getter,
-    )
-
-    OPEN_TRADES[:] = list(boot.open_trades)
-    _invalidate_equity_cache()
-    LAST_EXCHANGE_SYNC_TS = _require_float(boot.last_exchange_sync_ts, "boot.last_exchange_sync_ts", min_value=0.0)
-    LAST_EXIT_CANDLE_TS_1M = boot.last_exit_candle_ts_1m
-
-    persisted_peak = boot.persisted_equity_peak_usdt
-    for row in reversed(list(boot.closed_trade_rows)):
-        CLOSED_TRADES_CACHE.appendleft(row)
-
-    reconcile_confirm_n = _require_int(getattr(SET, "reconcile_confirm_n"), "settings.reconcile_confirm_n", min_value=1)
-    hard_consecutive_losses_limit = _require_int(
-        getattr(SET, "hard_consecutive_losses_limit"),
-        "settings.hard_consecutive_losses_limit",
-        min_value=0,
-    )
-    _ = hard_consecutive_losses_limit
-
-    from sync.reconcile_engine import ReconcileConfig, ReconcileEngine
-
-    reconcile_engine = ReconcileEngine(
-        ReconcileConfig(
-            symbol=str(SET.symbol),
-            interval_sec=_require_int(getattr(SET, "reconcile_interval_sec"), "settings.reconcile_interval_sec", min_value=1),
-            desync_confirm_n=int(reconcile_confirm_n),
-        ),
-        fetch_exchange_position=lambda symbol=str(SET.symbol): _fetch_exchange_position_snapshot(symbol),
-        get_local_position=lambda symbol=str(SET.symbol): _get_local_position_snapshot(symbol),
-        fetch_exchange_open_orders=lambda symbol=str(SET.symbol): _fetch_exchange_open_orders_snapshot(symbol),
-        on_desync=lambda result: _on_reconcile_desync(result),
-    )
-
-    regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
-    ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
-    account_builder = AccountStateBuilder(
-        win_rate_window=20,
-        min_trades_for_win_rate=5,
-        initial_equity_peak_usdt=persisted_peak,
-    )
-    risk_physics = RiskPhysicsEngine(
-        policy=RiskPhysicsPolicy(max_allocation=1.0)
-    )
-
-    monitoring_ctx = build_monitoring_cycle_context_or_raise(
-        settings=settings_view,
-        symbol=SET.symbol,
-        open_trades_ref=OPEN_TRADES,
-        reconcile_engine=reconcile_engine,
-        force_close_fn=close_all_positions_market,
-    )
-    monitoring_cycle_fn = build_monitoring_cycle_fn(monitoring_ctx)
-
-    exit_ctx = build_exit_cycle_context_or_raise(
-        settings=settings_view,
-        symbol=SET.symbol,
-        open_trades_ref=OPEN_TRADES,
-        invalidate_equity_cache_fn=_invalidate_equity_cache,
-        on_trade_closed_fn=_on_trade_closed_exit,
-        last_exit_candle_ts_1m=LAST_EXIT_CANDLE_TS_1M,
-    )
-    open_position_cycle_fn = build_open_position_cycle_fn(exit_ctx)
-
-    entry_ctx = build_entry_cycle_context_or_raise(
-        settings=settings_view,
-        symbol=SET.symbol,
-        last_close_ts_getter=lambda: LAST_CLOSE_TS,
-    )
-    if boot.last_entry_eval_signal_ts_ms is not None:
-        entry_ctx.state.last_entry_eval_signal_ts_ms = int(boot.last_entry_eval_signal_ts_ms)
-        entry_ctx.state.entry_gate_bootstrapped = True
-    entry_cycle_fn = build_entry_cycle_fn(entry_ctx)
-
-    risk_ctx = build_risk_cycle_context_or_raise(
-        settings=settings_view,
-        symbol=SET.symbol,
-        regime_engine=regime_engine,
-        account_builder=account_builder,
-        ev_heatmap=ev_heatmap,
-        risk_physics=risk_physics,
-        closed_trades_getter=_closed_trades_getter,
-        persisted_equity_peak_usdt=persisted_peak,
-    )
-    risk_cycle_fn = build_risk_cycle_fn(risk_ctx)
-
-    execution_ctx = build_execution_cycle_context_or_raise(
-        settings=settings_view,
-        open_trades_ref=OPEN_TRADES,
-        invalidate_equity_cache_fn=_invalidate_equity_cache,
-    )
-    execution_cycle_fn = build_execution_cycle_fn(execution_ctx)
-
-    runtime = EngineLoopRuntime(
-        running=True,
-        safe_stop_requested=SAFE_STOP_REQUESTED,
-        halted=False,
-        sigterm_deadline_ts=SIGTERM_DEADLINE_TS,
-    )
-
-    config = EngineLoopConfig(
-        tick_sec=ENGINE_LOOP_TICK_SEC,
-        open_position_tick_sec=ENGINE_OPEN_POSITION_TICK_SEC,
-        idle_tick_sec=ENGINE_IDLE_TICK_SEC,
-        safe_stop_tick_sec=ENGINE_SAFE_STOP_TICK_SEC,
-    )
+    watchdog_started = False
 
     try:
+        boot: EngineBootstrapArtifacts = bootstrap_engine_runtime_or_raise(
+            settings_view,
+            on_safe_stop=_on_safe_stop_command,
+            stop_flag_getter=_stop_flag_getter,
+        )
+
+        OPEN_TRADES[:] = list(boot.open_trades)
+        _invalidate_equity_cache()
+        LAST_EXCHANGE_SYNC_TS = _require_float(boot.last_exchange_sync_ts, "boot.last_exchange_sync_ts", min_value=0.0)
+        LAST_EXIT_CANDLE_TS_1M = boot.last_exit_candle_ts_1m
+
+        persisted_peak = boot.persisted_equity_peak_usdt
+        for row in reversed(list(boot.closed_trade_rows)):
+            CLOSED_TRADES_CACHE.appendleft(row)
+
+        _AUTO_REPORTER = _build_auto_reporter_or_raise()
+
+        start_watchdog(
+            settings=SET,
+            symbol=str(SET.symbol),
+            on_fatal=_on_watchdog_fatal,
+        )
+        watchdog_started = True
+
+        reconcile_confirm_n = _require_int(getattr(SET, "reconcile_confirm_n"), "settings.reconcile_confirm_n", min_value=1)
+        hard_consecutive_losses_limit = _require_int(
+            getattr(SET, "hard_consecutive_losses_limit"),
+            "settings.hard_consecutive_losses_limit",
+            min_value=0,
+        )
+        _ = hard_consecutive_losses_limit
+
+        from sync.reconcile_engine import ReconcileConfig, ReconcileEngine
+
+        reconcile_engine = ReconcileEngine(
+            ReconcileConfig(
+                symbol=str(SET.symbol),
+                interval_sec=_require_int(getattr(SET, "reconcile_interval_sec"), "settings.reconcile_interval_sec", min_value=1),
+                desync_confirm_n=int(reconcile_confirm_n),
+            ),
+            fetch_exchange_position=lambda symbol=str(SET.symbol): _fetch_exchange_position_snapshot(symbol),
+            get_local_position=lambda symbol=str(SET.symbol): _get_local_position_snapshot(symbol),
+            fetch_exchange_open_orders=lambda symbol=str(SET.symbol): _fetch_exchange_open_orders_snapshot(symbol),
+            on_desync=lambda result: _on_reconcile_desync(result),
+        )
+
+        regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
+        ev_heatmap = EvHeatmapEngine(window_size=50, min_samples=20)
+        account_builder = AccountStateBuilder(
+            win_rate_window=20,
+            min_trades_for_win_rate=5,
+            initial_equity_peak_usdt=persisted_peak,
+        )
+        risk_physics = RiskPhysicsEngine(
+            policy=RiskPhysicsPolicy(max_allocation=1.0)
+        )
+
+        monitoring_ctx = build_monitoring_cycle_context_or_raise(
+            settings=settings_view,
+            symbol=SET.symbol,
+            open_trades_ref=OPEN_TRADES,
+            reconcile_engine=reconcile_engine,
+            force_close_fn=close_all_positions_market,
+        )
+        monitoring_cycle_fn = build_monitoring_cycle_fn(monitoring_ctx)
+
+        exit_ctx = build_exit_cycle_context_or_raise(
+            settings=settings_view,
+            symbol=SET.symbol,
+            open_trades_ref=OPEN_TRADES,
+            invalidate_equity_cache_fn=_invalidate_equity_cache,
+            on_trade_closed_fn=_on_trade_closed_exit,
+            last_exit_candle_ts_1m=LAST_EXIT_CANDLE_TS_1M,
+        )
+        open_position_cycle_fn = build_open_position_cycle_fn(exit_ctx)
+
+        entry_ctx = build_entry_cycle_context_or_raise(
+            settings=settings_view,
+            symbol=SET.symbol,
+            last_close_ts_getter=lambda: LAST_CLOSE_TS,
+        )
+        if boot.last_entry_eval_signal_ts_ms is not None:
+            entry_ctx.state.last_entry_eval_signal_ts_ms = int(boot.last_entry_eval_signal_ts_ms)
+            entry_ctx.state.entry_gate_bootstrapped = True
+        entry_cycle_fn = build_entry_cycle_fn(entry_ctx)
+
+        risk_ctx = build_risk_cycle_context_or_raise(
+            settings=settings_view,
+            symbol=SET.symbol,
+            regime_engine=regime_engine,
+            account_builder=account_builder,
+            ev_heatmap=ev_heatmap,
+            risk_physics=risk_physics,
+            closed_trades_getter=_closed_trades_getter,
+            persisted_equity_peak_usdt=persisted_peak,
+        )
+        risk_cycle_fn = build_risk_cycle_fn(risk_ctx)
+
+        execution_ctx = build_execution_cycle_context_or_raise(
+            settings=settings_view,
+            open_trades_ref=OPEN_TRADES,
+            invalidate_equity_cache_fn=_invalidate_equity_cache,
+        )
+        execution_cycle_fn = build_execution_cycle_fn(execution_ctx)
+
+        runtime = EngineLoopRuntime(
+            running=True,
+            safe_stop_requested=SAFE_STOP_REQUESTED,
+            halted=False,
+            sigterm_deadline_ts=SIGTERM_DEADLINE_TS,
+        )
+
+        config = EngineLoopConfig(
+            tick_sec=ENGINE_LOOP_TICK_SEC,
+            open_position_tick_sec=ENGINE_OPEN_POSITION_TICK_SEC,
+            idle_tick_sec=ENGINE_IDLE_TICK_SEC,
+            safe_stop_tick_sec=ENGINE_SAFE_STOP_TICK_SEC,
+        )
+
         run_engine_loop_or_raise(
             config=config,
             runtime=runtime,
@@ -629,6 +752,7 @@ def main() -> None:
             idle_safe_stop_fn=_idle_safe_stop_fn,
             stop_flag_getter=_stop_flag_getter,
         )
+
     except EngineLoopHalted:
         return
     except Exception as e:
@@ -647,6 +771,12 @@ def main() -> None:
             reason=str(e),
         )
         raise
+    finally:
+        try:
+            if watchdog_started:
+                stop_watchdog()
+        finally:
+            stop_worker()
 
 
 def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
@@ -776,7 +906,7 @@ def _on_reconcile_desync(result: Any) -> None:
         log(f"[DESYNC] {code} | {message} | {details}")
     _safe_send_tg(msg)
 
-    force_close_on_desync = bool(getattr(SET, "force_close_on_desync"))
+    force_close_on_desync = _require_bool(getattr(SET, "force_close_on_desync"), "settings.force_close_on_desync")
     if force_close_on_desync:
         try:
             n = close_all_positions_market(symbol)

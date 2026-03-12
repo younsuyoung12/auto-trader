@@ -21,7 +21,14 @@ IMPORTANT POLICY:
 - 1m candle ts rollback 은 즉시 SAFE_STOP
 - maybe_exit_with_gpt 의 반환 계약 위반은 즉시 예외
 - hidden default / silent continue / 예외 삼키기 금지
+- SAFE_STOP 상태 전이는 runtime.request_safe_stop(...) 만 사용한다
 ============================================================
+
+CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(STATE-MACHINE): ts rollback 시 runtime.safe_stop_requested 직접 수정 제거 → runtime.request_safe_stop(...) 사용
+  2) FIX(CONTRACT): exit cycle 실행 상태를 RUNNING/SAFE_STOP/RECOVERY 에서만 허용
+  3) FIX(STRICT): open position branch 계약 명확화
 """
 
 from __future__ import annotations
@@ -36,7 +43,12 @@ from infra.market_data_ws import get_klines_with_volume as ws_get_klines_with_vo
 from state.exit_engine import maybe_exit_with_gpt
 from state.trader_state import Trade
 
-from engine.engine_loop import EngineLoopRuntime
+from engine.engine_loop import (
+    ENGINE_STATE_RECOVERY,
+    ENGINE_STATE_RUNNING,
+    ENGINE_STATE_SAFE_STOP,
+    EngineLoopRuntime,
+)
 
 
 class ExitCycleError(RuntimeError):
@@ -131,6 +143,15 @@ def run_open_position_cycle_or_raise(
     runtime.validate_or_raise()
     now_f = _require_float(now_ts, "now_ts", min_value=0.0)
 
+    if runtime.engine_state not in (
+        ENGINE_STATE_RUNNING,
+        ENGINE_STATE_SAFE_STOP,
+        ENGINE_STATE_RECOVERY,
+    ):
+        raise ExitCycleContractError(
+            f"exit cycle invalid runtime.engine_state (STRICT): {runtime.engine_state!r}"
+        )
+
     if not ctx.open_trades_ref:
         return False
 
@@ -158,7 +179,7 @@ def run_open_position_cycle_or_raise(
         return True
 
     if last_ts_ms < prev_ts:
-        runtime.safe_stop_requested = True
+        runtime.request_safe_stop("EXIT_CYCLE_TS_ROLLBACK", now_ts=now_f)
         msg = f"[SAFE_STOP][TS_ROLLBACK] 1m ts rollback: prev={prev_ts} now={last_ts_ms}"
         log(msg)
         _safe_send_tg(msg)

@@ -13,6 +13,7 @@ CORE RESPONSIBILITIES:
 - non-fatal entry rejection 을 explicit SKIP 으로 처리
 - 성공 시 OPEN_TRADES 반영
 - execution 후 equity cache invalidation 호출
+- ExecutionEngine 반환 Trade 의 state/quality 계약 검증
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -21,8 +22,14 @@ IMPORTANT POLICY:
 - execution latency 초과는 즉시 SAFE_STOP
 - invalid trade return / invalid packet contract 는 즉시 예외
 - ExecutionEngine non-fatal None 반환은 명시적 SKIP 처리
+- state machine 전이는 runtime.request_safe_stop(...) 만 사용한다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(STATE-MACHINE): SAFE_STOP 직접 플래그 수정 제거 → runtime.request_safe_stop() 사용
+  2) FEAT(CONTRACT): ExecutionEngine 반환 Trade 의 db_id / order_state / execution_quality 계약 검증 추가
+  3) FIX(STRICT): RUNNING 상태 외 execution 진입 금지
+  4) FIX(OPERABILITY): execution latency SAFE_STOP reason 명시화
 - 2026-03-12:
   1) FIX(ROOT-CAUSE): Signal 타입 import 누락 수정
   2) KEEP(STRICT): execution packet / signal contract strict validation 유지
@@ -39,10 +46,11 @@ from typing import Any, Callable, List, Optional
 from infra.telelog import log, send_tg
 from infra.async_worker import submit as submit_async
 from execution.execution_engine import ExecutionEngine
+from execution.order_state import OrderState
 from state.trader_state import Trade
 from strategy.signal import Signal
 
-from engine.engine_loop import EngineLoopRuntime
+from engine.engine_loop import ENGINE_STATE_RUNNING, EngineLoopRuntime
 from engine.cycles.risk_cycle import (
     RiskCyclePacket,
     consume_pending_risk_packet_or_none,
@@ -146,7 +154,12 @@ def run_execution_cycle_or_raise(
 ) -> None:
     ctx.validate_or_raise()
     runtime.validate_or_raise()
-    _ = _require_float(now_ts, "now_ts", min_value=0.0)
+    now_f = _require_float(now_ts, "now_ts", min_value=0.0)
+
+    if runtime.engine_state != ENGINE_STATE_RUNNING:
+        raise ExecutionCycleContractError(
+            f"execution cycle requires RUNNING state (STRICT), current={runtime.engine_state}"
+        )
 
     risk_packet = consume_pending_risk_packet_or_none(runtime)
     if risk_packet is None:
@@ -172,7 +185,7 @@ def run_execution_cycle_or_raise(
     dt_ms = (time.perf_counter() - t0) * 1000.0
 
     if dt_ms > ctx.config.max_exec_latency_ms:
-        runtime.safe_stop_requested = True
+        runtime.request_safe_stop("EXECUTION_LATENCY_EXCEEDED", now_ts=now_f)
         msg = f"[SAFE_STOP][LATENCY_EXEC] exec_ms={dt_ms:.1f} > {ctx.config.max_exec_latency_ms:.1f}"
         log(msg)
         _safe_send_tg(msg)
@@ -191,16 +204,7 @@ def run_execution_cycle_or_raise(
         _maybe_send_rejection_tg(ctx, "ENTRY_REJECTED_NONFATAL", msg)
         return
 
-    if not isinstance(trade, Trade):
-        raise ExecutionCycleContractError(
-            f"ExecutionEngine returned invalid type (STRICT): {type(trade).__name__}"
-        )
-
-    trade_symbol = _normalize_symbol_strict(_require_attr(trade, "symbol", "trade"), name="trade.symbol")
-    if trade_symbol != risk_packet.symbol:
-        raise ExecutionCycleContractError(
-            f"trade.symbol mismatch vs risk packet (STRICT): trade={trade_symbol} packet={risk_packet.symbol}"
-        )
+    _validate_execution_trade_contract_or_raise(trade, risk_packet)
 
     ctx.open_trades_ref.append(trade)
     ctx.invalidate_equity_cache_fn()
@@ -225,11 +229,17 @@ def _validate_risk_packet_or_raise(packet: RiskCyclePacket) -> None:
     if not isinstance(signal_final, Signal):
         raise ExecutionCycleContractError("risk_packet.signal_final must be Signal (STRICT)")
 
-    action = _require_nonempty_str(_require_attr(signal_final, "action", "signal_final"), "signal_final.action").upper()
+    action = _require_nonempty_str(
+        _require_attr(signal_final, "action", "signal_final"),
+        "signal_final.action",
+    ).upper()
     if action != "ENTER":
         raise ExecutionCycleContractError(f"signal_final.action must be ENTER (STRICT), got={action!r}")
 
-    direction = _require_nonempty_str(_require_attr(signal_final, "direction", "signal_final"), "signal_final.direction").upper()
+    direction = _require_nonempty_str(
+        _require_attr(signal_final, "direction", "signal_final"),
+        "signal_final.direction",
+    ).upper()
     if direction not in ("LONG", "SHORT"):
         raise ExecutionCycleContractError(f"signal_final.direction invalid (STRICT): {direction!r}")
 
@@ -253,6 +263,102 @@ def _validate_risk_packet_or_raise(packet: RiskCyclePacket) -> None:
         raise ExecutionCycleContractError("signal_final.meta.entry_price_source missing (STRICT)")
     _ = _require_float(meta["entry_price_hint"], "signal_final.meta.entry_price_hint", min_value=0.0)
     _ = _require_nonempty_str(meta["entry_price_source"], "signal_final.meta.entry_price_source")
+
+
+def _validate_execution_trade_contract_or_raise(
+    trade: Trade,
+    risk_packet: RiskCyclePacket,
+) -> None:
+    if not isinstance(trade, Trade):
+        raise ExecutionCycleContractError(
+            f"ExecutionEngine returned invalid type (STRICT): {type(trade).__name__}"
+        )
+
+    trade_symbol = _normalize_symbol_strict(_require_attr(trade, "symbol", "trade"), name="trade.symbol")
+    if trade_symbol != risk_packet.symbol:
+        raise ExecutionCycleContractError(
+            f"trade.symbol mismatch vs risk packet (STRICT): trade={trade_symbol} packet={risk_packet.symbol}"
+        )
+
+    trade_qty = _require_float(_require_attr(trade, "qty", "trade"), "trade.qty", min_value=0.0)
+    if trade_qty <= 0.0:
+        raise ExecutionCycleContractError("trade.qty must be > 0 (STRICT)")
+
+    db_id_raw = _require_attr(trade, "db_id", "trade")
+    db_id = _require_int(db_id_raw, "trade.db_id", min_value=1)
+    if db_id <= 0:
+        raise ExecutionCycleContractError("trade.db_id must be > 0 (STRICT)")
+
+    order_state_raw = _require_attr(trade, "order_state", "trade")
+    order_state = _require_nonempty_str(order_state_raw, "trade.order_state").upper()
+    if order_state != OrderState.FILLED.value:
+        raise ExecutionCycleContractError(
+            f"trade.order_state must be FILLED after successful execution (STRICT), got={order_state!r}"
+        )
+
+    reconciliation_status = _require_nonempty_str(
+        _require_attr(trade, "reconciliation_status", "trade"),
+        "trade.reconciliation_status",
+    ).upper()
+    if reconciliation_status != "PROTECTION_VERIFIED":
+        raise ExecutionCycleContractError(
+            "trade.reconciliation_status must be PROTECTION_VERIFIED after successful execution (STRICT)"
+        )
+
+    meta = _require_attr(trade, "meta", "trade")
+    if meta is not None and not isinstance(meta, dict):
+        raise ExecutionCycleContractError("trade.meta must be dict when present (STRICT)")
+
+    if isinstance(meta, dict) and "execution_quality" in meta:
+        execution_quality = meta["execution_quality"]
+        if not isinstance(execution_quality, dict):
+            raise ExecutionCycleContractError("trade.meta.execution_quality must be dict (STRICT)")
+
+        required_keys = (
+            "ts_ms",
+            "symbol",
+            "side",
+            "expected_price",
+            "filled_avg_price",
+            "slippage_pct",
+            "adverse_move_pct",
+            "post_prices",
+            "execution_score",
+            "meta",
+        )
+        for key in required_keys:
+            if key not in execution_quality:
+                raise ExecutionCycleContractError(
+                    f"trade.meta.execution_quality missing key: {key} (STRICT)"
+                )
+
+        eq_symbol = _normalize_symbol_strict(execution_quality["symbol"], name="execution_quality.symbol")
+        if eq_symbol != risk_packet.symbol:
+            raise ExecutionCycleContractError(
+                f"execution_quality.symbol mismatch (STRICT): {eq_symbol} != {risk_packet.symbol}"
+            )
+
+        _ = _require_int(execution_quality["ts_ms"], "execution_quality.ts_ms", min_value=1)
+        _ = _require_nonempty_str(execution_quality["side"], "execution_quality.side")
+        _ = _require_float(execution_quality["expected_price"], "execution_quality.expected_price", min_value=0.0)
+        _ = _require_float(execution_quality["filled_avg_price"], "execution_quality.filled_avg_price", min_value=0.0)
+        _ = _require_float(execution_quality["slippage_pct"], "execution_quality.slippage_pct", min_value=0.0)
+        _ = _require_float(execution_quality["adverse_move_pct"], "execution_quality.adverse_move_pct", min_value=0.0)
+        _ = _require_float(execution_quality["execution_score"], "execution_quality.execution_score", min_value=0.0)
+        if not isinstance(execution_quality["post_prices"], dict):
+            raise ExecutionCycleContractError("execution_quality.post_prices must be dict (STRICT)")
+        if not isinstance(execution_quality["meta"], dict):
+            raise ExecutionCycleContractError("execution_quality.meta must be dict (STRICT)")
+
+        execution_quality_status_raw = _require_attr(trade, "execution_quality_status", "trade")
+        execution_quality_status = _require_nonempty_str(
+            execution_quality_status_raw,
+            "trade.execution_quality_status",
+        ).upper()
+        if execution_quality_status != "ATTACHED":
+            raise ExecutionCycleContractError(
+                "trade.execution_quality_status must be ATTACHED when execution_quality exists (STRICT)"
+            )
 
 
 def _require_bool(v: Any, name: str) -> bool:
