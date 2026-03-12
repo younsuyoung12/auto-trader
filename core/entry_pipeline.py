@@ -5,9 +5,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ============================================================
 
 핵심 변경 요약
-- FIX(ROOT-CAUSE): entry_pipeline 단계 SKIP 사유를 bt_events 에 구조적으로 기록하도록 추가
+- FIX(ROOT-CAUSE): market_features_ws 의 양방향 후보 점수 계약과 entry_pipeline 정합화
+- FIX(STRUCTURE): 기존 단일 방향(direction_source old contract) 검증을
+  candidate telemetry 기반 검증으로 확장
 - KEEP(STRICT): 잘못된 방향 상태 / slope 누락 / signal contract 위반은 즉시 예외 유지
-- CLEANUP: bt_events 감사 로그 payload 정규화 helper 추가, 상단 변경 이력 최근 2일 기준으로 정리
+- CLEANUP: selected candidate / selection_margin / long_score / short_score 감사 메타 추가
 
 역할
 - run_bot_ws 엔진의 진입 후보 생성 전용 파이프라인을 분리한다.
@@ -22,9 +24,27 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 필수 데이터 누락/손상 시 즉시 예외 또는 명시적 SKIP 처리.
 - bt_events 감사 로그 기록 실패는 조용히 무시하지 않고 즉시 예외 전파한다.
 - 기존 run_bot_ws.py 의 로직을 분리만 하고 의미를 바꾸지 않는다.
+- LONG / SHORT 양방향 후보는 upstream 에서 동일 기준으로 계산되며,
+  entry_pipeline 은 선택 결과와 telemetry 계약을 검증한다.
+- selection_margin 이 부족하거나 primary 5m bias/slope 와 선택 방향이 어긋나면
+  임의 진입을 허용하지 않는다.
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-12:
+  1) FIX(ROOT-CAUSE): market_features_ws 양방향 후보 점수 계약과 정합화
+     - extra.direction_candidates / long_score / short_score / selection_margin 계약 수용
+     - old direction_source 우선 계약만 보던 구조 제거
+  2) FIX(TRADE-GRADE): selected candidate 검증 추가
+     - selected_candidate_score / selection_margin / primary 5m bias / primary 5m slope 검증
+     - upstream 에서 SHORT 가 선택되었는데 downstream 이 오래된 LONG 편향 계약으로 오판하는 경로 차단
+  3) KEEP(STRICT): higher timeframe support/opposition 가드는 유지
+     - 15m / 1h confirmed slope 기반 안전장치는 계속 유지
+  4) ADD(AUDIT): candidate telemetry 감사 메타 추가
+     - signal_long_score / signal_short_score / signal_selection_margin /
+       signal_selected_candidate_score / signal_selected_candidate_source 기록
+  5) KEEP(COMPAT): 기존 bt_events / candidate output / downstream 연결 계약 유지
+
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): entry_pipeline 단계 SKIP 사유(bt_events) 누락 수정
      - WS_NOT_READY / FEATURE_BUILD_FAIL / STRUCTURE_FILTER / DIRECTION_STABILITY 를 bt_events 로 기록
@@ -119,6 +139,10 @@ DIRECTION_CONFIRM_MAX_SECONDARY_OPPOSE: int = 1
 DIRECTION_CONFIRM_REQUIRED_HIGHER_TF_SUPPORTS: int = 1
 DIRECTION_CONFIRM_MAX_HIGHER_TF_OPPOSE: int = 0
 DIRECTION_CONFIRM_BLOCK_5M_ONLY_SOURCE: bool = True
+
+# 2026-03-12 candidate telemetry guard
+DIRECTION_CONFIRM_MIN_SELECTION_MARGIN: float = 0.55
+DIRECTION_CONFIRM_MIN_SELECTED_CANDIDATE_SCORE: float = 1.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +300,7 @@ def _normalize_options_bias_strict(v: Any) -> str:
 def _normalize_direction_source_strict(v: Any, name: str) -> str:
     s = _require_nonempty_str(v, name).strip()
     allowed = {
+        # legacy selection labels
         "4h_1h_agree",
         "1h_15m_agree",
         "15m_5m_agree",
@@ -283,6 +308,10 @@ def _normalize_direction_source_strict(v: Any, name: str) -> str:
         "1h_5m_agree",
         "5m_only",
         "undecided",
+        # current selected candidate labels / sources
+        "TREND",
+        "RANGE",
+        "GENERIC",
     }
     if s not in allowed:
         raise RuntimeError(f"{name} invalid (STRICT): {s!r}")
@@ -503,7 +532,15 @@ def _derive_options_directional_state_strict(
     return "NEUTRAL"
 
 
-def _extract_signal_direction_contract_from_extra_strict(extra: Any) -> Dict[str, Any]:
+def _extract_signal_direction_contract_from_extra_strict(
+    extra: Any,
+    *,
+    selected_direction: str,
+) -> Dict[str, Any]:
+    dir_norm = _normalize_directional_state_strict(selected_direction, "selected_direction")
+    if dir_norm == "NEUTRAL":
+        raise RuntimeError("selected_direction cannot be NEUTRAL (STRICT)")
+
     if extra is None:
         return {
             "direction_source": None,
@@ -511,8 +548,16 @@ def _extract_signal_direction_contract_from_extra_strict(extra: Any) -> Dict[str
             "high_tf_bias_1h": None,
             "high_tf_bias_15m": None,
             "bias_5m": None,
-            "support_count": None,
-            "oppose_count": None,
+            "slope_bias_5m": None,
+            "slope_bias_15m": None,
+            "slope_bias_1h": None,
+            "long_score": None,
+            "short_score": None,
+            "selection_margin": None,
+            "selected_candidate_support_count": None,
+            "selected_candidate_oppose_count": None,
+            "selected_candidate_score": None,
+            "selected_candidate_signal_source": None,
         }
     if not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None (STRICT)")
@@ -523,8 +568,16 @@ def _extract_signal_direction_contract_from_extra_strict(extra: Any) -> Dict[str
         "high_tf_bias_1h": None,
         "high_tf_bias_15m": None,
         "bias_5m": None,
-        "support_count": None,
-        "oppose_count": None,
+        "slope_bias_5m": None,
+        "slope_bias_15m": None,
+        "slope_bias_1h": None,
+        "long_score": None,
+        "short_score": None,
+        "selection_margin": None,
+        "selected_candidate_support_count": None,
+        "selected_candidate_oppose_count": None,
+        "selected_candidate_score": None,
+        "selected_candidate_signal_source": None,
     }
 
     if extra.get("direction_source") is not None:
@@ -552,10 +605,64 @@ def _extract_signal_direction_contract_from_extra_strict(extra: Any) -> Dict[str
             extra.get("bias_5m"),
             "extra.bias_5m",
         )
-    if extra.get("support_count") is not None:
-        out["support_count"] = int(_as_float(extra.get("support_count"), "extra.support_count", min_value=0.0))
-    if extra.get("oppose_count") is not None:
-        out["oppose_count"] = int(_as_float(extra.get("oppose_count"), "extra.oppose_count", min_value=0.0))
+    if extra.get("slope_bias_5m") is not None:
+        out["slope_bias_5m"] = _normalize_direction_bias_int_strict(
+            extra.get("slope_bias_5m"),
+            "extra.slope_bias_5m",
+        )
+    if extra.get("slope_bias_15m") is not None:
+        out["slope_bias_15m"] = _normalize_direction_bias_int_strict(
+            extra.get("slope_bias_15m"),
+            "extra.slope_bias_15m",
+        )
+    if extra.get("slope_bias_1h") is not None:
+        out["slope_bias_1h"] = _normalize_direction_bias_int_strict(
+            extra.get("slope_bias_1h"),
+            "extra.slope_bias_1h",
+        )
+    if extra.get("long_score") is not None:
+        out["long_score"] = _as_float(extra.get("long_score"), "extra.long_score", min_value=0.0)
+    if extra.get("short_score") is not None:
+        out["short_score"] = _as_float(extra.get("short_score"), "extra.short_score", min_value=0.0)
+    if extra.get("selection_margin") is not None:
+        out["selection_margin"] = _as_float(extra.get("selection_margin"), "extra.selection_margin", min_value=0.0)
+
+    direction_candidates = extra.get("direction_candidates")
+    if direction_candidates is not None:
+        if not isinstance(direction_candidates, dict):
+            raise RuntimeError("extra.direction_candidates must be dict (STRICT)")
+        selected_candidate = direction_candidates.get(dir_norm)
+        if not isinstance(selected_candidate, dict):
+            raise RuntimeError(f"extra.direction_candidates[{dir_norm}] must be dict (STRICT)")
+
+        if selected_candidate.get("support_count") is not None:
+            out["selected_candidate_support_count"] = int(
+                _as_float(
+                    selected_candidate.get("support_count"),
+                    f"extra.direction_candidates[{dir_norm}].support_count",
+                    min_value=0.0,
+                )
+            )
+        if selected_candidate.get("oppose_count") is not None:
+            out["selected_candidate_oppose_count"] = int(
+                _as_float(
+                    selected_candidate.get("oppose_count"),
+                    f"extra.direction_candidates[{dir_norm}].oppose_count",
+                    min_value=0.0,
+                )
+            )
+        if selected_candidate.get("score") is not None:
+            out["selected_candidate_score"] = _as_float(
+                selected_candidate.get("score"),
+                f"extra.direction_candidates[{dir_norm}].score",
+                min_value=0.0,
+            )
+        if selected_candidate.get("signal_source") is not None:
+            out["selected_candidate_signal_source"] = _normalize_direction_source_strict(
+                selected_candidate.get("signal_source"),
+                f"extra.direction_candidates[{dir_norm}].signal_source",
+            )
+
     return out
 
 
@@ -625,28 +732,95 @@ def _evaluate_direction_stability_guard_strict(
         if DIRECTION_CONFIRM_BLOCK_5M_ONLY_SOURCE and direction_source == "5m_only":
             return f"signal_direction_source_blocked:{direction_source}"
 
-        bias_map = {
-            "4h": signal_direction_contract.get("high_tf_bias_4h"),
-            "1h": signal_direction_contract.get("high_tf_bias_1h"),
-            "15m": signal_direction_contract.get("high_tf_bias_15m"),
-            "5m": signal_direction_contract.get("bias_5m"),
-        }
-        expected = 1 if dir_norm == "LONG" else -1
+    selected_candidate_score = signal_direction_contract.get("selected_candidate_score")
+    if selected_candidate_score is not None:
+        selected_candidate_score_f = _as_float(
+            selected_candidate_score,
+            "signal_direction_contract.selected_candidate_score",
+            min_value=0.0,
+        )
+        if selected_candidate_score_f < DIRECTION_CONFIRM_MIN_SELECTED_CANDIDATE_SCORE:
+            return f"selected_candidate_score_too_small:{selected_candidate_score_f:.6f}"
 
-        for tf_label, tf_bias in bias_map.items():
-            if tf_bias is None:
-                continue
-            if int(tf_bias) == -expected and tf_label in ("15m", "1h", "4h"):
-                return f"signal_contract_higher_tf_oppose:{tf_label}:{tf_bias}"
-            if tf_label == "5m" and int(tf_bias) != 0 and int(tf_bias) != expected:
-                return f"signal_contract_5m_bias_mismatch:{tf_bias}"
+    selection_margin = signal_direction_contract.get("selection_margin")
+    if selection_margin is not None:
+        selection_margin_f = _as_float(
+            selection_margin,
+            "signal_direction_contract.selection_margin",
+            min_value=0.0,
+        )
+        if selection_margin_f < DIRECTION_CONFIRM_MIN_SELECTION_MARGIN:
+            return f"selection_margin_too_small:{selection_margin_f:.6f}"
 
-        contract_support = signal_direction_contract.get("support_count")
-        contract_oppose = signal_direction_contract.get("oppose_count")
-        if contract_support is not None and int(contract_support) <= 0:
-            return f"signal_contract_support_invalid:{contract_support}"
-        if contract_oppose is not None and int(contract_oppose) > 0 and higher_tf_support_count <= 0:
-            return f"signal_contract_oppose_without_higher_tf_support:{contract_oppose}"
+    selected_candidate_support_count = signal_direction_contract.get("selected_candidate_support_count")
+    if selected_candidate_support_count is not None:
+        selected_candidate_support_count_i = int(
+            _as_float(
+                selected_candidate_support_count,
+                "signal_direction_contract.selected_candidate_support_count",
+                min_value=0.0,
+            )
+        )
+        if selected_candidate_support_count_i <= 0:
+            return f"selected_candidate_support_invalid:{selected_candidate_support_count_i}"
+
+    selected_candidate_oppose_count = signal_direction_contract.get("selected_candidate_oppose_count")
+    if selected_candidate_oppose_count is not None:
+        selected_candidate_oppose_count_i = int(
+            _as_float(
+                selected_candidate_oppose_count,
+                "signal_direction_contract.selected_candidate_oppose_count",
+                min_value=0.0,
+            )
+        )
+        if selected_candidate_oppose_count_i > support_count:
+            return (
+                f"selected_candidate_oppose_excess:{selected_candidate_oppose_count_i}:"
+                f"support={support_count}"
+            )
+
+    bias_map = {
+        "4h": signal_direction_contract.get("high_tf_bias_4h"),
+        "1h": signal_direction_contract.get("high_tf_bias_1h"),
+        "15m": signal_direction_contract.get("high_tf_bias_15m"),
+        "5m": signal_direction_contract.get("bias_5m"),
+    }
+    expected = 1 if dir_norm == "LONG" else -1
+
+    for tf_label, tf_bias in bias_map.items():
+        if tf_bias is None:
+            continue
+        if int(tf_bias) == -expected and tf_label in ("15m", "1h", "4h"):
+            return f"signal_contract_higher_tf_oppose:{tf_label}:{tf_bias}"
+        if tf_label == "5m" and int(tf_bias) != 0 and int(tf_bias) != expected:
+            return f"signal_contract_5m_bias_mismatch:{tf_bias}"
+
+    slope_bias_5m = signal_direction_contract.get("slope_bias_5m")
+    if slope_bias_5m is not None:
+        slope_bias_5m_i = _normalize_direction_bias_int_strict(
+            slope_bias_5m,
+            "signal_direction_contract.slope_bias_5m",
+        )
+        if slope_bias_5m_i != 0 and slope_bias_5m_i != expected:
+            return f"signal_contract_5m_slope_bias_mismatch:{slope_bias_5m_i}"
+
+    slope_bias_15m = signal_direction_contract.get("slope_bias_15m")
+    if slope_bias_15m is not None:
+        slope_bias_15m_i = _normalize_direction_bias_int_strict(
+            slope_bias_15m,
+            "signal_direction_contract.slope_bias_15m",
+        )
+        if slope_bias_15m_i == -expected:
+            return f"signal_contract_15m_slope_oppose:{slope_bias_15m_i}"
+
+    slope_bias_1h = signal_direction_contract.get("slope_bias_1h")
+    if slope_bias_1h is not None:
+        slope_bias_1h_i = _normalize_direction_bias_int_strict(
+            slope_bias_1h,
+            "signal_direction_contract.slope_bias_1h",
+        )
+        if slope_bias_1h_i == -expected:
+            return f"signal_contract_1h_slope_oppose:{slope_bias_1h_i}"
 
     return None
 
@@ -1004,6 +1178,16 @@ def _decide_entry_candidate_strict(market_data: Dict[str, Any], settings: Any) -
         "signal_high_tf_bias_1h": market_data.get("signal_high_tf_bias_1h"),
         "signal_high_tf_bias_15m": market_data.get("signal_high_tf_bias_15m"),
         "signal_bias_5m": market_data.get("signal_bias_5m"),
+        "signal_slope_bias_5m": market_data.get("signal_slope_bias_5m"),
+        "signal_slope_bias_15m": market_data.get("signal_slope_bias_15m"),
+        "signal_slope_bias_1h": market_data.get("signal_slope_bias_1h"),
+        "signal_long_score": market_data.get("signal_long_score"),
+        "signal_short_score": market_data.get("signal_short_score"),
+        "signal_selection_margin": market_data.get("signal_selection_margin"),
+        "signal_selected_candidate_score": market_data.get("signal_selected_candidate_score"),
+        "signal_selected_candidate_support_count": market_data.get("signal_selected_candidate_support_count"),
+        "signal_selected_candidate_oppose_count": market_data.get("signal_selected_candidate_oppose_count"),
+        "signal_selected_candidate_source": market_data.get("signal_selected_candidate_source"),
     }
 
     return EntryCandidate(
@@ -1130,7 +1314,10 @@ def _build_entry_market_data(
         notify_entry_block_fn(f"WS_NOT_READY:{symbol}:{prereq_reason}", msg, 60)
         return None
 
-    signal_direction_contract = _extract_signal_direction_contract_from_extra_strict(extra)
+    signal_direction_contract = _extract_signal_direction_contract_from_extra_strict(
+        extra,
+        selected_direction=direction,
+    )
 
     if extra is not None and not isinstance(extra, dict):
         raise RuntimeError("extra must be dict or None")
@@ -1274,6 +1461,16 @@ def _build_entry_market_data(
         "signal_high_tf_bias_1h": signal_direction_contract.get("high_tf_bias_1h"),
         "signal_high_tf_bias_15m": signal_direction_contract.get("high_tf_bias_15m"),
         "signal_bias_5m": signal_direction_contract.get("bias_5m"),
+        "signal_slope_bias_5m": signal_direction_contract.get("slope_bias_5m"),
+        "signal_slope_bias_15m": signal_direction_contract.get("slope_bias_15m"),
+        "signal_slope_bias_1h": signal_direction_contract.get("slope_bias_1h"),
+        "signal_long_score": signal_direction_contract.get("long_score"),
+        "signal_short_score": signal_direction_contract.get("short_score"),
+        "signal_selection_margin": signal_direction_contract.get("selection_margin"),
+        "signal_selected_candidate_support_count": signal_direction_contract.get("selected_candidate_support_count"),
+        "signal_selected_candidate_oppose_count": signal_direction_contract.get("selected_candidate_oppose_count"),
+        "signal_selected_candidate_score": signal_direction_contract.get("selected_candidate_score"),
+        "signal_selected_candidate_source": signal_direction_contract.get("selected_candidate_signal_source"),
     }
 
     structural_block_reason = _evaluate_structural_entry_conflict_strict(out)
@@ -1348,7 +1545,11 @@ def _build_entry_market_data(
             f"reason={direction_stability_guard_reason} tf_states={direction_tf_states} "
             f"tf_slopes_pct={direction_tf_slopes_pct} orderflow={direction_orderflow_state} "
             f"options={direction_options_state} signal_direction_source={signal_direction_contract.get('direction_source')} "
-            f"higher_tf_support={higher_tf_support_count} higher_tf_oppose={higher_tf_oppose_count}"
+            f"higher_tf_support={higher_tf_support_count} higher_tf_oppose={higher_tf_oppose_count} "
+            f"long_score={signal_direction_contract.get('long_score')} "
+            f"short_score={signal_direction_contract.get('short_score')} "
+            f"selection_margin={signal_direction_contract.get('selection_margin')} "
+            f"selected_candidate_score={signal_direction_contract.get('selected_candidate_score')}"
         )
         log_fn(msg)
         _emit_skip_event_strict(
@@ -1374,6 +1575,16 @@ def _build_entry_market_data(
                 "signal_high_tf_bias_1h": signal_direction_contract.get("high_tf_bias_1h"),
                 "signal_high_tf_bias_15m": signal_direction_contract.get("high_tf_bias_15m"),
                 "signal_bias_5m": signal_direction_contract.get("bias_5m"),
+                "signal_slope_bias_5m": signal_direction_contract.get("slope_bias_5m"),
+                "signal_slope_bias_15m": signal_direction_contract.get("slope_bias_15m"),
+                "signal_slope_bias_1h": signal_direction_contract.get("slope_bias_1h"),
+                "signal_long_score": signal_direction_contract.get("long_score"),
+                "signal_short_score": signal_direction_contract.get("short_score"),
+                "signal_selection_margin": signal_direction_contract.get("selection_margin"),
+                "signal_selected_candidate_support_count": signal_direction_contract.get("selected_candidate_support_count"),
+                "signal_selected_candidate_oppose_count": signal_direction_contract.get("selected_candidate_oppose_count"),
+                "signal_selected_candidate_score": signal_direction_contract.get("selected_candidate_score"),
+                "signal_selected_candidate_source": signal_direction_contract.get("selected_candidate_signal_source"),
                 "entry_score": float(out["entry_score"]),
                 "trend_strength": float(out["trend_strength"]),
                 "spread": float(out["spread"]),

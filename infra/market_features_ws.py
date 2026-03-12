@@ -25,8 +25,24 @@ IMPORTANT POLICY:
 - 방향 결정 계약은 entry_pipeline 과 정합해야 하며, 상위 TF 우선 편향으로
   저주기 confirmed momentum 을 무시하는 구조를 금지한다.
 - get_trading_signal() 은 데이터/계약 실패를 no-signal(None)로 숨기지 않는다.
+- LONG/SHORT 후보는 동일한 기준으로 동시에 계산해야 하며,
+  한 방향을 먼저 확정한 뒤 다른 방향을 제거하는 구조를 금지한다.
 
 CHANGE HISTORY:
+- 2026-03-12:
+  1) FIX(ROOT-CAUSE): LONG 편향의 직접 원인 제거
+     - 기존 trend_bias 단일 방향 선결정 구조 제거
+     - LONG / SHORT 후보를 동시에 점수화하고 margin 기반으로 최종 선택
+  2) FIX(STRUCTURE): direction selection contract 정합화
+     - 5m primary bias / 5m primary momentum 을 최우선으로 사용
+     - 15m / 1h 는 support/oppose 보조 근거로 사용
+     - 4h 는 선택 우선순위가 아닌 telemetry / 약한 bias 보조치로만 사용
+  3) ADD(OBSERVABILITY): extra 에 direction_candidates / long_score / short_score /
+     selection_margin / candidate telemetry 추가
+  4) FIX(STRICT): 애매한 양방향 동점/저확신 구간은 no-signal 처리
+     - arbitrary LONG fallback 금지
+  5) KEEP(COMPAT): 기존 EntrySignal 반환 계약 / freeze state / health summary 유지
+
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): direction bias 결정을 entry_pipeline 정합 기준으로 재구성
      - 기존 4h/1h 우선 구조 제거
@@ -1003,20 +1019,13 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     # WS 초기 구간에서는 orderbook payload가 아직 도착하지 않을 수 있음
     # STRICT 정책: 일정 시간 이후에도 payload가 없으면 실패
     if ob is None:
-
         ob_status = get_orderbook_buffer_status(symbol)
-
         recv_ts = ob_status.get("last_recv_ts")
 
         if recv_ts is None:
-            # WS start 이후 첫 payload 대기 구간
-            age_sec = ob_status.get("payload_delay_ms")
-
-            # 초기 구간은 skip (engine startup protection)
             raise FeatureBuildError(
                 f"{symbol} orderbook payload not received yet (startup phase)"
             )
-
         else:
             _fail(
                 symbol,
@@ -1126,64 +1135,194 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     }
 
 
-def _resolve_direction_bias_strict(
+def _sign(value: float, *, eps: float = 0.0) -> int:
+    if not math.isfinite(value):
+        raise FeatureBuildError("sign input must be finite (STRICT)")
+    if value > eps:
+        return 1
+    if value < -eps:
+        return -1
+    return 0
+
+
+def _build_direction_alignment_meta(
     *,
     tf5: Dict[str, Any],
     tf15: Optional[Dict[str, Any]],
     tf1h: Optional[Dict[str, Any]],
     tf4h: Optional[Dict[str, Any]],
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    방향 결정은 entry_pipeline 의 방향 안정성 계약과 정합해야 한다.
-
-    기존 문제:
-    - 4h/1h 우선 구조가 15m/5m 전환을 덮어써 LONG 편향을 만들었다.
-    - upstream(get_trading_signal)은 LONG 을 만들고,
-      downstream(entry_pipeline)은 5m confirmed momentum 기준으로 그 LONG 을 차단했다.
-
-    수정 원칙:
-    - 방향 선택은 1h/15m/5m 중기~진입 타이밍 합의만 사용한다.
-    - 4h 는 방향 선택에 사용하지 않고 telemetry 용 bias 메타로만 유지한다.
-    - source 값은 entry_pipeline 계약 허용값만 사용한다.
-    """
+) -> Dict[str, Any]:
     b5 = _compute_trend_bias(tf5)
     b15 = _compute_trend_bias(tf15) if tf15 else 0
     b1h = _compute_trend_bias(tf1h) if tf1h else 0
     b4h = _compute_trend_bias(tf4h) if tf4h else 0
 
-    support_count = 0
-    oppose_count = 0
-    chosen = 0
-    source = "undecided"
+    s5 = _sign(float(tf5.get("ema_fast_slope_pct", 0.0)))
+    s15 = _sign(float(tf15.get("ema_fast_slope_pct", 0.0))) if tf15 else 0
+    s1h = _sign(float(tf1h.get("ema_fast_slope_pct", 0.0))) if tf1h else 0
+    s4h = _sign(float(tf4h.get("ema_fast_slope_pct", 0.0))) if tf4h else 0
 
-    if b1h != 0 and b15 != 0 and b1h == b15:
-        chosen = b1h
-        source = "1h_15m_agree"
-    elif b15 != 0 and b5 != 0 and b15 == b5:
-        chosen = b15
-        source = "15m_5m_agree"
-    elif b1h != 0 and b5 != 0 and b1h == b5:
-        chosen = b1h
-        source = "1h_5m_agree"
-    elif b5 != 0:
-        chosen = b5
-        source = "5m_only"
-
-    if chosen != 0:
-        for bias in (b1h, b15, b5):
-            if bias == chosen:
-                support_count += 1
-            elif bias == -chosen:
-                oppose_count += 1
-
-    return chosen, {
+    return {
         "5m_bias": b5,
         "15m_bias": b15,
         "1h_bias": b1h,
         "4h_bias": b4h,
-        "direction_source": source,
-        "support_count": support_count,
-        "oppose_count": oppose_count,
+        "5m_slope_bias": s5,
+        "15m_slope_bias": s15,
+        "1h_slope_bias": s1h,
+        "4h_slope_bias": s4h,
+    }
+
+
+def _score_direction_candidate(
+    *,
+    symbol: str,
+    direction: str,
+    tf5: Dict[str, Any],
+    tf15: Optional[Dict[str, Any]],
+    tf1h: Optional[Dict[str, Any]],
+    tf4h: Optional[Dict[str, Any]],
+    ob: Dict[str, Any],
+    mtf: Dict[str, Any],
+    direction_meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    if direction not in ("LONG", "SHORT"):
+        raise FeatureBuildError(f"direction invalid (STRICT): {direction}")
+
+    dir_sign = 1 if direction == "LONG" else -1
+    score = 0.0
+    support_count = 0
+    oppose_count = 0
+    reasons: List[str] = []
+
+    def _apply_bias(component_name: str, bias_value: int, support_w: float, oppose_w: float) -> None:
+        nonlocal score, support_count, oppose_count
+        if bias_value == dir_sign:
+            score += support_w
+            support_count += 1
+            reasons.append(f"{component_name}:support")
+        elif bias_value == -dir_sign:
+            score -= oppose_w
+            oppose_count += 1
+            reasons.append(f"{component_name}:oppose")
+        else:
+            reasons.append(f"{component_name}:neutral")
+
+    # 5m primary bias / momentum 을 최우선
+    _apply_bias("bias_5m", int(direction_meta.get("5m_bias", 0)), 2.25, 2.25)
+    _apply_bias("slope_5m", int(direction_meta.get("5m_slope_bias", 0)), 2.25, 2.25)
+
+    # 중기 지원
+    _apply_bias("bias_15m", int(direction_meta.get("15m_bias", 0)), 1.10, 1.10)
+    _apply_bias("slope_15m", int(direction_meta.get("15m_slope_bias", 0)), 0.80, 0.80)
+    _apply_bias("bias_1h", int(direction_meta.get("1h_bias", 0)), 0.95, 0.95)
+    _apply_bias("slope_1h", int(direction_meta.get("1h_slope_bias", 0)), 0.65, 0.65)
+
+    # 4h 는 telemetry 성격의 약한 bias 보정만 허용
+    _apply_bias("bias_4h", int(direction_meta.get("4h_bias", 0)), 0.25, 0.25)
+
+    depth_imbalance_raw = ob.get("depth_imbalance")
+    depth_imbalance: Optional[float] = None
+    if depth_imbalance_raw is not None:
+        depth_imbalance = _require_finite_float(
+            symbol,
+            "candidate_score",
+            "orderbook.depth_imbalance",
+            depth_imbalance_raw,
+        )
+        depth_sign = _sign(depth_imbalance, eps=0.03)
+        if depth_sign == dir_sign:
+            score += min(abs(depth_imbalance) * 1.25, 0.90)
+            reasons.append("orderbook:support")
+        elif depth_sign == -dir_sign:
+            score -= min(abs(depth_imbalance) * 1.25, 0.90)
+            reasons.append("orderbook:oppose")
+        else:
+            reasons.append("orderbook:neutral")
+    else:
+        reasons.append("orderbook:missing")
+
+    strong_trend_flag = tf5.get("strong_trend_flag")
+    if not isinstance(strong_trend_flag, int):
+        _fail(symbol, "candidate_score", "tf5.strong_trend_flag must be int flag (STRICT)")
+
+    adx_trend_tfs_raw = mtf.get("adx_trend_tfs")
+    overbought_tfs_raw = mtf.get("overbought_tfs")
+    oversold_tfs_raw = mtf.get("oversold_tfs")
+    try:
+        adx_trend_tfs = int(adx_trend_tfs_raw or 0)
+        overbought_tfs = int(overbought_tfs_raw or 0)
+        oversold_tfs = int(oversold_tfs_raw or 0)
+    except Exception as e:
+        raise FeatureBuildError(f"candidate score counters must be int-compatible (STRICT): {e}") from e
+
+    if strong_trend_flag == 1 and support_count >= 2:
+        score += 0.55
+        reasons.append("trend_strength:support")
+    elif strong_trend_flag == 1 and oppose_count >= 2:
+        score -= 0.55
+        reasons.append("trend_strength:oppose")
+    else:
+        reasons.append("trend_strength:neutral")
+
+    vol_z = _require_finite_float(
+        symbol,
+        "candidate_score",
+        "tf5.volume_zscore",
+        tf5.get("volume_zscore"),
+    )
+    score += min(abs(vol_z) * 0.35, 0.70)
+    reasons.append("volume:activity")
+
+    # 과매수/과매도는 range 계열의 약한 보정만 허용
+    if direction == "LONG":
+        if oversold_tfs > 0:
+            score += min(float(oversold_tfs) * 0.25, 0.50)
+            reasons.append("range_reversal:support")
+        if overbought_tfs > 0:
+            score -= min(float(overbought_tfs) * 0.20, 0.40)
+            reasons.append("range_reversal:oppose")
+    else:
+        if overbought_tfs > 0:
+            score += min(float(overbought_tfs) * 0.25, 0.50)
+            reasons.append("range_reversal:support")
+        if oversold_tfs > 0:
+            score -= min(float(oversold_tfs) * 0.20, 0.40)
+            reasons.append("range_reversal:oppose")
+
+    primary_bias = int(direction_meta.get("5m_bias", 0))
+    primary_slope = int(direction_meta.get("5m_slope_bias", 0))
+
+    if strong_trend_flag == 1 and primary_bias == dir_sign and primary_slope == dir_sign and support_count >= 2:
+        signal_source = "TREND"
+        regime_level = 1.0
+    elif (
+        (direction == "LONG" and oversold_tfs > 0)
+        or (direction == "SHORT" and overbought_tfs > 0)
+    ):
+        signal_source = "RANGE"
+        regime_level = 2.0
+    else:
+        signal_source = "GENERIC"
+        regime_level = 1.5
+
+    score = max(0.0, min(score, 10.0))
+
+    return {
+        "direction": direction,
+        "score": float(score),
+        "support_count": int(support_count),
+        "oppose_count": int(oppose_count),
+        "signal_source": signal_source,
+        "regime_level": float(regime_level),
+        "primary_bias": primary_bias,
+        "primary_slope_bias": primary_slope,
+        "depth_imbalance": depth_imbalance,
+        "reasons": list(reasons),
+        "strong_trend_flag": int(strong_trend_flag),
+        "adx_trend_tfs": int(adx_trend_tfs),
+        "overbought_tfs": int(overbought_tfs),
+        "oversold_tfs": int(oversold_tfs),
     }
 
 
@@ -1305,13 +1444,13 @@ def get_trading_signal(
     ob_now = _compute_orderbook_features(symbol)
 
     last_price_candidates: List[float] = []
-    ob_last = ob_now.get("last_price")
-    if _is_finite_number(ob_last):
-        last_price_candidates.append(float(ob_last))
+    ob_last_now = ob_now.get("last_price")
+    if _is_finite_number(ob_last_now):
+        last_price_candidates.append(float(ob_last_now))
 
-    ob_mark = ob_now.get("mark_price")
-    if _is_finite_number(ob_mark):
-        last_price_candidates.append(float(ob_mark))
+    ob_mark_now = ob_now.get("mark_price")
+    if _is_finite_number(ob_mark_now):
+        last_price_candidates.append(float(ob_mark_now))
 
     tf5_close_light = buf_5m[-1][4]
     if _is_finite_number(tf5_close_light):
@@ -1429,28 +1568,49 @@ def get_trading_signal(
     else:
         last_price = float(buf_5m[-1][4])
 
-    depth_imbalance = ob.get("depth_imbalance")
     majority_trend = str(mtf.get("majority_trend", "NEUTRAL")).upper()
-
-    trend_bias, direction_meta = _resolve_direction_bias_strict(
+    direction_meta = _build_direction_alignment_meta(
         tf5=tf5,
         tf15=tf15,
         tf1h=tf1h,
         tf4h=tf4h,
     )
 
-    if trend_bias > 0:
-        chosen_signal = "LONG"
-        direction_num = 1.0
-    elif trend_bias < 0:
-        chosen_signal = "SHORT"
-        direction_num = -1.0
-    else:
+    long_candidate = _score_direction_candidate(
+        symbol=symbol,
+        direction="LONG",
+        tf5=tf5,
+        tf15=tf15,
+        tf1h=tf1h,
+        tf4h=tf4h,
+        ob=ob,
+        mtf=mtf,
+        direction_meta=direction_meta,
+    )
+    short_candidate = _score_direction_candidate(
+        symbol=symbol,
+        direction="SHORT",
+        tf5=tf5,
+        tf15=tf15,
+        tf1h=tf1h,
+        tf4h=tf4h,
+        ob=ob,
+        mtf=mtf,
+        direction_meta=direction_meta,
+    )
+
+    long_score = float(long_candidate["score"])
+    short_score = float(short_candidate["score"])
+    selection_margin = abs(long_score - short_score)
+
+    min_candidate_score = 1.25
+    min_selection_margin = 0.55
+
+    if long_score < min_candidate_score and short_score < min_candidate_score:
         log(
-            "[MKT-FEAT] get_trading_signal: 방향이 확정되지 않아 시그널 생성을 중단합니다 "
-            f"(majority_trend={majority_trend}, direction_source={direction_meta.get('direction_source')}, "
-            f"support={direction_meta.get('support_count')}, oppose={direction_meta.get('oppose_count')}, "
-            f"depth_imbalance={depth_imbalance})."
+            "[MKT-FEAT] get_trading_signal: 양방향 후보 점수가 모두 부족하여 시그널 생성을 중단합니다 "
+            f"(long_score={long_score:.3f}, short_score={short_score:.3f}, "
+            f"majority_trend={majority_trend})"
         )
         _set_signal_freeze_state(
             symbol=symbol,
@@ -1458,36 +1618,51 @@ def get_trading_signal(
             chosen_signal=None,
             signal_source=None,
             extra=None,
-            blocked_reason="direction_undecided",
+            blocked_reason="both_candidates_too_weak",
         )
         return None
 
-    adx_trend_tfs_raw = mtf.get("adx_trend_tfs")
-    overbought_tfs_raw = mtf.get("overbought_tfs")
-    oversold_tfs_raw = mtf.get("oversold_tfs")
-    strong_trend_flag = tf5.get("strong_trend_flag")
+    if selection_margin < min_selection_margin:
+        log(
+            "[MKT-FEAT] get_trading_signal: 양방향 후보 margin 이 부족하여 시그널 생성을 중단합니다 "
+            f"(long_score={long_score:.3f}, short_score={short_score:.3f}, "
+            f"selection_margin={selection_margin:.3f}, majority_trend={majority_trend})"
+        )
+        _set_signal_freeze_state(
+            symbol=symbol,
+            latest_ts=latest_ts,
+            chosen_signal=None,
+            signal_source=None,
+            extra=None,
+            blocked_reason="candidate_margin_too_small",
+        )
+        return None
 
-    if not isinstance(strong_trend_flag, int):
-        _fail(symbol, "get_trading_signal", "tf5.strong_trend_flag must be int flag (STRICT)")
-    try:
-        adx_trend_tfs = int(adx_trend_tfs_raw or 0)
-        overbought_tfs = int(overbought_tfs_raw or 0)
-        oversold_tfs = int(oversold_tfs_raw or 0)
-    except Exception:
-        _fail(symbol, "get_trading_signal", "multi_timeframe counters must be int-compatible (STRICT)")
-
-    signal_source = "GENERIC"
-    if direction_meta.get("support_count", 0) >= 2 and adx_trend_tfs >= 2 and strong_trend_flag == 1:
-        signal_source = "TREND"
-    elif (overbought_tfs + oversold_tfs) >= 1:
-        signal_source = "RANGE"
-
-    if signal_source == "TREND":
-        regime_level = 1.0
-    elif signal_source == "RANGE":
-        regime_level = 2.0
+    if long_score > short_score:
+        selected = long_candidate
+        chosen_signal = "LONG"
+        direction_num = 1.0
+    elif short_score > long_score:
+        selected = short_candidate
+        chosen_signal = "SHORT"
+        direction_num = -1.0
     else:
-        regime_level = 1.5
+        log(
+            "[MKT-FEAT] get_trading_signal: 양방향 후보가 완전 동점이라 시그널 생성을 중단합니다 "
+            f"(long_score={long_score:.3f}, short_score={short_score:.3f})"
+        )
+        _set_signal_freeze_state(
+            symbol=symbol,
+            latest_ts=latest_ts,
+            chosen_signal=None,
+            signal_source=None,
+            extra=None,
+            blocked_reason="candidate_tie",
+        )
+        return None
+
+    signal_source = str(selected["signal_source"])
+    regime_level = float(selected["regime_level"])
 
     atr_fast_val = _require_finite_float(symbol, "get_trading_signal", "tf5.atr", tf5.get("atr"))
     if tf15 is not None:
@@ -1495,30 +1670,25 @@ def get_trading_signal(
     else:
         atr_slow_val = atr_fast_val
 
-    signal_score = 0.5
-    vol_z = _require_finite_float(symbol, "get_trading_signal", "tf5.volume_zscore", tf5.get("volume_zscore"))
-    support_count = int(direction_meta.get("support_count") or 0)
-    oppose_count = int(direction_meta.get("oppose_count") or 0)
-    if signal_source == "TREND":
-        signal_score += 1.5
-    if support_count > 0:
-        signal_score += min(float(support_count) * 0.75, 2.5)
-    if oppose_count > 0:
-        signal_score -= min(float(oppose_count) * 0.75, 2.0)
-    signal_score += min(abs(vol_z) * 0.5, 2.0)
-    signal_score = max(0.5, min(signal_score, 6.0))
-
     reg5 = tf5.get("regime")
     if not isinstance(reg5, dict):
         _fail(symbol, "get_trading_signal", "tf5.regime dict 가 없습니다. (STRICT)")
 
-    trend_strength = _require_finite_float(symbol, "get_trading_signal", "tf5.regime.trend_strength", reg5.get("trend_strength"))
+    trend_strength = _require_finite_float(
+        symbol,
+        "get_trading_signal",
+        "tf5.regime.trend_strength",
+        reg5.get("trend_strength"),
+    )
     volatility = _require_finite_float(symbol, "get_trading_signal", "tf5.atr_pct", tf5.get("atr_pct"))
     volume_zscore = _require_finite_float(symbol, "get_trading_signal", "tf5.volume_zscore", tf5.get("volume_zscore"))
 
     health_info = features.get("health")
     extra: Dict[str, Any] = {
-        "signal_score": float(signal_score),
+        "signal_score": float(selected["score"]),
+        "long_score": float(long_score),
+        "short_score": float(short_score),
+        "selection_margin": float(selection_margin),
         "atr_fast": atr_fast_val,
         "atr_slow": atr_slow_val,
         "direction_raw": direction_num,
@@ -1530,19 +1700,26 @@ def get_trading_signal(
         "market_features": features,
         "last_close_ts": float(last_close_ts),
         "majority_trend": majority_trend,
-        "depth_imbalance": depth_imbalance,
+        "depth_imbalance": ob.get("depth_imbalance"),
         "spread_pct": ob.get("spread_pct"),
         "volume_zscore_5m": tf5.get("volume_zscore"),
         "strong_trend_flag_5m": tf5.get("strong_trend_flag"),
-        "direction_source": direction_meta.get("direction_source"),
+        "direction_source": signal_source,
         "high_tf_bias_4h": direction_meta.get("4h_bias"),
         "high_tf_bias_1h": direction_meta.get("1h_bias"),
         "high_tf_bias_15m": direction_meta.get("15m_bias"),
         "bias_5m": direction_meta.get("5m_bias"),
-        "support_count": int(direction_meta.get("support_count") or 0),
-        "oppose_count": int(direction_meta.get("oppose_count") or 0),
+        "slope_bias_5m": direction_meta.get("5m_slope_bias"),
+        "slope_bias_15m": direction_meta.get("15m_slope_bias"),
+        "slope_bias_1h": direction_meta.get("1h_slope_bias"),
+        "support_count": int(selected.get("support_count") or 0),
+        "oppose_count": int(selected.get("oppose_count") or 0),
         "health_has_warning": bool(health_info.get("has_warning")) if isinstance(health_info, dict) else False,
         "health_warnings": list(health_info.get("overall_warnings") or []) if isinstance(health_info, dict) else [],
+        "direction_candidates": {
+            "LONG": dict(long_candidate),
+            "SHORT": dict(short_candidate),
+        },
     }
 
     _set_signal_freeze_state(
