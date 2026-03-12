@@ -1713,7 +1713,7 @@ def get_trading_signal(
         "volume_zscore_5m": tf5.get("volume_zscore"),
         "strong_trend_flag_5m": tf5.get("strong_trend_flag"),
         "direction_source": signal_source,
-        "high_tf_bias_4h": direction_meta.get("4h_bias"),
+        "high_tf_bias_4h": None,
         "high_tf_bias_1h": direction_meta.get("1h_bias"),
         "high_tf_bias_15m": direction_meta.get("15m_bias"),
         "bias_5m": direction_meta.get("5m_bias"),

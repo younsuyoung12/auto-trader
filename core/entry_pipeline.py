@@ -795,11 +795,15 @@ def _evaluate_direction_stability_guard_strict(
     for tf_label, tf_bias in bias_map.items():
         if tf_bias is None:
             continue
-        if int(tf_bias) == -expected and tf_label in ("15m", "1h", "4h"):
-            return f"signal_contract_higher_tf_oppose:{tf_label}:{tf_bias}"
-        if tf_label == "5m" and int(tf_bias) != 0 and int(tf_bias) != expected:
-            return f"signal_contract_5m_bias_mismatch:{tf_bias}"
 
+        # 기관형 규칙
+        # 15m / 1h 만 veto
+        if tf_label in ("15m", "1h"):
+            if int(tf_bias) == -expected:
+                return f"signal_contract_higher_tf_oppose:{tf_label}:{tf_bias}"
+
+        # 4h 는 veto 금지 (context only)
+        
     slope_bias_5m = signal_direction_contract.get("slope_bias_5m")
     if slope_bias_5m is not None:
         slope_bias_5m_i = _normalize_direction_bias_int_strict(
