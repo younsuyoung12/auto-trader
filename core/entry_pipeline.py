@@ -8,6 +8,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - FIX(ROOT-CAUSE): market_features_ws 의 양방향 후보 점수 계약과 entry_pipeline 정합화
 - FIX(STRUCTURE): 기존 단일 방향(direction_source old contract) 검증을
   candidate telemetry 기반 검증으로 확장
+- FIX(INSTITUTIONAL): upstream candidate telemetry 와 downstream stability guard 책임 분리
 - KEEP(STRICT): 잘못된 방향 상태 / slope 누락 / signal contract 위반은 즉시 예외 유지
 - CLEANUP: selected candidate / selection_margin / long_score / short_score 감사 메타 추가
 
@@ -35,9 +36,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   1) FIX(ROOT-CAUSE): market_features_ws 양방향 후보 점수 계약과 정합화
      - extra.direction_candidates / long_score / short_score / selection_margin 계약 수용
      - old direction_source 우선 계약만 보던 구조 제거
-  2) FIX(TRADE-GRADE): selected candidate 검증 추가
-     - selected_candidate_score / selection_margin / primary 5m bias / primary 5m slope 검증
-     - upstream 에서 SHORT 가 선택되었는데 downstream 이 오래된 LONG 편향 계약으로 오판하는 경로 차단
+  2) FIX(TRADE-GRADE): selected candidate 검증 구조를 기관형으로 정리
+     - selected_candidate_score / selection_margin / primary 5m bias / primary 5m slope 검증 유지
+     - upstream candidate oppose/support telemetry 를 downstream stability guard 와 비교하던 구조 제거
+     - 후보 점수 엔진 telemetry 와 진입 안정성 guard 를 분리
   3) KEEP(STRICT): higher timeframe support/opposition 가드는 유지
      - 15m / 1h confirmed slope 기반 안전장치는 계속 유지
   4) ADD(AUDIT): candidate telemetry 감사 메타 추가
@@ -752,32 +754,35 @@ def _evaluate_direction_stability_guard_strict(
         if selection_margin_f < DIRECTION_CONFIRM_MIN_SELECTION_MARGIN:
             return f"selection_margin_too_small:{selection_margin_f:.6f}"
 
+    # selected_candidate_support_count / selected_candidate_oppose_count 는
+    # upstream 후보 점수 엔진 내부 텔레메트리다.
+    # 이 값은 downstream direction stability support_count/oppose_count 와
+    # 동일 의미가 아니므로 진입 차단 조건으로 재사용하면 안 된다.
+    # root-cause:
+    # - upstream oppose_count 는 5m bias/slope, 15m/1h/4h bias, orderbook 등
+    #   후보 점수 구성 요소의 반대 항목 개수다.
+    # - downstream support_count 는 15m/1h/orderflow/options confirmed state 기반
+    #   진입 안정성 가드 개수다.
+    # 서로 단위와 의미가 다르므로 비교 금지. 여기서는 telemetry 로만 유지한다.
     selected_candidate_support_count = signal_direction_contract.get("selected_candidate_support_count")
     if selected_candidate_support_count is not None:
-        selected_candidate_support_count_i = int(
+        _ = int(
             _as_float(
                 selected_candidate_support_count,
                 "signal_direction_contract.selected_candidate_support_count",
                 min_value=0.0,
             )
         )
-        if selected_candidate_support_count_i <= 0:
-            return f"selected_candidate_support_invalid:{selected_candidate_support_count_i}"
 
     selected_candidate_oppose_count = signal_direction_contract.get("selected_candidate_oppose_count")
     if selected_candidate_oppose_count is not None:
-        selected_candidate_oppose_count_i = int(
+        _ = int(
             _as_float(
                 selected_candidate_oppose_count,
                 "signal_direction_contract.selected_candidate_oppose_count",
                 min_value=0.0,
             )
         )
-        if selected_candidate_oppose_count_i > support_count:
-            return (
-                f"selected_candidate_oppose_excess:{selected_candidate_oppose_count_i}:"
-                f"support={support_count}"
-            )
 
     bias_map = {
         "4h": signal_direction_contract.get("high_tf_bias_4h"),
