@@ -10,7 +10,7 @@ ROLE:
 CORE RESPONSIBILITIES:
 - websocket transport liveness 검증
 - account websocket 연결 상태 검증
-- engine watchdog 기동 및 watchdog snapshot 검증
+- engine watchdog snapshot 검증
 - protection order 존재 및 정합성 검증
 - reconcile engine 주기 실행
 - SIGTERM grace deadline 도달 시 강제 정리
@@ -19,6 +19,7 @@ CORE RESPONSIBILITIES:
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
 - monitoring cycle 은 Signal / Risk / Execution 세부 판단을 가지지 않는다
+- watchdog start 책임은 BOOT/상위 orchestration 에 있으며 monitoring cycle 은 감시만 수행한다
 - contract violation / connectivity failure / protection missing / watchdog failure 는 즉시 예외 처리한다
 - force close 는 설정에 명시된 경우에만 실행한다
 - hidden default / silent continue / 예외 삼키기 금지
@@ -31,6 +32,8 @@ CHANGE HISTORY:
   3) FIX(STRICT): getattr(..., default) / dict.get(..., default) 기반 은닉 접근 제거
   4) FIX(STATE): watchdog started/fatal/snapshot rollback 상태를 MonitoringCycleState 로 통합
   5) FIX(RISK): watchdog FAIL / stale / internal fatal 발생 시 즉시 SAFE_STOP 승격
+  6) FIX(ROOT-CAUSE): monitoring cycle 에서 watchdog 재기동 제거
+  7) FIX(ARCH): watchdog 는 BOOT 에서 1회 시작, monitoring cycle 은 snapshot 감시만 수행
 ============================================================
 """
 from __future__ import annotations
@@ -394,22 +397,28 @@ def _ensure_watchdog_started_or_raise(
 ) -> None:
     _require_float(now_ts, "now_ts", min_value=0.0)
 
-    if ctx.state.watchdog_started:
+    snapshot = ctx.watchdog_snapshot_fn()
+    if snapshot is not None:
+        if not isinstance(snapshot, WatchdogSnapshot):
+            raise MonitoringContractError(
+                f"watchdog snapshot must be WatchdogSnapshot (STRICT), got={type(snapshot).__name__}"
+            )
+        ctx.state.watchdog_started = True
+        if ctx.state.watchdog_start_ts == 0.0:
+            ctx.state.watchdog_start_ts = now_ts
         return
 
-    if ctx.state.watchdog_start_ts != 0.0:
-        raise MonitoringContractError(
-            "state.watchdog_start_ts must be 0.0 before watchdog starts (STRICT)"
+    # watchdog start 책임은 monitoring cycle 이 아니라 BOOT 에 있다.
+    # 여기서는 최초 관측 시점만 기록하고 snapshot grace 동안만 대기한다.
+    if ctx.state.watchdog_start_ts == 0.0:
+        ctx.state.watchdog_start_ts = now_ts
+        log(
+            "[WATCHDOG][WAIT] "
+            f"symbol={ctx.symbol} snapshot unavailable yet "
+            f"grace_sec={ctx.config.watchdog_startup_grace_sec:.3f}"
         )
 
-    ctx.watchdog_start_fn(
-        settings=ctx.settings,
-        symbol=ctx.symbol,
-        on_fatal=ctx.watchdog_on_fatal_fn,
-    )
     ctx.state.watchdog_started = True
-    ctx.state.watchdog_start_ts = now_ts
-    log(f"[WATCHDOG][START] symbol={ctx.symbol} start_ts={now_ts:.6f}")
 
 
 def _watchdog_guard_or_raise(

@@ -18,7 +18,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 데이터 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
 - 예외 삼키기 금지
-- 분석 실패 시 즉시 예외 전파
+- 단, run_due_reports()는 비핵심 분석 서브시스템 실패를 엔진 치명 오류로 승격하지 않고
+  명시적으로 격리/로깅/알림한다.
+- 단건 실행(run_market_report_once / run_system_report_once)은 여전히 STRICT 예외 전파를 유지한다.
 
 변경 이력:
 - 2026-03-13:
@@ -27,6 +29,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   3) FIX(ARCH): settings 주입 가능하도록 수정(load_settings 기본 사용)
   4) FIX(CONTRACT): AutoReportItem / AutoReporterResult dataclass 자체 검증 추가
   5) FIX(STRICT): now_ms / last_run_ts_ms monotonic 계약 검증 강화
+  6) FIX(ROOT-CAUSE): run_due_reports()에서 auto report 실패를 엔진 치명 오류로 전파하지 않도록 격리
+  7) FIX(OPERABILITY): 실패 리포트는 로그/선택적 callback 알림으로만 surface 하고 trading engine은 계속 운용
+  8) FIX(STRICT): 단건 실행 API는 기존처럼 예외 전파 유지, 스케줄 실행 경로만 비치명 격리
 - 2026-03-07:
   1) 신규 생성
   2) 자동 시장/시스템 리포트 오케스트레이터 추가
@@ -168,6 +173,7 @@ class AutoReporter:
 
     _MARKET_REPORT_TYPE = "market_report"
     _SYSTEM_REPORT_TYPE = "system_report"
+    _ERROR_EVENT_TYPE = "QUANT_ANALYSIS_ERROR"
 
     _MARKET_REPORT_QUESTION = (
         "현재 BTC 선물 시장 상태를 요약하고 추세, 변동성, 유동성, 파생시장 구조, "
@@ -286,14 +292,26 @@ class AutoReporter:
             last_run_ts_ms=self._last_market_report_ts_ms,
             interval_sec=self._market_interval_sec,
         ):
-            reports.append(self.run_market_report_once().to_dict())
+            item = self._run_due_report_isolated(
+                report_type=self._MARKET_REPORT_TYPE,
+                runner=self.run_market_report_once,
+                now_ms=current_ms,
+            )
+            if item is not None:
+                reports.append(item.to_dict())
 
         if self._is_due(
             now_ms=current_ms,
             last_run_ts_ms=self._last_system_report_ts_ms,
             interval_sec=self._system_interval_sec,
         ):
-            reports.append(self.run_system_report_once().to_dict())
+            item = self._run_due_report_isolated(
+                report_type=self._SYSTEM_REPORT_TYPE,
+                runner=self.run_system_report_once,
+                now_ms=current_ms,
+            )
+            if item is not None:
+                reports.append(item.to_dict())
 
         return AutoReporterResult(
             generated_ts_ms=current_ms,
@@ -333,6 +351,79 @@ class AutoReporter:
                 item.report_type,
                 item.to_dict(),
             )
+
+    def _emit_report_failure_best_effort(
+        self,
+        *,
+        report_type: str,
+        now_ms: int,
+        error: Exception,
+    ) -> None:
+        payload = {
+            "symbol": self._symbol,
+            "report_type": _require_nonempty_str(report_type, "report_type"),
+            "generated_ts_ms": _require_positive_int(now_ms, "generated_ts_ms"),
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+        }
+
+        if self._persist_enabled and self._event_writer is not None:
+            try:
+                self._event_writer(
+                    self._ERROR_EVENT_TYPE,
+                    report_type,
+                    payload,
+                )
+            except Exception as emit_exc:
+                logger.exception(
+                    "AutoReporter failure event emit failed: symbol=%s report_type=%s error=%s",
+                    self._symbol,
+                    report_type,
+                    emit_exc,
+                )
+
+        if self._notify_enabled and self._notifier is not None:
+            try:
+                self._notifier(
+                    report_type,
+                    payload,
+                )
+            except Exception as notify_exc:
+                logger.exception(
+                    "AutoReporter failure notify failed: symbol=%s report_type=%s error=%s",
+                    self._symbol,
+                    report_type,
+                    notify_exc,
+                )
+
+    def _run_due_report_isolated(
+        self,
+        *,
+        report_type: str,
+        runner: Callable[[], AutoReportItem],
+        now_ms: int,
+    ) -> Optional[AutoReportItem]:
+        _require_nonempty_str(report_type, "report_type")
+        _require_positive_int(now_ms, "now_ms")
+
+        try:
+            item = runner()
+        except Exception as exc:
+            logger.exception(
+                "AutoReporter due-report isolated failure: symbol=%s report_type=%s now_ms=%s error=%s",
+                self._symbol,
+                report_type,
+                now_ms,
+                exc,
+            )
+            self._emit_report_failure_best_effort(
+                report_type=report_type,
+                now_ms=now_ms,
+                error=exc,
+            )
+            return None
+
+        return item
 
     # ========================================================
     # Quant analyst runner
@@ -396,7 +487,10 @@ class AutoReporter:
         return (current_ms - last_run) >= interval_ms
 
     def _now_ms(self) -> int:
-        return int(time.time() * 1000)
+        ts_ms = int(time.time() * 1000)
+        if ts_ms <= 0:
+            raise AutoReporterStateError("current timestamp must be > 0 (STRICT)")
+        return ts_ms
 
     # ========================================================
     # Settings helpers

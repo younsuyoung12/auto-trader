@@ -18,6 +18,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - print() 금지 / logging 사용
 - 데이터 누락/손상/모호성 발생 시 즉시 예외
 - 민감정보 로그 금지
+- 정상적인 초기 운영 상태(종료 거래 0건)는 오류가 아니라 명시적 empty-summary 상태로 처리한다.
 
 전제 테이블:
 - bt_trades
@@ -25,6 +26,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - bt_trade_snapshots
 
 변경 이력:
+2026-03-13
+1) FIX(ROOT-CAUSE): bt_trades 0건 / 종료 거래 부족 상태를 치명 오류로 보지 않도록 구조 수정
+2) FIX(OPERABILITY): 초기 운영 상태에서는 empty-summary를 반환해 auto_reporter/quant_analyst가 엔진을 죽이지 않도록 변경
+3) FIX(CONTRACT): required_limit 미만의 종료 거래도 사용 가능한 범위 내에서 분석하도록 명시 규칙 추가
+4) FIX(PAYLOAD): dashboard_payload가 거래 0건 상태에서도 유효한 as_of_ts_ms를 가지도록 계약 보강
+5) FIX(SUMMARY): 거래 0건 전용 analyst_summary_ko / side_performance / recent_trade_briefs empty-state 경로 추가
+
 2026-03-07
 - 신규 생성
 - DB 기반 거래 분석기 추가
@@ -52,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
@@ -63,6 +72,13 @@ from settings import SETTINGS
 from state.db_core import get_session
 
 logger = logging.getLogger(__name__)
+
+
+def _now_ms() -> int:
+    ts_ms = int(time.time() * 1000)
+    if ts_ms <= 0:
+        raise RuntimeError("current timestamp must be > 0")
+    return ts_ms
 
 
 @dataclass(frozen=True)
@@ -177,8 +193,20 @@ class TradeAnalyzer:
             symbol=self._symbol,
             required_limit=self._trade_limit,
         )
-        trade_ids = [t.trade_id for t in trades]
         events = self._load_recent_events(symbol=self._symbol, limit=self._event_limit)
+
+        if not trades:
+            summary = self._build_empty_summary(events=events)
+            logger.info(
+                "Trade analysis completed (empty-state): symbol=%s trades=%s wins=%s losses=%s",
+                summary.symbol,
+                summary.total_trades,
+                summary.wins,
+                summary.losses,
+            )
+            return summary
+
+        trade_ids = [t.trade_id for t in trades]
         snapshots = self._load_trade_snapshots_or_raise(trade_ids=trade_ids)
         summary = self._build_summary(trades=trades, events=events, snapshots=snapshots)
 
@@ -226,17 +254,33 @@ class TradeAnalyzer:
             ).mappings().all()
 
         if not rows:
-            raise RuntimeError(f"No bt_trades rows found for symbol={symbol}")
+            logger.info(
+                "TradeAnalyzer empty-state: no bt_trades rows found for symbol=%s",
+                symbol,
+            )
+            return []
 
         parsed_all = [self._parse_trade_row(row) for row in rows]
         closed_trades = [row for row in parsed_all if self._is_closed_trade(row)]
 
-        if len(closed_trades) < required_limit:
-            raise RuntimeError(
-                f"Insufficient closed trades for analysis: required={required_limit}, got={len(closed_trades)}"
+        if not closed_trades:
+            logger.info(
+                "TradeAnalyzer empty-state: no closed trades found for symbol=%s",
+                symbol,
             )
+            return []
 
-        selected = closed_trades[:required_limit]
+        if len(closed_trades) < required_limit:
+            logger.info(
+                "TradeAnalyzer partial-history mode: symbol=%s required=%s available_closed=%s",
+                symbol,
+                required_limit,
+                len(closed_trades),
+            )
+            selected = closed_trades
+        else:
+            selected = closed_trades[:required_limit]
+
         selected_sorted = sorted(selected, key=lambda x: (x.closed_ts_ms, x.trade_id))
         self._validate_trade_order(selected_sorted)
         return selected_sorted
@@ -350,6 +394,62 @@ class TradeAnalyzer:
     # Core Analysis
     # ========================================================
 
+    def _build_empty_summary(
+        self,
+        *,
+        events: Sequence[EventRecord],
+    ) -> TradeAnalyzerSummary:
+        as_of_ts_ms = self._derive_empty_summary_as_of_ts_ms(events)
+        long_performance = self._build_side_performance([], "LONG")
+        short_performance = self._build_side_performance([], "SHORT")
+        entry_failure_reasons = self._extract_entry_failure_reasons(events)
+        loss_causes = ["none"]
+        recent_trade_briefs: List[Dict[str, Any]] = []
+        analyst_summary_ko = self._build_empty_korean_summary(
+            symbol=self._symbol,
+            entry_failure_reasons=entry_failure_reasons,
+        )
+
+        dashboard_payload = self._build_dashboard_payload(
+            as_of_ts_ms=as_of_ts_ms,
+            total_trades=0,
+            wins=0,
+            losses=0,
+            breakeven=0,
+            win_rate_pct=Decimal("0"),
+            total_pnl=Decimal("0"),
+            avg_pnl=Decimal("0"),
+            avg_win_pnl=Decimal("0"),
+            avg_loss_pnl=Decimal("0"),
+            long_performance=long_performance,
+            short_performance=short_performance,
+            entry_failure_reasons=entry_failure_reasons,
+            loss_causes=loss_causes,
+            recent_trade_briefs=recent_trade_briefs,
+            analyst_summary_ko=analyst_summary_ko,
+        )
+
+        return TradeAnalyzerSummary(
+            symbol=self._symbol,
+            as_of_ts_ms=as_of_ts_ms,
+            total_trades=0,
+            wins=0,
+            losses=0,
+            breakeven=0,
+            win_rate_pct=Decimal("0"),
+            total_pnl=Decimal("0"),
+            avg_pnl=Decimal("0"),
+            avg_win_pnl=Decimal("0"),
+            avg_loss_pnl=Decimal("0"),
+            long_performance=long_performance,
+            short_performance=short_performance,
+            entry_failure_reasons=entry_failure_reasons,
+            loss_causes=loss_causes,
+            recent_trade_briefs=recent_trade_briefs,
+            analyst_summary_ko=analyst_summary_ko,
+            dashboard_payload=dashboard_payload,
+        )
+
     def _build_summary(
         self,
         trades: Sequence[TradeRecord],
@@ -408,8 +508,10 @@ class TradeAnalyzer:
             loss_causes=loss_causes,
         )
 
+        as_of_ts_ms = trades[-1].closed_ts_ms
+
         dashboard_payload = self._build_dashboard_payload(
-            trades=trades,
+            as_of_ts_ms=as_of_ts_ms,
             total_trades=total_trades,
             wins=wins,
             losses=losses,
@@ -426,8 +528,6 @@ class TradeAnalyzer:
             recent_trade_briefs=recent_trade_briefs,
             analyst_summary_ko=analyst_summary_ko,
         )
-
-        as_of_ts_ms = trades[-1].closed_ts_ms
 
         return TradeAnalyzerSummary(
             symbol=self._symbol,
@@ -646,6 +746,21 @@ class TradeAnalyzer:
     # Summary text / payload
     # ========================================================
 
+    def _build_empty_korean_summary(
+        self,
+        *,
+        symbol: str,
+        entry_failure_reasons: Sequence[str],
+    ) -> str:
+        entry_failure_text = ", ".join(entry_failure_reasons)
+        if len(entry_failure_reasons) == 1 and entry_failure_reasons[0] == "none":
+            entry_failure_text = "관측된 주요 진입 실패 사유 없음"
+
+        return (
+            f"{symbol}는 아직 종료된 거래가 없어 거래 성능 집계가 없습니다. "
+            f"현재는 초기 운영 상태로 판단하며, 최근 진입 실패 주요 사유는 {entry_failure_text} 입니다."
+        )
+
     def _build_korean_summary(
         self,
         symbol: str,
@@ -678,7 +793,8 @@ class TradeAnalyzer:
 
     def _build_dashboard_payload(
         self,
-        trades: Sequence[TradeRecord],
+        *,
+        as_of_ts_ms: int,
         total_trades: int,
         wins: int,
         losses: int,
@@ -695,9 +811,12 @@ class TradeAnalyzer:
         recent_trade_briefs: Sequence[Dict[str, Any]],
         analyst_summary_ko: str,
     ) -> Dict[str, Any]:
+        if as_of_ts_ms <= 0:
+            raise RuntimeError("as_of_ts_ms must be > 0")
+
         return {
             "symbol": self._symbol,
-            "as_of_ts_ms": trades[-1].closed_ts_ms,
+            "as_of_ts_ms": as_of_ts_ms,
             "performance": {
                 "total_trades": total_trades,
                 "wins": wins,
@@ -912,6 +1031,14 @@ class TradeAnalyzer:
     # Helpers
     # ========================================================
 
+    def _derive_empty_summary_as_of_ts_ms(
+        self,
+        events: Sequence[EventRecord],
+    ) -> int:
+        if events:
+            return events[-1].ts_ms
+        return _now_ms()
+
     def _avg_pnl_or_zero(self, trades: Sequence[TradeRecord]) -> Decimal:
         if not trades:
             return Decimal("0")
@@ -929,7 +1056,20 @@ class TradeAnalyzer:
     def _normalize_optional_side(self, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        return self._normalize_side(value)
+
+        normalized = value.upper().strip()
+
+        if normalized in {"LONG", "BUY"}:
+            return "LONG"
+
+        if normalized in {"SHORT", "SELL"}:
+            return "SHORT"
+
+        # 이벤트 계열 side (CLOSE, EXIT, TP, SL 등)는 trade side가 아니므로 무시
+        if normalized in {"CLOSE", "EXIT", "TP", "SL"}:
+            return None
+
+        raise RuntimeError(f"Unexpected trade side: {value}")
 
     def _normalize_status(self, value: str) -> str:
         normalized = value.upper().strip()

@@ -437,7 +437,7 @@ class Settings:
 
     # Engine watchdog
     engine_watchdog_interval_sec: float = 5.0
-    engine_watchdog_max_db_ping_ms: int = 1500
+    engine_watchdog_max_db_ping_ms: int = 4000
     engine_watchdog_emit_min_sec: int = 30
 
     # Preflight / Meta strategy
@@ -484,7 +484,7 @@ class Settings:
 
     analyst_openai_model: str = "gpt-5-mini"
     analyst_openai_timeout_sec: float = 120.0
-    analyst_openai_max_output_tokens: int = 1200
+    analyst_openai_max_output_tokens: int = 4000
     # Responses API 경로에서는 temperature 미사용. 호환성/레거시 설정 유지용 필드.
     analyst_openai_temperature: float = 0.1
     analyst_openai_reasoning_effort: Optional[str] = None

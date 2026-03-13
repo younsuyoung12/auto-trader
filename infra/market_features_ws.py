@@ -1012,26 +1012,31 @@ def _strict_optional_float(symbol: str, location: str, name: str, value: Any) ->
         _fail(symbol, location, f"{name} must be finite when present (STRICT)")
     return parsed
 
-
 def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
     ob = get_orderbook(symbol, limit=5)
+    ob_status = get_orderbook_buffer_status(symbol)
 
-    # WS 초기 구간에서는 orderbook payload가 아직 도착하지 않을 수 있음
-    # STRICT 정책: 일정 시간 이후에도 payload가 없으면 실패
+    if not isinstance(ob_status, dict):
+        _fail(symbol, "orderbook", "get_orderbook_buffer_status 결과가 dict 가 아닙니다. (STRICT)")
+
+    now_ms = _now_ms()
+    recv_ts = ob_status.get("last_recv_ts")
+    payload_ts = ob_status.get("payload_ts")
+
+    # 1) payload 자체가 아직 없을 때
     if ob is None:
-        ob_status = get_orderbook_buffer_status(symbol)
-        recv_ts = ob_status.get("last_recv_ts")
-
-        if recv_ts is None:
+        # WS가 막 떠서 아직 첫 depth5가 안 온 초기구간이면 즉시 치명오류로 죽이지 않음
+        if recv_ts is None and payload_ts is None:
             raise FeatureBuildError(
-                f"{symbol} orderbook payload not received yet (startup phase)"
+                f"{symbol} orderbook payload not received yet (startup grace)"
             )
-        else:
-            _fail(
-                symbol,
-                "orderbook",
-                "orderbook payload missing after WS start (STRICT)"
-            )
+
+        # recv_ts/payload_ts가 있는데도 실제 orderbook snapshot 이 비어 있으면 계약 위반
+        _fail(
+            symbol,
+            "orderbook",
+            "orderbook snapshot missing despite orderbook status timestamps (STRICT)",
+        )
 
     if not isinstance(ob, dict):
         _fail(symbol, "orderbook", "오더북 스냅샷 타입이 dict 가 아닙니다.")
@@ -1066,6 +1071,15 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
             "orderbook",
             "오더북 스냅샷 timestamp(exchTs/ts)가 없습니다. timestamp 누락을 현재 시각으로 대체하지 않습니다.",
         )
+
+    age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)
+    if age_sec > ORDERBOOK_MAX_DELAY_SEC:
+        _fail(
+            symbol,
+            "orderbook",
+            f"오더북 스냅샷이 {age_sec:.1f}초 동안 갱신되지 않았습니다 (허용 최대 {ORDERBOOK_MAX_DELAY_SEC:.1f}초).",
+        )
+
 
     now_ms = _now_ms()
     age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)

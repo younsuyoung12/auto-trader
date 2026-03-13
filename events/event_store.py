@@ -189,11 +189,25 @@ def _ensure_dict(v: Any, name: str) -> Dict[str, Any]:
     raise EventStoreContractError(
         f"{name} must be dict, JSON object string, or None (STRICT)"
     )
+from decimal import Decimal
 
+
+def _convert_decimal(obj):
+    if isinstance(obj, Decimal):
+        return str(obj)
+
+    if isinstance(obj, dict):
+        return {k: _convert_decimal(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [_convert_decimal(v) for v in obj]
+
+    return obj
 
 def _ensure_json_serializable_dict(v: Any, name: str) -> Dict[str, Any]:
     obj = _ensure_dict(v, name)
     try:
+        obj = _convert_decimal(obj)
         json.dumps(obj, ensure_ascii=False)
     except (TypeError, ValueError) as e:
         raise EventStoreContractError(f"{name} must be JSON serializable object: {e} (STRICT)") from e

@@ -22,6 +22,7 @@ IMPORTANT POLICY:
 - runtime state rollback 금지
 - 치명 오류는 SAFE_STOP + 예외 전파
 - 공통 인프라(async/commentary/watchdog/reporting)는 main()에서 명시적으로 부팅/종료한다
+- 단, auto reporter 는 비핵심 분석 서브시스템으로 격리하며 실패 시 log/tg surface 후 엔진은 계속 운용한다
 
 CHANGE HISTORY:
 - 2026-03-13:
@@ -30,6 +31,9 @@ CHANGE HISTORY:
   3) FEAT(WIRING): start_watchdog() + on_fatal SAFE_STOP 콜백 연결
   4) FEAT(WIRING): AutoReporter 주기 실행 및 bt_events 기록 연결
   5) FIX(STRICT): main() finally 에서 watchdog / async worker 종료 정리 추가
+  6) FIX(OPERABILITY): auto reporter 실패를 메인 엔진 치명 오류로 승격하지 않도록 격리
+  7) FIX(CONTRACT): QUANT_ANALYSIS_ERROR 이벤트 타입을 event writer 에서 허용
+  8) FIX(NOTIFY): auto report notifier 가 성공/실패 payload를 구분해 알림
 - 2026-03-12:
   1) FIX(ROOT-CAUSE): import 누락(time, Callable) 수정
   2) KEEP(STRUCTURE): bootstrap / engine_loop / cycles orchestration 구조 유지
@@ -448,17 +452,24 @@ def _normalize_direction_for_events_strict(v: Any) -> str:
 
 def _auto_report_event_writer(event_type: str, report_type: str, payload: Dict[str, Any]) -> None:
     et = _require_nonempty_str(event_type, "event_type")
-    if et != "QUANT_ANALYSIS":
+    if et not in ("QUANT_ANALYSIS", "QUANT_ANALYSIS_ERROR"):
         raise RuntimeError(f"unexpected auto report event_type (STRICT): {et}")
+
     rt = _require_nonempty_str(report_type, "report_type")
     data = _require_dict(payload, "payload")
     generated_ts_ms = _require_int(data.get("generated_ts_ms"), "payload.generated_ts_ms", min_value=1)
     ts_utc = datetime.datetime.fromtimestamp(generated_ts_ms / 1000.0, tz=datetime.timezone.utc)
+
+    if et == "QUANT_ANALYSIS":
+        reason = "auto_report_generated"
+    else:
+        reason = "auto_report_failed"
+
     record_quant_analysis_event_db(
         ts_utc=ts_utc,
         symbol=_normalize_symbol_strict(SET.symbol),
         report_type=rt,
-        reason="auto_report_generated",
+        reason=reason,
         analysis_payload=data,
         regime=None,
         is_test=False,
@@ -472,6 +483,22 @@ def _auto_report_notifier(report_type: str, payload: Dict[str, Any]) -> None:
     dt_kst = datetime.datetime.fromtimestamp(generated_ts_ms / 1000.0, tz=datetime.timezone.utc).astimezone(
         datetime.timezone(datetime.timedelta(hours=9))
     )
+
+    error_type = data.get("error_type")
+    error_message = data.get("error_message")
+
+    if error_type is not None or error_message is not None:
+        err_type = _require_nonempty_str(error_type or "UNKNOWN", "payload.error_type")
+        err_msg = _require_nonempty_str(error_message or "unknown error", "payload.error_message")
+        _safe_send_tg(
+            f"⚠️ 자동 분석 리포트 실패\n"
+            f"- 유형: {rt}\n"
+            f"- 종목: {_normalize_symbol_strict(SET.symbol)}\n"
+            f"- 시각: {dt_kst.strftime('%Y-%m-%d %H:%M:%S KST')}\n"
+            f"- 오류: {err_type}: {err_msg}"
+        )
+        return
+
     _safe_send_tg(
         f"🧠 자동 분석 리포트 생성\n"
         f"- 유형: {rt}\n"
@@ -488,12 +515,26 @@ def _build_auto_reporter_or_raise() -> AutoReporter:
     )
 
 
-def _maybe_auto_report_or_raise(now_ts: float) -> None:
+def _maybe_auto_report_best_effort(now_ts: float) -> None:
     global _AUTO_REPORTER
     if _AUTO_REPORTER is None:
-        raise RuntimeError("auto reporter is not initialized (STRICT)")
+        log("[AUTO_REPORT][SKIP] auto reporter is not initialized")
+        return
+
     now_ms = _require_int(now_ts * 1000.0, "now_ms", min_value=1)
-    _AUTO_REPORTER.run_due_reports(now_ms=now_ms)
+
+    try:
+        result = _AUTO_REPORTER.run_due_reports(now_ms=now_ms)
+    except Exception as e:
+        log(f"[AUTO_REPORT][ERROR] isolated failure: {type(e).__name__}: {e}")
+        _safe_send_tg(f"⚠️ 자동 분석 리포트 격리 실패: {type(e).__name__}: {e}")
+        return
+
+    reports = getattr(result, "reports", None)
+    if not isinstance(reports, list):
+        log("[AUTO_REPORT][ERROR] run_due_reports returned invalid reports payload")
+        _safe_send_tg("⚠️ 자동 분석 리포트 결과 payload invalid")
+        return
 
 
 def _ensure_commentary_engine_initialized_or_raise() -> None:
@@ -526,7 +567,7 @@ def _monitoring_cycle_wrapper(
     _maybe_position_resync_or_raise(now_ts)
     _maybe_balance_check_or_raise(now_ts, runtime)
     _maybe_fill_check_or_raise(now_ts, runtime)
-    _maybe_auto_report_or_raise(now_ts)
+    _maybe_auto_report_best_effort(now_ts)
 
     if runtime.safe_stop_requested:
         _request_safe_stop(runtime)

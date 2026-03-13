@@ -29,6 +29,16 @@ IMPORTANT POLICY:
 - 계좌/포지션 데이터는 이 파일 책임이 아니다. dashboard telemetry 는 시장데이터 전용으로만 제공한다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(ROOT-CAUSE): ws_status.state 를 OPEN / OPENING / RECONNECTING / CLOSED 계약으로 명시
+  2) FIX(ROOT-CAUSE): reconnect grace 동안 connection_not_open 을 즉시 transport fail 로 승격하지 않도록 수정
+  3) FIX(ROOT-CAUSE): 새 candle 도착 시 직전 open candle 정상 rollover close 확정 로직 추가
+  4) FIX(ROOT-CAUSE): same-candle rollback anomaly(high/low/volume/quote_volume)가 버퍼 overwrite 로 반영되지 않도록 수정
+  5) FIX(OPERABILITY): orderbook 초기 수신 전 짧은 startup 구간은 warning 으로 처리
+  6) FIX(OPERABILITY): websocket-client ping_timeout 제거로 ping/pong timeout 강제종료 완화
+  7) FIX(CONTRACT): quote_volume rollback 추적 상태 추가
+  8) FIX(ROOT-CAUSE): 최신 버퍼보다 과거 ts kline packet 은 stale packet 으로 간주하고 무시
+  9) FIX(ROOT-CAUSE): 누락된 _derive_rest_kline_closed_strict 복원 및 REST closed-state 계약 일관화
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): Binance multiplex WS 에서 pong callback 부재를 transport failure 로 오판하던 문제 제거
   2) FIX(TRADE-GRADE): WS transport health 는 connection_open 기준으로만 판단하고 market-data activity 는 별도 warning 으로 유지
@@ -165,6 +175,7 @@ def _derive_rest_kline_closed_strict(row: Any, idx: int, now_ms: int) -> bool:
         explicit_closed = row.get("x")
         if explicit_closed is not None:
             return _require_bool(explicit_closed, f"rest_klines[{idx}].x")
+
         close_time_raw = row.get("T")
         if close_time_raw is None:
             close_time_raw = row.get("closeTime")
@@ -172,6 +183,7 @@ def _derive_rest_kline_closed_strict(row: Any, idx: int, now_ms: int) -> bool:
             close_time_raw = row.get("close_time")
         if close_time_raw is None:
             raise RuntimeError(f"rest_klines[{idx}] missing close time for closed-state derivation (STRICT)")
+
         close_time_ms = _require_int_ms(close_time_raw, f"rest_klines[{idx}].close_time")
         return bool(now_ms > close_time_ms)
 
@@ -308,6 +320,52 @@ def _normalize_required_intervals_for_dashboard(intervals: Optional[List[str]]) 
     return normalized
 
 
+def _interval_to_ms_strict(interval: str) -> int:
+    iv = _normalize_interval(interval)
+    if not iv:
+        raise RuntimeError("interval is required (STRICT)")
+
+    unit = iv[-1]
+    value_raw = iv[:-1]
+    if not value_raw.isdigit():
+        raise RuntimeError(f"interval format invalid (STRICT): {interval!r}")
+    n = int(value_raw)
+    if n <= 0:
+        raise RuntimeError(f"interval value must be > 0 (STRICT): {interval!r}")
+
+    if unit == "m":
+        return n * 60_000
+    if unit == "h":
+        return n * 3_600_000
+    if unit == "d":
+        return n * 86_400_000
+    if unit == "w":
+        return n * 604_800_000
+    if unit == "M":
+        raise RuntimeError(f"monthly interval rollover unsupported in WS strict path: {interval!r}")
+
+    raise RuntimeError(f"unsupported interval unit (STRICT): {interval!r}")
+
+
+def _extract_quote_volume_from_rest_row_optional(row: Any, idx: int) -> Optional[float]:
+    if isinstance(row, (list, tuple)):
+        if len(row) > 7 and row[7] is not None:
+            return _require_float(row[7], f"rest_klines[{idx}].quote_volume", allow_zero=True)
+        return None
+
+    if isinstance(row, dict):
+        raw = row.get("q")
+        if raw is None:
+            raw = row.get("quoteVolume")
+        if raw is None:
+            raw = row.get("quote_volume")
+        if raw is None:
+            return None
+        return _require_float(raw, f"rest_klines[{idx}].quote_volume", allow_zero=True)
+
+    return None
+
+
 # ─────────────────────────────────────────────
 # Settings / SSOT
 # ─────────────────────────────────────────────
@@ -378,6 +436,7 @@ PONG_STARTUP_GRACE_SEC: float = _require_positive_float(
     SET.ws_pong_startup_grace_sec,
     "ws_pong_startup_grace_sec",
 )
+_WS_RECONNECT_GRACE_SEC: float = max(5.0, MARKET_EVENT_MAX_DELAY_SEC)
 
 _LONG_TF_MIN_BUFFER_DEFAULT: int = _require_positive_int(
     SET.ws_min_kline_buffer_long_tf,
@@ -417,6 +476,7 @@ _health_fail_lock = threading.Lock()
 
 _kline_buffers: Dict[Tuple[str, str], List[KlineRow]] = {}
 _kline_last_recv_ts: Dict[Tuple[str, str], int] = {}
+_kline_last_quote_volume: Dict[Tuple[str, str], Tuple[int, float]] = {}
 
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 _orderbook_last_update_id: Dict[str, int] = {}
@@ -500,6 +560,142 @@ def _mark_ws_error(symbol: str, error: Any) -> None:
         _ws_last_error_text[sym] = msg
 
 
+def _classify_same_candle_update_strict(
+    prev: KlineRow,
+    new_row: KlineRow,
+    *,
+    prev_quote_volume: Optional[float],
+    new_quote_volume: float,
+    context: str,
+) -> bool:
+    prev_ts, prev_o, prev_h, prev_l, _prev_c, prev_v, prev_closed = prev
+    new_ts, new_o, new_h, new_l, _new_c, new_v, new_closed = new_row
+
+    if new_ts != prev_ts:
+        raise WSProtocolError(f"{context} ts mismatch during same-candle update (STRICT)")
+
+    if prev_closed and not new_closed:
+        raise WSProtocolError(f"{context} closed candle cannot reopen (STRICT)")
+
+    if abs(new_o - prev_o) > 1e-12:
+        raise WSProtocolError(f"{context} open price changed within same candle (STRICT)")
+
+    if new_h + 1e-12 < prev_h:
+        log(f"[WS_ANOMALY] {context} high rollback prev={prev_h} new={new_h}")
+        return False
+
+    if new_l - 1e-12 > prev_l:
+        log(f"[WS_ANOMALY] {context} low rollback prev={prev_l} new={new_l}")
+        return False
+
+    if new_v + 1e-12 < prev_v:
+        log(f"[WS_ANOMALY] {context} volume rollback prev={prev_v} new={new_v}")
+        return False
+
+    if prev_quote_volume is not None and new_quote_volume + 1e-12 < prev_quote_volume:
+        log(f"[WS_ANOMALY] {context} quote_volume rollback prev={prev_quote_volume} new={new_quote_volume}")
+        return False
+
+    return True
+
+
+def _plan_kline_update_strict(
+    buf: List[KlineRow],
+    row: KlineRow,
+    *,
+    interval: str,
+    quote_volume: float,
+    prev_quote_volume: Optional[float],
+    context: str,
+) -> Tuple[bool, Optional[KlineRow]]:
+    _ = quote_volume
+    ts = int(row[0])
+    if not buf:
+        return True, None
+
+    last = buf[-1]
+    last_ts = int(last[0])
+
+    if ts < last_ts:
+        log(f"[WS_INFO] {context} stale kline ignored new_ts={ts} last_ts={last_ts}")
+        return False, None
+
+    if ts == last_ts:
+        should_apply = _classify_same_candle_update_strict(
+            last,
+            row,
+            prev_quote_volume=prev_quote_volume,
+            new_quote_volume=quote_volume,
+            context=context,
+        )
+        return should_apply, None
+
+    if bool(last[6]) is False:
+        interval_ms = _interval_to_ms_strict(interval)
+        delta_ms = ts - last_ts
+        if delta_ms != interval_ms:
+            raise WSProtocolError(
+                f"{context} new candle arrived before previous candle closed with invalid rollover delta (STRICT): "
+                f"prev_ts={last_ts} new_ts={ts} delta_ms={delta_ms} expected_ms={interval_ms}"
+            )
+
+        sealed_prev: KlineRow = (
+            int(last[0]),
+            float(last[1]),
+            float(last[2]),
+            float(last[3]),
+            float(last[4]),
+            float(last[5]),
+            True,
+        )
+        return True, sealed_prev
+
+    return True, None
+
+
+def _commit_kline_update_strict(
+    buf: List[KlineRow],
+    row: KlineRow,
+    *,
+    key: Tuple[str, str],
+    quote_volume: float,
+    should_apply: bool,
+    sealed_prev: Optional[KlineRow],
+    context: str,
+) -> None:
+    if not should_apply:
+        return
+
+    ts = int(row[0])
+
+    if not buf:
+        buf.append(row)
+        _kline_last_quote_volume[key] = (ts, float(quote_volume))
+        return
+
+    last = buf[-1]
+    last_ts = int(last[0])
+
+    if ts < last_ts:
+        raise WSProtocolError(f"{context} kline timestamp rollback on commit (STRICT): new_ts={ts} last_ts={last_ts}")
+
+    if ts == last_ts:
+        buf[-1] = row
+        _kline_last_quote_volume[key] = (ts, float(quote_volume))
+        return
+
+    if sealed_prev is not None:
+        if int(buf[-1][0]) != int(sealed_prev[0]):
+            raise WSProtocolError(f"{context} sealed prev ts mismatch on commit (STRICT)")
+        buf[-1] = sealed_prev
+        log(f"[WS_RECOVERY] {context} previous open candle sealed on rollover prev_ts={sealed_prev[0]} new_ts={ts}")
+
+    buf.append(row)
+    if len(buf) > MAX_KLINES:
+        del buf[0 : len(buf) - MAX_KLINES]
+    _kline_last_quote_volume[key] = (ts, float(quote_volume))
+
+
 def get_ws_status(symbol: str) -> Dict[str, Any]:
     """
     WS session status.
@@ -508,6 +704,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
     - transport 상태만 의미한다.
     - Binance multiplex WS 에서는 pong callback 부재를 transport failure 로 간주하지 않는다.
     - market_feed inactivity는 warning 으로 분리한다.
+    - reconnect grace 동안 brief disconnect 는 즉시 transport fail 로 승격하지 않는다.
     """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
@@ -520,6 +717,19 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
         last_message_ts = _ws_last_message_ts.get(sym)
         last_pong_ts = _ws_last_pong_ts.get(sym)
         last_error = _ws_last_error_text.get(sym)
+
+    with _start_ws_lock:
+        runner = _started_ws_symbols.get(sym)
+        runner_alive = bool(runner is not None and runner.is_alive())
+
+    if connection_open:
+        state = "OPEN"
+    elif runner_alive and last_open_ts is None:
+        state = "OPENING"
+    elif runner_alive:
+        state = "RECONNECTING"
+    else:
+        state = "CLOSED"
 
     market_event_delay_ms = None
     if last_message_ts is not None:
@@ -534,7 +744,21 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
     transport_observations: List[str] = []
 
     if not connection_open:
-        transport_reasons.append("connection_not_open")
+        if state == "OPENING":
+            transport_observations.append("opening_in_progress")
+        elif state == "RECONNECTING":
+            if last_close_ts is None:
+                transport_observations.append("reconnecting_without_last_close_ts")
+            else:
+                closed_age_sec = max(0, now_ms - int(last_close_ts)) / 1000.0
+                if closed_age_sec <= _WS_RECONNECT_GRACE_SEC:
+                    transport_observations.append(
+                        f"reconnecting_grace_sec<={_WS_RECONNECT_GRACE_SEC} (got={closed_age_sec:.1f})"
+                    )
+                else:
+                    transport_reasons.append("connection_not_open")
+        else:
+            transport_reasons.append("connection_not_open")
 
     if connection_open:
         if last_open_ts is None:
@@ -553,7 +777,10 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
                 )
 
     if last_message_ts is None:
-        market_feed_reasons.append("no_market_event")
+        if state in ("OPENING", "RECONNECTING"):
+            market_feed_reasons.append("startup_no_market_event_yet")
+        else:
+            market_feed_reasons.append("no_market_event")
     else:
         market_event_delay_sec = market_event_delay_ms / 1000.0
         if market_event_delay_sec > MARKET_EVENT_MAX_DELAY_SEC:
@@ -567,6 +794,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
 
     return {
         "symbol": sym,
+        "state": state,
         "connection_open": connection_open,
         "last_open_ts": last_open_ts,
         "last_close_ts": last_close_ts,
@@ -593,16 +821,12 @@ def _derive_dashboard_connection_status(symbol: str) -> str:
         raise RuntimeError("symbol is required for dashboard connection status")
 
     ws_status = get_ws_status(sym)
-    transport_ok = bool(ws_status.get("transport_ok", False))
-    if transport_ok:
+    state = str(ws_status.get("state") or "").upper().strip()
+
+    if state == "OPEN":
         return _DASHBOARD_WS_STATUS_CONNECTED
-
-    with _start_ws_lock:
-        runner = _started_ws_symbols.get(sym)
-
-    if runner is not None and runner.is_alive():
+    if state in ("OPENING", "RECONNECTING"):
         return _DASHBOARD_WS_STATUS_RECONNECTING
-
     return _DASHBOARD_WS_STATUS_DISCONNECTED
 
 
@@ -728,82 +952,6 @@ def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]
     return loaded
 
 
-def _require_kline_progression_strict(prev: KlineRow, new_row: KlineRow, *, context: str) -> None:
-    prev_ts, prev_o, prev_h, prev_l, _prev_c, prev_v, prev_closed = prev
-    new_ts, new_o, new_h, new_l, _new_c, new_v, new_closed = new_row
-
-    if new_ts != prev_ts:
-        raise WSProtocolError(f"{context} ts mismatch during same-candle update (STRICT)")
-
-    if prev_closed and not new_closed:
-        raise WSProtocolError(f"{context} closed candle cannot reopen (STRICT)")
-
-    if abs(new_o - prev_o) > 1e-12:
-        raise WSProtocolError(f"{context} open price changed within same candle (STRICT)")
-
-    # Binance WS에서는 open candle 동안 high/low/volume rollback이 발생할 수 있음
-    # STRICT 엔진에서는 이를 허용하되 anomaly 로그를 남기고 해당 업데이트를 무시한다.
-
-    if new_h + 1e-12 < prev_h:
-        log(f"[WS_ANOMALY] {context} high rollback prev={prev_h} new={new_h}")
-        return
-
-    if new_l - 1e-12 > prev_l:
-        log(f"[WS_ANOMALY] {context} low rollback prev={prev_l} new={new_l}")
-        return
-
-    if new_v + 1e-12 < prev_v:
-        log(f"[WS_ANOMALY] {context} volume rollback prev={prev_v} new={new_v}")
-        return
-
-def _validate_next_kline_row_against_buffer_strict(buf: List[KlineRow], row: KlineRow, *, context: str) -> None:
-    ts = int(row[0])
-    if not buf:
-        return
-
-    last = buf[-1]
-    last_ts = int(last[0])
-
-    if ts < last_ts:
-        raise WSProtocolError(f"{context} kline timestamp rollback (STRICT): new_ts={ts} last_ts={last_ts}")
-
-    if ts == last_ts:
-        _require_kline_progression_strict(last, row, context=context)
-        return
-
-    if bool(last[6]) is False:
-        raise WSProtocolError(
-            f"{context} new candle arrived before previous candle closed (STRICT): prev_ts={last_ts} new_ts={ts}"
-        )
-
-
-def _append_or_update_kline_row_strict(buf: List[KlineRow], row: KlineRow, *, context: str) -> None:
-    ts = int(row[0])
-    if not buf:
-        buf.append(row)
-        return
-
-    last = buf[-1]
-    last_ts = int(last[0])
-
-    if ts < last_ts:
-        raise WSProtocolError(f"{context} kline timestamp rollback (STRICT): new_ts={ts} last_ts={last_ts}")
-
-    if ts == last_ts:
-        _require_kline_progression_strict(last, row, context=context)
-        buf[-1] = row
-        return
-
-    if bool(last[6]) is False:
-        raise WSProtocolError(
-            f"{context} new candle arrived before previous candle closed (STRICT): prev_ts={last_ts} new_ts={ts}"
-        )
-
-    buf.append(row)
-    if len(buf) > MAX_KLINES:
-        del buf[0 : len(buf) - MAX_KLINES]
-
-
 def _persist_ws_kline_strict(
     *,
     symbol: str,
@@ -859,25 +1007,67 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
 
     with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
-        _validate_next_kline_row_against_buffer_strict(buf, row, context=f"ws_kline[{sym}:{iv}]")
+        prev_q_entry = _kline_last_quote_volume.get(key)
+        prev_quote_volume: Optional[float] = None
+        if prev_q_entry is not None and int(prev_q_entry[0]) == int(buf[-1][0] if buf else ts):
+            prev_quote_volume = float(prev_q_entry[1])
 
-    _persist_ws_kline_strict(
-        symbol=sym,
-        interval=iv,
-        ts_ms=ts,
-        open_=o,
-        high=h,
-        low=l,
-        close=c,
-        volume=v,
-        quote_volume=q,
-        is_closed=is_closed,
-    )
+        should_apply, sealed_prev = _plan_kline_update_strict(
+            buf,
+            row,
+            interval=iv,
+            quote_volume=q,
+            prev_quote_volume=prev_quote_volume,
+            context=f"ws_kline[{sym}:{iv}]",
+        )
+
+    if sealed_prev is not None:
+        sealed_quote_volume = prev_quote_volume
+        if sealed_quote_volume is None:
+            raise WSProtocolError(
+                f"ws_kline[{sym}:{iv}] rollover close missing previous quote_volume tracking (STRICT)"
+            )
+
+        _persist_ws_kline_strict(
+            symbol=sym,
+            interval=iv,
+            ts_ms=int(sealed_prev[0]),
+            open_=float(sealed_prev[1]),
+            high=float(sealed_prev[2]),
+            low=float(sealed_prev[3]),
+            close=float(sealed_prev[4]),
+            volume=float(sealed_prev[5]),
+            quote_volume=float(sealed_quote_volume),
+            is_closed=True,
+        )
+
+    if should_apply:
+        _persist_ws_kline_strict(
+            symbol=sym,
+            interval=iv,
+            ts_ms=ts,
+            open_=o,
+            high=h,
+            low=l,
+            close=c,
+            volume=v,
+            quote_volume=q,
+            is_closed=is_closed,
+        )
 
     with _kline_lock:
         buf = _kline_buffers.setdefault(key, [])
-        _append_or_update_kline_row_strict(buf, row, context=f"ws_kline[{sym}:{iv}]")
-        _kline_last_recv_ts[key] = now_ms
+        _commit_kline_update_strict(
+            buf,
+            row,
+            key=key,
+            quote_volume=q,
+            should_apply=should_apply,
+            sealed_prev=sealed_prev,
+            context=f"ws_kline[{sym}:{iv}]",
+        )
+        if should_apply:
+            _kline_last_recv_ts[key] = now_ms
 
 
 def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
@@ -967,9 +1157,11 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
         prev_update_id = _orderbook_last_update_id.get(sym)
 
     if prev_update_id is not None and update_id <= int(prev_update_id):
-        raise WSProtocolError(
-            f"orderbook outdated packet (STRICT): prev={int(prev_update_id)} new={int(update_id)}"
+        log(
+            f"[WS_INFO] orderbook replay/rollback ignored "
+            f"prev={int(prev_update_id)} new={int(update_id)}"
         )
+        return
 
     raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
     raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
@@ -1102,6 +1294,7 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
         _orderbook_last_update_id.pop(sym, None)
         _orderbook_buffers.pop(sym, None)
         _orderbook_last_recv_ts.pop(sym, None)
+    
 
     _mark_ws_open(sym, _now_ms())
     log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
@@ -1168,7 +1361,11 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
 
     now_ms = _now_ms()
     converted: List[KlineRow] = []
+    quote_volume_by_ts: Dict[int, float] = {}
+
     for idx, row in enumerate(rest_klines):
+        quote_volume_optional = _extract_quote_volume_from_rest_row_optional(row, idx)
+
         if isinstance(row, (list, tuple)):
             if len(row) < 7:
                 raise RuntimeError(f"rest_klines[{idx}] invalid len<7 (STRICT)")
@@ -1180,6 +1377,8 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
             v = _require_float(row[5], f"rest_klines[{idx}].v", allow_zero=True)
             is_closed = _derive_rest_kline_closed_strict(row, idx, now_ms)
             converted.append((ts, o, h, l, c, v, is_closed))
+            if quote_volume_optional is not None:
+                quote_volume_by_ts[ts] = quote_volume_optional
             continue
 
         if isinstance(row, dict):
@@ -1191,12 +1390,24 @@ def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]
             v = _require_float(row.get("v") or row.get("volume"), f"rest_klines[{idx}].v", allow_zero=True)
             is_closed = _derive_rest_kline_closed_strict(row, idx, now_ms)
             converted.append((ts, o, h, l, c, v, is_closed))
+            if quote_volume_optional is not None:
+                quote_volume_by_ts[ts] = quote_volume_optional
             continue
 
         raise RuntimeError(f"rest_klines[{idx}] invalid type (STRICT): {type(row).__name__}")
 
     converted.sort(key=lambda x: x[0])
     preload_klines(sym, iv, converted)
+
+    key = (sym, iv)
+    latest_ts = int(converted[-1][0])
+    latest_quote_volume = quote_volume_by_ts.get(latest_ts)
+
+    with _kline_lock:
+        if latest_quote_volume is not None:
+            _kline_last_quote_volume[key] = (latest_ts, float(latest_quote_volume))
+        else:
+            _kline_last_quote_volume.pop(key, None)
 
 
 def _log_no_buffer_once(symbol: str, interval: str, requested: int) -> None:
@@ -1415,8 +1626,21 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
         "reasons": [],
     }
 
+    ws_state = str(ws_status.get("state") or "").upper().strip()
+    last_open_ts = ws_status.get("last_open_ts")
+
     if ob is None:
-        payload_reasons.append("payload:no_orderbook")
+        if ws_state in ("OPEN", "OPENING", "RECONNECTING"):
+            if last_open_ts is not None:
+                open_age_sec = max(0, now_ms - int(last_open_ts)) / 1000.0
+                if open_age_sec <= MARKET_EVENT_MAX_DELAY_SEC:
+                    warning_reasons.append("feed:startup_no_orderbook_yet")
+                else:
+                    payload_reasons.append("payload:no_orderbook")
+            else:
+                warning_reasons.append("feed:opening_no_orderbook_yet")
+        else:
+            payload_reasons.append("payload:no_orderbook")
     else:
         ts = ob.get("ts")
         if ts is None:
@@ -1597,7 +1821,7 @@ def get_dashboard_ws_telemetry_snapshot(
     symbol: str,
     *,
     intervals: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    ) -> Dict[str, Any]:
     """
     Dashboard 전용 WS telemetry snapshot.
 
@@ -1709,7 +1933,6 @@ def start_ws_loop(symbol: str) -> None:
                 start_ts = time.time()
                 ws.run_forever(
                     ping_interval=20,
-                    ping_timeout=10,
                 )
                 session_dur = time.time() - start_ts
 

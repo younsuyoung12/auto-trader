@@ -17,6 +17,8 @@ CORE RESPONSIBILITIES:
 - 응답에서 JSON object 1개만 STRICT 추출
 - scope / used_inputs / answer_ko / list fields 무결성 검증
 - market-only / full-analysis 입력 계약 분리 유지
+- GPT 입력 payload를 deterministic compact policy로 축약해
+  max_output_tokens / 과도한 출력 유도를 구조적으로 방지한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -28,8 +30,14 @@ IMPORTANT POLICY:
 - 응답은 반드시 JSON object 1개여야 한다
 - structured output 후보가 여러 개거나 text 후보가 여러 개면 모호성으로 즉시 예외
 - settings alias 충돌 시 즉시 예외
+- payload compaction 은 사전 정의된 deterministic 계약이며 silent fallback 이 아니다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(ROOT-CAUSE): GPT 입력 payload를 deterministic compact policy로 축약해 max_output_tokens 초과를 구조적으로 완화
+  2) FIX(CONTRACT): response json schema에 answer_ko / list item / array max length·max items 제약 추가
+  3) FIX(OPERABILITY): request summary에 original/compacted payload chars 및 compaction phase 추적 추가
+  4) FIX(PROMPT): answer_ko는 1~2문장, bullet/newline 금지 규칙 강화
 - 2026-03-10:
   1) FIX(SSOT): settings canonical/legacy alias를 명시 계약으로 통합하고 충돌 시 즉시 예외
   2) FIX(STRICT): structured output 후보가 2개 이상이면 모호성으로 즉시 예외
@@ -89,6 +97,71 @@ _SETTING_ALIASES: Dict[str, Tuple[str, ...]] = {
     "openai_reasoning_effort": ("analyst_openai_reasoning_effort", "ANALYST_OPENAI_REASONING_EFFORT"),
 }
 
+# deterministic compaction policy
+_MODEL_INPUT_CHAR_BUDGET = 12_000
+_COMPACTION_PHASES: Tuple[Dict[str, int], ...] = (
+    {"max_string_chars": 400, "max_list_items": 10, "max_mapping_items": 64},
+    {"max_string_chars": 280, "max_list_items": 6, "max_mapping_items": 48},
+    {"max_string_chars": 180, "max_list_items": 4, "max_mapping_items": 32},
+    {"max_string_chars": 120, "max_list_items": 3, "max_mapping_items": 24},
+)
+
+_PRIORITY_KEYS: Tuple[str, ...] = (
+    "symbol",
+    "as_of_ms",
+    "as_of_ts_ms",
+    "timeframe",
+    "trend",
+    "market_regime",
+    "volatility",
+    "liquidity",
+    "conviction",
+    "price",
+    "mark_price",
+    "index_price",
+    "support_price",
+    "resistance_price",
+    "latest_close_price",
+    "price_change_pct",
+    "spread_bps",
+    "avg_spread_bps",
+    "latest_spread_bps",
+    "orderbook_imbalance",
+    "avg_orderbook_imbalance",
+    "latest_orderbook_imbalance",
+    "realized_volatility_pct",
+    "funding_rate",
+    "open_interest",
+    "open_interest_change_pct",
+    "global_long_short_ratio",
+    "top_long_short_ratio",
+    "taker_long_short_ratio",
+    "crowding_bias",
+    "liquidation_pressure",
+    "poc_price",
+    "value_area_low",
+    "value_area_high",
+    "cvd",
+    "delta_ratio_pct",
+    "options_bias",
+    "win_rate_pct",
+    "total_pnl",
+    "avg_pnl",
+    "avg_win_pnl",
+    "avg_loss_pnl",
+    "total_trades",
+    "wins",
+    "losses",
+    "breakeven",
+    "entry_blockers",
+    "entry_failure_reasons",
+    "loss_causes",
+    "recent_trade_briefs",
+    "key_signals",
+    "summary_ko",
+    "analyst_summary_ko",
+)
+
 _SYSTEM_INSTRUCTIONS = """
 You are a professional Bitcoin quantitative analyst for an internal trading intelligence system.
 
@@ -102,13 +175,15 @@ Strict rules:
 7. When evidence is insufficient or missing, you must fail by returning a strict explanation only from the provided data. Do not guess.
 8. Recommendations must be diagnostic or strategic suggestions only, never execution commands.
 9. Keep the output compact to fit within a strict token budget.
-10. answer_ko must be concise: maximum 2 short sentences.
-11. root_causes must contain 1 to 4 short items for non-out_of_scope.
-12. recommendations must contain 1 to 4 short items for non-out_of_scope.
-13. Each root_causes/recommendations item must be short and direct, not an essay.
-14. NEVER include a section name in used_inputs if that section is absent from the payload.
-15. If only one analysis section exists in the payload, used_inputs MUST contain only that section.
-16. used_inputs must exactly reflect the sections actually used, and every used section must exist in the payload.
+10. answer_ko must be concise: 1 or 2 short Korean sentences only.
+11. answer_ko must not contain bullet points, numbering, or line breaks.
+12. root_causes must contain 1 to 4 short items for non-out_of_scope.
+13. recommendations must contain 1 to 4 short items for non-out_of_scope.
+14. Each root_causes/recommendations item must be short and direct, not an essay.
+15. NEVER include a section name in used_inputs if that section is absent from the payload.
+16. If only one analysis section exists in the payload, used_inputs MUST contain only that section.
+17. used_inputs must exactly reflect the sections actually used, and every used section must exist in the payload.
+18. If the payload appears compacted or truncated for token budget, use only the visible compacted facts and do not infer omitted details.
 
 Required JSON schema:
 {
@@ -363,17 +438,31 @@ class GptAnalystEngine:
         json_safe_payload = self._json_safe_or_raise(payload, field_name="payload")
         self._validate_json_safe_payload_or_raise(json_safe_payload)
 
-        input_text = json.dumps(json_safe_payload, ensure_ascii=False, separators=(",", ":"))
-        request_summary = self._build_request_summary(json_safe_payload, input_text)
-        runtime_instructions = self._build_runtime_instructions(json_safe_payload)
+        original_input_text = self._serialize_json_compact(json_safe_payload)
+        compacted_payload, compaction_meta = self._compact_payload_to_budget_or_raise(
+            json_safe_payload,
+            char_budget=_MODEL_INPUT_CHAR_BUDGET,
+        )
+
+        input_text = self._serialize_json_compact(compacted_payload)
+        request_summary = self._build_request_summary(compacted_payload, input_text)
+        request_summary["original_payload_chars"] = len(original_input_text)
+        request_summary["compacted_payload_chars"] = len(input_text)
+        request_summary["compaction_applied"] = bool(compaction_meta["applied"])
+        request_summary["compaction_phase_index"] = int(compaction_meta["phase_index"])
+
+        runtime_instructions = self._build_runtime_instructions(compacted_payload)
 
         logger.info(
-            "OpenAI request prepared: model=%s max_output_tokens=%s payload_chars=%s question_chars=%s sections=%s",
+            "OpenAI request prepared: model=%s max_output_tokens=%s original_payload_chars=%s compacted_payload_chars=%s question_chars=%s sections=%s compaction_applied=%s phase=%s",
             self._model,
             self._max_output_tokens,
-            request_summary["payload_chars"],
+            request_summary["original_payload_chars"],
+            request_summary["compacted_payload_chars"],
             request_summary["question_chars"],
             json.dumps(request_summary["sections"], ensure_ascii=False, separators=(",", ":")),
+            request_summary["compaction_applied"],
+            request_summary["compaction_phase_index"],
         )
 
         request_args: Dict[str, Any] = {
@@ -397,17 +486,17 @@ class GptAnalystEngine:
             error_message = str(exc)
 
             logger.error(
-                "OpenAI Responses API request failed: error_type=%s model=%s timeout_sec=%.3f payload_chars=%s",
+                "OpenAI Responses API request failed: error_type=%s model=%s timeout_sec=%.3f compacted_payload_chars=%s",
                 error_name,
                 self._model,
                 self._timeout_sec,
-                request_summary["payload_chars"],
+                request_summary["compacted_payload_chars"],
             )
 
             if error_name == "APITimeoutError":
                 raise RuntimeError(
                     f"OpenAI Responses API request timed out: model={self._model}, timeout_sec={self._timeout_sec}, "
-                    f"payload_chars={request_summary['payload_chars']}"
+                    f"payload_chars={request_summary['compacted_payload_chars']}"
                 ) from exc
 
             if error_name == "BadRequestError":
@@ -431,7 +520,7 @@ class GptAnalystEngine:
                 json.dumps(self._extract_usage_summary(response), ensure_ascii=False, separators=(",", ":")),
             )
             result = self._parse_result_strict(raw_text)
-            self._validate_result_used_inputs_against_payload(result, json_safe_payload)
+            self._validate_result_used_inputs_against_payload(result, compacted_payload)
             return result
 
         raw_text = self._extract_output_text_or_raise(response)
@@ -442,7 +531,7 @@ class GptAnalystEngine:
             json.dumps(self._extract_usage_summary(response), ensure_ascii=False, separators=(",", ":")),
         )
         result = self._parse_result_strict(raw_text)
-        self._validate_result_used_inputs_against_payload(result, json_safe_payload)
+        self._validate_result_used_inputs_against_payload(result, compacted_payload)
         return result
 
     def _response_json_schema(self) -> Dict[str, Any]:
@@ -460,24 +549,35 @@ class GptAnalystEngine:
                     },
                     "answer_ko": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": 160,
                     },
                     "root_causes": {
                         "type": "array",
+                        "maxItems": 4,
                         "items": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": 80,
                         },
                     },
                     "recommendations": {
                         "type": "array",
+                        "maxItems": 4,
                         "items": {
                             "type": "string",
+                            "minLength": 1,
+                            "maxLength": 80,
                         },
                     },
                     "confidence": {
                         "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
                     },
                     "used_inputs": {
                         "type": "array",
+                        "maxItems": 3,
                         "items": {
                             "type": "string",
                             "enum": sorted(_ALLOWED_USED_INPUTS),
@@ -514,6 +614,9 @@ class GptAnalystEngine:
         else:
             lines.append("- No analysis sections are available. used_inputs MUST be [].")
 
+        lines.append("- answer_ko MUST be one or two Korean sentences only.")
+        lines.append("- answer_ko MUST NOT contain bullets, numbering, or line breaks.")
+        lines.append("- Keep every field as short as possible while still being useful.")
         return "\n".join(lines)
 
     def _extract_available_input_sections(self, payload: Mapping[str, Any]) -> List[str]:
@@ -583,7 +686,7 @@ class GptAnalystEngine:
             raise RuntimeError(
                 "OpenAI response incomplete: "
                 f"reason={detail}, model={self._model}, max_output_tokens={self._max_output_tokens}, "
-                f"payload_chars={request_summary['payload_chars']}, question_chars={request_summary['question_chars']}, "
+                f"payload_chars={request_summary['compacted_payload_chars']}, question_chars={request_summary['question_chars']}, "
                 f"usage={json.dumps(usage_summary, ensure_ascii=False, separators=(',', ':'))}"
             )
 
@@ -946,7 +1049,11 @@ class GptAnalystEngine:
                 unique.append(text)
         return unique
 
-    def _dedupe_mapping_candidates_strict(self, values: Sequence[Mapping[str, Any]], field_name: str) -> List[Dict[str, Any]]:
+    def _dedupe_mapping_candidates_strict(
+        self,
+        values: Sequence[Mapping[str, Any]],
+        field_name: str,
+    ) -> List[Dict[str, Any]]:
         unique: List[Dict[str, Any]] = []
         seen: set[str] = set()
 
@@ -960,6 +1067,150 @@ class GptAnalystEngine:
                 unique.append(normalized)
 
         return unique
+
+    # ========================================================
+    # Deterministic payload compaction
+    # ========================================================
+
+    def _compact_payload_to_budget_or_raise(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        char_budget: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        if not isinstance(payload, Mapping) or not payload:
+            raise RuntimeError("payload must be a non-empty mapping")
+        if char_budget <= 0:
+            raise RuntimeError("char_budget must be > 0")
+
+        original_payload = dict(payload)
+        original_text = self._serialize_json_compact(original_payload)
+        if len(original_text) <= char_budget:
+            return original_payload, {
+                "applied": False,
+                "phase_index": 0,
+                "original_payload_chars": len(original_text),
+                "compacted_payload_chars": len(original_text),
+            }
+
+        for phase_index, phase in enumerate(_COMPACTION_PHASES, start=1):
+            compacted = self._compact_value_for_model(
+                original_payload,
+                field_name="payload",
+                phase=phase,
+            )
+            if not isinstance(compacted, Mapping) or not compacted:
+                raise RuntimeError("compacted payload must remain a non-empty mapping")
+
+            compacted_dict = dict(compacted)
+            self._validate_payload_top_level_keys_or_raise(compacted_dict)
+            self._validate_json_safe_payload_or_raise(compacted_dict)
+
+            compacted_text = self._serialize_json_compact(compacted_dict)
+            if len(compacted_text) <= char_budget:
+                return compacted_dict, {
+                    "applied": True,
+                    "phase_index": phase_index,
+                    "original_payload_chars": len(original_text),
+                    "compacted_payload_chars": len(compacted_text),
+                }
+
+        raise RuntimeError(
+            f"payload exceeds deterministic compaction budget (STRICT): "
+            f"original_chars={len(original_text)} budget={char_budget}"
+        )
+
+    def _compact_value_for_model(
+        self,
+        value: Any,
+        *,
+        field_name: str,
+        phase: Mapping[str, int],
+    ) -> Any:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, bool)):
+            return value
+
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise RuntimeError(f"Non-finite float found in {field_name}")
+            return value
+
+        if isinstance(value, str):
+            return self._truncate_string_for_model(
+                value,
+                max_chars=int(phase["max_string_chars"]),
+            )
+
+        if isinstance(value, Mapping):
+            max_mapping_items = int(phase["max_mapping_items"])
+            if field_name == "payload":
+                max_mapping_items = len(value)
+
+            ordered_keys = self._order_mapping_keys_for_compaction(value)
+            selected_keys = ordered_keys[:max_mapping_items]
+
+            compacted_mapping: Dict[str, Any] = {}
+            for key in selected_keys:
+                compacted_mapping[str(key)] = self._compact_value_for_model(
+                    value[key],
+                    field_name=f"{field_name}.{key}",
+                    phase=phase,
+                )
+            return compacted_mapping
+
+        if isinstance(value, list):
+            max_list_items = int(phase["max_list_items"])
+            compacted_items = [
+                self._compact_value_for_model(
+                    item,
+                    field_name=f"{field_name}[{idx}]",
+                    phase=phase,
+                )
+                for idx, item in enumerate(value[:max_list_items])
+            ]
+            if len(value) > max_list_items:
+                compacted_items.append(
+                    {"truncated_items": len(value) - max_list_items}
+                )
+            return compacted_items
+
+        if isinstance(value, tuple):
+            return [
+                self._compact_value_for_model(
+                    item,
+                    field_name=f"{field_name}[{idx}]",
+                    phase=phase,
+                )
+                for idx, item in enumerate(list(value)[: int(phase["max_list_items"])])
+            ]
+
+        raise RuntimeError(
+            f"Unsupported payload type for model compaction in {field_name}: {value.__class__.__name__}"
+        )
+
+    def _order_mapping_keys_for_compaction(self, value: Mapping[str, Any]) -> List[str]:
+        keys = [str(k) for k in value.keys()]
+        priority = [k for k in _PRIORITY_KEYS if k in value]
+        remainder = sorted(k for k in keys if k not in priority)
+        return priority + remainder
+
+    def _truncate_string_for_model(self, value: str, *, max_chars: int) -> str:
+        text = value.strip()
+        if max_chars <= 0:
+            raise RuntimeError("max_chars must be > 0")
+        if len(text) <= max_chars:
+            return text
+        suffix = f"...(truncated,len={len(text)})"
+        keep = max_chars - len(suffix)
+        if keep <= 0:
+            return suffix[:max_chars]
+        return text[:keep] + suffix
+
+    def _serialize_json_compact(self, value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     # ========================================================
     # Strict output parsing
@@ -1044,6 +1295,9 @@ class GptAnalystEngine:
             raise RuntimeError(f"Unexpected result.scope: {result.scope}")
         if not isinstance(result.raw_response_text, str) or not result.raw_response_text.strip():
             raise RuntimeError("raw_response_text must be a non-empty string")
+
+        if "\n" in result.answer_ko or "\r" in result.answer_ko:
+            raise RuntimeError("answer_ko must not contain line breaks")
 
         sentence_count = self._count_sentences(result.answer_ko)
         if sentence_count <= 0:
@@ -1345,6 +1599,7 @@ class GptAnalystEngine:
 
     def _count_sentences(self, text: str) -> int:
         normalized = self._require_nonempty_str(text, "answer_ko")
+        normalized = normalized.replace("\n", " ").replace("\r", " ")
         parts = re.split(r"[.!?]+", normalized)
         count = sum(1 for part in parts if part.strip())
         if count == 0:

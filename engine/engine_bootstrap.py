@@ -1,3 +1,4 @@
+# engine/engine_bootstrap.py
 """
 ============================================================
 FILE: engine/engine_bootstrap.py
@@ -8,7 +9,7 @@ ROLE:
 CORE RESPONSIBILITIES:
 - settings runtime contract 검증
 - ws/account ws 부팅 및 준비 확인
-- REST backfill + market data store thread 시작
+- REST backfill + market data persistence readiness 확인
 - entry gate bootstrap snapshot 복구
 - 초기 open trade sync / closed trade bootstrap / equity peak bootstrap
 - bootstrap 결과를 dataclass 로 상위 엔진에 전달
@@ -20,8 +21,15 @@ IMPORTANT POLICY:
 - settings 는 SETTINGS 단일 객체만 사용한다
 - 부팅 단계는 실행 루프와 분리되어야 한다
 - 원본 엔진 로직을 임의 단순화하지 않는다
+- 공통 인프라(async worker)는 main() SSOT 에서만 부팅한다
+- market data DB writer 는 단일 경로만 허용한다
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(ROOT-CAUSE): bootstrap 내부 async_worker 이중 부팅 제거
+  2) FIX(ROOT-CAUSE): market_data_ws 직접 저장과 충돌하던 MD-STORE 중복 writer 제거
+  3) FIX(ARCH): bootstrap 책임을 startup / readiness / initial sync 로 재정렬
+  4) FIX(OPERABILITY): quote_volume mismatch 를 유발하던 중복 candle persistence 제거
 - 2026-03-12:
   1) ADD(ROOT-CAUSE): run_bot_ws 의 bootstrap 책임을 독립 파일로 1차 분리
   2) ADD(STRUCTURE): bootstrap 결과를 EngineBootstrapArtifacts dataclass 로 반환
@@ -33,21 +41,19 @@ from __future__ import annotations
 
 import datetime
 import math
-import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy import text
 
 from settings import SETTINGS
 from infra.telelog import log, send_tg
-from infra.async_worker import start_worker as start_async_worker, submit as submit_async
+from infra.async_worker import submit as submit_async
 from infra.bot_workers import start_telegram_command_thread
 from strategy.signal_analysis_worker import start_signal_analysis_thread
 
 from execution.exchange_api import (
-    get_balance_detail,
     set_leverage_and_mode,
 )
 from state.db_core import get_session
@@ -58,22 +64,14 @@ from infra.market_data_ws import (
     backfill_klines_from_rest,
     get_health_snapshot as ws_get_health_snapshot,
     get_klines_with_volume as ws_get_klines_with_volume,
-    get_klines_with_volume_and_closed as ws_get_klines_with_volume_and_closed,
-    get_orderbook as ws_get_orderbook,
     start_ws_loop,
 )
 from infra.account_ws import (
     get_account_ws_status,
     start_account_ws_loop,
 )
-from infra.market_data_store import save_candles_bulk_from_ws, save_orderbook_from_ws
 from infra.market_data_rest import fetch_klines_rest, KlineRestError
 from infra.data_health_monitor import start_health_monitor
-from infra.data_integrity_guard import (
-    DataIntegrityError,
-    validate_kline_series_strict,
-    validate_orderbook_strict,
-)
 
 SET = SETTINGS
 
@@ -123,9 +121,6 @@ ENTRY_REQUIRED_RUNTIME_SETTINGS: tuple[str, ...] = (
 ENTRY_GATE_RUNTIME_STATE_SCOPE: str = "ENTRY_EVAL_SIGNAL_GATE"
 ENTRY_GATE_RUNTIME_STATE_TABLE: str = "bt_engine_runtime_state"
 ACCOUNT_WS_READY_TIMEOUT_SEC: float = 20.0
-
-WsStoreCandleRow = Tuple[int, float, float, float, float, float, bool]
-LegacyStoreCandleRow = Tuple[int, float, float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -520,199 +515,6 @@ def _backfill_ws_kline_history(settings: Any) -> None:
             )
 
 
-def _coerce_ws_store_candle_row_strict(row: Any, *, interval: str, idx: int) -> WsStoreCandleRow:
-    if not isinstance(row, (list, tuple)):
-        raise RuntimeError(
-            f"[MD-STORE] ws candle row must be list/tuple (STRICT): interval={interval} idx={idx} type={type(row).__name__}"
-        )
-    if len(row) != 7:
-        raise RuntimeError(
-            f"[MD-STORE] ws candle row must be 7-tuple(ts,o,h,l,c,v,is_closed) (STRICT): interval={interval} idx={idx} len={len(row)}"
-        )
-
-    ts_ms = _require_int_ms(row[0], f"md_store.ws[{interval}][{idx}].ts_ms")
-    o = _as_float(row[1], f"md_store.ws[{interval}][{idx}].open", min_value=0.0)
-    h = _as_float(row[2], f"md_store.ws[{interval}][{idx}].high", min_value=0.0)
-    l = _as_float(row[3], f"md_store.ws[{interval}][{idx}].low", min_value=0.0)
-    c = _as_float(row[4], f"md_store.ws[{interval}][{idx}].close", min_value=0.0)
-    v = _as_float(row[5], f"md_store.ws[{interval}][{idx}].volume", min_value=0.0)
-    is_closed = _require_bool(row[6], f"md_store.ws[{interval}][{idx}].is_closed")
-
-    if o <= 0.0 or h <= 0.0 or l <= 0.0 or c <= 0.0:
-        raise RuntimeError(f"[MD-STORE] ws candle OHLC must be > 0 (STRICT): interval={interval} idx={idx}")
-    if h < l:
-        raise RuntimeError(f"[MD-STORE] ws candle high < low (STRICT): interval={interval} idx={idx}")
-    if h < o or h < c:
-        raise RuntimeError(f"[MD-STORE] ws candle high < open/close (STRICT): interval={interval} idx={idx}")
-    if l > o or l > c:
-        raise RuntimeError(f"[MD-STORE] ws candle low > open/close (STRICT): interval={interval} idx={idx}")
-
-    return (int(ts_ms), float(o), float(h), float(l), float(c), float(v), bool(is_closed))
-
-
-def _legacy_kline_rows_for_validator(rows: List[WsStoreCandleRow]) -> List[LegacyStoreCandleRow]:
-    return [(ts, o, h, l, c, v) for (ts, o, h, l, c, v, _is_closed) in rows]
-
-
-def _select_ws_rows_to_persist_strict(
-    rows_raw: List[Any],
-    *,
-    interval: str,
-    last_persisted_row: Optional[WsStoreCandleRow],
-) -> List[WsStoreCandleRow]:
-    typed_rows: List[WsStoreCandleRow] = [
-        _coerce_ws_store_candle_row_strict(row, interval=interval, idx=idx)
-        for idx, row in enumerate(rows_raw)
-    ]
-    if not typed_rows:
-        return []
-
-    for idx in range(1, len(typed_rows)):
-        prev_ts = int(typed_rows[idx - 1][0])
-        curr_ts = int(typed_rows[idx][0])
-        if curr_ts <= prev_ts:
-            raise RuntimeError(
-                f"[MD-STORE] ws candle buffer must be strictly increasing by ts (STRICT): "
-                f"interval={interval} prev_ts={prev_ts} curr_ts={curr_ts} idx={idx}"
-            )
-
-    if last_persisted_row is None:
-        return typed_rows
-
-    last_ts = int(last_persisted_row[0])
-    selected: List[WsStoreCandleRow] = [row for row in typed_rows if int(row[0]) > last_ts]
-
-    latest_row = typed_rows[-1]
-    if int(latest_row[0]) == last_ts and latest_row != last_persisted_row:
-        if selected and int(selected[-1][0]) == int(latest_row[0]):
-            selected[-1] = latest_row
-        else:
-            selected.append(latest_row)
-
-    return selected
-
-
-def _start_market_data_store_thread(settings: Any, *, stop_flag_getter: Callable[[], bool]) -> None:
-    symbol = settings.symbol
-    flush_sec = float(settings.md_store_flush_sec)
-    ob_interval_sec = float(settings.ob_store_interval_sec)
-    store_tfs = _parse_tfs(settings.md_store_tfs)
-
-    last_persisted_candle_row: Dict[str, Optional[WsStoreCandleRow]] = {iv: None for iv in store_tfs}
-    last_ob_ts: float = 0.0
-    last_ob_missing_log_ts: float = 0.0
-
-    def _loop() -> None:
-        nonlocal last_ob_ts, last_ob_missing_log_ts
-
-        try:
-            log(f"[MD-STORE] loop started: flush_sec={flush_sec}, ob_interval_sec={ob_interval_sec}, store_tfs={store_tfs}")
-            while True:
-                if stop_flag_getter():
-                    return
-
-                now = time.time()
-
-                candles_to_save: List[Dict[str, Any]] = []
-                latest_persisted_candidate_by_iv: Dict[str, WsStoreCandleRow] = {}
-
-                for iv in store_tfs:
-                    buf = ws_get_klines_with_volume_and_closed(symbol, iv, limit=500)
-                    if buf is None:
-                        raise RuntimeError(
-                            f"[MD-STORE] ws_get_klines_with_volume_and_closed returned None (STRICT) interval={iv}"
-                        )
-                    if not isinstance(buf, list):
-                        raise RuntimeError(
-                            f"[MD-STORE] kline buffer invalid type (STRICT) interval={iv} type={type(buf).__name__}"
-                        )
-                    if not buf:
-                        continue
-
-                    new_rows = _select_ws_rows_to_persist_strict(
-                        buf,
-                        interval=iv,
-                        last_persisted_row=last_persisted_candle_row.get(iv),
-                    )
-                    if not new_rows:
-                        continue
-
-                    try:
-                        validate_kline_series_strict(
-                            _legacy_kline_rows_for_validator(new_rows),
-                            name=f"md_store.ws_kline[{iv}]",
-                            min_len=1,
-                        )
-                    except DataIntegrityError as e:
-                        raise RuntimeError(f"[MD-STORE] kline integrity fail (STRICT): {e}") from e
-
-                    for ts_ms, o, h, l, c, v, is_closed in new_rows:
-                        candles_to_save.append(
-                            {
-                                "symbol": symbol,
-                                "interval": iv,
-                                "ts_ms": int(ts_ms),
-                                "open": float(o),
-                                "high": float(h),
-                                "low": float(l),
-                                "close": float(c),
-                                "volume": float(v),
-                                "quote_volume": None,
-                                "source": "ws",
-                                "is_closed": bool(is_closed),
-                            }
-                        )
-
-                    latest_persisted_candidate_by_iv[iv] = new_rows[-1]
-
-                if candles_to_save:
-                    save_candles_bulk_from_ws(candles_to_save)
-                    for iv, latest_row in latest_persisted_candidate_by_iv.items():
-                        last_persisted_candle_row[iv] = latest_row
-
-                if now - last_ob_ts >= ob_interval_sec:
-                    ob = ws_get_orderbook(symbol, limit=5)
-                    if not isinstance(ob, dict) or not ob:
-                        if now - last_ob_missing_log_ts >= 60:
-                            last_ob_missing_log_ts = now
-                            log(f"[MD-STORE][WARN] orderbook missing: symbol={symbol}")
-                        time.sleep(flush_sec)
-                        continue
-
-                    if not ob.get("bids") or not ob.get("asks"):
-                        if now - last_ob_missing_log_ts >= 60:
-                            last_ob_missing_log_ts = now
-                            log(f"[MD-STORE][WARN] orderbook empty bids/asks: symbol={symbol}")
-                        time.sleep(flush_sec)
-                        continue
-
-                    if "exchTs" in ob and ob.get("exchTs") is not None:
-                        ts_ms = _require_int_ms(ob.get("exchTs"), "orderbook.exchTs")
-                    elif "ts" in ob and ob.get("ts") is not None:
-                        ts_ms = _require_int_ms(ob.get("ts"), "orderbook.ts")
-                    else:
-                        raise RuntimeError("[MD-STORE] orderbook missing exchTs/ts (STRICT)")
-
-                    try:
-                        validate_orderbook_strict(ob, symbol=str(symbol), require_ts=True)
-                    except DataIntegrityError as e:
-                        raise RuntimeError(f"[MD-STORE] orderbook integrity fail (STRICT): {e}") from e
-
-                    save_orderbook_from_ws(symbol=symbol, ts_ms=int(ts_ms), bids=ob["bids"], asks=ob["asks"])
-                    last_ob_ts = now
-
-                time.sleep(flush_sec)
-
-        except Exception as e:
-            msg = f"⛔ [MD-STORE][FATAL] {type(e).__name__}: {e}"
-            log(msg)
-            _safe_send_tg(msg)
-            raise
-
-    threading.Thread(target=_loop, name="md-store-loop", daemon=True).start()
-    log("[MD-STORE] background store thread started")
-
-
 def _read_last_exit_candle_ts_1m_optional(symbol: str) -> Optional[int]:
     last_1m = ws_get_klines_with_volume(symbol, "1m", limit=1)
     if last_1m:
@@ -726,23 +528,17 @@ def bootstrap_engine_runtime_or_raise(
     on_safe_stop: Callable[[], None],
     stop_flag_getter: Callable[[], bool],
 ) -> EngineBootstrapArtifacts:
+    _ = stop_flag_getter
+
     _verify_runtime_settings_contract_or_raise(settings)
-
-    start_async_worker(
-        num_threads=int(settings.async_worker_threads),
-        max_queue_size=int(settings.async_worker_queue_size),
-        thread_name_prefix="async-io",
-    )
-
     _verify_ws_boot_configuration_or_die(settings)
-    last_entry_eval_signal_ts_ms = _bootstrap_entry_signal_gate_or_raise(settings.symbol)
 
+    last_entry_eval_signal_ts_ms = _bootstrap_entry_signal_gate_or_raise(settings.symbol)
     last_exit_candle_ts_1m: Optional[int] = None
 
     if bool(settings.ws_enabled):
         _backfill_ws_kline_history(settings)
         start_ws_loop(settings.symbol)
-        _start_market_data_store_thread(settings, stop_flag_getter=stop_flag_getter)
 
         market_ws_ready_timeout_sec = max(
             30.0,

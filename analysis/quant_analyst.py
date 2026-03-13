@@ -9,6 +9,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - FIX(INTEGRITY): dashboard market_cards별 필수 키/심볼 정합성 검증 추가
 - FIX(PAYLOAD): confidence / root_causes / recommendations / used_inputs 요소 타입 검증 강화
 - FIX(RESPONSE): 최종 응답의 internal/trade/external summary symbol 무결성 검증 추가
+- FIX(CONTRACT): analysis_as_of_ts_ms 계산을 명시적 helper로 분리
+- FIX(OPERABILITY): empty-summary/partial-summary 운영 경로에서도 dashboard timestamp 계약이 깨지지 않도록 보강
 - market-only / full-analysis scope 계약 검증 강화 유지
 - 내부/거래/외부 분석 결과 symbol 정합성 검증 유지
 
@@ -16,6 +18,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - dashboard payload 카드 검증 로직 분리
 - summary mapping symbol 계약 검증 분리
 - 문자열 리스트 검증 공통화
+- analysis_as_of_ts_ms 계산 로직 분리
 - 기존 오케스트레이션/GPT 호출 구조는 삭제 없이 유지
 
 역할:
@@ -34,6 +37,11 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 분석 실패 시 즉시 예외 전파
 
 변경 이력:
+2026-03-13
+1) FIX(CONTRACT): analysis_as_of_ts_ms 계산을 _derive_analysis_as_of_ts_ms_or_raise()로 분리
+2) FIX(OPERABILITY): summary candidate가 비어 있는 초기/특수 경로에서도 generated_ts_ms 기준 명시 계약으로 timestamp 일관성 보강
+3) FIX(STRICT): analysis_as_of_ts_ms > generated_ts_ms 케이스를 조기 차단하도록 보강
+
 2026-03-09
 1) FIX(INTEGRITY): dashboard market_cards별 필수 키/심볼 정합성 검증 추가
 2) FIX(PAYLOAD): confidence / root_causes / recommendations / used_inputs 요소 타입 검증 강화
@@ -658,6 +666,42 @@ class QuantAnalyst:
         if not isinstance(data, Mapping) or not data:
             raise RuntimeError("GptAnalystResult.to_dict() must return a non-empty mapping")
         return dict(data)
+    
+    def _derive_analysis_as_of_ts_ms_or_raise(
+        self,
+        *,
+        generated_ts_ms: int,
+        internal_market_summary_obj: Optional[InternalMarketSummary],
+        trade_summary_obj: Optional[TradeAnalyzerSummary],
+        external_market_summary_obj: Optional[MarketResearchReport],
+    ) -> int:
+        if generated_ts_ms <= 0:
+            raise RuntimeError("generated_ts_ms must be > 0")
+
+        as_of_candidates: List[int] = []
+
+        if internal_market_summary_obj is not None:
+            if internal_market_summary_obj.as_of_ms <= 0:
+                raise RuntimeError("internal_market_summary_obj.as_of_ms must be > 0")
+            if internal_market_summary_obj.as_of_ms <= generated_ts_ms:
+                as_of_candidates.append(internal_market_summary_obj.as_of_ms)
+
+        if trade_summary_obj is not None:
+            if trade_summary_obj.as_of_ts_ms <= 0:
+                raise RuntimeError("trade_summary_obj.as_of_ts_ms must be > 0")
+            if trade_summary_obj.as_of_ts_ms <= generated_ts_ms:
+                as_of_candidates.append(trade_summary_obj.as_of_ts_ms)
+
+        if external_market_summary_obj is not None:
+            if external_market_summary_obj.as_of_ms <= 0:
+                raise RuntimeError("external_market_summary_obj.as_of_ms must be > 0")
+            if external_market_summary_obj.as_of_ms <= generated_ts_ms:
+                as_of_candidates.append(external_market_summary_obj.as_of_ms)
+
+        if  not as_of_candidates:
+             return generated_ts_ms
+
+        return max(as_of_candidates) 
 
     # ========================================================
     # Dashboard payload
@@ -673,21 +717,12 @@ class QuantAnalyst:
         external_market_summary_obj: Optional[MarketResearchReport],
         gpt_result_obj: GptAnalystResult,
     ) -> Dict[str, Any]:
-        as_of_candidates: List[int] = []
-
-        if internal_market_summary_obj is not None:
-            as_of_candidates.append(internal_market_summary_obj.as_of_ms)
-
-        if trade_summary_obj is not None:
-            as_of_candidates.append(trade_summary_obj.as_of_ts_ms)
-
-        if external_market_summary_obj is not None:
-            as_of_candidates.append(external_market_summary_obj.as_of_ms)
-
-        if not as_of_candidates:
-            raise RuntimeError("as_of_candidates must not be empty")
-
-        analysis_as_of_ts_ms = max(as_of_candidates)
+        analysis_as_of_ts_ms = self._derive_analysis_as_of_ts_ms_or_raise(
+            generated_ts_ms=generated_ts_ms,
+            internal_market_summary_obj=internal_market_summary_obj,
+            trade_summary_obj=trade_summary_obj,
+            external_market_summary_obj=external_market_summary_obj,
+        )
 
         market_cards: Dict[str, Any] = {}
 
