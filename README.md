@@ -23,11 +23,16 @@ STRICT · NO-FALLBACK · TRADE-GRADE
 - 잔고가 없으면 실주문은 실패한다.
 - 잔고 없는 환경에서 파이프라인 검증은 `TEST_DRY_RUN=1` 로 진행한다.
 - 운영 실행 게이트는 `core/run_bot_preflight.py` 이다.
-  - Preflight ALL GREEN 통과 후에만 `core/run_bot_ws.py` 실행을 허용한다.
-  - `run_bot_ws` 직접 실행 금지(운영 사고 방지).
+  - `python -m core.run_bot_preflight --preflight-only`
+  - 또는 `python -m core.run_bot_preflight`
+- `python -m core.run_bot_ws` 직접 실행도 가능하지만, 현재 구조상 **내부적으로 preflight를 선행**한 뒤 handoff 한다.
+- Preflight는 **검사만 수행**해야 하며, runtime ownership을 가지면 안 된다.
+  - Async Worker / Watchdog / Runtime loop / Account WS는 **run_bot_ws / engine_bootstrap 쪽 단일 ownership** 을 유지해야 한다.
 - 외부시장 인텔리전스는 **API → DB snapshot 저장 → 이후 재사용** 구조를 따른다.
   - 서버 재시작 시 메모리 캐시만 초기화되어도, DB 스냅샷으로 재사용 가능해야 한다.
   - stale snapshot 재사용은 금지한다.
+- Meta L3는 cold-start(종료 거래 부족) 상태를 허용한다.
+  - 거래 부족 시 엔진 시작을 막지 않고 `NO_CHANGE` recommendation 으로 관측만 수행한다.
 
 ---------------------------------------------------------------------------
 1) 설계 원칙(절대 준수)
@@ -56,6 +61,19 @@ STRICT · NO-FALLBACK · TRADE-GRADE
   - fetcher 내부: 메모리 캐시 + DB 영속 캐시
   - orchestrator(`market_researcher`)는 별도 stale fallback을 들고 있지 않는다.
 
+### 1.4 Runtime Ownership (중요)
+- Preflight는 **runtime resource의 owner가 아니다**
+- 아래 리소스는 runtime에서만 시작되어야 한다.
+  - Async Worker
+  - Engine Watchdog
+  - Account WS
+  - Engine Loop
+- 동일 프로세스에서 중복 start를 허용하지 않는 리소스는
+  - 단일 owner
+  - idempotent start
+  - attach-only 재진입
+  구조를 유지한다.
+
 ---------------------------------------------------------------------------
 2) 배포 토폴로지(Production)
 ---------------------------------------------------------------------------
@@ -72,6 +90,12 @@ STRICT · NO-FALLBACK · TRADE-GRADE
 - Render에 Dashboard/API(조회 전용) 배포
 - Render에서 주문 실행 로직 / 키 / 권한 존재 금지
 - Dashboard DB 접근도 `state/db_core.py` 단일 세션 경로만 사용한다.
+
+### 2.3 Telegram / Alerts
+- 텔레그램 알림은 AWS Worker에서 전송한다.
+- Render는 알림 발송 owner가 아니다.
+- Telegram 오류는 엔진 치명 오류로 승격하지 않는다.
+- 단, 토큰/챗아이디 오류는 운영자가 즉시 수정해야 한다.
 
 ---------------------------------------------------------------------------
 3) 런타임 데이터 플로우
@@ -91,10 +115,16 @@ Preflight는 런타임 파이프라인을 1회 “완전 재현”한다.
 7. RiskPhysics 계산(DD/연속손실/AutoBlock 포함 최종 allocation)
 8. Drift Detector(급변 감지)
 9. Invariant Guard(수학 무결성)
-10. ExecutionEngine DRY_RUN(주문 없이 DB 기록)
-11. DB Round-trip 정합 검증
+10. ExecutionEngine DRY_RUN(주문 없이 계약 검증)
+11. Meta L3 observability 확인
+12. Handoff 가능 여부 판정
 
 ALL GREEN 통과 시에만 `run_bot_ws` 실행 허용.
+
+중요:
+- Preflight는 **검사만** 해야 한다.
+- Async Worker / Watchdog / Runtime Loop 소유 금지
+- Handoff 이후 runtime owner가 별도로 리소스를 시작한다.
 
 ### 3.1 부팅(BOOT)
 - REST 백필(boot only)
@@ -104,6 +134,9 @@ ALL GREEN 통과 시에만 `run_bot_ws` 실행 허용.
 - 워밍업
   - 필수 TF 데이터 준비 확인
   - `data_health_monitor` 시작(신선도/지연 감시)
+- Async Worker 시작
+- Watchdog 시작
+- Account WS 시작
 - 메인 루프 진입
 
 ### 3.2 런타임(RUNTIME)
@@ -147,6 +180,11 @@ ALL GREEN 통과 시에만 `run_bot_ws` 실행 허용.
 - DriftDetector
   - allocation/multiplier/regime/micro_score_risk 급변 감지
   - 위반 시 SAFE_STOP + 예외 전파
+- EngineWatchdog
+  - WS / Orderbook / DB / rollback 상태를 주기적으로 검사
+  - FAIL/WARNING/OK 구분
+  - watchdog snapshot stale/fail/internal fatal 시 SAFE_STOP 승격
+  - 단일 프로세스/단일 symbol 기준 **한 번만 시작**
 
 ---------------------------------------------------------------------------
 4) 구성 요소(책임 경계)
@@ -157,18 +195,37 @@ ALL GREEN 통과 시에만 `run_bot_ws` 실행 허용.
   - 운영형 사전검증 Gate(완전 재현) → 통과 시 `run_bot_ws` 실행 허용
 - `core/run_bot_ws.py`
   - Binance USDT-M Futures WebSocket 메인 루프
-- `core/entry_pipeline.py`
-  - 진입 후보 생성 전용 파이프라인
-  - 5m-only 방향 진입 차단
-  - higher timeframe alignment 강제
+- `engine/engine_bootstrap.py`
+  - runtime resource bootstrap owner
+  - Async Worker / Watchdog / Account WS / Market WS / Runtime state 초기화
+- `engine/engine_loop.py`
+  - 단일 엔진 루프 orchestration
+- `engine/cycles/monitoring_cycle.py`
+  - monitoring layer orchestration
+  - watchdog snapshot / ws liveness / account ws / protection / reconcile
+- `engine/cycles/entry_cycle.py`
+  - 진입 후보 평가 orchestration
+- `engine/cycles/risk_cycle.py`
+  - regime / risk physics / meta overlay orchestration
+- `engine/cycles/execution_cycle.py`
+  - risk 승인 packet 실행 orchestration
+- `engine/cycles/exit_cycle.py`
+  - open position 상태의 청산 orchestration
+
 - `infra/market_data_ws.py`
   - Binance Futures WS ingest(캔들/오더북 버퍼)
 - `infra/market_data_rest.py`
   - 부팅 시 REST 백필 전용(런타임 폴백 금지)
 - `infra/data_health_monitor.py`
   - WS 지연/신선도 감시(헬스 실패 시 SKIP)
+- `infra/account_ws.py`
+  - account / protection order / listenKey stream
 - `infra/async_worker.py`
   - Telegram/비핵심 I/O 비동기 위임
+  - singleton queue + idempotent lifecycle 필요
+- `infra/engine_watchdog.py`
+  - runtime watchdog
+  - 단일 ownership / 중복 시작 금지
 
 - `infra/data_integrity_guard.py`
   - 원시 데이터 무결성 STRICT 검증 + timestamp rollback 차단
@@ -266,6 +323,9 @@ ALL GREEN 통과 시에만 `run_bot_ws` 실행 허용.
 - `FORCE_CLOSE_ON_DESYNC`
 - `MAX_SIGNAL_LATENCY_MS`
 - `MAX_EXEC_LATENCY_MS`
+- `ENGINE_WATCHDOG_INTERVAL_SEC`
+- `ENGINE_WATCHDOG_MAX_DB_PING_MS`
+- `ENGINE_WATCHDOG_EMIT_MIN_SEC`
 - `ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC`
 - `ANALYST_AUTO_REPORT_SYSTEM_INTERVAL_SEC`
 
@@ -502,12 +562,18 @@ SELECT COUNT(*) FROM bt_options_snapshots;
 1. Preflight만 실행
    - `python -m core.run_bot_preflight --preflight-only`
 2. ALL GREEN 확인 후 운영 실행
-   - `python -m core.run_bot_ws`
-   - 또는 `python -m core.run_bot_preflight` 로 통과 후 자동 핸드오프
+   - `python -m core.run_bot_preflight`
+   - 또는 `python -m core.run_bot_ws` (내부 preflight 선행)
 
 ### 권장 주기
 - `ANALYST_AUTO_REPORT_MARKET_INTERVAL_SEC=300`
   - 너무 작으면 `market_features` / `trade_context_snapshots` row가 과도하게 증가한다.
+
+### Runtime ownership 권장
+- Async Worker: `engine_bootstrap` 단일 ownership
+- Watchdog: `engine_bootstrap` 단일 ownership
+- Monitoring cycle: snapshot 검증 / 상태 승격만 담당
+- Preflight: runtime resource ownership 금지
 
 ---------------------------------------------------------------------------
 10) 테스트/가상매매(잔고 없을 때)
@@ -579,10 +645,31 @@ SELECT COUNT(*) FROM bt_options_snapshots;
   - positionAmt 부호 기반 LONG/SHORT 판별 고정
 - 따라서 실제 뒤집힘이 발생한다면 상위 signal 생성 레이어를 우선 점검한다.
 
+### 11.8 Runtime resource duplicate-start
+- 현상:
+  - `Async worker already started with different config`
+  - `engine_watchdog already running`
+- 원인:
+  - 동일 프로세스에서 runtime resource를 두 번 시작
+  - ownership 불일치(preflight / bootstrap / monitoring 중복)
+- 해결 원칙:
+  - Preflight는 resource owner가 아니다.
+  - Async Worker / Watchdog는 단일 owner만 start
+  - 나머지는 attach / snapshot verification만 수행
+
+### 11.9 Telegram 인증 실패
+- 현상:
+  - `401 Unauthorized`
+  - `invalid telegram token`
+- 해결:
+  - `TELEGRAM_BOT_TOKEN`
+  - `TELEGRAM_CHAT_ID`
+  - 운영 토큰 회전 및 유출 토큰 폐기
+
 ---------------------------------------------------------------------------
 12) 면책
 ---------------------------------------------------------------------------
 
 자동매매는 손실 위험이 크다.  
 사용자는 모든 책임을 본인이 부담한다.  
-운영 전 반드시 소액/테스트로 검증한다.
+운영 전 반드시 소액/테스트로 검증한다.         
