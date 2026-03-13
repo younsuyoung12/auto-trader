@@ -67,7 +67,6 @@ if str(_ROOT) not in sys.path:
 
 from settings import SETTINGS  # noqa: E402
 from infra.telelog import log, send_tg  # noqa: E402
-from infra.async_worker import start_worker as start_async_worker  # noqa: E402
 
 from state.db_core import get_session  # noqa: E402
 
@@ -996,13 +995,7 @@ def _stage_execution_dry_run_strict(sig: Signal) -> None:
 def run_preflight(*, preflight_only: bool) -> None:
     host = socket.gethostname()
     log(f"[PRE-FLIGHT] start host={host} utc={_utc_now().isoformat()} pid={os.getpid()}")
-
-    start_async_worker(
-        num_threads=int(SET.async_worker_threads),
-        max_queue_size=int(SET.async_worker_queue_size),
-        thread_name_prefix="async-preflight",
-    )
-
+    
     results: List[StageResult] = []
 
     r, _ = _run_stage("SETTINGS", _stage_settings_strict)
@@ -1069,16 +1062,21 @@ def run_preflight(*, preflight_only: bool) -> None:
         return
 
     import core.run_bot_ws as rb
+    import engine.engine_bootstrap as eb
 
     def _noop(*args: Any, **kwargs: Any) -> None:
         return None
 
-    rb.start_async_worker = _noop  # type: ignore[attr-defined]
-    rb._backfill_ws_kline_history = _noop  # type: ignore[attr-defined]
-    rb.start_ws_loop = _noop  # type: ignore[attr-defined]
+    # preflight에서 이미 worker/WS bootstrap 완료
+    rb.start_async_worker = _noop
+    rb._backfill_ws_kline_history = _noop
+    rb.start_ws_loop = _noop
+
+    # bootstrap에서도 worker 재시작 방지
+    eb.start_async_worker = _noop
 
     log("[PRE-FLIGHT] handoff -> core.run_bot_ws.main()")
-    rb.main()
+    rb.main()  
 
 
 def main() -> None:

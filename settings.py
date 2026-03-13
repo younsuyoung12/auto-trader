@@ -375,6 +375,15 @@ class Settings:
     force_close_on_desync: bool = False
     max_signal_latency_ms: int = 200
     max_exec_latency_ms: int = 2500
+    
+    # =========================
+    # META STRATEGY SETTINGS
+    # =========================
+    exit_supervisor_enabled: bool = False
+    exit_supervisor_cooldown_sec: float = 180.0
+
+    meta_max_rationale_sentences: int = 3
+    meta_max_rationale_len: int = 800 
 
     # run_bot_ws
     position_resync_sec: float = 20.0

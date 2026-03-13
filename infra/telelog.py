@@ -593,36 +593,58 @@ def _humanize_telegram_text(text: str) -> str:
 # ─────────────────────────────────────────────────────
 def send_tg(text: str) -> None:
     """
-    중요 알림을 텔레그램으로 보낸다.
+    Telegram 메시지 전송
 
-    - 토큰/chat_id 없으면 콘솔 로그로 대체
-    - 네트워크 오류는 유틸 보호 차원에서만 무시
-    - 원문 로그를 운영자 기준의 쉬운 한글 문장으로 변환해 전송한다
+    STRICT POLICY:
+    - 텔레그램 실패로 엔진 중단 금지
+    - 토큰 없으면 콘솔 로그 fallback
+    - HTTP 오류는 로그만 남김
     """
+
     bot_token = _env_str("TELEGRAM_BOT_TOKEN", "")
     chat_id = _env_str("TELEGRAM_CHAT_ID", "")
-    timeout_sec = _env_float("TELEGRAM_TIMEOUT_SEC", 8.0)
+
     final_text = _humanize_telegram_text(text)
 
-    if timeout_sec <= 0:
-        timeout_sec = 8.0
-
-    if not (bot_token and chat_id):
-        log("[TG SKIP] " + final_text)
+    # 토큰 없는 경우
+    if not bot_token or not chat_id:
+        log("[TG DISABLED] " + final_text)
         return
 
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": final_text}
-        resp = requests.post(url, json=payload, timeout=timeout_sec)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"telegram send failed status={resp.status_code} body={resp.text[:300]}"
-            )
-        log("[TG OK] " + final_text)
-    except Exception as e:
-        log(f"[TG ERROR] {type(e).__name__}: {e} | {final_text}")
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
+    payload = {
+        "chat_id": chat_id,
+        "text": final_text,
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=8)
+
+        # 성공
+        if resp.status_code == 200:
+            log("[TG OK] " + final_text)
+            return
+
+        # 인증 실패
+        if resp.status_code == 401:
+            log("[TG AUTH ERROR] invalid telegram token")
+            return
+
+        # 기타 오류
+        log(
+            f"[TG HTTP ERROR] status={resp.status_code} "
+            f"body={resp.text[:200]}"
+        )
+
+    except requests.exceptions.Timeout:
+        log("[TG TIMEOUT] telegram request timeout")
+
+    except requests.exceptions.ConnectionError:
+        log("[TG NETWORK ERROR] telegram connection error")
+
+    except Exception as e:
+        log(f"[TG ERROR] {type(e).__name__}: {e}")
 
 def send_structured_tg(
     *,

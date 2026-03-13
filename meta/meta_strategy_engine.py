@@ -18,6 +18,8 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 환경 변수 직접 접근 금지: os.getenv 사용 금지.
 - GPT는 주문/진입/청산/TP·SL 결정 금지(제안만 가능).
 - 적용(apply)은 별도 레이어(meta_risk_adjuster)에서 수행(이 파일은 제안 생성까지만).
+- 단, COLD START(종료 거래 부족) 상태는 운영상 정상 상태이므로
+  명시적 NO_CHANGE recommendation 으로 처리한다.
 
 변경 이력
 --------------------------------------------------------
@@ -27,6 +29,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   3) FIX(CONTRACT): GPT 응답 / prompt 반환 / settings 키 계약 검증 강화
   4) FIX(ARCH): MetaStrategyConfig.validate_or_raise() 추가
   5) FIX(STRICT): MetaRecommendation dataclass 자체 검증 추가
+  6) FIX(OPERATIONS): COLD START(거래 부족) 시 NO_CHANGE recommendation 반환 추가
 - 2026-03-03:
   1) 신규 생성: Meta Strategy Engine(레벨3) 오케스트레이터
   2) GPT 출력 스키마 강제(단일 JSON object only) + 범위 검증 + 금지 행위 검증
@@ -45,7 +48,8 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from common.exceptions_strict import (
     StrictConfigError,
@@ -61,7 +65,12 @@ from meta.meta_decision_validator import (
     validate_meta_decision_text,
 )
 from meta.meta_prompt_builder import MetaPromptConfig, build_meta_prompts
-from meta.meta_stats_aggregator import MetaStatsConfig, build_meta_stats_dict
+from meta.meta_stats_aggregator import (
+    MetaStatsConfig,
+    MetaStatsDBError,
+    MetaStatsStateError,
+    build_meta_stats_dict,
+)
 from strategy.gpt_engine import GptEngineError, GptJsonResponse, call_chat_json
 
 
@@ -121,7 +130,7 @@ class MetaRecommendation:
 
     def __post_init__(self) -> None:
         version = _require_nonempty_str(self.version, "recommendation.version")
-        action = _require_nonempty_str(self.action, "recommendation.action")
+        action = _require_nonempty_str(self.action, "recommendation.action").upper()
         if action not in ("NO_CHANGE", "ADJUST_PARAMS", "RECOMMEND_SAFE_STOP"):
             _fail_contract("recommendation.action invalid (STRICT)")
 
@@ -346,6 +355,87 @@ def _require_settings_value_strict(settings: Any, name: str) -> Any:
     return getattr(settings, name)
 
 
+def _is_cold_start_meta_stats_error(exc: BaseException) -> bool:
+    """
+    STRICT:
+    - 거래 부족 / 종료 거래 없음은 운영상 정상적인 COLD START 로 본다.
+    - 그 외 DB/계약/스키마 오류는 예외로 유지한다.
+    """
+    if isinstance(exc, MetaStatsDBError):
+        msg = str(exc)
+        if "no closed trades found for symbol=" in msg:
+            return True
+
+    if isinstance(exc, MetaStatsStateError):
+        msg = str(exc)
+        if "not enough trades for meta stats" in msg:
+            return True
+        if "not enough trades for drift windows" in msg:
+            return True
+
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return _is_cold_start_meta_stats_error(cause)
+
+    return False
+
+
+def _build_no_change_recommendation_for_cold_start(
+    *,
+    symbol: str,
+    settings_snapshot: Dict[str, Any],
+    stats_generated_at_utc: str,
+) -> MetaRecommendation:
+    sym = _require_nonempty_str(symbol, "symbol").upper()
+    snap = _require_dict(settings_snapshot, "settings_snapshot")
+    generated_at = _require_nonempty_str(stats_generated_at_utc, "stats_generated_at_utc")
+
+    effective_max_spread_pct = _require_float(
+        snap.get("max_spread_pct"),
+        "settings_snapshot.max_spread_pct",
+        min_value=0.0,
+    )
+    effective_max_price_jump_pct = _require_float(
+        snap.get("max_price_jump_pct"),
+        "settings_snapshot.max_price_jump_pct",
+        min_value=0.0,
+        max_value=1.0,
+    )
+    effective_min_entry_volume_ratio = _require_float(
+        snap.get("min_entry_volume_ratio"),
+        "settings_snapshot.min_entry_volume_ratio",
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+    _ = sym  # symbol은 recommendation raw 필드에는 없지만 STRICT 검증용으로 사용
+
+    return MetaRecommendation(
+        version="cold_start",
+        action="NO_CHANGE",
+        severity=0,
+        tags=["COLD_START"],
+        confidence=1.0,
+        ttl_sec=3600,
+        risk_multiplier_delta=0.0,
+        allocation_ratio_cap=1.0,
+        disable_directions=[],
+        guard_multipliers={
+            "max_spread_pct_mult": 1.0,
+            "max_price_jump_pct_mult": 1.0,
+            "min_entry_volume_ratio_mult": 1.0,
+        },
+        rationale_short="종료 거래 이력이 아직 부족해 메타 전략 보정은 적용하지 않습니다.",
+        final_risk_multiplier=1.0,
+        effective_max_spread_pct=effective_max_spread_pct,
+        effective_max_price_jump_pct=effective_max_price_jump_pct,
+        effective_min_entry_volume_ratio=effective_min_entry_volume_ratio,
+        stats_generated_at_utc=generated_at,
+        model="META_COLD_START",
+        latency_sec=0.0,
+    )
+
+
 # ─────────────────────────────────────────────
 # Settings snapshot (safe allowlist)
 # ─────────────────────────────────────────────
@@ -533,17 +623,29 @@ class MetaStrategyEngine:
         if self._last_run_ts is not None and (now - self._last_run_ts) < float(self.cfg.cooldown_sec):
             _fail_state("meta strategy cooldown not elapsed (STRICT)")
 
+        settings_snapshot = _build_current_settings_snapshot_strict()
+
         # 1) stats
         try:
             stats = build_meta_stats_dict(self.cfg.stats_cfg)
+        except (MetaStatsDBError, MetaStatsStateError) as e:
+            if _is_cold_start_meta_stats_error(e):
+                rec = _build_no_change_recommendation_for_cold_start(
+                    symbol=self.cfg.stats_cfg.symbol,
+                    settings_snapshot=settings_snapshot,
+                    stats_generated_at_utc=datetime.now(timezone.utc).isoformat(),
+                )
+                self._last_run_ts = now
+                return rec
+            _fail_external("meta stats aggregation failed (STRICT)", e)
         except Exception as e:
             _fail_external("meta stats aggregation failed (STRICT)", e)
+
         stats_dict = _require_dict(stats, "stats")
         stats_generated_at_utc = _require_nonempty_str(stats_dict.get("generated_at_utc"), "stats.generated_at_utc")
         symbol = _require_nonempty_str(stats_dict.get("symbol"), "stats.symbol").upper()
 
         # 2) prompts
-        settings_snapshot = _build_current_settings_snapshot_strict()
         try:
             prompt_out = build_meta_prompts(
                 stats=stats_dict,
@@ -557,7 +659,10 @@ class MetaStrategyEngine:
             _fail_contract("build_meta_prompts must return (system_prompt, user_payload) tuple (STRICT)")
         system_prompt, user_payload = prompt_out
         _require_nonempty_str(system_prompt, "system_prompt")
-        _require_nonempty_str(user_payload, "user_payload")
+        if not isinstance(user_payload, dict):
+            _fail_contract("user_payload must be dict (STRICT)")
+        if not user_payload:
+            _fail_contract("user_payload must not be empty (STRICT)")
 
         # 3) GPT call (single entry point)
         try:
