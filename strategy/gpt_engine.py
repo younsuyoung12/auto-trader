@@ -30,11 +30,16 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 2026-03-05:
   1) OpenAI Chat Completions API → Responses API 전환 (GPT-5 계열 호환 / Logs→Responses 기록 보장)
   2) 토큰 파라미터: max_* → max_output_tokens 로 전환
-  3) store=True 사용(Responses 로그 저장)  :contentReference[oaicite:1]{index=1}
+  3) store=True 사용(Responses 로그 저장)
   4) 응답 텍스트 추출을 output_text 단일 의존에서 제거:
-     - output_text는 SDK convenience(없거나 empty 가능) :contentReference[oaicite:2]{index=2}
-     - output 배열의 message.content[*].type=="output_text"의 text를 STRICT 추출 :contentReference[oaicite:3]{index=3}
+     - output_text는 SDK convenience(없거나 empty 가능)
+     - output 배열의 message.content[*].type=="output_text"의 text를 STRICT 추출
   5) 기존 STRICT 정책 유지(예산/예외/민감정보 로그 금지/JSON 추출)
+- 2026-03-14:
+  1) FIX(ROOT-CAUSE): call_chat_json()을 Responses API JSON mode(text.format=json_object)로 전환
+  2) FIX(STRICT): JSON 호출은 "정확히 JSON object 1개만" 반환하도록 transport-level contract 강화
+  3) FIX(OPERABILITY): incomplete_details.reason=max_output_tokens 를 설정/예산 오류로 명확히 surface
+  4) KEEP(STRICT): partial/incomplete 응답 허용 없이 즉시 예외 유지
 ========================================================
 """
 
@@ -57,16 +62,10 @@ except Exception as e:  # pragma: no cover
     raise RuntimeError("infra.telelog import failed (STRICT · NO-FALLBACK · TRADE-GRADE MODE)") from e
 
 
-# -----------------------------------------------------------------------------
-# Exceptions (STRICT)
-# -----------------------------------------------------------------------------
 class GptEngineError(RuntimeError):
     """OpenAI 호출/파싱/정책 위반 오류."""
 
 
-# -----------------------------------------------------------------------------
-# Settings (SSOT)
-# -----------------------------------------------------------------------------
 SET = load_settings()
 
 
@@ -164,9 +163,6 @@ def _settings_max_latency_sec() -> float:
     return float(b)
 
 
-# -----------------------------------------------------------------------------
-# Data structures
-# -----------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class GptRawResponse:
     model: str
@@ -182,9 +178,6 @@ class GptJsonResponse:
     obj: Dict[str, Any]
 
 
-# -----------------------------------------------------------------------------
-# OpenAI client (STRICT)
-# -----------------------------------------------------------------------------
 _CLIENT: Optional[OpenAI] = None
 _CLIENT_LOCK: Lock = Lock()
 
@@ -202,20 +195,14 @@ def _get_client() -> OpenAI:
         return _CLIENT
 
 
-# -----------------------------------------------------------------------------
-# JSON extraction (STRICT)
-# -----------------------------------------------------------------------------
 _JSON_DECODER = json.JSONDecoder()
 
 
 def _extract_first_json_object(text: str) -> Dict[str, Any]:
     """
-    STRICT: 응답에서 첫 JSON object를 추출한다.
-
-    정책:
-    - 응답 전체가 JSON이면 그대로 파싱
-    - 아니면 문자열에서 '{'를 순차 탐색하며 raw_decode로 첫 object를 파싱한다.
-    - JSON root는 반드시 object(dict)여야 한다.
+    STRICT:
+    - 일반 텍스트 응답 안에 JSON object가 섞여 있을 수 있는 경로용.
+    - 첫 JSON object만 추출한다.
     """
     s = str(text).strip()
     if not s:
@@ -245,25 +232,45 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
         return obj
 
 
-# -----------------------------------------------------------------------------
-# Responses text extraction (STRICT)
-# -----------------------------------------------------------------------------
+def _extract_exact_json_object_strict(text: str) -> Dict[str, Any]:
+    """
+    STRICT:
+    - JSON mode 경로 전용.
+    - 응답 전체가 정확히 JSON object 1개여야 한다.
+    - prefix/suffix/commentary/markdown fence 허용 금지.
+    """
+    s = str(text).strip()
+    if not s:
+        _fail("parse", "empty response text")
+
+    try:
+        obj, end_idx = _JSON_DECODER.raw_decode(s)
+    except Exception as e:
+        _fail("parse", "exact json object decode failed", e)
+
+    trailing = s[end_idx:].strip()
+    if trailing:
+        _fail("parse", "json response contains trailing non-json text (STRICT)")
+
+    if not isinstance(obj, dict):
+        _fail("parse", f"json root must be object (got={type(obj).__name__})")
+
+    return obj
+
+
 def _extract_response_text_strict(resp: Any) -> str:
     """
     STRICT:
-    - output_text는 SDK convenience이며 empty일 수 있다. :contentReference[oaicite:4]{index=4}
-    - 따라서 output 배열의 message.content[*].type=="output_text"의 text를 정식으로 추출한다. :contentReference[oaicite:5]{index=5}
+    - output_text는 SDK convenience이며 empty일 수 있다.
+    - 따라서 output 배열의 message.content[*].type=="output_text"의 text를 정식으로 추출한다.
     """
-    # 1) SDK convenience (있으면 사용)
     t = getattr(resp, "output_text", None)
     if isinstance(t, str) and t.strip():
         return t.strip()
 
-    # 2) 정식 구조: resp.output[*].content[*].type=="output_text"의 text
     output = getattr(resp, "output", None)
     if isinstance(output, list):
         for item in output:
-            # item: message output
             content_list = getattr(item, "content", None)
             if not isinstance(content_list, list):
                 continue
@@ -282,65 +289,70 @@ def _extract_response_text_strict(resp: Any) -> str:
                 if isinstance(text, str) and text.strip():
                     return text.strip()
 
-    # 3) incomplete 사유가 있으면 원인만 노출(민감정보 없음)
     status = getattr(resp, "status", None)
     if isinstance(status, str) and status == "incomplete":
         details = getattr(resp, "incomplete_details", None)
         reason = getattr(details, "reason", None) if details is not None else None
         r = str(reason).strip() if reason is not None else ""
+        if r == "max_output_tokens":
+            _fail(
+                "openai",
+                "response incomplete: max_output_tokens "
+                "(increase settings.openai_max_tokens or reduce response budget)",
+            )
         _fail("openai", f"response incomplete: {r or 'unknown'}")
 
     _fail("openai", "response text missing/empty")
 
 
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
-def call_chat(
+def _build_json_only_system_prompt(system_prompt: str) -> str:
+    sp = _require_nonempty_str("input", system_prompt, "system_prompt")
+    return (
+        sp
+        + "\n\n"
+        + "OUTPUT CONTRACT (STRICT): "
+        + "Return exactly one valid JSON object. "
+        + "Do not wrap it in markdown. "
+        + "Do not add commentary, explanation, prefix, or suffix."
+    )
+
+
+def _responses_create_strict(
     *,
-    system_prompt: str,
-    user_content: str,
-    model: Optional[str] = None,
-    max_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-    max_latency_sec: Optional[float] = None,
+    model: str,
+    instructions: str,
+    input_text: str,
+    max_output_tokens: int,
+    max_latency_sec: float,
+    text_format: Dict[str, Any],
 ) -> GptRawResponse:
-    """
-    OpenAI Responses 호출(텍스트만 반환) — STRICT
-    - GPT-5 계열 호환 + OpenAI Console Logs→Responses 기록(store) 목적.
-    """
-    m = _require_nonempty_str("input", (model or _settings_model()), "model")
-    mt = _require_int("input", (max_tokens if max_tokens is not None else _settings_max_tokens()), "max_tokens")
+    m = _require_nonempty_str("input", model, "model")
+    inst = _require_nonempty_str("input", instructions, "instructions")
+    inp = _require_nonempty_str("input", input_text, "input_text")
+    mt = _require_int("input", max_output_tokens, "max_output_tokens")
     if mt <= 0 or mt > 4096:
-        _fail("input", "max_tokens out of allowed range (1..4096)")
-
-    # temperature는 설정 검증만 유지(일부 모델에서 미지원 가능)
-    temp = _require_float("input", (temperature if temperature is not None else _settings_temperature()), "temperature")
-    if temp < 0.0 or temp > 2.0:
-        _fail("input", "temperature out of range [0,2]")
-
-    budget = _require_float("input", (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()), "max_latency_sec")
+        _fail("input", "max_output_tokens out of allowed range (1..4096)")
+    budget = _require_float("input", max_latency_sec, "max_latency_sec")
     if budget <= 0:
         _fail("input", "max_latency_sec must be > 0")
-
-    sp = _require_nonempty_str("input", system_prompt, "system_prompt")
-    uc = _require_nonempty_str("input", user_content, "user_content")
+    if not isinstance(text_format, dict) or not text_format:
+        _fail("input", "text_format must be non-empty dict")
 
     base_client = _get_client()
 
     t0 = time.time()
     try:
-        # STRICT: 가능한 범위에서 request timeout 강제
         client = base_client.with_options(timeout=float(budget))
         if not hasattr(client, "responses"):
             _fail("openai", "client.with_options() lost 'responses' namespace (STRICT)")
 
         resp = client.responses.create(
             model=m,
-            instructions=sp,          # system/developer message :contentReference[oaicite:6]{index=6}
-            input=uc,                 # text input supports string :contentReference[oaicite:7]{index=7}
+            instructions=inst,
+            input=inp,
             max_output_tokens=int(mt),
-            store=True,               # 로그 저장 :contentReference[oaicite:8]{index=8}
+            text={"format": text_format},
+            store=True,
         )
     except Exception as e:
         _fail("openai", f"request failed: {e.__class__.__name__}", e)
@@ -354,6 +366,49 @@ def call_chat(
         _fail("openai", "empty content")
 
     return GptRawResponse(model=m, latency_sec=float(dt), text=content.strip())
+
+
+def call_chat(
+    *,
+    system_prompt: str,
+    user_content: str,
+    model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    max_latency_sec: Optional[float] = None,
+) -> GptRawResponse:
+    """
+    OpenAI Responses 호출(텍스트만 반환) — STRICT
+    """
+    m = _require_nonempty_str("input", (model or _settings_model()), "model")
+    mt = _require_int("input", (max_tokens if max_tokens is not None else _settings_max_tokens()), "max_tokens")
+    if mt <= 0 or mt > 4096:
+        _fail("input", "max_tokens out of allowed range (1..4096)")
+
+    temp = _require_float("input", (temperature if temperature is not None else _settings_temperature()), "temperature")
+    if temp < 0.0 or temp > 2.0:
+        _fail("input", "temperature out of range [0,2]")
+    _ = temp
+
+    budget = _require_float(
+        "input",
+        (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()),
+        "max_latency_sec",
+    )
+    if budget <= 0:
+        _fail("input", "max_latency_sec must be > 0")
+
+    sp = _require_nonempty_str("input", system_prompt, "system_prompt")
+    uc = _require_nonempty_str("input", user_content, "user_content")
+
+    return _responses_create_strict(
+        model=m,
+        instructions=sp,
+        input_text=uc,
+        max_output_tokens=int(mt),
+        max_latency_sec=float(budget),
+        text_format={"type": "text"},
+    )
 
 
 def call_chat_json(
@@ -376,15 +431,34 @@ def call_chat_json(
     except Exception as e:
         _fail("input", "user_payload must be JSON-serializable (strict)", e)
 
-    raw = call_chat(
-        system_prompt=system_prompt,
-        user_content=user_content,
-        model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        max_latency_sec=max_latency_sec,
+    m = _require_nonempty_str("input", (model or _settings_model()), "model")
+    mt = _require_int("input", (max_tokens if max_tokens is not None else _settings_max_tokens()), "max_tokens")
+    if mt <= 0 or mt > 4096:
+        _fail("input", "max_tokens out of allowed range (1..4096)")
+
+    temp = _require_float("input", (temperature if temperature is not None else _settings_temperature()), "temperature")
+    if temp < 0.0 or temp > 2.0:
+        _fail("input", "temperature out of range [0,2]")
+    _ = temp
+
+    budget = _require_float(
+        "input",
+        (max_latency_sec if max_latency_sec is not None else _settings_max_latency_sec()),
+        "max_latency_sec",
     )
-    obj = _extract_first_json_object(raw.text)
+    if budget <= 0:
+        _fail("input", "max_latency_sec must be > 0")
+
+    raw = _responses_create_strict(
+        model=m,
+        instructions=_build_json_only_system_prompt(system_prompt),
+        input_text=user_content,
+        max_output_tokens=int(mt),
+        max_latency_sec=float(budget),
+        text_format={"type": "json_object"},
+    )
+
+    obj = _extract_exact_json_object_strict(raw.text)
     return GptJsonResponse(model=raw.model, latency_sec=raw.latency_sec, text=raw.text, obj=obj)
 
 

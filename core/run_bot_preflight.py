@@ -1,4 +1,3 @@
-# core/run_bot_preflight.py
 """
 ========================================================
 FILE: core/run_bot_preflight.py
@@ -23,9 +22,17 @@ IMPORTANT POLICY:
 - Meta L3 는 별도 전략/분석 계층이며, trading-engine preflight의 필수 시작 게이트가 아니다
 - silent fail 금지, readiness 부족은 명시적 로그/결과 note 로 드러낸다
 - WS bootstrap / signal timestamp 계약은 runtime(run_bot_ws / entry_pipeline)과 정합해야 한다
+- preflight 는 runtime 내부 심볼을 monkey patch 하지 않는다
+- handoff 이후 authoritative bootstrap / worker start / runtime orchestration 은 run_bot_ws 가 책임진다
 
 CHANGE HISTORY:
 --------------------------------------------------------
+- 2026-03-14:
+  1) FIX(ROOT-CAUSE): GPT_PING max_tokens 하드코딩(512) 제거 → settings.openai_max_tokens SSOT 사용
+  2) FIX(OPERABILITY): GPT ping JSON 스키마를 최소화하여 max_output_tokens false fail 가능성 축소
+  3) FIX(STRICT): GPT ping 응답을 {"ok": true} 단일 object 계약으로 강화
+  4) FIX(ARCH): handoff 시 run_bot_ws / engine_bootstrap 내부 심볼 monkey patch 제거
+  5) FIX(ARCH): preflight 는 runtime bootstrap ownership 을 주장하지 않고 검증 후 정상 handoff 만 수행
 - 2026-03-11:
   1) FIX(ARCH): META_L3 를 preflight 필수 게이트에서 observability 단계로 재정의
   2) FIX(ROOT-CAUSE): live no-trade 상태와 분리된 execution probe signal 도입
@@ -174,6 +181,20 @@ def _require_bool(v: Any, name: str) -> bool:
     raise PreflightError(f"{name} must be bool-like (STRICT), got={v!r}")
 
 
+def _require_positive_int_from_any(v: Any, name: str) -> int:
+    if v is None:
+        raise PreflightError(f"{name} is required (STRICT)")
+    if isinstance(v, bool):
+        raise PreflightError(f"{name} must be int (bool not allowed) (STRICT)")
+    try:
+        iv = int(v)
+    except Exception as e:
+        raise PreflightError(f"{name} must be int-convertible (STRICT): {e}") from e
+    if iv <= 0:
+        raise PreflightError(f"{name} must be > 0 (STRICT)")
+    return int(iv)
+
+
 def _parse_tfs(value: Any) -> List[str]:
     if value is None:
         return []
@@ -319,6 +340,8 @@ def _stage_settings_strict() -> None:
     _ = _require_nonempty_str(SET.openai_api_key, "settings.openai_api_key")
     _ = _require_nonempty_str(SET.openai_model, "settings.openai_model")
     _ = _finite(SET.openai_max_latency_sec, "settings.openai_max_latency_sec")
+    _ = _finite(SET.openai_temperature, "settings.openai_temperature")
+    _ = _require_positive_int_from_any(SET.openai_max_tokens, "settings.openai_max_tokens")
     _ = _finite(SET.preflight_fake_usdt, "settings.preflight_fake_usdt")
 
     preflight_ws_wait_sec = _finite(SET.preflight_ws_wait_sec, "settings.preflight_ws_wait_sec")
@@ -823,28 +846,35 @@ def _stage_pipeline_simulation_strict(boot: PreflightBoot, uf: Dict[str, Any]) -
 
 
 def _stage_gpt_contract_ping_strict() -> None:
+    max_tokens = _require_positive_int_from_any(SET.openai_max_tokens, "settings.openai_max_tokens")
+    max_latency_sec = float(_finite(SET.openai_max_latency_sec, "settings.openai_max_latency_sec"))
+
     system_prompt = (
-        "Return STRICT JSON only (single object). No markdown.\n"
-        'Schema: {"ok": true, "ts_utc": "ISO8601"}\n'
-        "Always generate the JSON object.\n"
-        "Rules: do not include any other keys.\n"
+        "Return exactly one valid JSON object.\n"
+        'Schema: {"ok": true}\n'
+        "Rules:\n"
+        '- key must be exactly "ok"\n'
+        "- value must be exactly true\n"
+        "- do not include any other keys\n"
+        "- do not include markdown or explanation\n"
     )
-    payload = {"ping": True, "reply": "PONG"}
+    payload = {"ping": True}
+
     try:
         r = call_chat_json(
             system_prompt=system_prompt,
             user_payload=payload,
-            max_tokens=512,
+            max_tokens=max_tokens,
             temperature=0.0,
-            max_latency_sec=float(SET.openai_max_latency_sec),
+            max_latency_sec=max_latency_sec,
         )
     except GptEngineError as e:
         raise PreflightError(f"GPT ping failed (STRICT): {e}") from e
 
     if not isinstance(r.obj, dict) or not r.obj:
         raise PreflightError("GPT ping returned empty obj (STRICT)")
-    if r.obj.get("ok") is not True:
-        raise PreflightError("GPT ping schema mismatch (STRICT)")
+    if r.obj != {"ok": True}:
+        raise PreflightError(f"GPT ping schema mismatch (STRICT): got={r.obj!r}")
 
 
 def _stage_meta_l3_observability_strict() -> MetaL3Status:
@@ -995,7 +1025,7 @@ def _stage_execution_dry_run_strict(sig: Signal) -> None:
 def run_preflight(*, preflight_only: bool) -> None:
     host = socket.gethostname()
     log(f"[PRE-FLIGHT] start host={host} utc={_utc_now().isoformat()} pid={os.getpid()}")
-    
+
     results: List[StageResult] = []
 
     r, _ = _run_stage("SETTINGS", _stage_settings_strict)
@@ -1062,21 +1092,9 @@ def run_preflight(*, preflight_only: bool) -> None:
         return
 
     import core.run_bot_ws as rb
-    import engine.engine_bootstrap as eb
-
-    def _noop(*args: Any, **kwargs: Any) -> None:
-        return None
-
-    # preflight에서 이미 worker/WS bootstrap 완료
-    rb.start_async_worker = _noop
-    rb._backfill_ws_kline_history = _noop
-    rb.start_ws_loop = _noop
-
-    # bootstrap에서도 worker 재시작 방지
-    eb.start_async_worker = _noop
 
     log("[PRE-FLIGHT] handoff -> core.run_bot_ws.main()")
-    rb.main()  
+    rb.main()
 
 
 def main() -> None:

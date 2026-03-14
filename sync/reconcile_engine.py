@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 ========================================================
 FILE: sync/reconcile_engine.py
@@ -39,14 +41,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
   3) FEAT(DB): DB OPEN trade side / qty / remaining_qty / entry_price / reconciliation_status 검증 추가
   4) FIX(STRICT): partial fill 상태는 remaining_qty 기준으로 비교하고 qty 원본과의 불일치도 노출
   5) FIX(TRADE-GRADE): 단발 mismatch는 경고, N회 연속 mismatch만 desync_confirmed 유지
+  6) FIX(ROOT-CAUSE): positionAmt == 0 인 정상 무포지션 상태를 명시 지원
+  7) FIX(ROOT-CAUSE): 보호주문 visibility 파싱은 오픈 포지션일 때만 exit side 기준으로 평가
+  8) FIX(STRICT): 무포지션인데 reduceOnly/closePosition 보호주문이 남아 있으면 명시적 mismatch issue로 표면화
+  9) FIX(STRICT): 오픈 포지션인데 반대 side 보호주문이 보이면 명시적 mismatch issue로 표면화
+  10) FIX(STRICT): config / symbol / tolerance 계약 검증 강화
+  11) FIX(OBSERVABILITY): protection open_orders_count 를 심볼 관련 주문 기준으로 정규화
 - 2026-03-04:
   1) 단발 mismatch 즉시 HARD_STOP 금지: N회 연속 mismatch로 desync 확정(TRADE-GRADE)
   2) 결과에 consecutive_mismatches / desync_confirmed 필드 추가(기존 호환 유지)
   3) 예외 삼키기/None 보정/조용한 무시는 그대로 금지(STRICT 유지)
 ========================================================
 """
-
-from __future__ import annotations
 
 import logging
 import time
@@ -116,6 +122,8 @@ class ProtectionVisibility:
     open_orders_count: int
     tp_order_ids: Tuple[str, ...]
     sl_order_ids: Tuple[str, ...]
+    unexpected_side_protective_order_ids: Tuple[str, ...]
+    unsupported_protective_order_ids: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,18 @@ class ReconcileEngine:
             raise ValueError("interval_sec must be >= 1")
         if not isinstance(config.desync_confirm_n, int) or config.desync_confirm_n < 1:
             raise ValueError("desync_confirm_n must be int >= 1 (STRICT)")
+
+        _ = _normalize_symbol_strict(config.symbol, field_name="config.symbol")
+        _require_decimal_nonnegative(config.qty_epsilon, "config.qty_epsilon")
+        _require_decimal_nonnegative(config.qty_tolerance, "config.qty_tolerance")
+        _require_decimal_nonnegative(config.price_tolerance, "config.price_tolerance")
+
+        if not isinstance(config.require_db_trade_when_open, bool):
+            raise TypeError("config.require_db_trade_when_open must be bool (STRICT)")
+        if not isinstance(config.require_protection_orders_when_open, bool):
+            raise TypeError("config.require_protection_orders_when_open must be bool (STRICT)")
+        if not isinstance(config.require_protection_verified_when_open, bool):
+            raise TypeError("config.require_protection_verified_when_open must be bool (STRICT)")
 
         self._cfg = config
         self._fetch_exchange_position = fetch_exchange_position
@@ -253,7 +273,7 @@ def reconcile_once(
     단발 reconcile.
     - 필드 누락/형 변환 실패는 즉시 예외 (NO-FALLBACK)
     """
-    symbol = cfg.symbol
+    symbol = _normalize_symbol_strict(cfg.symbol, field_name="config.symbol")
 
     ex_raw = fetch_exchange_position(symbol)
     loc_raw = get_local_position(symbol)
@@ -261,30 +281,28 @@ def reconcile_once(
     ex = _parse_exchange_position(symbol, ex_raw)
     loc = _parse_local_position(symbol, loc_raw)
 
+    ex_open = _is_position_open(ex.position_amt, cfg.qty_epsilon)
+    loc_open = _is_position_open(loc.position_amt, cfg.qty_epsilon)
+
     db_trade: Optional[DbOpenTrade] = None
     if fetch_db_open_trade is not None:
         db_raw = fetch_db_open_trade(symbol)
         if db_raw is not None:
             db_trade = _parse_db_open_trade(symbol, db_raw)
 
+    db_open = db_trade is not None
+
     protection: Optional[ProtectionVisibility] = None
     open_orders_count: Optional[int] = None
     if fetch_exchange_open_orders is not None:
-        orders = fetch_exchange_open_orders(symbol)
-        if orders is None:
+        raw_orders = fetch_exchange_open_orders(symbol)
+        if raw_orders is None:
             raise RuntimeError("fetch_exchange_open_orders returned None (STRICT)")
-        ol = list(orders)
-        for i, row in enumerate(ol):
-            if not isinstance(row, dict):
-                raise TypeError(f"open_orders[{i}] must be dict (STRICT)")
-        protection = _parse_protection_visibility(symbol, ex, ol)
+        ol = _normalize_open_orders_strict(raw_orders)
+        protection = _parse_protection_visibility(symbol, ex.position_amt, ol)
         open_orders_count = int(protection.open_orders_count)
 
     issues: List[ReconcileIssue] = []
-
-    ex_open = abs(ex.position_amt) > cfg.qty_epsilon
-    loc_open = abs(loc.position_amt) > cfg.qty_epsilon
-    db_open = db_trade is not None
 
     # 1) 포지션 유무 불일치 (exchange vs local)
     if ex_open != loc_open:
@@ -437,16 +455,8 @@ def reconcile_once(
             )
 
     # 6) 보호주문 visibility 비교
-    if ex_open and cfg.require_protection_orders_when_open:
-        if protection is None:
-            issues.append(
-                ReconcileIssue(
-                    code="PROTECTION_VISIBILITY_UNAVAILABLE",
-                    message="Exchange open orders callback is missing while protection visibility is required",
-                    details={},
-                )
-            )
-        else:
+    if protection is not None:
+        if ex_open and cfg.require_protection_orders_when_open:
             if len(protection.tp_order_ids) != 1:
                 issues.append(
                     ReconcileIssue(
@@ -466,6 +476,34 @@ def reconcile_once(
                         message="SL protective order visibility must be exactly 1",
                         details={
                             "sl_order_ids": list(protection.sl_order_ids),
+                            "open_orders_count": protection.open_orders_count,
+                        },
+                    )
+                )
+
+            if protection.unexpected_side_protective_order_ids:
+                issues.append(
+                    ReconcileIssue(
+                        code="PROTECTION_SIDE_MISMATCH",
+                        message="Protective orders exist on unexpected side while position is open",
+                        details={
+                            "unexpected_side_protective_order_ids": list(
+                                protection.unexpected_side_protective_order_ids
+                            ),
+                            "open_orders_count": protection.open_orders_count,
+                        },
+                    )
+                )
+
+            if protection.unsupported_protective_order_ids:
+                issues.append(
+                    ReconcileIssue(
+                        code="PROTECTION_ORDER_TYPE_UNSUPPORTED",
+                        message="Unsupported protective order types are visible on exchange",
+                        details={
+                            "unsupported_protective_order_ids": list(
+                                protection.unsupported_protective_order_ids
+                            ),
                             "open_orders_count": protection.open_orders_count,
                         },
                     )
@@ -496,6 +534,41 @@ def reconcile_once(
                         )
                     )
 
+        if not ex_open:
+            has_any_protection_residue = bool(
+                protection.tp_order_ids
+                or protection.sl_order_ids
+                or protection.unexpected_side_protective_order_ids
+                or protection.unsupported_protective_order_ids
+            )
+            if has_any_protection_residue:
+                issues.append(
+                    ReconcileIssue(
+                        code="PROTECTION_ORDERS_UNEXPECTED_WHEN_CLOSED",
+                        message="Protective orders remain visible while exchange position is closed",
+                        details={
+                            "tp_order_ids": list(protection.tp_order_ids),
+                            "sl_order_ids": list(protection.sl_order_ids),
+                            "unexpected_side_protective_order_ids": list(
+                                protection.unexpected_side_protective_order_ids
+                            ),
+                            "unsupported_protective_order_ids": list(
+                                protection.unsupported_protective_order_ids
+                            ),
+                            "open_orders_count": protection.open_orders_count,
+                        },
+                    )
+                )
+
+    elif ex_open and cfg.require_protection_orders_when_open:
+        issues.append(
+            ReconcileIssue(
+                code="PROTECTION_VISIBILITY_UNAVAILABLE",
+                message="Exchange open orders callback is missing while protection visibility is required",
+                details={},
+            )
+        )
+
     ok = len(issues) == 0
     return ReconcileResult(
         ok=ok,
@@ -525,12 +598,15 @@ def _parse_exchange_position(symbol: str, raw: Dict[str, Any]) -> ExchangePositi
     if not isinstance(raw, dict):
         raise TypeError("exchange position raw must be dict (STRICT)")
 
-    raw_symbol = raw.get("symbol")
+    raw_symbol = _normalize_symbol_strict(raw.get("symbol"), field_name="exchange.symbol")
     if raw_symbol != symbol:
         raise ValueError(f"exchange symbol mismatch: expected={symbol} got={raw_symbol}")
 
     position_amt = _to_decimal_strict(raw, "positionAmt")
     entry_price = _to_decimal_strict(raw, "entryPrice")
+
+    if position_amt != 0 and entry_price <= 0:
+        raise ValueError("exchange entryPrice must be > 0 when position is open (STRICT)")
 
     return ExchangePosition(
         symbol=symbol,
@@ -552,12 +628,15 @@ def _parse_local_position(symbol: str, raw: Dict[str, Any]) -> LocalPosition:
     if not isinstance(raw, dict):
         raise TypeError("local position raw must be dict (STRICT)")
 
-    raw_symbol = raw.get("symbol")
+    raw_symbol = _normalize_symbol_strict(raw.get("symbol"), field_name="local.symbol")
     if raw_symbol != symbol:
         raise ValueError(f"local symbol mismatch: expected={symbol} got={raw_symbol}")
 
     position_amt = _to_decimal_strict(raw, "position_amt")
     entry_price = _to_decimal_strict(raw, "entry_price")
+
+    if position_amt != 0 and entry_price <= 0:
+        raise ValueError("local entry_price must be > 0 when position is open (STRICT)")
 
     return LocalPosition(
         symbol=symbol,
@@ -584,7 +663,7 @@ def _parse_db_open_trade(symbol: str, raw: Dict[str, Any]) -> DbOpenTrade:
     if not isinstance(raw, dict):
         raise TypeError("db open trade raw must be dict (STRICT)")
 
-    raw_symbol = raw.get("symbol")
+    raw_symbol = _normalize_symbol_strict(raw.get("symbol"), field_name="db_open_trade.symbol")
     if raw_symbol != symbol:
         raise ValueError(f"db open trade symbol mismatch: expected={symbol} got={raw_symbol}")
 
@@ -620,27 +699,54 @@ def _parse_db_open_trade(symbol: str, raw: Dict[str, Any]) -> DbOpenTrade:
     )
 
 
+def _normalize_open_orders_strict(raw_orders: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], ...]:
+    if isinstance(raw_orders, (str, bytes)):
+        raise TypeError("open orders raw must be sequence[dict], not str/bytes (STRICT)")
+
+    try:
+        rows = list(raw_orders)
+    except TypeError as e:
+        raise TypeError("open orders raw must be sequence[dict] (STRICT)") from e
+
+    normalized: List[Dict[str, Any]] = []
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise TypeError(f"open_orders[{i}] must be dict (STRICT)")
+        normalized.append(row)
+    return tuple(normalized)
+
+
 def _parse_protection_visibility(
     symbol: str,
-    exchange: ExchangePosition,
+    exchange_position_amt: Decimal,
     open_orders: Sequence[Dict[str, Any]],
 ) -> ProtectionVisibility:
     tp_ids: List[str] = []
     sl_ids: List[str] = []
+    unexpected_side_ids: List[str] = []
+    unsupported_ids: List[str] = []
 
-    exit_side = _exit_side_from_amt(exchange.position_amt)
+    relevant_open_orders_count = 0
+
+    exit_side: Optional[str] = None
+    if exchange_position_amt > 0:
+        exit_side = "SELL"
+    elif exchange_position_amt < 0:
+        exit_side = "BUY"
 
     for i, row in enumerate(open_orders):
         if not isinstance(row, dict):
             raise TypeError(f"open_orders[{i}] must be dict (STRICT)")
 
-        row_symbol = row.get("symbol")
+        row_symbol = _normalize_symbol_strict(row.get("symbol"), field_name=f"open_orders[{i}].symbol")
         if row_symbol != symbol:
             continue
 
+        relevant_open_orders_count += 1
+
         row_side = _to_nonempty_strict(row, "side").upper()
-        if row_side != exit_side:
-            continue
+        if row_side not in ("BUY", "SELL"):
+            raise ValueError(f"open_orders[{i}].side invalid (STRICT): {row_side!r}")
 
         if not _is_protective_order_strict(row):
             continue
@@ -648,21 +754,50 @@ def _parse_protection_visibility(
         order_id = _to_nonempty_strict(row, "orderId")
         order_type = _to_nonempty_strict(row, "type").upper()
 
+        if exit_side is not None and row_side != exit_side:
+            unexpected_side_ids.append(order_id)
+            continue
+
         if order_type in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
             tp_ids.append(order_id)
         elif order_type in ("STOP_MARKET", "STOP"):
             sl_ids.append(order_id)
+        else:
+            unsupported_ids.append(order_id)
 
     return ProtectionVisibility(
-        open_orders_count=len(list(open_orders)),
+        open_orders_count=int(relevant_open_orders_count),
         tp_order_ids=tuple(tp_ids),
         sl_order_ids=tuple(sl_ids),
+        unexpected_side_protective_order_ids=tuple(unexpected_side_ids),
+        unsupported_protective_order_ids=tuple(unsupported_ids),
     )
 
 
 # =========================
 # Primitive helpers
 # =========================
+
+def _normalize_symbol_strict(v: Any, *, field_name: str) -> str:
+    if v is None:
+        raise ValueError(f"{field_name} is None (STRICT)")
+    s = str(v).strip().upper().replace("-", "").replace("/", "").replace("_", "")
+    if not s:
+        raise ValueError(f"{field_name} is empty (STRICT)")
+    return s
+
+
+def _require_decimal_nonnegative(v: Any, name: str) -> Decimal:
+    if v is None:
+        raise ValueError(f"{name} is None (STRICT)")
+    try:
+        dv = Decimal(str(v))
+    except (InvalidOperation, ValueError) as e:
+        raise ValueError(f"{name} not convertible to Decimal (STRICT): {v}") from e
+    if dv < 0:
+        raise ValueError(f"{name} must be >= 0 (STRICT)")
+    return dv
+
 
 def _to_decimal_strict(d: Dict[str, Any], key: str) -> Decimal:
     if key not in d:
@@ -707,6 +842,10 @@ def _is_protective_order_strict(row: Dict[str, Any]) -> bool:
         raise TypeError("open order closePosition must be bool (STRICT)")
 
     return bool(reduce_only or close_position)
+
+
+def _is_position_open(position_amt: Decimal, qty_epsilon: Decimal) -> bool:
+    return abs(position_amt) > qty_epsilon
 
 
 def _position_dir_from_amt(x: Decimal) -> str:

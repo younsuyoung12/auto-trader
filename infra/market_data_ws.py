@@ -4,14 +4,15 @@
 FILE: infra/market_data_ws.py
 ROLE:
 - Binance USDT-M Futures multiplex WebSocket 수신기
-- 멀티 타임프레임 kline + depth5 orderbook을 메모리 버퍼에 유지
+- 멀티 타임프레임 kline + diff-depth orderbook을 메모리 버퍼에 유지
 - WS primary market-data를 bt_candles / bt_orderbook_snapshots 에 지속 기록한다
 - 상위 레이어에 getter / atomic snapshot / health snapshot / dashboard telemetry snapshot 을 제공한다
 
 CORE RESPONSIBILITIES:
 - WS 수신 데이터의 STRICT 검증 및 메모리 버퍼링
-- WS kline / depth5 orderbook의 DB 영속화(STRICT, fail-fast)
+- WS kline / orderbook DB 영속화(STRICT, fail-fast)
 - 부팅 시 REST bootstrap으로 필수 캔들 preload
+- orderbook 은 REST snapshot + diff-depth stream 으로 정합성 있게 유지
 - WS 세션 상태 / market-data freshness / orderbook payload 무결성 관측성 제공
 - dashboard 가 직접 사용할 수 있는 WS telemetry snapshot 제공
 - strategy / execution / exit 책임과 완전 분리
@@ -32,11 +33,19 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 - 2026-03-14:
-  1) FEAT(CIRCUIT-BREAKER): 반복 WS transport/protocol/feed-stale 장애를 연속 실패로 누적하고 breaker open 상태를 추가
-  2) FEAT(CIRCUIT-BREAKER): run_forever 반복 종료 / protocol_error / decode_error / orderbook feed gap 을 circuit breaker failure source 로 승격
-  3) FEAT(OBSERVABILITY): ws_status / health_snapshot / dashboard telemetry 에 circuit breaker 상태/사유/trip_count 노출 추가
-  4) FIX(RECOVERY): circuit breaker open 중에는 즉시 재접속 루프를 멈추고 cool-down 이후 재시도하도록 수정
-  5) FIX(STRICT): successful on_open 시 circuit breaker 연속 실패 카운터를 명시적으로 reset
+  1) FIX(ROOT-CAUSE): partial depth5 의존 제거, REST snapshot + diff-depth(@depth@100ms) 정합 모델로 교체
+  2) FEAT(ORDERBOOK-STATE): snapshot_last_update_id / stream_aligned / bids_map / asks_map 기반 로컬 북 상태 추가
+  3) FIX(STRICT): diff-depth first bridge(U/u) / pu chain / gap detection strict 검증 추가
+  4) FIX(RECOVERY): on_open 시 orderbook REST snapshot bootstrap 실패를 protocol 장애로 승격하고 즉시 세션 종료
+  5) FIX(OBSERVABILITY): orderbook source(rest_bootstrap / ws_diff_depth) 및 breaker 사유 노출 보강
+  6) FIX(TRADE-GRADE): on_open bootstrap 도중 유입되는 diff-depth 이벤트를 pending queue 로 버퍼링한 뒤
+     snapshot 이후 strict bridge/chain 규칙으로 순차 반영
+  7) FIX(RECOVERY): bootstrap placeholder state 추가로 snapshot 준비 전 diff-depth 도착 시 즉시 protocol fail 되지 않도록 정합 처리
+  8) FEAT(CIRCUIT-BREAKER): 반복 WS transport/protocol/feed-stale 장애를 연속 실패로 누적하고 breaker open 상태를 추가
+  9) FEAT(CIRCUIT-BREAKER): run_forever 반복 종료 / protocol_error / decode_error / orderbook feed gap 을 circuit breaker failure source 로 승격
+  10) FEAT(OBSERVABILITY): ws_status / health_snapshot / dashboard telemetry 에 circuit breaker 상태/사유/trip_count 노출 추가
+  11) FIX(RECOVERY): circuit breaker open 중에는 즉시 재접속 루프를 멈추고 cool-down 이후 재시도하도록 수정
+  12) FIX(STRICT): successful on_open 시 circuit breaker 연속 실패 카운터를 명시적으로 reset
 - 2026-03-13:
   1) FIX(ROOT-CAUSE): ws_status.state 를 OPEN / OPENING / RECONNECTING / CLOSED 계약으로 명시
   2) FIX(ROOT-CAUSE): reconnect grace 동안 connection_not_open 을 즉시 transport fail 로 승격하지 않도록 수정
@@ -86,7 +95,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import requests
 import websocket  # pip install websocket-client
@@ -109,6 +118,10 @@ LegacyKlineRow = Tuple[int, float, float, float, float]
 _DASHBOARD_WS_STATUS_CONNECTED = "CONNECTED"
 _DASHBOARD_WS_STATUS_RECONNECTING = "RECONNECTING"
 _DASHBOARD_WS_STATUS_DISCONNECTED = "DISCONNECTED"
+
+_ORDERBOOK_SNAPSHOT_LIMIT = 1000
+_ORDERBOOK_TOP_N = 5
+_ORDERBOOK_PENDING_EVENT_MAX = 5000
 
 
 def _now_ms() -> int:
@@ -378,9 +391,6 @@ def _extract_quote_volume_from_rest_row_optional(row: Any, idx: int) -> Optional
     return None
 
 
-# ─────────────────────────────────────────────
-# Settings / SSOT
-# ─────────────────────────────────────────────
 WS_INTERVALS: List[str] = _normalize_interval_list_from_settings(SET.ws_subscribe_tfs, name="ws_subscribe_tfs")
 REQUIRED_INTERVALS: List[str] = _normalize_interval_list_from_settings(SET.ws_required_tfs, name="ws_required_tfs")
 WS_BACKFILL_INTERVALS: List[str] = _normalize_interval_list_from_settings(SET.ws_backfill_tfs, name="ws_backfill_tfs")
@@ -450,7 +460,6 @@ PONG_STARTUP_GRACE_SEC: float = _require_positive_float(
 )
 _WS_RECONNECT_GRACE_SEC: float = max(5.0, MARKET_EVENT_MAX_DELAY_SEC)
 
-# Circuit breaker는 settings 추가 없이 기존 SSOT timing 값으로만 운영 강도를 계산한다.
 _WS_CIRCUIT_BREAKER_CONFIRM_N: int = 3
 _WS_CIRCUIT_BREAKER_COOLDOWN_SEC: float = max(_WS_RECONNECT_GRACE_SEC, MARKET_EVENT_MAX_DELAY_SEC)
 
@@ -497,6 +506,7 @@ _kline_last_quote_volume: Dict[Tuple[str, str], Tuple[int, float]] = {}
 _orderbook_buffers: Dict[str, Dict[str, Any]] = {}
 _orderbook_last_update_id: Dict[str, int] = {}
 _orderbook_last_recv_ts: Dict[str, int] = {}
+_orderbook_book_state: Dict[str, Dict[str, Any]] = {}
 
 _ws_connection_open: Dict[str, bool] = {}
 _ws_last_open_ts: Dict[str, int] = {}
@@ -510,7 +520,6 @@ _ws_reconnect_request_ts: Dict[str, int] = {}
 _ws_reconnect_request_reason: Dict[str, str] = {}
 _ws_state_lock = threading.Lock()
 
-# Circuit breaker runtime state
 _ws_cb_consecutive_failures: Dict[str, int] = {}
 _ws_cb_open_until_ts: Dict[str, int] = {}
 _ws_cb_last_reason: Dict[str, str] = {}
@@ -537,6 +546,20 @@ _start_ws_lock = threading.Lock()
 
 _rest_session = requests.Session()
 _rest_session.headers.update({"User-Agent": "auto-trader/market-data-ws-bootstrap"})
+
+
+def _make_orderbook_bootstrap_placeholder_state() -> Dict[str, Any]:
+    return {
+        "ready": False,
+        "bootstrapping": True,
+        "stream_aligned": False,
+        "snapshot_last_update_id": None,
+        "last_update_id": None,
+        "bids_map": {},
+        "asks_map": {},
+        "last_snapshot_recv_ts": None,
+        "pending_events": [],
+    }
 
 
 def _mark_ws_open(symbol: str, opened_at_ms: int) -> None:
@@ -596,6 +619,7 @@ def _clear_orderbook_runtime_state(symbol: str) -> None:
         _orderbook_last_update_id.pop(sym, None)
         _orderbook_buffers.pop(sym, None)
         _orderbook_last_recv_ts.pop(sym, None)
+        _orderbook_book_state.pop(sym, None)
 
 
 def _register_ws_app(symbol: str, ws: websocket.WebSocketApp) -> None:
@@ -883,16 +907,6 @@ def _commit_kline_update_strict(
 
 
 def get_ws_status(symbol: str) -> Dict[str, Any]:
-    """
-    WS session status.
-
-    ok:
-    - transport 상태만 의미한다.
-    - Binance multiplex WS 에서는 pong callback 부재를 transport failure 로 간주하지 않는다.
-    - market_feed inactivity는 warning 으로 분리한다.
-    - reconnect grace 동안 brief disconnect 는 즉시 transport fail 로 승격하지 않는다.
-    - circuit breaker open 은 명시적 transport failure 로 간주한다.
-    """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
 
@@ -1076,12 +1090,20 @@ def _min_buffer_for_interval(iv: str) -> int:
 
 def _build_stream_names(symbol: str) -> List[str]:
     s = _to_stream_symbol(symbol)
-    if not s:
-        raise RuntimeError("symbol is required to build WS streams")
-    streams: List[str] = [f"{s}@kline_{iv}" for iv in WS_INTERVALS]
-    streams.append(f"{s}@depth5@100ms")
-    return streams
 
+    if not s:
+        raise RuntimeError("symbol is required to build WS streams (STRICT)")
+
+    streams: List[str] = []
+
+    for iv in WS_INTERVALS:
+        streams.append(f"{s}@kline_{iv}")
+
+    # TRADE-GRADE CONTRACT
+    # engine orderbook pipeline requires depth5 snapshot stream
+    streams.append(f"{s}@depth5@100ms")
+
+    return streams
 
 def _build_ws_url(symbol: str) -> str:
     streams = _build_stream_names(symbol)
@@ -1140,14 +1162,47 @@ def _rest_fetch_klines_strict(symbol: str, interval: str, limit: int) -> List[An
     return payload
 
 
-def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]] = None) -> Dict[str, int]:
-    """
-    TRADE-GRADE startup bootstrap (explicit preload, not runtime fallback)
+def _rest_fetch_depth_snapshot_strict(symbol: str, limit: int) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    lim = _require_positive_int(limit, "rest_depth.limit")
+    if lim > _ORDERBOOK_SNAPSHOT_LIMIT:
+        raise RuntimeError(
+            f"REST depth limit exceeds cap (STRICT): symbol={sym} limit={lim} cap={_ORDERBOOK_SNAPSHOT_LIMIT}"
+        )
 
-    - 운영 시작 전에 필요한 캔들을 REST로 먼저 채운다.
-    - interval별 required buffer 길이만큼 정확히 받아오지 못하면 즉시 실패한다.
-    - bootstrap 성공 후에는 WS만으로 갱신한다.
-    """
+    url = f"{_WS_REST_BASE}/fapi/v1/depth"
+    try:
+        resp = _rest_session.get(
+            url,
+            params={"symbol": sym, "limit": lim},
+            timeout=_WS_REST_TIMEOUT_SEC,
+        )
+    except Exception as e:
+        raise RuntimeError(f"REST depth request failed (STRICT): symbol={sym} limit={lim}") from e
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"REST depth HTTP {resp.status_code} (STRICT): symbol={sym} limit={lim} body={resp.text[:500]!r}"
+        )
+
+    try:
+        payload = resp.json()
+    except Exception as e:
+        raise RuntimeError(f"REST depth response is not valid JSON (STRICT): symbol={sym}") from e
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"REST depth response root must be dict (STRICT): symbol={sym} got={type(payload).__name__}"
+        )
+
+    if "lastUpdateId" not in payload:
+        raise RuntimeError("REST depth snapshot missing lastUpdateId (STRICT)")
+    if "bids" not in payload or "asks" not in payload:
+        raise RuntimeError("REST depth snapshot missing bids/asks (STRICT)")
+    return payload
+
+
+def bootstrap_klines_from_rest_strict(symbol: str, intervals: Optional[List[str]] = None) -> Dict[str, int]:
     if not _WS_BOOTSTRAP_REST_ENABLED:
         raise RuntimeError("ws_bootstrap_rest_enabled is False. TRADE-GRADE startup requires explicit bootstrap.")
 
@@ -1288,7 +1343,13 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
             _kline_last_recv_ts[key] = now_ms
 
 
-def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float]]:
+def _normalize_depth_side_strict(
+    side_val: Any,
+    *,
+    name: str,
+    allow_zero_qty: bool = False,
+    allow_empty: bool = False,
+) -> List[List[float]]:
     if side_val is None:
         raise WSProtocolError(f"{name} missing")
     if not isinstance(side_val, (list, tuple)):
@@ -1298,17 +1359,17 @@ def _normalize_depth_side_strict(side_val: Any, *, name: str) -> List[List[float
     for i, row in enumerate(side_val):
         if isinstance(row, (list, tuple)) and len(row) >= 2:
             p = _require_float(row[0], f"{name}[{i}].price")
-            q = _require_float(row[1], f"{name}[{i}].qty")
+            q = _require_float(row[1], f"{name}[{i}].qty", allow_zero=allow_zero_qty)
             out.append([p, q])
             continue
         if isinstance(row, dict):
             p = _require_float(row.get("price"), f"{name}[{i}].price")
-            q = _require_float(row.get("qty"), f"{name}[{i}].qty")
+            q = _require_float(row.get("qty"), f"{name}[{i}].qty", allow_zero=allow_zero_qty)
             out.append([p, q])
             continue
         raise WSProtocolError(f"{name}[{i}] invalid level type: {type(row).__name__}")
 
-    if not out:
+    if not out and not allow_empty:
         raise WSProtocolError(f"{name} empty after parse (STRICT)")
     return out
 
@@ -1326,11 +1387,6 @@ def _compute_best_prices_strict(bids: List[List[float]], asks: List[List[float]]
 
 
 def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
-    """
-    STRICT CONTRACT:
-    - orderbook spreadPct/spread_pct 는 엔진 전체에서 ratio(0..1) 기준이다.
-    - 예: 0.0005 == 0.05%
-    """
     if best_bid <= 0 or best_ask <= 0:
         raise WSProtocolError("best prices invalid for spread (STRICT)")
     if best_ask <= best_bid:
@@ -1356,71 +1412,421 @@ def _persist_ws_orderbook_snapshot_strict(
     )
 
 
+def _build_orderbook_price_map_strict(levels: List[List[float]], *, name: str) -> Dict[float, float]:
+    price_map: Dict[float, float] = {}
+    for idx, row in enumerate(levels):
+        if not isinstance(row, list) or len(row) != 2:
+            raise WSProtocolError(f"{name}[{idx}] must be [price, qty] (STRICT)")
+        price = _require_float(row[0], f"{name}[{idx}].price")
+        qty = _require_float(row[1], f"{name}[{idx}].qty")
+        if qty <= 0.0:
+            raise WSProtocolError(f"{name}[{idx}].qty must be > 0 for snapshot/book state (STRICT)")
+        price_map[price] = qty
+    if not price_map:
+        raise WSProtocolError(f"{name} produced empty price_map (STRICT)")
+    return price_map
+
+
+def _apply_depth_updates_to_price_map_strict(
+    price_map: Dict[float, float],
+    updates: List[List[float]],
+    *,
+    name: str,
+) -> None:
+    if not isinstance(price_map, dict):
+        raise WSProtocolError(f"{name} price_map must be dict (STRICT)")
+
+    for idx, row in enumerate(updates):
+        if not isinstance(row, list) or len(row) != 2:
+            raise WSProtocolError(f"{name}[{idx}] must be [price, qty] (STRICT)")
+        price = _require_float(row[0], f"{name}[{idx}].price")
+        qty = _require_float(row[1], f"{name}[{idx}].qty", allow_zero=True)
+        if qty == 0.0:
+            price_map.pop(price, None)
+        else:
+            price_map[price] = qty
+
+
+def _materialize_orderbook_side_top_n_strict(
+    price_map: Dict[float, float],
+    *,
+    name: str,
+    descending: bool,
+    limit: int,
+) -> List[List[float]]:
+    if not isinstance(price_map, dict):
+        raise WSProtocolError(f"{name} price_map must be dict (STRICT)")
+    if limit <= 0:
+        raise WSProtocolError(f"{name} limit must be > 0 (STRICT)")
+    if not price_map:
+        raise WSProtocolError(f"{name} empty (STRICT)")
+
+    ordered = sorted(price_map.items(), key=lambda kv: kv[0], reverse=descending)
+    out: List[List[float]] = []
+    for price, qty in ordered[:limit]:
+        if price <= 0.0:
+            raise WSProtocolError(f"{name} contains non-positive price (STRICT)")
+        if qty <= 0.0:
+            raise WSProtocolError(f"{name} contains non-positive qty (STRICT)")
+        out.append([float(price), float(qty)])
+
+    if not out:
+        raise WSProtocolError(f"{name} top-n materialization empty (STRICT)")
+    return out
+
+
+def _materialize_orderbook_top_levels_strict(
+    bids_map: Dict[float, float],
+    asks_map: Dict[float, float],
+) -> Tuple[List[List[float]], List[List[float]], float, float, float]:
+    bids_top = _materialize_orderbook_side_top_n_strict(
+        bids_map,
+        name="orderbook.bids_map",
+        descending=True,
+        limit=_ORDERBOOK_TOP_N,
+    )
+    asks_top = _materialize_orderbook_side_top_n_strict(
+        asks_map,
+        name="orderbook.asks_map",
+        descending=False,
+        limit=_ORDERBOOK_TOP_N,
+    )
+    best_bid, best_ask = _compute_best_prices_strict(bids_top, asks_top)
+    spread_pct = _compute_spread_pct(best_bid, best_ask)
+    return bids_top, asks_top, best_bid, best_ask, spread_pct
+
+
+def _normalize_orderbook_diff_event_strict(payload: Dict[str, Any]) -> Dict[str, Any]:
+    first_update_id = _require_positive_int(payload.get("U"), "orderbook.U")
+    final_update_id = _require_positive_int(payload.get("u"), "orderbook.u")
+    if final_update_id < first_update_id:
+        raise WSProtocolError(
+            f"orderbook update id range invalid (STRICT): U={first_update_id} u={final_update_id}"
+        )
+
+    prev_final_update_id: Optional[int] = None
+    raw_prev_final_update_id = payload.get("pu")
+    if raw_prev_final_update_id is not None:
+        prev_final_update_id = _require_positive_int(raw_prev_final_update_id, "orderbook.pu")
+
+    raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
+    raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
+
+    normalized_bids = _normalize_depth_side_strict(
+        raw_bids,
+        name="orderbook.bids",
+        allow_zero_qty=True,
+        allow_empty=True,
+    )
+    normalized_asks = _normalize_depth_side_strict(
+        raw_asks,
+        name="orderbook.asks",
+        allow_zero_qty=True,
+        allow_empty=True,
+    )
+
+    return {
+        "U": int(first_update_id),
+        "u": int(final_update_id),
+        "pu": prev_final_update_id,
+        "bids": normalized_bids,
+        "asks": normalized_asks,
+        "event_ts_ms": _extract_orderbook_event_ts_ms_strict(payload),
+    }
+
+
+def _queue_orderbook_pending_event_locked(symbol: str, state: Dict[str, Any], event: Dict[str, Any]) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("symbol is required for pending diff-depth queue (STRICT)")
+    if not isinstance(state, dict):
+        raise WSProtocolError("orderbook state must be dict for pending queue (STRICT)")
+    pending = state.get("pending_events")
+    if not isinstance(pending, list):
+        raise WSProtocolError("orderbook_state.pending_events must be list (STRICT)")
+    pending.append(dict(event))
+    if len(pending) > _ORDERBOOK_PENDING_EVENT_MAX:
+        raise WSProtocolError(
+            f"pending diff-depth queue overflow (STRICT): symbol={sym} size={len(pending)} "
+            f"cap={_ORDERBOOK_PENDING_EVENT_MAX}"
+        )
+
+
+def _build_orderbook_state_from_snapshot_strict(
+    symbol: str,
+    snapshot_payload: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("symbol is required for snapshot state build (STRICT)")
+
+    last_update_id = _require_positive_int(snapshot_payload.get("lastUpdateId"), "depth_snapshot.lastUpdateId")
+
+    bids = _normalize_depth_side_strict(
+        snapshot_payload.get("bids"),
+        name="depth_snapshot.bids",
+        allow_zero_qty=False,
+        allow_empty=False,
+    )
+    asks = _normalize_depth_side_strict(
+        snapshot_payload.get("asks"),
+        name="depth_snapshot.asks",
+        allow_zero_qty=False,
+        allow_empty=False,
+    )
+
+    bids_map = _build_orderbook_price_map_strict(bids, name="depth_snapshot.bids")
+    asks_map = _build_orderbook_price_map_strict(asks, name="depth_snapshot.asks")
+    bids_top, asks_top, best_bid, best_ask, spread_pct = _materialize_orderbook_top_levels_strict(
+        bids_map,
+        asks_map,
+    )
+
+    now_ms = _now_ms()
+
+    state = {
+        "ready": True,
+        "bootstrapping": True,
+        "stream_aligned": False,
+        "snapshot_last_update_id": int(last_update_id),
+        "last_update_id": int(last_update_id),
+        "bids_map": bids_map,
+        "asks_map": asks_map,
+        "last_snapshot_recv_ts": now_ms,
+        "pending_events": [],
+    }
+    snapshot = {
+        "bids": bids_top,
+        "asks": asks_top,
+        "ts": now_ms,
+        "bestBid": best_bid,
+        "bestAsk": best_ask,
+        "spreadPct": spread_pct,
+        "lastUpdateId": int(last_update_id),
+        "exchTs": None,
+        "source": "rest_bootstrap",
+        "streamAligned": False,
+        "snapshotLastUpdateId": int(last_update_id),
+    }
+    return state, snapshot
+
+
+def _advance_orderbook_state_with_event_strict(
+    symbol: str,
+    state: Dict[str, Any],
+    event: Dict[str, Any],
+) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("symbol is required for orderbook diff advance (STRICT)")
+    if not isinstance(state, dict):
+        raise WSProtocolError("orderbook state must be dict (STRICT)")
+    if not isinstance(event, dict):
+        raise WSProtocolError("orderbook diff event must be dict (STRICT)")
+
+    ready = bool(state.get("ready", False))
+    if not ready:
+        raise WSProtocolError("orderbook state not ready for diff advance (STRICT)")
+
+    current_last_update_id = _require_positive_int(
+        state.get("last_update_id"),
+        "orderbook_state.last_update_id",
+    )
+    snapshot_last_update_id = _require_positive_int(
+        state.get("snapshot_last_update_id"),
+        "orderbook_state.snapshot_last_update_id",
+    )
+    stream_aligned = bool(state.get("stream_aligned", False))
+
+    first_update_id = _require_positive_int(event.get("U"), "orderbook_event.U")
+    final_update_id = _require_positive_int(event.get("u"), "orderbook_event.u")
+    if final_update_id <= current_last_update_id:
+        log(
+            f"[WS_INFO] orderbook replay/rollback ignored "
+            f"symbol={sym} prev={current_last_update_id} new={final_update_id}"
+        )
+        return None
+
+    prev_final_update_id = event.get("pu")
+    if prev_final_update_id is not None:
+        prev_final_update_id = _require_positive_int(prev_final_update_id, "orderbook_event.pu")
+
+    bridge_update_id = current_last_update_id + 1
+    if not stream_aligned:
+        if first_update_id > bridge_update_id or final_update_id < bridge_update_id:
+            raise WSProtocolError(
+                "first diff depth event does not bridge REST snapshot (STRICT): "
+                f"symbol={sym} snapshot_last_update_id={snapshot_last_update_id} "
+                f"state_last_update_id={current_last_update_id} U={first_update_id} u={final_update_id}"
+            )
+    else:
+        if prev_final_update_id is not None and prev_final_update_id != current_last_update_id:
+            raise WSProtocolError(
+                "diff depth chain broken by pu mismatch (STRICT): "
+                f"symbol={sym} expected_pu={current_last_update_id} got_pu={prev_final_update_id}"
+            )
+        if first_update_id > bridge_update_id:
+            raise WSProtocolError(
+                "diff depth gap detected (STRICT): "
+                f"symbol={sym} expected_U<={bridge_update_id} got_U={first_update_id}"
+            )
+
+    bids_map_raw = state.get("bids_map")
+    asks_map_raw = state.get("asks_map")
+    if not isinstance(bids_map_raw, dict) or not isinstance(asks_map_raw, dict):
+        raise WSProtocolError("orderbook state bids_map/asks_map missing (STRICT)")
+
+    next_bids_map = dict(bids_map_raw)
+    next_asks_map = dict(asks_map_raw)
+
+    _apply_depth_updates_to_price_map_strict(next_bids_map, list(event.get("bids") or []), name="orderbook.bids")
+    _apply_depth_updates_to_price_map_strict(next_asks_map, list(event.get("asks") or []), name="orderbook.asks")
+
+    bids_top, asks_top, best_bid, best_ask, spread_pct = _materialize_orderbook_top_levels_strict(
+        next_bids_map,
+        next_asks_map,
+    )
+
+    next_state = {
+        "ready": True,
+        "bootstrapping": bool(state.get("bootstrapping", False)),
+        "stream_aligned": True,
+        "snapshot_last_update_id": int(snapshot_last_update_id),
+        "last_update_id": int(final_update_id),
+        "bids_map": next_bids_map,
+        "asks_map": next_asks_map,
+        "last_snapshot_recv_ts": state.get("last_snapshot_recv_ts"),
+        "pending_events": list(state.get("pending_events") or []),
+    }
+    snapshot = {
+        "bids": bids_top,
+        "asks": asks_top,
+        "ts": int(event["event_ts_ms"]),
+        "bestBid": best_bid,
+        "bestAsk": best_ask,
+        "spreadPct": spread_pct,
+        "lastUpdateId": int(final_update_id),
+        "exchTs": int(event["event_ts_ms"]),
+        "source": "ws_diff_depth",
+        "streamAligned": True,
+        "snapshotLastUpdateId": int(snapshot_last_update_id),
+    }
+    return next_state, snapshot
+
+
+def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for REST depth bootstrap")
+
+    snapshot_payload = _rest_fetch_depth_snapshot_strict(sym, _ORDERBOOK_SNAPSHOT_LIMIT)
+    state_from_snapshot, snapshot_view = _build_orderbook_state_from_snapshot_strict(sym, snapshot_payload)
+
+    with _orderbook_lock:
+        placeholder = _orderbook_book_state.get(sym)
+        if not isinstance(placeholder, dict) or not bool(placeholder.get("bootstrapping", False)):
+            raise WSProtocolError("orderbook bootstrap placeholder missing (STRICT)")
+
+        pending_events_raw = placeholder.get("pending_events")
+        if not isinstance(pending_events_raw, list):
+            raise WSProtocolError("orderbook bootstrap placeholder pending_events invalid (STRICT)")
+
+        state = dict(state_from_snapshot)
+        state["pending_events"] = list(pending_events_raw)
+
+        _orderbook_book_state[sym] = state
+        _orderbook_buffers[sym] = dict(snapshot_view)
+        _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
+        _orderbook_last_recv_ts[sym] = int(state["last_snapshot_recv_ts"])
+
+        last_ws_snapshot: Optional[Dict[str, Any]] = None
+        while True:
+            pending = state.get("pending_events")
+            if not isinstance(pending, list):
+                raise WSProtocolError("orderbook_state.pending_events must remain list (STRICT)")
+            if not pending:
+                break
+
+            event = pending.pop(0)
+            transition = _advance_orderbook_state_with_event_strict(sym, state, event)
+            if transition is None:
+                continue
+
+            next_state, ws_snapshot = transition
+            _persist_ws_orderbook_snapshot_strict(
+                symbol=sym,
+                event_ts_ms=int(ws_snapshot["exchTs"]),
+                bids=list(ws_snapshot["bids"]),
+                asks=list(ws_snapshot["asks"]),
+            )
+            state = next_state
+            _orderbook_book_state[sym] = state
+            _orderbook_buffers[sym] = dict(ws_snapshot)
+            _orderbook_last_update_id[sym] = int(ws_snapshot["lastUpdateId"])
+            _orderbook_last_recv_ts[sym] = _now_ms()
+            last_ws_snapshot = ws_snapshot
+
+        state["bootstrapping"] = False
+        _orderbook_book_state[sym] = state
+
+        if last_ws_snapshot is not None:
+            _orderbook_buffers[sym] = dict(last_ws_snapshot)
+            _orderbook_last_update_id[sym] = int(last_ws_snapshot["lastUpdateId"])
+        else:
+            snapshot_view["streamAligned"] = False
+            _orderbook_buffers[sym] = dict(snapshot_view)
+            _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
+
+    if last_ws_snapshot is None:
+        log(
+            f"[MD_BINANCE_WS] orderbook snapshot bootstrapped: "
+            f"symbol={sym} lastUpdateId={snapshot_view['lastUpdateId']} "
+            f"bestBid={snapshot_view['bestBid']} bestAsk={snapshot_view['bestAsk']}"
+        )
+    else:
+        log(
+            f"[MD_BINANCE_WS] orderbook snapshot bootstrapped+aligned: "
+            f"symbol={sym} snapshot_lastUpdateId={snapshot_view['lastUpdateId']} "
+            f"final_lastUpdateId={last_ws_snapshot['lastUpdateId']}"
+        )
+
+
 def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     sym = _normalize_symbol(symbol)
     if not sym:
         raise WSProtocolError("empty symbol in orderbook push")
 
-    raw_update_id = payload.get("u") if payload.get("u") is not None else payload.get("lastUpdateId")
-    if raw_update_id is None:
-        raise WSProtocolError("orderbook missing update id (u/lastUpdateId) (STRICT)")
-    try:
-        update_id = int(raw_update_id)
-    except Exception as e:
-        raise WSProtocolError(f"orderbook update id must be int (STRICT): {e}") from e
-    if update_id <= 0:
-        raise WSProtocolError("orderbook update id must be > 0 (STRICT)")
-
-    with _orderbook_lock:
-        prev_update_id = _orderbook_last_update_id.get(sym)
-
-    if prev_update_id is not None and update_id <= int(prev_update_id):
-        log(
-            f"[WS_INFO] orderbook replay/rollback ignored "
-            f"prev={int(prev_update_id)} new={int(update_id)}"
-        )
-        return
-
-    raw_bids = payload.get("b") if payload.get("b") is not None else payload.get("bids")
-    raw_asks = payload.get("a") if payload.get("a") is not None else payload.get("asks")
-
-    normalized_bids = _normalize_depth_side_strict(raw_bids, name="orderbook.bids")
-    normalized_asks = _normalize_depth_side_strict(raw_asks, name="orderbook.asks")
-
-    event_ts_ms = _extract_orderbook_event_ts_ms_strict(payload)
+    event = _normalize_orderbook_diff_event_strict(payload)
     now_ms = _now_ms()
     _mark_ws_message(sym, now_ms)
 
-    best_bid, best_ask = _compute_best_prices_strict(normalized_bids, normalized_asks)
-    spread_pct = _compute_spread_pct(best_bid, best_ask)
-
-    ob: Dict[str, Any] = {
-        "bids": normalized_bids,
-        "asks": normalized_asks,
-        "ts": event_ts_ms,
-        "bestBid": best_bid,
-        "bestAsk": best_ask,
-        "spreadPct": spread_pct,
-        "lastUpdateId": int(update_id),
-        "exchTs": event_ts_ms,
-    }
-
-    _persist_ws_orderbook_snapshot_strict(
-        symbol=sym,
-        event_ts_ms=event_ts_ms,
-        bids=normalized_bids,
-        asks=normalized_asks,
-    )
-
     with _orderbook_lock:
-        prev2 = _orderbook_last_update_id.get(sym)
-        if prev2 is not None and update_id <= int(prev2):
-            raise WSProtocolError(
-                f"orderbook outdated packet (STRICT, race): prev={int(prev2)} new={int(update_id)}"
-            )
+        state = _orderbook_book_state.get(sym)
+        if not isinstance(state, dict):
+            raise WSProtocolError("orderbook state missing/not dict (STRICT)")
 
-        _orderbook_buffers[sym] = ob
-        _orderbook_last_update_id[sym] = int(update_id)
+        if bool(state.get("bootstrapping", False)):
+            _queue_orderbook_pending_event_locked(sym, state, event)
+            return
+
+        if not bool(state.get("ready", False)):
+            raise WSProtocolError("orderbook state not bootstrapped from REST snapshot (STRICT)")
+
+        transition = _advance_orderbook_state_with_event_strict(sym, state, event)
+        if transition is None:
+            return
+
+        next_state, ob_snapshot = transition
+        _persist_ws_orderbook_snapshot_strict(
+            symbol=sym,
+            event_ts_ms=int(ob_snapshot["exchTs"]),
+            bids=list(ob_snapshot["bids"]),
+            asks=list(ob_snapshot["asks"]),
+        )
+
+        _orderbook_book_state[sym] = next_state
+        _orderbook_buffers[sym] = ob_snapshot
+        _orderbook_last_update_id[sym] = int(ob_snapshot["lastUpdateId"])
         _orderbook_last_recv_ts[sym] = now_ms
 
 
@@ -1514,10 +1920,20 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
     streams = _build_stream_names(symbol)
     sym = _normalize_symbol(symbol)
 
-    _clear_orderbook_runtime_state(sym)
-    _mark_ws_open(sym, _now_ms())
-    _reset_ws_circuit_breaker_on_open(sym)
-    log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
+    with _orderbook_lock:
+        _clear_orderbook_runtime_state(sym)
+        _orderbook_book_state[sym] = _make_orderbook_bootstrap_placeholder_state()
+
+    try:
+        _bootstrap_orderbook_from_rest_snapshot_strict(sym)
+        _mark_ws_open(sym, _now_ms())
+        _reset_ws_circuit_breaker_on_open(sym)
+        log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
+    except Exception as e:
+        _record_ws_circuit_breaker_failure(sym, reason=f"orderbook_snapshot_bootstrap:{type(e).__name__}")
+        _mark_ws_error(sym, f"orderbook_snapshot_bootstrap:{type(e).__name__}:{e}")
+        log(f"[MD_BINANCE_WS] on_open bootstrap failed: {type(e).__name__}: {e}")
+        _close_ws_with_log(ws, context=f"on_open_bootstrap_failed symbol={sym}")
 
 
 def _on_pong(symbol: str, ws: websocket.WebSocketApp, data: Any) -> None:
@@ -1562,11 +1978,6 @@ def preload_klines(symbol: str, interval: str, rows: List[KlineRow]) -> None:
 
 
 def backfill_klines_from_rest(symbol: str, interval: str, rest_klines: List[Any]) -> None:
-    """
-    STRICT:
-    - REST 입력이 불량이면 조용히 건너뛰지 않는다(부팅 무결성).
-    - REST close_time 또는 explicit x 로만 closed 상태를 결정한다.
-    """
     sym = _normalize_symbol(symbol)
     iv = _normalize_interval(interval)
     if not sym:
@@ -1752,13 +2163,16 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
     with _orderbook_lock:
         ob = _orderbook_buffers.get(sym)
         last_recv_ts = _orderbook_last_recv_ts.get(sym)
+        state = _orderbook_book_state.get(sym)
 
     payload_ts = None
     last_update_id = None
     has_orderbook = ob is not None
+    orderbook_source = None
     if ob is not None:
         payload_ts = ob.get("ts")
         last_update_id = ob.get("lastUpdateId")
+        orderbook_source = ob.get("source")
 
     recv_delay_ms = None
     if last_recv_ts is not None:
@@ -1768,6 +2182,17 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
     if payload_ts is not None:
         payload_delay_ms = max(0, now_ms - int(payload_ts))
 
+    stream_aligned = None
+    snapshot_last_update_id = None
+    bootstrapping = None
+    if isinstance(state, dict):
+        if "stream_aligned" in state:
+            stream_aligned = bool(state.get("stream_aligned"))
+        if state.get("snapshot_last_update_id") is not None:
+            snapshot_last_update_id = int(state["snapshot_last_update_id"])
+        if "bootstrapping" in state:
+            bootstrapping = bool(state.get("bootstrapping"))
+
     return {
         "symbol": sym,
         "has_orderbook": has_orderbook,
@@ -1776,6 +2201,10 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
         "payload_ts": payload_ts,
         "payload_delay_ms": payload_delay_ms,
         "last_update_id": last_update_id,
+        "source": orderbook_source,
+        "stream_aligned": stream_aligned,
+        "snapshot_last_update_id": snapshot_last_update_id,
+        "bootstrapping": bootstrapping,
     }
 
 
@@ -1808,15 +2237,10 @@ def _compute_kline_health(symbol: str, interval: str) -> Dict[str, Any]:
 
 
 def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
-    """
-    Orderbook health는 payload integrity와 WS transport만 FAIL 조건으로 본다.
-
-    feed inactivity는 warning 으로만 다루되,
-    warning 이 stale threshold를 넘으면 MarketData Layer 가 WS reconnect 를 직접 요청한다.
-    """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
     ws_status = get_ws_status(sym)
+    ob_status = get_orderbook_buffer_status(sym)
 
     with _orderbook_lock:
         ob = _orderbook_buffers.get(sym)
@@ -1843,6 +2267,10 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
         "last_orderbook_recv_ts": orderbook_last_recv_ts,
         "last_pong_ts": ws_status.get("last_pong_ts"),
         "last_update_id": None,
+        "orderbook_source": ob_status.get("source"),
+        "stream_aligned": ob_status.get("stream_aligned"),
+        "snapshot_last_update_id": ob_status.get("snapshot_last_update_id"),
+        "bootstrapping": ob_status.get("bootstrapping"),
         "circuit_breaker_open": bool(ws_status.get("circuit_breaker_open", False)),
         "ok": False,
         "reasons": [],
@@ -1908,6 +2336,11 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
                 if parsed_update_id <= 0:
                     payload_reasons.append("payload:non_positive_last_update_id")
                 result["last_update_id"] = parsed_update_id
+
+        stream_aligned = ob_status.get("stream_aligned")
+        source = ob_status.get("source")
+        if source == "ws_diff_depth" and stream_aligned is not True:
+            payload_reasons.append("payload:ws_diff_depth_not_aligned")
 
     if orderbook_last_recv_ts is None:
         if ob is not None:
@@ -2056,14 +2489,6 @@ def get_dashboard_ws_telemetry_snapshot(
     *,
     intervals: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Dashboard 전용 WS telemetry snapshot.
-
-    목적:
-    - 대시보드가 buffer len 같은 간접 지표가 아니라
-      connection_status / data_freshness / kline latency / orderbook latency 를 직접 표시하게 한다.
-    - 시장데이터 레이어 책임만 제공한다. 계좌/포지션 정보는 여기서 다루지 않는다.
-    """
     sym = _normalize_symbol(symbol)
     if not sym:
         raise RuntimeError("symbol is required (STRICT)")
@@ -2135,6 +2560,10 @@ def get_dashboard_ws_telemetry_snapshot(
         "orderbook_latency_sec": orderbook_latency_sec,
         "orderbook_payload_ts_ms": orderbook_status.get("payload_ts"),
         "orderbook_recv_ts_ms": orderbook_status.get("last_recv_ts"),
+        "orderbook_source": orderbook_status.get("source"),
+        "orderbook_stream_aligned": orderbook_status.get("stream_aligned"),
+        "orderbook_snapshot_last_update_id": orderbook_status.get("snapshot_last_update_id"),
+        "orderbook_bootstrapping": orderbook_status.get("bootstrapping"),
     }
 
 
@@ -2234,24 +2663,6 @@ def start_ws_loop(symbol: str) -> None:
 
 
 def get_market_snapshot(symbol: str) -> Dict[str, Any]:
-    """
-    Atomic Market Snapshot (STRICT)
-
-    목적:
-    - strategy/feature builder가 kline + orderbook을 동일 시점으로 읽도록 한다.
-    - 개별 getter 조합 호출 시 발생 가능한 non-atomic read를 방지한다.
-
-    반환:
-    {
-        "symbol": str,
-        "orderbook": dict | None,
-        "klines": { "<interval>": [ (ts,o,h,l,c,v), ... ], ... }
-    }
-
-    주의:
-    - public snapshot 계약은 기존 호환성을 위해 6-tuple을 유지한다.
-    - closed state가 필요한 저장 경로는 get_klines_with_volume_and_closed()를 사용해야 한다.
-    """
     sym = _normalize_symbol(symbol)
 
     with _kline_lock, _orderbook_lock:

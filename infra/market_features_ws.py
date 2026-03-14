@@ -10,7 +10,7 @@ ROLE:
 
 CORE RESPONSIBILITIES:
 - 필수 타임프레임 WS 캔들 로드 및 freshness 검증
-- 오더북(depth5) freshness / 무결성 검증
+- 오더북 freshness / 무결성 검증
 - 타임프레임별 지표 및 multi-timeframe summary 생성
 - entry_flow 가 직접 사용할 수 있는 trading signal 생성
 - market_data_ws health snapshot 계약을 STRICT 검증하고 warning 정보를 보존한다
@@ -29,6 +29,13 @@ IMPORTANT POLICY:
   한 방향을 먼저 확정한 뒤 다른 방향을 제거하는 구조를 금지한다.
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FIX(ROOT-CAUSE): health snapshot 호출 중 market_data_ws 가 reconnect_requested 를 갱신한 직후에도
+     동일 호출 프레임에서 stale orderbook 을 hard-fail 로 오판하던 race 제거
+  2) FIX(RECOVERY): stale / missing orderbook 판정 직전에 live ws status 를 다시 strict 검증하여
+     reconnect_requested / RECONNECTING / circuit breaker open 상태를 recovery-in-progress 로 승격
+  3) FIX(OPERABILITY): orderbook stale / recovery 메시지 throttle key 분리로 동적 age 값 때문에
+     TG/로그 suppression 이 깨지던 문제 수정
 - 2026-03-13:
   1) FIX(ROOT-CAUSE): MarketData reconnect / startup grace 상태를 Feature Layer 가 명시적으로 해석하도록 수정
   2) FIX(RECOVERY): orderbook recovery-in-progress 상태는 stale contract violation 과 분리하여 FeatureBuildError 문맥을 교정
@@ -86,6 +93,7 @@ from infra.market_data_ws import (
     get_last_kline_delay_ms,
     get_orderbook,
     get_orderbook_buffer_status,
+    get_ws_status,
 )
 from strategy.indicators import (
     Candle,
@@ -274,16 +282,22 @@ def _log_recovery_once(key: str, human_msg: str) -> None:
     log(f"[MKT-FEAT][RECOVERY] {human_msg}")
 
 
-def _fail(symbol: str, location: str, reason: str) -> None:
+def _fail(symbol: str, location: str, reason: str, *, throttle_key: Optional[str] = None) -> None:
     msg = f"[{symbol}] {location}: {reason}"
-    key = f"{symbol}|{location}|{reason}"
+    key = throttle_key if throttle_key is not None else f"{symbol}|{location}|{reason}"
     _notify_error_once(key, msg)
     raise FeatureBuildError(msg)
 
 
-def _raise_recovery_in_progress(symbol: str, location: str, reason: str) -> None:
+def _raise_recovery_in_progress(
+    symbol: str,
+    location: str,
+    reason: str,
+    *,
+    throttle_key: Optional[str] = None,
+) -> None:
     msg = f"[{symbol}] {location}: {reason}"
-    key = f"{symbol}|{location}|{reason}"
+    key = throttle_key if throttle_key is not None else f"{symbol}|{location}|{reason}"
     _log_recovery_once(key, msg)
     raise FeatureBuildError(msg)
 
@@ -520,6 +534,80 @@ def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dic
         "orderbook_warnings": cleaned_orderbook_warnings,
         "orderbook_reasons": cleaned_orderbook_reasons,
     }
+
+
+def _validate_live_ws_status_contract(symbol: str, ws_status: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(ws_status, dict):
+        _fail(symbol, "ws_status", "get_ws_status 결과가 dict 가 아닙니다. (STRICT)")
+
+    ws_state_raw = ws_status.get("state")
+    if not isinstance(ws_state_raw, str) or not ws_state_raw.strip():
+        _fail(symbol, "ws_status", "ws_status.state must be non-empty str (STRICT)")
+    ws_state = ws_state_raw.strip().upper()
+    if ws_state not in ("OPEN", "OPENING", "RECONNECTING", "CLOSED"):
+        _fail(symbol, "ws_status", f"ws_status.state invalid (STRICT): {ws_state!r}")
+
+    reconnect_requested = ws_status.get("reconnect_requested")
+    if not isinstance(reconnect_requested, bool):
+        _fail(symbol, "ws_status", "ws_status.reconnect_requested must be bool (STRICT)")
+
+    reconnect_request_reason = ws_status.get("reconnect_request_reason")
+    if reconnect_request_reason is not None:
+        if not isinstance(reconnect_request_reason, str) or not reconnect_request_reason.strip():
+            _fail(
+                symbol,
+                "ws_status",
+                "ws_status.reconnect_request_reason must be non-empty str when present (STRICT)",
+            )
+        reconnect_request_reason = reconnect_request_reason.strip()
+
+    circuit_breaker_open = ws_status.get("circuit_breaker_open")
+    if not isinstance(circuit_breaker_open, bool):
+        _fail(symbol, "ws_status", "ws_status.circuit_breaker_open must be bool (STRICT)")
+
+    transport_ok = ws_status.get("transport_ok")
+    if not isinstance(transport_ok, bool):
+        _fail(symbol, "ws_status", "ws_status.transport_ok must be bool (STRICT)")
+
+    market_feed_ok = ws_status.get("market_feed_ok")
+    if not isinstance(market_feed_ok, bool):
+        _fail(symbol, "ws_status", "ws_status.market_feed_ok must be bool (STRICT)")
+
+    return {
+        "ws_state": ws_state,
+        "ws_reconnect_requested": bool(reconnect_requested),
+        "ws_reconnect_request_reason": reconnect_request_reason,
+        "circuit_breaker_open": bool(circuit_breaker_open),
+        "ws_transport_ok": bool(transport_ok),
+        "ws_market_feed_ok": bool(market_feed_ok),
+    }
+
+
+def _get_live_ws_recovery_state(symbol: str) -> Dict[str, Any]:
+    try:
+        ws_status = get_ws_status(symbol)
+    except FeatureBuildError:
+        raise
+    except Exception as e:
+        _fail(symbol, "ws_status", f"get_ws_status 예외: {e}")
+    return _validate_live_ws_status_contract(symbol, ws_status)
+
+
+def _build_ws_recovery_reason_suffix(
+    *,
+    ws_state: str,
+    reconnect_requested: bool,
+    reconnect_request_reason: Optional[str],
+    circuit_breaker_open: bool,
+) -> str:
+    parts: List[str] = [
+        f"ws_state={ws_state}",
+        f"reconnect_requested={reconnect_requested}",
+        f"circuit_breaker_open={circuit_breaker_open}",
+    ]
+    if isinstance(reconnect_request_reason, str) and reconnect_request_reason:
+        parts.append(f"reconnect_reason={reconnect_request_reason}")
+    return ", ".join(parts)
 
 
 def _validate_ws_ohlcv_buffer_strict(
@@ -1128,20 +1216,34 @@ def _compute_orderbook_features(
     payload_ts = ob_status.get("payload_ts")
 
     if ob is None:
+        live_ws = _get_live_ws_recovery_state(symbol)
+        live_ws_state = str(live_ws["ws_state"]).upper()
+        live_ws_reconnect_requested = bool(live_ws["ws_reconnect_requested"])
+        live_ws_reconnect_request_reason = live_ws["ws_reconnect_request_reason"]
+        live_circuit_breaker_open = bool(live_ws["circuit_breaker_open"])
+
+        reason_suffix = _build_ws_recovery_reason_suffix(
+            ws_state=live_ws_state,
+            reconnect_requested=live_ws_reconnect_requested,
+            reconnect_request_reason=live_ws_reconnect_request_reason,
+            circuit_breaker_open=live_circuit_breaker_open,
+        )
+
         if (
-            ws_state in ("OPENING", "RECONNECTING")
+            live_ws_state in ("OPENING", "RECONNECTING")
+            or live_ws_reconnect_requested
+            or live_circuit_breaker_open
+            or ws_state in ("OPENING", "RECONNECTING")
             or ws_reconnect_requested
             or "feed:startup_no_orderbook_yet" in orderbook_warnings
             or "feed:opening_no_orderbook_yet" in orderbook_warnings
         ):
-            reason_suffix = ""
-            if isinstance(ws_reconnect_request_reason, str) and ws_reconnect_request_reason:
-                reason_suffix = f", reconnect_reason={ws_reconnect_request_reason}"
             _raise_recovery_in_progress(
                 symbol,
                 "orderbook",
                 "WS recovery/startup in progress and orderbook snapshot is not ready yet "
-                f"(ws_state={ws_state}, reconnect_requested={ws_reconnect_requested}{reason_suffix})",
+                f"({reason_suffix})",
+                throttle_key=f"{symbol}|orderbook|recovery_missing_snapshot",
             )
 
         if recv_ts is None and payload_ts is None:
@@ -1149,12 +1251,14 @@ def _compute_orderbook_features(
                 symbol,
                 "orderbook",
                 "orderbook snapshot missing without recovery context (STRICT)",
+                throttle_key=f"{symbol}|orderbook|missing_snapshot",
             )
 
         _fail(
             symbol,
             "orderbook",
             "orderbook snapshot missing despite orderbook status timestamps (STRICT)",
+            throttle_key=f"{symbol}|orderbook|missing_snapshot_with_timestamps",
         )
 
     if not isinstance(ob, dict):
@@ -1167,13 +1271,15 @@ def _compute_orderbook_features(
         _fail(
             symbol,
             "orderbook",
-            "depth5 bids 스냅샷을 가져오지 못했습니다. WS 구독에 '@depth5' 가 포함되어 있는지 확인해 주세요.",
+            "오더북 bids 스냅샷을 가져오지 못했습니다. WS orderbook 구독 상태를 확인해 주세요.",
+            throttle_key=f"{symbol}|orderbook|missing_bids",
         )
     if not isinstance(asks, list) or not asks:
         _fail(
             symbol,
             "orderbook",
-            "depth5 asks 스냅샷을 가져오지 못했습니다. WS 구독에 '@depth5' 가 포함되어 있는지 확인해 주세요.",
+            "오더북 asks 스냅샷을 가져오지 못했습니다. WS orderbook 구독 상태를 확인해 주세요.",
+            throttle_key=f"{symbol}|orderbook|missing_asks",
         )
 
     ts_ms: Optional[int] = None
@@ -1189,25 +1295,44 @@ def _compute_orderbook_features(
             symbol,
             "orderbook",
             "오더북 스냅샷 timestamp(exchTs/ts)가 없습니다. timestamp 누락을 현재 시각으로 대체하지 않습니다.",
+            throttle_key=f"{symbol}|orderbook|missing_timestamp",
         )
 
     age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)
     if age_sec > ORDERBOOK_MAX_DELAY_SEC:
-        if ws_state in ("OPENING", "RECONNECTING") or ws_reconnect_requested:
-            reason_suffix = ""
-            if isinstance(ws_reconnect_request_reason, str) and ws_reconnect_request_reason:
-                reason_suffix = f", reconnect_reason={ws_reconnect_request_reason}"
+        live_ws = _get_live_ws_recovery_state(symbol)
+        live_ws_state = str(live_ws["ws_state"]).upper()
+        live_ws_reconnect_requested = bool(live_ws["ws_reconnect_requested"])
+        live_ws_reconnect_request_reason = live_ws["ws_reconnect_request_reason"]
+        live_circuit_breaker_open = bool(live_ws["circuit_breaker_open"])
+
+        reason_suffix = _build_ws_recovery_reason_suffix(
+            ws_state=live_ws_state,
+            reconnect_requested=live_ws_reconnect_requested,
+            reconnect_request_reason=live_ws_reconnect_request_reason,
+            circuit_breaker_open=live_circuit_breaker_open,
+        )
+
+        if (
+            live_ws_state in ("OPENING", "RECONNECTING")
+            or live_ws_reconnect_requested
+            or live_circuit_breaker_open
+            or ws_state in ("OPENING", "RECONNECTING")
+            or ws_reconnect_requested
+        ):
             _raise_recovery_in_progress(
                 symbol,
                 "orderbook",
                 "stale orderbook snapshot observed during WS recovery "
-                f"(age_sec={age_sec:.1f}, ws_state={ws_state}, reconnect_requested={ws_reconnect_requested}{reason_suffix})",
+                f"(age_sec={age_sec:.1f}, {reason_suffix})",
+                throttle_key=f"{symbol}|orderbook|recovery_stale_snapshot",
             )
 
         _fail(
             symbol,
             "orderbook",
             f"오더북 스냅샷이 {age_sec:.1f}초 동안 갱신되지 않았습니다 (허용 최대 {ORDERBOOK_MAX_DELAY_SEC:.1f}초).",
+            throttle_key=f"{symbol}|orderbook|stale_snapshot",
         )
 
     best_bid = _require_finite_float(symbol, "orderbook", "best_bid", bids[0][0], positive=True)
@@ -1246,6 +1371,8 @@ def _compute_orderbook_features(
     mark_price = _strict_optional_float(symbol, "orderbook", "markPrice", ob.get("markPrice"))
     last_price = _strict_optional_float(symbol, "orderbook", "lastPrice", ob.get("lastPrice"))
 
+    live_ws_runtime = _get_live_ws_recovery_state(symbol)
+
     return {
         "ts_ms": ts_ms,
         "age_sec": age_sec,
@@ -1262,8 +1389,10 @@ def _compute_orderbook_features(
         "recv_delay_ms": ob_status.get("recv_delay_ms"),
         "payload_delay_ms": ob_status.get("payload_delay_ms"),
         "last_update_id": ob_status.get("last_update_id"),
-        "ws_state": ws_state,
-        "ws_reconnect_requested": ws_reconnect_requested,
+        "ws_state": live_ws_runtime["ws_state"],
+        "ws_reconnect_requested": live_ws_runtime["ws_reconnect_requested"],
+        "ws_reconnect_request_reason": live_ws_runtime["ws_reconnect_request_reason"],
+        "circuit_breaker_open": live_ws_runtime["circuit_breaker_open"],
     }
 
 
