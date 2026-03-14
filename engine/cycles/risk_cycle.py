@@ -10,6 +10,7 @@ CORE RESPONSIBILITIES:
 - entry packet 소비
 - ws hard entry guards 수행
 - regime / account state / EV heatmap 계산
+- meta strategy recommendation 생성 및 risk overlay 적용
 - risk physics 결정
 - hard risk guard 승인
 - execution layer 로 넘길 finalized signal packet 생성
@@ -21,8 +22,17 @@ IMPORTANT POLICY:
 - hard risk / data integrity / invariant 위반은 즉시 예외 또는 명시적 SKIP 처리
 - hidden default / silent continue / 예외 삼키기 금지
 - risk cycle 은 주문 실행을 직접 수행하지 않는다
+- Meta Strategy(레벨3)는 recommendation 생성만이 아니라 risk overlay로 실제 반영되어야 한다
+- Meta recommendation 생성/적용 실패는 조용히 무시하지 않고 즉시 예외 또는 SAFE_STOP 처리한다
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FEAT(META-L3): MetaStrategyEngine + MetaRiskAdjuster 를 runtime risk cycle 에 정식 연결
+  2) FEAT(META-L3): active recommendation TTL / refresh state 추가
+  3) FEAT(META-L3): meta guard adjustments 를 entry guards 설정 overlay 로 반영
+  4) FEAT(META-L3): final allocation_ratio 를 meta overlay 로 재계산하고 audit blob 을 signal.meta 에 기록
+  5) FIX(STRICT): meta recommendation 만료/refresh 실패를 명시적 예외로 승격
+  6) FIX(STRICT): candidate.guard_adjustments 와 meta guard adjustments 병합 시 충돌을 즉시 차단
 - 2026-03-12:
   1) FIX(ROOT-CAUSE): build_risk_cycle_context_or_raise 누락/유실 상태 복구
   2) FIX(ROOT-CAUSE): helper 정의 순서/배치를 정리해 import 안정성 복구
@@ -35,16 +45,39 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from infra.telelog import log, send_tg
-from infra.async_worker import submit as submit_async
-from infra.market_data_ws import get_klines_with_volume as ws_get_klines_with_volume
 from execution.exchange_api import get_available_usdt, get_balance_detail
+from execution.invariant_guard import (
+    InvariantViolation,
+    SignalInvariantInputs,
+    validate_signal_invariants_strict,
+)
 from execution.risk_manager import hard_risk_guard_check
 from execution.risk_physics_engine import RiskPhysicsEngine
-from execution.invariant_guard import InvariantViolation, SignalInvariantInputs, validate_signal_invariants_strict
+from infra.async_worker import submit as submit_async
+from infra.market_data_ws import get_klines_with_volume as ws_get_klines_with_volume
+from infra.telelog import log, send_tg
+from meta.meta_prompt_builder import MetaPromptConfig
+from meta.meta_risk_adjuster import (
+    MetaApplyConfigError,
+    MetaApplyContractError,
+    MetaApplyStateError,
+    apply_allocation_ratio_from_recommendation,
+    build_guard_adjustments_from_recommendation,
+    build_meta_l3_audit_blob,
+)
+from meta.meta_stats_aggregator import MetaStatsConfig
+from meta.meta_strategy_engine import (
+    MetaRecommendation,
+    MetaStrategyConfig,
+    MetaStrategyConfigError,
+    MetaStrategyContractError,
+    MetaStrategyEngine,
+    MetaStrategyExternalError,
+    MetaStrategyStateError,
+)
 from risk.entry_guards_ws import (
     check_5m_delay_guard,
     check_manual_position_guard,
@@ -61,11 +94,11 @@ from strategy.ev_heatmap_engine import EvHeatmapEngine, HeatmapKey
 from strategy.regime_engine import RegimeEngine
 from strategy.signal import Signal
 
-from engine.engine_loop import EngineLoopRuntime
 from engine.cycles.entry_cycle import (
     EntryCyclePacket,
     consume_pending_entry_packet_or_none,
 )
+from engine.engine_loop import EngineLoopRuntime
 
 PENDING_RISK_PACKET_KEY: str = "pending_risk_packet"
 
@@ -186,12 +219,20 @@ class RiskCycleState:
     persisted_equity_peak_usdt: Optional[float] = None
     last_risk_block_tg_ts: float = 0.0
     last_risk_block_key: str = ""
+    active_meta_recommendation: Optional[MetaRecommendation] = None
+    active_meta_expires_ts: float = 0.0
+    last_meta_refresh_ts: float = 0.0
 
     def validate_or_raise(self) -> None:
         _require_optional_positive_float(self.persisted_equity_peak_usdt, "state.persisted_equity_peak_usdt")
         _require_float(self.last_risk_block_tg_ts, "state.last_risk_block_tg_ts", min_value=0.0)
+        _require_float(self.active_meta_expires_ts, "state.active_meta_expires_ts", min_value=0.0)
+        _require_float(self.last_meta_refresh_ts, "state.last_meta_refresh_ts", min_value=0.0)
+
         if not isinstance(self.last_risk_block_key, str):
             raise RiskCycleContractError("state.last_risk_block_key must be str (STRICT)")
+        if self.active_meta_recommendation is not None and not isinstance(self.active_meta_recommendation, MetaRecommendation):
+            raise RiskCycleContractError("state.active_meta_recommendation must be MetaRecommendation or None (STRICT)")
 
 
 @dataclass(frozen=True)
@@ -219,6 +260,7 @@ class RiskCycleContext:
     account_builder: AccountStateBuilder
     ev_heatmap: EvHeatmapEngine
     risk_physics: RiskPhysicsEngine
+    meta_engine: MetaStrategyEngine
     closed_trades_getter: Callable[[], Iterable[Dict[str, Any]]]
     config: RiskCycleConfig
     state: RiskCycleState
@@ -236,6 +278,8 @@ class RiskCycleContext:
             raise RiskCycleContractError("context.ev_heatmap must be EvHeatmapEngine (STRICT)")
         if not isinstance(self.risk_physics, RiskPhysicsEngine):
             raise RiskCycleContractError("context.risk_physics must be RiskPhysicsEngine (STRICT)")
+        if not isinstance(self.meta_engine, MetaStrategyEngine):
+            raise RiskCycleContractError("context.meta_engine must be MetaStrategyEngine (STRICT)")
         if not callable(self.closed_trades_getter):
             raise RiskCycleContractError("context.closed_trades_getter is required (STRICT)")
 
@@ -252,10 +296,63 @@ class RiskCycleContext:
             "hard_liquidation_distance_pct_min",
             "test_dry_run",
             "test_fake_available_usdt",
+            "meta_lookback_trades",
+            "meta_recent_window",
+            "meta_baseline_window",
+            "meta_min_trades_required",
+            "meta_max_recent_trades",
+            "meta_language",
+            "meta_max_output_sentences",
+            "meta_prompt_version",
+            "meta_cooldown_sec",
+            "meta_max_rationale_sentences",
+            "meta_max_rationale_len",
+            "allocation_ratio",
+            "max_spread_pct",
+            "max_price_jump_pct",
+            "min_entry_volume_ratio",
         )
         for name in required_setting_names:
             if not hasattr(self.settings, name):
                 raise RiskCycleContractError(f"settings.{name} is required (STRICT)")
+
+
+def _build_meta_strategy_engine_or_raise(settings: Any, symbol: str) -> MetaStrategyEngine:
+    if settings is None:
+        raise RiskCycleContractError("settings is required for meta engine (STRICT)")
+
+    try:
+        stats_cfg = MetaStatsConfig(
+            symbol=_normalize_symbol_strict(symbol),
+            lookback_trades=_require_int(_require_attr(settings, "meta_lookback_trades", "settings"), "settings.meta_lookback_trades", min_value=1),
+            recent_window=_require_int(_require_attr(settings, "meta_recent_window", "settings"), "settings.meta_recent_window", min_value=1),
+            baseline_window=_require_int(_require_attr(settings, "meta_baseline_window", "settings"), "settings.meta_baseline_window", min_value=1),
+            min_trades_required=_require_int(_require_attr(settings, "meta_min_trades_required", "settings"), "settings.meta_min_trades_required", min_value=1),
+            exclude_test_trades=True,
+        )
+        prompt_cfg = MetaPromptConfig(
+            max_recent_trades=_require_int(_require_attr(settings, "meta_max_recent_trades", "settings"), "settings.meta_max_recent_trades", min_value=1),
+            language=_require_nonempty_str(_require_attr(settings, "meta_language", "settings"), "settings.meta_language"),
+            max_output_sentences=_require_int(_require_attr(settings, "meta_max_output_sentences", "settings"), "settings.meta_max_output_sentences", min_value=1),
+            prompt_version=_require_nonempty_str(_require_attr(settings, "meta_prompt_version", "settings"), "settings.meta_prompt_version"),
+        )
+        cfg = MetaStrategyConfig(
+            stats_cfg=stats_cfg,
+            prompt_cfg=prompt_cfg,
+            cooldown_sec=_require_int(_require_attr(settings, "meta_cooldown_sec", "settings"), "settings.meta_cooldown_sec", min_value=1),
+        )
+        return MetaStrategyEngine(cfg)
+    except (
+        MetaStrategyConfigError,
+        MetaStrategyContractError,
+        MetaStrategyStateError,
+        MetaApplyConfigError,
+        MetaApplyContractError,
+        MetaApplyStateError,
+    ) as e:
+        raise RiskCycleContractError(f"meta strategy engine build failed (STRICT): {e}") from e
+    except Exception as e:
+        raise RiskCycleContractError(f"meta strategy engine build failed (STRICT): {e}") from e
 
 
 def build_risk_cycle_context_or_raise(
@@ -269,13 +366,17 @@ def build_risk_cycle_context_or_raise(
     closed_trades_getter: Callable[[], Iterable[Dict[str, Any]]],
     persisted_equity_peak_usdt: Optional[float],
 ) -> RiskCycleContext:
+    normalized_symbol = _normalize_symbol_strict(symbol)
+    meta_engine = _build_meta_strategy_engine_or_raise(settings, normalized_symbol)
+
     ctx = RiskCycleContext(
         settings=settings,
-        symbol=_normalize_symbol_strict(symbol),
+        symbol=normalized_symbol,
         regime_engine=regime_engine,
         account_builder=account_builder,
         ev_heatmap=ev_heatmap,
         risk_physics=risk_physics,
+        meta_engine=meta_engine,
         closed_trades_getter=closed_trades_getter,
         config=RiskCycleConfig(
             risk_block_tg_cooldown_sec=60,
@@ -295,6 +396,133 @@ def build_risk_cycle_fn(ctx: RiskCycleContext) -> Callable[[float, EngineLoopRun
         run_risk_cycle_or_raise(now_ts, runtime, ctx)
 
     return _fn
+
+
+def _resolve_active_meta_recommendation_or_raise(
+    *,
+    ctx: RiskCycleContext,
+    now_ts: float,
+    symbol: str,
+) -> MetaRecommendation:
+    ctx.validate_or_raise()
+    now_f = _require_float(now_ts, "now_ts", min_value=0.0)
+    _ = _normalize_symbol_strict(symbol, name="symbol")
+
+    active = ctx.state.active_meta_recommendation
+    if active is not None:
+        if now_f <= float(ctx.state.active_meta_expires_ts):
+            return active
+
+        cooldown_sec = _require_int(
+            _require_attr(ctx.settings, "meta_cooldown_sec", "settings"),
+            "settings.meta_cooldown_sec",
+            min_value=1,
+        )
+        elapsed = now_f - float(ctx.state.last_meta_refresh_ts)
+        if elapsed < float(cooldown_sec):
+            raise RiskCycleError(
+                f"[SAFE_STOP][META_EXPIRED] recommendation expired before cooldown elapsed "
+                f"(elapsed={elapsed:.2f}s cooldown={cooldown_sec}s symbol={symbol})"
+            )
+
+    try:
+        rec = ctx.meta_engine.run_once()
+    except (
+        MetaStrategyConfigError,
+        MetaStrategyContractError,
+        MetaStrategyStateError,
+        MetaStrategyExternalError,
+    ) as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_ENGINE] {e}") from e
+    except Exception as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_ENGINE] unexpected failure: {e}") from e
+
+    if not isinstance(rec, MetaRecommendation):
+        raise RiskCycleContractError("meta_engine.run_once() must return MetaRecommendation (STRICT)")
+
+    ctx.state.active_meta_recommendation = rec
+    ctx.state.last_meta_refresh_ts = now_f
+    ctx.state.active_meta_expires_ts = now_f + float(_require_int(rec.ttl_sec, "rec.ttl_sec", min_value=1))
+    return rec
+
+
+def _enforce_meta_direction_policy_or_raise(
+    *,
+    runtime: EngineLoopRuntime,
+    rec: MetaRecommendation,
+    direction: str,
+) -> None:
+    _ = _require_nonempty_str(direction, "direction").upper()
+
+    if rec.action == "RECOMMEND_SAFE_STOP":
+        runtime.safe_stop_requested = True
+        raise RiskCycleError(
+            f"[SAFE_STOP][META_L3] action=RECOMMEND_SAFE_STOP rationale={rec.rationale_short}"
+        )
+
+    if direction in rec.disable_directions:
+        raise RiskCycleSkip(
+            f"meta_l3 disabled direction={direction} action={rec.action} rationale={rec.rationale_short}"
+        )
+
+
+def _apply_meta_guard_adjustments_to_settings_or_raise(
+    settings: Any,
+    guard_adjustments: Dict[str, float],
+) -> Any:
+    if settings is None:
+        raise RiskCycleContractError("settings is required for guard overlay (STRICT)")
+    if not isinstance(guard_adjustments, dict):
+        raise RiskCycleContractError("guard_adjustments must be dict (STRICT)")
+    if not is_dataclass(settings):
+        raise RiskCycleContractError("settings must be dataclass instance for guard overlay (STRICT)")
+
+    max_spread_pct = _require_float(
+        _require_dict_key(guard_adjustments, "max_spread_pct", "guard_adjustments"),
+        "guard_adjustments.max_spread_pct",
+        min_value=0.0,
+    )
+    max_price_jump_pct = _require_float(
+        _require_dict_key(guard_adjustments, "max_price_jump_pct", "guard_adjustments"),
+        "guard_adjustments.max_price_jump_pct",
+        min_value=0.0,
+    )
+    min_entry_volume_ratio = _require_float(
+        _require_dict_key(guard_adjustments, "min_entry_volume_ratio", "guard_adjustments"),
+        "guard_adjustments.min_entry_volume_ratio",
+        min_value=0.0,
+    )
+
+    try:
+        return replace(
+            settings,
+            max_spread_pct=float(max_spread_pct),
+            max_price_jump_pct=float(max_price_jump_pct),
+            min_entry_volume_ratio=float(min_entry_volume_ratio),
+        )
+    except Exception as e:
+        raise RiskCycleContractError(f"failed to overlay meta guard adjustments into settings (STRICT): {e}") from e
+
+
+def _merge_guard_adjustments_strict(
+    base_adjustments: Dict[str, Any],
+    overlay_adjustments: Dict[str, float],
+) -> Dict[str, Any]:
+    base = _require_dict(base_adjustments, "base_guard_adjustments")
+    overlay = _require_dict(overlay_adjustments, "overlay_guard_adjustments")
+
+    out = dict(base)
+    for key, value in overlay.items():
+        new_value = _require_float(value, f"overlay_guard_adjustments[{key}]", min_value=0.0)
+        if key in out:
+            old_value = _require_float(out[key], f"base_guard_adjustments[{key}]", min_value=0.0)
+            if abs(float(old_value) - float(new_value)) > 1e-12:
+                raise RiskCycleContractError(
+                    f"guard_adjustments conflict on key={key!r} "
+                    f"(base={old_value}, overlay={new_value}) (STRICT)"
+                )
+        out[key] = float(new_value)
+    return out
 
 
 def run_risk_cycle_or_raise(
@@ -325,9 +553,43 @@ def run_risk_cycle_or_raise(
     signal_source = _require_nonempty_str(_require_dict_key(market_data, "signal_source", "market_data"), "market_data.signal_source")
     signal_ts_ms = _require_int_ms(_require_dict_key(market_data, "signal_ts_ms", "market_data"), "market_data.signal_ts_ms")
 
+    meta_rec = _resolve_active_meta_recommendation_or_raise(
+        ctx=ctx,
+        now_ts=now_f,
+        symbol=symbol,
+    )
+
+    try:
+        _enforce_meta_direction_policy_or_raise(
+            runtime=runtime,
+            rec=meta_rec,
+            direction=direction,
+        )
+    except RiskCycleSkip as e:
+        msg = f"[SKIP][META_L3] {e}"
+        log(msg)
+        _maybe_send_risk_block_tg(ctx, "META_L3_SKIP", msg)
+        return
+
+    try:
+        meta_guard_adjustments = build_guard_adjustments_from_recommendation(ctx.settings, meta_rec)
+    except (
+        MetaApplyConfigError,
+        MetaApplyContractError,
+        MetaApplyStateError,
+    ) as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_APPLY_GUARDS] {e}") from e
+    except Exception as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_APPLY_GUARDS] unexpected failure: {e}") from e
+
+    entry_guard_settings = _apply_meta_guard_adjustments_to_settings_or_raise(
+        ctx.settings,
+        meta_guard_adjustments,
+    )
+
     try:
         _run_entry_guards_or_skip(
-            settings=ctx.settings,
+            settings=entry_guard_settings,
             symbol=symbol,
             direction=direction,
             signal_source=signal_source,
@@ -428,13 +690,48 @@ def run_risk_cycle_or_raise(
         _maybe_send_risk_block_tg(ctx, "RISK_PHYSICS_SKIP", msg)
         return
 
-    effective_risk_pct = _require_float(
+    base_effective_risk_pct = _require_float(
         _require_attr(risk_decision, "effective_risk_pct", "risk_decision"),
         "risk_decision.effective_risk_pct",
         min_value=0.0,
     )
-    if effective_risk_pct <= 0.0:
+    if base_effective_risk_pct <= 0.0:
         raise RiskCycleContractError("ENTER decision must have effective_risk_pct > 0 (STRICT)")
+
+    try:
+        effective_risk_pct = apply_allocation_ratio_from_recommendation(
+            base_allocation_ratio=float(base_effective_risk_pct),
+            rec=meta_rec,
+        )
+    except (
+        MetaApplyConfigError,
+        MetaApplyContractError,
+        MetaApplyStateError,
+    ) as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_APPLY_ALLOC] {e}") from e
+    except Exception as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_APPLY_ALLOC] unexpected failure: {e}") from e
+
+    if effective_risk_pct <= 0.0:
+        msg = f"[SKIP][META_L3_ZERO_ALLOC] action={meta_rec.action} rationale={meta_rec.rationale_short}"
+        log(msg)
+        _maybe_send_risk_block_tg(ctx, "META_L3_ZERO_ALLOC", msg)
+        return
+
+    try:
+        meta_audit_blob = build_meta_l3_audit_blob(
+            meta_rec,
+            base_allocation_ratio=float(base_effective_risk_pct),
+            final_allocation_ratio=float(effective_risk_pct),
+        )
+    except (
+        MetaApplyConfigError,
+        MetaApplyContractError,
+        MetaApplyStateError,
+    ) as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_AUDIT] {e}") from e
+    except Exception as e:
+        raise RiskCycleError(f"[SAFE_STOP][META_AUDIT] unexpected failure: {e}") from e
 
     entry_price_hint, entry_price_source = _resolve_entry_price_hint_for_signal_or_raise(
         market_data,
@@ -480,7 +777,7 @@ def run_risk_cycle_or_raise(
                 sl_pct=float(sl_pct),
                 dd_pct=float(account_state.dd_pct),
                 micro_score_risk=float(micro_score_risk),
-                final_risk_multiplier=None,
+                final_risk_multiplier=float(meta_rec.final_risk_multiplier),
                 equity_current_usdt=float(account_state.equity_current_usdt),
                 equity_peak_usdt=float(account_state.equity_peak_usdt),
             )
@@ -489,6 +786,15 @@ def run_risk_cycle_or_raise(
         raise RiskCycleError(f"[SAFE_STOP][INVARIANT] {e}") from e
 
     raw_meta = _require_dict(_require_attr(candidate, "meta", "candidate"), "candidate.meta")
+    candidate_guard_adjustments = _require_dict(
+        _require_attr(candidate, "guard_adjustments", "candidate"),
+        "candidate.guard_adjustments",
+    )
+    merged_guard_adjustments = _merge_guard_adjustments_strict(
+        candidate_guard_adjustments,
+        meta_guard_adjustments,
+    )
+
     meta2 = dict(raw_meta)
     _purge_signal_execution_price_aliases_inplace(meta2)
     meta2.update(
@@ -502,6 +808,7 @@ def run_risk_cycle_or_raise(
             "risk_physics_reason": str(_require_attr(risk_decision, "reason", "risk_decision")),
             "dynamic_allocation_ratio": float(effective_risk_pct),
             "dynamic_risk_pct": float(effective_risk_pct),
+            "risk_physics_effective_risk_pct": float(base_effective_risk_pct),
             "regime_score": float(_require_attr(regime_decision, "score", "regime_decision")),
             "regime_band": str(regime_band),
             "regime_allocation": float(regime_allocation),
@@ -519,6 +826,18 @@ def run_risk_cycle_or_raise(
             "hard_risk_extra": dict(hard_extra),
             "available_usdt": float(available_usdt),
             "planned_incoming_notional": float(incoming_notional),
+            "meta_l3_action": str(meta_rec.action),
+            "meta_l3_severity": int(meta_rec.severity),
+            "meta_l3_tags": list(meta_rec.tags),
+            "meta_l3_confidence": float(meta_rec.confidence),
+            "meta_l3_ttl_sec": int(meta_rec.ttl_sec),
+            "meta_l3_disable_directions": list(meta_rec.disable_directions),
+            "meta_l3_guard_multipliers": dict(meta_rec.guard_multipliers),
+            "meta_l3_base_allocation_ratio": float(base_effective_risk_pct),
+            "meta_l3_final_allocation_ratio": float(effective_risk_pct),
+            "meta_l3_audit": dict(meta_audit_blob),
+            "meta_l3_guard_adjustments": dict(meta_guard_adjustments),
+            "meta_l3_rationale_short": str(meta_rec.rationale_short),
         }
     )
 
@@ -529,7 +848,7 @@ def run_risk_cycle_or_raise(
         sl_pct=float(sl_pct),
         risk_pct=float(effective_risk_pct),
         reason=str(_require_attr(candidate, "reason", "candidate")),
-        guard_adjustments=dict(_require_attr(candidate, "guard_adjustments", "candidate")),
+        guard_adjustments=dict(merged_guard_adjustments),
         meta=meta2,
     )
 

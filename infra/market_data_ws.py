@@ -15,6 +15,7 @@ CORE RESPONSIBILITIES:
 - WS 세션 상태 / market-data freshness / orderbook payload 무결성 관측성 제공
 - dashboard 가 직접 사용할 수 있는 WS telemetry snapshot 제공
 - strategy / execution / exit 책임과 완전 분리
+- 반복 WS 장애를 circuit breaker 상태로 승격해 운영 불가 상태를 상위로 명시 노출한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -27,8 +28,15 @@ IMPORTANT POLICY:
 - WS primary feed 의 DB 저장 실패는 치명적 오류로 간주하며 세션을 종료/재연결한다
 - orderbook DB timestamp 는 반드시 거래소 이벤트 시각(E/T)을 사용한다
 - 계좌/포지션 데이터는 이 파일 책임이 아니다. dashboard telemetry 는 시장데이터 전용으로만 제공한다
+- 반복 transport/protocol/feed 장애는 circuit breaker 로 누적/승격해야 하며, 단발 장애와 구분되어야 한다
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FEAT(CIRCUIT-BREAKER): 반복 WS transport/protocol/feed-stale 장애를 연속 실패로 누적하고 breaker open 상태를 추가
+  2) FEAT(CIRCUIT-BREAKER): run_forever 반복 종료 / protocol_error / decode_error / orderbook feed gap 을 circuit breaker failure source 로 승격
+  3) FEAT(OBSERVABILITY): ws_status / health_snapshot / dashboard telemetry 에 circuit breaker 상태/사유/trip_count 노출 추가
+  4) FIX(RECOVERY): circuit breaker open 중에는 즉시 재접속 루프를 멈추고 cool-down 이후 재시도하도록 수정
+  5) FIX(STRICT): successful on_open 시 circuit breaker 연속 실패 카운터를 명시적으로 reset
 - 2026-03-13:
   1) FIX(ROOT-CAUSE): ws_status.state 를 OPEN / OPENING / RECONNECTING / CLOSED 계약으로 명시
   2) FIX(ROOT-CAUSE): reconnect grace 동안 connection_not_open 을 즉시 transport fail 로 승격하지 않도록 수정
@@ -39,6 +47,10 @@ CHANGE HISTORY:
   7) FIX(CONTRACT): quote_volume rollback 추적 상태 추가
   8) FIX(ROOT-CAUSE): 최신 버퍼보다 과거 ts kline packet 은 stale packet 으로 간주하고 무시
   9) FIX(ROOT-CAUSE): 누락된 _derive_rest_kline_closed_strict 복원 및 REST closed-state 계약 일관화
+  10) FIX(ROOT-CAUSE): orderbook feed inactivity 가 stale threshold를 초과하면 WS 세션 강제 재연결 요청
+  11) FIX(RECOVERY): forced reconnect / ws close 시 stale orderbook runtime state 즉시 제거
+  12) FIX(OBSERVABILITY): ws_status 에 reconnect_requested / reconnect_request_reason 노출 추가
+  13) FIX(RECOVERY): 현재 활성 WebSocketApp 레지스트리 추가로 health path 에서 안전한 close/reconnect 가능화
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): Binance multiplex WS 에서 pong callback 부재를 transport failure 로 오판하던 문제 제거
   2) FIX(TRADE-GRADE): WS transport health 는 connection_open 기준으로만 판단하고 market-data activity 는 별도 warning 으로 유지
@@ -438,6 +450,10 @@ PONG_STARTUP_GRACE_SEC: float = _require_positive_float(
 )
 _WS_RECONNECT_GRACE_SEC: float = max(5.0, MARKET_EVENT_MAX_DELAY_SEC)
 
+# Circuit breaker는 settings 추가 없이 기존 SSOT timing 값으로만 운영 강도를 계산한다.
+_WS_CIRCUIT_BREAKER_CONFIRM_N: int = 3
+_WS_CIRCUIT_BREAKER_COOLDOWN_SEC: float = max(_WS_RECONNECT_GRACE_SEC, MARKET_EVENT_MAX_DELAY_SEC)
+
 _LONG_TF_MIN_BUFFER_DEFAULT: int = _require_positive_int(
     SET.ws_min_kline_buffer_long_tf,
     "ws_min_kline_buffer_long_tf",
@@ -489,7 +505,17 @@ _ws_last_close_text: Dict[str, str] = {}
 _ws_last_message_ts: Dict[str, int] = {}
 _ws_last_pong_ts: Dict[str, int] = {}
 _ws_last_error_text: Dict[str, str] = {}
+_ws_current_app: Dict[str, websocket.WebSocketApp] = {}
+_ws_reconnect_request_ts: Dict[str, int] = {}
+_ws_reconnect_request_reason: Dict[str, str] = {}
 _ws_state_lock = threading.Lock()
+
+# Circuit breaker runtime state
+_ws_cb_consecutive_failures: Dict[str, int] = {}
+_ws_cb_open_until_ts: Dict[str, int] = {}
+_ws_cb_last_reason: Dict[str, str] = {}
+_ws_cb_trip_count: Dict[str, int] = {}
+_ws_cb_lock = threading.Lock()
 
 _kline_lock = threading.Lock()
 _orderbook_lock = threading.Lock()
@@ -523,6 +549,8 @@ def _mark_ws_open(symbol: str, opened_at_ms: int) -> None:
         _ws_last_message_ts.pop(sym, None)
         _ws_last_pong_ts.pop(sym, None)
         _ws_last_error_text.pop(sym, None)
+        _ws_reconnect_request_ts.pop(sym, None)
+        _ws_reconnect_request_reason.pop(sym, None)
 
 
 def _mark_ws_closed(symbol: str, closed_at_ms: int, *, code: Any, msg: Any) -> None:
@@ -558,6 +586,164 @@ def _mark_ws_error(symbol: str, error: Any) -> None:
     msg = _truncate_text(error)
     with _ws_state_lock:
         _ws_last_error_text[sym] = msg
+
+
+def _clear_orderbook_runtime_state(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for orderbook runtime clear")
+    with _orderbook_lock:
+        _orderbook_last_update_id.pop(sym, None)
+        _orderbook_buffers.pop(sym, None)
+        _orderbook_last_recv_ts.pop(sym, None)
+
+
+def _register_ws_app(symbol: str, ws: websocket.WebSocketApp) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws app register")
+    with _ws_state_lock:
+        _ws_current_app[sym] = ws
+
+
+def _unregister_ws_app(symbol: str, ws: websocket.WebSocketApp) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for ws app unregister")
+    with _ws_state_lock:
+        current = _ws_current_app.get(sym)
+        if current is ws:
+            _ws_current_app.pop(sym, None)
+
+
+def _get_ws_circuit_breaker_snapshot(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for circuit breaker snapshot")
+    now_ms = _now_ms()
+    with _ws_cb_lock:
+        open_until_ts = _ws_cb_open_until_ts.get(sym)
+        is_open = open_until_ts is not None and now_ms < int(open_until_ts)
+        return {
+            "open": bool(is_open),
+            "open_until_ts": int(open_until_ts) if open_until_ts is not None else None,
+            "last_reason": _ws_cb_last_reason.get(sym),
+            "consecutive_failures": int(_ws_cb_consecutive_failures.get(sym, 0)),
+            "trip_count": int(_ws_cb_trip_count.get(sym, 0)),
+        }
+
+
+def _reset_ws_circuit_breaker_on_open(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for circuit breaker reset")
+    with _ws_cb_lock:
+        prev_count = int(_ws_cb_consecutive_failures.get(sym, 0))
+        prev_open_until = _ws_cb_open_until_ts.get(sym)
+        if prev_count != 0 or prev_open_until is not None:
+            log(
+                f"[MD_BINANCE_WS][CB] recovered symbol={sym} "
+                f"consecutive_failures={prev_count} open_until_ts={prev_open_until}"
+            )
+        _ws_cb_consecutive_failures[sym] = 0
+        _ws_cb_open_until_ts.pop(sym, None)
+        _ws_cb_last_reason.pop(sym, None)
+
+
+def _record_ws_circuit_breaker_failure(symbol: str, *, reason: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for circuit breaker failure")
+    rsn = str(reason or "").strip()
+    if not rsn:
+        raise RuntimeError("circuit breaker failure reason is required (STRICT)")
+
+    now_ms = _now_ms()
+    should_trip = False
+    ws_app: Optional[websocket.WebSocketApp] = None
+
+    with _ws_cb_lock:
+        open_until_ts = _ws_cb_open_until_ts.get(sym)
+        if open_until_ts is not None and now_ms < int(open_until_ts):
+            _ws_cb_last_reason[sym] = rsn
+            return
+
+        current = int(_ws_cb_consecutive_failures.get(sym, 0)) + 1
+        _ws_cb_consecutive_failures[sym] = current
+        _ws_cb_last_reason[sym] = rsn
+
+        if current >= _WS_CIRCUIT_BREAKER_CONFIRM_N:
+            should_trip = True
+            _ws_cb_open_until_ts[sym] = now_ms + int(_WS_CIRCUIT_BREAKER_COOLDOWN_SEC * 1000)
+            _ws_cb_trip_count[sym] = int(_ws_cb_trip_count.get(sym, 0)) + 1
+            _ws_cb_consecutive_failures[sym] = 0
+
+    if not should_trip:
+        log(
+            f"[MD_BINANCE_WS][CB] failure recorded symbol={sym} "
+            f"count<{_WS_CIRCUIT_BREAKER_CONFIRM_N} reason={rsn}"
+        )
+        return
+
+    _mark_ws_error(sym, f"circuit_breaker_open:{rsn}")
+    _clear_orderbook_runtime_state(sym)
+
+    with _ws_state_lock:
+        ws_app = _ws_current_app.get(sym)
+
+    log(
+        f"[MD_BINANCE_WS][CB_OPEN] symbol={sym} "
+        f"cooldown_sec={_WS_CIRCUIT_BREAKER_COOLDOWN_SEC:.1f} reason={rsn}"
+    )
+
+    if ws_app is not None:
+        _close_ws_with_log(ws_app, context=f"circuit_breaker_open symbol={sym} reason={rsn}")
+
+
+def _request_ws_reconnect_strict(symbol: str, *, reason: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for forced reconnect request")
+    rsn = str(reason or "").strip()
+    if not rsn:
+        raise RuntimeError("forced reconnect reason is required (STRICT)")
+
+    now_ms = _now_ms()
+    ws_app: Optional[websocket.WebSocketApp]
+
+    with _ws_state_lock:
+        last_requested_ts = _ws_reconnect_request_ts.get(sym)
+        if last_requested_ts is not None:
+            if (now_ms - int(last_requested_ts)) < int(_WS_RECONNECT_GRACE_SEC * 1000):
+                return
+
+        _ws_reconnect_request_ts[sym] = now_ms
+        _ws_reconnect_request_reason[sym] = rsn
+        ws_app = _ws_current_app.get(sym)
+
+    _mark_ws_error(sym, f"forced_reconnect_requested:{rsn}")
+    _clear_orderbook_runtime_state(sym)
+    log(f"[MD_BINANCE_WS] forced reconnect requested: symbol={sym} reason={rsn}")
+
+    if ws_app is not None:
+        _close_ws_with_log(ws_app, context=f"forced_reconnect symbol={sym} reason={rsn}")
+
+
+def _maybe_force_reconnect_on_orderbook_feed_gap(symbol: str, *, ws_status: Dict[str, Any], reason: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise RuntimeError("symbol is required for orderbook feed gap reconnect")
+
+    connection_open = bool(ws_status.get("connection_open", False))
+    if not connection_open:
+        return
+
+    state = str(ws_status.get("state") or "").upper().strip()
+    if state != "OPEN":
+        return
+
+    _record_ws_circuit_breaker_failure(sym, reason=f"orderbook_feed_gap:{reason}")
+    _request_ws_reconnect_strict(sym, reason=reason)
 
 
 def _classify_same_candle_update_strict(
@@ -705,6 +891,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
     - Binance multiplex WS 에서는 pong callback 부재를 transport failure 로 간주하지 않는다.
     - market_feed inactivity는 warning 으로 분리한다.
     - reconnect grace 동안 brief disconnect 는 즉시 transport fail 로 승격하지 않는다.
+    - circuit breaker open 은 명시적 transport failure 로 간주한다.
     """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
@@ -717,12 +904,18 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
         last_message_ts = _ws_last_message_ts.get(sym)
         last_pong_ts = _ws_last_pong_ts.get(sym)
         last_error = _ws_last_error_text.get(sym)
+        reconnect_request_ts = _ws_reconnect_request_ts.get(sym)
+        reconnect_request_reason = _ws_reconnect_request_reason.get(sym)
+
+    cb = _get_ws_circuit_breaker_snapshot(sym)
 
     with _start_ws_lock:
         runner = _started_ws_symbols.get(sym)
         runner_alive = bool(runner is not None and runner.is_alive())
 
-    if connection_open:
+    if cb["open"]:
+        state = "CLOSED"
+    elif connection_open:
         state = "OPEN"
     elif runner_alive and last_open_ts is None:
         state = "OPENING"
@@ -743,7 +936,18 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
     market_feed_reasons: List[str] = []
     transport_observations: List[str] = []
 
-    if not connection_open:
+    if cb["open"]:
+        open_until_ts = cb["open_until_ts"]
+        remaining_sec = None
+        if open_until_ts is not None:
+            remaining_sec = max(0.0, (int(open_until_ts) - now_ms) / 1000.0)
+        transport_reasons.append(
+            f"circuit_breaker_open remaining_sec={remaining_sec:.1f} reason={_truncate_text(cb['last_reason'])}"
+            if remaining_sec is not None
+            else f"circuit_breaker_open reason={_truncate_text(cb['last_reason'])}"
+        )
+
+    if not connection_open and not cb["open"]:
         if state == "OPENING":
             transport_observations.append("opening_in_progress")
         elif state == "RECONNECTING":
@@ -760,7 +964,7 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
         else:
             transport_reasons.append("connection_not_open")
 
-    if connection_open:
+    if connection_open and not cb["open"]:
         if last_open_ts is None:
             transport_reasons.append("no_open_ts")
         elif last_pong_ts is None:
@@ -776,10 +980,16 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
                     f"pong_delay_sec>{PONG_MAX_DELAY_SEC} (got={pong_delay_sec:.1f})"
                 )
 
+    if reconnect_request_ts is not None:
+        reconnect_age_sec = max(0, now_ms - int(reconnect_request_ts)) / 1000.0
+        transport_observations.append(
+            f"forced_reconnect_requested age_sec={reconnect_age_sec:.1f} reason={_truncate_text(reconnect_request_reason)}"
+        )
+
     if last_message_ts is None:
         if state in ("OPENING", "RECONNECTING"):
             market_feed_reasons.append("startup_no_market_event_yet")
-        else:
+        elif not cb["open"]:
             market_feed_reasons.append("no_market_event")
     else:
         market_event_delay_sec = market_event_delay_ms / 1000.0
@@ -804,6 +1014,14 @@ def get_ws_status(symbol: str) -> Dict[str, Any]:
         "last_pong_ts": last_pong_ts,
         "pong_delay_ms": pong_delay_ms,
         "last_error": last_error,
+        "reconnect_requested": reconnect_request_ts is not None,
+        "reconnect_request_ts": reconnect_request_ts,
+        "reconnect_request_reason": reconnect_request_reason,
+        "circuit_breaker_open": bool(cb["open"]),
+        "circuit_breaker_open_until_ts": cb["open_until_ts"],
+        "circuit_breaker_last_reason": cb["last_reason"],
+        "circuit_breaker_consecutive_failures": int(cb["consecutive_failures"]),
+        "circuit_breaker_trip_count": int(cb["trip_count"]),
         "transport_ok": len(transport_reasons) == 0,
         "market_feed_ok": len(market_feed_reasons) == 0,
         "ok": len(transport_reasons) == 0,
@@ -1252,6 +1470,7 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
     try:
         data = _decode_msg(message)
     except Exception as e:
+        _record_ws_circuit_breaker_failure(symbol, reason=f"decode_error:{type(e).__name__}")
         log(f"[MD_BINANCE_WS] decode error: {type(e).__name__}: {e}")
         _mark_ws_error(symbol, f"decode_error:{type(e).__name__}:{e}")
         _close_ws_with_log(ws, context=f"decode_error symbol={_normalize_symbol(symbol)}")
@@ -1264,10 +1483,12 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
         else:
             _handle_single_msg(symbol, data)
     except WSProtocolError as e:
+        _record_ws_circuit_breaker_failure(symbol, reason=f"protocol_error:{e}")
         _mark_ws_error(symbol, f"protocol_error:{e}")
         log(f"[MD_BINANCE_WS] protocol error: {e}")
         _close_ws_with_log(ws, context=f"protocol_error symbol={_normalize_symbol(symbol)}")
     except Exception as e:
+        _record_ws_circuit_breaker_failure(symbol, reason=f"fatal_message_handling_error:{type(e).__name__}")
         _mark_ws_error(symbol, f"fatal_message_handling_error:{type(e).__name__}:{e}")
         log(f"[MD_BINANCE_WS] fatal message handling error: {type(e).__name__}: {e}")
         _close_ws_with_log(ws, context=f"fatal_message_handling_error symbol={_normalize_symbol(symbol)}")
@@ -1275,13 +1496,16 @@ def _on_message(symbol: str, ws: websocket.WebSocketApp, message: Any) -> None:
 
 def _on_error(symbol: str, ws: websocket.WebSocketApp, error: Any) -> None:
     _ = ws
+    _record_ws_circuit_breaker_failure(symbol, reason=f"ws_error:{type(error).__name__}")
     _mark_ws_error(symbol, error)
     log(f"[MD_BINANCE_WS] error: {error}")
 
 
 def _on_close(symbol: str, ws: websocket.WebSocketApp, code: Any, msg: Any) -> None:
     _ = ws
-    _mark_ws_closed(symbol, _now_ms(), code=code, msg=msg)
+    sym = _normalize_symbol(symbol)
+    _clear_orderbook_runtime_state(sym)
+    _mark_ws_closed(sym, _now_ms(), code=code, msg=msg)
     log(f"[MD_BINANCE_WS] closed: {code} {msg}")
 
 
@@ -1290,13 +1514,9 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
     streams = _build_stream_names(symbol)
     sym = _normalize_symbol(symbol)
 
-    with _orderbook_lock:
-        _orderbook_last_update_id.pop(sym, None)
-        _orderbook_buffers.pop(sym, None)
-        _orderbook_last_recv_ts.pop(sym, None)
-    
-
+    _clear_orderbook_runtime_state(sym)
     _mark_ws_open(sym, _now_ms())
+    _reset_ws_circuit_breaker_on_open(sym)
     log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
 
 
@@ -1591,7 +1811,8 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
     """
     Orderbook health는 payload integrity와 WS transport만 FAIL 조건으로 본다.
 
-    feed inactivity는 warning 으로만 다룬다.
+    feed inactivity는 warning 으로만 다루되,
+    warning 이 stale threshold를 넘으면 MarketData Layer 가 WS reconnect 를 직접 요청한다.
     """
     sym = _normalize_symbol(symbol)
     now_ms = _now_ms()
@@ -1622,6 +1843,7 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
         "last_orderbook_recv_ts": orderbook_last_recv_ts,
         "last_pong_ts": ws_status.get("last_pong_ts"),
         "last_update_id": None,
+        "circuit_breaker_open": bool(ws_status.get("circuit_breaker_open", False)),
         "ok": False,
         "reasons": [],
     }
@@ -1637,6 +1859,11 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
                     warning_reasons.append("feed:startup_no_orderbook_yet")
                 else:
                     payload_reasons.append("payload:no_orderbook")
+                    _maybe_force_reconnect_on_orderbook_feed_gap(
+                        sym,
+                        ws_status=ws_status,
+                        reason=f"orderbook_missing_after_open>{MARKET_EVENT_MAX_DELAY_SEC}s",
+                    )
             else:
                 warning_reasons.append("feed:opening_no_orderbook_yet")
         else:
@@ -1692,6 +1919,11 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
         if recv_delay_sec > MARKET_EVENT_MAX_DELAY_SEC:
             warning_reasons.append(
                 f"feed:orderbook_recv_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={recv_delay_sec:.1f})"
+            )
+            _maybe_force_reconnect_on_orderbook_feed_gap(
+                sym,
+                ws_status=ws_status,
+                reason=f"orderbook_feed_stale>{MARKET_EVENT_MAX_DELAY_SEC}s recv_delay={recv_delay_sec:.1f}s",
             )
 
     result["payload_ok"] = len(payload_reasons) == 0
@@ -1753,6 +1985,7 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
         "required_intervals": list(HEALTH_REQUIRED_INTERVALS),
         "ws_required_intervals": list(REQUIRED_INTERVALS),
         "feature_required_intervals": list(FEATURE_REQUIRED_INTERVALS),
+        "circuit_breaker_open": False,
     }
 
     overall_ok = True
@@ -1765,6 +1998,7 @@ def get_health_snapshot(symbol: str) -> Dict[str, Any]:
 
     ws_status = get_ws_status(sym)
     snapshot["ws"] = ws_status
+    snapshot["circuit_breaker_open"] = bool(ws_status.get("circuit_breaker_open", False))
 
     if not ws_status.get("transport_ok", False):
         overall_ok = False
@@ -1821,7 +2055,7 @@ def get_dashboard_ws_telemetry_snapshot(
     symbol: str,
     *,
     intervals: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+) -> Dict[str, Any]:
     """
     Dashboard 전용 WS telemetry snapshot.
 
@@ -1889,6 +2123,9 @@ def get_dashboard_ws_telemetry_snapshot(
         "market_feed_ok": bool(ws_status.get("market_feed_ok", False)),
         "warnings": list(ws_status.get("warnings") or []),
         "reasons": list(ws_status.get("reasons") or []),
+        "circuit_breaker_open": bool(ws_status.get("circuit_breaker_open", False)),
+        "circuit_breaker_open_until_ts": ws_status.get("circuit_breaker_open_until_ts"),
+        "circuit_breaker_last_reason": ws_status.get("circuit_breaker_last_reason"),
         "last_ws_message_ts_ms": last_ws_message_ts_ms,
         "last_ws_message_latency_sec": last_ws_message_latency_sec,
         "data_freshness_sec": data_freshness_sec,
@@ -1917,6 +2154,19 @@ def start_ws_loop(symbol: str) -> None:
     def _runner() -> None:
         retry_wait = 1.0
         while True:
+            cb = _get_ws_circuit_breaker_snapshot(sym)
+            if cb["open"]:
+                open_until_ts = cb["open_until_ts"]
+                sleep_sec = _WS_CIRCUIT_BREAKER_COOLDOWN_SEC
+                if open_until_ts is not None:
+                    sleep_sec = max(0.1, (int(open_until_ts) - _now_ms()) / 1000.0)
+                log(
+                    f"[MD_BINANCE_WS][CB_WAIT] symbol={sym} "
+                    f"sleep_sec={sleep_sec:.1f} reason={_truncate_text(cb['last_reason'])}"
+                )
+                time.sleep(sleep_sec)
+                continue
+
             session_dur = 0.0
             try:
                 log(f"[MD_BINANCE_WS] connecting ... url={url}")
@@ -1930,21 +2180,31 @@ def start_ws_loop(symbol: str) -> None:
                     on_pong=lambda ws_, data: _on_pong(sym, ws_, data),
                 )
 
-                start_ts = time.time()
-                ws.run_forever(
-                    ping_interval=20,
-                )
-                session_dur = time.time() - start_ts
+                _register_ws_app(sym, ws)
+                try:
+                    start_ts = time.time()
+                    ws.run_forever(
+                        ping_interval=20,
+                    )
+                    session_dur = time.time() - start_ts
+                finally:
+                    _unregister_ws_app(sym, ws)
 
                 with _ws_state_lock:
                     still_open = bool(_ws_connection_open.get(sym, False))
                 if still_open:
+                    _clear_orderbook_runtime_state(sym)
                     _mark_ws_closed(sym, _now_ms(), code="RUN_FOREVER_RETURN", msg="run_forever returned")
+
+                if session_dur <= 60.0:
+                    _record_ws_circuit_breaker_failure(sym, reason="run_forever_return_short_session")
 
                 log("[MD_BINANCE_WS] WS disconnected → retrying ...")
 
             except Exception as e:
+                _record_ws_circuit_breaker_failure(sym, reason=f"run_forever_exception:{type(e).__name__}")
                 _mark_ws_error(sym, f"run_forever_exception:{type(e).__name__}:{e}")
+                _clear_orderbook_runtime_state(sym)
                 _mark_ws_closed(sym, _now_ms(), code="RUN_FOREVER_EXCEPTION", msg=str(e))
                 log(f"[MD_BINANCE_WS] run_forever exception: {type(e).__name__}: {e}")
 

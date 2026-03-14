@@ -17,6 +17,7 @@ CORE RESPONSIBILITIES:
 - bt_trades INSERT 및 trade.db_id 연결
 - execution quality snapshot 생성 및 trade 객체에 부착
 - 명시적 비치명 주문 거절(-2019) 감지 및 None 반환
+- 공통 STRICT 검증 프리미티브(common.strict_validators)와 정합 유지
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -24,6 +25,7 @@ IMPORTANT POLICY:
 - symbol 누락 시 settings.symbol 로 폴백하지 않는다
 - action 은 반드시 ENTER 여야 하며 누락 시 즉시 예외
 - source 는 출처 필드만 허용하며 regime/reason 을 대체값으로 사용하지 않는다
+- regime 는 source 와 분리된 독립 계약으로 강제한다
 - tp_pct/sl_pct/risk_pct 는 ratio 계약(0,1] 을 강제한다
 - 주문 실행 / 체결 검증 / 보호주문 검증의 실제 SSOT 는 order_executor 이다
 - 단, 거래소가 명시적으로 "주문 자체를 거절"한 비치명 사유는 시스템 치명 오류로 승격하지 않는다
@@ -31,6 +33,16 @@ IMPORTANT POLICY:
 - state_writer / execution_quality_engine 연결 실패는 즉시 예외 처리한다
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FIX(ARCH): common.strict_validators 공통 STRICT 검증 프리미티브를 Execution Layer에 연결
+  2) FIX(CONSISTENCY): symbol/float/bool/mapping 검증을 프로젝트 공통 계약과 정합화
+  3) FIX(SAFETY): StrictValidationError 를 OrderExecutionError 로 승격해 기존 호출자 계약 유지
+  4) FIX(STRICT): qty/tp/sl/risk/client_order_id 정규화 정책은 유지하되 primitive validation 중복 제거
+  5) FIX(ROOT-CAUSE): risk_pct 누락 시 tp_pct 대입 fallback 제거, 즉시 예외 처리
+  6) FIX(ROOT-CAUSE): regime 누락 시 source 대입 fallback 제거, regime 필수 계약으로 승격
+  7) FIX(ROOT-CAUSE): require_deterministic_client_order_id 누락/None fallback 제거, settings 필수 bool 계약으로 승격
+  8) FIX(STRICT): Trade 필수 필드 접근에서 getattr(..., default) 제거 및 명시적 계약 검증 추가
+  9) FIX(STATE): state_writer 이후 trade.db_id 필수 반영 검증 추가
 - 2026-03-13:
   1) FEAT(STATE): execution.state_writer.insert_trade_row() 정식 연결
   2) FEAT(QUALITY): execution.execution_quality_engine execution snapshot 생성/부착 추가
@@ -71,6 +83,14 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Mapping, Optional
 
+from common.strict_validators import (
+    StrictValidationError,
+    normalize_symbol as _sv_normalize_symbol,
+    require_bool as _sv_require_bool,
+    require_float as _sv_require_float,
+    require_mapping as _sv_require_mapping,
+    require_nonempty_str as _sv_require_nonempty_str,
+)
 from execution.execution_quality_engine import (
     ExecutionQualityError,
     build_execution_quality_snapshot,
@@ -112,11 +132,31 @@ class EntryExecutionRequest:
     tp_pct: float
     sl_pct: float
     source: str
+    regime: str
     soft_mode: bool
     sl_floor_ratio: Optional[float]
     available_usdt: Optional[float]
     entry_client_order_id: Optional[str]
-    risk_pct: Optional[float]
+    risk_pct: float
+
+
+def _raise_exec_from_strict(where: str, exc: StrictValidationError) -> OrderExecutionError:
+    return OrderExecutionError(f"{where}: {exc}")
+
+
+def _require_attr_exists_strict(obj: Any, attr_name: str, owner_name: str) -> Any:
+    if obj is None:
+        raise OrderExecutionError(f"{owner_name} is None (STRICT)")
+    if not hasattr(obj, attr_name):
+        raise OrderExecutionError(f"{owner_name}.{attr_name} missing (STRICT)")
+    return getattr(obj, attr_name)
+
+
+def _require_attr_value_strict(obj: Any, attr_name: str, owner_name: str) -> Any:
+    value = _require_attr_exists_strict(obj, attr_name, owner_name)
+    if value is None:
+        raise OrderExecutionError(f"{owner_name}.{attr_name} missing (STRICT)")
+    return value
 
 
 def _signal_to_mapping_strict(signal: Any) -> dict[str, Any]:
@@ -124,23 +164,29 @@ def _signal_to_mapping_strict(signal: Any) -> dict[str, Any]:
         raise OrderExecutionError("signal is None (STRICT)")
 
     if isinstance(signal, Mapping):
-        data = dict(signal)
-        if not data:
-            raise OrderExecutionError("signal mapping is empty (STRICT)")
-        return data
+        try:
+            mapping_obj = _sv_require_mapping(signal, "signal", non_empty=True)
+        except StrictValidationError as exc:
+            raise _raise_exec_from_strict("signal", exc) from exc
+        return dict(mapping_obj)
 
-    model_dump = getattr(signal, "model_dump", None)
-    if callable(model_dump):
-        data = model_dump()
-        if not isinstance(data, dict) or not data:
-            raise OrderExecutionError("signal.model_dump() returned empty/non-dict (STRICT)")
-        return data
+    if hasattr(signal, "model_dump"):
+        model_dump = getattr(signal, "model_dump")
+        if callable(model_dump):
+            data = model_dump()
+            try:
+                mapping_obj = _sv_require_mapping(data, "signal.model_dump()", non_empty=True)
+            except StrictValidationError as exc:
+                raise _raise_exec_from_strict("signal.model_dump()", exc) from exc
+            return dict(mapping_obj)
 
     if is_dataclass(signal):
         data = asdict(signal)
-        if not isinstance(data, dict) or not data:
-            raise OrderExecutionError("dataclass signal converted to empty/non-dict (STRICT)")
-        return data
+        try:
+            mapping_obj = _sv_require_mapping(data, "signal.dataclass", non_empty=True)
+        except StrictValidationError as exc:
+            raise _raise_exec_from_strict("signal.dataclass", exc) from exc
+        return dict(mapping_obj)
 
     if hasattr(signal, "__dict__"):
         data = {
@@ -148,28 +194,33 @@ def _signal_to_mapping_strict(signal: Any) -> dict[str, Any]:
             for k, v in vars(signal).items()
             if not str(k).startswith("_")
         }
-        if not isinstance(data, dict) or not data:
-            raise OrderExecutionError("signal.__dict__ is empty/invalid (STRICT)")
-        return data
+        try:
+            mapping_obj = _sv_require_mapping(data, "signal.__dict__", non_empty=True)
+        except StrictValidationError as exc:
+            raise _raise_exec_from_strict("signal.__dict__", exc) from exc
+        return dict(mapping_obj)
 
     raise OrderExecutionError(f"unsupported signal type for execution: {type(signal).__name__}")
 
 
 def _meta_to_mapping_strict(signal_map: Mapping[str, Any]) -> dict[str, Any]:
-    if "meta" not in signal_map or signal_map["meta"] is None:
+    if "meta" not in signal_map:
         return {}
-
     meta = signal_map["meta"]
-    if not isinstance(meta, Mapping):
-        raise OrderExecutionError("signal.meta must be mapping when present (STRICT)")
-    return dict(meta)
+    if meta is None:
+        return {}
+    try:
+        mapping_obj = _sv_require_mapping(meta, "signal.meta", non_empty=False)
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict("signal.meta", exc) from exc
+    return dict(mapping_obj)
 
 
 def _normalize_symbol_strict(value: Any) -> str:
-    s = str(value).replace("-", "").replace("/", "").upper().strip()
-    if not s:
-        raise OrderExecutionError("symbol is empty (STRICT)")
-    return s
+    try:
+        return _sv_normalize_symbol(value, name="symbol")
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict("symbol", exc) from exc
 
 
 def _normalize_open_side_strict(value: Any) -> str:
@@ -182,9 +233,10 @@ def _normalize_open_side_strict(value: Any) -> str:
 
 
 def _normalize_action_strict(value: Any) -> str:
-    s = str(value).upper().strip()
-    if not s:
-        raise OrderExecutionError("action is empty (STRICT)")
+    try:
+        s = _sv_require_nonempty_str(value, "action").upper().strip()
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict("action", exc) from exc
     if s != "ENTER":
         raise OrderExecutionError(f"ExecutionEngine only accepts ENTER action (STRICT): got={s!r}")
     return s
@@ -192,11 +244,9 @@ def _normalize_action_strict(value: Any) -> str:
 
 def _normalize_positive_float_strict(value: Any, *, field_name: str) -> float:
     try:
-        f = float(value)
-    except Exception as e:
-        raise OrderExecutionError(f"{field_name} must be numeric (STRICT)") from e
-    if not math.isfinite(f):
-        raise OrderExecutionError(f"{field_name} must be finite (STRICT)")
+        f = _sv_require_float(value, field_name, min_value=0.0)
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict(field_name, exc) from exc
     if f <= 0.0:
         raise OrderExecutionError(f"{field_name} must be > 0 (STRICT)")
     return f
@@ -204,14 +254,9 @@ def _normalize_positive_float_strict(value: Any, *, field_name: str) -> float:
 
 def _normalize_nonnegative_float_strict(value: Any, *, field_name: str) -> float:
     try:
-        f = float(value)
-    except Exception as e:
-        raise OrderExecutionError(f"{field_name} must be numeric (STRICT)") from e
-    if not math.isfinite(f):
-        raise OrderExecutionError(f"{field_name} must be finite (STRICT)")
-    if f < 0.0:
-        raise OrderExecutionError(f"{field_name} must be >= 0 (STRICT)")
-    return f
+        return _sv_require_float(value, field_name, min_value=0.0)
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict(field_name, exc) from exc
 
 
 def _normalize_ratio_float_strict(value: Any, *, field_name: str) -> float:
@@ -228,46 +273,56 @@ def _normalize_optional_positive_float_strict(value: Any, *, field_name: str) ->
 
 
 def _normalize_source_strict(value: Any) -> str:
-    s = str(value).strip()
-    if not s:
-        raise OrderExecutionError("source is empty (STRICT)")
-    return s
+    try:
+        return _sv_require_nonempty_str(value, "source")
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict("source", exc) from exc
+
+
+def _normalize_regime_strict(value: Any) -> str:
+    try:
+        return _sv_require_nonempty_str(value, "regime")
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict("regime", exc) from exc
+
+
+def _normalize_bool_strict(value: Any, *, field_name: str) -> bool:
+    try:
+        return _sv_require_bool(value, field_name)
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict(field_name, exc) from exc
 
 
 def _normalize_optional_bool_strict(value: Any, *, field_name: str) -> Optional[bool]:
     if value is None:
         return None
-
-    if isinstance(value, bool):
-        return value
-
-    s = str(value).strip().lower()
-    if s in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "f", "no", "n", "off"}:
-        return False
-
-    raise OrderExecutionError(f"{field_name} must be bool-convertible (STRICT)")
+    return _normalize_bool_strict(value, field_name=field_name)
 
 
 def _normalize_optional_client_order_id_strict(value: Any) -> Optional[str]:
     if value is None:
         return None
 
-    cid = str(value).strip()
-    if not cid:
-        raise OrderExecutionError("entry_client_order_id is empty (STRICT)")
+    try:
+        cid = _sv_require_nonempty_str(value, "entry_client_order_id")
+    except StrictValidationError as exc:
+        raise _raise_exec_from_strict("entry_client_order_id", exc) from exc
+
     if len(cid) > 36:
         raise OrderExecutionError("entry_client_order_id exceeds 36 chars (STRICT)")
     try:
         cid.encode("ascii")
-    except UnicodeEncodeError as e:
-        raise OrderExecutionError("entry_client_order_id must be ASCII (STRICT)") from e
+    except UnicodeEncodeError as exc:
+        raise OrderExecutionError("entry_client_order_id must be ASCII (STRICT)") from exc
     return cid
 
 
 def _require_settings_value_strict(settings: Any, field_name: str) -> Any:
-    value = getattr(settings, field_name, None)
+    if settings is None:
+        raise OrderExecutionError("settings is required (STRICT)")
+    if not hasattr(settings, field_name):
+        raise OrderExecutionError(f"settings.{field_name} missing (STRICT)")
+    value = getattr(settings, field_name)
     if value is None:
         raise OrderExecutionError(f"settings.{field_name} missing (STRICT)")
     return value
@@ -323,9 +378,7 @@ def _extract_symbol_strict(
         normalizer=_normalize_symbol_strict,
         required=True,
     )
-    settings_symbol = getattr(settings, "symbol", None)
-    if settings_symbol is None:
-        raise OrderExecutionError("settings.symbol missing (STRICT)")
+    settings_symbol = _require_settings_value_strict(settings, "symbol")
     normalized_settings_symbol = _normalize_symbol_strict(settings_symbol)
     if symbol != normalized_settings_symbol:
         raise OrderExecutionError(
@@ -344,6 +397,19 @@ def _extract_action_required_or_raise(
         field_name="action",
         aliases=("action",),
         normalizer=_normalize_action_strict,
+        required=True,
+    )
+
+
+def _extract_required_regime_strict(
+    *,
+    search_spaces: tuple[tuple[str, Mapping[str, Any]], ...],
+) -> str:
+    return _extract_normalized_value_strict(
+        search_spaces=search_spaces,
+        field_name="regime",
+        aliases=("regime", "market_regime", "regime_at_entry"),
+        normalizer=_normalize_regime_strict,
         required=True,
     )
 
@@ -491,10 +557,11 @@ def _canonicalize_for_hash_strict(
         finally:
             seen.remove(obj_id)
 
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump()
-        return _canonicalize_for_hash_strict(dumped, path=path, seen=seen)
+    if hasattr(value, "model_dump"):
+        model_dump = getattr(value, "model_dump")
+        if callable(model_dump):
+            dumped = model_dump()
+            return _canonicalize_for_hash_strict(dumped, path=path, seen=seen)
 
     if is_dataclass(value):
         dumped = asdict(value)
@@ -532,10 +599,11 @@ def _build_deterministic_client_order_id_strict(
         "tp_pct": format(req.tp_pct, ".15g"),
         "sl_pct": format(req.sl_pct, ".15g"),
         "source": req.source,
+        "regime": req.regime,
         "soft_mode": req.soft_mode,
         "sl_floor_ratio": None if req.sl_floor_ratio is None else format(req.sl_floor_ratio, ".15g"),
         "available_usdt": None if req.available_usdt is None else format(req.available_usdt, ".15g"),
-        "risk_pct": None if req.risk_pct is None else format(req.risk_pct, ".15g"),
+        "risk_pct": format(req.risk_pct, ".15g"),
     }
 
     payload = {
@@ -547,16 +615,18 @@ def _build_deterministic_client_order_id_strict(
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest().upper()
     client_order_id = f"AT{digest[:34]}"
 
-    return _normalize_optional_client_order_id_strict(client_order_id)  # type: ignore[return-value]
+    normalized = _normalize_optional_client_order_id_strict(client_order_id)
+    if normalized is None:
+        raise OrderExecutionError("deterministic client_order_id generation failed (STRICT)")
+    return normalized
 
 
 def _settings_require_deterministic_client_order_id_strict(settings: Any) -> bool:
-    raw = getattr(settings, "require_deterministic_client_order_id", None)
-    normalized = _normalize_optional_bool_strict(
+    raw = _require_settings_value_strict(settings, "require_deterministic_client_order_id")
+    return _normalize_bool_strict(
         raw,
         field_name="settings.require_deterministic_client_order_id",
     )
-    return bool(normalized) if normalized is not None else False
 
 
 def _enforce_or_generate_client_order_id_strict(
@@ -691,6 +761,10 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
         required=True,
     )
 
+    regime = _extract_required_regime_strict(
+        search_spaces=search_spaces,
+    )
+
     soft_mode_raw = _extract_normalized_value_strict(
         search_spaces=search_spaces,
         field_name="soft_mode",
@@ -745,6 +819,8 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
 
     if explicit_qty is not None:
         qty = explicit_qty
+        if risk_pct is None:
+            raise OrderExecutionError("explicit qty path still requires risk_pct contract (STRICT)")
     else:
         if risk_pct is None:
             raise OrderExecutionError("qty missing and risk_pct missing (STRICT)")
@@ -771,67 +847,81 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
         tp_pct=float(tp_pct),
         sl_pct=float(sl_pct),
         source=source,
+        regime=regime,
         soft_mode=soft_mode,
         sl_floor_ratio=sl_floor_ratio,
         available_usdt=None if capital_usdt is None else float(capital_usdt),
         entry_client_order_id=entry_client_order_id,
-        risk_pct=None if risk_pct is None else float(risk_pct),
+        risk_pct=float(risk_pct),
     )
+
+
+def _extract_trade_entry_price_strict(trade: Trade) -> float:
+    if hasattr(trade, "entry_price"):
+        raw = getattr(trade, "entry_price")
+    elif hasattr(trade, "entry"):
+        raw = getattr(trade, "entry")
+    else:
+        raise OrderExecutionError("Trade.entry_price/entry missing (STRICT)")
+
+    if raw is None:
+        raise OrderExecutionError("Trade.entry_price/entry missing (STRICT)")
+
+    try:
+        entry_price = float(raw)
+    except Exception as exc:
+        raise OrderExecutionError("Trade.entry_price/entry missing or invalid (STRICT)") from exc
+
+    if not math.isfinite(entry_price) or entry_price <= 0.0:
+        raise OrderExecutionError("Trade.entry_price/entry must be finite > 0 (STRICT)")
+    return entry_price
 
 
 def _validate_trade_contract_strict(trade: Trade, req: EntryExecutionRequest) -> None:
     if not isinstance(trade, Trade):
         raise OrderExecutionError(f"execute() returned non-Trade object: {type(trade).__name__} (STRICT)")
 
-    trade_symbol = _normalize_symbol_strict(getattr(trade, "symbol", None))
+    trade_symbol = _normalize_symbol_strict(_require_attr_value_strict(trade, "symbol", "trade"))
     if trade_symbol != req.symbol:
         raise OrderExecutionError(
             f"Trade.symbol mismatch (got={trade_symbol}, expected={req.symbol}) (STRICT)"
         )
 
-    trade_side = _normalize_open_side_strict(getattr(trade, "side", None))
+    trade_side = _normalize_open_side_strict(_require_attr_value_strict(trade, "side", "trade"))
     if trade_side != req.side_open:
         raise OrderExecutionError(
             f"Trade.side mismatch (got={trade_side}, expected={req.side_open}) (STRICT)"
         )
 
     try:
-        trade_qty = float(getattr(trade, "qty"))
-    except Exception as e:
-        raise OrderExecutionError("Trade.qty missing/invalid (STRICT)") from e
+        trade_qty = float(_require_attr_value_strict(trade, "qty", "trade"))
+    except Exception as exc:
+        raise OrderExecutionError("Trade.qty missing/invalid (STRICT)") from exc
     if not math.isfinite(trade_qty) or trade_qty <= 0.0:
         raise OrderExecutionError("Trade.qty must be finite > 0 (STRICT)")
 
-    entry_price_raw = getattr(trade, "entry_price", None)
-    if entry_price_raw is None:
-        entry_price_raw = getattr(trade, "entry", None)
-    try:
-        entry_price = float(entry_price_raw)
-    except Exception as e:
-        raise OrderExecutionError("Trade.entry_price/entry missing or invalid (STRICT)") from e
-    if not math.isfinite(entry_price) or entry_price <= 0.0:
-        raise OrderExecutionError("Trade.entry_price/entry must be finite > 0 (STRICT)")
+    _extract_trade_entry_price_strict(trade)
 
-    entry_order_id = getattr(trade, "entry_order_id", None)
-    if entry_order_id is None or not str(entry_order_id).strip():
+    entry_order_id = _require_attr_value_strict(trade, "entry_order_id", "trade")
+    if not str(entry_order_id).strip():
         raise OrderExecutionError("Trade.entry_order_id missing (STRICT)")
 
-    tp_order_id = getattr(trade, "tp_order_id", None)
-    if tp_order_id is None or not str(tp_order_id).strip():
+    tp_order_id = _require_attr_value_strict(trade, "tp_order_id", "trade")
+    if not str(tp_order_id).strip():
         raise OrderExecutionError("Trade.tp_order_id missing (STRICT)")
 
     if not req.soft_mode:
-        sl_order_id = getattr(trade, "sl_order_id", None)
-        if sl_order_id is None or not str(sl_order_id).strip():
+        sl_order_id = _require_attr_value_strict(trade, "sl_order_id", "trade")
+        if not str(sl_order_id).strip():
             raise OrderExecutionError("Trade.sl_order_id missing while soft_mode=False (STRICT)")
 
-    entry_ts = getattr(trade, "entry_ts", None)
+    entry_ts = _require_attr_value_strict(trade, "entry_ts", "trade")
     if not isinstance(entry_ts, datetime):
         raise OrderExecutionError("Trade.entry_ts must be datetime (STRICT)")
     if entry_ts.tzinfo is None or entry_ts.utcoffset() is None:
         raise OrderExecutionError("Trade.entry_ts must be timezone-aware (STRICT)")
 
-    reconciliation_status = str(getattr(trade, "reconciliation_status", "") or "").upper().strip()
+    reconciliation_status = str(_require_attr_value_strict(trade, "reconciliation_status", "trade")).upper().strip()
     if reconciliation_status != "PROTECTION_VERIFIED":
         raise OrderExecutionError(
             f"Trade.reconciliation_status mismatch "
@@ -839,33 +929,23 @@ def _validate_trade_contract_strict(trade: Trade, req: EntryExecutionRequest) ->
         )
 
     if req.entry_client_order_id is not None:
-        client_entry_id = getattr(trade, "client_entry_id", None)
-        if str(client_entry_id or "").strip() != req.entry_client_order_id:
+        client_entry_id = _require_attr_value_strict(trade, "client_entry_id", "trade")
+        if str(client_entry_id).strip() != req.entry_client_order_id:
             raise OrderExecutionError(
                 f"Trade.client_entry_id mismatch "
                 f"(got={client_entry_id!r}, expected={req.entry_client_order_id!r}) (STRICT)"
             )
 
 
-def _extract_optional_regime_strict(signal: Any, req: EntryExecutionRequest) -> str:
+def _extract_required_regime_from_signal_strict(signal: Any) -> str:
     signal_map = _signal_to_mapping_strict(signal)
     meta_map = _meta_to_mapping_strict(signal_map)
     search_spaces = (("signal", signal_map), ("signal.meta", meta_map))
-
-    regime = _extract_normalized_value_strict(
-        search_spaces=search_spaces,
-        field_name="regime",
-        aliases=("regime", "market_regime", "regime_at_entry"),
-        normalizer=_normalize_source_strict,
-        required=False,
-    )
-    if regime is None:
-        return req.source
-    return regime
+    return _extract_required_regime_strict(search_spaces=search_spaces)
 
 
 def _trade_entry_ts_ms_strict(trade: Trade) -> int:
-    entry_ts = getattr(trade, "entry_ts", None)
+    entry_ts = _require_attr_value_strict(trade, "entry_ts", "trade")
     if not isinstance(entry_ts, datetime):
         raise OrderExecutionError("Trade.entry_ts must be datetime (STRICT)")
     if entry_ts.tzinfo is None or entry_ts.utcoffset() is None:
@@ -877,24 +957,30 @@ def _trade_entry_ts_ms_strict(trade: Trade) -> int:
 
 
 def _ensure_trade_meta_dict_strict(trade: Trade) -> dict[str, Any]:
-    meta = getattr(trade, "meta", None)
-    if meta is None:
-        try:
-            setattr(trade, "meta", {})
-        except Exception as e:
-            raise OrderExecutionError("Trade.meta missing and cannot be initialized (STRICT)") from e
-        meta = getattr(trade, "meta", None)
-
+    meta = _require_attr_value_strict(trade, "meta", "trade")
     if not isinstance(meta, dict):
         raise OrderExecutionError("Trade.meta must be dict when present (STRICT)")
     return meta
 
 
+def _ensure_trade_db_id_strict(trade: Trade) -> int:
+    raw = _require_attr_value_strict(trade, "db_id", "trade")
+    if isinstance(raw, bool):
+        raise OrderExecutionError("trade.db_id must be int (STRICT)")
+    try:
+        db_id = int(raw)
+    except Exception as exc:
+        raise OrderExecutionError("trade.db_id must be int (STRICT)") from exc
+    if db_id <= 0:
+        raise OrderExecutionError("trade.db_id must be > 0 (STRICT)")
+    return db_id
+
+
 def _set_trade_attr_strict(trade: Trade, attr_name: str, value: Any) -> None:
     try:
         setattr(trade, attr_name, value)
-    except Exception as e:
-        raise OrderExecutionError(f"failed to set trade.{attr_name} (STRICT)") from e
+    except Exception as exc:
+        raise OrderExecutionError(f"failed to set trade.{attr_name} (STRICT)") from exc
 
 
 def _set_trade_order_state_strict(trade: Trade, state: OrderState) -> None:
@@ -915,9 +1001,12 @@ def _persist_trade_strict(
         field_name="settings.leverage",
     )
 
-    regime_at_entry = _extract_optional_regime_strict(signal, req)
+    regime_at_entry = _extract_required_regime_from_signal_strict(signal)
     strategy = req.source
     ts_ms = _trade_entry_ts_ms_strict(trade)
+
+    if req.risk_pct is None:
+        raise OrderExecutionError("req.risk_pct missing for state persistence (STRICT)")
 
     try:
         insert_trade_row(
@@ -926,15 +1015,17 @@ def _persist_trade_strict(
             ts_ms=ts_ms,
             regime_at_entry=regime_at_entry,
             strategy=strategy,
-            risk_pct=req.risk_pct if req.risk_pct is not None else req.tp_pct,
+            risk_pct=req.risk_pct,
             tp_pct=req.tp_pct,
             sl_pct=req.sl_pct,
             leverage=leverage,
         )
-    except StateWriterError as e:
-        raise OrderExecutionError(f"state_writer insert failed (STRICT): {e}") from e
-    except Exception as e:
-        raise OrderExecutionError(f"state_writer unexpected failure (STRICT): {e}") from e
+    except StateWriterError as exc:
+        raise OrderExecutionError(f"state_writer insert failed (STRICT): {exc}") from exc
+    except Exception as exc:
+        raise OrderExecutionError(f"state_writer unexpected failure (STRICT): {exc}") from exc
+
+    _ensure_trade_db_id_strict(trade)
 
 
 def _extract_post_prices_optional_strict(signal: Any) -> Optional[dict[str, float]]:
@@ -975,13 +1066,7 @@ def _attach_execution_quality_snapshot_if_available_strict(
     if post_prices is None:
         return
 
-    entry_price_raw = getattr(trade, "entry_price", None)
-    if entry_price_raw is None:
-        entry_price_raw = getattr(trade, "entry", None)
-    filled_avg_price = _normalize_positive_float_strict(
-        entry_price_raw,
-        field_name="trade.entry_price",
-    )
+    filled_avg_price = _extract_trade_entry_price_strict(trade)
 
     try:
         snapshot = build_execution_quality_snapshot(
@@ -991,10 +1076,10 @@ def _attach_execution_quality_snapshot_if_available_strict(
             filled_avg_price=filled_avg_price,
             post_prices=post_prices,
         )
-    except ExecutionQualityError as e:
-        raise OrderExecutionError(f"execution quality build failed (STRICT): {e}") from e
-    except Exception as e:
-        raise OrderExecutionError(f"execution quality unexpected failure (STRICT): {e}") from e
+    except ExecutionQualityError as exc:
+        raise OrderExecutionError(f"execution quality build failed (STRICT): {exc}") from exc
+    except Exception as exc:
+        raise OrderExecutionError(f"execution quality unexpected failure (STRICT): {exc}") from exc
 
     meta = _ensure_trade_meta_dict_strict(trade)
     if "execution_quality" in meta:
@@ -1042,7 +1127,7 @@ class ExecutionEngine:
         logger.info(
             "ExecutionEngine.execute start "
             "(symbol=%s side=%s qty=%s entry_price_hint=%s tp_pct=%s sl_pct=%s risk_pct=%s "
-            "source=%s soft_mode=%s entry_client_order_id=%s)",
+            "source=%s regime=%s soft_mode=%s entry_client_order_id=%s)",
             req.symbol,
             req.side_open,
             req.qty,
@@ -1051,6 +1136,7 @@ class ExecutionEngine:
             req.sl_pct,
             req.risk_pct,
             req.source,
+            req.regime,
             req.soft_mode,
             req.entry_client_order_id,
         )
@@ -1070,8 +1156,8 @@ class ExecutionEngine:
                 available_usdt=req.available_usdt,
                 entry_client_order_id=req.entry_client_order_id,
             )
-        except OrderExecutionError as e:
-            if _is_nonfatal_entry_submission_rejection(e):
+        except OrderExecutionError as exc:
+            if _is_nonfatal_entry_submission_rejection(exc):
                 logger.warning(
                     "ExecutionEngine.execute skipped non-fatal entry rejection "
                     "(symbol=%s side=%s qty=%s source=%s reason=%s)",
@@ -1079,7 +1165,7 @@ class ExecutionEngine:
                     req.side_open,
                     req.qty,
                     req.source,
-                    _format_exception_chain_for_log(e),
+                    _format_exception_chain_for_log(exc),
                 )
                 return None
             raise
@@ -1101,17 +1187,26 @@ class ExecutionEngine:
             signal=signal,
         )
 
+        entry_price_for_log = _extract_trade_entry_price_strict(trade)
+        entry_order_id_for_log = _require_attr_value_strict(trade, "entry_order_id", "trade")
+        client_entry_id_for_log = _require_attr_value_strict(trade, "client_entry_id", "trade")
+        db_id_for_log = _ensure_trade_db_id_strict(trade)
+        order_state_for_log = _require_attr_value_strict(trade, "order_state", "trade")
+        trade_symbol_for_log = _require_attr_value_strict(trade, "symbol", "trade")
+        trade_side_for_log = _require_attr_value_strict(trade, "side", "trade")
+        trade_qty_for_log = _require_attr_value_strict(trade, "qty", "trade")
+
         logger.info(
             "ExecutionEngine.execute success "
             "(symbol=%s side=%s qty=%s entry=%s entry_order_id=%s client_entry_id=%s db_id=%s order_state=%s)",
-            getattr(trade, "symbol", None),
-            getattr(trade, "side", None),
-            getattr(trade, "qty", None),
-            getattr(trade, "entry_price", getattr(trade, "entry", None)),
-            getattr(trade, "entry_order_id", None),
-            getattr(trade, "client_entry_id", None),
-            getattr(trade, "db_id", None),
-            getattr(trade, "order_state", None),
+            trade_symbol_for_log,
+            trade_side_for_log,
+            trade_qty_for_log,
+            entry_price_for_log,
+            entry_order_id_for_log,
+            client_entry_id_for_log,
+            db_id_for_log,
+            order_state_for_log,
         )
         return trade
 

@@ -29,6 +29,13 @@ IMPORTANT POLICY:
   한 방향을 먼저 확정한 뒤 다른 방향을 제거하는 구조를 금지한다.
 
 CHANGE HISTORY:
+- 2026-03-13:
+  1) FIX(ROOT-CAUSE): MarketData reconnect / startup grace 상태를 Feature Layer 가 명시적으로 해석하도록 수정
+  2) FIX(RECOVERY): orderbook recovery-in-progress 상태는 stale contract violation 과 분리하여 FeatureBuildError 문맥을 교정
+  3) FIX(STRUCTURE): get_trading_signal() 에서 freeze state 재사용 판단을 orderbook 접근보다 먼저 수행하도록 순서 교정
+  4) FIX(CONTRACT): health snapshot 에서 ws / orderbook 하위 계약을 strict 검증하고 recovery 메타를 반환하도록 확장
+  5) FIX(ROOT-CAUSE): _compute_orderbook_features() 중복 stale 검사 제거 및 단일 freshness 경로로 정리
+  6) FIX(OBSERVABILITY): recovery-in-progress 상태는 TG 알림이 아닌 throttled log 로 surface 하도록 분리
 - 2026-03-12:
   1) FIX(ROOT-CAUSE): LONG 편향의 직접 원인 제거
      - 기존 trend_bias 단일 방향 선결정 구조 제거
@@ -182,13 +189,13 @@ def _resolve_runtime_positive_float(settings_obj: Any, attr_name: str) -> float:
 
 
 EntrySignal = Tuple[
-    str,                 # chosen_signal ("LONG"|"SHORT")
-    str,                 # signal_source ("TREND"|"RANGE"|"GENERIC"...)
-    int,                 # latest_ts (ms)
-    List[List[float]],   # candles_5m (ts, o, h, l, c)
-    List[List[float]],   # candles_5m_raw (ts, o, h, l, c, v)
-    float,               # last_price
-    Dict[str, Any],      # extra (GPT/EntryScore용 메타)
+    str,
+    str,
+    int,
+    List[List[float]],
+    List[List[float]],
+    float,
+    Dict[str, Any],
 ]
 
 REQUIRED_TFS: List[str] = _require_str_list_setting("features_required_tfs")
@@ -224,7 +231,7 @@ class FeatureBuildError(RuntimeError):
 
 
 _LAST_ERROR_SENT: Dict[str, float] = {}
-
+_LAST_RECOVERY_LOG_SENT: Dict[str, float] = {}
 _SIGNAL_FREEZE_STATE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -258,10 +265,26 @@ def _notify_error_once(key: str, human_msg: str) -> None:
         log(f"[MKT-FEAT] telegram notify failed: {e.__class__.__name__}: {e}")
 
 
+def _log_recovery_once(key: str, human_msg: str) -> None:
+    now = time.time()
+    last = _LAST_RECOVERY_LOG_SENT.get(key)
+    if last is not None and (now - last) < FEATURE_ERROR_TG_COOLDOWN_SEC:
+        return
+    _LAST_RECOVERY_LOG_SENT[key] = now
+    log(f"[MKT-FEAT][RECOVERY] {human_msg}")
+
+
 def _fail(symbol: str, location: str, reason: str) -> None:
     msg = f"[{symbol}] {location}: {reason}"
     key = f"{symbol}|{location}|{reason}"
     _notify_error_once(key, msg)
+    raise FeatureBuildError(msg)
+
+
+def _raise_recovery_in_progress(symbol: str, location: str, reason: str) -> None:
+    msg = f"[{symbol}] {location}: {reason}"
+    key = f"{symbol}|{location}|{reason}"
+    _log_recovery_once(key, msg)
     raise FeatureBuildError(msg)
 
 
@@ -430,12 +453,72 @@ def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dic
     if not isinstance(reasons, list):
         _fail(symbol, "health_snapshot", "health snapshot overall_reasons must be list (STRICT)")
 
+    ws = snap.get("ws")
+    if not isinstance(ws, dict):
+        _fail(symbol, "health_snapshot", "health snapshot missing ws dict (STRICT)")
+
+    orderbook = snap.get("orderbook")
+    if not isinstance(orderbook, dict):
+        _fail(symbol, "health_snapshot", "health snapshot missing orderbook dict (STRICT)")
+
+    ws_state_raw = ws.get("state")
+    if not isinstance(ws_state_raw, str) or not ws_state_raw.strip():
+        _fail(symbol, "health_snapshot", "health snapshot ws.state must be non-empty str (STRICT)")
+    ws_state = ws_state_raw.strip().upper()
+    if ws_state not in ("OPEN", "OPENING", "RECONNECTING", "CLOSED"):
+        _fail(symbol, "health_snapshot", f"health snapshot ws.state invalid (STRICT): {ws_state!r}")
+
+    ws_reconnect_requested = ws.get("reconnect_requested")
+    if not isinstance(ws_reconnect_requested, bool):
+        _fail(symbol, "health_snapshot", "health snapshot ws.reconnect_requested must be bool (STRICT)")
+
+    ws_reconnect_request_reason = ws.get("reconnect_request_reason")
+    if ws_reconnect_request_reason is not None:
+        if not isinstance(ws_reconnect_request_reason, str) or not ws_reconnect_request_reason.strip():
+            _fail(
+                symbol,
+                "health_snapshot",
+                "health snapshot ws.reconnect_request_reason must be non-empty str when present (STRICT)",
+            )
+        ws_reconnect_request_reason = ws_reconnect_request_reason.strip()
+
+    ws_transport_ok = ws.get("transport_ok")
+    if not isinstance(ws_transport_ok, bool):
+        _fail(symbol, "health_snapshot", "health snapshot ws.transport_ok must be bool (STRICT)")
+
+    ws_market_feed_ok = ws.get("market_feed_ok")
+    if not isinstance(ws_market_feed_ok, bool):
+        _fail(symbol, "health_snapshot", "health snapshot ws.market_feed_ok must be bool (STRICT)")
+
+    orderbook_ok = orderbook.get("ok")
+    if not isinstance(orderbook_ok, bool):
+        _fail(symbol, "health_snapshot", "health snapshot orderbook.ok must be bool (STRICT)")
+
+    orderbook_warnings_raw = orderbook.get("warnings")
+    if not isinstance(orderbook_warnings_raw, list):
+        _fail(symbol, "health_snapshot", "health snapshot orderbook.warnings must be list (STRICT)")
+
+    orderbook_reasons_raw = orderbook.get("reasons")
+    if not isinstance(orderbook_reasons_raw, list):
+        _fail(symbol, "health_snapshot", "health snapshot orderbook.reasons must be list (STRICT)")
+
     cleaned_warnings = [str(x).strip() for x in warnings if str(x).strip()]
+    cleaned_orderbook_warnings = [str(x).strip() for x in orderbook_warnings_raw if str(x).strip()]
+    cleaned_orderbook_reasons = [str(x).strip() for x in orderbook_reasons_raw if str(x).strip()]
+
     return {
         "overall_ok": bool(snap["overall_ok"]),
         "has_warning": bool(snap["has_warning"]),
         "overall_warnings": cleaned_warnings,
         "overall_reasons": [str(x).strip() for x in reasons if str(x).strip()],
+        "ws_state": ws_state,
+        "ws_transport_ok": bool(ws_transport_ok),
+        "ws_market_feed_ok": bool(ws_market_feed_ok),
+        "ws_reconnect_requested": bool(ws_reconnect_requested),
+        "ws_reconnect_request_reason": ws_reconnect_request_reason,
+        "orderbook_ok": bool(orderbook_ok),
+        "orderbook_warnings": cleaned_orderbook_warnings,
+        "orderbook_reasons": cleaned_orderbook_reasons,
     }
 
 
@@ -904,7 +987,6 @@ def _build_timeframe_features(
     tf_features["candles_raw"] = list(validated_buf)
     tf_features["candles"] = list(candles_for_calc)
 
-    # unified_features_builder STRICT 계약 대응
     if interval in ("1h", "4h"):
         tf_features["raw_ohlcv_last60"] = [
             [ts, o, h, l, c, v]
@@ -1012,26 +1094,63 @@ def _strict_optional_float(symbol: str, location: str, name: str, value: Any) ->
         _fail(symbol, location, f"{name} must be finite when present (STRICT)")
     return parsed
 
-def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
+
+def _ensure_runtime_health_summary(symbol: str, health_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if health_summary is not None:
+        if not isinstance(health_summary, dict):
+            _fail(symbol, "health_snapshot", "runtime health_summary must be dict when provided (STRICT)")
+        return dict(health_summary)
+
+    raw_snap = get_health_snapshot(symbol)
+    return _validate_health_snapshot_contract(symbol, raw_snap)
+
+
+def _compute_orderbook_features(
+    symbol: str,
+    *,
+    health_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    runtime_health = _ensure_runtime_health_summary(symbol, health_summary)
+
     ob = get_orderbook(symbol, limit=5)
     ob_status = get_orderbook_buffer_status(symbol)
 
     if not isinstance(ob_status, dict):
         _fail(symbol, "orderbook", "get_orderbook_buffer_status 결과가 dict 가 아닙니다. (STRICT)")
 
+    ws_state = str(runtime_health["ws_state"]).upper()
+    ws_reconnect_requested = bool(runtime_health["ws_reconnect_requested"])
+    ws_reconnect_request_reason = runtime_health["ws_reconnect_request_reason"]
+    orderbook_warnings = list(runtime_health["orderbook_warnings"])
+
     now_ms = _now_ms()
     recv_ts = ob_status.get("last_recv_ts")
     payload_ts = ob_status.get("payload_ts")
 
-    # 1) payload 자체가 아직 없을 때
     if ob is None:
-        # WS가 막 떠서 아직 첫 depth5가 안 온 초기구간이면 즉시 치명오류로 죽이지 않음
-        if recv_ts is None and payload_ts is None:
-            raise FeatureBuildError(
-                f"{symbol} orderbook payload not received yet (startup grace)"
+        if (
+            ws_state in ("OPENING", "RECONNECTING")
+            or ws_reconnect_requested
+            or "feed:startup_no_orderbook_yet" in orderbook_warnings
+            or "feed:opening_no_orderbook_yet" in orderbook_warnings
+        ):
+            reason_suffix = ""
+            if isinstance(ws_reconnect_request_reason, str) and ws_reconnect_request_reason:
+                reason_suffix = f", reconnect_reason={ws_reconnect_request_reason}"
+            _raise_recovery_in_progress(
+                symbol,
+                "orderbook",
+                "WS recovery/startup in progress and orderbook snapshot is not ready yet "
+                f"(ws_state={ws_state}, reconnect_requested={ws_reconnect_requested}{reason_suffix})",
             )
 
-        # recv_ts/payload_ts가 있는데도 실제 orderbook snapshot 이 비어 있으면 계약 위반
+        if recv_ts is None and payload_ts is None:
+            _fail(
+                symbol,
+                "orderbook",
+                "orderbook snapshot missing without recovery context (STRICT)",
+            )
+
         _fail(
             symbol,
             "orderbook",
@@ -1074,25 +1193,22 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
 
     age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)
     if age_sec > ORDERBOOK_MAX_DELAY_SEC:
+        if ws_state in ("OPENING", "RECONNECTING") or ws_reconnect_requested:
+            reason_suffix = ""
+            if isinstance(ws_reconnect_request_reason, str) and ws_reconnect_request_reason:
+                reason_suffix = f", reconnect_reason={ws_reconnect_request_reason}"
+            _raise_recovery_in_progress(
+                symbol,
+                "orderbook",
+                "stale orderbook snapshot observed during WS recovery "
+                f"(age_sec={age_sec:.1f}, ws_state={ws_state}, reconnect_requested={ws_reconnect_requested}{reason_suffix})",
+            )
+
         _fail(
             symbol,
             "orderbook",
             f"오더북 스냅샷이 {age_sec:.1f}초 동안 갱신되지 않았습니다 (허용 최대 {ORDERBOOK_MAX_DELAY_SEC:.1f}초).",
         )
-
-
-    now_ms = _now_ms()
-    age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)
-    if age_sec > ORDERBOOK_MAX_DELAY_SEC:
-        _fail(
-            symbol,
-            "orderbook",
-            f"오더북 스냅샷이 {age_sec:.1f}초 동안 갱신되지 않았습니다 (허용 최대 {ORDERBOOK_MAX_DELAY_SEC:.1f}초).",
-        )
-
-    ob_status = get_orderbook_buffer_status(symbol)
-    if not isinstance(ob_status, dict):
-        _fail(symbol, "orderbook", "get_orderbook_buffer_status 결과가 dict 가 아닙니다. (STRICT)")
 
     best_bid = _require_finite_float(symbol, "orderbook", "best_bid", bids[0][0], positive=True)
     best_ask = _require_finite_float(symbol, "orderbook", "best_ask", asks[0][0], positive=True)
@@ -1146,6 +1262,8 @@ def _compute_orderbook_features(symbol: str) -> Dict[str, Any]:
         "recv_delay_ms": ob_status.get("recv_delay_ms"),
         "payload_delay_ms": ob_status.get("payload_delay_ms"),
         "last_update_id": ob_status.get("last_update_id"),
+        "ws_state": ws_state,
+        "ws_reconnect_requested": ws_reconnect_requested,
     }
 
 
@@ -1222,17 +1340,12 @@ def _score_direction_candidate(
         else:
             reasons.append(f"{component_name}:neutral")
 
-    # 5m primary bias / momentum 을 최우선
     _apply_bias("bias_5m", int(direction_meta.get("5m_bias", 0)), 2.25, 2.25)
     _apply_bias("slope_5m", int(direction_meta.get("5m_slope_bias", 0)), 2.25, 2.25)
-
-    # 중기 지원
     _apply_bias("bias_15m", int(direction_meta.get("15m_bias", 0)), 1.10, 1.10)
     _apply_bias("slope_15m", int(direction_meta.get("15m_slope_bias", 0)), 0.80, 0.80)
     _apply_bias("bias_1h", int(direction_meta.get("1h_bias", 0)), 0.95, 0.95)
     _apply_bias("slope_1h", int(direction_meta.get("1h_slope_bias", 0)), 0.65, 0.65)
-
-    # 4h 는 telemetry 성격의 약한 bias 보정만 허용
     _apply_bias("bias_4h", int(direction_meta.get("4h_bias", 0)), 0.25, 0.25)
 
     depth_imbalance_raw = ob.get("depth_imbalance")
@@ -1288,7 +1401,6 @@ def _score_direction_candidate(
     score += min(abs(vol_z) * 0.35, 0.70)
     reasons.append("volume:activity")
 
-    # 과매수/과매도는 range 계열의 약한 보정만 허용
     if direction == "LONG":
         if oversold_tfs > 0:
             score += min(float(oversold_tfs) * 0.25, 0.50)
@@ -1409,7 +1521,7 @@ def build_entry_features_ws(
     if not timeframes:
         _fail(symbol, "features", "어떤 타임프레임에서도 피처를 생성하지 못했습니다.")
 
-    ob_features = _compute_orderbook_features(symbol)
+    ob_features = _compute_orderbook_features(symbol, health_summary=health_summary)
     mtf_summary = _build_multi_timeframe_summary(symbol, timeframes)
 
     return {
@@ -1455,26 +1567,6 @@ def get_trading_signal(
     ]
     latest_ts = int(buf_5m[-1][0])
 
-    ob_now = _compute_orderbook_features(symbol)
-
-    last_price_candidates: List[float] = []
-    ob_last_now = ob_now.get("last_price")
-    if _is_finite_number(ob_last_now):
-        last_price_candidates.append(float(ob_last_now))
-
-    ob_mark_now = ob_now.get("mark_price")
-    if _is_finite_number(ob_mark_now):
-        last_price_candidates.append(float(ob_mark_now))
-
-    tf5_close_light = buf_5m[-1][4]
-    if _is_finite_number(tf5_close_light):
-        last_price_candidates.append(float(tf5_close_light))
-
-    if last_price_candidates:
-        last_price = float(last_price_candidates[0])
-    else:
-        last_price = float(buf_5m[-1][4])
-
     freeze_state = _get_signal_freeze_state(symbol)
     if freeze_state is not None:
         frozen_ts = freeze_state.get("latest_ts")
@@ -1503,7 +1595,7 @@ def get_trading_signal(
                         latest_ts,
                         candles_5m,
                         candles_5m_raw,
-                        float(last_price),
+                        float(buf_5m[-1][4]),
                         _clone_frozen_extra_for_return(
                             frozen_extra,
                             last_close_ts=float(last_close_ts),
@@ -1618,11 +1710,11 @@ def get_trading_signal(
     selection_margin = abs(long_score - short_score)
 
     log(
-    f"[DIRECTION_SCORE] {symbol} "
-    f"long_score={long_score:.3f} "
-    f"short_score={short_score:.3f} "
-    f"margin={selection_margin:.3f} "
-    f"majority_trend={majority_trend}"
+        f"[DIRECTION_SCORE] {symbol} "
+        f"long_score={long_score:.3f} "
+        f"short_score={short_score:.3f} "
+        f"margin={selection_margin:.3f} "
+        f"majority_trend={majority_trend}"
     )
 
     min_candidate_score = 1.25

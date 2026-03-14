@@ -28,10 +28,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 변경 이력
 --------------------------------------------------------
 - 2026-03-13:
-  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
-  2) FIX(STRICT): regime/source 공백 문자열은 즉시 예외 처리
-  3) FIX(CONTRACT): is_test bool 계약 검증 추가
-  4) FIX(DB): DB insert 실패를 EventStoreDBError 로 분리
+  1) FIX(ARCH): JSON 직렬화 정규화 책임을 AutoReporter 상위 계층으로 이동하고 event_store는 strict validator 역할만 유지
+  2) FIX(STRICT): Decimal 암묵 변환 제거, 미정규화 payload는 즉시 계약 위반으로 차단
+  3) FIX(CODE-QUALITY): import 위치 정리 및 JSON serializable 검증 책임 명확화
+  4) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  5) FIX(STRICT): regime/source 공백 문자열은 즉시 예외 처리
+  6) FIX(CONTRACT): is_test bool 계약 검증 추가
+  7) FIX(DB): DB insert 실패를 EventStoreDBError 로 분리
 - 2026-03-07:
   1) 헤더를 AI TRADING INTELLIGENCE SYSTEM 규약으로 정합화
   2) logging 추가(print 금지 정책 정합)
@@ -189,25 +192,11 @@ def _ensure_dict(v: Any, name: str) -> Dict[str, Any]:
     raise EventStoreContractError(
         f"{name} must be dict, JSON object string, or None (STRICT)"
     )
-from decimal import Decimal
 
-
-def _convert_decimal(obj):
-    if isinstance(obj, Decimal):
-        return str(obj)
-
-    if isinstance(obj, dict):
-        return {k: _convert_decimal(v) for k, v in obj.items()}
-
-    if isinstance(obj, list):
-        return [_convert_decimal(v) for v in obj]
-
-    return obj
 
 def _ensure_json_serializable_dict(v: Any, name: str) -> Dict[str, Any]:
     obj = _ensure_dict(v, name)
     try:
-        obj = _convert_decimal(obj)
         json.dumps(obj, ensure_ascii=False)
     except (TypeError, ValueError) as e:
         raise EventStoreContractError(f"{name} must be JSON serializable object: {e} (STRICT)") from e

@@ -14,6 +14,7 @@ CORE RESPONSIBILITIES:
 - 청산 전 보호주문 정리 / 청산 후 포지션 0 STRICT 검증
 - TP/SL 보호주문 visibility STRICT 검증
 - Trade 반환 계약(strict fields / reconciliation_status) 보장
+- 반복 엔트리 실패를 circuit breaker 상태로 승격해 신규 진입을 차단한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -23,8 +24,15 @@ IMPORTANT POLICY:
 - 무보호 포지션 상태를 정상으로 취급하지 않는다
 - 청산 후 잔존 보호주문/잔존 포지션을 정상으로 취급하지 않는다
 - print 금지, logging만 사용
+- entry circuit breaker 는 신규 진입 차단용이며 강제 청산/정리 경로를 막으면 안 된다
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FEAT(CIRCUIT-BREAKER): 반복 엔트리 제출/체결/포지션반영/보호주문 검증 실패를 누적하는 entry circuit breaker 추가
+  2) FEAT(CIRCUIT-BREAKER): breaker open 상태에서는 open_position_with_tp_sl 신규 진입을 즉시 차단
+  3) FEAT(OBSERVABILITY): breaker last_reason / trip_count / open_until_ts snapshot helper 추가
+  4) FIX(RECOVERY): entry path 최종 성공 시 breaker 상태 reset
+  5) FIX(STRICT): entry failure stage 를 submit/fill/position_reflect/protection_set/protection_verify 로 분리 기록
 - 2026-03-11:
   1) FIX(CONTRACT): open_position_with_tp_sl() 반환 Trade에 entry_ts 포함
   2) FIX(CONTRACT): 체결 주문 응답에서 실제 체결 시각(updateTime/transactTime/time) strict 추출 추가
@@ -111,6 +119,10 @@ _ACTIVE_OR_FILLED_ORDER_STATUSES: set[str] = {
     "PENDING_CANCEL",
 }
 
+# Entry circuit breaker
+_ENTRY_CIRCUIT_BREAKER_CONFIRM_N: int = 3
+_ENTRY_CIRCUIT_BREAKER_COOLDOWN_SEC: float = 30.0
+
 
 # ---------------------------------------------------------------------------
 # Exceptions (TRADE-GRADE)
@@ -133,6 +145,10 @@ class PositionVerificationError(OrderExecutionError):
 
 class ProtectionOrderVerificationError(OrderExecutionError):
     """Raised when TP/SL protection orders are missing or invalid (STRICT)."""
+
+
+class EntryCircuitBreakerOpenError(OrderExecutionError):
+    """Raised when entry circuit breaker is open and 신규 진입이 차단된 상태."""
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +195,13 @@ _SETTINGS_LOCK = threading.Lock()
 _CLIENT_ID_CACHE: Dict[str, float] = {}
 _CLIENT_ID_INFLIGHT: set[str] = set()
 _CLIENT_ID_LOCK = threading.Lock()
+
+# Entry circuit breaker runtime state
+_ENTRY_CB_CONSECUTIVE_FAILURES: Dict[str, int] = {}
+_ENTRY_CB_OPEN_UNTIL_TS: Dict[str, float] = {}
+_ENTRY_CB_LAST_REASON: Dict[str, str] = {}
+_ENTRY_CB_TRIP_COUNT: Dict[str, int] = {}
+_ENTRY_CB_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +360,7 @@ def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
     if not hasattr(settings, "allocation_ratio"):
         return None
 
-    v = getattr(settings, "allocation_ratio")
+    v = settings.allocation_ratio
     if v is None:
         return None
 
@@ -425,6 +448,111 @@ def _resolve_order_fill_datetime_strict(order: Dict[str, Any]) -> datetime:
             return _ts_ms_to_datetime_utc_strict(order.get(key), name=f"order.{key}")
 
     raise OrderExecutionError("filled order missing updateTime/transactTime/time (STRICT)")
+
+
+# ---------------------------------------------------------------------------
+# Entry circuit breaker helpers
+# ---------------------------------------------------------------------------
+def get_entry_circuit_breaker_snapshot(symbol: str) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    now = time.time()
+    with _ENTRY_CB_LOCK:
+        open_until_ts = _ENTRY_CB_OPEN_UNTIL_TS.get(sym)
+        is_open = open_until_ts is not None and now < float(open_until_ts)
+        return {
+            "open": bool(is_open),
+            "open_until_ts": float(open_until_ts) if open_until_ts is not None else None,
+            "last_reason": _ENTRY_CB_LAST_REASON.get(sym),
+            "consecutive_failures": int(_ENTRY_CB_CONSECUTIVE_FAILURES.get(sym, 0)),
+            "trip_count": int(_ENTRY_CB_TRIP_COUNT.get(sym, 0)),
+        }
+
+
+def _assert_entry_circuit_closed(symbol: str) -> None:
+    snap = get_entry_circuit_breaker_snapshot(symbol)
+    if not snap["open"]:
+        return
+
+    open_until_ts = snap["open_until_ts"]
+    remaining_sec: Optional[float] = None
+    if open_until_ts is not None:
+        remaining_sec = max(0.0, float(open_until_ts) - time.time())
+
+    if remaining_sec is None:
+        raise EntryCircuitBreakerOpenError(
+            f"entry circuit breaker is OPEN (symbol={_normalize_symbol(symbol)} reason={snap['last_reason']})"
+        )
+
+    raise EntryCircuitBreakerOpenError(
+        f"entry circuit breaker is OPEN "
+        f"(symbol={_normalize_symbol(symbol)} remaining_sec={remaining_sec:.1f} reason={snap['last_reason']})"
+    )
+
+
+def _record_entry_circuit_breaker_failure(symbol: str, *, stage: str, reason: str) -> None:
+    sym = _normalize_symbol(symbol)
+    stage_s = str(stage).strip().lower()
+    reason_s = str(reason).strip()
+    if not stage_s:
+        raise RuntimeError("entry circuit breaker stage is empty (STRICT)")
+    if not reason_s:
+        raise RuntimeError("entry circuit breaker reason is empty (STRICT)")
+
+    now = time.time()
+    should_trip = False
+    trip_count = 0
+
+    with _ENTRY_CB_LOCK:
+        open_until_ts = _ENTRY_CB_OPEN_UNTIL_TS.get(sym)
+        if open_until_ts is not None and now < float(open_until_ts):
+            _ENTRY_CB_LAST_REASON[sym] = f"{stage_s}:{reason_s}"
+            return
+
+        current = int(_ENTRY_CB_CONSECUTIVE_FAILURES.get(sym, 0)) + 1
+        _ENTRY_CB_CONSECUTIVE_FAILURES[sym] = current
+        _ENTRY_CB_LAST_REASON[sym] = f"{stage_s}:{reason_s}"
+
+        if current >= _ENTRY_CIRCUIT_BREAKER_CONFIRM_N:
+            should_trip = True
+            _ENTRY_CB_OPEN_UNTIL_TS[sym] = now + _ENTRY_CIRCUIT_BREAKER_COOLDOWN_SEC
+            trip_count = int(_ENTRY_CB_TRIP_COUNT.get(sym, 0)) + 1
+            _ENTRY_CB_TRIP_COUNT[sym] = trip_count
+            _ENTRY_CB_CONSECUTIVE_FAILURES[sym] = 0
+
+    if should_trip:
+        logger.error(
+            "entry circuit breaker OPEN (symbol=%s cooldown_sec=%.1f trip_count=%s reason=%s)",
+            sym,
+            _ENTRY_CIRCUIT_BREAKER_COOLDOWN_SEC,
+            trip_count,
+            f"{stage_s}:{reason_s}",
+        )
+        return
+
+    logger.warning(
+        "entry circuit breaker failure recorded (symbol=%s count<%s stage=%s reason=%s)",
+        sym,
+        _ENTRY_CIRCUIT_BREAKER_CONFIRM_N,
+        stage_s,
+        reason_s,
+    )
+
+
+def _reset_entry_circuit_breaker_on_success(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    with _ENTRY_CB_LOCK:
+        prev_count = int(_ENTRY_CB_CONSECUTIVE_FAILURES.get(sym, 0))
+        prev_open_until = _ENTRY_CB_OPEN_UNTIL_TS.get(sym)
+        if prev_count != 0 or prev_open_until is not None:
+            logger.info(
+                "entry circuit breaker reset on success (symbol=%s prev_consecutive=%s prev_open_until_ts=%s)",
+                sym,
+                prev_count,
+                prev_open_until,
+            )
+        _ENTRY_CB_CONSECUTIVE_FAILURES[sym] = 0
+        _ENTRY_CB_OPEN_UNTIL_TS.pop(sym, None)
+        _ENTRY_CB_LAST_REASON.pop(sym, None)
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +710,9 @@ def get_symbol_filters(symbol: str) -> SymbolFilters:
 # Trading settings enforcement (margin mode / leverage)
 # ---------------------------------------------------------------------------
 def _require_margin_mode(settings: Any) -> str:
-    mm = getattr(settings, "margin_mode", None)
+    if not hasattr(settings, "margin_mode"):
+        raise ValueError("settings.margin_mode is required")
+    mm = settings.margin_mode
     if not isinstance(mm, str) or not mm.strip():
         raise ValueError("settings.margin_mode is required")
     mm_u = mm.strip().upper()
@@ -594,7 +724,9 @@ def _require_margin_mode(settings: Any) -> str:
 
 
 def _require_leverage(settings: Any) -> int:
-    lev = getattr(settings, "leverage", None)
+    if not hasattr(settings, "leverage"):
+        raise ValueError("settings.leverage is required")
+    lev = settings.leverage
     if lev is None:
         raise ValueError("settings.leverage is required")
     try:
@@ -607,7 +739,9 @@ def _require_leverage(settings: Any) -> int:
 
 
 def _require_timeout_sec(settings: Any) -> int:
-    v = getattr(settings, "request_timeout_sec", None)
+    if not hasattr(settings, "request_timeout_sec"):
+        raise ValueError("settings.request_timeout_sec is required")
+    v = settings.request_timeout_sec
     if v is None:
         raise ValueError("settings.request_timeout_sec is required")
     try:
@@ -620,7 +754,9 @@ def _require_timeout_sec(settings: Any) -> int:
 
 
 def _require_recv_window_ms(settings: Any) -> int:
-    v = getattr(settings, "recv_window_ms", None)
+    if not hasattr(settings, "recv_window_ms"):
+        raise ValueError("settings.recv_window_ms is required")
+    v = settings.recv_window_ms
     if v is None:
         raise ValueError("settings.recv_window_ms is required")
     try:
@@ -633,28 +769,36 @@ def _require_recv_window_ms(settings: Any) -> int:
 
 
 def _require_entry_fill_wait_sec(settings: Any) -> float:
-    v = getattr(settings, "entry_fill_wait_sec", None)
+    if not hasattr(settings, "entry_fill_wait_sec"):
+        raise ValueError("settings.entry_fill_wait_sec is required")
+    v = settings.entry_fill_wait_sec
     if v is None:
         raise ValueError("settings.entry_fill_wait_sec is required")
     return _require_positive_float(v, "settings.entry_fill_wait_sec")
 
 
 def _require_position_reflect_wait_sec(settings: Any) -> float:
-    v = getattr(settings, "position_reflect_wait_sec", None)
+    if not hasattr(settings, "position_reflect_wait_sec"):
+        raise ValueError("settings.position_reflect_wait_sec is required")
+    v = settings.position_reflect_wait_sec
     if v is None:
         raise ValueError("settings.position_reflect_wait_sec is required")
     return _require_positive_float(v, "settings.position_reflect_wait_sec")
 
 
 def _require_exit_fill_wait_sec(settings: Any) -> float:
-    v = getattr(settings, "exit_fill_wait_sec", None)
+    if not hasattr(settings, "exit_fill_wait_sec"):
+        raise ValueError("settings.exit_fill_wait_sec is required")
+    v = settings.exit_fill_wait_sec
     if v is None:
         raise ValueError("settings.exit_fill_wait_sec is required")
     return _require_positive_float(v, "settings.exit_fill_wait_sec")
 
 
 def _require_deterministic_client_order_id_flag(settings: Any) -> bool:
-    v = getattr(settings, "require_deterministic_client_order_id", None)
+    if not hasattr(settings, "require_deterministic_client_order_id"):
+        raise ValueError("settings.require_deterministic_client_order_id must be bool (STRICT)")
+    v = settings.require_deterministic_client_order_id
     if not isinstance(v, bool):
         raise ValueError("settings.require_deterministic_client_order_id must be bool (STRICT)")
     return v
@@ -663,7 +807,7 @@ def _require_deterministic_client_order_id_flag(settings: Any) -> bool:
 def _get_optional_max_entry_slippage_pct(settings: Any) -> Optional[float]:
     if not hasattr(settings, "max_entry_slippage_pct"):
         return None
-    v = getattr(settings, "max_entry_slippage_pct")
+    v = settings.max_entry_slippage_pct
     if v is None:
         return None
     try:
@@ -1738,6 +1882,8 @@ def open_position_with_tp_sl(
     _ = available_usdt
 
     sym = _normalize_symbol(symbol)
+    _assert_entry_circuit_closed(sym)
+
     open_side = _normalize_side(side_open)
     source_str = _require_nonempty_source(source)
 
@@ -1789,6 +1935,7 @@ def open_position_with_tp_sl(
             client_order_id=entry_cid,
         )
     except Exception as e:
+        _record_entry_circuit_breaker_failure(sym, stage="submit_entry", reason=str(e))
         logger.exception(
             "entry order failed (symbol=%s side=%s qty=%s source=%s)",
             sym,
@@ -1806,40 +1953,51 @@ def open_position_with_tp_sl(
                 "open_side": open_side,
                 "qty": expected_qty_f,
                 "clientOrderId": entry_cid,
+                "entry_cb_snapshot": get_entry_circuit_breaker_snapshot(sym),
             },
         )
         raise OrderExecutionError("entry order submission failed") from e
 
     order_id = entry_resp.get("orderId") if isinstance(entry_resp, dict) else None
     if order_id is None:
+        _record_entry_circuit_breaker_failure(sym, stage="submit_entry", reason="entry response missing orderId")
         raise OrderExecutionError("entry response missing orderId (STRICT)")
     entry_order_id = str(order_id)
 
     # 3) ENTRY 체결 검증(FILLED + executedQty + avgPrice)
-    od, exec_qty_dec, entry_price = _wait_order_filled_strict(
-        symbol=sym,
-        order_id=entry_order_id,
-        settings=settings,
-        expected_qty=expected_qty_dec,
-        qty_step=filt.market_step,
-        max_wait_sec=_require_entry_fill_wait_sec(settings),
-    )
-    executed_qty_f = float(exec_qty_dec)
+    try:
+        od, exec_qty_dec, entry_price = _wait_order_filled_strict(
+            symbol=sym,
+            order_id=entry_order_id,
+            settings=settings,
+            expected_qty=expected_qty_dec,
+            qty_step=filt.market_step,
+            max_wait_sec=_require_entry_fill_wait_sec(settings),
+        )
+    except Exception as e:
+        _record_entry_circuit_breaker_failure(sym, stage="fill_verify", reason=str(e))
+        raise
 
+    executed_qty_f = float(exec_qty_dec)
     entry_ts = _resolve_order_fill_datetime_strict(od)
 
     if entry_price <= 0 or not math.isfinite(entry_price):
+        _record_entry_circuit_breaker_failure(sym, stage="fill_verify", reason="entry_price invalid after fill")
         raise OrderExecutionError("entry_price resolved invalid (<=0 or non-finite)")
 
     # 4) 포지션 반영 확인
-    _verify_position_reflects_execution_strict(
-        symbol=sym,
-        open_side=open_side,
-        executed_qty=exec_qty_dec,
-        qty_step=filt.market_step,
-        settings=settings,
-        max_wait_sec=_require_position_reflect_wait_sec(settings),
-    )
+    try:
+        _verify_position_reflects_execution_strict(
+            symbol=sym,
+            open_side=open_side,
+            executed_qty=exec_qty_dec,
+            qty_step=filt.market_step,
+            settings=settings,
+            max_wait_sec=_require_position_reflect_wait_sec(settings),
+        )
+    except Exception as e:
+        _record_entry_circuit_breaker_failure(sym, stage="position_reflect", reason=str(e))
+        raise
 
     # 5) 슬리피지 진단
     slip_pct = abs(entry_price - eph) / eph * 100.0
@@ -1947,6 +2105,7 @@ def open_position_with_tp_sl(
             sl_client_order_id=sl_cid,
         )
     except Exception as e:
+        _record_entry_circuit_breaker_failure(sym, stage="protection_set", reason=str(e))
         logger.exception("set_tp_sl failed (symbol=%s soft_mode=%s)", sym, bool(soft_mode))
         log_event(
             event_type="ERROR",
@@ -1960,6 +2119,7 @@ def open_position_with_tp_sl(
                 "qty": executed_qty_f,
                 "entry_order_id": entry_order_id,
                 "clientOrderId": entry_cid,
+                "entry_cb_snapshot": get_entry_circuit_breaker_snapshot(sym),
             },
         )
 
@@ -1972,8 +2132,10 @@ def open_position_with_tp_sl(
         raise OrderExecutionError("tp/sl set failed") from e
 
     if tp_order_id is None or not str(tp_order_id).strip():
+        _record_entry_circuit_breaker_failure(sym, stage="protection_set", reason="TP order_id missing")
         raise OrderExecutionError("TP order_id is missing after set_tp_sl (STRICT)")
     if not bool(soft_mode) and (sl_order_id is None or not str(sl_order_id).strip()):
+        _record_entry_circuit_breaker_failure(sym, stage="protection_set", reason="SL order_id missing while soft_mode=False")
         raise OrderExecutionError("soft_mode=False but SL order_id is missing (STRICT)")
 
     # 8) 보호주문 실제 존재 검증
@@ -1990,6 +2152,7 @@ def open_position_with_tp_sl(
             settings=settings,
         )
     except Exception as e:
+        _record_entry_circuit_breaker_failure(sym, stage="protection_verify", reason=str(e))
         logger.exception("protection order verification failed (symbol=%s soft_mode=%s)", sym, bool(soft_mode))
         log_event(
             event_type="ERROR",
@@ -2007,6 +2170,7 @@ def open_position_with_tp_sl(
                 "tp_clientOrderId": tp_cid,
                 "sl_clientOrderId": (sl_cid if sl_order_id is not None else None),
                 "entry_clientOrderId": entry_cid,
+                "entry_cb_snapshot": get_entry_circuit_breaker_snapshot(sym),
             },
         )
 
@@ -2046,7 +2210,7 @@ def open_position_with_tp_sl(
 
     now_sync = datetime.now(timezone.utc)
 
-    return _make_trade_strict(
+    trade = _make_trade_strict(
         symbol=sym,
         side=open_side,
         qty=executed_qty_f,
@@ -2067,6 +2231,9 @@ def open_position_with_tp_sl(
         reconciliation_status="PROTECTION_VERIFIED",
         last_synced_at=now_sync,
     )
+
+    _reset_entry_circuit_breaker_on_success(sym)
+    return trade
 
 
 def close_position_market(
@@ -2298,6 +2465,13 @@ def close_all_positions_market(
 
 
 __all__ = [
+    "OrderExecutionError",
+    "OrderFillTimeoutError",
+    "PartialFillError",
+    "PositionVerificationError",
+    "ProtectionOrderVerificationError",
+    "EntryCircuitBreakerOpenError",
+    "get_entry_circuit_breaker_snapshot",
     "open_position_with_tp_sl",
     "place_market",
     "place_limit",

@@ -12,6 +12,7 @@ CORE RESPONSIBILITIES:
 - Signal.meta 필수 진단 정보 구성
 - 실행 계층용 기본 entry_price_hint 제공
 - quant / decision 메타 일관성 검증
+- 공통 STRICT 검증 프리미티브(common.strict_validators)와 정합 유지
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -24,6 +25,11 @@ IMPORTANT POLICY:
 - 최종 authoritative 실행 가격은 상위 계층(run_bot_ws)이 주입/정합화한다
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FIX(ARCH): common.strict_validators 공통 STRICT 검증 프리미티브를 Signal Layer에 연결
+  2) FIX(CONSISTENCY): int/float/list/mapping/choice 검증을 공통 계약과 정합화
+  3) FIX(SAFETY): StrictValidationError 를 EntryFlowContractError / EntryFlowConfigError 로 승격해 기존 호출자 계약 유지
+  4) FIX(STRICT): 문자열은 기존 계약대로 str 타입만 허용한 뒤 공통 validator를 적용하도록 wrapper 강화
 - 2026-03-13:
   1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
   2) FEAT(CONTRACT): EntryFlowDecision.__post_init__ 추가로 action/direction/reason/reasons/numeric 계약 검증 강화
@@ -43,7 +49,6 @@ CHANGE HISTORY:
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -51,6 +56,16 @@ from common.exceptions_strict import (
     StrictConfigError,
     StrictDataError,
     StrictStateError,
+)
+from common.strict_validators import (
+    StrictValidationError,
+    opt_float as _sv_opt_float,
+    require_choice as _sv_require_choice,
+    require_float as _sv_require_float,
+    require_int as _sv_require_int,
+    require_list as _sv_require_list,
+    require_mapping as _sv_require_mapping,
+    require_nonempty_str as _sv_require_nonempty_str,
 )
 from strategy.signal import Signal
 
@@ -70,6 +85,14 @@ class EntryFlowContractError(StrictDataError):
 
 class EntryFlowStateError(StrictStateError):
     """decision / quant state 불일치."""
+
+
+def _raise_contract_from_strict(where: str, exc: StrictValidationError) -> EntryFlowContractError:
+    return EntryFlowContractError(f"{where}: {exc}")
+
+
+def _raise_config_from_strict(where: str, exc: StrictValidationError) -> EntryFlowConfigError:
+    return EntryFlowConfigError(f"{where}: {exc}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +118,7 @@ class EntryFlowDecision:
             raise EntryFlowContractError("decision.reasons must be list[str] (STRICT)")
         if not self.reasons:
             raise EntryFlowContractError("decision.reasons must not be empty (STRICT)")
+
         normalized_reasons: List[str] = []
         for idx, item in enumerate(self.reasons):
             normalized_reasons.append(_require_nonempty_str(item, f"decision.reasons[{idx}]"))
@@ -132,14 +156,11 @@ class EntryFlowDecision:
 
 
 def _require_mapping(value: Any, name: str) -> Dict[str, Any]:
-    if value is None:
-        raise EntryFlowContractError(f"{name} is required (STRICT)")
-    if not isinstance(value, Mapping):
-        raise EntryFlowContractError(f"{name} must be mapping (STRICT), got={type(value).__name__}")
-    data = dict(value)
-    if not data:
-        raise EntryFlowContractError(f"{name} must not be empty (STRICT)")
-    return data
+    try:
+        mapping_obj = _sv_require_mapping(value, name, non_empty=True)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
+    return dict(mapping_obj)
 
 
 def _require_nonempty_str(value: Any, name: str) -> str:
@@ -147,45 +168,50 @@ def _require_nonempty_str(value: Any, name: str) -> str:
         raise EntryFlowContractError(f"{name} is required (STRICT)")
     if not isinstance(value, str):
         raise EntryFlowContractError(f"{name} must be str (STRICT), got={type(value).__name__}")
-    s = value.strip()
-    if not s:
-        raise EntryFlowContractError(f"{name} must not be empty (STRICT)")
-    return s
+    try:
+        return _sv_require_nonempty_str(value, name)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _require_direction(value: Any, name: str) -> str:
-    direction = _require_nonempty_str(value, name).upper()
-    if direction not in _ALLOWED_DIRECTIONS:
-        raise EntryFlowContractError(f"{name} must be LONG/SHORT (STRICT)")
-    return direction
+    if value is None:
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
+    if not isinstance(value, str):
+        raise EntryFlowContractError(f"{name} must be str (STRICT), got={type(value).__name__}")
+    try:
+        return _sv_require_choice(value, name, _ALLOWED_DIRECTIONS)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _require_action(value: Any, name: str) -> str:
-    action = _require_nonempty_str(value, name).upper()
-    if action not in _ALLOWED_ACTIONS:
-        raise EntryFlowContractError(f"{name} must be ENTER/SKIP (STRICT)")
-    return action
+    if value is None:
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
+    if not isinstance(value, str):
+        raise EntryFlowContractError(f"{name} must be str (STRICT), got={type(value).__name__}")
+    try:
+        return _sv_require_choice(value, name, _ALLOWED_ACTIONS)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _require_quant_final_decision(value: Any, name: str) -> str:
-    decision = _require_nonempty_str(value, name).upper()
-    if decision not in _ALLOWED_QUANT_FINAL_DECISIONS:
-        raise EntryFlowContractError(f"{name} must be ENTER/SKIP (STRICT)")
-    return decision
+    if value is None:
+        raise EntryFlowContractError(f"{name} is required (STRICT)")
+    if not isinstance(value, str):
+        raise EntryFlowContractError(f"{name} must be str (STRICT), got={type(value).__name__}")
+    try:
+        return _sv_require_choice(value, name, _ALLOWED_QUANT_FINAL_DECISIONS)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _require_int(value: Any, name: str) -> int:
-    if value is None:
-        raise EntryFlowContractError(f"{name} is required (STRICT)")
-    if isinstance(value, bool):
-        raise EntryFlowContractError(f"{name} must be int (STRICT), bool not allowed")
     try:
-        iv = int(value)
-    except Exception as exc:
-        raise EntryFlowContractError(f"{name} must be int (STRICT): {exc}") from exc
-    if iv <= 0:
-        raise EntryFlowContractError(f"{name} must be > 0 (STRICT)")
-    return iv
+        return _sv_require_int(value, name, min_value=1)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _require_float(
@@ -195,21 +221,10 @@ def _require_float(
     min_value: Optional[float] = None,
     max_value: Optional[float] = None,
 ) -> float:
-    if value is None:
-        raise EntryFlowContractError(f"{name} is required (STRICT)")
-    if isinstance(value, bool):
-        raise EntryFlowContractError(f"{name} must be numeric (STRICT), bool not allowed")
     try:
-        fv = float(value)
-    except Exception as exc:
-        raise EntryFlowContractError(f"{name} must be numeric (STRICT): {exc}") from exc
-    if not math.isfinite(fv):
-        raise EntryFlowContractError(f"{name} must be finite (STRICT)")
-    if min_value is not None and fv < min_value:
-        raise EntryFlowContractError(f"{name} must be >= {min_value} (STRICT)")
-    if max_value is not None and fv > max_value:
-        raise EntryFlowContractError(f"{name} must be <= {max_value} (STRICT)")
-    return fv
+        return _sv_require_float(value, name, min_value=min_value, max_value=max_value)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _optional_float(
@@ -219,27 +234,27 @@ def _optional_float(
     min_value: Optional[float] = None,
     max_value: Optional[float] = None,
 ) -> Optional[float]:
-    if value is None:
-        return None
-    return _require_float(value, name, min_value=min_value, max_value=max_value)
+    try:
+        return _sv_opt_float(value, name, min_value=min_value, max_value=max_value)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
-def _require_list(value: Any, name: str) -> list:
-    if value is None:
-        raise EntryFlowContractError(f"{name} is required (STRICT)")
-    if not isinstance(value, list):
-        raise EntryFlowContractError(f"{name} must be list (STRICT), got={type(value).__name__}")
-    if not value:
-        raise EntryFlowContractError(f"{name} must not be empty (STRICT)")
-    return value
+def _require_list(value: Any, name: str) -> list[Any]:
+    try:
+        return _sv_require_list(value, name, non_empty=True)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
 
 
 def _optional_dict(value: Any, name: str) -> Optional[Dict[str, Any]]:
     if value is None:
         return None
-    if not isinstance(value, Mapping):
-        raise EntryFlowContractError(f"{name} must be mapping when provided (STRICT)")
-    return dict(value)
+    try:
+        mapping_obj = _sv_require_mapping(value, name, non_empty=False)
+    except StrictValidationError as exc:
+        raise _raise_contract_from_strict(name, exc) from exc
+    return dict(mapping_obj)
 
 
 def _read_feature_str(features: Mapping[str, Any], key: str) -> str:
@@ -271,7 +286,10 @@ def _read_setting_float(
         raise EntryFlowConfigError("settings is required (STRICT)")
     if not hasattr(settings, key):
         raise EntryFlowConfigError(f"settings.{key} is required (STRICT)")
-    return _require_float(getattr(settings, key), f"settings.{key}", min_value=min_value, max_value=max_value)
+    try:
+        return _sv_require_float(getattr(settings, key), f"settings.{key}", min_value=min_value, max_value=max_value)
+    except StrictValidationError as exc:
+        raise _raise_config_from_strict(f"settings.{key}", exc) from exc
 
 
 def _validate_core_feature_contract(features: Mapping[str, Any]) -> None:

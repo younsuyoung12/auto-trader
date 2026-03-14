@@ -9,7 +9,15 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - 캔들(Kline) / 오더북(Orderbook) 구조·값 범위·NaN/inf·시간 역전(rollback)·미래 시각을 STRICT로 차단한다.
 - 이 모듈은 "검증"만 수행한다. (로그/알림/SAFE_STOP 결정은 호출자 책임)
 
-설계 원칙:
+CORE RESPONSIBILITIES
+- 원시 시세 데이터 필수 필드/형태 검증
+- timestamp rollback / future timestamp 차단
+- 가격/수량/스프레드 관계식 검증
+- entry market data bundle 계약 검증
+- 공통 STRICT 검증 프리미티브(common.strict_validators)와 정합 유지
+
+IMPORTANT POLICY
+- STRICT · NO-FALLBACK · TRADE-GRADE
 - 폴백 금지(None→0 등 금지)
 - 데이터 누락/불일치/비정상 값 발견 시 즉시 예외
 - 예외 삼키기 금지
@@ -18,6 +26,10 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 --------------------------------------------------------
+- 2026-03-14:
+  1) FIX(ARCH): 공통 STRICT 검증 프리미티브를 common.strict_validators로 단일화
+  2) FIX(CONSISTENCY): 문자열/정수ms/실수/심볼 정규화 규칙을 프로젝트 공통 계약과 정합화
+  3) FIX(SAFETY): common.strict_validators 예외를 DataIntegrityError로 승격해 호출자 계약 유지
 - 2026-03-04:
   1) 신규 생성: Kline/Orderbook 원시 데이터 무결성 STRICT 검증 추가
   2) 시간 역전(timestamp rollback) 즉시 차단 + 미래 timestamp 차단
@@ -30,7 +42,16 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+from common.strict_validators import (
+    StrictValidationError,
+    normalize_symbol as _sv_normalize_symbol,
+    require_float as _sv_require_float,
+    require_int_ms as _sv_require_int_ms,
+    require_list as _sv_require_list,
+    require_nonempty_str as _sv_require_nonempty_str,
+)
 
 
 class DataIntegrityError(RuntimeError):
@@ -44,48 +65,50 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _wrap_validation_error(where: str, exc: StrictValidationError) -> DataIntegrityError:
+    return DataIntegrityError(f"{where}: {exc}")
+
+
 def _require_nonempty_str(v: Any, name: str) -> str:
-    if v is None:
-        raise DataIntegrityError(f"{name} is required (STRICT)")
-    s = str(v).strip()
-    if not s:
-        raise DataIntegrityError(f"{name} is required (STRICT)")
-    return s
+    try:
+        return _sv_require_nonempty_str(v, name)
+    except StrictValidationError as e:
+        raise _wrap_validation_error(name, e) from e
 
 
 def _require_int_ms(v: Any, name: str) -> int:
-    if v is None:
-        raise DataIntegrityError(f"{name} is required (STRICT)")
-    if isinstance(v, bool):
-        raise DataIntegrityError(f"{name} must be int ms (bool not allowed)")
     try:
-        iv = int(v)
-    except Exception as e:
-        raise DataIntegrityError(f"{name} must be int ms (STRICT): {e}") from e
-    if iv <= 0:
-        raise DataIntegrityError(f"{name} must be > 0 (STRICT)")
-    return int(iv)
+        return _sv_require_int_ms(v, name)
+    except StrictValidationError as e:
+        raise _wrap_validation_error(name, e) from e
 
 
 def _require_float(v: Any, name: str) -> float:
-    if v is None:
-        raise DataIntegrityError(f"{name} is required (STRICT)")
-    if isinstance(v, bool):
-        raise DataIntegrityError(f"{name} must be numeric (bool not allowed)")
     try:
-        x = float(v)
-    except Exception as e:
-        raise DataIntegrityError(f"{name} must be numeric (STRICT): {e}") from e
-    if not math.isfinite(x):
-        raise DataIntegrityError(f"{name} must be finite (STRICT)")
-    return float(x)
+        return _sv_require_float(v, name)
+    except StrictValidationError as e:
+        raise _wrap_validation_error(name, e) from e
 
 
 def _require_float_min(v: Any, name: str, *, min_value: float) -> float:
-    x = _require_float(v, name)
-    if x < min_value:
-        raise DataIntegrityError(f"{name} must be >= {min_value} (STRICT)")
-    return float(x)
+    try:
+        return _sv_require_float(v, name, min_value=min_value)
+    except StrictValidationError as e:
+        raise _wrap_validation_error(name, e) from e
+
+
+def _require_list(v: Any, name: str, *, non_empty: bool = False) -> list[Any]:
+    try:
+        return _sv_require_list(v, name, non_empty=non_empty)
+    except StrictValidationError as e:
+        raise _wrap_validation_error(name, e) from e
+
+
+def _normalize_symbol(symbol: Any, *, name: str = "symbol") -> str:
+    try:
+        return _sv_normalize_symbol(symbol, name=name)
+    except StrictValidationError as e:
+        raise _wrap_validation_error(name, e) from e
 
 
 # =============================================================================
@@ -156,15 +179,12 @@ def validate_kline_row_strict(
     c = _require_float(row[4], f"{name}[{idx}].close")
     v = _require_float(row[5], f"{name}[{idx}].volume")
 
-    # Basic invariants
     if h < l:
         raise DataIntegrityError(f"{name}[{idx}] high < low (STRICT)")
     if c < l or c > h:
         raise DataIntegrityError(f"{name}[{idx}] close out of range [low,high] (STRICT)")
     if v < 0:
         raise DataIntegrityError(f"{name}[{idx}] volume < 0 (STRICT)")
-
-    # Additional sanity (prices should be non-negative; allow 0 only if exchange ever sends it -> treat as invalid here)
     if o <= 0 or h <= 0 or l <= 0 or c <= 0:
         raise DataIntegrityError(f"{name}[{idx}] price must be > 0 (STRICT)")
 
@@ -220,21 +240,15 @@ def _require_price_qty_pair(v: Any, name: str) -> Tuple[float, float]:
     qty = _require_float_min(v[1], f"{name}.qty", min_value=0.0)
     if px <= 0:
         raise DataIntegrityError(f"{name}.price must be > 0 (STRICT)")
-    # qty == 0 은 의미 없으나, 거래소가 0을 보내는 경우는 이상치로 본다.
     if qty <= 0:
         raise DataIntegrityError(f"{name}.qty must be > 0 (STRICT)")
     return float(px), float(qty)
 
 
 def _pick_best_bid_ask_strict(ob: Dict[str, Any]) -> Tuple[float, float]:
-    bids = ob.get("bids")
-    asks = ob.get("asks")
-    if not isinstance(bids, list) or not bids:
-        raise DataIntegrityError("orderbook.bids empty/invalid (STRICT)")
-    if not isinstance(asks, list) or not asks:
-        raise DataIntegrityError("orderbook.asks empty/invalid (STRICT)")
+    bids = _require_list(ob.get("bids"), "orderbook.bids", non_empty=True)
+    asks = _require_list(ob.get("asks"), "orderbook.asks", non_empty=True)
 
-    # Prefer explicit keys if present; else use first levels
     best_bid_raw = ob.get("bestBid")
     best_ask_raw = ob.get("bestAsk")
 
@@ -287,9 +301,7 @@ def validate_orderbook_strict(
     - (옵션) ts 존재 + 미래 ts 차단
     returns: (best_bid, best_ask)
     """
-    sym = _require_nonempty_str(symbol, "symbol").replace("-", "").replace("/", "").upper().strip()
-    if not sym:
-        raise DataIntegrityError("symbol normalized empty (STRICT)")
+    sym = _normalize_symbol(symbol, name="symbol")
 
     if not isinstance(ob, dict) or not ob:
         raise DataIntegrityError(f"{name} must be non-empty dict (STRICT) symbol={sym}")
@@ -300,14 +312,9 @@ def validate_orderbook_strict(
         if ts_ms > nowv + int(allowed_future_ms):
             raise DataIntegrityError(f"{name} future ts_ms (STRICT): ts={ts_ms} now={nowv} symbol={sym}")
 
-    bids = ob.get("bids")
-    asks = ob.get("asks")
-    if not isinstance(bids, list) or not bids:
-        raise DataIntegrityError(f"{name}.bids empty/invalid (STRICT) symbol={sym}")
-    if not isinstance(asks, list) or not asks:
-        raise DataIntegrityError(f"{name}.asks empty/invalid (STRICT) symbol={sym}")
+    bids = _require_list(ob.get("bids"), f"{name}.bids", non_empty=True)
+    asks = _require_list(ob.get("asks"), f"{name}.asks", non_empty=True)
 
-    # Validate a few top levels (do not loop all levels to avoid latency)
     top_n = 5
     for i in range(min(top_n, len(bids))):
         _require_price_qty_pair(bids[i], f"{name}.bids[{i}]")
@@ -335,9 +342,9 @@ def validate_entry_market_data_bundle_strict(market_data: Dict[str, Any]) -> Non
     if not isinstance(market_data, dict) or not market_data:
         raise DataIntegrityError("market_data must be non-empty dict (STRICT)")
 
-    symbol = _require_nonempty_str(market_data.get("symbol"), "market_data.symbol")
-    _ = _require_nonempty_str(market_data.get("direction"), "market_data.direction")
-    _ = _require_nonempty_str(market_data.get("signal_source"), "market_data.signal_source")
+    symbol = _normalize_symbol(market_data.get("symbol"), name="market_data.symbol")
+    _require_nonempty_str(market_data.get("direction"), "market_data.direction")
+    _require_nonempty_str(market_data.get("signal_source"), "market_data.signal_source")
 
     ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
     nowv = _now_ms()
@@ -360,12 +367,11 @@ def validate_entry_market_data_bundle_strict(market_data: Dict[str, Any]) -> Non
     if extra is not None and not isinstance(extra, dict):
         raise DataIntegrityError("market_data.extra must be dict or None (STRICT)")
 
-    # market_features/unified_features는 존재하면 dict 형태만 강제(세부 스키마는 해당 레이어에서)
     mf = market_data.get("market_features")
     if mf is not None and not isinstance(mf, dict):
         raise DataIntegrityError("market_data.market_features must be dict when provided (STRICT)")
 
-    _ = symbol  # explicit usage to avoid lint confusion
+    _ = symbol
 
 
 __all__ = [

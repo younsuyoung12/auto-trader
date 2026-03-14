@@ -4,19 +4,22 @@
 FILE: engine/engine_loop.py
 ROLE:
 - trading engine main loop orchestrator
-- bootstrap 이후 각 cycle(monitoring / open-position / idle entry / safe-stop resolution)를
+- bootstrap 이후 각 cycle(monitoring / position-supervisor / reconciliation / open-position / idle entry / safe-stop resolution)를
   deterministic 하게 실행한다
 - 기관형 엔진 상태기계(BOOTING / RUNNING / SAFE_STOP / RECOVERY / HALTED)를
   단일 runtime 객체로 관리한다
 
 CORE RESPONSIBILITIES:
 - monitoring cycle 실행
+- position supervisor cycle 실행
+- reconciliation cycle 실행
 - open-position cycle 실행
 - idle entry cycle 실행
 - SAFE_STOP / RECOVERY / HALTED 전이 처리
 - tick cadence 유지
 - loop runtime state를 단일 객체로 관리
 - 상태 전이 사유(reason)와 시각(ts)을 strict 하게 보존
+- execution 직후 position supervisor / reconciliation 이 같은 루프 안에서 실행되도록 보장
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -27,9 +30,16 @@ IMPORTANT POLICY:
 - runtime state rollback 금지
 - BOOTING / RUNNING / SAFE_STOP / RECOVERY / HALTED 상태 계약 위반 금지
 - SAFE_STOP 상태에서 신규 진입 실행 금지
+- HALTED 전이 시 즉시 loop 종료
 ============================================================
 
 CHANGE HISTORY:
+- 2026-03-14
+  1) FEAT(ARCH): position_supervisor_cycle_fn / reconciliation_cycle_fn 정식 orchestration 슬롯 추가
+  2) FEAT(ORDER): monitoring → position_supervisor → open_position → reconciliation → safe-stop / entry 순서로 loop 재구성
+  3) FIX(ROOT-CAUSE): open_position handled 이후 safe_stop_requested=True 면 즉시 SAFE_STOP 분기하도록 수정
+  4) FIX(OPERABILITY): last_position_supervisor_ts / last_reconciliation_ts 추적 추가
+  5) FIX(HALT): 각 cycle 이후 HALTED 상태 즉시 감지/종료 추가
 - 2026-03-13
   1) FIX(STATE-MACHINE): BOOTING / RUNNING / SAFE_STOP / RECOVERY / HALTED 명시 상태기계 도입
   2) FIX(OPERABILITY): safe_stop_reason / halt_reason / recovery_reason / last_state_transition_ts 추적 추가
@@ -75,6 +85,14 @@ class EngineLoopHalted(EngineLoopError):
 
 
 class MonitoringCycleFn(Protocol):
+    def __call__(self, now_ts: float, runtime: "EngineLoopRuntime") -> None: ...
+
+
+class PositionSupervisorCycleFn(Protocol):
+    def __call__(self, now_ts: float, runtime: "EngineLoopRuntime") -> None: ...
+
+
+class ReconciliationCycleFn(Protocol):
     def __call__(self, now_ts: float, runtime: "EngineLoopRuntime") -> None: ...
 
 
@@ -198,6 +216,8 @@ class EngineLoopRuntime:
 
     last_tick_ts: float = 0.0
     last_monitoring_ts: float = 0.0
+    last_position_supervisor_ts: float = 0.0
+    last_reconciliation_ts: float = 0.0
     last_open_position_cycle_ts: float = 0.0
     last_idle_entry_cycle_ts: float = 0.0
     last_safe_stop_check_ts: float = 0.0
@@ -223,6 +243,8 @@ class EngineLoopRuntime:
 
         _require_float(self.last_tick_ts, "runtime.last_tick_ts", min_value=0.0)
         _require_float(self.last_monitoring_ts, "runtime.last_monitoring_ts", min_value=0.0)
+        _require_float(self.last_position_supervisor_ts, "runtime.last_position_supervisor_ts", min_value=0.0)
+        _require_float(self.last_reconciliation_ts, "runtime.last_reconciliation_ts", min_value=0.0)
         _require_float(self.last_open_position_cycle_ts, "runtime.last_open_position_cycle_ts", min_value=0.0)
         _require_float(self.last_idle_entry_cycle_ts, "runtime.last_idle_entry_cycle_ts", min_value=0.0)
         _require_float(self.last_safe_stop_check_ts, "runtime.last_safe_stop_check_ts", min_value=0.0)
@@ -433,11 +455,66 @@ def _interruptible_sleep_or_raise(
                     sleep_fn(min(tick, remain))
 
 
+def _raise_if_halted_or_stopped_or_raise(runtime: EngineLoopRuntime) -> None:
+    runtime.validate_or_raise()
+    if runtime.engine_state == ENGINE_STATE_HALTED or runtime.halted:
+        raise EngineLoopHalted(f"engine loop halted: reason={runtime.halt_reason}")
+
+
+def _run_safe_stop_resolution_or_raise(
+    *,
+    now_ts: float,
+    runtime: EngineLoopRuntime,
+    idle_safe_stop_fn: IdleSafeStopFn,
+    resume_sleep_sec: float,
+    safe_stop_sleep_sec: float,
+) -> float:
+    if not runtime.safe_stop_requested:
+        raise EngineLoopContractError("safe-stop resolution called without safe_stop_requested=True (STRICT)")
+
+    if runtime.engine_state not in (ENGINE_STATE_SAFE_STOP, ENGINE_STATE_RECOVERY):
+        raise EngineLoopContractError(
+            f"safe-stop resolution requires SAFE_STOP/RECOVERY (STRICT), current={runtime.engine_state}"
+        )
+
+    runtime.last_safe_stop_check_ts = now_ts
+    should_halt = idle_safe_stop_fn(now_ts, runtime)
+    if not isinstance(should_halt, bool):
+        raise EngineLoopContractError("idle_safe_stop_fn must return bool (STRICT)")
+
+    if should_halt:
+        halt_reason = runtime.safe_stop_reason
+        if halt_reason is None:
+            halt_reason = "SAFE_STOP_RESOLUTION_REQUESTED_HALT"
+        runtime.halt(halt_reason, now_ts=now_ts)
+        raise EngineLoopHalted(
+            f"engine loop halted after SAFE_STOP resolution: reason={runtime.halt_reason}"
+        )
+
+    runtime.validate_or_raise()
+
+    if runtime.safe_stop_requested:
+        if runtime.engine_state not in (ENGINE_STATE_SAFE_STOP, ENGINE_STATE_RECOVERY):
+            raise EngineLoopContractError(
+                "post safe-stop resolution state must be SAFE_STOP/RECOVERY when request still active (STRICT)"
+            )
+        return _require_float(safe_stop_sleep_sec, "safe_stop_sleep_sec", min_value=0.001)
+
+    if runtime.engine_state != ENGINE_STATE_RUNNING:
+        raise EngineLoopContractError(
+            "safe_stop cleared but engine_state is not RUNNING (STRICT)"
+        )
+
+    return _require_float(resume_sleep_sec, "resume_sleep_sec", min_value=0.001)
+
+
 def run_engine_loop_or_raise(
     *,
     config: EngineLoopConfig,
     runtime: EngineLoopRuntime,
     monitoring_cycle_fn: MonitoringCycleFn,
+    position_supervisor_cycle_fn: PositionSupervisorCycleFn,
+    reconciliation_cycle_fn: ReconciliationCycleFn,
     open_position_cycle_fn: OpenPositionCycleFn,
     entry_cycle_fn: EntryCycleFn,
     idle_safe_stop_fn: IdleSafeStopFn,
@@ -450,13 +527,20 @@ def run_engine_loop_or_raise(
 
     loop order
     1) monitoring
-    2) open-position cycle
-    3) idle safe-stop resolution
-    4) idle entry cycle
+    2) position supervisor
+    3) open-position cycle
+    4) reconciliation
+    5) safe-stop resolution
+    6) idle entry cycle
+    7) reconciliation
     """
 
     if monitoring_cycle_fn is None:
         raise EngineLoopContractError("monitoring_cycle_fn is required (STRICT)")
+    if position_supervisor_cycle_fn is None:
+        raise EngineLoopContractError("position_supervisor_cycle_fn is required (STRICT)")
+    if reconciliation_cycle_fn is None:
+        raise EngineLoopContractError("reconciliation_cycle_fn is required (STRICT)")
     if open_position_cycle_fn is None:
         raise EngineLoopContractError("open_position_cycle_fn is required (STRICT)")
     if entry_cycle_fn is None:
@@ -500,61 +584,70 @@ def run_engine_loop_or_raise(
 
         monitoring_cycle_fn(now_ts, runtime)
         runtime.last_monitoring_ts = now_ts
+        _raise_if_halted_or_stopped_or_raise(runtime)
 
-        runtime.validate_or_raise()
-
-        sleep_sec: float
+        position_supervisor_cycle_fn(now_ts, runtime)
+        runtime.last_position_supervisor_ts = now_ts
+        _raise_if_halted_or_stopped_or_raise(runtime)
 
         handled_open_position = open_position_cycle_fn(now_ts, runtime)
         if not isinstance(handled_open_position, bool):
             raise EngineLoopContractError("open_position_cycle_fn must return bool (STRICT)")
-
         if handled_open_position:
             runtime.last_open_position_cycle_ts = now_ts
-            sleep_sec = config.open_position_tick_sec
+        _raise_if_halted_or_stopped_or_raise(runtime)
+
+        sleep_sec: float
+
+        if handled_open_position:
+            reconciliation_cycle_fn(now_ts, runtime)
+            runtime.last_reconciliation_ts = now_ts
+            _raise_if_halted_or_stopped_or_raise(runtime)
+
+            if runtime.safe_stop_requested:
+                sleep_sec = _run_safe_stop_resolution_or_raise(
+                    now_ts=now_ts,
+                    runtime=runtime,
+                    idle_safe_stop_fn=idle_safe_stop_fn,
+                    resume_sleep_sec=config.open_position_tick_sec,
+                    safe_stop_sleep_sec=config.safe_stop_tick_sec,
+                )
+            else:
+                sleep_sec = config.open_position_tick_sec
+
         else:
             if runtime.safe_stop_requested:
-                if runtime.engine_state not in (ENGINE_STATE_SAFE_STOP, ENGINE_STATE_RECOVERY):
-                    raise EngineLoopContractError(
-                        "safe_stop_requested=True requires engine_state SAFE_STOP/RECOVERY (STRICT)"
-                    )
-
-                runtime.last_safe_stop_check_ts = now_ts
-                should_halt = idle_safe_stop_fn(now_ts, runtime)
-                if not isinstance(should_halt, bool):
-                    raise EngineLoopContractError("idle_safe_stop_fn must return bool (STRICT)")
-
-                if should_halt:
-                    halt_reason = runtime.safe_stop_reason
-                    if halt_reason is None:
-                        halt_reason = "SAFE_STOP_RESOLUTION_REQUESTED_HALT"
-                    runtime.halt(halt_reason, now_ts=now_ts)
-                    raise EngineLoopHalted(
-                        f"engine loop halted after SAFE_STOP resolution: reason={runtime.halt_reason}"
-                    )
-
-                runtime.validate_or_raise()
-
-                if runtime.safe_stop_requested:
-                    if runtime.engine_state not in (ENGINE_STATE_SAFE_STOP, ENGINE_STATE_RECOVERY):
-                        raise EngineLoopContractError(
-                            "post safe-stop resolution state must be SAFE_STOP/RECOVERY/RUNNING (STRICT)"
-                        )
-                    sleep_sec = config.safe_stop_tick_sec
-                else:
-                    if runtime.engine_state != ENGINE_STATE_RUNNING:
-                        raise EngineLoopContractError(
-                            "safe_stop cleared but engine_state is not RUNNING (STRICT)"
-                        )
-                    sleep_sec = config.idle_tick_sec
+                sleep_sec = _run_safe_stop_resolution_or_raise(
+                    now_ts=now_ts,
+                    runtime=runtime,
+                    idle_safe_stop_fn=idle_safe_stop_fn,
+                    resume_sleep_sec=config.idle_tick_sec,
+                    safe_stop_sleep_sec=config.safe_stop_tick_sec,
+                )
             else:
                 if runtime.engine_state != ENGINE_STATE_RUNNING:
                     raise EngineLoopContractError(
                         f"entry cycle requires RUNNING state (STRICT), current={runtime.engine_state}"
                     )
+
                 entry_cycle_fn(now_ts, runtime)
                 runtime.last_idle_entry_cycle_ts = now_ts
-                sleep_sec = config.idle_tick_sec
+                _raise_if_halted_or_stopped_or_raise(runtime)
+
+                reconciliation_cycle_fn(now_ts, runtime)
+                runtime.last_reconciliation_ts = now_ts
+                _raise_if_halted_or_stopped_or_raise(runtime)
+
+                if runtime.safe_stop_requested:
+                    sleep_sec = _run_safe_stop_resolution_or_raise(
+                        now_ts=now_ts,
+                        runtime=runtime,
+                        idle_safe_stop_fn=idle_safe_stop_fn,
+                        resume_sleep_sec=config.idle_tick_sec,
+                        safe_stop_sleep_sec=config.safe_stop_tick_sec,
+                    )
+                else:
+                    sleep_sec = config.idle_tick_sec
 
         runtime.validate_or_raise()
 

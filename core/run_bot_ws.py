@@ -8,11 +8,12 @@ ROLE:
 
 CORE RESPONSIBILITIES:
 - engine bootstrap 결과를 받아 runtime 상태를 초기화한다
-- monitoring / exit / entry / risk / execution cycle 을 orchestration 한다
+- monitoring / position supervisor / reconciliation / exit / entry / risk / execution cycle 을 orchestration 한다
 - periodic sync / balance check / fill close reconciliation 을 수행한다
 - SAFE_STOP / HALTED 상태 전이를 관리한다
 - cycle 계층 간 shared runtime state 를 단일 루프에서 유지한다
 - async worker / commentary engine / watchdog / auto reporter 를 실제 런타임에 연결한다
+- position supervisor / reconcile engine 을 engine loop 에 실제 연결한다
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
@@ -23,8 +24,15 @@ IMPORTANT POLICY:
 - 치명 오류는 SAFE_STOP + 예외 전파
 - 공통 인프라(async/commentary/watchdog/reporting)는 main()에서 명시적으로 부팅/종료한다
 - 단, auto reporter 는 비핵심 분석 서브시스템으로 격리하며 실패 시 log/tg surface 후 엔진은 계속 운용한다
+- position supervisor / reconcile 은 runtime loop 의 명시적 orchestration 슬롯으로만 실행한다
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FEAT(WIRING): position_supervisor 를 main runtime 에 정식 연결
+  2) FEAT(WIRING): reconciliation_cycle_fn 을 engine_loop 신규 시그니처에 맞게 연결
+  3) FIX(ARCH): entry→risk→execution 직후 position supervisor 즉시 실행 경로 추가
+  4) FIX(STRICT): reconcile / supervisor callback 입력 검증 강화 및 SAFE_STOP escalation 정리
+  5) FIX(CONTRACT): engine_loop 신규 인자(position_supervisor_cycle_fn / reconciliation_cycle_fn) 정합 반영
 - 2026-03-13:
   1) FEAT(WIRING): async_worker.start_worker() 실제 부팅 연결
   2) FEAT(WIRING): init_commentary_engine() 1회 초기화 연결
@@ -48,7 +56,7 @@ import signal
 import time
 import traceback
 from collections import deque
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from settings import SETTINGS
 from infra.telelog import log, send_tg
@@ -67,6 +75,12 @@ from events.signals_logger import log_signal
 from strategy.regime_engine import RegimeEngine
 from strategy.account_state_builder import AccountStateBuilder
 from strategy.ev_heatmap_engine import EvHeatmapEngine
+from risk.position_supervisor import (
+    PositionSupervisor,
+    PositionSupervisorError,
+    build_position_supervisor_or_raise,
+    run_position_supervisor_once_or_raise,
+)
 
 from engine.engine_bootstrap import EngineBootstrapArtifacts, bootstrap_engine_runtime_or_raise
 from engine.engine_loop import (
@@ -207,6 +221,21 @@ def _require_dict(v: Any, name: str) -> Dict[str, Any]:
     return dict(v)
 
 
+def _require_attr_exists(obj: Any, attr_name: str, owner_name: str) -> Any:
+    if obj is None:
+        raise RuntimeError(f"{owner_name} is None (STRICT)")
+    if not hasattr(obj, attr_name):
+        raise RuntimeError(f"{owner_name}.{attr_name} missing (STRICT)")
+    return getattr(obj, attr_name)
+
+
+def _require_attr_value(obj: Any, attr_name: str, owner_name: str) -> Any:
+    value = _require_attr_exists(obj, attr_name, owner_name)
+    if value is None:
+        raise RuntimeError(f"{owner_name}.{attr_name} missing (STRICT)")
+    return value
+
+
 def _normalize_symbol_strict(symbol: Any, *, name: str = "symbol") -> str:
     s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
     if not s:
@@ -239,31 +268,33 @@ def _resolve_closed_trade_pnl_total_strict(trade: Trade, summary: Dict[str, Any]
         raise RuntimeError("closed summary must be dict (STRICT)")
     if "pnl" not in summary:
         raise RuntimeError("close summary missing pnl (STRICT)")
-    summary_pnl_f = _require_float(summary.get("pnl"), "summary.pnl")
+    summary_pnl_f = _require_float(summary["pnl"], "summary.pnl")
 
-    trade_realized = getattr(trade, "realized_pnl_usdt", None)
-    if trade_realized is None:
-        return float(summary_pnl_f)
+    if hasattr(trade, "realized_pnl_usdt"):
+        trade_realized = getattr(trade, "realized_pnl_usdt")
+        if trade_realized is not None:
+            return _require_float(trade_realized, "trade.realized_pnl_usdt")
 
-    return _require_float(trade_realized, "trade.realized_pnl_usdt")
+    return float(summary_pnl_f)
 
 
 def _resolve_closed_trade_exit_ts_dt_strict(trade: Trade, summary: Dict[str, Any]) -> datetime.datetime:
     if not isinstance(summary, dict):
         raise RuntimeError("closed summary must be dict (STRICT)")
 
-    close_ts = getattr(trade, "close_ts", None)
-    if close_ts is not None:
-        close_ts_f = _require_float(close_ts, "trade.close_ts", min_value=0.0)
-        if close_ts_f > 0:
-            dt = datetime.datetime.fromtimestamp(close_ts_f, tz=datetime.timezone.utc)
-            if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
-                raise RuntimeError("resolved close datetime must be tz-aware (STRICT)")
-            return dt
+    if hasattr(trade, "close_ts"):
+        close_ts = getattr(trade, "close_ts")
+        if close_ts is not None:
+            close_ts_f = _require_float(close_ts, "trade.close_ts", min_value=0.0)
+            if close_ts_f > 0:
+                dt = datetime.datetime.fromtimestamp(close_ts_f, tz=datetime.timezone.utc)
+                if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+                    raise RuntimeError("resolved close datetime must be tz-aware (STRICT)")
+                return dt
 
     if "close_time" not in summary:
         raise RuntimeError("close summary missing close_time (STRICT)")
-    close_time_ms_i = _require_int(summary.get("close_time"), "summary.close_time", min_value=1)
+    close_time_ms_i = _require_int(summary["close_time"], "summary.close_time", min_value=1)
     dt2 = datetime.datetime.fromtimestamp(close_time_ms_i / 1000.0, tz=datetime.timezone.utc)
     if dt2.tzinfo is None or dt2.tzinfo.utcoffset(dt2) is None:
         raise RuntimeError("resolved close datetime from close_time must be tz-aware (STRICT)")
@@ -284,7 +315,7 @@ def _sigterm(*_: Any) -> None:
 
     if SIGTERM_REQUESTED_AT is None:
         SIGTERM_REQUESTED_AT = now
-        grace = _require_float(getattr(SET, "sigterm_grace_sec"), "settings.sigterm_grace_sec", min_value=0.001)
+        grace = _require_float(_require_attr_value(SET, "sigterm_grace_sec", "settings"), "settings.sigterm_grace_sec", min_value=0.001)
         SIGTERM_DEADLINE_TS = now + grace
 
         msg = f"🧯 SIGTERM 수신: 신규 진입 중단, 포지션 정리 후 종료 시도 (grace={int(grace)}s)"
@@ -306,7 +337,7 @@ def _on_safe_stop_command() -> None:
 def _maybe_position_resync_or_raise(now_ts: float) -> None:
     global LAST_EXCHANGE_SYNC_TS
 
-    position_resync_sec = _require_float(getattr(SET, "position_resync_sec"), "settings.position_resync_sec", min_value=0.001)
+    position_resync_sec = _require_float(_require_attr_value(SET, "position_resync_sec", "settings"), "settings.position_resync_sec", min_value=0.001)
     if (now_ts - LAST_EXCHANGE_SYNC_TS) < position_resync_sec:
         return
 
@@ -344,7 +375,7 @@ def _maybe_balance_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> 
 def _maybe_fill_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> None:
     global LAST_FILL_CHECK_TS, CONSEC_LOSSES, LAST_CLOSE_TS
 
-    poll_fills_sec = _require_float(getattr(SET, "poll_fills_sec"), "settings.poll_fills_sec", min_value=0.001)
+    poll_fills_sec = _require_float(_require_attr_value(SET, "poll_fills_sec", "settings"), "settings.poll_fills_sec", min_value=0.001)
     if (now_ts - LAST_FILL_CHECK_TS) < poll_fills_sec:
         return
 
@@ -368,8 +399,8 @@ def _maybe_fill_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> Non
         if not isinstance(t, Trade):
             raise RuntimeError(f"closed item trade must be Trade (STRICT), got={type(t).__name__}")
 
-        reason = str(closed.get("reason") or "").strip()
-        summary = closed.get("summary")
+        reason = str(closed["reason"]).strip() if "reason" in closed and closed["reason"] is not None else ""
+        summary = closed["summary"] if "summary" in closed else None
 
         if not isinstance(summary, dict) or not summary:
             reason2, summary2 = build_close_summary_strict(t)
@@ -392,13 +423,14 @@ def _maybe_fill_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> Non
         LAST_CLOSE_TS = now_ts
         CONSEC_LOSSES = (CONSEC_LOSSES + 1) if pnl_total < 0 else 0
 
-        trade_id = getattr(t, "id", None)
+        trade_id = _require_attr_value(t, "id", "trade")
         if not isinstance(trade_id, int) or trade_id <= 0:
             raise RuntimeError("closed trade missing valid trade.id (STRICT)")
 
         exit_ts_dt = _resolve_closed_trade_exit_ts_dt_strict(t, summary)
-        tp_pct_v = getattr(t, "tp_pct", None)
-        sl_pct_v = getattr(t, "sl_pct", None)
+
+        tp_pct_v = getattr(t, "tp_pct") if hasattr(t, "tp_pct") else None
+        sl_pct_v = getattr(t, "sl_pct") if hasattr(t, "sl_pct") else None
 
         CLOSED_TRADES_CACHE.appendleft(
             {
@@ -422,10 +454,12 @@ def _maybe_fill_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> Non
         )
 
         hard_consec_limit_i = _require_int(
-            getattr(SET, "hard_consecutive_losses_limit"),
+            _require_attr_value(SET, "hard_consecutive_losses_limit", "settings"),
             "settings.hard_consecutive_losses_limit",
             min_value=0,
         )
+        _ = hard_consec_limit_i
+
         if hard_consec_limit_i > 0 and CONSEC_LOSSES >= hard_consec_limit_i:
             _request_safe_stop(runtime)
             msg = (
@@ -457,7 +491,9 @@ def _auto_report_event_writer(event_type: str, report_type: str, payload: Dict[s
 
     rt = _require_nonempty_str(report_type, "report_type")
     data = _require_dict(payload, "payload")
-    generated_ts_ms = _require_int(data.get("generated_ts_ms"), "payload.generated_ts_ms", min_value=1)
+    if "generated_ts_ms" not in data:
+        raise RuntimeError("payload.generated_ts_ms missing (STRICT)")
+    generated_ts_ms = _require_int(data["generated_ts_ms"], "payload.generated_ts_ms", min_value=1)
     ts_utc = datetime.datetime.fromtimestamp(generated_ts_ms / 1000.0, tz=datetime.timezone.utc)
 
     if et == "QUANT_ANALYSIS":
@@ -479,13 +515,15 @@ def _auto_report_event_writer(event_type: str, report_type: str, payload: Dict[s
 def _auto_report_notifier(report_type: str, payload: Dict[str, Any]) -> None:
     rt = _require_nonempty_str(report_type, "report_type")
     data = _require_dict(payload, "payload")
-    generated_ts_ms = _require_int(data.get("generated_ts_ms"), "payload.generated_ts_ms", min_value=1)
+    if "generated_ts_ms" not in data:
+        raise RuntimeError("payload.generated_ts_ms missing (STRICT)")
+    generated_ts_ms = _require_int(data["generated_ts_ms"], "payload.generated_ts_ms", min_value=1)
     dt_kst = datetime.datetime.fromtimestamp(generated_ts_ms / 1000.0, tz=datetime.timezone.utc).astimezone(
         datetime.timezone(datetime.timedelta(hours=9))
     )
 
-    error_type = data.get("error_type")
-    error_message = data.get("error_message")
+    error_type = data["error_type"] if "error_type" in data else None
+    error_message = data["error_message"] if "error_message" in data else None
 
     if error_type is not None or error_message is not None:
         err_type = _require_nonempty_str(error_type or "UNKNOWN", "payload.error_type")
@@ -530,7 +568,7 @@ def _maybe_auto_report_best_effort(now_ts: float) -> None:
         _safe_send_tg(f"⚠️ 자동 분석 리포트 격리 실패: {type(e).__name__}: {e}")
         return
 
-    reports = getattr(result, "reports", None)
+    reports = _require_attr_value(result, "reports", "auto_report_result")
     if not isinstance(reports, list):
         log("[AUTO_REPORT][ERROR] run_due_reports returned invalid reports payload")
         _safe_send_tg("⚠️ 자동 분석 리포트 결과 payload invalid")
@@ -573,12 +611,84 @@ def _monitoring_cycle_wrapper(
         _request_safe_stop(runtime)
 
 
+def _position_supervisor_cycle_wrapper(
+    now_ts: float,
+    runtime: EngineLoopRuntime,
+    supervisor: PositionSupervisor,
+) -> None:
+    _ = _require_float(now_ts, "now_ts", min_value=0.0)
+
+    if not isinstance(supervisor, PositionSupervisor):
+        raise RuntimeError("supervisor must be PositionSupervisor (STRICT)")
+
+    if len(OPEN_TRADES) > 1:
+        _request_safe_stop(runtime)
+        raise RuntimeError(f"OPEN_TRADES must be <= 1 in one-way mode (STRICT), got={len(OPEN_TRADES)}")
+
+    expected_trade: Optional[Trade] = None
+    if len(OPEN_TRADES) == 1:
+        t = OPEN_TRADES[0]
+        if not isinstance(t, Trade):
+            raise RuntimeError(f"OPEN_TRADES[0] must be Trade (STRICT), got={type(t).__name__}")
+        expected_trade = t
+
+    try:
+        snapshot = run_position_supervisor_once_or_raise(
+            supervisor=supervisor,
+            expected_trade=expected_trade,
+        )
+    except PositionSupervisorError as e:
+        _request_safe_stop(runtime)
+        msg = f"[SAFE_STOP][POSITION_SUPERVISOR] {type(e).__name__}: {e}"
+        log(msg)
+        _safe_send_tg(f"⛔ POSITION SUPERVISOR 치명 상태: {e}")
+        raise RuntimeError(msg) from e
+
+    runtime.extra["last_position_supervisor_snapshot"] = snapshot
+
+    if runtime.safe_stop_requested:
+        _request_safe_stop(runtime)
+
+
+def _reconciliation_cycle_wrapper(
+    now_ts: float,
+    runtime: EngineLoopRuntime,
+    reconcile_engine: Any,
+) -> None:
+    _ = _require_float(now_ts, "now_ts", min_value=0.0)
+
+    if reconcile_engine is None:
+        raise RuntimeError("reconcile_engine is required (STRICT)")
+    if not hasattr(reconcile_engine, "run_if_due"):
+        raise RuntimeError("reconcile_engine.run_if_due missing (STRICT)")
+
+    run_if_due = getattr(reconcile_engine, "run_if_due")
+    if not callable(run_if_due):
+        raise RuntimeError("reconcile_engine.run_if_due must be callable (STRICT)")
+
+    try:
+        result = run_if_due(now_ts=now_ts)
+    except Exception as e:
+        _request_safe_stop(runtime)
+        msg = f"[SAFE_STOP][RECONCILIATION] {type(e).__name__}: {e}"
+        log(msg)
+        _safe_send_tg(f"⛔ RECONCILIATION 치명 상태: {e}")
+        raise RuntimeError(msg) from e
+
+    if result is not None:
+        runtime.extra["last_reconcile_result"] = result
+
+    if runtime.safe_stop_requested:
+        _request_safe_stop(runtime)
+
+
 def _entry_risk_execution_cycle_wrapper(
     now_ts: float,
     runtime: EngineLoopRuntime,
     entry_cycle_fn: Callable[[float, EngineLoopRuntime], None],
     risk_cycle_fn: Callable[[float, EngineLoopRuntime], None],
     execution_cycle_fn: Callable[[float, EngineLoopRuntime], None],
+    position_supervisor_cycle_fn: Callable[[float, EngineLoopRuntime], None],
 ) -> None:
     entry_cycle_fn(now_ts, runtime)
     if runtime.safe_stop_requested:
@@ -593,6 +703,12 @@ def _entry_risk_execution_cycle_wrapper(
     execution_cycle_fn(now_ts, runtime)
     if runtime.safe_stop_requested:
         _request_safe_stop(runtime)
+        return
+
+    if OPEN_TRADES:
+        position_supervisor_cycle_fn(now_ts, runtime)
+        if runtime.safe_stop_requested:
+            _request_safe_stop(runtime)
 
 
 def _open_position_cycle_wrapper(
@@ -674,9 +790,9 @@ def main() -> None:
         )
         watchdog_started = True
 
-        reconcile_confirm_n = _require_int(getattr(SET, "reconcile_confirm_n"), "settings.reconcile_confirm_n", min_value=1)
+        reconcile_confirm_n = _require_int(_require_attr_value(SET, "reconcile_confirm_n", "settings"), "settings.reconcile_confirm_n", min_value=1)
         hard_consecutive_losses_limit = _require_int(
-            getattr(SET, "hard_consecutive_losses_limit"),
+            _require_attr_value(SET, "hard_consecutive_losses_limit", "settings"),
             "settings.hard_consecutive_losses_limit",
             min_value=0,
         )
@@ -687,13 +803,18 @@ def main() -> None:
         reconcile_engine = ReconcileEngine(
             ReconcileConfig(
                 symbol=str(SET.symbol),
-                interval_sec=_require_int(getattr(SET, "reconcile_interval_sec"), "settings.reconcile_interval_sec", min_value=1),
+                interval_sec=_require_int(_require_attr_value(SET, "reconcile_interval_sec", "settings"), "settings.reconcile_interval_sec", min_value=1),
                 desync_confirm_n=int(reconcile_confirm_n),
             ),
             fetch_exchange_position=lambda symbol=str(SET.symbol): _fetch_exchange_position_snapshot(symbol),
             get_local_position=lambda symbol=str(SET.symbol): _get_local_position_snapshot(symbol),
             fetch_exchange_open_orders=lambda symbol=str(SET.symbol): _fetch_exchange_open_orders_snapshot(symbol),
             on_desync=lambda result: _on_reconcile_desync(result),
+        )
+
+        position_supervisor = build_position_supervisor_or_raise(
+            settings=SET,
+            symbol=str(SET.symbol),
         )
 
         regime_engine = RegimeEngine(window_size=200, percentile_min_history=60)
@@ -777,6 +898,16 @@ def main() -> None:
                 rt,
                 monitoring_cycle_fn,
             ),
+            position_supervisor_cycle_fn=lambda now_ts, rt: _position_supervisor_cycle_wrapper(
+                now_ts,
+                rt,
+                position_supervisor,
+            ),
+            reconciliation_cycle_fn=lambda now_ts, rt: _reconciliation_cycle_wrapper(
+                now_ts,
+                rt,
+                reconcile_engine,
+            ),
             open_position_cycle_fn=lambda now_ts, rt: _open_position_cycle_wrapper(
                 now_ts,
                 rt,
@@ -789,6 +920,7 @@ def main() -> None:
                 entry_cycle_fn,
                 risk_cycle_fn,
                 execution_cycle_fn,
+                lambda _now_ts, _rt: _position_supervisor_cycle_wrapper(_now_ts, _rt, position_supervisor),
             ),
             idle_safe_stop_fn=_idle_safe_stop_fn,
             stop_flag_getter=_stop_flag_getter,
@@ -832,11 +964,13 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
     for r in rows:
         if not isinstance(r, dict):
             raise RuntimeError("fetch_open_positions contains non-dict row (STRICT)")
-        if str(r.get("symbol") or "").upper().strip() != sym:
+        if "symbol" not in r:
+            raise RuntimeError("positionRisk.symbol missing (STRICT)")
+        if str(r["symbol"]).upper().strip() != sym:
             continue
         if "positionAmt" not in r:
             raise RuntimeError("positionRisk.positionAmt missing (STRICT)")
-        amt = _require_float(r.get("positionAmt"), "positionRisk.positionAmt")
+        amt = _require_float(r["positionAmt"], "positionRisk.positionAmt")
         if abs(amt) > 1e-12:
             live.append(r)
 
@@ -849,12 +983,14 @@ def _fetch_exchange_position_snapshot(symbol: str) -> Dict[str, Any]:
     weighted_entry_sum = 0.0
 
     for idx, r in enumerate(live):
-        amt = _require_float(r.get("positionAmt"), f"positionRisk[{idx}].positionAmt")
-        entry = _require_float(r.get("entryPrice"), f"positionRisk[{idx}].entryPrice", min_value=0.0)
+        amt = _require_float(r["positionAmt"], f"positionRisk[{idx}].positionAmt")
+        if "entryPrice" not in r:
+            raise RuntimeError("positionRisk.entryPrice missing (STRICT)")
+        entry = _require_float(r["entryPrice"], f"positionRisk[{idx}].entryPrice", min_value=0.0)
         if entry <= 0:
             raise RuntimeError("positionRisk.entryPrice must be > 0 (STRICT)")
 
-        ps_raw = str(r.get("positionSide") or "").upper().strip() or "BOTH"
+        ps_raw = str(r["positionSide"]).upper().strip() if "positionSide" in r and r["positionSide"] is not None else "BOTH"
         if ps_raw not in ("BOTH", "LONG", "SHORT"):
             raise RuntimeError(f"positionRisk.positionSide invalid (STRICT): {ps_raw!r}")
         pos_sides.add(ps_raw)
@@ -891,22 +1027,38 @@ def _get_local_position_snapshot(symbol: str) -> Dict[str, Any]:
         raise RuntimeError(f"OPEN_TRADES must be <= 1 in one-way mode (STRICT), got={len(OPEN_TRADES)}")
 
     t = OPEN_TRADES[0]
-    if str(t.symbol).upper().strip() != sym:
-        raise RuntimeError(f"local trade symbol mismatch (STRICT): trade={t.symbol} expected={sym}")
+    if not isinstance(t, Trade):
+        raise RuntimeError(f"OPEN_TRADES[0] must be Trade (STRICT), got={type(t).__name__}")
 
-    side = str(t.side or "").upper().strip()
+    trade_symbol = _require_attr_value(t, "symbol", "trade")
+    if str(trade_symbol).upper().strip() != sym:
+        raise RuntimeError(f"local trade symbol mismatch (STRICT): trade={trade_symbol} expected={sym}")
+
+    trade_side = _require_attr_value(t, "side", "trade")
+    side = str(trade_side).upper().strip()
     if side in ("LONG", "BUY"):
         sign = 1.0
     elif side in ("SHORT", "SELL"):
         sign = -1.0
     else:
-        raise RuntimeError(f"invalid trade.side (STRICT): {t.side!r}")
+        raise RuntimeError(f"invalid trade.side (STRICT): {trade_side!r}")
 
-    qty = _require_float(getattr(t, "remaining_qty", None), "trade.remaining_qty", min_value=0.0)
+    remaining_qty_raw = _require_attr_value(t, "remaining_qty", "trade")
+    qty = _require_float(remaining_qty_raw, "trade.remaining_qty", min_value=0.0)
     if qty <= 0:
         raise RuntimeError("trade.remaining_qty must be > 0 (STRICT)")
 
-    ep = _require_float(getattr(t, "entry_price", None), "trade.entry_price", min_value=0.0)
+    if hasattr(t, "entry_price"):
+        entry_price_raw = getattr(t, "entry_price")
+    elif hasattr(t, "entry"):
+        entry_price_raw = getattr(t, "entry")
+    else:
+        raise RuntimeError("trade.entry_price/entry missing (STRICT)")
+
+    if entry_price_raw is None:
+        raise RuntimeError("trade.entry_price/entry missing (STRICT)")
+
+    ep = _require_float(entry_price_raw, "trade.entry_price", min_value=0.0)
     if ep <= 0:
         raise RuntimeError("trade.entry_price must be > 0 (STRICT)")
 
@@ -927,27 +1079,34 @@ def _on_reconcile_desync(result: Any) -> None:
     global SAFE_STOP_REQUESTED
     SAFE_STOP_REQUESTED = True
 
-    desync_confirmed = getattr(result, "desync_confirmed", None)
+    if result is None:
+        raise RuntimeError("reconcile result is None (STRICT)")
+    if not hasattr(result, "desync_confirmed"):
+        raise RuntimeError("result.desync_confirmed missing (STRICT)")
+    desync_confirmed = getattr(result, "desync_confirmed")
     if not isinstance(desync_confirmed, bool):
         raise RuntimeError("result.desync_confirmed must be bool (STRICT)")
     if not desync_confirmed:
         raise RuntimeError("on_desync called but desync_confirmed is False (STRICT)")
 
-    symbol = _normalize_symbol_strict(getattr(result, "symbol", None), name="result.symbol")
-    issues = getattr(result, "issues", None)
-    if not isinstance(issues, list):
-        raise RuntimeError("result.issues must be list (STRICT)")
+    symbol = _normalize_symbol_strict(_require_attr_value(result, "symbol", "result"), name="result.symbol")
+
+    issues = _require_attr_value(result, "issues", "result")
+    if not isinstance(issues, (list, tuple)):
+        raise RuntimeError("result.issues must be list/tuple (STRICT)")
 
     msg = f"⛔ DESYNC 확정: {symbol} issues={len(issues)} (신규 진입 차단, 종료)"
     log(msg)
     for it in issues:
-        code = getattr(it, "code", None)
-        message = getattr(it, "message", None)
-        details = getattr(it, "details", None)
+        if it is None:
+            raise RuntimeError("result.issues contains None (STRICT)")
+        code = _require_attr_value(it, "code", "issue")
+        message = _require_attr_value(it, "message", "issue")
+        details = _require_attr_value(it, "details", "issue")
         log(f"[DESYNC] {code} | {message} | {details}")
     _safe_send_tg(msg)
 
-    force_close_on_desync = _require_bool(getattr(SET, "force_close_on_desync"), "settings.force_close_on_desync")
+    force_close_on_desync = _require_bool(_require_attr_value(SET, "force_close_on_desync", "settings"), "settings.force_close_on_desync")
     if force_close_on_desync:
         try:
             n = close_all_positions_market(symbol)

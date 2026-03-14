@@ -24,14 +24,18 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력:
 - 2026-03-13:
-  1) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
-  2) FIX(CONTRACT): QuantAnalyst payload(gpt_result.scope) strict 검증 추가
-  3) FIX(ARCH): settings 주입 가능하도록 수정(load_settings 기본 사용)
-  4) FIX(CONTRACT): AutoReportItem / AutoReporterResult dataclass 자체 검증 추가
-  5) FIX(STRICT): now_ms / last_run_ts_ms monotonic 계약 검증 강화
-  6) FIX(ROOT-CAUSE): run_due_reports()에서 auto report 실패를 엔진 치명 오류로 전파하지 않도록 격리
-  7) FIX(OPERABILITY): 실패 리포트는 로그/선택적 callback 알림으로만 surface 하고 trading engine은 계속 운용
-  8) FIX(STRICT): 단건 실행 API는 기존처럼 예외 전파 유지, 스케줄 실행 경로만 비치명 격리
+  1) FIX(ROOT-CAUSE): QuantAnalyst payload를 emit 전에 JSON-compatible payload로 strict 정규화
+  2) FIX(CONTRACT): Decimal / datetime / tuple 등 비직렬화 타입을 허용 가능한 명시 규칙으로 변환하고 미지원 타입은 즉시 예외
+  3) FIX(STRICT): getattr(..., default) / dict.get(..., default) 기반 핵심 계약 검증 제거
+  4) FIX(OPERABILITY): 실패 알림 payload도 동일한 JSON-compatible 정규화 경로를 사용하도록 통일
+  5) FIX(EXCEPTION): common.exceptions_strict 공통 예외 계층 적용
+  6) FIX(CONTRACT): QuantAnalyst payload(gpt_result.scope) strict 검증 추가
+  7) FIX(ARCH): settings 주입 가능하도록 수정(load_settings 기본 사용)
+  8) FIX(CONTRACT): AutoReportItem / AutoReporterResult dataclass 자체 검증 추가
+  9) FIX(STRICT): now_ms / last_run_ts_ms monotonic 계약 검증 강화
+ 10) FIX(ROOT-CAUSE): run_due_reports()에서 auto report 실패를 엔진 치명 오류로 전파하지 않도록 격리
+ 11) FIX(OPERABILITY): 실패 리포트는 로그/선택적 callback 알림으로만 surface 하고 trading engine은 계속 운용
+ 12) FIX(STRICT): 단건 실행 API는 기존처럼 예외 전파 유지, 스케줄 실행 경로만 비치명 격리
 - 2026-03-07:
   1) 신규 생성
   2) 자동 시장/시스템 리포트 오케스트레이터 추가
@@ -43,6 +47,8 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional
 
 from analysis.quant_analyst import QuantAnalyst
@@ -74,6 +80,9 @@ class AutoReporterExternalError(StrictExternalError):
 
 class AutoReporterStateError(StrictStateError):
     """시간/스케줄 상태 불일치."""
+
+
+_JSON_SCALAR_TYPES = (str, int, float, bool)
 
 
 def _require_nonempty_str(value: Any, name: str) -> str:
@@ -119,6 +128,57 @@ def _require_bool_setting_value(value: Any, name: str) -> bool:
     raise AutoReporterConfigError(f"{name} must be bool or bool-like string (STRICT)")
 
 
+def _require_present_key(mapping: Dict[str, Any], key: str, name: str) -> Any:
+    if key not in mapping:
+        raise AutoReporterContractError(f"{name}.{key} is required (STRICT)")
+    return mapping[key]
+
+
+def _normalize_json_compatible_value_strict(value: Any, name: str) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, _JSON_SCALAR_TYPES):
+        return value
+
+    if isinstance(value, Decimal):
+        return str(value)
+
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for key, inner_value in value.items():
+            if not isinstance(key, str):
+                raise AutoReporterContractError(
+                    f"{name} contains non-str dict key (STRICT): key_type={type(key).__name__}"
+                )
+            out[key] = _normalize_json_compatible_value_strict(inner_value, f"{name}.{key}")
+        return out
+
+    if isinstance(value, (list, tuple)):
+        out_list: List[Any] = []
+        for idx, inner_value in enumerate(value):
+            out_list.append(_normalize_json_compatible_value_strict(inner_value, f"{name}[{idx}]"))
+        return out_list
+
+    raise AutoReporterContractError(
+        f"{name} contains unsupported JSON-compatible type (STRICT): {type(value).__name__}"
+    )
+
+
+def _normalize_json_compatible_dict_strict(value: Any, name: str) -> Dict[str, Any]:
+    payload = _require_dict(value, name)
+    normalized = _normalize_json_compatible_value_strict(payload, name)
+    if not isinstance(normalized, dict) or not normalized:
+        raise AutoReporterContractError(f"{name} must normalize to non-empty dict (STRICT)")
+    return normalized
+
+
 @dataclass(frozen=True)
 class AutoReportItem:
     report_type: str
@@ -134,7 +194,11 @@ class AutoReportItem:
             "generated_ts_ms",
             _require_positive_int(self.generated_ts_ms, "AutoReportItem.generated_ts_ms"),
         )
-        object.__setattr__(self, "payload", _require_dict(self.payload, "AutoReportItem.payload"))
+        object.__setattr__(
+            self,
+            "payload",
+            _normalize_json_compatible_dict_strict(self.payload, "AutoReportItem.payload"),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -155,8 +219,12 @@ class AutoReporterResult:
             raise AutoReporterContractError(
                 f"AutoReporterResult.reports must be list (STRICT), got={type(self.reports).__name__}"
             )
+        normalized_reports: List[Dict[str, Any]] = []
         for idx, item in enumerate(self.reports):
-            _require_dict(item, f"AutoReporterResult.reports[{idx}]")
+            normalized_reports.append(
+                _normalize_json_compatible_dict_strict(item, f"AutoReporterResult.reports[{idx}]")
+            )
+        object.__setattr__(self, "reports", normalized_reports)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -227,10 +295,6 @@ class AutoReporter:
 
         self._last_market_report_ts_ms: Optional[int] = None
         self._last_system_report_ts_ms: Optional[int] = None
-
-    # ========================================================
-    # Public API
-    # ========================================================
 
     def run_market_report_once(self) -> AutoReportItem:
         generated_ts_ms = self._now_ms()
@@ -330,18 +394,16 @@ class AutoReporter:
             "last_system_report_ts_ms": self._last_system_report_ts_ms,
         }
 
-    # ========================================================
-    # Internal emitters
-    # ========================================================
-
     def _emit_report(self, item: AutoReportItem) -> None:
+        item_dict = item.to_dict()
+
         if self._persist_enabled:
             if self._event_writer is None:
                 raise AutoReporterConfigError("event_writer callback is missing (STRICT)")
             self._event_writer(
                 "QUANT_ANALYSIS",
                 item.report_type,
-                item.to_dict(),
+                item_dict,
             )
 
         if self._notify_enabled:
@@ -349,7 +411,7 @@ class AutoReporter:
                 raise AutoReporterConfigError("notifier callback is missing (STRICT)")
             self._notifier(
                 item.report_type,
-                item.to_dict(),
+                item_dict,
             )
 
     def _emit_report_failure_best_effort(
@@ -359,13 +421,16 @@ class AutoReporter:
         now_ms: int,
         error: Exception,
     ) -> None:
-        payload = {
-            "symbol": self._symbol,
-            "report_type": _require_nonempty_str(report_type, "report_type"),
-            "generated_ts_ms": _require_positive_int(now_ms, "generated_ts_ms"),
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-        }
+        payload = _normalize_json_compatible_dict_strict(
+            {
+                "symbol": self._symbol,
+                "report_type": _require_nonempty_str(report_type, "report_type"),
+                "generated_ts_ms": _require_positive_int(now_ms, "generated_ts_ms"),
+                "error_type": type(error).__name__,
+                "error_message": str(error),
+            },
+            "failure_payload",
+        )
 
         if self._persist_enabled and self._event_writer is not None:
             try:
@@ -425,10 +490,6 @@ class AutoReporter:
 
         return item
 
-    # ========================================================
-    # Quant analyst runner
-    # ========================================================
-
     def _run_quant_analysis_strict(
         self,
         *,
@@ -449,20 +510,23 @@ class AutoReporter:
                 f"QuantAnalyst.analyze failed (STRICT): {type(exc).__name__}: {exc}"
             ) from exc
 
-        to_dict = getattr(response, "to_dict", None)
-        if not callable(to_dict):
+        if not hasattr(response, "to_dict"):
             raise AutoReporterContractError("QuantAnalyst response.to_dict is required (STRICT)")
 
+        to_dict = getattr(response, "to_dict")
+        if not callable(to_dict):
+            raise AutoReporterContractError("QuantAnalyst response.to_dict must be callable (STRICT)")
+
         payload = to_dict()
-        payload_dict = _require_dict(payload, "quant_analyst.payload")
-        gpt_result = _require_dict(payload_dict.get("gpt_result"), "quant_analyst.payload.gpt_result")
-        _require_nonempty_str(gpt_result.get("scope"), "quant_analyst.payload.gpt_result.scope")
+        payload_dict = _normalize_json_compatible_dict_strict(payload, "quant_analyst.payload")
+        gpt_result_raw = _require_present_key(payload_dict, "gpt_result", "quant_analyst.payload")
+        gpt_result = _require_dict(gpt_result_raw, "quant_analyst.payload.gpt_result")
+        _require_nonempty_str(
+            _require_present_key(gpt_result, "scope", "quant_analyst.payload.gpt_result"),
+            "quant_analyst.payload.gpt_result.scope",
+        )
 
         return payload_dict
-
-    # ========================================================
-    # Time helpers
-    # ========================================================
 
     def _is_due(
         self,
@@ -491,10 +555,6 @@ class AutoReporter:
         if ts_ms <= 0:
             raise AutoReporterStateError("current timestamp must be > 0 (STRICT)")
         return ts_ms
-
-    # ========================================================
-    # Settings helpers
-    # ========================================================
 
     def _require_setting_value(self, name: str) -> Any:
         if not hasattr(self._settings, name):

@@ -4,7 +4,7 @@ FILE: state/sync_exchange.py
 ROLE:
 - Binance USDT-M Futures 전용 거래소 상태 동기화 SSOT
 - 거래소 실제 포지션/미체결 주문과 DB(bt_trades) OPEN 트레이드 정합을 강제한다
-- 엔진 재시작 시 거래소 사실값으로 DB 실행 필드와 메모리 Trade를 복구한다
+- 엔진 재시작 시 거래소 사실값과 메모리 사실값으로 DB 실행 필드와 메모리 Trade를 복구한다
 
 CORE RESPONSIBILITIES:
 - 거래소 포지션/오더 snapshot STRICT 수집
@@ -12,6 +12,8 @@ CORE RESPONSIBILITIES:
 - TP/SL 보호주문 식별 및 실행 필드 DB 반영
 - 메모리 Trade 재구성 전 필수 계약 검증
 - POSITION 이벤트 기록 및 sync 성공 알림
+- DB OPEN trade 부재 시 memory-assisted recovery 수행
+- 복구 불가능 상태를 SyncRecoveryRequiredError 로 명시 승격
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · PRODUCTION MODE
@@ -20,9 +22,16 @@ IMPORTANT POLICY:
 - Hedge / ambiguous topology / duplicate memory trade 금지
 - PROTECTION_VERIFIED 상태는 필수 필드 완비 상태에서만 인정
 - 거래소 사실값이 DB/메모리와 다르면 즉시 예외 또는 거래소 사실로 엄격 갱신
+- blind recovery 금지: DB OPEN trade 부재 시 current_trades 기반 복구가 가능한 경우에만 복구
 - print 금지, logging만 사용
 
 CHANGE HISTORY:
+- 2026-03-14:
+  1) FIX(ROOT-CAUSE): exchange OPEN position + DB NO OPEN trade 상태에 대한 memory-assisted recovery 경로 추가
+  2) ADD(RECOVERY): 복구 불가능 상태를 SyncRecoveryRequiredError 로 명시 승격
+  3) ADD(STRICT): recovery 시 mem trade / exchange protection / db persisted fields 계약 검증 추가
+  4) FIX(STRICT): recovery 가능한 경우에만 DB OPEN trade 재구성, 불가능하면 blind fallback 없이 즉시 중단
+  5) ADD(OPERABILITY): recovery success / recovery required 텔레그램/로그 알림 추가
 - 2026-03-10:
   1) FIX(ROOT-CAUSE): DB trade side ↔ exchange pos_dir 방향 정합 검증 추가
   2) FIX(ROOT-CAUSE): replace=False 경로에서 동일 심볼 memory trade 중복 복구 금지
@@ -50,6 +59,10 @@ from infra.telelog import log, send_tg
 from state.db_core import get_session
 from state.db_models import Trade as TradeORM
 from state.trader_state import Trade as MemTrade
+
+
+class SyncRecoveryRequiredError(RuntimeError):
+    """거래소 OPEN 포지션은 존재하지만 현재 보유한 진실원천만으로는 안전 복구가 불가능한 상태."""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -181,12 +194,56 @@ def _order_price(o: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _req_float_from_dict(d: Dict[str, Any], key: str) -> float:
+    if key not in d:
+        raise RuntimeError(f"exchange position missing required field: {key}")
+    val = d.get(key)
+    if val is None:
+        raise RuntimeError(f"exchange position field is null: {key}")
+    try:
+        f = float(val)
+    except Exception as e:
+        raise RuntimeError(f"exchange position field not a number: {key}") from e
+    if not math.isfinite(f):
+        raise RuntimeError(f"exchange position field not finite: {key}")
+    return f
+
+
+def _req_float_from_dict_multi(d: Dict[str, Any], keys: Tuple[str, ...], *, name: str) -> float:
+    for k in keys:
+        if k in d and d.get(k) is not None:
+            try:
+                f = float(d.get(k))
+            except Exception as e:
+                raise RuntimeError(f"exchange position field not a number: {k}") from e
+            if not math.isfinite(f):
+                raise RuntimeError(f"exchange position field not finite: {k}")
+            return f
+    raise RuntimeError(f"exchange position missing required field for {name}: {list(keys)}")
+
+
 def _notify_sync_ok(symbol: str, *, pos_dir: str, abs_qty: float, tp_id: Optional[str], sl_id: Optional[str]) -> None:
     msg = f"🔁 [SYNC_OK] {symbol} pos={pos_dir} qty={abs_qty:.6f} tp={tp_id} sl={sl_id}"
     try:
         send_tg(msg)
     except Exception as e:
         log(f"[SYNC_OK][TG_FAIL] {type(e).__name__}: {e}")
+
+
+def _notify_sync_recovered(symbol: str, *, pos_dir: str, abs_qty: float, trade_id: int) -> None:
+    msg = f"♻️ [SYNC_RECOVERED] {symbol} pos={pos_dir} qty={abs_qty:.6f} trade_id={trade_id}"
+    try:
+        send_tg(msg)
+    except Exception as e:
+        log(f"[SYNC_RECOVERED][TG_FAIL] {type(e).__name__}: {e}")
+
+
+def _notify_sync_recovery_required(symbol: str, *, reason: str) -> None:
+    msg = f"⛔ [SYNC_RECOVERY_REQUIRED] {symbol} reason={reason}"
+    try:
+        send_tg(msg)
+    except Exception as e:
+        log(f"[SYNC_RECOVERY_REQUIRED][TG_FAIL] {type(e).__name__}: {e}")
 
 
 def _set_db_mismatch_and_commit(session, db_trade: TradeORM, *, status: str) -> None:
@@ -197,6 +254,9 @@ def _set_db_mismatch_and_commit(session, db_trade: TradeORM, *, status: str) -> 
     session.commit()
 
 
+# ─────────────────────────────────────────────────────────────
+# Position event / contracts
+# ─────────────────────────────────────────────────────────────
 def _emit_position_sync_event_strict(
     *,
     symbol: str,
@@ -206,6 +266,7 @@ def _emit_position_sync_event_strict(
     entry_price: float,
     tp_price: Optional[float],
     sl_price: Optional[float],
+    reason: str = "position_synced",
 ) -> None:
     symbol_s = _normalize_symbol(symbol)
     pos_dir_s = _require_nonempty_str(pos_dir, "pos_dir").upper()
@@ -274,7 +335,7 @@ def _emit_position_sync_event_strict(
         tp_pct=float(tp_pct),
         sl_pct=float(sl_pct),
         risk_pct=float(risk_pct),
-        reason="position_synced",
+        reason=_require_nonempty_str(reason, "reason"),
         extra_json=extra_json,
     )
 
@@ -338,6 +399,278 @@ def _assert_db_direction_matches_exchange_strict(
             f"DB trade side mismatches exchange position direction (STRICT): "
             f"db_side={db_side} exch_expected_side={expected_side}"
         )
+
+
+# ─────────────────────────────────────────────────────────────
+# Memory-assisted recovery helpers
+# ─────────────────────────────────────────────────────────────
+def _find_single_memory_trade_or_none(
+    *,
+    symbol: str,
+    current_trades: List[MemTrade],
+) -> Optional[MemTrade]:
+    sym = _normalize_symbol(symbol)
+    matches: List[MemTrade] = []
+
+    for t in current_trades:
+        if not isinstance(t, MemTrade):
+            raise RuntimeError("current_trades contains non-MemTrade item (STRICT)")
+        if _normalize_symbol(getattr(t, "symbol", None)) == sym:
+            matches.append(t)
+
+    if len(matches) > 1:
+        raise RuntimeError(f"multiple memory trades found for symbol={sym} (STRICT, n={len(matches)})")
+    if len(matches) == 0:
+        return None
+    return matches[0]
+
+
+def _extract_optional_meta_dict_from_mem_trade(mem_trade: MemTrade) -> Optional[Dict[str, Any]]:
+    meta = getattr(mem_trade, "meta", None)
+    if meta is None:
+        return None
+    if not isinstance(meta, dict):
+        raise RuntimeError("mem_trade.meta must be dict when present (STRICT)")
+    return dict(meta)
+
+
+def _extract_nonempty_str_from_mem_trade_or_meta_strict(
+    mem_trade: MemTrade,
+    *,
+    attr_candidates: Tuple[str, ...],
+    meta_candidates: Tuple[str, ...],
+    name: str,
+) -> str:
+    for attr_name in attr_candidates:
+        if hasattr(mem_trade, attr_name):
+            raw = getattr(mem_trade, attr_name)
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if s:
+                return s
+
+    meta = _extract_optional_meta_dict_from_mem_trade(mem_trade)
+    if meta is not None:
+        for key in meta_candidates:
+            if key not in meta or meta[key] is None:
+                continue
+            s = str(meta[key]).strip()
+            if s:
+                return s
+
+    raise RuntimeError(f"{name} missing in mem_trade/meta (STRICT)")
+
+
+def _extract_float_from_mem_trade_or_meta_strict(
+    mem_trade: MemTrade,
+    *,
+    attr_candidates: Tuple[str, ...],
+    meta_candidates: Tuple[str, ...],
+    name: str,
+    min_value: Optional[float] = None,
+) -> float:
+    for attr_name in attr_candidates:
+        if hasattr(mem_trade, attr_name):
+            raw = getattr(mem_trade, attr_name)
+            if raw is None:
+                continue
+            value = _safe_float_strict(raw, name)
+            if min_value is not None and value < min_value:
+                raise RuntimeError(f"{name} must be >= {min_value} (STRICT)")
+            return value
+
+    meta = _extract_optional_meta_dict_from_mem_trade(mem_trade)
+    if meta is not None:
+        for key in meta_candidates:
+            if key not in meta or meta[key] is None:
+                continue
+            value = _safe_float_strict(meta[key], name)
+            if min_value is not None and value < min_value:
+                raise RuntimeError(f"{name} must be >= {min_value} (STRICT)")
+            return value
+
+    raise RuntimeError(f"{name} missing in mem_trade/meta (STRICT)")
+
+
+def _derive_tp_pct_from_prices_strict(entry_price: float, tp_price: float, pos_dir: str) -> float:
+    if entry_price <= 0 or tp_price <= 0:
+        raise RuntimeError("entry_price/tp_price must be > 0 (STRICT)")
+    if pos_dir == "LONG":
+        pct = (tp_price - entry_price) / entry_price
+    elif pos_dir == "SHORT":
+        pct = (entry_price - tp_price) / entry_price
+    else:
+        raise RuntimeError(f"invalid pos_dir (STRICT): {pos_dir!r}")
+
+    if not math.isfinite(pct) or pct <= 0:
+        raise RuntimeError("derived tp_pct must be finite > 0 (STRICT)")
+    return float(pct)
+
+
+def _derive_sl_pct_from_prices_strict(entry_price: float, sl_price: float, pos_dir: str) -> float:
+    if entry_price <= 0 or sl_price <= 0:
+        raise RuntimeError("entry_price/sl_price must be > 0 (STRICT)")
+    if pos_dir == "LONG":
+        pct = (entry_price - sl_price) / entry_price
+    elif pos_dir == "SHORT":
+        pct = (sl_price - entry_price) / entry_price
+    else:
+        raise RuntimeError(f"invalid pos_dir (STRICT): {pos_dir!r}")
+
+    if not math.isfinite(pct) or pct <= 0:
+        raise RuntimeError("derived sl_pct must be finite > 0 (STRICT)")
+    return float(pct)
+
+
+def _set_model_field_if_exists(obj: Any, field_name: str, value: Any) -> None:
+    if hasattr(obj, field_name):
+        setattr(obj, field_name, value)
+
+
+def _recover_db_trade_from_memory_trade_or_raise(
+    session,
+    *,
+    symbol: str,
+    mem_trade: MemTrade,
+    pos_dir: str,
+    abs_qty: float,
+    entry_price: float,
+    position_side_raw: str,
+    tp_id: str,
+    tp_price: Optional[float],
+    sl_id: str,
+    sl_price: Optional[float],
+) -> TradeORM:
+    sym = _normalize_symbol(symbol)
+    if _normalize_symbol(getattr(mem_trade, "symbol", None)) != sym:
+        raise RuntimeError("mem_trade.symbol mismatch during recovery (STRICT)")
+
+    mem_side = _normalize_entry_side_strict(getattr(mem_trade, "side", None), "mem_trade.side")
+    expected_side = _entry_side_from_dir(pos_dir)
+    if mem_side != expected_side:
+        raise RuntimeError(
+            f"mem_trade.side mismatches exchange position direction (STRICT): mem_side={mem_side} exch_expected={expected_side}"
+        )
+
+    mem_qty = _safe_float_strict(getattr(mem_trade, "qty", None), "mem_trade.qty")
+    if mem_qty <= 0:
+        raise RuntimeError("mem_trade.qty must be > 0 (STRICT)")
+    if abs_qty - mem_qty > 1e-12:
+        raise RuntimeError(
+            f"exchange abs_qty exceeds mem_trade.qty (STRICT): mem_qty={mem_qty} exch_abs_qty={abs_qty}"
+        )
+
+    mem_entry_order_id = _require_nonempty_str(getattr(mem_trade, "entry_order_id", None), "mem_trade.entry_order_id")
+    mem_tp_order_id = _require_nonempty_str(getattr(mem_trade, "tp_order_id", None), "mem_trade.tp_order_id")
+    mem_sl_order_id = _require_nonempty_str(getattr(mem_trade, "sl_order_id", None), "mem_trade.sl_order_id")
+    if mem_tp_order_id != tp_id:
+        raise RuntimeError(
+            f"mem_trade.tp_order_id mismatches exchange tp_id (STRICT): mem={mem_tp_order_id} exch={tp_id}"
+        )
+    if mem_sl_order_id != sl_id:
+        raise RuntimeError(
+            f"mem_trade.sl_order_id mismatches exchange sl_id (STRICT): mem={mem_sl_order_id} exch={sl_id}"
+        )
+
+    leverage = _safe_positive_int_strict(getattr(mem_trade, "leverage", None), "mem_trade.leverage")
+    entry_ts = _require_tz_aware_datetime(getattr(mem_trade, "entry_ts", None), "mem_trade.entry_ts")
+
+    source = _extract_nonempty_str_from_mem_trade_or_meta_strict(
+        mem_trade,
+        attr_candidates=("source",),
+        meta_candidates=("source", "signal_source", "strategy_source", "entry_source", "strategy_type"),
+        name="mem_trade.source",
+    )
+    strategy = _extract_nonempty_str_from_mem_trade_or_meta_strict(
+        mem_trade,
+        attr_candidates=("strategy",),
+        meta_candidates=("strategy", "strategy_type", "source"),
+        name="mem_trade.strategy",
+    )
+    regime_at_entry = _extract_nonempty_str_from_mem_trade_or_meta_strict(
+        mem_trade,
+        attr_candidates=("regime_at_entry", "regime"),
+        meta_candidates=("regime_at_entry", "regime", "market_regime"),
+        name="mem_trade.regime_at_entry",
+    )
+
+    risk_pct = _extract_float_from_mem_trade_or_meta_strict(
+        mem_trade,
+        attr_candidates=("risk_pct",),
+        meta_candidates=("risk_pct", "allocation_ratio", "dynamic_allocation_ratio", "dynamic_risk_pct"),
+        name="mem_trade.risk_pct",
+        min_value=0.0,
+    )
+    if risk_pct <= 0:
+        raise RuntimeError("mem_trade.risk_pct must be > 0 (STRICT)")
+
+    if tp_price is not None and tp_price > 0:
+        tp_pct = _derive_tp_pct_from_prices_strict(entry_price, tp_price, pos_dir)
+    else:
+        tp_pct = _extract_float_from_mem_trade_or_meta_strict(
+            mem_trade,
+            attr_candidates=("tp_pct",),
+            meta_candidates=("tp_pct", "take_profit_pct", "target_pct"),
+            name="mem_trade.tp_pct",
+            min_value=0.0,
+        )
+        if tp_pct <= 0:
+            raise RuntimeError("mem_trade.tp_pct must be > 0 (STRICT)")
+
+    if sl_price is not None and sl_price > 0:
+        sl_pct = _derive_sl_pct_from_prices_strict(entry_price, sl_price, pos_dir)
+    else:
+        sl_pct = _extract_float_from_mem_trade_or_meta_strict(
+            mem_trade,
+            attr_candidates=("sl_pct",),
+            meta_candidates=("sl_pct", "stop_loss_pct", "stop_pct"),
+            name="mem_trade.sl_pct",
+            min_value=0.0,
+        )
+        if sl_pct <= 0:
+            raise RuntimeError("mem_trade.sl_pct must be > 0 (STRICT)")
+
+    db_trade = TradeORM()
+    db_trade.symbol = sym
+    db_trade.side = expected_side
+    db_trade.qty = float(mem_qty)
+    db_trade.leverage = int(leverage)
+    db_trade.strategy = strategy
+    db_trade.regime_at_entry = regime_at_entry
+    db_trade.source = source
+    db_trade.entry_ts = entry_ts
+    db_trade.entry_order_id = mem_entry_order_id
+    db_trade.tp_order_id = mem_tp_order_id
+    db_trade.sl_order_id = mem_sl_order_id
+    db_trade.exchange_position_side = _normalize_position_side_raw(position_side_raw, default_both=True)
+    db_trade.remaining_qty = float(abs_qty)
+    db_trade.reconciliation_status = "PROTECTION_VERIFIED"
+    db_trade.last_synced_at = _utc_now()
+    db_trade.tp_pct = float(tp_pct)
+    db_trade.sl_pct = float(sl_pct)
+    db_trade.risk_pct = float(risk_pct)
+
+    if hasattr(mem_trade, "realized_pnl_usdt"):
+        realized = getattr(mem_trade, "realized_pnl_usdt")
+        db_trade.realized_pnl_usdt = None if realized is None else float(_safe_float_strict(realized, "mem_trade.realized_pnl_usdt"))
+    else:
+        db_trade.realized_pnl_usdt = None
+
+    _set_model_field_if_exists(db_trade, "exit_ts", None)
+    _set_model_field_if_exists(db_trade, "entry_price", float(entry_price))
+    _set_model_field_if_exists(db_trade, "entry", float(entry_price))
+    _set_model_field_if_exists(db_trade, "client_entry_id", getattr(mem_trade, "client_entry_id", None))
+    _set_model_field_if_exists(db_trade, "is_test", False)
+
+    session.add(db_trade)
+    session.flush()
+
+    if getattr(db_trade, "id", None) is None:
+        raise RuntimeError("recovered db trade id missing after flush (STRICT)")
+
+    _validate_db_trade_contract_before_sync_strict(db_trade)
+    return db_trade
 
 
 # ─────────────────────────────────────────────────────────────
@@ -672,8 +1005,9 @@ def sync_open_trades_from_exchange(
     """
     STRICT:
     - REST 실패/응답 이상/정합 불일치 시 즉시 예외
-    - DB OPEN 트레이드가 없는데 거래소 포지션이 있으면 즉시 예외
+    - DB OPEN 트레이드가 없는데 거래소 포지션이 있으면 current_trades 기반 복구 가능 시에만 복구
     - DB OPEN 트레이드가 있는데 거래소 포지션이 없으면 즉시 예외
+    - blind fallback 없이 복구 불가능 상태는 SyncRecoveryRequiredError 로 승격
     - 결과로 반환되는 Trade 리스트는 DB+거래소 정합을 통과한 상태만 포함
 
     Returns:
@@ -682,6 +1016,8 @@ def sync_open_trades_from_exchange(
     sym = _normalize_symbol(symbol)
     if current_trades is None:
         current_trades = []
+    if not isinstance(current_trades, list):
+        raise RuntimeError("current_trades must be list (STRICT)")
     if not replace:
         _ensure_no_duplicate_memory_trade_strict(symbol=sym, current_trades=current_trades)
 
@@ -700,6 +1036,7 @@ def sync_open_trades_from_exchange(
     tp_price: Optional[float] = None
     sl_id: Optional[str] = None
     sl_price: Optional[float] = None
+    recovered_from_memory = False
 
     with get_session() as session:
         db_open = _load_db_open_trade_strict(session, sym)
@@ -711,11 +1048,6 @@ def sync_open_trades_from_exchange(
 
             return ([], 0) if replace else (current_trades, 0)
 
-        if db_open is None:
-            raise RuntimeError(f"exchange has OPEN position but DB has NO OPEN trade (STRICT, symbol={sym})")
-
-        _validate_db_trade_contract_before_sync_strict(db_open)
-
         tp_id, tp_price, sl_id, sl_price = _pick_unique_tp_sl_orders_strict(
             sym,
             pos_dir=pos_dir,
@@ -724,10 +1056,40 @@ def sync_open_trades_from_exchange(
         )
 
         if tp_id is None or sl_id is None:
-            _set_db_mismatch_and_commit(session, db_open, status="MISMATCH_PROTECTION_ORDERS")
+            if db_open is not None:
+                _set_db_mismatch_and_commit(session, db_open, status="MISMATCH_PROTECTION_ORDERS")
             raise RuntimeError(
                 f"exchange protection orders missing (STRICT, symbol={sym}, tp_id={tp_id}, sl_id={sl_id})"
             )
+
+        if db_open is None:
+            mem_trade = _find_single_memory_trade_or_none(symbol=sym, current_trades=current_trades)
+            if mem_trade is None:
+                _notify_sync_recovery_required(
+                    sym,
+                    reason="exchange_open_position_but_db_missing_and_no_memory_trade",
+                )
+                raise SyncRecoveryRequiredError(
+                    f"exchange has OPEN position but DB has NO OPEN trade and no memory trade is available "
+                    f"(STRICT, symbol={sym})"
+                )
+
+            db_open = _recover_db_trade_from_memory_trade_or_raise(
+                session,
+                symbol=sym,
+                mem_trade=mem_trade,
+                pos_dir=pos_dir,
+                abs_qty=abs_qty,
+                entry_price=entry_price,
+                position_side_raw=position_side_raw,
+                tp_id=tp_id,
+                tp_price=tp_price,
+                sl_id=sl_id,
+                sl_price=sl_price,
+            )
+            recovered_from_memory = True
+
+        _validate_db_trade_contract_before_sync_strict(db_open)
 
         _update_trade_exec_fields_strict(
             session,
@@ -749,6 +1111,7 @@ def sync_open_trades_from_exchange(
             entry_price=entry_price,
             tp_price=tp_price,
             sl_price=sl_price,
+            reason=("position_recovered_from_memory" if recovered_from_memory else "position_synced"),
         )
 
         rebuilt = _build_mem_trade_strict(
@@ -760,15 +1123,22 @@ def sync_open_trades_from_exchange(
             sl_price=sl_price,
         )
 
+        session.commit()
+
     if rebuilt is None:
         raise RuntimeError("rebuilt trade missing after sync (STRICT)")
 
     out = [rebuilt] if replace else (list(current_trades) + [rebuilt])
 
-    _notify_sync_ok(sym, pos_dir=pos_dir, abs_qty=abs_qty, tp_id=tp_id, sl_id=sl_id)
+    if recovered_from_memory:
+        _notify_sync_recovered(sym, pos_dir=pos_dir, abs_qty=abs_qty, trade_id=int(rebuilt.id))
+    else:
+        _notify_sync_ok(sym, pos_dir=pos_dir, abs_qty=abs_qty, tp_id=tp_id, sl_id=sl_id)
+
     return out, 1
 
 
 __all__ = [
+    "SyncRecoveryRequiredError",
     "sync_open_trades_from_exchange",
 ]
