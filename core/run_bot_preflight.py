@@ -850,15 +850,19 @@ def _stage_gpt_contract_ping_strict() -> None:
     max_latency_sec = float(_finite(SET.openai_max_latency_sec, "settings.openai_max_latency_sec"))
 
     system_prompt = (
-        "Return exactly one valid JSON object.\n"
+        "Return exactly one valid json object.\n"
         'Schema: {"ok": true}\n'
+        "The output must be json.\n"
         "Rules:\n"
         '- key must be exactly "ok"\n'
         "- value must be exactly true\n"
         "- do not include any other keys\n"
         "- do not include markdown or explanation\n"
     )
-    payload = {"ping": True}
+    payload = {
+        "ping": True,
+        "request": "json"
+    }
 
     try:
         r = call_chat_json(

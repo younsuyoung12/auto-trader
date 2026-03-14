@@ -306,14 +306,26 @@ def _extract_response_text_strict(resp: Any) -> str:
 
 
 def _build_json_only_system_prompt(system_prompt: str) -> str:
+    """
+    STRICT JSON MODE PROMPT
+
+    OpenAI Responses API 규칙:
+    text.format = {"type": "json_object"} 사용 시
+    입력 메시지 안에 반드시 'json' 단어가 포함되어야 한다.
+ 
+    이 함수는 항상 JSON contract를 명시적으로 강제한다.
+    """
     sp = _require_nonempty_str("input", system_prompt, "system_prompt")
+
     return (
         sp
         + "\n\n"
         + "OUTPUT CONTRACT (STRICT): "
-        + "Return exactly one valid JSON object. "
+        + "Return exactly one valid json object. "
+        + "The response must be json. "   
         + "Do not wrap it in markdown. "
         + "Do not add commentary, explanation, prefix, or suffix."
+        + "Only output JSON."
     )
 
 

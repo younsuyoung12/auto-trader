@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # engine/cycles/monitoring_cycle.py
 """
 ============================================================
@@ -24,8 +25,19 @@ IMPORTANT POLICY:
 - force close 는 설정에 명시된 경우에만 실행한다
 - hidden default / silent continue / 예외 삼키기 금지
 - settings 는 SSOT 만 사용한다
+- orderbook reconnect / bootstrap / resync 는 recoverable window 로 취급해야 하며
+  watchdog FAIL(orderbook_integrity_fail)을 즉시 SAFE_STOP 하지 않는다
+- watchdog snapshot.detail 이 이미 recovery 메타를 제공하면 그것을 우선 신뢰한다
+- monitoring layer 가 watchdog 판단을 다시 뒤집는 별도 stale 정책을 만들지 않는다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(ROOT-CAUSE): watchdog FAIL(orderbook_integrity_fail) 즉시 SAFE_STOP 제거
+  2) FEAT(RECOVERY-GRACE): ws RECONNECTING/OPENING, orderbook bootstrapping/resync 상태에서
+     orderbook_integrity_fail 를 grace window 동안 recoverable 로 처리
+  3) FIX(OPERABILITY): recovery grace 경과 후에도 orderbook_fail 지속 시에만 SAFE_STOP 승격
+  4) FEAT(OBSERVABILITY): recovery grace 시작/유지/해제 로그 추가
+  5) FIX(RACE): watchdog snapshot.detail 의 orderbook recovery 메타를 우선 사용하도록 수정
 - 2026-03-13:
   1) ADD(MONITORING): infra.engine_watchdog 를 monitoring cycle 에 정식 연결
   2) ADD(CONTRACT): watchdog startup / snapshot freshness / fatal escalation 계약 추가
@@ -40,7 +52,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from infra.telelog import log, send_tg
 from infra.async_worker import submit as submit_async
@@ -53,7 +65,10 @@ from infra.engine_watchdog import (
     get_last_watchdog_snapshot,
     start_watchdog,
 )
-from infra.market_data_ws import get_ws_status as ws_get_ws_status
+from infra.market_data_ws import (
+    get_orderbook_buffer_status as ws_get_orderbook_buffer_status,
+    get_ws_status as ws_get_ws_status,
+)
 from execution.exchange_api import (
     fetch_open_orders,
     fetch_open_positions,
@@ -188,6 +203,16 @@ def _join_reason_list_strict(v: Any, name: str) -> str:
     return " | ".join(cleaned)
 
 
+def _reason_list_contains_fragment_strict(v: Any, name: str, fragment: str) -> bool:
+    rows = _require_list(v, name)
+    frag = _require_nonempty_str(fragment, "fragment")
+    for idx, item in enumerate(rows):
+        s = _require_nonempty_str(item, f"{name}[{idx}]")
+        if frag in s:
+            return True
+    return False
+
+
 def _safe_send_tg(msg: str) -> None:
     try:
         ok = submit_async(send_tg, msg, critical=False, label="send_tg")
@@ -206,6 +231,7 @@ class MonitoringCycleConfig:
     account_ws_fail_hardstop_n: int
     watchdog_startup_grace_sec: float
     watchdog_snapshot_max_age_sec: float
+    watchdog_orderbook_recovery_grace_sec: float
 
     def validate_or_raise(self) -> None:
         _require_float(
@@ -233,6 +259,11 @@ class MonitoringCycleConfig:
             "config.watchdog_snapshot_max_age_sec",
             min_value=0.001,
         )
+        _require_float(
+            self.watchdog_orderbook_recovery_grace_sec,
+            "config.watchdog_orderbook_recovery_grace_sec",
+            min_value=0.001,
+        )
 
 
 @dataclass
@@ -247,6 +278,10 @@ class MonitoringCycleState:
     watchdog_last_snapshot_checked_at_ms: int = 0
     watchdog_fatal_reason: Optional[str] = None
     watchdog_fatal_detail: Optional[Dict[str, Any]] = None
+
+    watchdog_orderbook_recovery_grace_started_ts: float = 0.0
+    watchdog_orderbook_recovery_last_log_ts: float = 0.0
+    watchdog_orderbook_recovery_reason: Optional[str] = None
 
     def validate_or_raise(self) -> None:
         _require_int(self.ws_liveness_consec_fails, "state.ws_liveness_consec_fails", min_value=0)
@@ -266,6 +301,22 @@ class MonitoringCycleState:
             _require_nonempty_str(self.watchdog_fatal_reason, "state.watchdog_fatal_reason")
         if self.watchdog_fatal_detail is not None:
             _require_dict(self.watchdog_fatal_detail, "state.watchdog_fatal_detail")
+
+        _require_float(
+            self.watchdog_orderbook_recovery_grace_started_ts,
+            "state.watchdog_orderbook_recovery_grace_started_ts",
+            min_value=0.0,
+        )
+        _require_float(
+            self.watchdog_orderbook_recovery_last_log_ts,
+            "state.watchdog_orderbook_recovery_last_log_ts",
+            min_value=0.0,
+        )
+        if self.watchdog_orderbook_recovery_reason is not None:
+            _require_nonempty_str(
+                self.watchdog_orderbook_recovery_reason,
+                "state.watchdog_orderbook_recovery_reason",
+            )
 
 
 @dataclass(frozen=True)
@@ -334,6 +385,7 @@ def build_monitoring_cycle_context_or_raise(
     )
     startup_grace_sec = watchdog_interval_sec * 3.0
     snapshot_max_age_sec = watchdog_interval_sec * 3.0
+    orderbook_recovery_grace_sec = max(15.0, watchdog_interval_sec * 4.0)
 
     state = MonitoringCycleState()
 
@@ -356,6 +408,7 @@ def build_monitoring_cycle_context_or_raise(
             account_ws_fail_hardstop_n=DEFAULT_ACCOUNT_WS_FAIL_HARDSTOP_N,
             watchdog_startup_grace_sec=startup_grace_sec,
             watchdog_snapshot_max_age_sec=snapshot_max_age_sec,
+            watchdog_orderbook_recovery_grace_sec=orderbook_recovery_grace_sec,
         ),
         state=state,
     )
@@ -391,6 +444,163 @@ def _request_safe_stop_or_raise(runtime: EngineLoopRuntime, reason: str) -> None
     runtime.request_safe_stop()
 
 
+def _reset_watchdog_orderbook_recovery_grace_state(ctx: MonitoringCycleContext) -> None:
+    ctx.state.watchdog_orderbook_recovery_grace_started_ts = 0.0
+    ctx.state.watchdog_orderbook_recovery_last_log_ts = 0.0
+    ctx.state.watchdog_orderbook_recovery_reason = None
+
+
+def _extract_watchdog_detail_recovery_context_strict(
+    snapshot: WatchdogSnapshot,
+) -> Tuple[Optional[bool], Optional[str]]:
+    detail = snapshot.detail
+    if not isinstance(detail, dict):
+        raise MonitoringContractError("watchdog_snapshot.detail must be dict (STRICT)")
+
+    if "orderbook_recovery_context" not in detail:
+        return None, None
+
+    recovery_context = _require_bool(
+        detail["orderbook_recovery_context"],
+        "watchdog_snapshot.detail.orderbook_recovery_context",
+    )
+
+    recovery_reason_raw = detail.get("orderbook_recovery_context_reason")
+    recovery_reason: Optional[str] = None
+    if recovery_reason_raw is not None:
+        recovery_reason = _require_nonempty_str(
+            recovery_reason_raw,
+            "watchdog_snapshot.detail.orderbook_recovery_context_reason",
+        )
+    return recovery_context, recovery_reason
+
+
+def _is_recoverable_orderbook_fail_context(
+    now_ts: float,
+    ctx: MonitoringCycleContext,
+    snapshot: WatchdogSnapshot,
+) -> Tuple[bool, Optional[str]]:
+    _require_float(now_ts, "now_ts", min_value=0.0)
+
+    detail_recovery_context, detail_recovery_reason = _extract_watchdog_detail_recovery_context_strict(snapshot)
+    if detail_recovery_context is True:
+        return True, detail_recovery_reason or "watchdog_detail_recovery_context"
+    if detail_recovery_context is False:
+        return False, None
+
+    ws_status_any = ws_get_ws_status(ctx.symbol)
+    ws_status = _require_dict(ws_status_any, "ws_status")
+
+    orderbook_status_any = ws_get_orderbook_buffer_status(ctx.symbol)
+    orderbook_status = _require_dict(orderbook_status_any, "orderbook_buffer_status")
+
+    ws_state = _require_nonempty_str(
+        _require_dict_key(ws_status, "state", "ws_status"),
+        "ws_status.state",
+    ).upper().strip()
+
+    ws_warnings = _require_list_key(ws_status, "warnings", "ws_status")
+    has_orderbook = _require_bool_key(orderbook_status, "has_orderbook", "orderbook_buffer_status")
+
+    bootstrapping = False
+    if "bootstrapping" in orderbook_status and orderbook_status["bootstrapping"] is not None:
+        bootstrapping = _require_bool(
+            orderbook_status["bootstrapping"],
+            "orderbook_buffer_status.bootstrapping",
+        )
+
+    resync_reason: Optional[str] = None
+    if "resync_reason" in orderbook_status and orderbook_status["resync_reason"] is not None:
+        resync_reason = _require_nonempty_str(
+            orderbook_status["resync_reason"],
+            "orderbook_buffer_status.resync_reason",
+        )
+
+    last_resync_ts_ms: Optional[int] = None
+    if "last_resync_ts" in orderbook_status and orderbook_status["last_resync_ts"] is not None:
+        last_resync_ts_ms = _require_int(
+            orderbook_status["last_resync_ts"],
+            "orderbook_buffer_status.last_resync_ts",
+            min_value=1,
+        )
+
+    startup_warning = _reason_list_contains_fragment_strict(
+        ws_warnings,
+        "ws_status.warnings",
+        "startup_no_orderbook_yet",
+    )
+
+    resync_recent = False
+    if last_resync_ts_ms is not None:
+        last_resync_ts = float(last_resync_ts_ms) / 1000.0
+        if (now_ts - last_resync_ts) <= ctx.config.watchdog_orderbook_recovery_grace_sec:
+            resync_recent = True
+
+    if ws_state in ("OPENING", "RECONNECTING"):
+        return True, f"ws_state={ws_state}"
+    if bootstrapping:
+        return True, "orderbook_bootstrapping"
+    if resync_reason is not None:
+        return True, f"orderbook_resync:{resync_reason}"
+    if startup_warning:
+        return True, "warning_startup_no_orderbook_yet"
+    if (not has_orderbook) and resync_recent:
+        return True, "orderbook_recent_resync_without_snapshot"
+
+    return False, None
+
+
+def _maybe_tolerate_watchdog_orderbook_fail_or_raise(
+    now_ts: float,
+    ctx: MonitoringCycleContext,
+    snapshot: WatchdogSnapshot,
+    fail_reason: str,
+) -> bool:
+    _require_float(now_ts, "now_ts", min_value=0.0)
+    reason = _require_nonempty_str(fail_reason, "fail_reason")
+
+    if reason != "orderbook_integrity_fail":
+        _reset_watchdog_orderbook_recovery_grace_state(ctx)
+        return False
+
+    recoverable, recoverable_reason = _is_recoverable_orderbook_fail_context(now_ts, ctx, snapshot)
+    if not recoverable:
+        _reset_watchdog_orderbook_recovery_grace_state(ctx)
+        return False
+
+    if ctx.state.watchdog_orderbook_recovery_grace_started_ts == 0.0:
+        ctx.state.watchdog_orderbook_recovery_grace_started_ts = now_ts
+        ctx.state.watchdog_orderbook_recovery_last_log_ts = now_ts
+        ctx.state.watchdog_orderbook_recovery_reason = reason
+        log(
+            "[WATCHDOG][RECOVERY_GRACE][START] "
+            f"symbol={ctx.symbol} reason={reason} "
+            f"context={recoverable_reason} "
+            f"grace_sec={ctx.config.watchdog_orderbook_recovery_grace_sec:.3f}"
+        )
+        return True
+
+    elapsed = now_ts - ctx.state.watchdog_orderbook_recovery_grace_started_ts
+    if elapsed <= ctx.config.watchdog_orderbook_recovery_grace_sec:
+        last_log_elapsed = now_ts - ctx.state.watchdog_orderbook_recovery_last_log_ts
+        if last_log_elapsed >= 5.0:
+            ctx.state.watchdog_orderbook_recovery_last_log_ts = now_ts
+            log(
+                "[WATCHDOG][RECOVERY_GRACE][KEEP] "
+                f"symbol={ctx.symbol} reason={reason} context={recoverable_reason} "
+                f"elapsed_sec={elapsed:.3f}/{ctx.config.watchdog_orderbook_recovery_grace_sec:.3f}"
+            )
+        return True
+
+    log(
+        "[WATCHDOG][RECOVERY_GRACE][EXPIRED] "
+        f"symbol={ctx.symbol} reason={reason} context={recoverable_reason} "
+        f"elapsed_sec={elapsed:.3f} grace_sec={ctx.config.watchdog_orderbook_recovery_grace_sec:.3f}"
+    )
+    _reset_watchdog_orderbook_recovery_grace_state(ctx)
+    return False
+
+
 def _ensure_watchdog_started_or_raise(
     now_ts: float,
     ctx: MonitoringCycleContext,
@@ -408,8 +618,6 @@ def _ensure_watchdog_started_or_raise(
             ctx.state.watchdog_start_ts = now_ts
         return
 
-    # watchdog start 책임은 monitoring cycle 이 아니라 BOOT 에 있다.
-    # 여기서는 최초 관측 시점만 기록하고 snapshot grace 동안만 대기한다.
     if ctx.state.watchdog_start_ts == 0.0:
         ctx.state.watchdog_start_ts = now_ts
         log(
@@ -494,6 +702,10 @@ def _watchdog_guard_or_raise(
     if level not in ("OK", "WARNING", "FAIL"):
         raise MonitoringContractError(f"watchdog_snapshot.level invalid (STRICT): {level}")
 
+    if level == "OK":
+        _reset_watchdog_orderbook_recovery_grace_state(ctx)
+        return
+
     if level == "WARNING":
         warning_reason = snapshot.warning_reason
         if warning_reason is not None:
@@ -508,11 +720,15 @@ def _watchdog_guard_or_raise(
         fail_reason = snapshot.fail_reason
         if fail_reason is None:
             raise MonitoringContractError("watchdog_snapshot.fail_reason is required on FAIL (STRICT)")
-        _require_nonempty_str(fail_reason, "watchdog_snapshot.fail_reason")
-        _request_safe_stop_or_raise(runtime, f"WATCHDOG_FAIL:{fail_reason}")
+        reason = _require_nonempty_str(fail_reason, "watchdog_snapshot.fail_reason")
+
+        if _maybe_tolerate_watchdog_orderbook_fail_or_raise(now_ts, ctx, snapshot, reason):
+            return
+
+        _request_safe_stop_or_raise(runtime, f"WATCHDOG_FAIL:{reason}")
         msg = (
             "[SAFE_STOP][WATCHDOG_FAIL] "
-            f"symbol={ctx.symbol} fail_reason={fail_reason} checked_at_ms={checked_at_ms}"
+            f"symbol={ctx.symbol} fail_reason={reason} checked_at_ms={checked_at_ms}"
         )
         log(msg)
         _safe_send_tg(msg)

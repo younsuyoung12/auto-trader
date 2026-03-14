@@ -27,8 +27,15 @@ IMPORTANT POLICY:
 - get_trading_signal() 은 데이터/계약 실패를 no-signal(None)로 숨기지 않는다.
 - LONG/SHORT 후보는 동일한 기준으로 동시에 계산해야 하며,
   한 방향을 먼저 확정한 뒤 다른 방향을 제거하는 구조를 금지한다.
+- orderbook recovery/startup 판단은 health snapshot contract를 우선 사용하고,
+  feature layer 가 별도 live ws 재판정으로 hard-fail을 덮어쓰지 않는다.
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(ROOT-CAUSE): health snapshot 의 orderbook recovery_context / recovery_context_reason 계약을 feature layer 에 정식 반영
+  2) FIX(ARCH): orderbook recovery 판단 시 live ws 상태 재조회 의존 제거 → health snapshot 기준 단일화
+  3) FIX(RECOVERY): reconnect / bootstrapping / resync 상태는 hard-fail 대신 recovery-in-progress FeatureBuildError 로 분리 유지
+  4) FEAT(OBSERVABILITY): health summary / orderbook feature payload 에 recovery_context / recovery_reason / resync metadata 노출 추가
 - 2026-03-14:
   1) FIX(ROOT-CAUSE): health snapshot 호출 중 market_data_ws 가 reconnect_requested 를 갱신한 직후에도
      동일 호출 프레임에서 stale orderbook 을 hard-fail 로 오판하던 race 제거
@@ -93,7 +100,6 @@ from infra.market_data_ws import (
     get_last_kline_delay_ms,
     get_orderbook,
     get_orderbook_buffer_status,
-    get_ws_status,
 )
 from strategy.indicators import (
     Candle,
@@ -516,6 +522,59 @@ def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dic
     if not isinstance(orderbook_reasons_raw, list):
         _fail(symbol, "health_snapshot", "health snapshot orderbook.reasons must be list (STRICT)")
 
+    orderbook_recovery_context = orderbook.get("recovery_context")
+    if not isinstance(orderbook_recovery_context, bool):
+        _fail(
+            symbol,
+            "health_snapshot",
+            "health snapshot orderbook.recovery_context must be bool (STRICT)",
+        )
+
+    orderbook_recovery_context_reason = orderbook.get("recovery_context_reason")
+    if orderbook_recovery_context_reason is not None:
+        if not isinstance(orderbook_recovery_context_reason, str) or not orderbook_recovery_context_reason.strip():
+            _fail(
+                symbol,
+                "health_snapshot",
+                "health snapshot orderbook.recovery_context_reason must be non-empty str when present (STRICT)",
+            )
+        orderbook_recovery_context_reason = orderbook_recovery_context_reason.strip()
+
+    orderbook_bootstrapping = orderbook.get("bootstrapping")
+    if orderbook_bootstrapping is not None and not isinstance(orderbook_bootstrapping, bool):
+        _fail(
+            symbol,
+            "health_snapshot",
+            "health snapshot orderbook.bootstrapping must be bool when present (STRICT)",
+        )
+
+    orderbook_resync_reason = orderbook.get("resync_reason")
+    if orderbook_resync_reason is not None:
+        if not isinstance(orderbook_resync_reason, str) or not orderbook_resync_reason.strip():
+            _fail(
+                symbol,
+                "health_snapshot",
+                "health snapshot orderbook.resync_reason must be non-empty str when present (STRICT)",
+            )
+        orderbook_resync_reason = orderbook_resync_reason.strip()
+
+    orderbook_last_resync_ts = orderbook.get("last_resync_ts")
+    if orderbook_last_resync_ts is not None:
+        try:
+            orderbook_last_resync_ts = int(orderbook_last_resync_ts)
+        except Exception:
+            _fail(
+                symbol,
+                "health_snapshot",
+                "health snapshot orderbook.last_resync_ts must be int-compatible when present (STRICT)",
+            )
+        if orderbook_last_resync_ts <= 0:
+            _fail(
+                symbol,
+                "health_snapshot",
+                "health snapshot orderbook.last_resync_ts must be > 0 when present (STRICT)",
+            )
+
     cleaned_warnings = [str(x).strip() for x in warnings if str(x).strip()]
     cleaned_orderbook_warnings = [str(x).strip() for x in orderbook_warnings_raw if str(x).strip()]
     cleaned_orderbook_reasons = [str(x).strip() for x in orderbook_reasons_raw if str(x).strip()]
@@ -533,125 +592,84 @@ def _validate_health_snapshot_contract(symbol: str, snap: Dict[str, Any]) -> Dic
         "orderbook_ok": bool(orderbook_ok),
         "orderbook_warnings": cleaned_orderbook_warnings,
         "orderbook_reasons": cleaned_orderbook_reasons,
+        "orderbook_recovery_context": bool(orderbook_recovery_context),
+        "orderbook_recovery_context_reason": orderbook_recovery_context_reason,
+        "orderbook_bootstrapping": orderbook_bootstrapping,
+        "orderbook_resync_reason": orderbook_resync_reason,
+        "orderbook_last_resync_ts": orderbook_last_resync_ts,
     }
 
 
-def _validate_live_ws_status_contract(symbol: str, ws_status: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(ws_status, dict):
-        _fail(symbol, "ws_status", "get_ws_status 결과가 dict 가 아닙니다. (STRICT)")
-
-    ws_state_raw = ws_status.get("state")
-    if not isinstance(ws_state_raw, str) or not ws_state_raw.strip():
-        _fail(symbol, "ws_status", "ws_status.state must be non-empty str (STRICT)")
-    ws_state = ws_state_raw.strip().upper()
-    if ws_state not in ("OPEN", "OPENING", "RECONNECTING", "CLOSED"):
-        _fail(symbol, "ws_status", f"ws_status.state invalid (STRICT): {ws_state!r}")
-
-    reconnect_requested = ws_status.get("reconnect_requested")
-    if not isinstance(reconnect_requested, bool):
-        _fail(symbol, "ws_status", "ws_status.reconnect_requested must be bool (STRICT)")
-
-    reconnect_request_reason = ws_status.get("reconnect_request_reason")
-    if reconnect_request_reason is not None:
-        if not isinstance(reconnect_request_reason, str) or not reconnect_request_reason.strip():
-            _fail(
-                symbol,
-                "ws_status",
-                "ws_status.reconnect_request_reason must be non-empty str when present (STRICT)",
-            )
-        reconnect_request_reason = reconnect_request_reason.strip()
-
-    circuit_breaker_open = ws_status.get("circuit_breaker_open")
-    if not isinstance(circuit_breaker_open, bool):
-        _fail(symbol, "ws_status", "ws_status.circuit_breaker_open must be bool (STRICT)")
-
-    transport_ok = ws_status.get("transport_ok")
-    if not isinstance(transport_ok, bool):
-        _fail(symbol, "ws_status", "ws_status.transport_ok must be bool (STRICT)")
-
-    market_feed_ok = ws_status.get("market_feed_ok")
-    if not isinstance(market_feed_ok, bool):
-        _fail(symbol, "ws_status", "ws_status.market_feed_ok must be bool (STRICT)")
-
-    return {
-        "ws_state": ws_state,
-        "ws_reconnect_requested": bool(reconnect_requested),
-        "ws_reconnect_request_reason": reconnect_request_reason,
-        "circuit_breaker_open": bool(circuit_breaker_open),
-        "ws_transport_ok": bool(transport_ok),
-        "ws_market_feed_ok": bool(market_feed_ok),
-    }
-
-
-def _get_live_ws_recovery_state(symbol: str) -> Dict[str, Any]:
-    try:
-        ws_status = get_ws_status(symbol)
-    except FeatureBuildError:
-        raise
-    except Exception as e:
-        _fail(symbol, "ws_status", f"get_ws_status 예외: {e}")
-    return _validate_live_ws_status_contract(symbol, ws_status)
-
-
-def _build_ws_recovery_reason_suffix(
-    *,
-    ws_state: str,
-    reconnect_requested: bool,
-    reconnect_request_reason: Optional[str],
-    circuit_breaker_open: bool,
-) -> str:
-    parts: List[str] = [
-        f"ws_state={ws_state}",
-        f"reconnect_requested={reconnect_requested}",
-        f"circuit_breaker_open={circuit_breaker_open}",
-    ]
-    if isinstance(reconnect_request_reason, str) and reconnect_request_reason:
-        parts.append(f"reconnect_reason={reconnect_request_reason}")
-    return ", ".join(parts)
-
-
-def _validate_ws_ohlcv_buffer_strict(
+def _is_orderbook_recovery_context(
     symbol: str,
-    interval: str,
-    rows: Any,
-) -> List[Tuple[int, float, float, float, float, float]]:
-    location = f"kline_{interval}"
+    runtime_health: Dict[str, Any],
+    ob_status: Dict[str, Any],
+) -> Tuple[bool, Optional[str]]:
+    if not isinstance(runtime_health, dict):
+        _fail(symbol, "orderbook", "runtime_health must be dict (STRICT)")
+    if not isinstance(ob_status, dict):
+        _fail(symbol, "orderbook", "orderbook status must be dict (STRICT)")
 
-    if not isinstance(rows, list) or not rows:
-        _fail(symbol, location, f"{interval} 캔들 버퍼가 비어 있습니다. (STRICT)")
+    if bool(runtime_health["orderbook_recovery_context"]):
+        reason = runtime_health["orderbook_recovery_context_reason"]
+        if reason is not None:
+            return True, str(reason)
+        return True, "health_orderbook_recovery_context"
 
-    out: List[Tuple[int, float, float, float, float, float]] = []
-    prev_ts: Optional[int] = None
+    if runtime_health["orderbook_bootstrapping"] is True:
+        return True, "health_orderbook_bootstrapping"
 
-    for idx, row in enumerate(rows):
-        if not isinstance(row, (list, tuple)) or len(row) < 6:
-            _fail(symbol, location, f"{interval}[{idx}] row malformed: expected len>=6 (STRICT)")
+    resync_reason = runtime_health["orderbook_resync_reason"]
+    if isinstance(resync_reason, str) and resync_reason:
+        return True, f"health_orderbook_resync:{resync_reason}"
 
-        ts = _require_int_ms(symbol, location, f"{interval}[{idx}].ts_ms", row[0])
-        open_px = _require_finite_float(symbol, location, f"{interval}[{idx}].open", row[1], positive=True)
-        high_px = _require_finite_float(symbol, location, f"{interval}[{idx}].high", row[2], positive=True)
-        low_px = _require_finite_float(symbol, location, f"{interval}[{idx}].low", row[3], positive=True)
-        close_px = _require_finite_float(symbol, location, f"{interval}[{idx}].close", row[4], positive=True)
-        volume = _require_finite_float(symbol, location, f"{interval}[{idx}].volume", row[5], non_negative=True)
+    status_bootstrapping = ob_status.get("bootstrapping")
+    if status_bootstrapping is not None:
+        if not isinstance(status_bootstrapping, bool):
+            _fail(symbol, "orderbook", "orderbook_status.bootstrapping must be bool when present (STRICT)")
+        if status_bootstrapping:
+            return True, "status_orderbook_bootstrapping"
 
-        if high_px < low_px:
-            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: high < low (STRICT)")
-        if high_px < max(open_px, close_px):
-            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: high < max(open, close) (STRICT)")
-        if low_px > min(open_px, close_px):
-            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: low > min(open, close) (STRICT)")
+    status_resync_reason = ob_status.get("resync_reason")
+    if status_resync_reason is not None:
+        if not isinstance(status_resync_reason, str) or not status_resync_reason.strip():
+            _fail(symbol, "orderbook", "orderbook_status.resync_reason must be non-empty str when present (STRICT)")
+        return True, f"status_orderbook_resync:{status_resync_reason.strip()}"
 
-        if prev_ts is not None and ts <= prev_ts:
-            _fail(
-                symbol,
-                location,
-                f"{interval} timestamp must be strictly increasing "
-                f"(prev_ts={prev_ts}, ts={ts}, index={idx}) (STRICT)",
-            )
-        prev_ts = ts
-        out.append((ts, open_px, high_px, low_px, close_px, volume))
+    return False, None
 
-    return out
+
+def _build_orderbook_recovery_reason_suffix(
+    *,
+    runtime_health: Dict[str, Any],
+    ob_status: Dict[str, Any],
+    recovery_reason: Optional[str],
+) -> str:
+    if not isinstance(runtime_health, dict):
+        _fail("UNKNOWN", "orderbook", "runtime_health must be dict (STRICT)")
+    if not isinstance(ob_status, dict):
+        _fail("UNKNOWN", "orderbook", "ob_status must be dict (STRICT)")
+
+    parts: List[str] = [
+        f"ws_state={runtime_health['ws_state']}",
+        f"ws_reconnect_requested={runtime_health['ws_reconnect_requested']}",
+    ]
+    if runtime_health["ws_reconnect_request_reason"] is not None:
+        parts.append(f"ws_reconnect_reason={runtime_health['ws_reconnect_request_reason']}")
+    parts.append(f"orderbook_recovery_context={runtime_health['orderbook_recovery_context']}")
+    if runtime_health["orderbook_recovery_context_reason"] is not None:
+        parts.append(f"health_recovery_reason={runtime_health['orderbook_recovery_context_reason']}")
+    if runtime_health["orderbook_bootstrapping"] is not None:
+        parts.append(f"health_bootstrapping={runtime_health['orderbook_bootstrapping']}")
+    if runtime_health["orderbook_resync_reason"] is not None:
+        parts.append(f"health_resync_reason={runtime_health['orderbook_resync_reason']}")
+    if ob_status.get("bootstrapping") is not None:
+        parts.append(f"status_bootstrapping={ob_status.get('bootstrapping')}")
+    if ob_status.get("resync_reason") is not None:
+        parts.append(f"status_resync_reason={ob_status.get('resync_reason')}")
+    if recovery_reason is not None:
+        parts.append(f"effective_recovery_reason={recovery_reason}")
+    return ", ".join(parts)
 
 
 def _fetch_candles_strict(
@@ -707,6 +725,50 @@ def _fetch_candles_strict(
         return []
 
     return validated
+
+
+def _validate_ws_ohlcv_buffer_strict(
+    symbol: str,
+    interval: str,
+    rows: Any,
+) -> List[Tuple[int, float, float, float, float, float]]:
+    location = f"kline_{interval}"
+
+    if not isinstance(rows, list) or not rows:
+        _fail(symbol, location, f"{interval} 캔들 버퍼가 비어 있습니다. (STRICT)")
+
+    out: List[Tuple[int, float, float, float, float, float]] = []
+    prev_ts: Optional[int] = None
+
+    for idx, row in enumerate(rows):
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            _fail(symbol, location, f"{interval}[{idx}] row malformed: expected len>=6 (STRICT)")
+
+        ts = _require_int_ms(symbol, location, f"{interval}[{idx}].ts_ms", row[0])
+        open_px = _require_finite_float(symbol, location, f"{interval}[{idx}].open", row[1], positive=True)
+        high_px = _require_finite_float(symbol, location, f"{interval}[{idx}].high", row[2], positive=True)
+        low_px = _require_finite_float(symbol, location, f"{interval}[{idx}].low", row[3], positive=True)
+        close_px = _require_finite_float(symbol, location, f"{interval}[{idx}].close", row[4], positive=True)
+        volume = _require_finite_float(symbol, location, f"{interval}[{idx}].volume", row[5], non_negative=True)
+
+        if high_px < low_px:
+            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: high < low (STRICT)")
+        if high_px < max(open_px, close_px):
+            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: high < max(open, close) (STRICT)")
+        if low_px > min(open_px, close_px):
+            _fail(symbol, location, f"{interval}[{idx}] invalid OHLC: low > min(open, close) (STRICT)")
+
+        if prev_ts is not None and ts <= prev_ts:
+            _fail(
+                symbol,
+                location,
+                f"{interval} timestamp must be strictly increasing "
+                f"(prev_ts={prev_ts}, ts={ts}, index={idx}) (STRICT)",
+            )
+        prev_ts = ts
+        out.append((ts, open_px, high_px, low_px, close_px, volume))
+
+    return out
 
 
 def _candles_from_ws_buf(
@@ -1209,35 +1271,20 @@ def _compute_orderbook_features(
     ws_state = str(runtime_health["ws_state"]).upper()
     ws_reconnect_requested = bool(runtime_health["ws_reconnect_requested"])
     ws_reconnect_request_reason = runtime_health["ws_reconnect_request_reason"]
-    orderbook_warnings = list(runtime_health["orderbook_warnings"])
+
+    recovery_context, recovery_reason = _is_orderbook_recovery_context(symbol, runtime_health, ob_status)
+    reason_suffix = _build_orderbook_recovery_reason_suffix(
+        runtime_health=runtime_health,
+        ob_status=ob_status,
+        recovery_reason=recovery_reason,
+    )
 
     now_ms = _now_ms()
     recv_ts = ob_status.get("last_recv_ts")
     payload_ts = ob_status.get("payload_ts")
 
     if ob is None:
-        live_ws = _get_live_ws_recovery_state(symbol)
-        live_ws_state = str(live_ws["ws_state"]).upper()
-        live_ws_reconnect_requested = bool(live_ws["ws_reconnect_requested"])
-        live_ws_reconnect_request_reason = live_ws["ws_reconnect_request_reason"]
-        live_circuit_breaker_open = bool(live_ws["circuit_breaker_open"])
-
-        reason_suffix = _build_ws_recovery_reason_suffix(
-            ws_state=live_ws_state,
-            reconnect_requested=live_ws_reconnect_requested,
-            reconnect_request_reason=live_ws_reconnect_request_reason,
-            circuit_breaker_open=live_circuit_breaker_open,
-        )
-
-        if (
-            live_ws_state in ("OPENING", "RECONNECTING")
-            or live_ws_reconnect_requested
-            or live_circuit_breaker_open
-            or ws_state in ("OPENING", "RECONNECTING")
-            or ws_reconnect_requested
-            or "feed:startup_no_orderbook_yet" in orderbook_warnings
-            or "feed:opening_no_orderbook_yet" in orderbook_warnings
-        ):
+        if recovery_context:
             _raise_recovery_in_progress(
                 symbol,
                 "orderbook",
@@ -1300,26 +1347,7 @@ def _compute_orderbook_features(
 
     age_sec = max(0.0, (now_ms - ts_ms) / 1000.0)
     if age_sec > ORDERBOOK_MAX_DELAY_SEC:
-        live_ws = _get_live_ws_recovery_state(symbol)
-        live_ws_state = str(live_ws["ws_state"]).upper()
-        live_ws_reconnect_requested = bool(live_ws["ws_reconnect_requested"])
-        live_ws_reconnect_request_reason = live_ws["ws_reconnect_request_reason"]
-        live_circuit_breaker_open = bool(live_ws["circuit_breaker_open"])
-
-        reason_suffix = _build_ws_recovery_reason_suffix(
-            ws_state=live_ws_state,
-            reconnect_requested=live_ws_reconnect_requested,
-            reconnect_request_reason=live_ws_reconnect_request_reason,
-            circuit_breaker_open=live_circuit_breaker_open,
-        )
-
-        if (
-            live_ws_state in ("OPENING", "RECONNECTING")
-            or live_ws_reconnect_requested
-            or live_circuit_breaker_open
-            or ws_state in ("OPENING", "RECONNECTING")
-            or ws_reconnect_requested
-        ):
+        if recovery_context:
             _raise_recovery_in_progress(
                 symbol,
                 "orderbook",
@@ -1371,8 +1399,6 @@ def _compute_orderbook_features(
     mark_price = _strict_optional_float(symbol, "orderbook", "markPrice", ob.get("markPrice"))
     last_price = _strict_optional_float(symbol, "orderbook", "lastPrice", ob.get("lastPrice"))
 
-    live_ws_runtime = _get_live_ws_recovery_state(symbol)
-
     return {
         "ts_ms": ts_ms,
         "age_sec": age_sec,
@@ -1389,10 +1415,17 @@ def _compute_orderbook_features(
         "recv_delay_ms": ob_status.get("recv_delay_ms"),
         "payload_delay_ms": ob_status.get("payload_delay_ms"),
         "last_update_id": ob_status.get("last_update_id"),
-        "ws_state": live_ws_runtime["ws_state"],
-        "ws_reconnect_requested": live_ws_runtime["ws_reconnect_requested"],
-        "ws_reconnect_request_reason": live_ws_runtime["ws_reconnect_request_reason"],
-        "circuit_breaker_open": live_ws_runtime["circuit_breaker_open"],
+        "ws_state": ws_state,
+        "ws_reconnect_requested": ws_reconnect_requested,
+        "ws_reconnect_request_reason": ws_reconnect_request_reason,
+        "health_recovery_context": recovery_context,
+        "health_recovery_context_reason": recovery_reason,
+        "health_orderbook_bootstrapping": runtime_health["orderbook_bootstrapping"],
+        "health_orderbook_resync_reason": runtime_health["orderbook_resync_reason"],
+        "health_orderbook_last_resync_ts": runtime_health["orderbook_last_resync_ts"],
+        "status_orderbook_bootstrapping": ob_status.get("bootstrapping"),
+        "status_orderbook_resync_reason": ob_status.get("resync_reason"),
+        "status_orderbook_last_resync_ts": ob_status.get("last_resync_ts"),
     }
 
 
@@ -1959,6 +1992,8 @@ def get_trading_signal(
         "oppose_count": int(selected.get("oppose_count") or 0),
         "health_has_warning": bool(health_info.get("has_warning")) if isinstance(health_info, dict) else False,
         "health_warnings": list(health_info.get("overall_warnings") or []) if isinstance(health_info, dict) else [],
+        "health_orderbook_recovery_context": bool(health_info.get("orderbook_recovery_context")) if isinstance(health_info, dict) else False,
+        "health_orderbook_recovery_context_reason": health_info.get("orderbook_recovery_context_reason") if isinstance(health_info, dict) else None,
         "direction_candidates": {
             "LONG": dict(long_candidate),
             "SHORT": dict(short_candidate),

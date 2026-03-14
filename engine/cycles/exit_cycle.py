@@ -40,7 +40,7 @@ from typing import Any, Callable, List, Optional
 from infra.telelog import log, send_tg
 from infra.async_worker import submit as submit_async
 from infra.market_data_ws import get_klines_with_volume as ws_get_klines_with_volume
-from state.exit_engine import maybe_exit_with_gpt
+from execution.exit_executor import maybe_exit_with_gpt
 from state.trader_state import Trade
 
 from engine.engine_loop import (

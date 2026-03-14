@@ -25,8 +25,18 @@ IMPORTANT POLICY:
 - 조용한 continue / 예외 삼키기 금지
 - 이벤트 기록 실패는 즉시 예외 전파
 - thread start 실패 시 started 상태 rollback 보장
+- orderbook reconnect / resync / bootstrapping 은 recoverable window 로 취급해야 한다
+- watchdog 는 orderbook recovery 판단을 자체 재구현하지 않고
+  health snapshot.orderbook.recovery_context 계약을 그대로 따른다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(ROOT-CAUSE): orderbook snapshot 부재를 즉시 FAIL로 승격하던 문제 수정
+  2) FEAT(RECOVERY): health snapshot.orderbook.recovery_context 기반으로 recoverable orderbook 상태를 WARNING으로 분류
+  3) FIX(ARCH): watchdog 의 별도 ws/orderbook recovery 재판정 제거 → health snapshot 단일 진실값으로 통일
+  4) FIX(OPERABILITY): recoverable orderbook recovery window 에서는 on_fatal 콜백 호출 금지
+  5) FEAT(OBSERVABILITY): orderbook_guard_level / orderbook_guard_warning_reason /
+     orderbook_recovery_context / orderbook_recovery_context_reason detail 추가
 - 2026-03-13:
   1) FIX(STRICT): ws health snapshot parsing 에서 dict.get(..., default) 제거
   2) FIX(OBSERVABILITY): ws_min_kline_buffer 실제 관측 반영(limit=min_buf)
@@ -252,21 +262,6 @@ def _normalize_reason_list(values: Any, name: str) -> List[str]:
     return [str(x).strip() for x in rows if str(x).strip()]
 
 
-def _interval_ms(tf: str) -> int:
-    s = str(tf).strip().lower()
-    if s == "1m":
-        return 60_000
-    if s == "5m":
-        return 300_000
-    if s == "15m":
-        return 900_000
-    if s == "1h":
-        return 3_600_000
-    if s == "4h":
-        return 14_400_000
-    raise RuntimeError(f"unsupported tf (STRICT): {tf!r}")
-
-
 def _extract_health_snapshot_strict(snapshot: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     ws = _require_dict(_require_key(snapshot, "ws", "health_snapshot"), "health_snapshot.ws")
     orderbook = _require_dict(
@@ -278,6 +273,24 @@ def _extract_health_snapshot_strict(snapshot: Dict[str, Any]) -> Tuple[Dict[str,
         "health_snapshot.klines",
     )
     return ws, orderbook, klines
+
+
+def _extract_orderbook_recovery_state_strict(orderbook_snapshot: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    recovery_context = _require_bool(
+        _require_key(orderbook_snapshot, "recovery_context", "health_snapshot.orderbook"),
+        "health_snapshot.orderbook.recovery_context",
+    )
+
+    recovery_context_reason_raw = orderbook_snapshot.get("recovery_context_reason")
+    recovery_context_reason: Optional[str] = None
+    if recovery_context_reason_raw is not None:
+        recovery_context_reason = str(recovery_context_reason_raw).strip()
+        if not recovery_context_reason:
+            raise RuntimeError(
+                "health_snapshot.orderbook.recovery_context_reason must be non-empty when present (STRICT)"
+            )
+
+    return recovery_context, recovery_context_reason
 
 
 # =============================================================================
@@ -335,14 +348,25 @@ def _check_kline_rollback_strict(
 def _check_orderbook_integrity_strict(
     *,
     symbol: str,
-) -> Tuple[bool, Optional[int], Optional[int]]:
+    orderbook_snapshot: Dict[str, Any],
+) -> Tuple[WatchdogLevel, Optional[str], Optional[str], Optional[int], Optional[int], Optional[str]]:
     """
     orderbook integrity 전용 검사.
-    stale/transport 판단은 market_data_ws.get_health_snapshot()를 진실값으로 사용한다.
+    stale/transport/recovery 판단은 health snapshot.orderbook 계약을 진실값으로 사용한다.
+
+    returns:
+        level, fail_reason, warning_reason, ts_ms, age_ms, recovery_context_reason
     """
+    if not isinstance(orderbook_snapshot, dict):
+        raise RuntimeError("orderbook_snapshot must be dict (STRICT)")
+
+    recovery_ok, recovery_context_reason = _extract_orderbook_recovery_state_strict(orderbook_snapshot)
+
     ob = ws_get_orderbook(symbol, limit=5)
     if not isinstance(ob, dict) or not ob:
-        return False, None, None
+        if recovery_ok:
+            return "WARNING", None, "warning_orderbook_recovery", None, None, recovery_context_reason
+        return "FAIL", "orderbook_integrity_fail", None, None, None, None
 
     ts_ms: Optional[int] = None
     if "exchTs" in ob and ob["exchTs"] is not None:
@@ -353,13 +377,15 @@ def _check_orderbook_integrity_strict(
     try:
         validate_orderbook_strict(ob, symbol=str(symbol), require_ts=bool(ts_ms))
     except DataIntegrityError:
-        return False, ts_ms, None
+        if recovery_ok:
+            return "WARNING", None, "warning_orderbook_recovery", ts_ms, None, recovery_context_reason
+        return "FAIL", "orderbook_integrity_fail", None, ts_ms, None, None
 
     age_ms: Optional[int] = None
     if ts_ms is not None:
         age_ms = _now_ms() - int(ts_ms)
 
-    return True, ts_ms, age_ms
+    return "OK", None, None, ts_ms, age_ms, recovery_context_reason
 
 
 def _check_db_ping_strict(*, max_ping_ms: int) -> Tuple[bool, int]:
@@ -379,17 +405,26 @@ def _check_db_ping_strict(*, max_ping_ms: int) -> Tuple[bool, int]:
 def _classify_ws_fail_reason(snapshot: Dict[str, Any]) -> str:
     ws, orderbook, kline_map = _extract_health_snapshot_strict(snapshot)
 
-    transport_ok = _require_bool(_require_key(ws, "transport_ok", "health_snapshot.ws"), "health_snapshot.ws.transport_ok")
+    transport_ok = _require_bool(
+        _require_key(ws, "transport_ok", "health_snapshot.ws"),
+        "health_snapshot.ws.transport_ok",
+    )
     if not transport_ok:
         return "ws_transport_fail"
 
     for _, st in kline_map.items():
         st_dict = _require_dict(st, "health_snapshot.klines.item")
-        ok = _require_bool(_require_key(st_dict, "ok", "health_snapshot.klines.item"), "health_snapshot.klines.item.ok")
+        ok = _require_bool(
+            _require_key(st_dict, "ok", "health_snapshot.klines.item"),
+            "health_snapshot.klines.item.ok",
+        )
         if not ok:
             return "ws_kline_stale"
 
-    ob_ok = _require_bool(_require_key(orderbook, "ok", "health_snapshot.orderbook"), "health_snapshot.orderbook.ok")
+    ob_ok = _require_bool(
+        _require_key(orderbook, "ok", "health_snapshot.orderbook"),
+        "health_snapshot.orderbook.ok",
+    )
     if not ob_ok:
         payload_reasons = _require_key(orderbook, "payload_reasons", "health_snapshot.orderbook")
         if isinstance(payload_reasons, list) and payload_reasons:
@@ -422,10 +457,6 @@ def _check_market_data_health_strict(
         "health_snapshot.has_warning",
     )
 
-    overall_reasons = _normalize_reason_list(
-        _require_key(snapshot, "overall_reasons", "health_snapshot"),
-        "health_snapshot.overall_reasons",
-    )
     overall_warnings = _normalize_reason_list(
         _require_key(snapshot, "overall_warnings", "health_snapshot"),
         "health_snapshot.overall_warnings",
@@ -522,7 +553,12 @@ def start_watchdog(
                 ws_level, ws_fail_reason, ws_warning_reason, ws_snapshot = _check_market_data_health_strict(
                     symbol=sym
                 )
-                ws_dict, _, _ = _extract_health_snapshot_strict(ws_snapshot)
+                ws_dict, orderbook_snapshot, _ = _extract_health_snapshot_strict(ws_snapshot)
+
+                ws_overall_warnings = _normalize_reason_list(
+                    _require_key(ws_snapshot, "overall_warnings", "health_snapshot"),
+                    "health_snapshot.overall_warnings",
+                )
 
                 lens, last_ts, ages, short_tfs = _check_kline_rollback_strict(
                     symbol=sym,
@@ -531,12 +567,28 @@ def start_watchdog(
                     last_seen=last_seen,
                 )
 
-                ob_integrity_ok, ob_ts, ob_age = _check_orderbook_integrity_strict(symbol=sym)
+                (
+                    orderbook_guard_level,
+                    orderbook_guard_fail_reason,
+                    orderbook_guard_warning_reason,
+                    ob_ts,
+                    ob_age,
+                    orderbook_recovery_context_reason,
+                ) = _check_orderbook_integrity_strict(
+                    symbol=sym,
+                    orderbook_snapshot=orderbook_snapshot,
+                )
+
                 db_ok, db_ms = _check_db_ping_strict(max_ping_ms=max_db_ping_ms)
 
                 loop_ms = int((time.perf_counter() - t_loop0) * 1000.0)
                 if loop_ms < 0:
                     loop_ms = 0
+
+                orderbook_recovery_context = _require_bool(
+                    _require_key(orderbook_snapshot, "recovery_context", "health_snapshot.orderbook"),
+                    "health_snapshot.orderbook.recovery_context",
+                )
 
                 detail: Dict[str, Any] = {
                     "watchdog_interval_sec": float(interval_sec),
@@ -546,7 +598,12 @@ def start_watchdog(
                     "kline_last_ts_ms": dict(last_ts),
                     "kline_age_ms": dict(ages),
                     "kline_short_tfs": list(short_tfs),
-                    "orderbook_integrity_ok": bool(ob_integrity_ok),
+                    "orderbook_integrity_ok": bool(orderbook_guard_level == "OK"),
+                    "orderbook_guard_level": str(orderbook_guard_level),
+                    "orderbook_guard_fail_reason": orderbook_guard_fail_reason,
+                    "orderbook_guard_warning_reason": orderbook_guard_warning_reason,
+                    "orderbook_recovery_context": bool(orderbook_recovery_context),
+                    "orderbook_recovery_context_reason": orderbook_recovery_context_reason,
                     "orderbook_ts_ms": ob_ts,
                     "orderbook_age_ms": ob_age,
                     "db_ok": bool(db_ok),
@@ -568,10 +625,7 @@ def start_watchdog(
                         _require_key(ws_snapshot, "overall_reasons", "health_snapshot"),
                         "health_snapshot.overall_reasons",
                     ),
-                    "ws_overall_warnings": _normalize_reason_list(
-                        _require_key(ws_snapshot, "overall_warnings", "health_snapshot"),
-                        "health_snapshot.overall_warnings",
-                    ),
+                    "ws_overall_warnings": list(ws_overall_warnings),
                 }
 
                 level: WatchdogLevel = "OK"
@@ -581,12 +635,15 @@ def start_watchdog(
                 if ws_level == "FAIL":
                     level = "FAIL"
                     fail_reason = ws_fail_reason
-                elif not ob_integrity_ok:
+                elif orderbook_guard_level == "FAIL":
                     level = "FAIL"
-                    fail_reason = "orderbook_integrity_fail"
+                    fail_reason = orderbook_guard_fail_reason
                 elif not db_ok:
                     level = "FAIL"
                     fail_reason = "db_lag"
+                elif orderbook_guard_level == "WARNING":
+                    level = "WARNING"
+                    warning_reason = orderbook_guard_warning_reason
                 elif ws_level == "WARNING":
                     level = "WARNING"
                     warning_reason = ws_warning_reason
@@ -608,10 +665,6 @@ def start_watchdog(
                     _require_key(ws_snapshot, "overall_reasons", "health_snapshot"),
                     "health_snapshot.overall_reasons",
                 )
-                ws_overall_warnings = _normalize_reason_list(
-                    _require_key(ws_snapshot, "overall_warnings", "health_snapshot"),
-                    "health_snapshot.overall_warnings",
-                )
 
                 snap = WatchdogSnapshot(
                     level=level,
@@ -621,11 +674,11 @@ def start_watchdog(
                     ws_transport_ok=ws_transport_ok,
                     ws_overall_ok=ws_overall_ok,
                     ws_overall_reasons=ws_overall_reasons,
-                    ws_overall_warnings=ws_overall_warnings,
+                    ws_overall_warnings=list(ws_overall_warnings),
                     kline_len=dict(lens),
                     kline_last_ts_ms=dict(last_ts),
                     kline_age_ms=dict(ages),
-                    orderbook_ok=bool(ob_integrity_ok),
+                    orderbook_ok=bool(orderbook_guard_level == "OK"),
                     orderbook_ts_ms=ob_ts,
                     orderbook_age_ms=ob_age,
                     db_ok=bool(db_ok),
@@ -646,8 +699,10 @@ def start_watchdog(
                 key = (
                     f"{level}|reason={reason}|"
                     f"ws_fail={ws_fail_reason}|ws_warn={ws_warning_reason}|"
-                    f"ob_integrity={int(ob_integrity_ok)}|db={int(db_ok)}|"
-                    f"short_tfs={','.join(short_tfs)}"
+                    f"ob_level={orderbook_guard_level}|ob_fail={orderbook_guard_fail_reason}|"
+                    f"ob_warn={orderbook_guard_warning_reason}|"
+                    f"ob_recovery={int(orderbook_recovery_context)}|"
+                    f"db={int(db_ok)}|short_tfs={','.join(short_tfs)}"
                 )
 
                 if _should_emit(key, min_interval_sec=emit_min_sec):
