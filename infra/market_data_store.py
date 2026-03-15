@@ -29,6 +29,12 @@ IMPORTANT POLICY:
   이런 충돌은 store 계층에서 즉시 예외로 폭로해야 하며, 더미 보정/타임시프트로 숨기지 않는다.
 
 CHANGE HISTORY:
+- 2026-03-16:
+  1) FIX(ROOT-CAUSE): 캔들 저장을 사전조회+일반 INSERT 에서 PostgreSQL ON CONFLICT 기반 원자적 UPSERT 로 교체
+  2) FIX(TRADE-GRADE): 동일 자연키 경쟁 INSERT 상황에서도 UniqueViolation 대신 저장 계약 검증으로 처리
+  3) FIX(STRICT): open candle monotonic update 규칙을 DB UPDATE WHERE 조건으로 강제
+  4) FIX(STRICT): UPSERT no-op 발생 시 기존 row 재조회 후 closed immutable / reopen / mutate 위반을 명시적으로 예외 처리
+  5) KEEP(CONTRACT): closed candle immutable / open candle mutable update / DB 오류 전파 정책 유지
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): open candle / closed candle 저장 계약 추가 (is_closed REQUIRED)
   2) FIX(ROOT-CAUSE): open candle은 STRICT mutable update, closed candle은 STRICT immutable 검증으로 분리
@@ -52,7 +58,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sqlalchemy import tuple_
+from sqlalchemy import and_, func, or_
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from infra.telelog import log
@@ -365,17 +372,16 @@ def _require_open_candle_monotonic_update_strict(existing: Candle, incoming: Dic
     existing_volume = None if existing.volume is None else float(existing.volume)
     incoming_volume = incoming["volume"]
     if existing_volume is not None and incoming_volume is None:
-         incoming["volume"] = existing_volume
+        incoming["volume"] = existing_volume
     if existing_volume is not None and incoming_volume is not None:
         if float(incoming_volume) + 1e-12 < existing_volume:
             raise MarketDataStoreError("open candle update cannot decrease volume (STRICT)")
 
     existing_quote_volume = None if existing.quote_volume is None else float(existing.quote_volume)
     incoming_quote_volume = incoming["quote_volume"]
-    
+
     # Binance WS open candle update에서는 quote_volume 누락이 발생할 수 있음
     # STRICT 정책에서는 기존 값을 유지하고 업데이트를 계속 진행한다.
-
     if existing_quote_volume is not None and incoming_quote_volume is None:
         incoming["quote_volume"] = existing_quote_volume
     if existing_quote_volume is not None and incoming_quote_volume is not None:
@@ -501,6 +507,98 @@ def _validate_candle_batch_integrity_strict(rows: List[Dict[str, Any]]) -> None:
         per_bucket_last_ts[bucket] = row["ts"]
 
 
+def _load_existing_candle_by_key_strict(session: Any, row: Dict[str, Any]) -> Optional[Candle]:
+    existing = (
+        session.query(Candle)
+        .filter(Candle.symbol == row["symbol"])
+        .filter(Candle.timeframe == row["interval"])
+        .filter(Candle.ts == row["ts"])
+        .filter(Candle.source == row["source"])
+        .one_or_none()
+    )
+    return existing
+
+
+def _save_single_candle_atomic_strict(session: Any, row: Dict[str, Any]) -> None:
+    """
+    PostgreSQL 원자적 UPSERT 기반 STRICT 저장.
+
+    설계 의도:
+    - 진행중(open) 캔들의 반복 WS 업데이트는 DB 수준에서 원자적으로 처리
+    - closed candle immutable 계약은 UPSERT no-op 후 기존 row 재검증으로 강제
+    - 경쟁 INSERT 상황에서 UniqueViolation 대신 저장 계약 검증으로 귀결
+    """
+    insert_stmt = pg_insert(Candle).values(
+        symbol=row["symbol"],
+        timeframe=row["interval"],
+        ts=row["ts"],
+        open=row["open"],
+        high=row["high"],
+        low=row["low"],
+        close=row["close"],
+        volume=row["volume"],
+        quote_volume=row["quote_volume"],
+        source=row["source"],
+        is_closed=row["is_closed"],
+    )
+
+    excluded = insert_stmt.excluded
+
+    upsert_stmt = (
+        insert_stmt.on_conflict_do_update(
+            index_elements=[Candle.symbol, Candle.timeframe, Candle.ts, Candle.source],
+            set_={
+                "high": excluded.high,
+                "low": excluded.low,
+                "close": excluded.close,
+                "volume": func.coalesce(excluded.volume, Candle.volume),
+                "quote_volume": func.coalesce(excluded.quote_volume, Candle.quote_volume),
+                "is_closed": excluded.is_closed,
+            },
+            where=and_(
+                Candle.is_closed.is_(False),
+                Candle.open == excluded.open,
+                excluded.high >= Candle.high,
+                excluded.low <= Candle.low,
+                or_(
+                    excluded.volume.is_(None),
+                    Candle.volume.is_(None),
+                    excluded.volume >= Candle.volume,
+                ),
+                or_(
+                    excluded.quote_volume.is_(None),
+                    Candle.quote_volume.is_(None),
+                    excluded.quote_volume >= Candle.quote_volume,
+                ),
+            ),
+        )
+        .returning(Candle.id)
+    )
+
+    result = session.execute(upsert_stmt).first()
+    if result is not None:
+        return
+
+    existing = _load_existing_candle_by_key_strict(session, row)
+    if existing is None:
+        raise MarketDataStoreError(
+            "candle UPSERT returned no row and existing row not found (STRICT)"
+        )
+
+    if bool(existing.is_closed):
+        if not row["is_closed"]:
+            raise MarketDataStoreError(
+                "incoming open candle cannot reopen existing closed candle (STRICT)"
+            )
+        _require_same_candle_content_strict(existing, row)
+        return
+
+    _require_open_candle_monotonic_update_strict(existing, row)
+    raise MarketDataStoreError(
+        "open candle UPSERT returned no row despite passing monotonic contract (STRICT)"
+    )
+
+
 # ─────────────────────────────────────────────
 # Candle 저장
 # ─────────────────────────────────────────────
@@ -589,64 +687,8 @@ def save_candles_bulk_from_ws(
 
     try:
         with get_session() as session:
-            existing_rows = (
-                session.query(Candle)
-                .filter(
-                    tuple_(Candle.symbol, Candle.timeframe, Candle.ts, Candle.source).in_(
-                        [(r["symbol"], r["interval"], r["ts"], r["source"]) for r in rows]
-                    )
-                )
-                .all()
-            )
-
-            existing_by_key: Dict[Tuple[str, str, datetime, str], Candle] = {}
-            for row in existing_rows:
-                key = (
-                    _normalize_symbol_strict(row.symbol, "existing.symbol"),
-                    _normalize_interval_strict(row.timeframe, "existing.timeframe"),
-                    row.ts,
-                    _require_nonempty_str(row.source, "existing.source"),
-                )
-                if key in existing_by_key:
-                    raise MarketDataStoreError(f"duplicate existing candle natural key in DB (STRICT): {key}")
-                existing_by_key[key] = row
-
-            to_insert: List[Candle] = []
-
             for row in rows:
-                key = (row["symbol"], row["interval"], row["ts"], row["source"])
-                existing = existing_by_key.get(key)
-
-                if existing is None:
-                    to_insert.append(
-                        Candle(
-                            symbol=row["symbol"],
-                            timeframe=row["interval"],
-                            ts=row["ts"],
-                            open=row["open"],
-                            high=row["high"],
-                            low=row["low"],
-                            close=row["close"],
-                            volume=row["volume"],
-                            quote_volume=row["quote_volume"],
-                            source=row["source"],
-                            is_closed=row["is_closed"],
-                        )
-                    )
-                    continue
-
-                if bool(existing.is_closed):
-                    if not row["is_closed"]:
-                        raise MarketDataStoreError(
-                            "incoming open candle cannot reopen existing closed candle (STRICT)"
-                        )
-                    _require_same_candle_content_strict(existing, row)
-                    continue
-
-                _apply_open_candle_update_strict(existing, row)
-
-            if to_insert:
-                session.add_all(to_insert)
+                _save_single_candle_atomic_strict(session, row)
     except SQLAlchemyError as e:
         log(f"[MD-STORE][FAIL] save_candles_bulk_from_ws db_error={type(e).__name__}")
         raise
