@@ -1,5 +1,5 @@
 requests==2.*
-websocket-client==1.*
+websocket-client==1.8.0
 python-dotenv==1.*
 psutil>=5.9
 google-api-python-client==2.*

@@ -288,6 +288,25 @@ def _compute_orderbook_health(symbol: str) -> Dict[str, Any]:
                 warning_reasons.append(
                     f"feed:orderbook_recv_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={recv_delay_sec:.1f})"
                 )
+
+                if recv_delay_sec > MARKET_EVENT_MAX_DELAY_SEC:
+                    if recovery_ok:
+                        warning_reasons.append(
+                            f"feed:orderbook_recv_delay_recovering>{MARKET_EVENT_MAX_DELAY_SEC} "
+                            f"(got={recv_delay_sec:.1f}, reason={recovery_context_reason})"
+                        )
+                else:
+                    warning_reasons.append(
+                        f"feed:orderbook_recv_delay_sec>{MARKET_EVENT_MAX_DELAY_SEC} (got={recv_delay_sec:.1f})"
+                    )           
+
+                    # reconnect 는 2배 delay 이후에만 수행
+                    if recv_delay_sec > (MARKET_EVENT_MAX_DELAY_SEC * 2):
+                        _maybe_force_reconnect_on_orderbook_feed_gap(
+                            sym,
+                            ws_status=ws_status,
+                            reason=f"orderbook_feed_stale>{MARKET_EVENT_MAX_DELAY_SEC}s recv_delay={recv_delay_sec:.1f}s",
+                        )
                 _maybe_force_reconnect_on_orderbook_feed_gap(
                     sym,
                     ws_status=ws_status,

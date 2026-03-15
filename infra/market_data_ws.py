@@ -297,7 +297,10 @@ def start_ws_loop(symbol: str) -> None:
                 _register_ws_app(sym, ws)
                 try:
                     start_ts = time.time()
-                    ws.run_forever(ping_interval=20)
+                    ws.run_forever(
+                        ping_interval=25,
+                        ping_timeout=10                      
+                    )
                     session_dur = time.time() - start_ts
                 finally:
                     _unregister_ws_app(sym, ws)

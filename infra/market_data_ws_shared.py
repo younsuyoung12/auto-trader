@@ -569,7 +569,7 @@ def _build_stream_names(symbol: str) -> List[str]:
 
     streams: List[str] = []
     for iv in WS_INTERVALS:
-        streams.append(f"{s}@kline_{iv}")
+         streams.append(f"{s}@kline_{iv}")
 
     # IMPORTANT:
     # current orderbook parser/storage contract is diff-depth(U/u/pu) based.

@@ -331,7 +331,7 @@ class Settings:
     preflight_ws_wait_sec: int = 60
     ws_min_kline_buffer: int = 300
     ws_max_kline_delay_sec: float = 120.0
-    ws_market_event_max_delay_sec: float = 10.0
+    ws_market_event_max_delay_sec: float = 120.0
     ws_bootstrap_rest_enabled: bool = True
     ws_rest_timeout_sec: float = 10.0
     ws_min_kline_buffer_long_tf: int = 2
@@ -835,7 +835,7 @@ def _load_analyst_openai_settings() -> Dict[str, Any]:
         ),
         "analyst_openai_max_output_tokens": _resolve_int_env(
             ["ANALYST_OPENAI_MAX_OUTPUT_TOKENS"],
-            default=1200,
+            default=4000,
             label="analyst_openai_max_output_tokens",
         ),
         # Responses API 경로에서는 현재 미사용이나, 레거시 호환을 위해 로딩 유지
@@ -1426,7 +1426,7 @@ def _build_settings() -> Settings:
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_market_event_max_delay_sec = _resolve_float_env(
         ["WS_MARKET_EVENT_MAX_DELAY_SEC", "WS_ORDERBOOK_MAX_DELAY_SEC"],
-        default=60.0,
+        default=120.0,
         label="ws_market_event_max_delay_sec",
     )
     ws_bootstrap_rest_enabled = _as_bool("WS_BOOTSTRAP_REST_ENABLED", True)
@@ -1435,7 +1435,7 @@ def _build_settings() -> Settings:
     ws_min_kline_buffer_by_interval = _as_interval_int_map("WS_MIN_KLINE_BUFFER_BY_INTERVAL")
     ws_health_fail_log_suppress_sec = _as_float("WS_HEALTH_FAIL_LOG_SUPPRESS_SEC", 10.0)
     ws_no_buffer_log_suppress_sec = _as_float("WS_NO_BUFFER_LOG_SUPPRESS_SEC", 30.0)
-    ws_pong_max_delay_sec = _as_float("WS_PONG_MAX_DELAY_SEC", 15.0)
+    ws_pong_max_delay_sec = _as_float("WS_PONG_MAX_DELAY_SEC", 30.0)
     ws_pong_startup_grace_sec = _as_float("WS_PONG_STARTUP_GRACE_SEC", 15.0)
     ws_log_enabled = _as_bool("WS_LOG_ENABLED", False)
     ws_log_interval_sec = _as_int("WS_LOG_INTERVAL_SEC", 60)

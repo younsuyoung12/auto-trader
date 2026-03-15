@@ -1254,6 +1254,7 @@ class GptAnalystEngine:
 
         scope = self._require_scope(obj["scope"])
         answer_ko = self._require_nonempty_str(obj["answer_ko"], "answer_ko")
+        answer_ko = self._normalize_answer_ko(answer_ko)   # ← 추가
         root_causes = self._require_string_list(obj["root_causes"], "root_causes")
         recommendations = self._require_string_list(obj["recommendations"], "recommendations")
         confidence = self._require_confidence(obj["confidence"])
@@ -1289,6 +1290,24 @@ class GptAnalystEngine:
         )
         self._validate_result_integrity_or_raise(result)
         return result
+
+    def _normalize_answer_ko(self, text: str) -> str:
+        """
+        GPT가 2문장 초과 출력하는 경우 자동 정규화한다.
+        STRICT validator 전에 실행된다.
+        """
+        if not isinstance(text, str):
+            return text
+
+        text = text.replace("\n", " ").replace("\r", " ").strip()
+
+        parts = re.split(r"[.!?]+", text)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        if len(parts) <= 2:
+            return ". ".join(parts)
+
+        return ". ".join(parts[:2]) + "."    
 
     def _validate_result_integrity_or_raise(self, result: GptAnalystResult) -> None:
         if result.scope not in _ALLOWED_SCOPE:

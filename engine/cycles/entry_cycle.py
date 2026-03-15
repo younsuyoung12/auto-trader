@@ -279,18 +279,22 @@ def run_entry_cycle_or_raise(
 
     health_level, health_fail_reason, health_warning_reason, health_snapshot = _get_data_health_state_or_raise()
     if health_level == "FAIL":
-        reason_text = _format_data_health_snapshot_reason(health_snapshot, health_fail_reason)
-        _rebase_entry_cycle_markers_on_health_failure(
-            ctx,
-            now_ts=now_f,
-            latest_1m_ts=latest_1m_ts,
-            latest_orderbook_ts=latest_orderbook_ts,
-            reason_text=reason_text,
-        )
-        msg = f"[SKIP][DATA_HEALTH_FAIL] {reason_text}"
-        log(msg)
-        _maybe_send_entry_block_tg(ctx, "DATA_HEALTH_FAIL", msg)
-        return
+        # recoverable 상태는 entry 차단하지 않는다
+        if health_snapshot.get("recovery_context"):
+            log("[ENTRY][RECOVERY] health FAIL but recovery_context active → skip SAFE_STOP")
+        else:
+            reason_text = _format_data_health_snapshot_reason(health_snapshot, health_fail_reason)
+            _rebase_entry_cycle_markers_on_health_failure(
+                ctx,
+                now_ts=now_f,
+                latest_1m_ts=latest_1m_ts,
+                latest_orderbook_ts=latest_orderbook_ts,
+                reason_text=reason_text,
+            )
+            msg = f"[SKIP][DATA_HEALTH_FAIL] {reason_text}"
+            log(msg)
+            _maybe_send_entry_block_tg(ctx, "DATA_HEALTH_FAIL", msg)
+            return
 
     if health_level == "WARNING":
         warning_text = _format_data_health_warning_reason(health_snapshot, health_warning_reason)

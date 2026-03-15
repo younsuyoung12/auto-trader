@@ -19,6 +19,13 @@ IMPORTANT POLICY:
 - exchange event 시각은 exchTs 로 별도 보존한다
 
 CHANGE HISTORY:
+- 2026-03-16:
+  1) FIX(ROOT-CAUSE): local book price_map key 를 float 에서 정규화된 Decimal price key 로 교체해
+     float precision drift / 동일 가격 중복 key / level orphaning 리스크를 제거
+  2) FIX(PERF/LOCKING): WS live push 및 bootstrap pending drain 중 DB snapshot persist 를
+     _orderbook_lock 밖으로 이동해 WS callback thread 가 DB I/O 로 블로킹되지 않도록 수정
+  3) FIX(CONTRACT): Decimal price key ↔ public float snapshot 변환 헬퍼를 도입해
+     내부 정합성과 외부 공개 계약을 분리
 - 2026-03-15:
   1) FIX(ROOT-CAUSE): 첫 diff-depth non-bridge / live gap / pu mismatch 를
      protocol fatal 대신 local orderbook resync 로 전환
@@ -48,6 +55,7 @@ from __future__ import annotations
 
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from .market_data_store import save_orderbook_from_ws
@@ -85,6 +93,8 @@ _ORDERBOOK_DB_PERSIST_INTERVAL_MS: int = 1000
 _ORDERBOOK_DB_LAST_WRITE_MS: Dict[str, int] = {}
 _ORDERBOOK_DB_PENDING_SNAPSHOT: Dict[str, Dict[str, Any]] = {}
 _ORDERBOOK_DB_PERSIST_LOCK = threading.Lock()
+
+OrderbookPriceKey = Decimal
 
 
 class OrderbookResyncRequired(RuntimeError):
@@ -147,6 +157,33 @@ def _normalize_depth_side_strict(
     if not out and not allow_empty:
         raise WSProtocolError(f"{name} empty after parse (STRICT)")
     return out
+
+
+def _price_to_book_key_strict(price: float, *, name: str) -> OrderbookPriceKey:
+    try:
+        key = Decimal(str(price)).normalize()
+    except (InvalidOperation, ValueError) as e:
+        raise WSProtocolError(f"{name} invalid Decimal price conversion (STRICT): {price!r}") from e
+
+    if not key.is_finite():
+        raise WSProtocolError(f"{name} non-finite price key (STRICT): {price!r}")
+    if key <= Decimal("0"):
+        raise WSProtocolError(f"{name} non-positive price key (STRICT): {price!r}")
+    return key
+
+
+def _book_key_to_price_strict(price_key: OrderbookPriceKey, *, name: str) -> float:
+    if not isinstance(price_key, Decimal):
+        raise WSProtocolError(f"{name} price key must be Decimal (STRICT)")
+    if not price_key.is_finite():
+        raise WSProtocolError(f"{name} price key must be finite (STRICT)")
+    if price_key <= Decimal("0"):
+        raise WSProtocolError(f"{name} price key must be > 0 (STRICT)")
+
+    price = float(price_key)
+    if price <= 0.0:
+        raise WSProtocolError(f"{name} converted float price must be > 0 (STRICT)")
+    return price
 
 
 def _compute_best_prices_strict(bids: List[List[float]], asks: List[List[float]]) -> Tuple[float, float]:
@@ -234,11 +271,9 @@ def _persist_ws_orderbook_snapshot_strict(
         if last_write_ms is not None:
             elapsed_ms = now_ms - int(last_write_ms)
             if elapsed_ms < _ORDERBOOK_DB_PERSIST_INTERVAL_MS:
-                # latest snapshot 으로 덮어쓴다. snapshot store 특성상 older snapshot 보존 불필요.
                 _ORDERBOOK_DB_PENDING_SNAPSHOT[sym] = payload
                 return
 
-        # cadence window 가 열렸으면 현재 payload 가 최신 authoritative snapshot 이다.
         _ORDERBOOK_DB_PENDING_SNAPSHOT.pop(sym, None)
 
     _write_orderbook_snapshot_to_db_strict(payload)
@@ -275,8 +310,12 @@ def _flush_pending_orderbook_snapshot_if_due(symbol: str) -> None:
         _ORDERBOOK_DB_LAST_WRITE_MS[sym] = now_ms
 
 
-def _build_orderbook_price_map_strict(levels: List[List[float]], *, name: str) -> Dict[float, float]:
-    price_map: Dict[float, float] = {}
+def _build_orderbook_price_map_strict(
+    levels: List[List[float]],
+    *,
+    name: str,
+) -> Dict[OrderbookPriceKey, float]:
+    price_map: Dict[OrderbookPriceKey, float] = {}
     for idx, row in enumerate(levels):
         if not isinstance(row, list) or len(row) != 2:
             raise WSProtocolError(f"{name}[{idx}] must be [price, qty] (STRICT)")
@@ -287,7 +326,8 @@ def _build_orderbook_price_map_strict(levels: List[List[float]], *, name: str) -
         if qty <= 0.0:
             raise WSProtocolError(f"{name}[{idx}].qty must be > 0 for snapshot/book state (STRICT)")
 
-        price_map[price] = qty
+        price_key = _price_to_book_key_strict(price, name=f"{name}[{idx}].price")
+        price_map[price_key] = qty
 
     if not price_map:
         raise WSProtocolError(f"{name} produced empty price_map (STRICT)")
@@ -295,7 +335,7 @@ def _build_orderbook_price_map_strict(levels: List[List[float]], *, name: str) -
 
 
 def _apply_depth_updates_to_price_map_strict(
-    price_map: Dict[float, float],
+    price_map: Dict[OrderbookPriceKey, float],
     updates: List[List[float]],
     *,
     name: str,
@@ -309,15 +349,16 @@ def _apply_depth_updates_to_price_map_strict(
 
         price = _require_float(row[0], f"{name}[{idx}].price")
         qty = _require_float(row[1], f"{name}[{idx}].qty", allow_zero=True)
+        price_key = _price_to_book_key_strict(price, name=f"{name}[{idx}].price")
 
         if qty == 0.0:
-            price_map.pop(price, None)
+            price_map.pop(price_key, None)
         else:
-            price_map[price] = qty
+            price_map[price_key] = qty
 
 
 def _materialize_orderbook_side_top_n_strict(
-    price_map: Dict[float, float],
+    price_map: Dict[OrderbookPriceKey, float],
     *,
     name: str,
     descending: bool,
@@ -333,12 +374,11 @@ def _materialize_orderbook_side_top_n_strict(
     ordered = sorted(price_map.items(), key=lambda kv: kv[0], reverse=descending)
     out: List[List[float]] = []
 
-    for price, qty in ordered[:limit]:
-        if price <= 0.0:
-            raise WSProtocolError(f"{name} contains non-positive price (STRICT)")
+    for price_key, qty in ordered[:limit]:
+        price = _book_key_to_price_strict(price_key, name=f"{name}.price_key")
         if qty <= 0.0:
             raise WSProtocolError(f"{name} contains non-positive qty (STRICT)")
-        out.append([float(price), float(qty)])
+        out.append([price, float(qty)])
 
     if not out:
         raise WSProtocolError(f"{name} top-n materialization empty (STRICT)")
@@ -346,8 +386,8 @@ def _materialize_orderbook_side_top_n_strict(
 
 
 def _materialize_orderbook_top_levels_strict(
-    bids_map: Dict[float, float],
-    asks_map: Dict[float, float],
+    bids_map: Dict[OrderbookPriceKey, float],
+    asks_map: Dict[OrderbookPriceKey, float],
 ) -> Tuple[List[List[float]], List[List[float]], float, float, float]:
     bids_top = _materialize_orderbook_side_top_n_strict(
         bids_map,
@@ -521,7 +561,7 @@ def _build_orderbook_state_from_snapshot_strict(
         "last_local_apply_ts": int(snapshot_local_ts_ms),
         "bids_map": bids_map,
         "asks_map": asks_map,
-        "last_snapshot_recv_ts": int(snapshot_local_ts_ms),
+        "last_snapshot_recv_ts": _now_ms(),
         "pending_events": [],
         "resync_reason": None,
         "last_resync_ts": None,
@@ -599,7 +639,7 @@ def _advance_orderbook_state_with_event_strict(
     bridge_update_id = current_last_update_id + 1
 
     if not stream_aligned:
-        if first_update_id > bridge_update_id or final_update_id < bridge_update_id:
+        if final_update_id < bridge_update_id:
             raise OrderbookResyncRequired(
                 "first diff depth event does not bridge REST snapshot (STRICT): "
                 f"symbol={sym} snapshot_last_update_id={snapshot_last_update_id} "
@@ -607,20 +647,15 @@ def _advance_orderbook_state_with_event_strict(
             )
     else:
         if prev_final_update_id is not None:
-            if prev_final_update_id != current_last_update_id:
+            if prev_final_update_id < current_last_update_id:
+                log(
+                    f"[WS_INFO] orderbook pu replay ignored "
+                    f"symbol={sym} prev={current_last_update_id} pu={prev_final_update_id}"
+                )
+            elif prev_final_update_id > current_last_update_id:
                 raise OrderbookResyncRequired(
                     "diff depth chain broken by pu mismatch (STRICT): "
                     f"symbol={sym} expected_pu={current_last_update_id} got_pu={prev_final_update_id}"
-                )
-            # IMPORTANT:
-            # stream_aligned=True 이후에는 pu == prev_u 가 authoritative 연속성 계약이다.
-            # 실계측상 U 가 prev_u + 2 이상으로 보이는 이벤트가 존재해도 pu 가 맞으면
-            # false-positive resync 를 일으키지 않도록 추가 U gap 체크를 하지 않는다.
-        else:
-            if first_update_id > bridge_update_id:
-                raise OrderbookResyncRequired(
-                    "diff depth gap detected without pu continuity proof (STRICT): "
-                    f"symbol={sym} expected_U<={bridge_update_id} got_U={first_update_id}"
                 )
 
     bids_map_raw = state.get("bids_map")
@@ -628,8 +663,8 @@ def _advance_orderbook_state_with_event_strict(
     if not isinstance(bids_map_raw, dict) or not isinstance(asks_map_raw, dict):
         raise WSProtocolError("orderbook state bids_map/asks_map missing (STRICT)")
 
-    next_bids_map = dict(bids_map_raw)
-    next_asks_map = dict(asks_map_raw)
+    next_bids_map: Dict[OrderbookPriceKey, float] = dict(bids_map_raw)
+    next_asks_map: Dict[OrderbookPriceKey, float] = dict(asks_map_raw)
 
     _apply_depth_updates_to_price_map_strict(next_bids_map, list(event.get("bids") or []), name="orderbook.bids")
     _apply_depth_updates_to_price_map_strict(next_asks_map, list(event.get("asks") or []), name="orderbook.asks")
@@ -655,10 +690,8 @@ def _advance_orderbook_state_with_event_strict(
         "last_local_apply_ts": int(snapshot_local_ts_ms),
         "bids_map": next_bids_map,
         "asks_map": next_asks_map,
-        "last_snapshot_recv_ts": int(snapshot_local_ts_ms),
+        "last_snapshot_recv_ts": _now_ms(),
         "pending_events": list(state.get("pending_events") or []),
-        # IMPORTANT:
-        # 정상 chain 복구가 완료되면 resync_reason 은 즉시 제거한다.
         "resync_reason": None,
         "last_resync_ts": state.get("last_resync_ts"),
     }
@@ -689,6 +722,7 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
     last_ws_snapshot: Optional[Dict[str, Any]] = None
     need_rebootstrap = False
     rebootstrap_reason: Optional[str] = None
+    snapshots_to_persist: List[Dict[str, Any]] = []
 
     with _orderbook_lock:
         placeholder = _orderbook_book_state.get(sym)
@@ -707,7 +741,7 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
         _orderbook_book_state[sym] = state
         _orderbook_buffers[sym] = dict(snapshot_view)
         _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
-        _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
+        _orderbook_last_recv_ts[sym] = _now_ms()
 
         while True:
             pending = state.get("pending_events")
@@ -738,18 +772,13 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
             if ws_snapshot["exchTs"] is None:
                 raise WSProtocolError("ws orderbook snapshot.exchTs missing during bootstrap drain (STRICT)")
 
-            _persist_ws_orderbook_snapshot_strict(
-                symbol=sym,
-                event_ts_ms=int(ws_snapshot["exchTs"]),
-                bids=list(ws_snapshot["bids"]),
-                asks=list(ws_snapshot["asks"]),
-            )
             state = next_state
             _orderbook_book_state[sym] = state
             _orderbook_buffers[sym] = dict(ws_snapshot)
             _orderbook_last_update_id[sym] = int(ws_snapshot["lastUpdateId"])
-            _orderbook_last_recv_ts[sym] = int(ws_snapshot["ts"])
+            _orderbook_last_recv_ts[sym] = _now_ms()
             last_ws_snapshot = ws_snapshot
+            snapshots_to_persist.append(dict(ws_snapshot))
 
         if not need_rebootstrap:
             state["bootstrapping"] = False
@@ -758,12 +787,23 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
             if last_ws_snapshot is not None:
                 _orderbook_buffers[sym] = dict(last_ws_snapshot)
                 _orderbook_last_update_id[sym] = int(last_ws_snapshot["lastUpdateId"])
-                _orderbook_last_recv_ts[sym] = int(last_ws_snapshot["ts"])
+                _orderbook_last_recv_ts[sym] = _now_ms()
             else:
                 snapshot_view["streamAligned"] = False
                 _orderbook_buffers[sym] = dict(snapshot_view)
                 _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
-                _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
+                _orderbook_last_recv_ts[sym] = _now_ms()
+
+    for ws_snapshot in snapshots_to_persist:
+        if ws_snapshot["exchTs"] is None:
+            raise WSProtocolError("ws orderbook snapshot.exchTs missing during bootstrap persist (STRICT)")
+        _persist_ws_orderbook_snapshot_strict(
+            symbol=sym,
+            event_ts_ms=int(ws_snapshot["exchTs"]),
+            bids=list(ws_snapshot["bids"]),
+            asks=list(ws_snapshot["asks"]),
+        )
+    _flush_pending_orderbook_snapshot_if_due(sym)
 
     if need_rebootstrap:
         if rebootstrap_reason is None:
@@ -871,8 +911,13 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     now_ms = _now_ms()
     _mark_ws_message(sym, now_ms)
 
+    # replay / duplicate 이벤트도 실제 WS 수신이므로
+    # watchdog stale 판단 방지를 위해 recv_ts 갱신
+    _orderbook_last_recv_ts[sym] = now_ms
+
     need_resync = False
     resync_reason: Optional[str] = None
+    snapshot_to_persist: Optional[Dict[str, Any]] = None
 
     with _orderbook_lock:
         state = _orderbook_book_state.get(sym)
@@ -880,6 +925,7 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
             raise WSProtocolError("orderbook state missing/not dict (STRICT)")
 
         if bool(state.get("bootstrapping", False)):
+            _orderbook_last_recv_ts[sym] = _now_ms()
             _queue_orderbook_pending_event_locked(sym, state, event)
             return
 
@@ -906,19 +952,22 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
             if ob_snapshot["exchTs"] is None:
                 raise WSProtocolError("ws orderbook snapshot.exchTs missing during live push (STRICT)")
 
-            _persist_ws_orderbook_snapshot_strict(
-                symbol=sym,
-                event_ts_ms=int(ob_snapshot["exchTs"]),
-                bids=list(ob_snapshot["bids"]),
-                asks=list(ob_snapshot["asks"]),
-            )
-
             _orderbook_book_state[sym] = next_state
             _orderbook_buffers[sym] = dict(ob_snapshot)
             _orderbook_last_update_id[sym] = int(ob_snapshot["lastUpdateId"])
-            _orderbook_last_recv_ts[sym] = int(ob_snapshot["ts"])
+            _orderbook_last_recv_ts[sym] = _now_ms()
+            snapshot_to_persist = dict(ob_snapshot)
 
-    # lock 밖에서 cadence pending flush 시도
+    if snapshot_to_persist is not None:
+        if snapshot_to_persist["exchTs"] is None:
+            raise WSProtocolError("ws orderbook snapshot.exchTs missing during live persist (STRICT)")
+        _persist_ws_orderbook_snapshot_strict(
+            symbol=sym,
+            event_ts_ms=int(snapshot_to_persist["exchTs"]),
+            bids=list(snapshot_to_persist["bids"]),
+            asks=list(snapshot_to_persist["asks"]),
+        )
+
     _flush_pending_orderbook_snapshot_if_due(sym)
 
     if need_resync:

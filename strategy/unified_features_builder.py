@@ -135,16 +135,16 @@ _ORDERBOOK_SCALAR_TOL: float = 1e-9
 
 # engine_scores.total 가중치 (합=1.0)
 _TOTAL_WEIGHTS: Dict[str, float] = {
-    "trend_4h": 0.12,
-    "momentum_1h": 0.10,
-    "structure_15m": 0.10,
-    "timing_5m": 0.10,
+    "trend_4h": 0.14,
+    "momentum_1h": 0.11,
+    "structure_15m": 0.11,
+    "timing_5m": 0.11,
     "orderbook_micro": 0.10,
     "volatility_regime": 0.08,
     "volume_regime": 0.08,
     "liquidity_regime": 0.05,
     "volume_profile_regime": 0.10,
-    "orderflow_regime": 0.20,
+    "orderflow_regime": 0.17,
     "options_regime": 0.05,
 }
 

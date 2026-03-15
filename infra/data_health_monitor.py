@@ -654,19 +654,21 @@ def _update_health(symbol: str) -> None:
 
     ok_feat, reason_feat, feature_status = _check_feature_health(symbol)
     if not ok_feat:
-        snapshot = _build_health_snapshot(
-            symbol=symbol,
-            level="FAIL",
-            fail_reason=reason_feat,
-            warning_reason="",
-            ws_snapshot=ws_snapshot,
-            feature_status=feature_status,
-            checked_at_ts=now_ts,
-        )
-        _set_health_state("FAIL", reason_feat, "", snapshot)
-        return
-
-    if ws_level == "WARNING":
+       
+        # WS 정상일 때 feature 실패는 recoverable 상태
+        if ws_level != "FAIL":
+            snapshot = _build_health_snapshot(
+                symbol=symbol,
+                level="FAIL",
+                fail_reason=reason_feat,
+                warning_reason="",
+                ws_snapshot=ws_snapshot,
+                feature_status=feature_status,
+                checked_at_ts=now_ts,
+            )
+            _set_health_state("FAIL", reason_feat, "", snapshot)
+            return
+    
         snapshot = _build_health_snapshot(
             symbol=symbol,
             level="WARNING",

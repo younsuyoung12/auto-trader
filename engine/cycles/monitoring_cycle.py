@@ -1052,7 +1052,7 @@ def _ws_liveness_guard_or_raise(
     state_raw = _require_dict_key(ws_status, "state", "ws_status")
     state = str(state_raw).upper().strip()
 
-    if transport_ok or state in ("CONNECTING", "RECONNECTING", "OPENING"):
+    if transport_ok or state in ("CONNECTING", "RECONNECTING", "OPENING", "CLOSING"):
         if ctx.state.ws_liveness_consec_fails != 0:
             log(f"[WS_LIVENESS][RECOVER] consecutive={ctx.state.ws_liveness_consec_fails} -> 0")
         ctx.state.ws_liveness_consec_fails = 0
