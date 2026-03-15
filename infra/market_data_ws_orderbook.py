@@ -35,6 +35,8 @@ CHANGE HISTORY:
   7) FIX(ROOT-CAUSE): public orderbook snapshot.ts 를 REST/WS 공통 local apply ts 로 통일하고
      exchTs 는 exchange event ts 로 분리 유지해 reconnect 직후 timestamp rollback 오탐 제거
   8) FEAT(CONTRACT): state.last_local_apply_ts 를 추가해 orderbook snapshot 시각 계약을 상태에 명시 보존
+  9) FIX(ROOT-CAUSE): stream_aligned=True 이후에는 U strict gap 보다 pu 연속성(pu == prev_u)을
+     우선 authoritative chain 기준으로 사용하고, pu 가 없을 때만 U gap 계약을 적용
 ========================================================
 """
 
@@ -494,6 +496,7 @@ def _advance_orderbook_state_with_event_strict(
         prev_final_update_id = _require_positive_int(prev_final_update_id, "orderbook_event.pu")
 
     bridge_update_id = current_last_update_id + 1
+
     if not stream_aligned:
         if first_update_id > bridge_update_id or final_update_id < bridge_update_id:
             raise OrderbookResyncRequired(
@@ -502,16 +505,22 @@ def _advance_orderbook_state_with_event_strict(
                 f"state_last_update_id={current_last_update_id} U={first_update_id} u={final_update_id}"
             )
     else:
-        if prev_final_update_id is not None and prev_final_update_id != current_last_update_id:
-            raise OrderbookResyncRequired(
-                "diff depth chain broken by pu mismatch (STRICT): "
-                f"symbol={sym} expected_pu={current_last_update_id} got_pu={prev_final_update_id}"
-            )
-        if first_update_id > bridge_update_id:
-            raise OrderbookResyncRequired(
-                "diff depth gap detected (STRICT): "
-                f"symbol={sym} expected_U<={bridge_update_id} got_U={first_update_id}"
-            )
+        if prev_final_update_id is not None:
+            if prev_final_update_id != current_last_update_id:
+                raise OrderbookResyncRequired(
+                    "diff depth chain broken by pu mismatch (STRICT): "
+                    f"symbol={sym} expected_pu={current_last_update_id} got_pu={prev_final_update_id}"
+                )
+            # IMPORTANT:
+            # stream_aligned=True 이후에는 pu == prev_u 가 authoritative 연속성 계약이다.
+            # 실계측상 U 가 prev_u + 2 이상으로 보이는 이벤트가 존재해도 pu 가 맞으면
+            # false-positive resync 를 일으키지 않도록 추가 U gap 체크를 하지 않는다.
+        else:
+            if first_update_id > bridge_update_id:
+                raise OrderbookResyncRequired(
+                    "diff depth gap detected without pu continuity proof (STRICT): "
+                    f"symbol={sym} expected_U<={bridge_update_id} got_U={first_update_id}"
+                )
 
     bids_map_raw = state.get("bids_map")
     asks_map_raw = state.get("asks_map")
