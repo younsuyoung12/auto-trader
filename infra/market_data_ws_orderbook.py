@@ -24,8 +24,8 @@ CHANGE HISTORY:
      protocol fatal 대신 local orderbook resync 로 전환
   2) FIX(RECOVERY): resync 진입 시 placeholder state + seed event 를 재구성하고
      stale orderbook buffer 를 즉시 제거하도록 수정
-  3) FIX(OPERABILITY): bootstrap 중 pending event 처리에서 재동기화 필요 이벤트를
-     fatal 처리하지 않고 bootstrap 종료 후 다음 live event 로 회복 가능하게 정리
+  3) FIX(RECOVERY): bootstrap 중 pending event 처리에서 재동기화 필요 이벤트가 나오면
+     stale unaligned snapshot 으로 종료하지 않고 placeholder 재구성 + bootstrap retry 로 전환
   4) FEAT(OBSERVABILITY): state.resync_reason / state.last_resync_ts 를 추가해
      watchdog / telemetry 에서 recovery 문맥을 추적 가능화
   5) FIX(ROOT-CAUSE): resync 시 REST bootstrap 을 동일 WS callback 스레드에서 동기 수행하지 않고
@@ -37,6 +37,10 @@ CHANGE HISTORY:
   8) FEAT(CONTRACT): state.last_local_apply_ts 를 추가해 orderbook snapshot 시각 계약을 상태에 명시 보존
   9) FIX(ROOT-CAUSE): stream_aligned=True 이후에는 U strict gap 보다 pu 연속성(pu == prev_u)을
      우선 authoritative chain 기준으로 사용하고, pu 가 없을 때만 U gap 계약을 적용
+  10) FIX(DB-LAG): depth diff 이벤트마다 DB snapshot 을 동기 저장하지 않고
+      latest snapshot coalescing + cadence persistence(기본 1초)로 축약
+  11) FIX(RECOVERY): stream_aligned=True 성공 시 resync_reason 을 즉시 제거해
+      feature/watchdog recovery_context 잔존 오탐을 방지
 ========================================================
 """
 
@@ -72,6 +76,15 @@ _ORDERBOOK_BOOTSTRAP_MAX_RETRIES: int = 3
 
 _ORDERBOOK_BOOTSTRAP_INFLIGHT: set[str] = set()
 _ORDERBOOK_BOOTSTRAP_INFLIGHT_LOCK = threading.Lock()
+
+# DB persist cadence:
+# - runtime memory/local book 가 authoritative source
+# - DB 는 orderbook "snapshot telemetry" 용도이므로 every diff write 금지
+# - latest snapshot 만 coalescing 하여 cadence 간격으로 저장한다
+_ORDERBOOK_DB_PERSIST_INTERVAL_MS: int = 1000
+_ORDERBOOK_DB_LAST_WRITE_MS: Dict[str, int] = {}
+_ORDERBOOK_DB_PENDING_SNAPSHOT: Dict[str, Dict[str, Any]] = {}
+_ORDERBOOK_DB_PERSIST_LOCK = threading.Lock()
 
 
 class OrderbookResyncRequired(RuntimeError):
@@ -164,6 +177,36 @@ def _compute_spread_pct(best_bid: float, best_ask: float) -> float:
     return (best_ask - best_bid) / mid
 
 
+def _make_orderbook_db_payload_strict(
+    *,
+    symbol: str,
+    event_ts_ms: int,
+    bids: List[List[float]],
+    asks: List[List[float]],
+) -> Dict[str, Any]:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("symbol is required for DB orderbook persist (STRICT)")
+    return {
+        "symbol": sym,
+        "event_ts_ms": int(_require_positive_int(event_ts_ms, "orderbook_db.event_ts_ms")),
+        "bids": list(bids),
+        "asks": list(asks),
+    }
+
+
+def _write_orderbook_snapshot_to_db_strict(payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        raise WSProtocolError("orderbook DB payload must be dict (STRICT)")
+
+    save_orderbook_from_ws(
+        symbol=str(payload["symbol"]),
+        ts_ms=int(payload["event_ts_ms"]),
+        bids=list(payload["bids"]),
+        asks=list(payload["asks"]),
+    )
+
+
 def _persist_ws_orderbook_snapshot_strict(
     *,
     symbol: str,
@@ -171,12 +214,65 @@ def _persist_ws_orderbook_snapshot_strict(
     bids: List[List[float]],
     asks: List[List[float]],
 ) -> None:
-    save_orderbook_from_ws(
+    """
+    STRICT policy 유지:
+    - runtime orderbook 는 메모리가 authoritative
+    - DB 는 snapshot cadence 저장
+    - every diff synchronous write 를 금지하고 latest snapshot only coalescing 한다
+    """
+    payload = _make_orderbook_db_payload_strict(
         symbol=symbol,
-        ts_ms=event_ts_ms,
+        event_ts_ms=event_ts_ms,
         bids=bids,
         asks=asks,
     )
+    sym = str(payload["symbol"])
+    now_ms = _now_ms()
+
+    with _ORDERBOOK_DB_PERSIST_LOCK:
+        last_write_ms = _ORDERBOOK_DB_LAST_WRITE_MS.get(sym)
+        if last_write_ms is not None:
+            elapsed_ms = now_ms - int(last_write_ms)
+            if elapsed_ms < _ORDERBOOK_DB_PERSIST_INTERVAL_MS:
+                # latest snapshot 으로 덮어쓴다. snapshot store 특성상 older snapshot 보존 불필요.
+                _ORDERBOOK_DB_PENDING_SNAPSHOT[sym] = payload
+                return
+
+        # cadence window 가 열렸으면 현재 payload 가 최신 authoritative snapshot 이다.
+        _ORDERBOOK_DB_PENDING_SNAPSHOT.pop(sym, None)
+
+    _write_orderbook_snapshot_to_db_strict(payload)
+
+    with _ORDERBOOK_DB_PERSIST_LOCK:
+        _ORDERBOOK_DB_LAST_WRITE_MS[sym] = now_ms
+
+
+def _flush_pending_orderbook_snapshot_if_due(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("symbol is required for pending DB flush (STRICT)")
+
+    payload: Optional[Dict[str, Any]] = None
+    now_ms = _now_ms()
+
+    with _ORDERBOOK_DB_PERSIST_LOCK:
+        pending = _ORDERBOOK_DB_PENDING_SNAPSHOT.get(sym)
+        if pending is None:
+            return
+
+        last_write_ms = _ORDERBOOK_DB_LAST_WRITE_MS.get(sym)
+        if last_write_ms is not None:
+            elapsed_ms = now_ms - int(last_write_ms)
+            if elapsed_ms < _ORDERBOOK_DB_PERSIST_INTERVAL_MS:
+                return
+
+        payload = dict(pending)
+        _ORDERBOOK_DB_PENDING_SNAPSHOT.pop(sym, None)
+
+    _write_orderbook_snapshot_to_db_strict(payload)
+
+    with _ORDERBOOK_DB_PERSIST_LOCK:
+        _ORDERBOOK_DB_LAST_WRITE_MS[sym] = now_ms
 
 
 def _build_orderbook_price_map_strict(levels: List[List[float]], *, name: str) -> Dict[float, float]:
@@ -335,6 +431,7 @@ def _replace_with_bootstrap_placeholder_locked(
     *,
     seed_event: Optional[Dict[str, Any]],
     reason: str,
+    carry_pending_events: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -343,6 +440,10 @@ def _replace_with_bootstrap_placeholder_locked(
     pending_events: List[Dict[str, Any]] = []
     if seed_event is not None:
         pending_events.append(dict(seed_event))
+    for item in list(carry_pending_events or []):
+        if not isinstance(item, dict):
+            raise WSProtocolError("carry_pending_events item must be dict (STRICT)")
+        pending_events.append(dict(item))
 
     _orderbook_book_state[sym] = _make_orderbook_bootstrap_placeholder_state(
         pending_events=pending_events,
@@ -556,7 +657,9 @@ def _advance_orderbook_state_with_event_strict(
         "asks_map": next_asks_map,
         "last_snapshot_recv_ts": int(snapshot_local_ts_ms),
         "pending_events": list(state.get("pending_events") or []),
-        "resync_reason": state.get("resync_reason"),
+        # IMPORTANT:
+        # 정상 chain 복구가 완료되면 resync_reason 은 즉시 제거한다.
+        "resync_reason": None,
         "last_resync_ts": state.get("last_resync_ts"),
     }
     snapshot = {
@@ -583,6 +686,10 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
     snapshot_payload = _rest_fetch_depth_snapshot_strict(sym, _ORDERBOOK_SNAPSHOT_LIMIT)
     state_from_snapshot, snapshot_view = _build_orderbook_state_from_snapshot_strict(sym, snapshot_payload)
 
+    last_ws_snapshot: Optional[Dict[str, Any]] = None
+    need_rebootstrap = False
+    rebootstrap_reason: Optional[str] = None
+
     with _orderbook_lock:
         placeholder = _orderbook_book_state.get(sym)
         if not isinstance(placeholder, dict) or not bool(placeholder.get("bootstrapping", False)):
@@ -602,7 +709,6 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
         _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
         _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
 
-        last_ws_snapshot: Optional[Dict[str, Any]] = None
         while True:
             pending = state.get("pending_events")
             if not isinstance(pending, list):
@@ -614,9 +720,14 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
             try:
                 transition = _advance_orderbook_state_with_event_strict(sym, state, event)
             except OrderbookResyncRequired as e:
-                log(
-                    f"[MD_BINANCE_WS][ORDERBOOK][BOOTSTRAP_PENDING_SKIP] "
-                    f"symbol={sym} reason={e}"
+                need_rebootstrap = True
+                rebootstrap_reason = str(e)
+                remaining_events = list(pending)
+                _replace_with_bootstrap_placeholder_locked(
+                    sym,
+                    seed_event=event,
+                    reason=rebootstrap_reason,
+                    carry_pending_events=remaining_events,
                 )
                 break
 
@@ -640,18 +751,24 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
             _orderbook_last_recv_ts[sym] = int(ws_snapshot["ts"])
             last_ws_snapshot = ws_snapshot
 
-        state["bootstrapping"] = False
-        _orderbook_book_state[sym] = state
+        if not need_rebootstrap:
+            state["bootstrapping"] = False
+            _orderbook_book_state[sym] = state
 
-        if last_ws_snapshot is not None:
-            _orderbook_buffers[sym] = dict(last_ws_snapshot)
-            _orderbook_last_update_id[sym] = int(last_ws_snapshot["lastUpdateId"])
-            _orderbook_last_recv_ts[sym] = int(last_ws_snapshot["ts"])
-        else:
-            snapshot_view["streamAligned"] = False
-            _orderbook_buffers[sym] = dict(snapshot_view)
-            _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
-            _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
+            if last_ws_snapshot is not None:
+                _orderbook_buffers[sym] = dict(last_ws_snapshot)
+                _orderbook_last_update_id[sym] = int(last_ws_snapshot["lastUpdateId"])
+                _orderbook_last_recv_ts[sym] = int(last_ws_snapshot["ts"])
+            else:
+                snapshot_view["streamAligned"] = False
+                _orderbook_buffers[sym] = dict(snapshot_view)
+                _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
+                _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
+
+    if need_rebootstrap:
+        if rebootstrap_reason is None:
+            raise WSProtocolError("rebootstrap_reason missing after bootstrap resync trigger (STRICT)")
+        raise OrderbookResyncRequired(rebootstrap_reason)
 
     if last_ws_snapshot is None:
         log(
@@ -800,7 +917,9 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
             _orderbook_buffers[sym] = dict(ob_snapshot)
             _orderbook_last_update_id[sym] = int(ob_snapshot["lastUpdateId"])
             _orderbook_last_recv_ts[sym] = int(ob_snapshot["ts"])
-            return
+
+    # lock 밖에서 cadence pending flush 시도
+    _flush_pending_orderbook_snapshot_if_due(sym)
 
     if need_resync:
         if resync_reason is None:
@@ -912,6 +1031,7 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
 __all__ = [
     "_make_orderbook_bootstrap_placeholder_state",
     "_bootstrap_orderbook_from_rest_snapshot_strict",
+    "_start_async_orderbook_bootstrap_if_needed",
     "_push_orderbook",
     "get_orderbook",
     "get_orderbook_buffer_status",

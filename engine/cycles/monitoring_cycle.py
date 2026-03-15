@@ -45,6 +45,11 @@ CHANGE HISTORY:
   8) FIX(OPERABILITY): recovery grace 경과 후에도 orderbook_fail 지속 시에만 SAFE_STOP 승격
   9) FEAT(OBSERVABILITY): recovery grace 시작/유지/해제 로그 추가
   10) FIX(RACE): watchdog snapshot.detail 의 orderbook recovery 메타를 우선 사용하도록 수정
+  11) FIX(OPERABILITY): db_lag 단일 스파이크로 즉시 SAFE_STOP 하지 않고
+      ws/orderbook 이 정상인 경우 짧은 recovery grace 를 허용
+  12) FEAT(OBSERVABILITY): db_lag recovery grace 시작/유지/만료 로그 추가
+  13) KEEP(RISK): db_lag grace 는 ws_overall_ok / orderbook_integrity_ok / orderbook_guard_level=OK
+      조건이 모두 만족할 때만 적용
 - 2026-03-13:
   1) ADD(MONITORING): infra.engine_watchdog 를 monitoring cycle 에 정식 연결
   2) ADD(CONTRACT): watchdog startup / snapshot freshness / fatal escalation 계약 추가
@@ -246,6 +251,7 @@ class MonitoringCycleConfig:
     watchdog_startup_grace_sec: float
     watchdog_snapshot_max_age_sec: float
     watchdog_orderbook_recovery_grace_sec: float
+    watchdog_db_lag_recovery_grace_sec: float
     drift_snapshot_max_age_sec: float
 
     def validate_or_raise(self) -> None:
@@ -280,6 +286,11 @@ class MonitoringCycleConfig:
             min_value=0.001,
         )
         _require_float(
+            self.watchdog_db_lag_recovery_grace_sec,
+            "config.watchdog_db_lag_recovery_grace_sec",
+            min_value=0.001,
+        )
+        _require_float(
             self.drift_snapshot_max_age_sec,
             "config.drift_snapshot_max_age_sec",
             min_value=0.001,
@@ -302,6 +313,10 @@ class MonitoringCycleState:
     watchdog_orderbook_recovery_grace_started_ts: float = 0.0
     watchdog_orderbook_recovery_last_log_ts: float = 0.0
     watchdog_orderbook_recovery_reason: Optional[str] = None
+
+    watchdog_db_lag_recovery_grace_started_ts: float = 0.0
+    watchdog_db_lag_recovery_last_log_ts: float = 0.0
+    watchdog_db_lag_recovery_reason: Optional[str] = None
 
     drift_last_snapshot_checked_at_ms: int = 0
     drift_snapshot_wait_logged: bool = False
@@ -339,6 +354,22 @@ class MonitoringCycleState:
             _require_nonempty_str(
                 self.watchdog_orderbook_recovery_reason,
                 "state.watchdog_orderbook_recovery_reason",
+            )
+
+        _require_float(
+            self.watchdog_db_lag_recovery_grace_started_ts,
+            "state.watchdog_db_lag_recovery_grace_started_ts",
+            min_value=0.0,
+        )
+        _require_float(
+            self.watchdog_db_lag_recovery_last_log_ts,
+            "state.watchdog_db_lag_recovery_last_log_ts",
+            min_value=0.0,
+        )
+        if self.watchdog_db_lag_recovery_reason is not None:
+            _require_nonempty_str(
+                self.watchdog_db_lag_recovery_reason,
+                "state.watchdog_db_lag_recovery_reason",
             )
 
         _require_int(
@@ -420,6 +451,7 @@ def build_monitoring_cycle_context_or_raise(
     startup_grace_sec = watchdog_interval_sec * 3.0
     snapshot_max_age_sec = watchdog_interval_sec * 3.0
     orderbook_recovery_grace_sec = max(15.0, watchdog_interval_sec * 4.0)
+    db_lag_recovery_grace_sec = max(10.0, watchdog_interval_sec * 4.0)
     drift_snapshot_max_age_sec = max(DEFAULT_DRIFT_SNAPSHOT_MAX_AGE_SEC, watchdog_interval_sec * 5.0)
 
     state = MonitoringCycleState()
@@ -445,6 +477,7 @@ def build_monitoring_cycle_context_or_raise(
             watchdog_startup_grace_sec=startup_grace_sec,
             watchdog_snapshot_max_age_sec=snapshot_max_age_sec,
             watchdog_orderbook_recovery_grace_sec=orderbook_recovery_grace_sec,
+            watchdog_db_lag_recovery_grace_sec=db_lag_recovery_grace_sec,
             drift_snapshot_max_age_sec=drift_snapshot_max_age_sec,
         ),
         state=state,
@@ -485,6 +518,12 @@ def _reset_watchdog_orderbook_recovery_grace_state(ctx: MonitoringCycleContext) 
     ctx.state.watchdog_orderbook_recovery_grace_started_ts = 0.0
     ctx.state.watchdog_orderbook_recovery_last_log_ts = 0.0
     ctx.state.watchdog_orderbook_recovery_reason = None
+
+
+def _reset_watchdog_db_lag_recovery_grace_state(ctx: MonitoringCycleContext) -> None:
+    ctx.state.watchdog_db_lag_recovery_grace_started_ts = 0.0
+    ctx.state.watchdog_db_lag_recovery_last_log_ts = 0.0
+    ctx.state.watchdog_db_lag_recovery_reason = None
 
 
 def _extract_watchdog_detail_recovery_context_strict(
@@ -635,6 +674,94 @@ def _maybe_tolerate_watchdog_orderbook_fail_or_raise(
         f"elapsed_sec={elapsed:.3f} grace_sec={ctx.config.watchdog_orderbook_recovery_grace_sec:.3f}"
     )
     _reset_watchdog_orderbook_recovery_grace_state(ctx)
+    return False
+
+
+def _maybe_tolerate_watchdog_db_lag_or_raise(
+    now_ts: float,
+    ctx: MonitoringCycleContext,
+    snapshot: WatchdogSnapshot,
+    fail_reason: str,
+) -> bool:
+    _require_float(now_ts, "now_ts", min_value=0.0)
+    reason = _require_nonempty_str(fail_reason, "fail_reason")
+
+    if reason != "db_lag":
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
+        return False
+
+    detail = _require_dict(snapshot.detail, "watchdog_snapshot.detail")
+
+    db_ok = _require_bool_key(detail, "db_ok", "watchdog_snapshot.detail")
+    db_ping_ms = _require_int(
+        _require_dict_key(detail, "db_ping_ms", "watchdog_snapshot.detail"),
+        "watchdog_snapshot.detail.db_ping_ms",
+        min_value=0,
+    )
+    max_db_ping_ms = _require_int(
+        _require_dict_key(detail, "max_db_ping_ms", "watchdog_snapshot.detail"),
+        "watchdog_snapshot.detail.max_db_ping_ms",
+        min_value=1,
+    )
+    ws_overall_ok = _require_bool_key(detail, "ws_overall_ok", "watchdog_snapshot.detail")
+    orderbook_integrity_ok = _require_bool_key(
+        detail,
+        "orderbook_integrity_ok",
+        "watchdog_snapshot.detail",
+    )
+    orderbook_guard_level = _require_nonempty_str(
+        _require_dict_key(detail, "orderbook_guard_level", "watchdog_snapshot.detail"),
+        "watchdog_snapshot.detail.orderbook_guard_level",
+    ).upper().strip()
+
+    if db_ok:
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
+        return False
+
+    if not ws_overall_ok:
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
+        return False
+
+    if not orderbook_integrity_ok:
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
+        return False
+
+    if orderbook_guard_level != "OK":
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
+        return False
+
+    if ctx.state.watchdog_db_lag_recovery_grace_started_ts == 0.0:
+        ctx.state.watchdog_db_lag_recovery_grace_started_ts = now_ts
+        ctx.state.watchdog_db_lag_recovery_last_log_ts = now_ts
+        ctx.state.watchdog_db_lag_recovery_reason = reason
+        log(
+            "[WATCHDOG][DB_LAG_GRACE][START] "
+            f"symbol={ctx.symbol} reason={reason} "
+            f"db_ping_ms={db_ping_ms} max_db_ping_ms={max_db_ping_ms} "
+            f"grace_sec={ctx.config.watchdog_db_lag_recovery_grace_sec:.3f}"
+        )
+        return True
+
+    elapsed = now_ts - ctx.state.watchdog_db_lag_recovery_grace_started_ts
+    if elapsed <= ctx.config.watchdog_db_lag_recovery_grace_sec:
+        last_log_elapsed = now_ts - ctx.state.watchdog_db_lag_recovery_last_log_ts
+        if last_log_elapsed >= 5.0:
+            ctx.state.watchdog_db_lag_recovery_last_log_ts = now_ts
+            log(
+                "[WATCHDOG][DB_LAG_GRACE][KEEP] "
+                f"symbol={ctx.symbol} reason={reason} "
+                f"db_ping_ms={db_ping_ms} max_db_ping_ms={max_db_ping_ms} "
+                f"elapsed_sec={elapsed:.3f}/{ctx.config.watchdog_db_lag_recovery_grace_sec:.3f}"
+            )
+        return True
+
+    log(
+        "[WATCHDOG][DB_LAG_GRACE][EXPIRED] "
+        f"symbol={ctx.symbol} reason={reason} "
+        f"db_ping_ms={db_ping_ms} max_db_ping_ms={max_db_ping_ms} "
+        f"elapsed_sec={elapsed:.3f} grace_sec={ctx.config.watchdog_db_lag_recovery_grace_sec:.3f}"
+    )
+    _reset_watchdog_db_lag_recovery_grace_state(ctx)
     return False
 
 
@@ -868,9 +995,12 @@ def _watchdog_guard_or_raise(
 
     if level == "OK":
         _reset_watchdog_orderbook_recovery_grace_state(ctx)
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
         return
 
     if level == "WARNING":
+        _reset_watchdog_orderbook_recovery_grace_state(ctx)
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
         warning_reason = snapshot.warning_reason
         if warning_reason is not None:
             _require_nonempty_str(warning_reason, "watchdog_snapshot.warning_reason")
@@ -887,7 +1017,15 @@ def _watchdog_guard_or_raise(
         reason = _require_nonempty_str(fail_reason, "watchdog_snapshot.fail_reason")
 
         if _maybe_tolerate_watchdog_orderbook_fail_or_raise(now_ts, ctx, snapshot, reason):
+            _reset_watchdog_db_lag_recovery_grace_state(ctx)
             return
+
+        if _maybe_tolerate_watchdog_db_lag_or_raise(now_ts, ctx, snapshot, reason):
+            _reset_watchdog_orderbook_recovery_grace_state(ctx)
+            return
+
+        _reset_watchdog_orderbook_recovery_grace_state(ctx)
+        _reset_watchdog_db_lag_recovery_grace_state(ctx)
 
         _request_safe_stop_or_raise(runtime, f"WATCHDOG_FAIL:{reason}")
         msg = (

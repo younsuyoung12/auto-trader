@@ -14,19 +14,20 @@ CORE RESPONSIBILITIES:
 - entry market_data build 수행
 - upstream engine_scores strict contract 검증
 - entry_flow 기반 strategy signal 생성
+- gpt_entry_filter 기반 최종 진입 veto 연결
 - legacy candidate 와 strategy signal 간 계약 정합성 검증
 - 다음 계층(risk_cycle)으로 전달할 pending entry packet 생성
 - entry skip / warning / contract violation 을 명시적으로 처리
 
 IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
-- entry cycle 은 market data build / signal build / candidate compatibility 검증만 담당한다
+- entry cycle 은 market data build / signal build / gpt veto / candidate compatibility 검증만 담당한다
 - risk sizing / execution submit 은 이 파일에서 수행하지 않는다
 - authoritative 5m entry gate 는 market_data build 성공 후에만 claim 한다
 - upstream engine_scores 의 단일 owner 는 unified_features_builder 출력이며 entry cycle 은 재계산하지 않는다
 - NO_SIGNAL / explicit SKIP 은 명시적 skip 으로 처리한다
 - hidden default / silent continue / 예외 삼키기 금지
-- entry_flow / common.exceptions_strict 를 정식 연결한다
+- entry_flow / gpt_entry_filter / common.exceptions_strict 를 정식 연결한다
 ============================================================
 
 CHANGE HISTORY:
@@ -40,6 +41,10 @@ CHANGE HISTORY:
   7) FIX(OPERABILITY): health snapshot fail_reason / warning_reason 키가 존재하지만 빈 문자열인 경우 fatal 처리하지 않고 무시하도록 조정
   8) FIX(ROOT-CAUSE): engine_scores 단일 owner 를 upstream unified_features_builder 로 고정하고 entry cycle 재계산 제거
   9) FIX(ARCH): market_data.market_features.engine_scores 는 구조/범위/entry_score 정합만 검증하고 local score_engine mismatch fatal 제거
+  10) ADD(GPT-VETO): strategy.gpt_entry_filter.apply_gpt_entry_filter_strict 정식 연결
+  11) ADD(CONTRACT): gpt_entry_* settings 필수 계약 추가
+  12) ADD(SAFE_STOP): GPT entry filter 실패 시 ENTRY_GPT_FILTER_ERROR safe stop 요청
+  13) FIX(STATE): GPT entry filter 가 실제 호출된 경우 last_entry_gpt_call_ts 즉시 반영
 - 2026-03-13
   1) ADD(SIGNAL-LAYER): strategy.entry_flow.build_entry_signal_strict 정식 연결
   2) ADD(CONTRACT): legacy candidate vs strategy signal action/direction strict 정합성 검증 추가
@@ -74,6 +79,12 @@ from strategy.engine_runtime_state import (
     claim_entry_signal_ts_or_skip,
 )
 from strategy.entry_flow import build_entry_signal_strict
+from strategy.gpt_entry_filter import (
+    GptEntryFilterConfigError,
+    GptEntryFilterContractError,
+    GptEntryFilterRuntimeError,
+    apply_gpt_entry_filter_strict,
+)
 from strategy.signal import Signal
 from engine.engine_loop import ENGINE_STATE_RUNNING, EngineLoopRuntime
 
@@ -172,6 +183,7 @@ class EntryCycleContext:
     build_entry_market_data_fn: Callable[..., Optional[Dict[str, Any]]] = _build_entry_market_data
     decide_entry_candidate_fn: Callable[[Dict[str, Any], Any], Any] = _decide_entry_candidate_strict
     build_entry_signal_fn: Callable[..., Signal] = build_entry_signal_strict
+    apply_gpt_entry_filter_fn: Callable[..., Signal] = apply_gpt_entry_filter_strict
 
     def validate_or_raise(self) -> None:
         _ = _normalize_symbol_strict(self.symbol, name="context.symbol")
@@ -188,6 +200,8 @@ class EntryCycleContext:
             raise EntryCycleContractError("context.decide_entry_candidate_fn is required (STRICT)")
         if not callable(self.build_entry_signal_fn):
             raise EntryCycleContractError("context.build_entry_signal_fn is required (STRICT)")
+        if not callable(self.apply_gpt_entry_filter_fn):
+            raise EntryCycleContractError("context.apply_gpt_entry_filter_fn is required (STRICT)")
 
         required_setting_names = (
             "entry_cooldown_sec",
@@ -200,6 +214,10 @@ class EntryCycleContext:
             "entry_max_spread_pct",
             "entry_min_trend_strength",
             "entry_min_abs_orderbook_imbalance",
+            "gpt_entry_enabled",
+            "gpt_entry_min_entry_score",
+            "gpt_entry_timeout_sec",
+            "gpt_entry_max_tokens",
         )
         for name in required_setting_names:
             if not hasattr(self.settings, name):
@@ -363,6 +381,18 @@ def run_entry_cycle_or_raise(
         ctx.settings,
         build_fn=ctx.build_entry_signal_fn,
     )
+    strategy_signal = _apply_gpt_entry_filter_stage_or_raise(
+        signal_features=signal_features,
+        strategy_signal=strategy_signal,
+        settings=ctx.settings,
+        engine_scores=engine_scores,
+        apply_fn=ctx.apply_gpt_entry_filter_fn,
+        runtime=runtime,
+        now_ts=now_f,
+    )
+
+    if _did_gpt_entry_filter_invoke_model_or_raise(strategy_signal):
+        ctx.state.last_entry_gpt_call_ts = now_f
 
     signal_action = _require_nonempty_str(strategy_signal.action, "strategy_signal.action").upper()
 
@@ -1205,6 +1235,101 @@ def _build_strategy_signal_stage_or_raise(
     _ = _require_float(signal.sl_pct, "strategy_signal.sl_pct", min_value=0.0)
 
     return signal
+
+
+def _apply_gpt_entry_filter_stage_or_raise(
+    *,
+    signal_features: Dict[str, Any],
+    strategy_signal: Signal,
+    settings: Any,
+    engine_scores: Dict[str, Any],
+    apply_fn: Callable[..., Signal],
+    runtime: EngineLoopRuntime,
+    now_ts: float,
+) -> Signal:
+    _ = _require_dict(signal_features, "signal_features")
+    _ = _require_dict(engine_scores, "engine_scores")
+    if settings is None:
+        raise EntryCycleContractError("settings is required for gpt entry filter (STRICT)")
+    if not isinstance(strategy_signal, Signal):
+        raise EntryCycleContractError(
+            f"strategy_signal must be Signal before gpt entry filter (STRICT), got={type(strategy_signal).__name__}"
+        )
+    if not callable(apply_fn):
+        raise EntryCycleContractError("apply_gpt_entry_filter_fn must be callable (STRICT)")
+
+    try:
+        filtered_signal = apply_fn(
+            features=signal_features,
+            strategy_signal=strategy_signal,
+            settings=settings,
+            engine_scores=engine_scores,
+        )
+    except (
+        GptEntryFilterConfigError,
+        GptEntryFilterContractError,
+        GptEntryFilterRuntimeError,
+    ) as e:
+        runtime.request_safe_stop("ENTRY_GPT_FILTER_ERROR", now_ts=now_ts)
+        raise EntryCycleError(
+            f"gpt entry filter failed (STRICT): {type(e).__name__}: {e}"
+        ) from e
+    except Exception as e:
+        runtime.request_safe_stop("ENTRY_GPT_FILTER_ERROR", now_ts=now_ts)
+        raise EntryCycleError(
+            f"gpt entry filter unexpected failure (STRICT): {type(e).__name__}: {e}"
+        ) from e
+
+    if not isinstance(filtered_signal, Signal):
+        raise EntryCycleContractError(
+            "apply_gpt_entry_filter_fn must return strategy.signal.Signal (STRICT)"
+        )
+
+    action = _require_nonempty_str(filtered_signal.action, "gpt_filtered_signal.action").upper()
+    direction = _require_nonempty_str(filtered_signal.direction, "gpt_filtered_signal.direction").upper()
+    if action not in ("ENTER", "SKIP"):
+        raise EntryCycleContractError(f"gpt_filtered_signal.action invalid (STRICT): {action!r}")
+    if direction not in ("LONG", "SHORT"):
+        raise EntryCycleContractError(f"gpt_filtered_signal.direction invalid (STRICT): {direction!r}")
+
+    _ = _require_nonempty_str(filtered_signal.reason, "gpt_filtered_signal.reason")
+    _ = _require_float(filtered_signal.risk_pct, "gpt_filtered_signal.risk_pct", min_value=0.0)
+    _ = _require_float(filtered_signal.tp_pct, "gpt_filtered_signal.tp_pct", min_value=0.0)
+    _ = _require_float(filtered_signal.sl_pct, "gpt_filtered_signal.sl_pct", min_value=0.0)
+
+    return filtered_signal
+
+
+def _did_gpt_entry_filter_invoke_model_or_raise(strategy_signal: Signal) -> bool:
+    if not isinstance(strategy_signal, Signal):
+        raise EntryCycleContractError("strategy_signal must be Signal (STRICT)")
+
+    meta = strategy_signal.meta
+    if not isinstance(meta, dict):
+        raise EntryCycleContractError("strategy_signal.meta must be dict (STRICT)")
+
+    if "gpt_entry_filter" not in meta:
+        return False
+
+    raw = meta["gpt_entry_filter"]
+    info = _require_dict(raw, "strategy_signal.meta.gpt_entry_filter")
+
+    enabled_raw = _optional_mapping_value(info, "enabled")
+    if enabled_raw is not None:
+        enabled = _require_bool(enabled_raw, "strategy_signal.meta.gpt_entry_filter.enabled")
+        if not enabled:
+            return False
+
+    status_raw = _optional_mapping_value(info, "status")
+    if status_raw is None:
+        return True
+    if not isinstance(status_raw, str):
+        raise EntryCycleContractError("strategy_signal.meta.gpt_entry_filter.status must be str (STRICT)")
+
+    status = status_raw.strip().upper()
+    if status in ("DISABLED", "BYPASS"):
+        return False
+    return True
 
 
 def _validate_candidate_vs_strategy_signal_or_raise(

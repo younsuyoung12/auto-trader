@@ -144,7 +144,7 @@ _TOTAL_WEIGHTS: Dict[str, float] = {
     "volume_regime": 0.08,
     "liquidity_regime": 0.05,
     "volume_profile_regime": 0.10,
-    "orderflow_regime": 0.12,
+    "orderflow_regime": 0.20,
     "options_regime": 0.05,
 }
 

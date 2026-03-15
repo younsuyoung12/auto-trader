@@ -12,6 +12,10 @@ CHANGE HISTORY:
   1) FIX(RECOVERY): reconnect / close / transport exception 시 last-good orderbook snapshot 즉시 삭제 제거
   2) FIX(OPERABILITY): recoverable WS 재연결 동안 stale snapshot을 health/monitoring이 관측할 수 있도록 유지
   3) FIX(ARCH): stale orderbook cleanup 책임을 close path가 아닌 next on_open bootstrap path 로 일원화
+  4) FIX(ROOT-CAUSE): _on_open 에서 orderbook REST bootstrap 을 동기 수행하지 않고
+     placeholder 세팅 후 WS OPEN 상태를 먼저 반영한 뒤 background bootstrap worker 로 분리
+  5) FIX(RECOVERY): on_open 직후 들어오는 diff-depth 이벤트가 bootstrapping placeholder.pending_events 로
+     적재될 수 있도록 open path 를 non-blocking 으로 변경
 - 2026-03-14:
   1) REFACTOR(ROOT-CAUSE): WS transport / kline / orderbook / health 책임을 내부 모듈로 분리
   2) FIX(CONTRACT): orderbook stream contract 를 depth5@100ms 에서 diff-depth @depth@100ms 로 교정
@@ -46,9 +50,9 @@ from .market_data_ws_kline import (
     preload_klines,
 )
 from .market_data_ws_orderbook import (
-    _bootstrap_orderbook_from_rest_snapshot_strict,
     _make_orderbook_bootstrap_placeholder_state,
     _push_orderbook,
+    _start_async_orderbook_bootstrap_if_needed,
     get_orderbook,
     get_orderbook_buffer_status,
 )
@@ -217,9 +221,8 @@ def _on_close(symbol: str, ws: websocket.WebSocketApp, code: Any, msg: Any) -> N
 
 
 def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
-    _ = ws
-    streams = _build_stream_names(symbol)
     sym = _normalize_symbol(symbol)
+    streams = _build_stream_names(symbol)
 
     # IMPORTANT:
     # stale orderbook cleanup 는 next on_open bootstrap path 에서만 수행한다.
@@ -227,18 +230,22 @@ def _on_open(symbol: str, ws: websocket.WebSocketApp) -> None:
     _clear_orderbook_runtime_state(sym)
 
     with _orderbook_lock:
-        _orderbook_book_state[sym] = _make_orderbook_bootstrap_placeholder_state()
+        _orderbook_book_state[sym] = _make_orderbook_bootstrap_placeholder_state(reason="startup")
 
     try:
-        _bootstrap_orderbook_from_rest_snapshot_strict(sym)
+        # IMPORTANT:
+        # on_open 에서 REST bootstrap 을 동기 수행하면 websocket read loop 가 늦게 시작되어
+        # 첫 diff-depth 이벤트를 pending queue 에 쌓지 못한다.
+        # 반드시 OPEN 상태를 먼저 반영하고 background bootstrap worker 로 넘긴다.
         _mark_ws_open(sym, _now_ms())
         _reset_ws_circuit_breaker_on_open(sym)
+        _start_async_orderbook_bootstrap_if_needed(sym, reason="startup")
         log(f"[MD_BINANCE_WS] opened: symbol={sym} streams={streams}")
     except Exception as e:
-        _record_ws_circuit_breaker_failure(sym, reason=f"orderbook_snapshot_bootstrap:{type(e).__name__}")
-        _mark_ws_error(sym, f"orderbook_snapshot_bootstrap:{type(e).__name__}:{e}")
-        log(f"[MD_BINANCE_WS] on_open bootstrap failed: {type(e).__name__}: {e}")
-        _close_ws_with_log(ws, context=f"on_open_bootstrap_failed symbol={sym}")
+        _record_ws_circuit_breaker_failure(sym, reason=f"orderbook_bootstrap_start:{type(e).__name__}")
+        _mark_ws_error(sym, f"orderbook_bootstrap_start:{type(e).__name__}:{e}")
+        log(f"[MD_BINANCE_WS] on_open bootstrap start failed: {type(e).__name__}: {e}")
+        _close_ws_with_log(ws, context=f"on_open_bootstrap_start_failed symbol={sym}")
 
 
 def _on_pong(symbol: str, ws: websocket.WebSocketApp, data: Any) -> None:

@@ -26,6 +26,11 @@ IMPORTANT POLICY:
 - load_settings() 는 동일 런타임에서 항상 동일 singleton 을 반환해야 한다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(SSOT): entry_cycle.py 가 직접 참조하는 engine_loop_tick_sec 정식 승격
+  2) FEAT(SSOT): GPT entry filter 설정(gpt_entry_enabled / gpt_entry_min_entry_score / gpt_entry_timeout_sec / gpt_entry_max_tokens) 정식 승격
+  3) FIX(STRICT): GPT entry filter / engine loop tick 설정 검증 추가
+  4) FIX(COMPAT): GPT_ENTRY_* / ENGINE_LOOP_TICK_SEC uppercase alias 접근 호환성 추가
 - 2026-03-11:
   1) FIX(SSOT): load_settings() 재호출 시 새 객체를 만들지 않고 singleton 반환으로 고정
   2) FIX(STRICT): futures_position_mode 가 ONEWAY 인지 settings 단계에서 즉시 검증
@@ -101,6 +106,12 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "OPENAI_TRADER_MAX_LATENCY_SEC": "openai_max_latency_sec",
     "OPENAI_TRADER_MAX_LATENCY": "openai_max_latency_sec",
 
+    # GPT entry filter
+    "GPT_ENTRY_ENABLED": "gpt_entry_enabled",
+    "GPT_ENTRY_MIN_ENTRY_SCORE": "gpt_entry_min_entry_score",
+    "GPT_ENTRY_TIMEOUT_SEC": "gpt_entry_timeout_sec",
+    "GPT_ENTRY_MAX_TOKENS": "gpt_entry_max_tokens",
+
     # External intelligence
     "ALPHAVANTAGE_API_KEY": "alphavantage_api_key",
 
@@ -119,6 +130,9 @@ _SETTINGS_ALIAS_MAP: Dict[str, str] = {
     "WS_PONG_MAX_DELAY_SEC": "ws_pong_max_delay_sec",
     "WS_PONG_STARTUP_GRACE_SEC": "ws_pong_startup_grace_sec",
     "PREFLIGHT_WS_WAIT_SEC": "preflight_ws_wait_sec",
+
+    # Engine loop
+    "ENGINE_LOOP_TICK_SEC": "engine_loop_tick_sec",
 
     # Entry
     "ENTRY_SCORE_THRESHOLD": "entry_score_threshold",
@@ -231,7 +245,7 @@ class Settings:
     allocation_ratio: float = 0.35
     risk_pct: float = 0.35
     max_risk_pct: float = 1.0
-    
+
     # Default TP/SL
     tp_pct: float = 0.006
     sl_pct: float = 0.003
@@ -258,6 +272,11 @@ class Settings:
     gpt_min_confidence: float = 0.6
     gpt_reject_if_over_pnl_pct: float = 0.02
 
+    # GPT entry filter
+    gpt_entry_enabled: bool = True
+    gpt_entry_min_entry_score: float = 0.65
+    gpt_entry_timeout_sec: float = 8.0
+    gpt_entry_max_tokens: int = 700
     # OpenAI (Trader engine)
     openai_api_key: str = ""
     openai_model: str = ""
@@ -366,6 +385,7 @@ class Settings:
     # Operations / runtime safety
     sigterm_grace_sec: int = 30
     allow_start_without_leverage_setup: bool = False
+    engine_loop_tick_sec: float = 0.25
 
     # 운영 파라미터
     async_worker_threads: int = 1
@@ -375,7 +395,7 @@ class Settings:
     force_close_on_desync: bool = False
     max_signal_latency_ms: int = 200
     max_exec_latency_ms: int = 2500
-    
+
     # =========================
     # META STRATEGY SETTINGS
     # =========================
@@ -383,7 +403,7 @@ class Settings:
     exit_supervisor_cooldown_sec: float = 180.0
 
     meta_max_rationale_sentences: int = 3
-    meta_max_rationale_len: int = 800 
+    meta_max_rationale_len: int = 800
 
     # run_bot_ws
     position_resync_sec: float = 20.0
@@ -984,6 +1004,8 @@ def _validate_settings(s: Settings) -> None:
         raise ValueError("slippage_block_pct must be <= 1.0 (fraction)")
     if s.sigterm_grace_sec <= 0:
         raise ValueError("sigterm_grace_sec must be > 0")
+    if s.engine_loop_tick_sec <= 0:
+        raise ValueError("engine_loop_tick_sec must be > 0")
 
     if s.async_worker_threads < 1:
         raise ValueError("async_worker_threads must be >= 1")
@@ -1067,6 +1089,19 @@ def _validate_settings(s: Settings) -> None:
 
     if not isinstance(s.require_deterministic_client_order_id, bool):
         raise ValueError("require_deterministic_client_order_id must be bool")
+
+    if not isinstance(s.gpt_entry_enabled, bool):
+        raise ValueError("gpt_entry_enabled must be bool")
+    if not (0.0 <= float(s.gpt_entry_min_entry_score) <= 1.0):
+        raise ValueError("gpt_entry_min_entry_score must be within 0..1")
+    if not (
+        isinstance(s.gpt_entry_timeout_sec, (int, float))
+        and math.isfinite(float(s.gpt_entry_timeout_sec))
+        and float(s.gpt_entry_timeout_sec) > 0
+    ):
+        raise ValueError("gpt_entry_timeout_sec must be finite > 0")
+    if not (1 <= int(s.gpt_entry_max_tokens) <= 4096):
+        raise ValueError("gpt_entry_max_tokens must be within 1..4096")
 
     if not (isinstance(s.entry_fill_wait_sec, (int, float)) and math.isfinite(float(s.entry_fill_wait_sec))):
         raise ValueError("entry_fill_wait_sec must be finite number")
@@ -1340,6 +1375,11 @@ def _build_settings() -> Settings:
     gpt_min_confidence = _as_float("GPT_MIN_CONFIDENCE", 0.6)
     gpt_reject_if_over_pnl_pct = _as_float("GPT_REJECT_IF_OVER_PNL_PCT", 0.02)
 
+    gpt_entry_enabled = _as_bool("GPT_ENTRY_ENABLED", False)
+    gpt_entry_min_entry_score = _as_float("GPT_ENTRY_MIN_ENTRY_SCORE", 0.70)
+    gpt_entry_timeout_sec = _as_float("GPT_ENTRY_TIMEOUT_SEC", 8.0)
+    gpt_entry_max_tokens = _as_int("GPT_ENTRY_MAX_TOKENS", 700)
+
     openai_api_key = _as_str("OPENAI_API_KEY", "")
     alphavantage_api_key = _as_str("ALPHAVANTAGE_API_KEY", "")
     trader_openai = _load_trader_openai_settings()
@@ -1386,7 +1426,7 @@ def _build_settings() -> Settings:
     ws_max_kline_delay_sec = _as_float("WS_MAX_KLINE_DELAY_SEC", 120.0)
     ws_market_event_max_delay_sec = _resolve_float_env(
         ["WS_MARKET_EVENT_MAX_DELAY_SEC", "WS_ORDERBOOK_MAX_DELAY_SEC"],
-        default= 60.0,
+        default=60.0,
         label="ws_market_event_max_delay_sec",
     )
     ws_bootstrap_rest_enabled = _as_bool("WS_BOOTSTRAP_REST_ENABLED", True)
@@ -1439,6 +1479,7 @@ def _build_settings() -> Settings:
 
     sigterm_grace_sec = _as_int("SIGTERM_GRACE_SEC", 30)
     allow_start_without_leverage_setup = _as_bool("ALLOW_START_WITHOUT_LEVERAGE_SETUP", False)
+    engine_loop_tick_sec = _as_float("ENGINE_LOOP_TICK_SEC", 0.25)
 
     async_worker_threads = _as_int("ASYNC_WORKER_THREADS", 1)
     async_worker_queue_size = _as_int("ASYNC_WORKER_QUEUE_SIZE", 2000)
@@ -1582,6 +1623,10 @@ def _build_settings() -> Settings:
         gpt_max_risk_pct=gpt_max_risk_pct,
         gpt_min_confidence=gpt_min_confidence,
         gpt_reject_if_over_pnl_pct=gpt_reject_if_over_pnl_pct,
+        gpt_entry_enabled=gpt_entry_enabled,
+        gpt_entry_min_entry_score=gpt_entry_min_entry_score,
+        gpt_entry_timeout_sec=gpt_entry_timeout_sec,
+        gpt_entry_max_tokens=gpt_entry_max_tokens,
         openai_api_key=openai_api_key,
         openai_model=openai_model,
         openai_max_tokens=openai_max_tokens,
@@ -1658,6 +1703,7 @@ def _build_settings() -> Settings:
         krw_per_usdt=krw_per_usdt,
         sigterm_grace_sec=sigterm_grace_sec,
         allow_start_without_leverage_setup=allow_start_without_leverage_setup,
+        engine_loop_tick_sec=engine_loop_tick_sec,
         async_worker_threads=async_worker_threads,
         async_worker_queue_size=async_worker_queue_size,
         reconcile_interval_sec=reconcile_interval_sec,

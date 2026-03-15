@@ -101,7 +101,7 @@ _IDEMPOTENCY_CACHE_TTL_SEC: int = 6 * 3600  # 6 hours
 _IDEMPOTENCY_INFLIGHT_WAIT_SEC: float = 2.0  # wait window for concurrent same clientOrderId
 
 # Protection order verification
-_PROTECTION_VERIFY_WAIT_SEC: float = 3.0
+_PROTECTION_VERIFY_WAIT_SEC: float = 10.0
 _PROTECTION_VERIFY_POLL_SEC: float = 0.2
 _PROTECTION_CANCEL_WAIT_SEC: float = 3.0
 _PROTECTION_CANCEL_POLL_SEC: float = 0.2

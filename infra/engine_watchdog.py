@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+# infra/engine_watchdog.py
 """
 ========================================================
 FILE: infra/engine_watchdog.py
@@ -28,6 +30,8 @@ IMPORTANT POLICY:
 - orderbook reconnect / resync / bootstrapping 은 recoverable window 로 취급해야 한다
 - watchdog 는 orderbook recovery 판단을 자체 재구현하지 않고
   health snapshot.orderbook.recovery_context 계약을 그대로 따른다
+- db_lag 는 이벤트/스냅샷에는 FAIL 로 남기되, 즉시 on_fatal 콜백으로 SAFE_STOP 하지 않는다
+  (grace / escalation 판단은 monitoring cycle 이 수행한다)
 
 CHANGE HISTORY:
 - 2026-03-15:
@@ -37,6 +41,9 @@ CHANGE HISTORY:
   4) FIX(OPERABILITY): recoverable orderbook recovery window 에서는 on_fatal 콜백 호출 금지
   5) FEAT(OBSERVABILITY): orderbook_guard_level / orderbook_guard_warning_reason /
      orderbook_recovery_context / orderbook_recovery_context_reason detail 추가
+  6) FIX(OPERABILITY): db_lag 는 FAIL 이벤트로 기록하되 on_fatal 즉시 호출은 억제하고
+     monitoring cycle 의 recovery grace / 최종 escalation 에 위임
+  7) FEAT(OBSERVABILITY): fatal_callback_allowed / fatal_callback_suppressed_reason detail 추가
 - 2026-03-13:
   1) FIX(STRICT): ws health snapshot parsing 에서 dict.get(..., default) 제거
   2) FIX(OBSERVABILITY): ws_min_kline_buffer 실제 관측 반영(limit=min_buf)
@@ -291,6 +298,20 @@ def _extract_orderbook_recovery_state_strict(orderbook_snapshot: Dict[str, Any])
             )
 
     return recovery_context, recovery_context_reason
+
+
+def _should_call_on_fatal_strict(
+    *,
+    level: WatchdogLevel,
+    fail_reason: Optional[str],
+) -> Tuple[bool, Optional[str]]:
+    if level != "FAIL":
+        return False, None
+    if fail_reason is None:
+        raise RuntimeError("fail_reason is required when level=FAIL (STRICT)")
+    if fail_reason == "db_lag":
+        return False, "db_lag_delegated_to_monitoring_cycle"
+    return True, None
 
 
 # =============================================================================
@@ -653,6 +674,13 @@ def start_watchdog(
                 else:
                     level = "OK"
 
+                fatal_callback_allowed, fatal_callback_suppressed_reason = _should_call_on_fatal_strict(
+                    level=level,
+                    fail_reason=fail_reason,
+                )
+                detail["fatal_callback_allowed"] = bool(fatal_callback_allowed)
+                detail["fatal_callback_suppressed_reason"] = fatal_callback_suppressed_reason
+
                 ws_transport_ok = _require_bool(
                     _require_key(ws_dict, "transport_ok", "health_snapshot.ws"),
                     "health_snapshot.ws.transport_ok",
@@ -692,8 +720,12 @@ def start_watchdog(
 
                 reason = "ok"
                 if level == "FAIL":
+                    if fail_reason is None:
+                        raise RuntimeError("fail_reason missing when level=FAIL (STRICT)")
                     reason = str(fail_reason)
                 elif level == "WARNING":
+                    if warning_reason is None:
+                        raise RuntimeError("warning_reason missing when level=WARNING (STRICT)")
                     reason = str(warning_reason)
 
                 key = (
@@ -708,7 +740,9 @@ def start_watchdog(
                 if _should_emit(key, min_interval_sec=emit_min_sec):
                     _safe_event(sym, reason, detail)
 
-                if level == "FAIL" and on_fatal is not None:
+                if level == "FAIL" and on_fatal is not None and fatal_callback_allowed:
+                    if fail_reason is None:
+                        raise RuntimeError("fail_reason missing before on_fatal callback (STRICT)")
                     on_fatal(str(fail_reason), dict(detail))
 
                 stop_evt.wait(timeout=float(interval_sec))

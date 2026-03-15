@@ -31,8 +31,13 @@ IMPORTANT POLICY:
 - 단, 거래소가 명시적으로 "주문 자체를 거절"한 비치명 사유는 시스템 치명 오류로 승격하지 않는다
 - 현재 비치명 주문 거절로 허용하는 케이스는 Binance code=-2019 (Margin is insufficient) 뿐이다
 - state_writer / execution_quality_engine 연결 실패는 즉시 예외 처리한다
+- explicit qty path 에서는 qty 가 execution authoritative 값이며, risk_pct 는 persistence/audit 계약으로 별도 강제한다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(ROOT-CAUSE): explicit qty path impossible 계약 제거
+  2) FIX(CONTRACT): explicit qty path 에서는 qty+risk_pct 동시 입력을 허용하고, qty 를 execution authoritative 값으로 사용
+  3) FIX(STATE): explicit qty path 에서도 state_writer risk_pct 필수 계약을 유지하도록 risk_pct 필수화
 - 2026-03-14:
   1) FIX(ARCH): common.strict_validators 공통 STRICT 검증 프리미티브를 Execution Layer에 연결
   2) FIX(CONSISTENCY): symbol/float/bool/mapping 검증을 프로젝트 공통 계약과 정합화
@@ -814,13 +819,12 @@ def _normalize_entry_request_strict(signal: Any, settings: Any) -> EntryExecutio
         required=False,
     )
 
-    if explicit_qty is not None and risk_pct is not None:
-        raise OrderExecutionError("qty and risk_pct cannot both be provided (STRICT)")
-
     if explicit_qty is not None:
         qty = explicit_qty
         if risk_pct is None:
-            raise OrderExecutionError("explicit qty path still requires risk_pct contract (STRICT)")
+            raise OrderExecutionError(
+                "explicit qty path requires risk_pct for persistence/audit (STRICT)"
+            )
     else:
         if risk_pct is None:
             raise OrderExecutionError("qty missing and risk_pct missing (STRICT)")

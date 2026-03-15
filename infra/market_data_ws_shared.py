@@ -13,6 +13,12 @@ IMPORTANT POLICY:
 - 환경변수 직접 접근 금지, settings.py(SSOT)만 사용
 - 공용 상태는 이 파일에서만 선언한다
 - 하위 모듈은 공용 상태를 직접 임의 생성하지 않는다
+
+CHANGE HISTORY:
+- 2026-03-15:
+  1) KEEP(CONTRACT): orderbook stream contract 는 diff-depth parser(U/u/pu)와 일치하도록
+     @depth@100ms 를 유지한다
+  2) NOTE(GUARD): parser/storage contract 동시 교체 없이 @depth5@100ms 로 변경 금지
 ========================================================
 """
 
@@ -565,8 +571,9 @@ def _build_stream_names(symbol: str) -> List[str]:
     for iv in WS_INTERVALS:
         streams.append(f"{s}@kline_{iv}")
 
-    # CONTRACT FIX (2026-03-14)
-    # orderbook parser is U/u/pu diff-depth based. stream contract must match parser contract.
+    # IMPORTANT:
+    # current orderbook parser/storage contract is diff-depth(U/u/pu) based.
+    # do not change this to depth5@100ms unless parser + state machine + storage contract are replaced together.
     streams.append(f"{s}@depth@100ms")
     return streams
 
