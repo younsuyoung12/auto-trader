@@ -33,6 +33,7 @@ CHANGE HISTORY:
   3) FIX(STATE): 외부 종료 요청(SIGTERM / watchdog / telegram / reconcile)은 runtime.request_safe_stop 또는 pre-runtime SIGTERM 상태로만 반영
   4) FIX(BOOT): watchdog 시작 시점을 runtime 생성 이후로 이동
   5) FIX(RELIABILITY): main() 시작 시 런타임 전역 상태 초기화 강화
+  6) FIX(CONTRACT): _request_safe_stop() 가 EngineLoopRuntime.request_safe_stop(now_ts=...) 계약을 따르도록 수정
 - 2026-03-14:
   1) FEAT(WIRING): position_supervisor 를 main runtime 에 정식 연결
   2) FEAT(WIRING): reconciliation_cycle_fn 을 engine_loop 신규 시그니처에 맞게 연결
@@ -263,7 +264,7 @@ def _request_safe_stop(runtime: EngineLoopRuntime, *, reason: str) -> None:
     if not isinstance(runtime, EngineLoopRuntime):
         raise RuntimeError(f"runtime must be EngineLoopRuntime (STRICT), got={type(runtime).__name__}")
     reason_s = _require_nonempty_str(reason, "reason")
-    runtime.request_safe_stop(reason_s, time.time())
+    runtime.request_safe_stop(reason_s, now_ts=time.time())
 
 
 def _request_safe_stop_via_runtime_or_sigterm(*, reason: str) -> None:

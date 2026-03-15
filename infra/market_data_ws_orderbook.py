@@ -15,6 +15,8 @@ IMPORTANT POLICY:
   "로컬 북 재동기화(resync)"를 우선 수행한다
 - REST snapshot 과 WS diff 간 타이밍 차이로 발생하는 초기 gap은
   운영상 정상 시나리오로 취급하며 self-heal 해야 한다
+- public orderbook snapshot.ts 는 로컬 적용 시각(local apply ts)으로 일관되게 유지한다
+- exchange event 시각은 exchTs 로 별도 보존한다
 
 CHANGE HISTORY:
 - 2026-03-15:
@@ -30,6 +32,9 @@ CHANGE HISTORY:
      background bootstrap worker 로 분리
   6) FIX(RECOVERY): bootstrap worker 실행 중 들어오는 diff-depth 이벤트를 placeholder pending queue 에
      적재할 수 있도록 구조 보강
+  7) FIX(ROOT-CAUSE): public orderbook snapshot.ts 를 REST/WS 공통 local apply ts 로 통일하고
+     exchTs 는 exchange event ts 로 분리 유지해 reconnect 직후 timestamp rollback 오탐 제거
+  8) FEAT(CONTRACT): state.last_local_apply_ts 를 추가해 orderbook snapshot 시각 계약을 상태에 명시 보존
 ========================================================
 """
 
@@ -82,6 +87,7 @@ def _make_orderbook_bootstrap_placeholder_state(
         "stream_aligned": False,
         "snapshot_last_update_id": None,
         "last_update_id": None,
+        "last_local_apply_ts": None,
         "bids_map": {},
         "asks_map": {},
         "last_snapshot_recv_ts": None,
@@ -112,8 +118,12 @@ def _normalize_depth_side_strict(
             continue
 
         if isinstance(row, dict):
-            p = _require_float(row.get("price"), f"{name}[{i}].price")
-            q = _require_float(row.get("qty"), f"{name}[{i}].qty", allow_zero=allow_zero_qty)
+            if "price" not in row:
+                raise WSProtocolError(f"{name}[{i}].price missing (STRICT)")
+            if "qty" not in row:
+                raise WSProtocolError(f"{name}[{i}].qty missing (STRICT)")
+            p = _require_float(row["price"], f"{name}[{i}].price")
+            q = _require_float(row["qty"], f"{name}[{i}].qty", allow_zero=allow_zero_qty)
             out.append([p, q])
             continue
 
@@ -304,7 +314,9 @@ def _queue_orderbook_pending_event_locked(symbol: str, state: Dict[str, Any], ev
     if not isinstance(state, dict):
         raise WSProtocolError("orderbook state must be dict for pending queue (STRICT)")
 
-    pending = state.get("pending_events")
+    if "pending_events" not in state:
+        raise WSProtocolError("orderbook_state.pending_events missing (STRICT)")
+    pending = state["pending_events"]
     if not isinstance(pending, list):
         raise WSProtocolError("orderbook_state.pending_events must be list (STRICT)")
 
@@ -339,6 +351,28 @@ def _replace_with_bootstrap_placeholder_locked(
     _orderbook_last_recv_ts.pop(sym, None)
 
 
+def _resolve_snapshot_local_ts_ms_strict(
+    *,
+    now_ms: int,
+    previous_local_ts_ms: Optional[int],
+    owner_name: str,
+) -> int:
+    current_local_ts_ms = _require_positive_int(now_ms, f"{owner_name}.now_ms")
+    if previous_local_ts_ms is None:
+        return int(current_local_ts_ms)
+
+    previous_local_ts_ms_i = _require_positive_int(
+        previous_local_ts_ms,
+        f"{owner_name}.previous_local_ts_ms",
+    )
+    if current_local_ts_ms < previous_local_ts_ms_i:
+        raise WSProtocolError(
+            f"{owner_name} local apply ts rollback detected (STRICT): "
+            f"prev={previous_local_ts_ms_i} now={current_local_ts_ms}"
+        )
+    return int(current_local_ts_ms)
+
+
 def _build_orderbook_state_from_snapshot_strict(
     symbol: str,
     snapshot_payload: Dict[str, Any],
@@ -369,7 +403,11 @@ def _build_orderbook_state_from_snapshot_strict(
         asks_map,
     )
 
-    now_ms = _now_ms()
+    snapshot_local_ts_ms = _resolve_snapshot_local_ts_ms_strict(
+        now_ms=_now_ms(),
+        previous_local_ts_ms=None,
+        owner_name=f"orderbook_bootstrap[{sym}]",
+    )
 
     state = {
         "ready": True,
@@ -377,9 +415,10 @@ def _build_orderbook_state_from_snapshot_strict(
         "stream_aligned": False,
         "snapshot_last_update_id": int(last_update_id),
         "last_update_id": int(last_update_id),
+        "last_local_apply_ts": int(snapshot_local_ts_ms),
         "bids_map": bids_map,
         "asks_map": asks_map,
-        "last_snapshot_recv_ts": now_ms,
+        "last_snapshot_recv_ts": int(snapshot_local_ts_ms),
         "pending_events": [],
         "resync_reason": None,
         "last_resync_ts": None,
@@ -387,7 +426,7 @@ def _build_orderbook_state_from_snapshot_strict(
     snapshot = {
         "bids": bids_top,
         "asks": asks_top,
-        "ts": now_ms,
+        "ts": int(snapshot_local_ts_ms),
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spreadPct": spread_pct,
@@ -413,7 +452,9 @@ def _advance_orderbook_state_with_event_strict(
     if not isinstance(event, dict):
         raise WSProtocolError("orderbook diff event must be dict (STRICT)")
 
-    ready = bool(state.get("ready", False))
+    if "ready" not in state:
+        raise WSProtocolError("orderbook_state.ready missing (STRICT)")
+    ready = bool(state["ready"])
     if not ready:
         raise WSProtocolError("orderbook state not ready for diff advance (STRICT)")
 
@@ -425,7 +466,18 @@ def _advance_orderbook_state_with_event_strict(
         state.get("snapshot_last_update_id"),
         "orderbook_state.snapshot_last_update_id",
     )
-    stream_aligned = bool(state.get("stream_aligned", False))
+
+    if "stream_aligned" not in state:
+        raise WSProtocolError("orderbook_state.stream_aligned missing (STRICT)")
+    stream_aligned = bool(state["stream_aligned"])
+
+    previous_local_apply_ts_raw = state.get("last_local_apply_ts")
+    previous_local_apply_ts: Optional[int] = None
+    if previous_local_apply_ts_raw is not None:
+        previous_local_apply_ts = _require_positive_int(
+            previous_local_apply_ts_raw,
+            "orderbook_state.last_local_apply_ts",
+        )
 
     first_update_id = _require_positive_int(event.get("U"), "orderbook_event.U")
     final_update_id = _require_positive_int(event.get("u"), "orderbook_event.u")
@@ -477,15 +529,23 @@ def _advance_orderbook_state_with_event_strict(
         next_asks_map,
     )
 
+    snapshot_local_ts_ms = _resolve_snapshot_local_ts_ms_strict(
+        now_ms=_now_ms(),
+        previous_local_ts_ms=previous_local_apply_ts,
+        owner_name=f"orderbook_state[{sym}]",
+    )
+    event_ts_ms = _require_positive_int(event.get("event_ts_ms"), "orderbook_event.event_ts_ms")
+
     next_state = {
         "ready": True,
         "bootstrapping": bool(state.get("bootstrapping", False)),
         "stream_aligned": True,
         "snapshot_last_update_id": int(snapshot_last_update_id),
         "last_update_id": int(final_update_id),
+        "last_local_apply_ts": int(snapshot_local_ts_ms),
         "bids_map": next_bids_map,
         "asks_map": next_asks_map,
-        "last_snapshot_recv_ts": state.get("last_snapshot_recv_ts"),
+        "last_snapshot_recv_ts": int(snapshot_local_ts_ms),
         "pending_events": list(state.get("pending_events") or []),
         "resync_reason": state.get("resync_reason"),
         "last_resync_ts": state.get("last_resync_ts"),
@@ -493,12 +553,12 @@ def _advance_orderbook_state_with_event_strict(
     snapshot = {
         "bids": bids_top,
         "asks": asks_top,
-        "ts": int(event["event_ts_ms"]),
+        "ts": int(snapshot_local_ts_ms),
         "bestBid": best_bid,
         "bestAsk": best_ask,
         "spreadPct": spread_pct,
         "lastUpdateId": int(final_update_id),
-        "exchTs": int(event["event_ts_ms"]),
+        "exchTs": int(event_ts_ms),
         "source": "ws_diff_depth",
         "streamAligned": True,
         "snapshotLastUpdateId": int(snapshot_last_update_id),
@@ -531,7 +591,7 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
         _orderbook_book_state[sym] = state
         _orderbook_buffers[sym] = dict(snapshot_view)
         _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
-        _orderbook_last_recv_ts[sym] = int(state["last_snapshot_recv_ts"])
+        _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
 
         last_ws_snapshot: Optional[Dict[str, Any]] = None
         while True:
@@ -555,6 +615,9 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
                 continue
 
             next_state, ws_snapshot = transition
+            if ws_snapshot["exchTs"] is None:
+                raise WSProtocolError("ws orderbook snapshot.exchTs missing during bootstrap drain (STRICT)")
+
             _persist_ws_orderbook_snapshot_strict(
                 symbol=sym,
                 event_ts_ms=int(ws_snapshot["exchTs"]),
@@ -565,7 +628,7 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
             _orderbook_book_state[sym] = state
             _orderbook_buffers[sym] = dict(ws_snapshot)
             _orderbook_last_update_id[sym] = int(ws_snapshot["lastUpdateId"])
-            _orderbook_last_recv_ts[sym] = _now_ms()
+            _orderbook_last_recv_ts[sym] = int(ws_snapshot["ts"])
             last_ws_snapshot = ws_snapshot
 
         state["bootstrapping"] = False
@@ -574,10 +637,12 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
         if last_ws_snapshot is not None:
             _orderbook_buffers[sym] = dict(last_ws_snapshot)
             _orderbook_last_update_id[sym] = int(last_ws_snapshot["lastUpdateId"])
+            _orderbook_last_recv_ts[sym] = int(last_ws_snapshot["ts"])
         else:
             snapshot_view["streamAligned"] = False
             _orderbook_buffers[sym] = dict(snapshot_view)
             _orderbook_last_update_id[sym] = int(snapshot_view["lastUpdateId"])
+            _orderbook_last_recv_ts[sym] = int(snapshot_view["ts"])
 
     if last_ws_snapshot is None:
         log(
@@ -712,6 +777,9 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
                 return
         else:
             next_state, ob_snapshot = transition
+            if ob_snapshot["exchTs"] is None:
+                raise WSProtocolError("ws orderbook snapshot.exchTs missing during live push (STRICT)")
+
             _persist_ws_orderbook_snapshot_strict(
                 symbol=sym,
                 event_ts_ms=int(ob_snapshot["exchTs"]),
@@ -720,13 +788,14 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
             )
 
             _orderbook_book_state[sym] = next_state
-            _orderbook_buffers[sym] = ob_snapshot
+            _orderbook_buffers[sym] = dict(ob_snapshot)
             _orderbook_last_update_id[sym] = int(ob_snapshot["lastUpdateId"])
-            _orderbook_last_recv_ts[sym] = now_ms
+            _orderbook_last_recv_ts[sym] = int(ob_snapshot["ts"])
             return
 
     if need_resync:
-        assert resync_reason is not None
+        if resync_reason is None:
+            raise WSProtocolError("resync_reason missing after resync trigger (STRICT)")
         log(f"[MD_BINANCE_WS][ORDERBOOK][RESYNC_TRIGGER] symbol={sym} reason={resync_reason}")
         _start_async_orderbook_bootstrap_if_needed(sym, reason=resync_reason)
         return
@@ -742,15 +811,19 @@ def get_orderbook(symbol: str, limit: int = 5) -> Optional[Dict[str, Any]]:
         if not ob:
             return None
 
-        bids = ob.get("bids") or []
-        asks = ob.get("asks") or []
+        if "bids" not in ob or "asks" not in ob:
+            raise WSProtocolError("orderbook buffer missing bids/asks (STRICT)")
+        bids = ob["bids"]
+        asks = ob["asks"]
+        if not isinstance(bids, list) or not isinstance(asks, list):
+            raise WSProtocolError("orderbook buffer bids/asks must be list (STRICT)")
         if not bids or not asks:
             return None
 
         result = dict(ob)
 
-    result["bids"] = list((result.get("bids") or [])[:limit])
-    result["asks"] = list((result.get("asks") or [])[:limit])
+    result["bids"] = list(result["bids"][:limit])
+    result["asks"] = list(result["asks"][:limit])
     return result
 
 
@@ -764,14 +837,20 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
         state = _orderbook_book_state.get(sym)
 
     payload_ts = None
+    exch_ts = None
     last_update_id = None
     has_orderbook = ob is not None
     orderbook_source = None
 
     if ob is not None:
-        payload_ts = ob.get("ts")
-        last_update_id = ob.get("lastUpdateId")
-        orderbook_source = ob.get("source")
+        if "ts" in ob and ob["ts"] is not None:
+            payload_ts = int(ob["ts"])
+        if "exchTs" in ob and ob["exchTs"] is not None:
+            exch_ts = int(ob["exchTs"])
+        if "lastUpdateId" in ob and ob["lastUpdateId"] is not None:
+            last_update_id = int(ob["lastUpdateId"])
+        if "source" in ob and ob["source"] is not None:
+            orderbook_source = str(ob["source"])
 
     recv_delay_ms = None
     if last_recv_ts is not None:
@@ -786,16 +865,21 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
     bootstrapping = None
     resync_reason = None
     last_resync_ts = None
+    last_local_apply_ts = None
 
     if isinstance(state, dict):
         if "stream_aligned" in state:
-            stream_aligned = bool(state.get("stream_aligned"))
-        if state.get("snapshot_last_update_id") is not None:
+            stream_aligned = bool(state["stream_aligned"])
+        if "snapshot_last_update_id" in state and state["snapshot_last_update_id"] is not None:
             snapshot_last_update_id = int(state["snapshot_last_update_id"])
         if "bootstrapping" in state:
-            bootstrapping = bool(state.get("bootstrapping"))
-        resync_reason = state.get("resync_reason")
-        last_resync_ts = state.get("last_resync_ts")
+            bootstrapping = bool(state["bootstrapping"])
+        if "resync_reason" in state and state["resync_reason"] is not None:
+            resync_reason = str(state["resync_reason"])
+        if "last_resync_ts" in state and state["last_resync_ts"] is not None:
+            last_resync_ts = int(state["last_resync_ts"])
+        if "last_local_apply_ts" in state and state["last_local_apply_ts"] is not None:
+            last_local_apply_ts = int(state["last_local_apply_ts"])
 
     return {
         "symbol": sym,
@@ -804,6 +888,7 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
         "recv_delay_ms": recv_delay_ms,
         "payload_ts": payload_ts,
         "payload_delay_ms": payload_delay_ms,
+        "exch_ts": exch_ts,
         "last_update_id": last_update_id,
         "source": orderbook_source,
         "stream_aligned": stream_aligned,
@@ -811,6 +896,7 @@ def get_orderbook_buffer_status(symbol: str) -> Dict[str, Any]:
         "bootstrapping": bootstrapping,
         "resync_reason": resync_reason,
         "last_resync_ts": last_resync_ts,
+        "last_local_apply_ts": last_local_apply_ts,
     }
 
 

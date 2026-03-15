@@ -12,7 +12,7 @@ CORE RESPONSIBILITIES:
 - data health(OK/WARNING/FAIL) 상태 소비
 - authoritative 5m entry gate 사전 차단
 - entry market_data build 수행
-- score_engine 재계산 및 strict 정합성 검증
+- upstream engine_scores strict contract 검증
 - entry_flow 기반 strategy signal 생성
 - legacy candidate 와 strategy signal 간 계약 정합성 검증
 - 다음 계층(risk_cycle)으로 전달할 pending entry packet 생성
@@ -23,19 +23,29 @@ IMPORTANT POLICY:
 - entry cycle 은 market data build / signal build / candidate compatibility 검증만 담당한다
 - risk sizing / execution submit 은 이 파일에서 수행하지 않는다
 - authoritative 5m entry gate 는 market_data build 성공 후에만 claim 한다
+- upstream engine_scores 의 단일 owner 는 unified_features_builder 출력이며 entry cycle 은 재계산하지 않는다
 - NO_SIGNAL / explicit SKIP 은 명시적 skip 으로 처리한다
 - hidden default / silent continue / 예외 삼키기 금지
-- score_engine / entry_flow / common.exceptions_strict 를 정식 연결한다
+- entry_flow / common.exceptions_strict 를 정식 연결한다
 ============================================================
 
 CHANGE HISTORY:
+- 2026-03-15
+  1) FIX(ROOT-CAUSE): data health FAIL / WS recovery 경로를 cadence rollback 검사보다 먼저 실행하도록 run_entry_cycle_or_raise 순서 수정
+  2) FIX(STATE): health FAIL 시 entry cycle wall/1m/orderbook marker 를 recovery authoritative baseline 으로 재기준화
+  3) FIX(CONTRACT): 정상 RUNNING 상태의 1m/orderbook ts rollback fatal 계약은 유지하고, recovery 경계는 baseline rebase 로 분리
+  4) FIX(STRICT): _require_float 에 max_value 계약을 추가해 기존 score 검증 호출과 함수 시그니처를 정합화
+  5) FIX(STRICT): 핵심 계약 경로에서 getattr(..., default) / dict.get(..., default) 사용 제거
+  6) FIX(ROOT-CAUSE): health_level_state.fail_reason / warning_reason 는 빈 문자열을 허용하고, 실제 reason 조합 단계에서만 non-empty 를 요구하도록 계약 분리
+  7) FIX(OPERABILITY): health snapshot fail_reason / warning_reason 키가 존재하지만 빈 문자열인 경우 fatal 처리하지 않고 무시하도록 조정
+  8) FIX(ROOT-CAUSE): engine_scores 단일 owner 를 upstream unified_features_builder 로 고정하고 entry cycle 재계산 제거
+  9) FIX(ARCH): market_data.market_features.engine_scores 는 구조/범위/entry_score 정합만 검증하고 local score_engine mismatch fatal 제거
 - 2026-03-13
   1) ADD(SIGNAL-LAYER): strategy.entry_flow.build_entry_signal_strict 정식 연결
-  2) ADD(SCORE-VERIFY): strategy.score_engine.build_engine_scores 정식 연결 및 market_features.engine_scores 재검증 추가
-  3) ADD(CONTRACT): legacy candidate vs strategy signal action/direction strict 정합성 검증 추가
-  4) ADD(PACKET): EntryCyclePacket 에 strategy_signal / engine_scores 포함
-  5) FIX(STRICT): common.exceptions_strict 기반 entry 예외 계층 연결
-  6) FIX(SAFE_STOP): signal/data contract mismatch 시 runtime.request_safe_stop() 사용
+  2) ADD(CONTRACT): legacy candidate vs strategy signal action/direction strict 정합성 검증 추가
+  3) ADD(PACKET): EntryCyclePacket 에 strategy_signal / engine_scores 포함
+  4) FIX(STRICT): common.exceptions_strict 기반 entry 예외 계층 연결
+  5) FIX(SAFE_STOP): signal/data contract mismatch 시 runtime.request_safe_stop() 사용
 ============================================================
 """
 
@@ -64,7 +74,6 @@ from strategy.engine_runtime_state import (
     claim_entry_signal_ts_or_skip,
 )
 from strategy.entry_flow import build_entry_signal_strict
-from strategy.score_engine import ScoreEngineError, build_engine_scores
 from strategy.signal import Signal
 from engine.engine_loop import ENGINE_STATE_RUNNING, EngineLoopRuntime
 
@@ -163,7 +172,6 @@ class EntryCycleContext:
     build_entry_market_data_fn: Callable[..., Optional[Dict[str, Any]]] = _build_entry_market_data
     decide_entry_candidate_fn: Callable[[Dict[str, Any], Any], Any] = _decide_entry_candidate_strict
     build_entry_signal_fn: Callable[..., Signal] = build_entry_signal_strict
-    build_engine_scores_fn: Callable[..., Dict[str, Any]] = build_engine_scores
 
     def validate_or_raise(self) -> None:
         _ = _normalize_symbol_strict(self.symbol, name="context.symbol")
@@ -180,8 +188,6 @@ class EntryCycleContext:
             raise EntryCycleContractError("context.decide_entry_candidate_fn is required (STRICT)")
         if not callable(self.build_entry_signal_fn):
             raise EntryCycleContractError("context.build_entry_signal_fn is required (STRICT)")
-        if not callable(self.build_engine_scores_fn):
-            raise EntryCycleContractError("context.build_engine_scores_fn is required (STRICT)")
 
         required_setting_names = (
             "entry_cooldown_sec",
@@ -251,23 +257,18 @@ def run_entry_cycle_or_raise(
             f"entry cycle requires RUNNING state (STRICT), current={runtime.engine_state}"
         )
 
-    if _is_entry_cooldown_active(now_f, ctx):
-        return
-
-    should_run_entry_cycle, latest_1m_ts, latest_orderbook_ts = _should_run_entry_cycle(
-        ctx.symbol,
-        now_f,
-        ctx.state.last_entry_cycle_wall_ts,
-        ctx.state.last_entry_cycle_1m_ts,
-        ctx.state.last_entry_cycle_orderbook_ts,
-        ctx.config,
-    )
-    if not should_run_entry_cycle:
-        return
+    latest_1m_ts, latest_orderbook_ts = _capture_entry_cycle_markers_or_raise(ctx.symbol)
 
     health_level, health_fail_reason, health_warning_reason, health_snapshot = _get_data_health_state_or_raise()
     if health_level == "FAIL":
         reason_text = _format_data_health_snapshot_reason(health_snapshot, health_fail_reason)
+        _rebase_entry_cycle_markers_on_health_failure(
+            ctx,
+            now_ts=now_f,
+            latest_1m_ts=latest_1m_ts,
+            latest_orderbook_ts=latest_orderbook_ts,
+            reason_text=reason_text,
+        )
         msg = f"[SKIP][DATA_HEALTH_FAIL] {reason_text}"
         log(msg)
         _maybe_send_entry_block_tg(ctx, "DATA_HEALTH_FAIL", msg)
@@ -277,13 +278,31 @@ def run_entry_cycle_or_raise(
         warning_text = _format_data_health_warning_reason(health_snapshot, health_warning_reason)
         log(f"[WARN][DATA_HEALTH_WARNING] {warning_text}")
 
+    if _is_entry_cooldown_active(now_f, ctx):
+        return
+
+    should_run_entry_cycle = _should_run_entry_cycle(
+        now_ts=now_f,
+        last_eval_wall_ts=ctx.state.last_entry_cycle_wall_ts,
+        last_eval_1m_ts=ctx.state.last_entry_cycle_1m_ts,
+        last_eval_orderbook_ts=ctx.state.last_entry_cycle_orderbook_ts,
+        latest_1m_ts=latest_1m_ts,
+        latest_orderbook_ts=latest_orderbook_ts,
+        config=ctx.config,
+    )
+    if not should_run_entry_cycle:
+        return
+
     authoritative_5m_gate_ts = _get_latest_ws_5m_signal_gate_ts_or_raise(ctx.symbol)
     _bootstrap_entry_gate_state_if_needed(ctx)
 
     if _is_current_entry_signal_gate_already_claimed_or_raise(ctx, authoritative_5m_gate_ts):
-        ctx.state.last_entry_cycle_wall_ts = now_f
-        ctx.state.last_entry_cycle_1m_ts = latest_1m_ts
-        ctx.state.last_entry_cycle_orderbook_ts = latest_orderbook_ts
+        _update_entry_cycle_markers(
+            ctx.state,
+            now_ts=now_f,
+            latest_1m_ts=latest_1m_ts,
+            latest_orderbook_ts=latest_orderbook_ts,
+        )
         return
 
     market_data = _build_entry_market_data_stage_or_raise(
@@ -299,12 +318,18 @@ def run_entry_cycle_or_raise(
         build_fn=ctx.build_entry_market_data_fn,
     )
 
-    ctx.state.last_entry_cycle_wall_ts = now_f
-    ctx.state.last_entry_cycle_1m_ts = latest_1m_ts
-    ctx.state.last_entry_cycle_orderbook_ts = latest_orderbook_ts
+    _update_entry_cycle_markers(
+        ctx.state,
+        now_ts=now_f,
+        latest_1m_ts=latest_1m_ts,
+        latest_orderbook_ts=latest_orderbook_ts,
+    )
 
     if market_data is not None:
-        signal_ts_ms = _require_int_ms(market_data.get("signal_ts_ms"), "market_data.signal_ts_ms")
+        signal_ts_ms = _require_int_ms(
+            _require_mapping_key(market_data, "signal_ts_ms", "market_data"),
+            "market_data.signal_ts_ms",
+        )
         if signal_ts_ms != authoritative_5m_gate_ts:
             raise EntryCycleContractError(
                 "market_data.signal_ts_ms != authoritative_5m_gate_ts (STRICT): "
@@ -326,11 +351,8 @@ def run_entry_cycle_or_raise(
         _safe_send_tg(msg)
         raise EntryCycleError(msg) from e
 
-    engine_scores = _recompute_engine_scores_stage_or_raise(
-        market_data,
-        build_fn=ctx.build_engine_scores_fn,
-    )
-    _validate_engine_scores_consistency_or_raise(market_data, engine_scores)
+    engine_scores = _extract_upstream_engine_scores_or_raise(market_data)
+    _validate_market_data_entry_score_vs_upstream_engine_scores_or_raise(market_data, engine_scores)
 
     signal_features = _build_entry_signal_features_from_market_data_or_raise(
         market_data,
@@ -343,7 +365,6 @@ def run_entry_cycle_or_raise(
     )
 
     signal_action = _require_nonempty_str(strategy_signal.action, "strategy_signal.action").upper()
-    signal_direction = _require_nonempty_str(strategy_signal.direction, "strategy_signal.direction").upper()
 
     if signal_action == "SKIP":
         reason = _require_nonempty_str(strategy_signal.reason, "strategy_signal.reason")
@@ -374,7 +395,10 @@ def run_entry_cycle_or_raise(
     ctx.state.last_entry_gpt_call_ts = now_f
 
     packet = EntryCyclePacket(
-        symbol=_normalize_symbol_strict(market_data.get("symbol"), name="market_data.symbol"),
+        symbol=_normalize_symbol_strict(
+            _require_mapping_key(market_data, "symbol", "market_data"),
+            name="market_data.symbol",
+        ),
         authoritative_signal_ts_ms=int(authoritative_5m_gate_ts),
         market_data=market_data,
         candidate=candidate,
@@ -387,9 +411,9 @@ def run_entry_cycle_or_raise(
 
 def consume_pending_entry_packet_or_none(runtime: EngineLoopRuntime) -> Optional[EntryCyclePacket]:
     runtime.validate_or_raise()
-    raw = runtime.extra.pop(PENDING_ENTRY_PACKET_KEY, None)
-    if raw is None:
+    if PENDING_ENTRY_PACKET_KEY not in runtime.extra:
         return None
+    raw = runtime.extra.pop(PENDING_ENTRY_PACKET_KEY)
     if not isinstance(raw, EntryCyclePacket):
         raise EntryCycleContractError(
             f"runtime.extra[{PENDING_ENTRY_PACKET_KEY!r}] must be EntryCyclePacket (STRICT)"
@@ -399,9 +423,9 @@ def consume_pending_entry_packet_or_none(runtime: EngineLoopRuntime) -> Optional
 
 def peek_pending_entry_packet_or_none(runtime: EngineLoopRuntime) -> Optional[EntryCyclePacket]:
     runtime.validate_or_raise()
-    raw = runtime.extra.get(PENDING_ENTRY_PACKET_KEY)
-    if raw is None:
+    if PENDING_ENTRY_PACKET_KEY not in runtime.extra:
         return None
+    raw = runtime.extra[PENDING_ENTRY_PACKET_KEY]
     if not isinstance(raw, EntryCyclePacket):
         raise EntryCycleContractError(
             f"runtime.extra[{PENDING_ENTRY_PACKET_KEY!r}] must be EntryCyclePacket (STRICT)"
@@ -410,9 +434,9 @@ def peek_pending_entry_packet_or_none(runtime: EngineLoopRuntime) -> Optional[En
 
 
 def _clear_stale_pending_packet_if_present(runtime: EngineLoopRuntime) -> None:
-    raw = runtime.extra.get(PENDING_ENTRY_PACKET_KEY)
-    if raw is None:
+    if PENDING_ENTRY_PACKET_KEY not in runtime.extra:
         return
+    raw = runtime.extra[PENDING_ENTRY_PACKET_KEY]
     if not isinstance(raw, EntryCyclePacket):
         raise EntryCycleContractError(
             f"runtime.extra[{PENDING_ENTRY_PACKET_KEY!r}] must be EntryCyclePacket (STRICT)"
@@ -433,7 +457,13 @@ def _require_bool(v: Any, name: str) -> bool:
     return bool(v)
 
 
-def _require_float(v: Any, name: str, *, min_value: Optional[float] = None) -> float:
+def _require_float(
+    v: Any,
+    name: str,
+    *,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+) -> float:
     if isinstance(v, bool):
         raise EntryCycleContractError(f"{name} must be numeric (bool not allowed)")
     try:
@@ -444,6 +474,8 @@ def _require_float(v: Any, name: str, *, min_value: Optional[float] = None) -> f
         raise EntryCycleContractError(f"{name} must be finite (STRICT)")
     if min_value is not None and x < min_value:
         raise EntryCycleContractError(f"{name} must be >= {min_value} (STRICT)")
+    if max_value is not None and x > max_value:
+        raise EntryCycleContractError(f"{name} must be <= {max_value} (STRICT)")
     return float(x)
 
 
@@ -464,7 +496,9 @@ def _require_int_ms(v: Any, name: str) -> int:
 
 
 def _require_nonempty_str(v: Any, name: str) -> str:
-    s = str(v or "").strip()
+    if not isinstance(v, str):
+        raise EntryCycleContractError(f"{name} must be str (STRICT)")
+    s = v.strip()
     if not s:
         raise EntryCycleContractError(f"{name} is empty (STRICT)")
     return s
@@ -498,8 +532,27 @@ def _require_mapping_key(d: Dict[str, Any], key: str, ctx_name: str) -> Any:
     return d[key]
 
 
+def _optional_mapping_value(d: Dict[str, Any], key: str) -> Any:
+    if key in d:
+        return d[key]
+    return None
+
+
+def _require_attr_value(obj: Any, attr_name: str, owner_name: str) -> Any:
+    if obj is None:
+        raise EntryCycleContractError(f"{owner_name} is None (STRICT)")
+    if not hasattr(obj, attr_name):
+        raise EntryCycleContractError(f"{owner_name}.{attr_name} is required (STRICT)")
+    value = getattr(obj, attr_name)
+    if value is None:
+        raise EntryCycleContractError(f"{owner_name}.{attr_name} is required (STRICT)")
+    return value
+
+
 def _normalize_symbol_strict(symbol: Any, *, name: str = "symbol") -> str:
-    s = str(symbol or "").replace("-", "").replace("/", "").upper().strip()
+    if not isinstance(symbol, str):
+        raise EntryCycleContractError(f"{name} must be str (STRICT)")
+    s = symbol.replace("-", "").replace("/", "").upper().strip()
     if not s:
         raise EntryCycleContractError(f"{name} is empty (STRICT)")
     return s
@@ -513,7 +566,9 @@ def _join_reason_list_strict(v: Any, name: str) -> str:
 
 
 def _normalize_health_level_strict(v: Any, name: str) -> str:
-    s = str(v or "").strip().upper()
+    if not isinstance(v, str):
+        raise EntryCycleContractError(f"{name} must be str (STRICT)")
+    s = v.strip().upper()
     if s not in ("OK", "WARNING", "FAIL"):
         raise EntryCycleContractError(f"{name} must be OK/WARNING/FAIL (STRICT), got={v!r}")
     return s
@@ -550,43 +605,59 @@ def _maybe_send_entry_block_tg(
 
 def _format_data_health_snapshot_reason(snapshot: Dict[str, Any], fallback_reason: str) -> str:
     if not isinstance(snapshot, dict):
-        fb = str(fallback_reason or "").strip()
-        if fb:
-            return fb
         raise EntryCycleContractError("data health snapshot must be dict (STRICT)")
 
     reasons: List[str] = []
 
-    fail_reason = str(snapshot.get("fail_reason") or "").strip()
-    if fail_reason:
-        reasons.append(fail_reason)
+    fail_reason_raw = _optional_mapping_value(snapshot, "fail_reason")
+    if fail_reason_raw is not None:
+        if not isinstance(fail_reason_raw, str):
+            raise EntryCycleContractError("health_snapshot.fail_reason must be str (STRICT)")
+        fail_reason = fail_reason_raw.strip()
+        if fail_reason:
+            reasons.append(fail_reason)
 
-    ws = snapshot.get("ws")
-    if isinstance(ws, dict):
-        ws_reasons = ws.get("overall_reasons")
-        if isinstance(ws_reasons, list):
-            joined = _join_reason_list_strict(ws_reasons, "health_snapshot.ws.overall_reasons")
+    ws_raw = _optional_mapping_value(snapshot, "ws")
+    if ws_raw is not None:
+        ws = _require_dict(ws_raw, "health_snapshot.ws")
+        ws_reasons_raw = _optional_mapping_value(ws, "overall_reasons")
+        if ws_reasons_raw is not None:
+            joined = _join_reason_list_strict(ws_reasons_raw, "health_snapshot.ws.overall_reasons")
             if joined:
                 reasons.append(f"ws={joined}")
 
-    feature = snapshot.get("feature")
-    if isinstance(feature, dict):
-        if not bool(feature.get("ok", False)):
-            missing_tfs = feature.get("missing_tfs")
-            if isinstance(missing_tfs, list) and missing_tfs:
+    feature_raw = _optional_mapping_value(snapshot, "feature")
+    if feature_raw is not None:
+        feature = _require_dict(feature_raw, "health_snapshot.feature")
+        feature_ok = _require_bool(
+            _require_mapping_key(feature, "ok", "health_snapshot.feature"),
+            "health_snapshot.feature.ok",
+        )
+        if not feature_ok:
+            missing_tfs_raw = _optional_mapping_value(feature, "missing_tfs")
+            if missing_tfs_raw is not None:
+                missing_tfs = _require_list(missing_tfs_raw, "health_snapshot.feature.missing_tfs")
                 reasons.append(f"feature_missing_tfs={missing_tfs}")
-            field = feature.get("field")
-            if field is not None and str(field).strip():
-                reasons.append(f"feature_field={field}")
-            err = feature.get("error_type")
-            if err is not None and str(err).strip():
-                reasons.append(f"feature_error_type={err}")
+
+            field_raw = _optional_mapping_value(feature, "field")
+            if field_raw is not None:
+                if not isinstance(field_raw, str):
+                    raise EntryCycleContractError("health_snapshot.feature.field must be str (STRICT)")
+                field = field_raw.strip()
+                if field:
+                    reasons.append(f"feature_field={field}")
+
+            err_raw = _optional_mapping_value(feature, "error_type")
+            if err_raw is not None:
+                if not isinstance(err_raw, str):
+                    raise EntryCycleContractError("health_snapshot.feature.error_type must be str (STRICT)")
+                err = err_raw.strip()
+                if err:
+                    reasons.append(f"feature_error_type={err}")
 
     if not reasons:
-        fb = str(fallback_reason or "").strip()
-        if fb:
-            return fb
-        raise EntryCycleContractError("health fail reason missing (STRICT)")
+        fb = _require_nonempty_str(fallback_reason, "fallback_reason")
+        return fb
 
     unique: List[str] = []
     seen: set[str] = set()
@@ -599,30 +670,30 @@ def _format_data_health_snapshot_reason(snapshot: Dict[str, Any], fallback_reaso
 
 def _format_data_health_warning_reason(snapshot: Dict[str, Any], fallback_warning: str) -> str:
     if not isinstance(snapshot, dict):
-        fb = str(fallback_warning or "").strip()
-        if fb:
-            return fb
         raise EntryCycleContractError("data health snapshot must be dict (STRICT)")
 
     reasons: List[str] = []
 
-    warning_reason = str(snapshot.get("warning_reason") or "").strip()
-    if warning_reason:
-        reasons.append(warning_reason)
+    warning_reason_raw = _optional_mapping_value(snapshot, "warning_reason")
+    if warning_reason_raw is not None:
+        if not isinstance(warning_reason_raw, str):
+            raise EntryCycleContractError("health_snapshot.warning_reason must be str (STRICT)")
+        warning_reason = warning_reason_raw.strip()
+        if warning_reason:
+            reasons.append(warning_reason)
 
-    ws = snapshot.get("ws")
-    if isinstance(ws, dict):
-        ws_warnings = ws.get("overall_warnings")
-        if isinstance(ws_warnings, list):
-            joined = _join_reason_list_strict(ws_warnings, "health_snapshot.ws.overall_warnings")
+    ws_raw = _optional_mapping_value(snapshot, "ws")
+    if ws_raw is not None:
+        ws = _require_dict(ws_raw, "health_snapshot.ws")
+        ws_warnings_raw = _optional_mapping_value(ws, "overall_warnings")
+        if ws_warnings_raw is not None:
+            joined = _join_reason_list_strict(ws_warnings_raw, "health_snapshot.ws.overall_warnings")
             if joined:
                 reasons.append(f"ws={joined}")
 
     if not reasons:
-        fb = str(fallback_warning or "").strip()
-        if fb:
-            return fb
-        raise EntryCycleContractError("health warning reason missing (STRICT)")
+        fb = _require_nonempty_str(fallback_warning, "fallback_warning")
+        return fb
 
     unique: List[str] = []
     seen: set[str] = set()
@@ -638,20 +709,28 @@ def _get_data_health_state_or_raise() -> tuple[str, str, str, Dict[str, Any]]:
     if not isinstance(level_state, dict):
         raise EntryCycleContractError("data_health_monitor.get_health_level_state() must return dict (STRICT)")
 
-    level = _normalize_health_level_strict(level_state.get("level"), "health_level_state.level")
-    ok = level_state.get("ok")
-    if not isinstance(ok, bool):
-        raise EntryCycleContractError("health_level_state.ok must be bool (STRICT)")
-    has_warning = level_state.get("has_warning")
-    if not isinstance(has_warning, bool):
-        raise EntryCycleContractError("health_level_state.has_warning must be bool (STRICT)")
+    level = _normalize_health_level_strict(
+        _require_mapping_key(level_state, "level", "health_level_state"),
+        "health_level_state.level",
+    )
+    ok = _require_bool(
+        _require_mapping_key(level_state, "ok", "health_level_state"),
+        "health_level_state.ok",
+    )
+    has_warning = _require_bool(
+        _require_mapping_key(level_state, "has_warning", "health_level_state"),
+        "health_level_state.has_warning",
+    )
 
-    fail_reason = level_state.get("fail_reason")
-    if not isinstance(fail_reason, str):
+    fail_reason_raw = _require_mapping_key(level_state, "fail_reason", "health_level_state")
+    if not isinstance(fail_reason_raw, str):
         raise EntryCycleContractError("health_level_state.fail_reason must be str (STRICT)")
-    warning_reason = level_state.get("warning_reason")
-    if not isinstance(warning_reason, str):
+    fail_reason = fail_reason_raw.strip()
+
+    warning_reason_raw = _require_mapping_key(level_state, "warning_reason", "health_level_state")
+    if not isinstance(warning_reason_raw, str):
         raise EntryCycleContractError("health_level_state.warning_reason must be str (STRICT)")
+    warning_reason = warning_reason_raw.strip()
 
     if level == "FAIL" and ok:
         raise EntryCycleContractError("health level FAIL but ok=True (STRICT)")
@@ -694,47 +773,98 @@ def _get_orderbook_marker_ts_optional(symbol: str) -> Optional[int]:
     if not isinstance(ob, dict):
         raise EntryCycleContractError("ws_get_orderbook returned non-dict (STRICT)")
 
-    ts_val = ob.get("ts")
-    if ts_val is None:
+    if "ts" not in ob:
         return None
-    return _require_int_ms(ts_val, "orderbook.ts")
+    return _require_int_ms(ob["ts"], "orderbook.ts")
+
+
+def _capture_entry_cycle_markers_or_raise(symbol: str) -> tuple[Optional[int], Optional[int]]:
+    latest_1m_ts = _get_latest_ws_kline_ts_optional(symbol, "1m")
+    latest_orderbook_ts = _get_orderbook_marker_ts_optional(symbol)
+    return latest_1m_ts, latest_orderbook_ts
+
+
+def _update_entry_cycle_markers(
+    state: EntryCycleState,
+    *,
+    now_ts: float,
+    latest_1m_ts: Optional[int],
+    latest_orderbook_ts: Optional[int],
+) -> None:
+    state.last_entry_cycle_wall_ts = _require_float(now_ts, "entry_cycle_marker.now_ts", min_value=0.0)
+    state.last_entry_cycle_1m_ts = _require_optional_positive_int(
+        latest_1m_ts,
+        "entry_cycle_marker.latest_1m_ts",
+    )
+    state.last_entry_cycle_orderbook_ts = _require_optional_positive_int(
+        latest_orderbook_ts,
+        "entry_cycle_marker.latest_orderbook_ts",
+    )
+
+
+def _rebase_entry_cycle_markers_on_health_failure(
+    ctx: EntryCycleContext,
+    *,
+    now_ts: float,
+    latest_1m_ts: Optional[int],
+    latest_orderbook_ts: Optional[int],
+    reason_text: str,
+) -> None:
+    _update_entry_cycle_markers(
+        ctx.state,
+        now_ts=now_ts,
+        latest_1m_ts=latest_1m_ts,
+        latest_orderbook_ts=latest_orderbook_ts,
+    )
+    log(
+        "[ENTRY_CYCLE][REBASE] health failure baseline updated: "
+        f"symbol={ctx.symbol} "
+        f"last_entry_cycle_1m_ts={ctx.state.last_entry_cycle_1m_ts} "
+        f"last_entry_cycle_orderbook_ts={ctx.state.last_entry_cycle_orderbook_ts} "
+        f"reason={reason_text}"
+    )
 
 
 def _should_run_entry_cycle(
-    symbol: str,
+    *,
     now_ts: float,
     last_eval_wall_ts: float,
     last_eval_1m_ts: Optional[int],
     last_eval_orderbook_ts: Optional[int],
+    latest_1m_ts: Optional[int],
+    latest_orderbook_ts: Optional[int],
     config: EntryCycleConfig,
-) -> tuple[bool, Optional[int], Optional[int]]:
-    latest_1m_ts = _get_latest_ws_kline_ts_optional(symbol, "1m")
-    latest_orderbook_ts = _get_orderbook_marker_ts_optional(symbol)
-
+) -> bool:
     if latest_1m_ts is not None and last_eval_1m_ts is not None and latest_1m_ts < last_eval_1m_ts:
         raise EntryCycleContractError(
             f"entry loop 1m ts rollback detected (STRICT): prev={last_eval_1m_ts} now={latest_1m_ts}"
         )
 
-    if latest_orderbook_ts is not None and last_eval_orderbook_ts is not None and latest_orderbook_ts < last_eval_orderbook_ts:
+    if (
+        latest_orderbook_ts is not None
+        and last_eval_orderbook_ts is not None
+        and latest_orderbook_ts < last_eval_orderbook_ts
+    ):
         raise EntryCycleContractError(
             f"entry loop orderbook ts rollback detected (STRICT): prev={last_eval_orderbook_ts} now={latest_orderbook_ts}"
         )
 
     if last_eval_wall_ts <= 0.0:
-        return True, latest_1m_ts, latest_orderbook_ts
+        return True
 
     if latest_1m_ts is not None and (last_eval_1m_ts is None or latest_1m_ts > last_eval_1m_ts):
-        return True, latest_1m_ts, latest_orderbook_ts
+        return True
 
-    if latest_orderbook_ts is not None and (last_eval_orderbook_ts is None or latest_orderbook_ts > last_eval_orderbook_ts):
+    if latest_orderbook_ts is not None and (
+        last_eval_orderbook_ts is None or latest_orderbook_ts > last_eval_orderbook_ts
+    ):
         if (now_ts - last_eval_wall_ts) >= config.engine_entry_ob_min_interval_sec:
-            return True, latest_1m_ts, latest_orderbook_ts
+            return True
 
     if (now_ts - last_eval_wall_ts) >= config.engine_entry_force_interval_sec:
-        return True, latest_1m_ts, latest_orderbook_ts
+        return True
 
-    return False, latest_1m_ts, latest_orderbook_ts
+    return False
 
 
 def _bootstrap_entry_gate_state_if_needed(ctx: EntryCycleContext) -> None:
@@ -819,134 +949,107 @@ def _decide_entry_candidate_stage_or_raise(
             f"entry candidate build failed (STRICT): {type(e).__name__}: {e}"
         ) from e
 
-    action = _require_nonempty_str(getattr(candidate, "action", None), "candidate.action").upper()
-    _ = _require_nonempty_str(getattr(candidate, "reason", None), "candidate.reason")
+    action = _require_nonempty_str(
+        _require_attr_value(candidate, "action", "candidate"),
+        "candidate.action",
+    ).upper()
+    _ = _require_nonempty_str(
+        _require_attr_value(candidate, "reason", "candidate"),
+        "candidate.reason",
+    )
     if action == "ENTER":
-        _ = _require_nonempty_str(getattr(candidate, "direction", None), "candidate.direction")
+        _ = _require_nonempty_str(
+            _require_attr_value(candidate, "direction", "candidate"),
+            "candidate.direction",
+        )
     return candidate
 
 
-def _recompute_engine_scores_stage_or_raise(
-    market_data: Dict[str, Any],
-    *,
-    build_fn: Callable[..., Dict[str, Any]],
-) -> Dict[str, Any]:
-    market_data_dict = _require_dict(market_data, "market_data")
-    symbol = _normalize_symbol_strict(
-        _require_mapping_key(market_data_dict, "symbol", "market_data"),
-        name="market_data.symbol",
-    )
-    market_features = _require_dict(
-        _require_mapping_key(market_data_dict, "market_features", "market_data"),
-        "market_data.market_features",
-    )
-
-    timeframes = _require_dict(
-        _require_mapping_key(market_features, "timeframes", "market_features"),
-        "market_features.timeframes",
-    )
-    pattern_features = _require_dict(
-        _require_mapping_key(market_features, "pattern_features", "market_features"),
-        "market_features.pattern_features",
-    )
-    pattern_summary = _require_dict(
-        _require_mapping_key(market_features, "pattern_summary", "market_features"),
-        "market_features.pattern_summary",
-    )
-    orderbook = _require_dict(
-        _require_mapping_key(market_features, "orderbook", "market_features"),
-        "market_features.orderbook",
-    )
-
-    try:
-        scores = build_fn(
-            symbol,
-            timeframes,
-            pattern_features,
-            pattern_summary,
-            orderbook,
-        )
-    except ScoreEngineError as e:
-        raise EntryCycleError(
-            f"score_engine recompute failed (STRICT): {type(e).__name__}: {e}"
-        ) from e
-    except Exception as e:
-        raise EntryCycleError(
-            f"score_engine unexpected failure (STRICT): {type(e).__name__}: {e}"
-        ) from e
-
-    return _require_dict(scores, "recomputed_engine_scores")
-
-
-def _validate_engine_scores_consistency_or_raise(
-    market_data: Dict[str, Any],
-    recomputed_engine_scores: Dict[str, Any],
-) -> None:
+def _extract_upstream_engine_scores_or_raise(market_data: Dict[str, Any]) -> Dict[str, Any]:
     market_data_dict = _require_dict(market_data, "market_data")
     market_features = _require_dict(
         _require_mapping_key(market_data_dict, "market_features", "market_data"),
         "market_data.market_features",
     )
-    upstream_scores = _require_dict(
+    engine_scores = _require_dict(
         _require_mapping_key(market_features, "engine_scores", "market_features"),
         "market_features.engine_scores",
     )
 
-    required_blocks = (
-        "trend_4h",
-        "momentum_1h",
-        "structure_15m",
-        "timing_5m",
-        "orderbook_micro",
-        "total",
+    total_block = _require_dict(
+        _require_mapping_key(engine_scores, "total", "market_features.engine_scores"),
+        "market_features.engine_scores.total",
     )
-    for key in required_blocks:
-        upstream_block = _require_dict(
-            _require_mapping_key(upstream_scores, key, "market_features.engine_scores"),
-            f"market_features.engine_scores.{key}",
-        )
-        recomputed_block = _require_dict(
-            _require_mapping_key(recomputed_engine_scores, key, "recomputed_engine_scores"),
-            f"recomputed_engine_scores.{key}",
-        )
+    _ = _require_float(
+        _require_mapping_key(total_block, "score", "market_features.engine_scores.total"),
+        "market_features.engine_scores.total.score",
+        min_value=0.0,
+        max_value=100.0,
+    )
 
-        upstream_score = _require_float(
-            _require_mapping_key(upstream_block, "score", f"market_features.engine_scores.{key}"),
-            f"market_features.engine_scores.{key}.score",
+    if "weights" in total_block and total_block["weights"] is not None:
+        weights = _require_dict(
+            total_block["weights"],
+            "market_features.engine_scores.total.weights",
         )
-        recomputed_score = _require_float(
-            _require_mapping_key(recomputed_block, "score", f"recomputed_engine_scores.{key}"),
-            f"recomputed_engine_scores.{key}.score",
-        )
-
-        if abs(upstream_score - recomputed_score) > 1e-9:
+        total_weight = 0.0
+        for weight_name, weight_val in weights.items():
+            if not isinstance(weight_name, str) or not weight_name.strip():
+                raise EntryCycleContractError("engine_scores.total.weights key must be non-empty str (STRICT)")
+            fv = _require_float(
+                weight_val,
+                f"market_features.engine_scores.total.weights[{weight_name}]",
+                min_value=0.0,
+                max_value=1.0,
+            )
+            total_weight += fv
+        if abs(total_weight - 1.0) > 1e-9:
             raise EntryCycleContractError(
-                "engine_scores mismatch detected (STRICT): "
-                f"block={key} upstream={upstream_score} recomputed={recomputed_score}"
+                f"engine_scores.total.weights sum must be 1.0 (STRICT), got={total_weight}"
             )
 
+    for block_name, block_val in engine_scores.items():
+        if not isinstance(block_name, str) or not block_name.strip():
+            raise EntryCycleContractError("engine_scores block name must be non-empty str (STRICT)")
+        block = _require_dict(block_val, f"market_features.engine_scores.{block_name}")
+        _ = _require_float(
+            _require_mapping_key(block, "score", f"market_features.engine_scores.{block_name}"),
+            f"market_features.engine_scores.{block_name}.score",
+            min_value=0.0,
+            max_value=100.0,
+        )
+
+    return engine_scores
+
+
+def _validate_market_data_entry_score_vs_upstream_engine_scores_or_raise(
+    market_data: Dict[str, Any],
+    engine_scores: Dict[str, Any],
+) -> None:
+    market_data_dict = _require_dict(market_data, "market_data")
     market_data_entry_score = _require_float(
         _require_mapping_key(market_data_dict, "entry_score", "market_data"),
         "market_data.entry_score",
         min_value=0.0,
         max_value=1.0,
     )
-    recomputed_total = _require_dict(
-        _require_mapping_key(recomputed_engine_scores, "total", "recomputed_engine_scores"),
-        "recomputed_engine_scores.total",
+
+    total_block = _require_dict(
+        _require_mapping_key(engine_scores, "total", "engine_scores"),
+        "engine_scores.total",
     )
-    recomputed_entry_score = _require_float(
-        _require_mapping_key(recomputed_total, "score", "recomputed_engine_scores.total"),
-        "recomputed_engine_scores.total.score",
+    upstream_entry_score = _require_float(
+        _require_mapping_key(total_block, "score", "engine_scores.total"),
+        "engine_scores.total.score",
         min_value=0.0,
         max_value=100.0,
     ) / 100.0
 
-    if abs(market_data_entry_score - recomputed_entry_score) > 1e-9:
+    if abs(market_data_entry_score - upstream_entry_score) > 1e-9:
         raise EntryCycleContractError(
-            "market_data.entry_score mismatch detected (STRICT): "
+            "market_data.entry_score mismatch detected vs upstream engine_scores (STRICT): "
             f"market_data.entry_score={market_data_entry_score} "
-            f"recomputed_entry_score={recomputed_entry_score}"
+            f"upstream_entry_score={upstream_entry_score}"
         )
 
 
@@ -1019,7 +1122,7 @@ def _build_entry_signal_features_from_market_data_or_raise(
         _require_mapping_key(engine_scores, "total", "engine_scores"),
         "engine_scores.total",
     )
-    recomputed_entry_score = _require_float(
+    upstream_entry_score = _require_float(
         _require_mapping_key(total_block, "score", "engine_scores.total"),
         "engine_scores.total.score",
         min_value=0.0,
@@ -1052,7 +1155,7 @@ def _build_entry_signal_features_from_market_data_or_raise(
         "equity_current_usdt": float(equity_current_usdt),
         "equity_peak_usdt": float(equity_peak_usdt),
         "dd_pct": float(dd_pct),
-        "entry_score": float(recomputed_entry_score),
+        "entry_score": float(upstream_entry_score),
         "trend_strength": float(trend_strength),
         "spread": float(spread),
         "orderbook_imbalance": float(orderbook_imbalance),
@@ -1111,8 +1214,14 @@ def _validate_candidate_vs_strategy_signal_or_raise(
     runtime: EngineLoopRuntime,
     now_ts: float,
 ) -> None:
-    candidate_action = _require_nonempty_str(getattr(candidate, "action", None), "candidate.action").upper()
-    candidate_reason = _require_nonempty_str(getattr(candidate, "reason", None), "candidate.reason")
+    candidate_action = _require_nonempty_str(
+        _require_attr_value(candidate, "action", "candidate"),
+        "candidate.action",
+    ).upper()
+    candidate_reason = _require_nonempty_str(
+        _require_attr_value(candidate, "reason", "candidate"),
+        "candidate.reason",
+    )
     signal_action = _require_nonempty_str(strategy_signal.action, "strategy_signal.action").upper()
     signal_reason = _require_nonempty_str(strategy_signal.reason, "strategy_signal.reason")
 
@@ -1131,7 +1240,7 @@ def _validate_candidate_vs_strategy_signal_or_raise(
         )
 
     candidate_direction = _require_nonempty_str(
-        getattr(candidate, "direction", None),
+        _require_attr_value(candidate, "direction", "candidate"),
         "candidate.direction",
     ).upper()
     signal_direction = _require_nonempty_str(

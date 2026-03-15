@@ -7,6 +7,20 @@ ROLE:
 - market_data_ws 분리 리팩터링 kline 전용 계층
 - REST bootstrap / WS kline push / buffer 상태 조회를 담당한다
 - 상위 계층에는 기존 market_data_ws 공개 API와 동일한 kline getter를 제공한다
+
+IMPORTANT POLICY:
+- STRICT · NO-FALLBACK · TRADE-GRADE
+- 거래소 정상 gap(복수 interval rollover)은 protocol fatal로 보지 않고
+  authoritative REST backfill로 복구한다
+- interval 미만 delta / non-aligned delta / timestamp rollback 만 치명 오류다
+========================================================
+
+CHANGE HISTORY:
+- 2026-03-15
+  1) FIX(ROOT-CAUSE): WS kline rollover delta 가 expected interval 과 정확히 같아야만 허용하던 로직 제거
+  2) FIX(RECOVERY): delta_ms 가 interval 배수인 복수-candle gap 은 recoverable gap 으로 판단
+  3) FIX(RECOVERY): recoverable kline gap 발생 시 REST klines backfill 로 buffer 재동기화 후 동일 WS row 재처리
+  4) FIX(OPERABILITY): recoverable gap 을 protocol fatal 로 WS disconnect 하지 않고 self-heal 경로로 전환
 ========================================================
 """
 
@@ -46,6 +60,8 @@ from infra.market_data_ws_shared import (
     log,
 )
 
+_KLINE_GAP_REPAIR_MAX_ATTEMPTS: int = 2
+
 
 def _classify_same_candle_update_strict(
     prev: KlineRow,
@@ -79,6 +95,67 @@ def _classify_same_candle_update_strict(
     return True
 
 
+def _validate_rollover_delta_strict(
+    *,
+    last_ts: int,
+    new_ts: int,
+    interval: str,
+    context: str,
+) -> Tuple[int, int]:
+    interval_ms = _interval_to_ms_strict(interval)
+    delta_ms = int(new_ts) - int(last_ts)
+
+    if delta_ms <= 0:
+        raise WSProtocolError(
+            f"{context} rollover delta must be > 0 (STRICT): prev_ts={last_ts} new_ts={new_ts} delta_ms={delta_ms}"
+        )
+
+    if delta_ms < interval_ms:
+        raise WSProtocolError(
+            f"{context} rollover delta shorter than interval (STRICT): "
+            f"prev_ts={last_ts} new_ts={new_ts} delta_ms={delta_ms} expected_ms={interval_ms}"
+        )
+
+    if (delta_ms % interval_ms) != 0:
+        raise WSProtocolError(
+            f"{context} rollover delta not aligned to interval (STRICT): "
+            f"prev_ts={last_ts} new_ts={new_ts} delta_ms={delta_ms} expected_ms={interval_ms}"
+        )
+
+    return interval_ms, delta_ms
+
+
+def _repair_kline_gap_from_rest_or_raise(
+    symbol: str,
+    interval: str,
+    *,
+    min_limit: int,
+    reason: str,
+) -> None:
+    sym = _normalize_symbol(symbol)
+    iv = _normalize_interval(interval)
+
+    if not sym:
+        raise WSProtocolError("symbol is required for kline gap repair (STRICT)")
+    if not iv:
+        raise WSProtocolError("interval is required for kline gap repair (STRICT)")
+    if min_limit <= 0:
+        raise WSProtocolError(f"kline gap repair min_limit must be > 0 (STRICT), got={min_limit}")
+
+    fetch_limit = max(int(min_limit), int(_min_buffer_for_interval(iv)))
+    payload = _rest_fetch_klines_strict(sym, iv, fetch_limit)
+    if not isinstance(payload, list) or not payload:
+        raise WSProtocolError(
+            f"REST gap repair returned empty/non-list payload (STRICT): symbol={sym} interval={iv}"
+        )
+
+    backfill_klines_from_rest(sym, iv, payload)
+    log(
+        f"[WS_RECOVERY] ws_kline[{sym}:{iv}] gap repaired from REST "
+        f"loaded={len(payload)} reason={reason}"
+    )
+
+
 def _plan_kline_update_strict(
     buf: List[KlineRow],
     row: KlineRow,
@@ -87,18 +164,18 @@ def _plan_kline_update_strict(
     quote_volume: float,
     prev_quote_volume: Optional[float],
     context: str,
-) -> Tuple[bool, Optional[KlineRow]]:
+) -> Tuple[bool, Optional[KlineRow], Optional[str]]:
     _ = quote_volume
     ts = int(row[0])
     if not buf:
-        return True, None
+        return True, None, None
 
     last = buf[-1]
     last_ts = int(last[0])
 
     if ts < last_ts:
         log(f"[WS_INFO] {context} stale kline ignored new_ts={ts} last_ts={last_ts}")
-        return False, None
+        return False, None, None
 
     if ts == last_ts:
         should_apply = _classify_same_candle_update_strict(
@@ -108,16 +185,22 @@ def _plan_kline_update_strict(
             new_quote_volume=quote_volume,
             context=context,
         )
-        return should_apply, None
+        return should_apply, None, None
 
     if bool(last[6]) is False:
-        interval_ms = _interval_to_ms_strict(interval)
-        delta_ms = ts - last_ts
-        if delta_ms != interval_ms:
-            raise WSProtocolError(
-                f"{context} new candle arrived before previous candle closed with invalid rollover delta (STRICT): "
+        interval_ms, delta_ms = _validate_rollover_delta_strict(
+            last_ts=last_ts,
+            new_ts=ts,
+            interval=interval,
+            context=context,
+        )
+
+        if delta_ms > interval_ms:
+            repair_reason = (
+                f"{context} rollover gap detected (STRICT-RECOVERABLE): "
                 f"prev_ts={last_ts} new_ts={ts} delta_ms={delta_ms} expected_ms={interval_ms}"
             )
+            return False, None, repair_reason
 
         sealed_prev: KlineRow = (
             int(last[0]),
@@ -128,9 +211,9 @@ def _plan_kline_update_strict(
             float(last[5]),
             True,
         )
-        return True, sealed_prev
+        return True, sealed_prev, None
 
-    return True, None
+    return True, None, None
 
 
 def _commit_kline_update_strict(
@@ -172,7 +255,7 @@ def _commit_kline_update_strict(
 
     buf.append(row)
     if len(buf) > MAX_KLINES:
-        del buf[0 : len(buf) - MAX_KLINES]
+        del buf[0: len(buf) - MAX_KLINES]
     _kline_last_quote_volume[key] = (ts, float(quote_volume))
 
 
@@ -227,25 +310,45 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
     row: KlineRow = (ts, o, h, l, c, v, is_closed)
     now_ms = _now_ms()
 
-    with _kline_lock:
-        buf = _kline_buffers.setdefault(key, [])
-        prev_q_entry = _kline_last_quote_volume.get(key)
-        prev_quote_volume: Optional[float] = None
-        if prev_q_entry is not None and int(prev_q_entry[0]) == int(buf[-1][0] if buf else ts):
-            prev_quote_volume = float(prev_q_entry[1])
+    should_apply: bool = False
+    sealed_prev: Optional[KlineRow] = None
+    gap_repair_reason: Optional[str] = None
 
-        should_apply, sealed_prev = _plan_kline_update_strict(
-            buf,
-            row,
-            interval=iv,
-            quote_volume=q,
-            prev_quote_volume=prev_quote_volume,
-            context=f"ws_kline[{sym}:{iv}]",
+    for attempt in range(1, _KLINE_GAP_REPAIR_MAX_ATTEMPTS + 2):
+        with _kline_lock:
+            buf = _kline_buffers.setdefault(key, [])
+            prev_q_entry = _kline_last_quote_volume.get(key)
+            prev_quote_volume: Optional[float] = None
+            if prev_q_entry is not None and int(prev_q_entry[0]) == int(buf[-1][0] if buf else ts):
+                prev_quote_volume = float(prev_q_entry[1])
+
+            should_apply, sealed_prev, gap_repair_reason = _plan_kline_update_strict(
+                buf,
+                row,
+                interval=iv,
+                quote_volume=q,
+                prev_quote_volume=prev_quote_volume,
+                context=f"ws_kline[{sym}:{iv}]",
+            )
+            repair_limit = max(len(buf), _min_buffer_for_interval(iv), 2)
+
+        if gap_repair_reason is None:
+            break
+
+        if attempt > _KLINE_GAP_REPAIR_MAX_ATTEMPTS:
+            raise WSProtocolError(
+                f"{gap_repair_reason} | repair_attempts_exceeded={_KLINE_GAP_REPAIR_MAX_ATTEMPTS}"
+            )
+
+        _repair_kline_gap_from_rest_or_raise(
+            sym,
+            iv,
+            min_limit=repair_limit,
+            reason=gap_repair_reason,
         )
 
     if sealed_prev is not None:
-        sealed_quote_volume = prev_quote_volume
-        if sealed_quote_volume is None:
+        if prev_quote_volume is None:
             raise WSProtocolError(
                 f"ws_kline[{sym}:{iv}] rollover close missing previous quote_volume tracking (STRICT)"
             )
@@ -258,7 +361,7 @@ def _push_kline(symbol: str, interval: str, kline_obj: Dict[str, Any]) -> None:
             low=float(sealed_prev[3]),
             close=float(sealed_prev[4]),
             volume=float(sealed_prev[5]),
-            quote_volume=float(sealed_quote_volume),
+            quote_volume=float(prev_quote_volume),
             is_closed=True,
         )
 
