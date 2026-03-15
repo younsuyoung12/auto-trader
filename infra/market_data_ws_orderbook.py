@@ -26,11 +26,17 @@ CHANGE HISTORY:
      fatal 처리하지 않고 bootstrap 종료 후 다음 live event 로 회복 가능하게 정리
   4) FEAT(OBSERVABILITY): state.resync_reason / state.last_resync_ts 를 추가해
      watchdog / telemetry 에서 recovery 문맥을 추적 가능화
+  5) FIX(ROOT-CAUSE): resync 시 REST bootstrap 을 동일 WS callback 스레드에서 동기 수행하지 않고
+     background bootstrap worker 로 분리
+  6) FIX(RECOVERY): bootstrap worker 실행 중 들어오는 diff-depth 이벤트를 placeholder pending queue 에
+     적재할 수 있도록 구조 보강
 ========================================================
 """
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .market_data_store import save_orderbook_from_ws
@@ -53,6 +59,12 @@ from .market_data_ws_shared import (
     _rest_fetch_depth_snapshot_strict,
     log,
 )
+
+_ORDERBOOK_BOOTSTRAP_RETRY_SEC: float = 0.5
+_ORDERBOOK_BOOTSTRAP_MAX_RETRIES: int = 3
+
+_ORDERBOOK_BOOTSTRAP_INFLIGHT: set[str] = set()
+_ORDERBOOK_BOOTSTRAP_INFLIGHT_LOCK = threading.Lock()
 
 
 class OrderbookResyncRequired(RuntimeError):
@@ -581,6 +593,68 @@ def _bootstrap_orderbook_from_rest_snapshot_strict(symbol: str) -> None:
         )
 
 
+def _run_orderbook_bootstrap_worker(symbol: str) -> None:
+    sym = _normalize_symbol(symbol)
+    try:
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, _ORDERBOOK_BOOTSTRAP_MAX_RETRIES + 1):
+            try:
+                _bootstrap_orderbook_from_rest_snapshot_strict(sym)
+                return
+            except Exception as e:
+                last_error = e
+                log(
+                    f"[MD_BINANCE_WS][ORDERBOOK][BOOTSTRAP_WORKER_FAIL] "
+                    f"symbol={sym} attempt={attempt}/{_ORDERBOOK_BOOTSTRAP_MAX_RETRIES} "
+                    f"error={type(e).__name__}: {e}"
+                )
+                if attempt >= _ORDERBOOK_BOOTSTRAP_MAX_RETRIES:
+                    break
+                time.sleep(_ORDERBOOK_BOOTSTRAP_RETRY_SEC)
+
+        if last_error is not None:
+            log(
+                f"[MD_BINANCE_WS][ORDERBOOK][BOOTSTRAP_WORKER_GIVEUP] "
+                f"symbol={sym} error={type(last_error).__name__}: {last_error}"
+            )
+    finally:
+        with _ORDERBOOK_BOOTSTRAP_INFLIGHT_LOCK:
+            _ORDERBOOK_BOOTSTRAP_INFLIGHT.discard(sym)
+
+
+def _start_async_orderbook_bootstrap_if_needed(symbol: str, *, reason: str) -> None:
+    sym = _normalize_symbol(symbol)
+    if not sym:
+        raise WSProtocolError("symbol is required for async orderbook bootstrap (STRICT)")
+
+    with _ORDERBOOK_BOOTSTRAP_INFLIGHT_LOCK:
+        if sym in _ORDERBOOK_BOOTSTRAP_INFLIGHT:
+            log(
+                f"[MD_BINANCE_WS][ORDERBOOK][BOOTSTRAP_WORKER_SKIP] "
+                f"symbol={sym} reason={reason} already_inflight=True"
+            )
+            return
+        _ORDERBOOK_BOOTSTRAP_INFLIGHT.add(sym)
+
+    th = threading.Thread(
+        target=_run_orderbook_bootstrap_worker,
+        args=(sym,),
+        name=f"md-orderbook-bootstrap-{sym}",
+        daemon=True,
+    )
+    try:
+        th.start()
+    except Exception:
+        with _ORDERBOOK_BOOTSTRAP_INFLIGHT_LOCK:
+            _ORDERBOOK_BOOTSTRAP_INFLIGHT.discard(sym)
+        raise
+
+    log(
+        f"[MD_BINANCE_WS][ORDERBOOK][BOOTSTRAP_WORKER_START] "
+        f"symbol={sym} reason={reason}"
+    )
+
+
 def _resync_orderbook_from_event_or_raise(symbol: str, *, event: Dict[str, Any], reason: str) -> None:
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -594,7 +668,7 @@ def _resync_orderbook_from_event_or_raise(symbol: str, *, event: Dict[str, Any],
         )
 
     log(f"[MD_BINANCE_WS][ORDERBOOK][RESYNC] symbol={sym} reason={reason}")
-    _bootstrap_orderbook_from_rest_snapshot_strict(sym)
+    _start_async_orderbook_bootstrap_if_needed(sym, reason=reason)
 
 
 def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
@@ -654,7 +728,7 @@ def _push_orderbook(symbol: str, payload: Dict[str, Any]) -> None:
     if need_resync:
         assert resync_reason is not None
         log(f"[MD_BINANCE_WS][ORDERBOOK][RESYNC_TRIGGER] symbol={sym} reason={resync_reason}")
-        _bootstrap_orderbook_from_rest_snapshot_strict(sym)
+        _start_async_orderbook_bootstrap_if_needed(sym, reason=resync_reason)
         return
 
 

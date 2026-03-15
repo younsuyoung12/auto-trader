@@ -27,6 +27,12 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 --------------------------------------------------------
+- 2026-03-15:
+  1) FIX(ARCH): preflight→runtime handoff helper 추가
+  2) FIX(CONTRACT): core.run_bot_ws.main callable 계약을 handoff 시점에 strict 검증
+  3) FIX(ARCH): run_bot_ws 의 preflight 역참조 제거와 정합되도록 단방향 handoff 유지
+  4) FIX(ROOT-CAUSE): WS ready 직후 orderbook recovery/resync 안정화 대기 단계 추가
+  5) FIX(BOOT): orderbook snapshot 존재와 orderbook 안정화 상태를 분리 검증하도록 강화
 - 2026-03-14:
   1) FIX(ROOT-CAUSE): GPT_PING max_tokens 하드코딩(512) 제거 → settings.openai_max_tokens SSOT 사용
   2) FIX(OPERABILITY): GPT ping JSON 스키마를 최소화하여 max_output_tokens false fail 가능성 축소
@@ -56,6 +62,7 @@ CHANGE HISTORY:
 from __future__ import annotations
 
 import argparse
+import importlib
 import math
 import os
 import socket
@@ -135,6 +142,11 @@ PREFLIGHT_REASON_DETAIL = "PREFLIGHT_EXECUTION_PROBE"
 PREFLIGHT_STAGE_NAME = "EXECUTION_DRY_RUN"
 
 META_L3_STAGE_NAME = "META_L3_OBSERVABILITY"
+
+PREFLIGHT_ORDERBOOK_STABILIZE_MIN_SEC: float = 3.0
+PREFLIGHT_ORDERBOOK_STABILIZE_CONFIRM_N: int = 3
+PREFLIGHT_ORDERBOOK_STABILIZE_TIMEOUT_SEC: float = 8.0
+PREFLIGHT_ORDERBOOK_STABILIZE_POLL_SEC: float = 0.5
 
 
 class PreflightError(RuntimeError):
@@ -420,6 +432,37 @@ def _validate_kline_rows_strict(rows: List[List[Any]], *, name: str, min_len: in
             raise PreflightError(f"{name}[{i}] volume<0 (STRICT)")
 
 
+def _wait_for_stable_orderbook_or_raise(symbol: str) -> None:
+    symbol_norm = _require_nonempty_str(symbol, "symbol").replace("-", "").replace("/", "").upper().strip()
+    deadline = time.time() + PREFLIGHT_ORDERBOOK_STABILIZE_TIMEOUT_SEC
+    started_at = time.time()
+    consecutive_ok = 0
+
+    while True:
+        ob = ws_get_orderbook(symbol_norm, limit=5)
+        ok_ob = isinstance(ob, dict) and bool(ob.get("bids")) and bool(ob.get("asks"))
+
+        if ok_ob:
+            consecutive_ok += 1
+        else:
+            consecutive_ok = 0
+
+        elapsed = time.time() - started_at
+        if (
+            elapsed >= PREFLIGHT_ORDERBOOK_STABILIZE_MIN_SEC
+            and consecutive_ok >= PREFLIGHT_ORDERBOOK_STABILIZE_CONFIRM_N
+        ):
+            return
+
+        if time.time() >= deadline:
+            raise PreflightError(
+                "WS orderbook snapshot did not stabilize after bootstrap "
+                f"(STRICT): waited={elapsed:.1f}s confirm_n={consecutive_ok}"
+            )
+
+        time.sleep(PREFLIGHT_ORDERBOOK_STABILIZE_POLL_SEC)
+
+
 def _stage_bootstrap_ws_strict() -> PreflightBoot:
     symbol = str(SET.symbol).replace("-", "").replace("/", "").upper().strip()
     if not symbol:
@@ -459,6 +502,8 @@ def _stage_bootstrap_ws_strict() -> PreflightBoot:
         if time.time() >= deadline:
             raise PreflightError("WS not ready within deadline (STRICT)")
         time.sleep(0.5)
+
+    _wait_for_stable_orderbook_or_raise(symbol)
 
     ob = ws_get_orderbook(symbol, limit=5)
     try:
@@ -1026,6 +1071,20 @@ def _stage_execution_dry_run_strict(sig: Signal) -> None:
     )
 
 
+def _handoff_to_runtime_or_raise() -> None:
+    try:
+        runtime_mod = importlib.import_module("core.run_bot_ws")
+    except Exception as e:
+        raise PreflightError(f"runtime handoff import failed (STRICT): {_sanitize_err(e)}") from e
+
+    runtime_main = getattr(runtime_mod, "main", None)
+    if not callable(runtime_main):
+        raise PreflightError("core.run_bot_ws.main missing/not-callable (STRICT)")
+
+    log("[PRE-FLIGHT] handoff -> core.run_bot_ws.main()")
+    runtime_main()
+
+
 def run_preflight(*, preflight_only: bool) -> None:
     host = socket.gethostname()
     log(f"[PRE-FLIGHT] start host={host} utc={_utc_now().isoformat()} pid={os.getpid()}")
@@ -1095,10 +1154,7 @@ def run_preflight(*, preflight_only: bool) -> None:
         log("[PRE-FLIGHT] preflight_only=True -> exit without starting run_bot_ws")
         return
 
-    import core.run_bot_ws as rb
-
-    log("[PRE-FLIGHT] handoff -> core.run_bot_ws.main()")
-    rb.main()
+    _handoff_to_runtime_or_raise()
 
 
 def main() -> None:

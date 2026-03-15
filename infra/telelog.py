@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 ========================================================
 FILE: infra/telelog.py
-STRICT · NO-FALLBACK · IMPORT-SAFE
+STRICT · NO-FALLBACK · TRADE-GRADE · IMPORT-SAFE
 ========================================================
 역할:
 - 콘솔 로그 출력
@@ -13,20 +13,32 @@ STRICT · NO-FALLBACK · IMPORT-SAFE
 
 중요 원칙(STRICT):
 - import 시점에 settings.load_settings() 호출 금지 (IMPORT-SAFE)
+- settings.py SSOT 사용
 - 민감정보(키/토큰/시크릿) 로그 출력 금지
 - 텔레그램 전송 실패/네트워크 오류는 봇 전체를 멈추게 하지 않는다(유틸 보호)
 - 파일 로그 쓰기 실패도 봇을 멈추게 하지 않는다(유틸 보호)
 - print() 금지 / logging 사용
-- env-first 정책 유지 (이 파일은 운영 유틸 예외 모듈)
+- silent fail 금지, 단 유틸 보호 예외는 surface 후 엔진은 계속 운용한다
 
 설정 소스:
-- 환경변수(env-first)만 사용한다.
-  - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  - LOG_TO_FILE (true/false), LOG_FILE
-  - SKIP_TG_COOLDOWN_SEC, BALANCE_SKIP_COOLDOWN_SEC
-  - TELEGRAM_TIMEOUT_SEC
+- settings.SETTINGS 만 사용한다.
+  - telegram_bot_token
+  - telegram_chat_id
+  - log_to_file
+  - log_file
+  - request_timeout_sec
+
+주의:
+- 현재 settings.py 에 skip telegram cooldown 전용 필드가 없으므로
+  운영 상수로 명시 고정한다(숨은 fallback 아님, 코드상 명시 정책).
 
 변경 이력:
+- 2026-03-15
+  1) FIX(SSOT): os.environ 직접 접근 제거 → settings.SETTINGS lazy access 로 통일
+  2) FIX(IMPORT-SAFE): import 시 settings.load_settings() 호출 없이 lazy import helper 추가
+  3) FIX(LOGGING): 파일 로그 경로 생성 로직을 pathlib 기반으로 정리
+  4) FIX(CONTRACT): telegram timeout 을 settings.request_timeout_sec 계약으로 통일
+  5) FIX(STRUCTURE): env-first 설명 제거, settings SSOT 정책으로 문서화 정합 복구
 - 2026-03-13
   1) FIX(LOGGING): print() 제거, logging 기반 콘솔/파일 로그로 전환
   2) FIX(CONCURRENCY): LAST_SKIP_TG 접근에 RLock 적용
@@ -44,17 +56,23 @@ STRICT · NO-FALLBACK · IMPORT-SAFE
 """
 
 import logging
-import os
 import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from importlib import import_module
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
 
 # KST(UTC+9) — 호환용으로 제공
 KST = timezone(timedelta(hours=9))
+
+# settings 에 전용 필드가 아직 없어 운영 상수로 명시 고정
+DEFAULT_SKIP_TG_COOLDOWN_SEC = 30.0
+BALANCE_SKIP_TG_COOLDOWN_SEC = 3600.0
+RANGE_BLOCK_SKIP_TG_COOLDOWN_SEC = 3600.0
 
 # 스킵 텔레그램 쿨다운 관리용 딕셔너리
 # key: reason 문자열, value: 마지막으로 이 reason 을 전송한 epoch 시각(float)
@@ -71,37 +89,59 @@ _STATE_LOCK = threading.RLock()
 
 
 # ─────────────────────────────────────────────────────
-# env helpers (STRICT: 타입 파싱 실패 시 예외)
+# settings helpers (STRICT / IMPORT-SAFE / LAZY)
 # ─────────────────────────────────────────────────────
-def _env_str(key: str, default: str = "") -> str:
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    vv = str(v).strip()
-    return vv if vv != "" else default
-
-
-def _env_bool(key: str, default: bool = False) -> bool:
-    v = os.environ.get(key)
-    if v is None:
-        return default
-    vv = str(v).strip().lower()
-    if vv in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if vv in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise RuntimeError(f"invalid bool env: {key}")
-
-
-def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key)
-    if v is None or str(v).strip() == "":
-        return default
+def _get_settings() -> Any:
     try:
-        out = float(str(v).strip())
+        mod = import_module("settings")
     except Exception as e:
-        raise RuntimeError(f"invalid float env: {key}") from e
+        raise RuntimeError(f"settings import failed (STRICT): {type(e).__name__}: {e}") from e
+
+    if not hasattr(mod, "SETTINGS"):
+        raise RuntimeError("settings.SETTINGS missing (STRICT)")
+
+    settings_obj = getattr(mod, "SETTINGS")
+    if settings_obj is None:
+        raise RuntimeError("settings.SETTINGS is None (STRICT)")
+    return settings_obj
+
+
+def _settings_attr(name: str) -> Any:
+    settings_obj = _get_settings()
+    if not hasattr(settings_obj, name):
+        raise RuntimeError(f"settings.{name} missing (STRICT)")
+    value = getattr(settings_obj, name)
+    if value is None:
+        raise RuntimeError(f"settings.{name} is None (STRICT)")
+    return value
+
+
+def _settings_str(name: str, *, allow_empty: bool = False) -> str:
+    value = _settings_attr(name)
+    out = str(value).strip()
+    if not allow_empty and out == "":
+        raise RuntimeError(f"settings.{name} is empty (STRICT)")
     return out
+
+
+def _settings_bool(name: str) -> bool:
+    value = _settings_attr(name)
+    if not isinstance(value, bool):
+        raise RuntimeError(f"settings.{name} must be bool (STRICT)")
+    return bool(value)
+
+
+def _settings_float(name: str, *, min_value: Optional[float] = None) -> float:
+    value = _settings_attr(name)
+    if isinstance(value, bool):
+        raise RuntimeError(f"settings.{name} must be numeric (bool not allowed)")
+    try:
+        out = float(value)
+    except Exception as e:
+        raise RuntimeError(f"settings.{name} must be numeric (STRICT): {e}") from e
+    if min_value is not None and out < min_value:
+        raise RuntimeError(f"settings.{name} must be >= {min_value} (STRICT)")
+    return float(out)
 
 
 # ─────────────────────────────────────────────────────
@@ -118,8 +158,8 @@ def _ensure_logger_configured() -> None:
             _LOGGER.addHandler(stream_handler)
             _STREAM_HANDLER_INSTALLED = True
 
-        log_to_file = _env_bool("LOG_TO_FILE", False)
-        desired_path = _env_str("LOG_FILE", "logs/bot.log") if log_to_file else None
+        log_to_file = _settings_bool("log_to_file")
+        desired_path = _settings_str("log_file", allow_empty=False) if log_to_file else None
 
         if _FILE_HANDLER_PATH == desired_path:
             return
@@ -139,15 +179,22 @@ def _ensure_logger_configured() -> None:
             return
 
         try:
-            os.makedirs(os.path.dirname(desired_path) or ".", exist_ok=True)
-            file_handler = logging.FileHandler(desired_path, encoding="utf-8")
+            path_obj = Path(desired_path)
+            if path_obj.parent != Path(""):
+                path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+            file_handler = logging.FileHandler(path_obj, encoding="utf-8")
             file_handler.setLevel(logging.INFO)
             file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
             _LOGGER.addHandler(file_handler)
-            _FILE_HANDLER_PATH = desired_path
-        except Exception:
-            # 유틸 보호: 파일 로그 실패로 봇을 멈추지 않는다.
+            _FILE_HANDLER_PATH = str(path_obj)
+        except Exception as e:
+            # 유틸 보호: 파일 로그 실패로 엔진을 멈추지 않는다.
             _FILE_HANDLER_PATH = None
+            try:
+                _LOGGER.error(f"[TELELOG][FILE_HANDLER_ERROR] {type(e).__name__}: {e}")
+            except Exception:
+                pass
 
 
 def log(msg: str) -> None:
@@ -160,9 +207,12 @@ def log(msg: str) -> None:
     """
     try:
         _ensure_logger_configured()
-    except Exception:
+    except Exception as e:
         # logger configure 실패도 유틸 보호
-        pass
+        try:
+            _LOGGER.error(f"[TELELOG][CONFIG_ERROR] {type(e).__name__}: {e}")
+        except Exception:
+            pass
 
     line = str(msg if isinstance(msg, str) else repr(msg))
     try:
@@ -597,14 +647,20 @@ def send_tg(text: str) -> None:
 
     STRICT POLICY:
     - 텔레그램 실패로 엔진 중단 금지
-    - 토큰 없으면 콘솔 로그 fallback
+    - token/chat_id 없으면 콘솔 로그만 남김
     - HTTP 오류는 로그만 남김
     """
 
-    bot_token = _env_str("TELEGRAM_BOT_TOKEN", "")
-    chat_id = _env_str("TELEGRAM_CHAT_ID", "")
-
     final_text = _humanize_telegram_text(text)
+
+    try:
+        bot_token = _settings_str("telegram_bot_token", allow_empty=True)
+        chat_id = _settings_str("telegram_chat_id", allow_empty=True)
+        timeout_sec = _settings_float("request_timeout_sec", min_value=0.001)
+    except Exception as e:
+        log(f"[TG SETTINGS ERROR] {type(e).__name__}: {e}")
+        log("[TG DISABLED] " + final_text)
+        return
 
     # 토큰 없는 경우
     if not bot_token or not chat_id:
@@ -619,7 +675,7 @@ def send_tg(text: str) -> None:
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=8)
+        resp = requests.post(url, json=payload, timeout=timeout_sec)
 
         # 성공
         if resp.status_code == 200:
@@ -645,6 +701,7 @@ def send_tg(text: str) -> None:
 
     except Exception as e:
         log(f"[TG ERROR] {type(e).__name__}: {e}")
+
 
 def send_structured_tg(
     *,
@@ -705,17 +762,14 @@ def send_skip_tg(reason: str) -> None:
 
     now = time.time()
 
-    default_skip_cooldown = _env_float("SKIP_TG_COOLDOWN_SEC", 30.0)
-    balance_skip_cooldown = _env_float("BALANCE_SKIP_COOLDOWN_SEC", 3600.0)
-
     if reason.startswith("[BALANCE_SKIP]"):
-        cooldown = balance_skip_cooldown
+        cooldown = BALANCE_SKIP_TG_COOLDOWN_SEC
         title = "스킵 / 잔고"
     elif "range_blocked_today" in reason:
-        cooldown = 3600.0
+        cooldown = RANGE_BLOCK_SKIP_TG_COOLDOWN_SEC
         title = "스킵 / 박스장 차단"
     else:
-        cooldown = default_skip_cooldown
+        cooldown = DEFAULT_SKIP_TG_COOLDOWN_SEC
         title = "스킵"
 
     with _STATE_LOCK:

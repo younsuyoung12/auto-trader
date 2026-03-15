@@ -27,6 +27,11 @@ IMPORTANT POLICY:
 - entry circuit breaker 는 신규 진입 차단용이며 강제 청산/정리 경로를 막으면 안 된다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(STRICT): exchange payload dict.get(..., default) 기반 은닉 정규화 제거
+  2) FIX(CONTRACT): open order / protection order / position row 핵심 필드 strict 검증 helper 추가
+  3) FIX(RISK): 보호주문/청산 검증 경로에서 symbol/side/type/positionSide/reduceOnly/closePosition/orderId/positionAmt 필드 존재 강제
+  4) KEEP(ARCH): entry circuit breaker 구조 유지, 강제 청산 경로 비차단 유지
 - 2026-03-14:
   1) FEAT(CIRCUIT-BREAKER): 반복 엔트리 제출/체결/포지션반영/보호주문 검증 실패를 누적하는 entry circuit breaker 추가
   2) FEAT(CIRCUIT-BREAKER): breaker open 상태에서는 open_position_with_tp_sl 신규 진입을 즉시 차단
@@ -347,6 +352,40 @@ def _require_positive_float(v: Any, name: str) -> float:
     if f <= 0:
         raise ValueError(f"{name} must be > 0")
     return f
+
+
+def _require_dict_key_strict(d: Dict[str, Any], key: str, ctx: str) -> Any:
+    if not isinstance(d, dict):
+        raise OrderExecutionError(f"{ctx} must be dict (STRICT)")
+    if key not in d:
+        raise OrderExecutionError(f"{ctx}.{key} missing (STRICT)")
+    v = d[key]
+    if v is None:
+        raise OrderExecutionError(f"{ctx}.{key} is None (STRICT)")
+    return v
+
+
+def _require_bool_dict_key_strict(d: Dict[str, Any], key: str, ctx: str) -> bool:
+    v = _require_dict_key_strict(d, key, ctx)
+    if not isinstance(v, bool):
+        raise OrderExecutionError(f"{ctx}.{key} must be bool (STRICT)")
+    return bool(v)
+
+
+def _require_symbol_from_row_strict(row: Dict[str, Any], ctx: str) -> str:
+    return _normalize_symbol(str(_require_dict_key_strict(row, "symbol", ctx)))
+
+
+def _require_side_from_row_strict(row: Dict[str, Any], ctx: str) -> str:
+    return _normalize_side(str(_require_dict_key_strict(row, "side", ctx)))
+
+
+def _require_position_side_from_row_strict(row: Dict[str, Any], ctx: str) -> str:
+    return _normalize_position_side(str(_require_dict_key_strict(row, "positionSide", ctx)))
+
+
+def _require_order_id_from_row_strict(row: Dict[str, Any], ctx: str) -> str:
+    return str(_require_dict_key_strict(row, "orderId", ctx)).strip()
 
 
 def _get_allocation_ratio_for_log(settings: Any) -> Optional[float]:
@@ -866,7 +905,8 @@ def _find_open_order_by_client_id(symbol: str, client_order_id: str) -> Optional
     for o in orders:
         if not isinstance(o, dict):
             raise RuntimeError("openOrders contains non-dict (STRICT)")
-        if str(o.get("clientOrderId", "")).strip() == client_order_id:
+        row_cid = str(_require_dict_key_strict(o, "clientOrderId", "open_order")).strip()
+        if row_cid == client_order_id:
             return o
     return None
 
@@ -878,10 +918,8 @@ def _find_open_order_by_id(symbol: str, order_id: str) -> Optional[Dict[str, Any
     for o in orders:
         if not isinstance(o, dict):
             raise RuntimeError("openOrders contains non-dict (STRICT)")
-        oid = o.get("orderId")
-        if oid is None:
-            raise RuntimeError("openOrders row missing orderId (STRICT)")
-        if str(oid).strip() == str(order_id).strip():
+        oid = _require_order_id_from_row_strict(o, "open_order")
+        if oid == str(order_id).strip():
             return o
     return None
 
@@ -1416,10 +1454,7 @@ def _verify_position_reflects_execution_strict(
         if not isinstance(pos, dict):
             raise PositionVerificationError("get_position returned non-dict (STRICT)")
 
-        if "positionAmt" not in pos:
-            raise PositionVerificationError("position missing positionAmt (STRICT)")
-
-        amt = _require_decimal(pos.get("positionAmt"), name="position.positionAmt")
+        amt = _require_decimal(_require_dict_key_strict(pos, "positionAmt", "position"), name="position.positionAmt")
         last_amt = amt
 
         if side_u == "BUY":
@@ -1452,15 +1487,23 @@ def _normalize_order_status_strict(v: Any) -> str:
 
 
 def _normalize_order_position_side_from_row(order: Dict[str, Any]) -> str:
-    return _normalize_position_side(order.get("positionSide"))
+    return _require_position_side_from_row_strict(order, "order")
 
 
 def _is_protection_order_row(order: Dict[str, Any]) -> bool:
     if not isinstance(order, dict):
         raise ProtectionOrderVerificationError("order must be dict (STRICT)")
-    type_u = str(order.get("type") or order.get("origType") or "").upper().strip()
-    reduce_only = bool(order.get("reduceOnly", False))
-    close_position = bool(order.get("closePosition", False))
+
+    if "type" in order and order.get("type") is not None:
+        type_raw = order["type"]
+    elif "origType" in order and order.get("origType") is not None:
+        type_raw = order["origType"]
+    else:
+        raise ProtectionOrderVerificationError("order.type/origType missing (STRICT)")
+
+    type_u = str(type_raw).upper().strip()
+    reduce_only = _require_bool_dict_key_strict(order, "reduceOnly", "order")
+    close_position = _require_bool_dict_key_strict(order, "closePosition", "order")
     is_protection_type = type_u in {"STOP_MARKET", "TAKE_PROFIT_MARKET"}
     return reduce_only or close_position or is_protection_type
 
@@ -1484,24 +1527,22 @@ def _list_open_protection_orders_strict(
         if not isinstance(row, dict):
             raise ProtectionOrderVerificationError("open order row must be dict (STRICT)")
 
-        row_symbol = _normalize_symbol(str(row.get("symbol") or ""))
+        row_symbol = _require_symbol_from_row_strict(row, "open_order")
         if row_symbol != sym:
             continue
 
         if not _is_protection_order_row(row):
             continue
 
-        row_side = _normalize_side(str(row.get("side") or ""))
-        row_pos_side = _normalize_order_position_side_from_row(row)
+        row_side = _require_side_from_row_strict(row, "open_order")
+        row_pos_side = _require_position_side_from_row_strict(row, "open_order")
 
         if side_n is not None and row_side != side_n:
             continue
         if pos_side_n is not None and row_pos_side != pos_side_n:
             continue
 
-        order_id = row.get("orderId")
-        if order_id is None or not str(order_id).strip():
-            raise ProtectionOrderVerificationError("protection order missing orderId (STRICT)")
+        _ = _require_order_id_from_row_strict(row, "open_order")
         out.append(row)
 
     return out
@@ -1525,7 +1566,7 @@ def _wait_protection_orders_absent_strict(
             return
 
         if time.time() >= deadline:
-            ids = [str(r.get("orderId")) for r in remaining]
+            ids = [_require_order_id_from_row_strict(r, "open_order") for r in remaining]
             raise ProtectionOrderVerificationError(
                 f"protection orders still visible after cancel deadline (orderIds={ids})"
             )
@@ -1548,9 +1589,7 @@ def _cancel_open_protection_orders_strict(
 
     canceled_ids: List[str] = []
     for row in rows:
-        order_id = row.get("orderId")
-        if order_id is None or not str(order_id).strip():
-            raise ProtectionOrderVerificationError("protection order missing orderId during cancel (STRICT)")
+        order_id = _require_order_id_from_row_strict(row, "open_order")
         cancel_order_safe(symbol, str(order_id), settings=settings)
         canceled_ids.append(str(order_id))
 
@@ -1619,29 +1658,27 @@ def _validate_protection_order_shape_strict(
     if not isinstance(order, dict):
         raise ProtectionOrderVerificationError("protection order must be dict (STRICT)")
 
-    order_symbol = _normalize_symbol(order.get("symbol", ""))
+    order_symbol = _require_symbol_from_row_strict(order, "protection_order")
     if order_symbol != _normalize_symbol(symbol):
         raise ProtectionOrderVerificationError(
             f"protection order symbol mismatch (STRICT): got={order_symbol} expected={symbol}"
         )
 
-    order_id = order.get("orderId")
-    if order_id is None or not str(order_id).strip():
-        raise ProtectionOrderVerificationError("protection order missing orderId (STRICT)")
+    order_id = _require_order_id_from_row_strict(order, "protection_order")
 
-    side = str(order.get("side") or "").upper().strip()
+    side = _require_side_from_row_strict(order, "protection_order")
     if side != _normalize_side(expected_side):
         raise ProtectionOrderVerificationError(
             f"protection order side mismatch (STRICT): got={side} expected={_normalize_side(expected_side)}"
         )
 
-    order_type = str(order.get("type") or "").upper().strip()
+    order_type = str(_require_dict_key_strict(order, "type", "protection_order")).upper().strip()
     if order_type != str(expected_type).upper().strip():
         raise ProtectionOrderVerificationError(
             f"protection order type mismatch (STRICT): got={order_type} expected={str(expected_type).upper().strip()}"
         )
 
-    status = _normalize_order_status_strict(order.get("status"))
+    status = _normalize_order_status_strict(_require_dict_key_strict(order, "status", "protection_order"))
     if status in {"CANCELED", "EXPIRED", "REJECTED"}:
         raise ProtectionOrderVerificationError(
             f"protection order terminal status (STRICT): orderId={order_id} status={status}"
@@ -1651,19 +1688,19 @@ def _validate_protection_order_shape_strict(
             f"unexpected protection order status (STRICT): orderId={order_id} status={status}"
         )
 
-    position_side = str(order.get("positionSide") or "").upper().strip() or "BOTH"
+    position_side = _require_position_side_from_row_strict(order, "protection_order")
     if position_side != _normalize_position_side(expected_position_side):
         raise ProtectionOrderVerificationError(
             f"protection order positionSide mismatch (STRICT): got={position_side} expected={_normalize_position_side(expected_position_side)}"
         )
 
-    reduce_only = bool(order.get("reduceOnly", False))
-    close_position = bool(order.get("closePosition", False))
+    reduce_only = _require_bool_dict_key_strict(order, "reduceOnly", "protection_order")
+    close_position = _require_bool_dict_key_strict(order, "closePosition", "protection_order")
     if not reduce_only and not close_position:
         raise ProtectionOrderVerificationError("protection order must be reduceOnly or closePosition (STRICT)")
 
     if expected_client_order_id is not None:
-        cid = str(order.get("clientOrderId") or "").strip()
+        cid = str(_require_dict_key_strict(order, "clientOrderId", "protection_order")).strip()
         if cid != str(expected_client_order_id).strip():
             raise ProtectionOrderVerificationError(
                 f"protection order clientOrderId mismatch (STRICT): got={cid!r} expected={str(expected_client_order_id).strip()!r}"
@@ -1768,15 +1805,15 @@ def _verify_position_closed_strict(
             if not isinstance(row, dict):
                 raise PositionVerificationError("open position row must be dict (STRICT)")
 
-            row_symbol = _normalize_symbol(str(row.get("symbol") or ""))
+            row_symbol = _require_symbol_from_row_strict(row, "position")
             if row_symbol != sym:
                 continue
 
-            row_pos_side = _normalize_position_side(row.get("positionSide"))
+            row_pos_side = _require_position_side_from_row_strict(row, "position")
             if row_pos_side != pos_side_u:
                 continue
 
-            amt = _require_decimal(row.get("positionAmt"), name="position.positionAmt")
+            amt = _require_decimal(_require_dict_key_strict(row, "positionAmt", "position"), name="position.positionAmt")
             last_amt = amt
             if _decimal_abs(amt) > tol:
                 still_open = True
@@ -2354,22 +2391,18 @@ def close_all_positions_market(
     for p in positions:
         if not isinstance(p, dict):
             raise RuntimeError("position item is not a dict")
-        if str(p.get("symbol") or "").upper() != sym:
+
+        row_symbol = _require_symbol_from_row_strict(p, "position")
+        if row_symbol != sym:
             continue
 
-        if "positionAmt" not in p:
-            raise RuntimeError("position missing positionAmt")
-        amt_dec = _require_decimal(p.get("positionAmt"), name="position.positionAmt")
+        amt_dec = _require_decimal(_require_dict_key_strict(p, "positionAmt", "position"), name="position.positionAmt")
         abs_amt_dec = _decimal_abs(amt_dec)
 
         if abs_amt_dec <= zero_tol:
             continue
 
-        if "positionSide" not in p:
-            raise RuntimeError("position missing positionSide")
-        pos_side = str(p.get("positionSide") or "").upper().strip()
-        if pos_side not in ("BOTH", "LONG", "SHORT"):
-            raise RuntimeError(f"invalid positionSide: {pos_side!r}")
+        pos_side = _require_position_side_from_row_strict(p, "position")
 
         if pos_side in ("LONG", "SHORT"):
             direction = pos_side

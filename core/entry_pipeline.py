@@ -5,6 +5,9 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 ============================================================
 
 핵심 변경 요약
+- FIX(CONTRACT): runtime entry prerequisite 최소 캔들 계약을 preflight 와 정합화
+- FIX(SSOT): getattr(..., default) 제거, settings 필수 속성 strict access 로 통일
+- FIX(STRICT): notify/log callback 계약 검증 추가
 - FIX(ROOT-CAUSE): market_features_ws 의 양방향 후보 점수 계약과 entry_pipeline 정합화
 - FIX(STRUCTURE): 기존 단일 방향(direction_source old contract) 검증을
   candidate telemetry 기반 검증으로 확장
@@ -23,7 +26,7 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 - WS 버퍼 데이터만 사용한다.
 - None→0, 조용한 continue, 임의 보정 금지.
 - 필수 데이터 누락/손상 시 즉시 예외 또는 명시적 SKIP 처리.
-- bt_events 감사 로그 기록 실패는 조용히 무시하지 않고 즉시 예외 전파한다.
+- bt_events 감사 로그 기록 실패는 조용한 무시 없이 즉시 예외 전파한다.
 - 기존 run_bot_ws.py 의 로직을 분리만 하고 의미를 바꾸지 않는다.
 - LONG / SHORT 양방향 후보는 upstream 에서 동일 기준으로 계산되며,
   entry_pipeline 은 선택 결과와 telemetry 계약을 검증한다.
@@ -32,6 +35,13 @@ STRICT · NO-FALLBACK · TRADE-GRADE MODE
 
 변경 이력
 ------------------------------------------------------------
+- 2026-03-15:
+  1) FIX(CONTRACT): runtime entry prerequisite 최소 캔들 계약을 preflight 와 정합화
+     - 1m=120 / 5m=200 / 15m=200 / 1h=200 / 4h=200 으로 상향
+     - preflight / runtime 간 캔들 계약 불일치 제거
+  2) FIX(SSOT): getattr(..., default) 제거
+     - settings.symbol / tp_pct / sl_pct / entry_score_threshold 를 strict access 로 통일
+  3) FIX(STRICT): notify_entry_block_fn / log_fn callable 계약 검증 추가
 - 2026-03-12:
   1) FIX(ROOT-CAUSE): market_features_ws 양방향 후보 점수 계약과 정합화
      - extra.direction_candidates / long_score / short_score / selection_margin 계약 수용
@@ -111,7 +121,13 @@ from infra.market_data_ws import (
 from infra.market_features_ws import FeatureBuildError, get_trading_signal
 from strategy.unified_features_builder import UnifiedFeaturesError, build_unified_features
 
-ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {"1m": 60, "5m": 60, "15m": 60, "1h": 60, "4h": 60}
+ENTRY_REQUIRED_KLINES_MIN: Dict[str, int] = {
+    "1m": 120,
+    "5m": 200,
+    "15m": 200,
+    "1h": 200,
+    "4h": 200,
+}
 
 ORDERFLOW_BLOCK_DELTA_RATIO_PCT: float = 8.0
 OPTIONS_BEARISH_PCR_THRESHOLD: float = 1.20
@@ -191,6 +207,23 @@ def _require_nonempty_str(v: Any, name: str) -> str:
     if not s:
         raise RuntimeError(f"{name} must be non-empty string (STRICT)")
     return s
+
+
+def _require_setting_attr(settings: Any, attr_name: str) -> Any:
+    if settings is None:
+        raise RuntimeError("settings is required (STRICT)")
+    if not hasattr(settings, attr_name):
+        raise RuntimeError(f"settings.{attr_name} is required (STRICT)")
+    value = getattr(settings, attr_name)
+    if value is None:
+        raise RuntimeError(f"settings.{attr_name} is required (STRICT)")
+    return value
+
+
+def _require_callable(v: Any, name: str) -> Callable[..., Any]:
+    if not callable(v):
+        raise RuntimeError(f"{name} must be callable (STRICT)")
+    return v
 
 
 def _to_jsonable_strict(v: Any, name: str) -> Any:
@@ -336,8 +369,8 @@ def _normalize_directional_state_strict(v: Any, name: str) -> str:
 
 
 def _require_tp_sl_from_settings_or_extra(settings: Any, extra: Any) -> tuple[float, float]:
-    tp = _as_float(getattr(settings, "tp_pct", None), "settings.tp_pct", min_value=0.0, max_value=1.0)
-    sl = _as_float(getattr(settings, "sl_pct", None), "settings.sl_pct", min_value=0.0, max_value=1.0)
+    tp = _as_float(_require_setting_attr(settings, "tp_pct"), "settings.tp_pct", min_value=0.0, max_value=1.0)
+    sl = _as_float(_require_setting_attr(settings, "sl_pct"), "settings.sl_pct", min_value=0.0, max_value=1.0)
 
     if isinstance(extra, dict):
         if extra.get("tp_pct") is not None:
@@ -926,7 +959,7 @@ def _extract_runtime_decision_meta_strict(market_features: Dict[str, Any], setti
         max_value=1.0,
     )
     entry_score_threshold = _as_float(
-        getattr(settings, "entry_score_threshold", None),
+        _require_setting_attr(settings, "entry_score_threshold"),
         "settings.entry_score_threshold",
         min_value=0.0,
     )
@@ -1276,9 +1309,10 @@ def _build_entry_market_data(
     notify_entry_block_fn: Callable[[str, str, int], None],
     log_fn: Callable[[str], None],
 ) -> Optional[Dict[str, Any]]:
-    symbol = str(getattr(settings, "symbol", "")).strip()
-    if not symbol:
-        raise RuntimeError("settings.symbol is required")
+    _require_callable(notify_entry_block_fn, "notify_entry_block_fn")
+    _require_callable(log_fn, "log_fn")
+
+    symbol = _require_nonempty_str(_require_setting_attr(settings, "symbol"), "settings.symbol")
 
     try:
         signal_ctx = get_trading_signal(settings=settings, last_close_ts=last_close_ts, symbol=symbol)

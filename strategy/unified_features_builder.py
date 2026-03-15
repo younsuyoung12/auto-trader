@@ -33,6 +33,12 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 --------------------------------------------------------
+- 2026-03-15:
+  1) FIX(SSOT): getattr(..., default) 제거
+     - settings.symbol 접근을 strict helper로 통일
+     - microstructure config의 숨은 settings fallback 제거
+  2) FIX(ARCH): microstructure 설정은 내부 정책 상수만 사용하도록 정리
+  3) FIX(OPERABILITY): stale success cache hit 시 즉시 제거
 - 2026-03-11:
   1) FIX(ROOT-CAUSE): invariant 검증의 direction="LONG" 하드코딩 제거
   2) FIX(STRICT): unified_features 단계에서 LONG/SHORT 양방향 invariant 동시 검증 추가
@@ -215,6 +221,7 @@ def _get_success_cache(symbol: str, feature_name: str, ttl_sec: int) -> Optional
     age = time.time() - float(saved_at)
     if age <= float(ttl_sec):
         return payload
+    del _SUCCESS_CACHE[key]
     return None
 
 
@@ -230,6 +237,17 @@ def _require_nonempty_str(symbol: str, stage: str, v: Any, name: str) -> str:
     if s == "":
         _fail_unified(symbol, stage, f"{name} is required (empty)")
     return s
+
+
+def _require_setting_attr_strict(symbol: str, stage: str, settings: Any, attr_name: str) -> Any:
+    if settings is None:
+        _fail_unified(symbol, stage, "settings is required (STRICT)")
+    if not hasattr(settings, attr_name):
+        _fail_unified(symbol, stage, f"settings.{attr_name} missing (STRICT)")
+    value = getattr(settings, attr_name)
+    if value is None:
+        _fail_unified(symbol, stage, f"settings.{attr_name} is None (STRICT)")
+    return value
 
 
 def _require_dict(symbol: str, stage: str, v: Any, name: str) -> Dict[str, Any]:
@@ -1393,26 +1411,21 @@ def _compact_timeframes_for_output(symbol: str, timeframes: Dict[str, Any]) -> D
 
 
 def _load_microstructure_config(symbol: str) -> Tuple[str, int, int]:
-    period = str(getattr(SET, "microstructure_period", _MICRO_PERIOD_DEFAULT)).strip()
-    if not period:
-        _fail_unified(symbol, "microstructure.config", "microstructure_period is empty")
+    stage = "microstructure.config"
 
-    lookback_raw = getattr(SET, "microstructure_lookback", _MICRO_LOOKBACK_DEFAULT)
-    ttl_raw = getattr(SET, "microstructure_cache_ttl_sec", _MICRO_CACHE_TTL_SEC_DEFAULT)
+    period = _MICRO_PERIOD_DEFAULT
+    lookback = _MICRO_LOOKBACK_DEFAULT
+    ttl = _MICRO_CACHE_TTL_SEC_DEFAULT
 
-    try:
-        lookback = int(lookback_raw)
-    except Exception as e:
-        _fail_unified(symbol, "microstructure.config", f"microstructure_lookback must be int (got={lookback_raw!r})", e)
+    period = _require_nonempty_str(symbol, stage, period, "microstructure_period")
+    if period not in REQUIRED_TFS:
+        _fail_unified(symbol, stage, f"microstructure_period invalid (got={period!r})")
+
     if lookback < 2 or lookback > 500:
-        _fail_unified(symbol, "microstructure.config", f"microstructure_lookback out of range [2,500] (got={lookback})")
+        _fail_unified(symbol, stage, f"microstructure_lookback out of range [2,500] (got={lookback})")
 
-    try:
-        ttl = int(ttl_raw)
-    except Exception as e:
-        _fail_unified(symbol, "microstructure.config", f"microstructure_cache_ttl_sec must be int (got={ttl_raw!r})", e)
     if ttl <= 0 or ttl > 300:
-        _fail_unified(symbol, "microstructure.config", f"microstructure_cache_ttl_sec out of range [1,300] (got={ttl})")
+        _fail_unified(symbol, stage, f"microstructure_cache_ttl_sec out of range [1,300] (got={ttl})")
 
     return period, lookback, ttl
 
@@ -1612,10 +1625,7 @@ def _validate_unified_feature_invariants_strict(symbol: str, micro_score_risk: f
 
 def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if symbol is None:
-        try:
-            sym_raw = getattr(SET, "symbol")
-        except AttributeError as e:
-            _fail_unified("UNKNOWN", "symbol", "settings.symbol missing (STRICT)", e)
+        sym_raw = _require_setting_attr_strict("UNKNOWN", "symbol", SET, "symbol")
         sym = _require_nonempty_str("UNKNOWN", "symbol", sym_raw, "settings.symbol")
     else:
         sym = _require_nonempty_str("UNKNOWN", "symbol", symbol, "symbol")
@@ -1677,12 +1687,12 @@ def build_unified_features(symbol: Optional[str] = None) -> Dict[str, Any]:
     if msr < 0.0 or msr > 100.0:
         _fail_unified(sym, "microstructure", f"micro_score_risk out of range [0,100] (STRICT): {msr}")
 
-    if not hasattr(SET, "tp_pct") or not hasattr(SET, "sl_pct"):
-        _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct required for invariant check (STRICT)")
+    tp_pct_raw = _require_setting_attr_strict(sym, "settings", SET, "tp_pct")
+    sl_pct_raw = _require_setting_attr_strict(sym, "settings", SET, "sl_pct")
 
     try:
-        tp_pct = float(SET.tp_pct)
-        sl_pct = float(SET.sl_pct)
+        tp_pct = float(tp_pct_raw)
+        sl_pct = float(sl_pct_raw)
     except Exception as e:
         _fail_unified(sym, "settings", "settings.tp_pct/settings.sl_pct must be float-convertible (STRICT)", e)
 

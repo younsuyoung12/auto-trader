@@ -27,6 +27,12 @@ IMPORTANT POLICY:
 - position supervisor / reconcile 은 runtime loop 의 명시적 orchestration 슬롯으로만 실행한다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(ROOT-CAUSE): __main__ 에서 core.run_bot_preflight import 제거 → 순환 import 제거
+  2) FIX(STATE): SAFE_STOP_REQUESTED 전역 플래그 제거 → EngineLoopRuntime.safe_stop_requested 단일화
+  3) FIX(STATE): 외부 종료 요청(SIGTERM / watchdog / telegram / reconcile)은 runtime.request_safe_stop 또는 pre-runtime SIGTERM 상태로만 반영
+  4) FIX(BOOT): watchdog 시작 시점을 runtime 생성 이후로 이동
+  5) FIX(RELIABILITY): main() 시작 시 런타임 전역 상태 초기화 강화
 - 2026-03-14:
   1) FEAT(WIRING): position_supervisor 를 main runtime 에 정식 연결
   2) FEAT(WIRING): reconciliation_cycle_fn 을 engine_loop 신규 시그니처에 맞게 연결
@@ -112,7 +118,7 @@ from engine.cycles.exit_cycle import (
 
 SET = SETTINGS
 RUNNING: bool = True
-SAFE_STOP_REQUESTED: bool = False
+_ENGINE_RUNTIME: Optional[EngineLoopRuntime] = None
 
 SIGTERM_REQUESTED_AT: Optional[float] = None
 SIGTERM_DEADLINE_TS: Optional[float] = None
@@ -253,14 +259,40 @@ def _closed_trades_getter() -> Iterable[Dict[str, Any]]:
     return list(CLOSED_TRADES_CACHE)
 
 
-def _request_safe_stop(runtime: EngineLoopRuntime) -> None:
-    global SAFE_STOP_REQUESTED
-    SAFE_STOP_REQUESTED = True
-    runtime.safe_stop_requested = True
+def _request_safe_stop(runtime: EngineLoopRuntime, *, reason: str) -> None:
+    if not isinstance(runtime, EngineLoopRuntime):
+        raise RuntimeError(f"runtime must be EngineLoopRuntime (STRICT), got={type(runtime).__name__}")
+    reason_s = _require_nonempty_str(reason, "reason")
+    runtime.request_safe_stop(reason_s, time.time())
+
+
+def _request_safe_stop_via_runtime_or_sigterm(*, reason: str) -> None:
+    global SIGTERM_REQUESTED_AT, SIGTERM_DEADLINE_TS
+
+    reason_s = _require_nonempty_str(reason, "reason")
+    if _ENGINE_RUNTIME is not None:
+        _request_safe_stop(_ENGINE_RUNTIME, reason=reason_s)
+        return
+
+    now = time.time()
+    if SIGTERM_REQUESTED_AT is None:
+        SIGTERM_REQUESTED_AT = now
+        grace = _require_float(
+            _require_attr_value(SET, "sigterm_grace_sec", "settings"),
+            "settings.sigterm_grace_sec",
+            min_value=0.001,
+        )
+        SIGTERM_DEADLINE_TS = now + grace
 
 
 def _stop_flag_getter() -> bool:
-    return (not RUNNING) or SAFE_STOP_REQUESTED
+    runtime_stop_requested = False
+    if _ENGINE_RUNTIME is not None:
+        runtime_stop_requested = _require_bool(
+            _require_attr_value(_ENGINE_RUNTIME, "safe_stop_requested", "runtime"),
+            "runtime.safe_stop_requested",
+        )
+    return (not RUNNING) or (SIGTERM_REQUESTED_AT is not None) or runtime_stop_requested
 
 
 def _resolve_closed_trade_pnl_total_strict(trade: Trade, summary: Dict[str, Any]) -> float:
@@ -309,35 +341,49 @@ def _on_trade_closed_exit(trade: Trade, now_ts: float) -> None:
 
 
 def _sigterm(*_: Any) -> None:
-    global SAFE_STOP_REQUESTED, SIGTERM_REQUESTED_AT, SIGTERM_DEADLINE_TS, _SIGTERM_NOTICE_SENT
-    SAFE_STOP_REQUESTED = True
+    global SIGTERM_REQUESTED_AT, SIGTERM_DEADLINE_TS, _SIGTERM_NOTICE_SENT
+
     now = time.time()
+    _request_safe_stop_via_runtime_or_sigterm(reason="sigterm")
 
     if SIGTERM_REQUESTED_AT is None:
         SIGTERM_REQUESTED_AT = now
-        grace = _require_float(_require_attr_value(SET, "sigterm_grace_sec", "settings"), "settings.sigterm_grace_sec", min_value=0.001)
-        SIGTERM_DEADLINE_TS = now + grace
 
-        msg = f"🧯 SIGTERM 수신: 신규 진입 중단, 포지션 정리 후 종료 시도 (grace={int(grace)}s)"
-        log(msg)
-        if not _SIGTERM_NOTICE_SENT:
-            _SIGTERM_NOTICE_SENT = True
-            _safe_send_tg(msg)
+    if SIGTERM_DEADLINE_TS is None:
+        grace = _require_float(
+            _require_attr_value(SET, "sigterm_grace_sec", "settings"),
+            "settings.sigterm_grace_sec",
+            min_value=0.001,
+        )
+        SIGTERM_DEADLINE_TS = now + grace
+    else:
+        grace = SIGTERM_DEADLINE_TS - SIGTERM_REQUESTED_AT
+        if grace <= 0:
+            raise RuntimeError("SIGTERM grace must be > 0 (STRICT)")
+
+    msg = f"🧯 SIGTERM 수신: 신규 진입 중단, 포지션 정리 후 종료 시도 (grace={int(grace)}s)"
+    log(msg)
+    if not _SIGTERM_NOTICE_SENT:
+        _SIGTERM_NOTICE_SENT = True
+        _safe_send_tg(msg)
 
 
 signal.signal(signal.SIGTERM, _sigterm)
 
 
 def _on_safe_stop_command() -> None:
-    global SAFE_STOP_REQUESTED
-    SAFE_STOP_REQUESTED = True
+    _request_safe_stop_via_runtime_or_sigterm(reason="telegram_safe_stop")
     _safe_send_tg("🛑 텔레그램 '종료' 요청: 포지션 정리 후 종료합니다.")
 
 
 def _maybe_position_resync_or_raise(now_ts: float) -> None:
     global LAST_EXCHANGE_SYNC_TS
 
-    position_resync_sec = _require_float(_require_attr_value(SET, "position_resync_sec", "settings"), "settings.position_resync_sec", min_value=0.001)
+    position_resync_sec = _require_float(
+        _require_attr_value(SET, "position_resync_sec", "settings"),
+        "settings.position_resync_sec",
+        min_value=0.001,
+    )
     if (now_ts - LAST_EXCHANGE_SYNC_TS) < position_resync_sec:
         return
 
@@ -366,7 +412,7 @@ def _maybe_balance_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> 
         log(msg)
         _safe_send_tg(msg)
         if _BALANCE_CONSEC_FAILS >= _BALANCE_FAIL_HARDSTOP_N:
-            _request_safe_stop(runtime)
+            _request_safe_stop(runtime, reason="balance_check_failed")
             raise RuntimeError("balance check failed consecutively (STRICT)") from e
     finally:
         LAST_BALANCE_LOG_TS = now_ts
@@ -375,7 +421,11 @@ def _maybe_balance_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> 
 def _maybe_fill_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> None:
     global LAST_FILL_CHECK_TS, CONSEC_LOSSES, LAST_CLOSE_TS
 
-    poll_fills_sec = _require_float(_require_attr_value(SET, "poll_fills_sec", "settings"), "settings.poll_fills_sec", min_value=0.001)
+    poll_fills_sec = _require_float(
+        _require_attr_value(SET, "poll_fills_sec", "settings"),
+        "settings.poll_fills_sec",
+        min_value=0.001,
+    )
     if (now_ts - LAST_FILL_CHECK_TS) < poll_fills_sec:
         return
 
@@ -461,7 +511,7 @@ def _maybe_fill_check_or_raise(now_ts: float, runtime: EngineLoopRuntime) -> Non
         _ = hard_consec_limit_i
 
         if hard_consec_limit_i > 0 and CONSEC_LOSSES >= hard_consec_limit_i:
-            _request_safe_stop(runtime)
+            _request_safe_stop(runtime, reason="hard_consecutive_losses_limit_reached")
             msg = (
                 "🛑 [SAFE_STOP][CONSEC_LOSS] 연속 손실 한도 도달: "
                 f"consecutive_losses={CONSEC_LOSSES} limit={hard_consec_limit_i} "
@@ -584,10 +634,9 @@ def _ensure_commentary_engine_initialized_or_raise() -> None:
 
 
 def _on_watchdog_fatal(reason: str, detail: Dict[str, Any]) -> None:
-    global SAFE_STOP_REQUESTED
     reason_s = _require_nonempty_str(reason, "reason")
     detail_d = _require_dict(detail, "detail")
-    SAFE_STOP_REQUESTED = True
+    _request_safe_stop_via_runtime_or_sigterm(reason=f"watchdog_fatal:{reason_s}")
     log(f"[WATCHDOG][FATAL][CALLBACK] reason={reason_s} detail={detail_d}")
     _safe_send_tg(f"⛔ WATCHDOG 치명 상태 감지: {reason_s}")
 
@@ -600,7 +649,7 @@ def _monitoring_cycle_wrapper(
     runtime.sigterm_deadline_ts = SIGTERM_DEADLINE_TS
     monitoring_cycle_fn(now_ts, runtime)
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="monitoring_cycle_requested_safe_stop")
 
     _maybe_position_resync_or_raise(now_ts)
     _maybe_balance_check_or_raise(now_ts, runtime)
@@ -608,7 +657,7 @@ def _monitoring_cycle_wrapper(
     _maybe_auto_report_best_effort(now_ts)
 
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="post_monitoring_runtime_safe_stop")
 
 
 def _position_supervisor_cycle_wrapper(
@@ -622,7 +671,7 @@ def _position_supervisor_cycle_wrapper(
         raise RuntimeError("supervisor must be PositionSupervisor (STRICT)")
 
     if len(OPEN_TRADES) > 1:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="one_way_mode_open_trades_overflow")
         raise RuntimeError(f"OPEN_TRADES must be <= 1 in one-way mode (STRICT), got={len(OPEN_TRADES)}")
 
     expected_trade: Optional[Trade] = None
@@ -638,7 +687,7 @@ def _position_supervisor_cycle_wrapper(
             expected_trade=expected_trade,
         )
     except PositionSupervisorError as e:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="position_supervisor_error")
         msg = f"[SAFE_STOP][POSITION_SUPERVISOR] {type(e).__name__}: {e}"
         log(msg)
         _safe_send_tg(f"⛔ POSITION SUPERVISOR 치명 상태: {e}")
@@ -647,7 +696,7 @@ def _position_supervisor_cycle_wrapper(
     runtime.extra["last_position_supervisor_snapshot"] = snapshot
 
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="position_supervisor_requested_safe_stop")
 
 
 def _reconciliation_cycle_wrapper(
@@ -669,7 +718,7 @@ def _reconciliation_cycle_wrapper(
     try:
         result = run_if_due(now_ts=now_ts)
     except Exception as e:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="reconciliation_cycle_error")
         msg = f"[SAFE_STOP][RECONCILIATION] {type(e).__name__}: {e}"
         log(msg)
         _safe_send_tg(f"⛔ RECONCILIATION 치명 상태: {e}")
@@ -679,7 +728,7 @@ def _reconciliation_cycle_wrapper(
         runtime.extra["last_reconcile_result"] = result
 
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="reconciliation_requested_safe_stop")
 
 
 def _entry_risk_execution_cycle_wrapper(
@@ -692,23 +741,23 @@ def _entry_risk_execution_cycle_wrapper(
 ) -> None:
     entry_cycle_fn(now_ts, runtime)
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="entry_cycle_requested_safe_stop")
         return
 
     risk_cycle_fn(now_ts, runtime)
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="risk_cycle_requested_safe_stop")
         return
 
     execution_cycle_fn(now_ts, runtime)
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="execution_cycle_requested_safe_stop")
         return
 
     if OPEN_TRADES:
         position_supervisor_cycle_fn(now_ts, runtime)
         if runtime.safe_stop_requested:
-            _request_safe_stop(runtime)
+            _request_safe_stop(runtime, reason="post_execution_position_supervisor_requested_safe_stop")
 
 
 def _open_position_cycle_wrapper(
@@ -726,7 +775,7 @@ def _open_position_cycle_wrapper(
         LAST_EXIT_CANDLE_TS_1M = exit_ctx.state.last_exit_candle_ts_1m
 
     if runtime.safe_stop_requested:
-        _request_safe_stop(runtime)
+        _request_safe_stop(runtime, reason="open_position_cycle_requested_safe_stop")
 
     return handled
 
@@ -739,7 +788,7 @@ def _idle_safe_stop_fn(now_ts: float, runtime: EngineLoopRuntime) -> bool:
     if OPEN_TRADES:
         return False
 
-    if not runtime.safe_stop_requested and not SAFE_STOP_REQUESTED:
+    if not runtime.safe_stop_requested:
         return False
 
     if not _HALT_NOTICE_SENT:
@@ -749,7 +798,37 @@ def _idle_safe_stop_fn(now_ts: float, runtime: EngineLoopRuntime) -> bool:
 
 
 def main() -> None:
-    global OPEN_TRADES, LAST_EXCHANGE_SYNC_TS, LAST_EXIT_CANDLE_TS_1M, SAFE_STOP_REQUESTED, _AUTO_REPORTER
+    global RUNNING
+    global _ENGINE_RUNTIME
+    global OPEN_TRADES, TRADER_STATE
+    global LAST_CLOSE_TS, LAST_EXCHANGE_SYNC_TS, LAST_EXIT_CANDLE_TS_1M
+    global CONSEC_LOSSES, _BALANCE_CONSEC_FAILS, LAST_BALANCE_LOG_TS, LAST_FILL_CHECK_TS
+    global SIGTERM_REQUESTED_AT, SIGTERM_DEADLINE_TS, _SIGTERM_NOTICE_SENT, _HALT_NOTICE_SENT
+    global _AUTO_REPORTER
+
+    RUNNING = True
+    _ENGINE_RUNTIME = None
+
+    OPEN_TRADES = []
+    TRADER_STATE = TraderState()
+
+    LAST_CLOSE_TS = 0.0
+    LAST_EXCHANGE_SYNC_TS = 0.0
+    LAST_EXIT_CANDLE_TS_1M = None
+
+    CONSEC_LOSSES = 0
+    _BALANCE_CONSEC_FAILS = 0
+    LAST_BALANCE_LOG_TS = 0.0
+    LAST_FILL_CHECK_TS = 0.0
+
+    SIGTERM_REQUESTED_AT = None
+    SIGTERM_DEADLINE_TS = None
+    _SIGTERM_NOTICE_SENT = False
+    _HALT_NOTICE_SENT = False
+
+    CLOSED_TRADES_CACHE.clear()
+    _AUTO_REPORTER = None
+    _invalidate_equity_cache()
 
     start_worker(
         num_threads=ASYNC_WORKER_THREADS,
@@ -783,14 +862,11 @@ def main() -> None:
 
         _AUTO_REPORTER = _build_auto_reporter_or_raise()
 
-        start_watchdog(
-            settings=SET,
-            symbol=str(SET.symbol),
-            on_fatal=_on_watchdog_fatal,
+        reconcile_confirm_n = _require_int(
+            _require_attr_value(SET, "reconcile_confirm_n", "settings"),
+            "settings.reconcile_confirm_n",
+            min_value=1,
         )
-        watchdog_started = True
-
-        reconcile_confirm_n = _require_int(_require_attr_value(SET, "reconcile_confirm_n", "settings"), "settings.reconcile_confirm_n", min_value=1)
         hard_consecutive_losses_limit = _require_int(
             _require_attr_value(SET, "hard_consecutive_losses_limit", "settings"),
             "settings.hard_consecutive_losses_limit",
@@ -803,7 +879,11 @@ def main() -> None:
         reconcile_engine = ReconcileEngine(
             ReconcileConfig(
                 symbol=str(SET.symbol),
-                interval_sec=_require_int(_require_attr_value(SET, "reconcile_interval_sec", "settings"), "settings.reconcile_interval_sec", min_value=1),
+                interval_sec=_require_int(
+                    _require_attr_value(SET, "reconcile_interval_sec", "settings"),
+                    "settings.reconcile_interval_sec",
+                    min_value=1,
+                ),
                 desync_confirm_n=int(reconcile_confirm_n),
             ),
             fetch_exchange_position=lambda symbol=str(SET.symbol): _fetch_exchange_position_snapshot(symbol),
@@ -878,10 +958,18 @@ def main() -> None:
 
         runtime = EngineLoopRuntime(
             running=True,
-            safe_stop_requested=SAFE_STOP_REQUESTED,
+            safe_stop_requested=False,
             halted=False,
             sigterm_deadline_ts=SIGTERM_DEADLINE_TS,
         )
+        _ENGINE_RUNTIME = runtime
+
+        start_watchdog(
+            settings=SET,
+            symbol=str(SET.symbol),
+            on_fatal=_on_watchdog_fatal,
+        )
+        watchdog_started = True
 
         config = EngineLoopConfig(
             tick_sec=ENGINE_LOOP_TICK_SEC,
@@ -929,7 +1017,8 @@ def main() -> None:
     except EngineLoopHalted:
         return
     except Exception as e:
-        SAFE_STOP_REQUESTED = True
+        if _ENGINE_RUNTIME is not None:
+            _request_safe_stop(_ENGINE_RUNTIME, reason="fatal_exception")
 
         tb = traceback.format_exc()
         log(f"ERROR(FATAL): {e}\n{tb}")
@@ -945,6 +1034,9 @@ def main() -> None:
         )
         raise
     finally:
+        RUNNING = False
+        _ENGINE_RUNTIME = None
+        _AUTO_REPORTER = None
         try:
             if watchdog_started:
                 stop_watchdog()
@@ -1076,9 +1168,6 @@ def _fetch_exchange_open_orders_snapshot(symbol: str) -> List[Dict[str, Any]]:
 
 
 def _on_reconcile_desync(result: Any) -> None:
-    global SAFE_STOP_REQUESTED
-    SAFE_STOP_REQUESTED = True
-
     if result is None:
         raise RuntimeError("reconcile result is None (STRICT)")
     if not hasattr(result, "desync_confirmed"):
@@ -1088,6 +1177,8 @@ def _on_reconcile_desync(result: Any) -> None:
         raise RuntimeError("result.desync_confirmed must be bool (STRICT)")
     if not desync_confirmed:
         raise RuntimeError("on_desync called but desync_confirmed is False (STRICT)")
+
+    _request_safe_stop_via_runtime_or_sigterm(reason="reconcile_desync_confirmed")
 
     symbol = _normalize_symbol_strict(_require_attr_value(result, "symbol", "result"), name="result.symbol")
 
@@ -1106,7 +1197,10 @@ def _on_reconcile_desync(result: Any) -> None:
         log(f"[DESYNC] {code} | {message} | {details}")
     _safe_send_tg(msg)
 
-    force_close_on_desync = _require_bool(_require_attr_value(SET, "force_close_on_desync", "settings"), "settings.force_close_on_desync")
+    force_close_on_desync = _require_bool(
+        _require_attr_value(SET, "force_close_on_desync", "settings"),
+        "settings.force_close_on_desync",
+    )
     if force_close_on_desync:
         try:
             n = close_all_positions_market(symbol)
@@ -1121,6 +1215,4 @@ def _on_reconcile_desync(result: Any) -> None:
 
 
 if __name__ == "__main__":
-    from core.run_bot_preflight import run_preflight
-
-    run_preflight(preflight_only=False)
+    main()

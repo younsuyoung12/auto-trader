@@ -6,12 +6,13 @@ FILE: engine/cycles/monitoring_cycle.py
 ROLE:
 - trading engine monitoring cycle
 - Monitoring Layer 전용 orchestration 계층
-- ws/account/protection/reconciliation/watchdog 감시를 단일 계약으로 수행한다
+- ws/account/protection/reconciliation/watchdog/drift 감시를 단일 계약으로 수행한다
 
 CORE RESPONSIBILITIES:
 - websocket transport liveness 검증
 - account websocket 연결 상태 검증
 - engine watchdog snapshot 검증
+- runtime risk drift snapshot 검증
 - protection order 존재 및 정합성 검증
 - reconcile engine 주기 실행
 - SIGTERM grace deadline 도달 시 강제 정리
@@ -21,7 +22,8 @@ IMPORTANT POLICY:
 - STRICT · NO-FALLBACK · TRADE-GRADE
 - monitoring cycle 은 Signal / Risk / Execution 세부 판단을 가지지 않는다
 - watchdog start 책임은 BOOT/상위 orchestration 에 있으며 monitoring cycle 은 감시만 수행한다
-- contract violation / connectivity failure / protection missing / watchdog failure 는 즉시 예외 처리한다
+- drift detector 입력값은 runtime risk snapshot 계약만 사용한다
+- contract violation / connectivity failure / protection missing / watchdog failure / drift detected 는 즉시 예외 처리한다
 - force close 는 설정에 명시된 경우에만 실행한다
 - hidden default / silent continue / 예외 삼키기 금지
 - settings 는 SSOT 만 사용한다
@@ -32,12 +34,17 @@ IMPORTANT POLICY:
 
 CHANGE HISTORY:
 - 2026-03-15:
-  1) FIX(ROOT-CAUSE): watchdog FAIL(orderbook_integrity_fail) 즉시 SAFE_STOP 제거
-  2) FEAT(RECOVERY-GRACE): ws RECONNECTING/OPENING, orderbook bootstrapping/resync 상태에서
+  1) FEAT(RUNTIME-DRIFT): runtime.extra.last_risk_drift_snapshot 기반 DriftDetector 런타임 연결
+  2) ADD(CONTRACT): drift snapshot rollback / stale / schema violation 검증 추가
+  3) FIX(RISK): drift detected 시 즉시 SAFE_STOP 승격
+  4) FIX(OBSERVABILITY): drift snapshot 미도착/정상화 로그 추가
+  5) KEEP(ARCH): monitoring layer 는 risk decision 자체를 만들지 않고 snapshot 감시만 수행
+  6) FIX(ROOT-CAUSE): watchdog FAIL(orderbook_integrity_fail) 즉시 SAFE_STOP 제거
+  7) FEAT(RECOVERY-GRACE): ws RECONNECTING/OPENING, orderbook bootstrapping/resync 상태에서
      orderbook_integrity_fail 를 grace window 동안 recoverable 로 처리
-  3) FIX(OPERABILITY): recovery grace 경과 후에도 orderbook_fail 지속 시에만 SAFE_STOP 승격
-  4) FEAT(OBSERVABILITY): recovery grace 시작/유지/해제 로그 추가
-  5) FIX(RACE): watchdog snapshot.detail 의 orderbook recovery 메타를 우선 사용하도록 수정
+  8) FIX(OPERABILITY): recovery grace 경과 후에도 orderbook_fail 지속 시에만 SAFE_STOP 승격
+  9) FEAT(OBSERVABILITY): recovery grace 시작/유지/해제 로그 추가
+  10) FIX(RACE): watchdog snapshot.detail 의 orderbook recovery 메타를 우선 사용하도록 수정
 - 2026-03-13:
   1) ADD(MONITORING): infra.engine_watchdog 를 monitoring cycle 에 정식 연결
   2) ADD(CONTRACT): watchdog startup / snapshot freshness / fatal escalation 계약 추가
@@ -69,6 +76,12 @@ from infra.market_data_ws import (
     get_orderbook_buffer_status as ws_get_orderbook_buffer_status,
     get_ws_status as ws_get_ws_status,
 )
+from infra.drift_detector import (
+    DriftDetectedError,
+    DriftDetector,
+    DriftDetectorConfig,
+    DriftSnapshot,
+)
 from execution.exchange_api import (
     fetch_open_orders,
     fetch_open_positions,
@@ -79,6 +92,7 @@ from engine.engine_loop import EngineLoopRuntime
 DEFAULT_WS_LIVENESS_FAIL_HARDSTOP_N: int = 15
 DEFAULT_ACCOUNT_WS_FAIL_HARDSTOP_N: int = 3
 DEFAULT_PROTECTION_GUARD_INTERVAL_SEC: float = 1.0
+DEFAULT_DRIFT_SNAPSHOT_MAX_AGE_SEC: float = 30.0
 
 
 class MonitoringCycleError(RuntimeError):
@@ -232,6 +246,7 @@ class MonitoringCycleConfig:
     watchdog_startup_grace_sec: float
     watchdog_snapshot_max_age_sec: float
     watchdog_orderbook_recovery_grace_sec: float
+    drift_snapshot_max_age_sec: float
 
     def validate_or_raise(self) -> None:
         _require_float(
@@ -264,6 +279,11 @@ class MonitoringCycleConfig:
             "config.watchdog_orderbook_recovery_grace_sec",
             min_value=0.001,
         )
+        _require_float(
+            self.drift_snapshot_max_age_sec,
+            "config.drift_snapshot_max_age_sec",
+            min_value=0.001,
+        )
 
 
 @dataclass
@@ -282,6 +302,9 @@ class MonitoringCycleState:
     watchdog_orderbook_recovery_grace_started_ts: float = 0.0
     watchdog_orderbook_recovery_last_log_ts: float = 0.0
     watchdog_orderbook_recovery_reason: Optional[str] = None
+
+    drift_last_snapshot_checked_at_ms: int = 0
+    drift_snapshot_wait_logged: bool = False
 
     def validate_or_raise(self) -> None:
         _require_int(self.ws_liveness_consec_fails, "state.ws_liveness_consec_fails", min_value=0)
@@ -318,6 +341,13 @@ class MonitoringCycleState:
                 "state.watchdog_orderbook_recovery_reason",
             )
 
+        _require_int(
+            self.drift_last_snapshot_checked_at_ms,
+            "state.drift_last_snapshot_checked_at_ms",
+            min_value=0,
+        )
+        _require_bool(self.drift_snapshot_wait_logged, "state.drift_snapshot_wait_logged")
+
 
 @dataclass(frozen=True)
 class MonitoringCycleContext:
@@ -329,6 +359,7 @@ class MonitoringCycleContext:
     watchdog_start_fn: StartWatchdogFn
     watchdog_snapshot_fn: GetWatchdogSnapshotFn
     watchdog_on_fatal_fn: Callable[[str, Dict[str, Any]], None]
+    drift_detector: DriftDetector
     config: MonitoringCycleConfig
     state: MonitoringCycleState
 
@@ -358,6 +389,9 @@ class MonitoringCycleContext:
         if not callable(self.watchdog_on_fatal_fn):
             raise MonitoringContractError("context.watchdog_on_fatal_fn is required (STRICT)")
 
+        if not isinstance(self.drift_detector, DriftDetector):
+            raise MonitoringContractError("context.drift_detector must be DriftDetector (STRICT)")
+
         self.config.validate_or_raise()
         self.state.validate_or_raise()
 
@@ -386,6 +420,7 @@ def build_monitoring_cycle_context_or_raise(
     startup_grace_sec = watchdog_interval_sec * 3.0
     snapshot_max_age_sec = watchdog_interval_sec * 3.0
     orderbook_recovery_grace_sec = max(15.0, watchdog_interval_sec * 4.0)
+    drift_snapshot_max_age_sec = max(DEFAULT_DRIFT_SNAPSHOT_MAX_AGE_SEC, watchdog_interval_sec * 5.0)
 
     state = MonitoringCycleState()
 
@@ -402,6 +437,7 @@ def build_monitoring_cycle_context_or_raise(
         watchdog_start_fn=start_watchdog,
         watchdog_snapshot_fn=get_last_watchdog_snapshot,
         watchdog_on_fatal_fn=_on_watchdog_fatal,
+        drift_detector=DriftDetector(DriftDetectorConfig()),
         config=MonitoringCycleConfig(
             protection_guard_interval_sec=DEFAULT_PROTECTION_GUARD_INTERVAL_SEC,
             ws_liveness_fail_hardstop_n=DEFAULT_WS_LIVENESS_FAIL_HARDSTOP_N,
@@ -409,6 +445,7 @@ def build_monitoring_cycle_context_or_raise(
             watchdog_startup_grace_sec=startup_grace_sec,
             watchdog_snapshot_max_age_sec=snapshot_max_age_sec,
             watchdog_orderbook_recovery_grace_sec=orderbook_recovery_grace_sec,
+            drift_snapshot_max_age_sec=drift_snapshot_max_age_sec,
         ),
         state=state,
     )
@@ -599,6 +636,133 @@ def _maybe_tolerate_watchdog_orderbook_fail_or_raise(
     )
     _reset_watchdog_orderbook_recovery_grace_state(ctx)
     return False
+
+
+def _extract_runtime_drift_payload_or_none(runtime: EngineLoopRuntime) -> Optional[Dict[str, Any]]:
+    extra_any = _require_attr(runtime, "extra", "runtime")
+    extra = _require_dict(extra_any, "runtime.extra")
+
+    if "last_risk_drift_snapshot" not in extra:
+        return None
+
+    payload_any = extra["last_risk_drift_snapshot"]
+    payload = _require_dict(payload_any, "runtime.extra.last_risk_drift_snapshot")
+    return payload
+
+
+def _build_drift_snapshot_from_payload_or_raise(
+    ctx: MonitoringCycleContext,
+    payload: Dict[str, Any],
+) -> Tuple[DriftSnapshot, int]:
+    symbol = _normalize_symbol_strict(
+        _require_dict_key(payload, "symbol", "runtime.extra.last_risk_drift_snapshot"),
+        name="runtime.extra.last_risk_drift_snapshot.symbol",
+    )
+    if symbol != ctx.symbol:
+        raise MonitoringContractError(
+            "runtime drift snapshot symbol mismatch (STRICT): "
+            f"snapshot={symbol} context={ctx.symbol}"
+        )
+
+    allocation_ratio = _require_float(
+        _require_dict_key(payload, "allocation_ratio", "runtime.extra.last_risk_drift_snapshot"),
+        "runtime.extra.last_risk_drift_snapshot.allocation_ratio",
+        min_value=0.0,
+    )
+    risk_multiplier = _require_float(
+        _require_dict_key(payload, "risk_multiplier", "runtime.extra.last_risk_drift_snapshot"),
+        "runtime.extra.last_risk_drift_snapshot.risk_multiplier",
+        min_value=0.0,
+    )
+    regime_band = _require_nonempty_str(
+        _require_dict_key(payload, "regime_band", "runtime.extra.last_risk_drift_snapshot"),
+        "runtime.extra.last_risk_drift_snapshot.regime_band",
+    )
+    micro_score_risk = _require_float(
+        _require_dict_key(payload, "micro_score_risk", "runtime.extra.last_risk_drift_snapshot"),
+        "runtime.extra.last_risk_drift_snapshot.micro_score_risk",
+        min_value=0.0,
+    )
+    as_of_ts_ms = _require_int(
+        _require_dict_key(payload, "as_of_ts_ms", "runtime.extra.last_risk_drift_snapshot"),
+        "runtime.extra.last_risk_drift_snapshot.as_of_ts_ms",
+        min_value=1,
+    )
+
+    if micro_score_risk > 100.0:
+        raise MonitoringContractError(
+            "runtime drift snapshot micro_score_risk must be <= 100 (STRICT)"
+        )
+
+    return (
+        DriftSnapshot(
+            symbol=symbol,
+            allocation_ratio=float(allocation_ratio),
+            risk_multiplier=float(risk_multiplier),
+            regime_band=str(regime_band),
+            micro_score_risk=float(micro_score_risk),
+        ),
+        int(as_of_ts_ms),
+    )
+
+
+def _drift_guard_or_raise(
+    now_ts: float,
+    runtime: EngineLoopRuntime,
+    ctx: MonitoringCycleContext,
+) -> None:
+    _require_float(now_ts, "now_ts", min_value=0.0)
+
+    payload = _extract_runtime_drift_payload_or_none(runtime)
+    if payload is None:
+        if not ctx.state.drift_snapshot_wait_logged:
+            ctx.state.drift_snapshot_wait_logged = True
+            log(
+                "[DRIFT][WAIT] "
+                f"symbol={ctx.symbol} runtime.extra.last_risk_drift_snapshot unavailable yet"
+            )
+        return
+
+    ctx.state.drift_snapshot_wait_logged = False
+
+    snapshot, as_of_ts_ms = _build_drift_snapshot_from_payload_or_raise(ctx, payload)
+
+    prev_as_of_ts_ms = ctx.state.drift_last_snapshot_checked_at_ms
+    if prev_as_of_ts_ms > 0 and as_of_ts_ms < prev_as_of_ts_ms:
+        raise MonitoringContractError(
+            "runtime drift snapshot rollback detected (STRICT): "
+            f"prev={prev_as_of_ts_ms} now={as_of_ts_ms}"
+        )
+
+    now_ms = int(now_ts * 1000.0)
+    age_ms = now_ms - as_of_ts_ms
+    if age_ms < 0:
+        raise MonitoringContractError(
+            "runtime drift snapshot future timestamp detected (STRICT): "
+            f"now_ms={now_ms} as_of_ts_ms={as_of_ts_ms}"
+        )
+
+    max_age_ms = int(ctx.config.drift_snapshot_max_age_sec * 1000.0)
+    if age_ms > max_age_ms:
+        _request_safe_stop_or_raise(runtime, "DRIFT_SNAPSHOT_STALE")
+        msg = (
+            "[SAFE_STOP][DRIFT_SNAPSHOT_STALE] "
+            f"symbol={ctx.symbol} age_ms={age_ms} max_age_ms={max_age_ms}"
+        )
+        log(msg)
+        _safe_send_tg(msg)
+        raise MonitoringCycleError(msg)
+
+    try:
+        ctx.drift_detector.update_and_check(snapshot)
+    except DriftDetectedError as e:
+        _request_safe_stop_or_raise(runtime, "DRIFT_DETECTED")
+        msg = f"[SAFE_STOP][DRIFT_DETECTED] symbol={ctx.symbol} reason={e}"
+        log(msg)
+        _safe_send_tg(msg)
+        raise MonitoringCycleError(msg) from e
+
+    ctx.state.drift_last_snapshot_checked_at_ms = as_of_ts_ms
 
 
 def _ensure_watchdog_started_or_raise(
@@ -1100,6 +1264,7 @@ def run_monitoring_cycle_or_raise(
     _require_float(now_ts, "now_ts", min_value=0.0)
 
     _watchdog_guard_or_raise(now_ts, runtime, ctx)
+    _drift_guard_or_raise(now_ts, runtime, ctx)
     _ws_liveness_guard_or_raise(now_ts, runtime, ctx)
     _account_ws_connected_guard_or_raise(runtime, ctx)
     _protection_orders_guard_or_raise(now_ts, runtime, ctx)

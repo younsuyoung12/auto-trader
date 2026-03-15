@@ -14,6 +14,7 @@ CORE RESPONSIBILITIES:
 - risk physics 결정
 - hard risk guard 승인
 - execution layer 로 넘길 finalized signal packet 생성
+- runtime monitoring 이 읽을 drift snapshot 발행
 - STOP / SKIP / ENTER 상태를 명시적으로 분기
 
 IMPORTANT POLICY:
@@ -24,8 +25,15 @@ IMPORTANT POLICY:
 - risk cycle 은 주문 실행을 직접 수행하지 않는다
 - Meta Strategy(레벨3)는 recommendation 생성만이 아니라 risk overlay로 실제 반영되어야 한다
 - Meta recommendation 생성/적용 실패는 조용히 무시하지 않고 즉시 예외 또는 SAFE_STOP 처리한다
+- SAFE_STOP 상태는 runtime.request_safe_stop() 로만 전이한다
+- drift snapshot 은 monitoring cycle 계약(runtime.extra.last_risk_drift_snapshot)에 맞게 발행한다
 
 CHANGE HISTORY:
+- 2026-03-15:
+  1) FIX(STATE): runtime.safe_stop_requested 직접 수정 제거 → runtime.request_safe_stop() 단일화
+  2) FEAT(RUNTIME-DRIFT): runtime.extra.last_risk_drift_snapshot 발행 추가
+  3) FIX(CONTRACT): monitoring_cycle drift 계약(symbol/allocation_ratio/risk_multiplier/regime_band/micro_score_risk/as_of_ts_ms) 정합 반영
+  4) FIX(OBSERVABILITY): final effective allocation 기반 runtime risk multiplier 계산 및 발행
 - 2026-03-14:
   1) FEAT(META-L3): MetaStrategyEngine + MetaRiskAdjuster 를 runtime risk cycle 에 정식 연결
   2) FEAT(META-L3): active recommendation TTL / refresh state 추가
@@ -101,6 +109,7 @@ from engine.cycles.entry_cycle import (
 from engine.engine_loop import EngineLoopRuntime
 
 PENDING_RISK_PACKET_KEY: str = "pending_risk_packet"
+DRIFT_SNAPSHOT_RUNTIME_KEY: str = "last_risk_drift_snapshot"
 
 
 class RiskCycleError(RuntimeError):
@@ -204,6 +213,64 @@ def _safe_send_tg(msg: str) -> None:
             log(f"[TG][DROP] async queue full: {msg}")
     except Exception as e:
         log(f"[TG] async submit error: {type(e).__name__}: {e} | msg={msg}")
+
+
+def _request_safe_stop_runtime_or_raise(runtime: EngineLoopRuntime, reason: str) -> None:
+    if not isinstance(runtime, EngineLoopRuntime):
+        raise RiskCycleContractError(
+            f"runtime must be EngineLoopRuntime (STRICT), got={type(runtime).__name__}"
+        )
+    _require_nonempty_str(reason, "reason")
+    runtime.validate_or_raise()
+    runtime.request_safe_stop()
+
+
+def _publish_runtime_drift_snapshot_or_raise(
+    runtime: EngineLoopRuntime,
+    *,
+    symbol: str,
+    allocation_ratio: float,
+    risk_multiplier: float,
+    regime_band: str,
+    micro_score_risk: float,
+    as_of_ts_ms: int,
+) -> None:
+    if not isinstance(runtime, EngineLoopRuntime):
+        raise RiskCycleContractError(
+            f"runtime must be EngineLoopRuntime (STRICT), got={type(runtime).__name__}"
+        )
+    runtime.validate_or_raise()
+
+    symbol_norm = _normalize_symbol_strict(symbol, name="drift_snapshot.symbol")
+    allocation_ratio_f = _require_float(
+        allocation_ratio,
+        "drift_snapshot.allocation_ratio",
+        min_value=0.0,
+    )
+    risk_multiplier_f = _require_float(
+        risk_multiplier,
+        "drift_snapshot.risk_multiplier",
+        min_value=0.0,
+    )
+    regime_band_s = _require_nonempty_str(regime_band, "drift_snapshot.regime_band")
+    micro_score_risk_f = _require_float(
+        micro_score_risk,
+        "drift_snapshot.micro_score_risk",
+        min_value=0.0,
+    )
+    as_of_ts_ms_i = _require_int_ms(as_of_ts_ms, "drift_snapshot.as_of_ts_ms")
+
+    if micro_score_risk_f > 100.0:
+        raise RiskCycleContractError("drift_snapshot.micro_score_risk must be <= 100 (STRICT)")
+
+    runtime.extra[DRIFT_SNAPSHOT_RUNTIME_KEY] = {
+        "symbol": symbol_norm,
+        "allocation_ratio": float(allocation_ratio_f),
+        "risk_multiplier": float(risk_multiplier_f),
+        "regime_band": str(regime_band_s),
+        "micro_score_risk": float(micro_score_risk_f),
+        "as_of_ts_ms": int(as_of_ts_ms_i),
+    }
 
 
 @dataclass(frozen=True)
@@ -455,7 +522,7 @@ def _enforce_meta_direction_policy_or_raise(
     _ = _require_nonempty_str(direction, "direction").upper()
 
     if rec.action == "RECOMMEND_SAFE_STOP":
-        runtime.safe_stop_requested = True
+        _request_safe_stop_runtime_or_raise(runtime, "META_L3_RECOMMEND_SAFE_STOP")
         raise RiskCycleError(
             f"[SAFE_STOP][META_L3] action=RECOMMEND_SAFE_STOP rationale={rec.rationale_short}"
         )
@@ -678,7 +745,7 @@ def run_risk_cycle_or_raise(
     ).upper()
 
     if action_override == "STOP":
-        runtime.safe_stop_requested = True
+        _request_safe_stop_runtime_or_raise(runtime, "RISK_PHYSICS_STOP")
         msg = f"[SAFE_STOP][RISK_PHYSICS_STOP] {_require_attr(risk_decision, 'reason', 'risk_decision')}"
         log(msg)
         _safe_send_tg(msg)
@@ -784,6 +851,28 @@ def run_risk_cycle_or_raise(
         )
     except InvariantViolation as e:
         raise RiskCycleError(f"[SAFE_STOP][INVARIANT] {e}") from e
+
+    configured_allocation_ratio = _require_float(
+        _require_attr(ctx.settings, "allocation_ratio", "settings"),
+        "settings.allocation_ratio",
+        min_value=0.0,
+    )
+    if configured_allocation_ratio <= 0.0:
+        raise RiskCycleContractError("settings.allocation_ratio must be > 0 (STRICT)")
+
+    runtime_risk_multiplier = float(effective_risk_pct) / float(configured_allocation_ratio)
+    if not math.isfinite(runtime_risk_multiplier) or runtime_risk_multiplier <= 0.0:
+        raise RiskCycleContractError("runtime_risk_multiplier invalid (STRICT)")
+
+    _publish_runtime_drift_snapshot_or_raise(
+        runtime,
+        symbol=symbol,
+        allocation_ratio=float(effective_risk_pct),
+        risk_multiplier=float(runtime_risk_multiplier),
+        regime_band=str(regime_band),
+        micro_score_risk=float(micro_score_risk),
+        as_of_ts_ms=int(now_f * 1000.0),
+    )
 
     raw_meta = _require_dict(_require_attr(candidate, "meta", "candidate"), "candidate.meta")
     candidate_guard_adjustments = _require_dict(
@@ -1151,6 +1240,7 @@ __all__ = [
     "RiskCyclePacket",
     "RiskCycleContext",
     "PENDING_RISK_PACKET_KEY",
+    "DRIFT_SNAPSHOT_RUNTIME_KEY",
     "build_risk_cycle_context_or_raise",
     "build_risk_cycle_fn",
     "run_risk_cycle_or_raise",

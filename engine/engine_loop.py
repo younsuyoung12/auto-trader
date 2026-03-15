@@ -34,6 +34,11 @@ IMPORTANT POLICY:
 ============================================================
 
 CHANGE HISTORY:
+- 2026-03-15
+  1) FIX(ROOT-CAUSE): cycle 계층이 runtime.safe_stop_requested / runtime.halted 만 직접 세팅해도
+     engine_loop 가 상태기계로 즉시 동기화하도록 _sync_runtime_state_from_flags_or_raise 추가
+  2) FIX(CONTRACT): 각 cycle 직후 bool flag ↔ engine_state 불일치로 validate_or_raise 가 즉시 깨지던 문제 수정
+  3) FIX(HALT): halted flag direct-set 도 HALTED 상태로 즉시 승격되도록 동기화 추가
 - 2026-03-14
   1) FEAT(ARCH): position_supervisor_cycle_fn / reconciliation_cycle_fn 정식 orchestration 슬롯 추가
   2) FEAT(ORDER): monitoring → position_supervisor → open_position → reconciliation → safe-stop / entry 순서로 loop 재구성
@@ -54,7 +59,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Optional, Protocol
+from typing import Any, Dict, Optional, Protocol
 
 
 ENGINE_STATE_BOOTING = "BOOTING"
@@ -149,6 +154,20 @@ def _require_nonempty_str(v: Any, name: str) -> str:
     return s
 
 
+def _resolve_safe_stop_reason_strict(reason: Optional[str]) -> str:
+    if reason is None:
+        return "SAFE_STOP_REQUESTED"
+    return _require_nonempty_str(reason, "safe_stop_reason")
+
+
+def _resolve_halt_reason_strict(reason: Optional[str], fallback: Optional[str] = None) -> str:
+    if reason is not None:
+        return _require_nonempty_str(reason, "halt_reason")
+    if fallback is not None:
+        return _require_nonempty_str(fallback, "halt_reason_fallback")
+    return "HALTED"
+
+
 def _normalize_engine_state(v: Any, name: str) -> str:
     s = _require_nonempty_str(v, name).upper().strip()
     if s not in _ALLOWED_ENGINE_STATES:
@@ -156,20 +175,6 @@ def _normalize_engine_state(v: Any, name: str) -> str:
             f"{name} invalid (STRICT): {s!r} allowed={sorted(_ALLOWED_ENGINE_STATES)}"
         )
     return s
-
-
-def _require_optional_positive_int(v: Any, name: str) -> Optional[int]:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        raise EngineLoopContractError(f"{name} must be int or None (bool not allowed) (STRICT)")
-    try:
-        iv = int(v)
-    except Exception as e:
-        raise EngineLoopContractError(f"{name} must be int or None (STRICT): {e}") from e
-    if iv <= 0:
-        raise EngineLoopContractError(f"{name} must be > 0 when provided (STRICT)")
-    return int(iv)
 
 
 def _resolve_transition_ts_or_raise(now_ts: Optional[float], runtime: "EngineLoopRuntime") -> float:
@@ -341,10 +346,7 @@ class EngineLoopRuntime:
         if self.engine_state == ENGINE_STATE_HALTED:
             raise EngineLoopContractError("cannot request SAFE_STOP from HALTED state (STRICT)")
 
-        normalized_reason: Optional[str] = None
-        if reason is not None:
-            normalized_reason = _require_nonempty_str(reason, "reason")
-
+        normalized_reason = _resolve_safe_stop_reason_strict(reason)
         ts = self._set_transition_ts_or_raise(now_ts)
 
         if not self.safe_stop_requested:
@@ -355,7 +357,7 @@ class EngineLoopRuntime:
         self.running = True
         self.halted = False
 
-        if normalized_reason is not None and self.safe_stop_reason is None:
+        if self.safe_stop_reason is None:
             self.safe_stop_reason = normalized_reason
 
     def request_recovery(self, reason: str, *, now_ts: Optional[float] = None) -> None:
@@ -397,16 +399,39 @@ class EngineLoopRuntime:
         self.extra["last_resume_ts"] = ts
 
     def halt(self, reason: Optional[str] = None, *, now_ts: Optional[float] = None) -> None:
-        normalized_reason = "HALTED"
-        if reason is not None:
-            normalized_reason = _require_nonempty_str(reason, "reason")
-
+        normalized_reason = _resolve_halt_reason_strict(reason)
         ts = self._set_transition_ts_or_raise(now_ts)
         self.engine_state = ENGINE_STATE_HALTED
         self.running = False
         self.halted = True
         self.halt_reason = normalized_reason
         self.halted_ts = ts
+
+
+def _sync_runtime_state_from_flags_or_raise(runtime: EngineLoopRuntime, *, now_ts: float) -> None:
+    _require_bool(runtime.running, "runtime.running")
+    _require_bool(runtime.safe_stop_requested, "runtime.safe_stop_requested")
+    _require_bool(runtime.halted, "runtime.halted")
+    runtime.engine_state = _normalize_engine_state(runtime.engine_state, "runtime.engine_state")
+    ts = _require_float(now_ts, "sync.now_ts", min_value=0.0)
+
+    if runtime.halted and runtime.engine_state != ENGINE_STATE_HALTED:
+        runtime.halt(
+            _resolve_halt_reason_strict(runtime.halt_reason, runtime.safe_stop_reason),
+            now_ts=ts,
+        )
+
+    if runtime.engine_state == ENGINE_STATE_HALTED:
+        runtime.validate_or_raise()
+        return
+
+    if runtime.safe_stop_requested and runtime.engine_state in (ENGINE_STATE_BOOTING, ENGINE_STATE_RUNNING):
+        runtime.request_safe_stop(
+            _resolve_safe_stop_reason_strict(runtime.safe_stop_reason),
+            now_ts=ts,
+        )
+
+    runtime.validate_or_raise()
 
 
 def _interruptible_sleep_or_raise(
@@ -432,7 +457,9 @@ def _interruptible_sleep_or_raise(
         if not isinstance(stop_requested, bool):
             raise EngineLoopContractError("stop_flag_getter must return bool (STRICT)")
         if stop_requested:
-            runtime.request_safe_stop("STOP_FLAG", now_ts=_require_float(now_fn(), "sleep.stop_now_ts", min_value=0.0))
+            stop_now_ts = _require_float(now_fn(), "sleep.stop_now_ts", min_value=0.0)
+            runtime.request_safe_stop("STOP_FLAG", now_ts=stop_now_ts)
+            _sync_runtime_state_from_flags_or_raise(runtime, now_ts=stop_now_ts)
             sleeping = False
         else:
             current_now = _require_float(now_fn(), "sleep.current_now", min_value=0.0)
@@ -455,8 +482,8 @@ def _interruptible_sleep_or_raise(
                     sleep_fn(min(tick, remain))
 
 
-def _raise_if_halted_or_stopped_or_raise(runtime: EngineLoopRuntime) -> None:
-    runtime.validate_or_raise()
+def _raise_if_halted_or_stopped_or_raise(runtime: EngineLoopRuntime, *, now_ts: float) -> None:
+    _sync_runtime_state_from_flags_or_raise(runtime, now_ts=now_ts)
     if runtime.engine_state == ENGINE_STATE_HALTED or runtime.halted:
         raise EngineLoopHalted(f"engine loop halted: reason={runtime.halt_reason}")
 
@@ -469,6 +496,8 @@ def _run_safe_stop_resolution_or_raise(
     resume_sleep_sec: float,
     safe_stop_sleep_sec: float,
 ) -> float:
+    _sync_runtime_state_from_flags_or_raise(runtime, now_ts=now_ts)
+
     if not runtime.safe_stop_requested:
         raise EngineLoopContractError("safe-stop resolution called without safe_stop_requested=True (STRICT)")
 
@@ -483,15 +512,13 @@ def _run_safe_stop_resolution_or_raise(
         raise EngineLoopContractError("idle_safe_stop_fn must return bool (STRICT)")
 
     if should_halt:
-        halt_reason = runtime.safe_stop_reason
-        if halt_reason is None:
-            halt_reason = "SAFE_STOP_RESOLUTION_REQUESTED_HALT"
+        halt_reason = _resolve_halt_reason_strict(runtime.safe_stop_reason, "SAFE_STOP_RESOLUTION_REQUESTED_HALT")
         runtime.halt(halt_reason, now_ts=now_ts)
         raise EngineLoopHalted(
             f"engine loop halted after SAFE_STOP resolution: reason={runtime.halt_reason}"
         )
 
-    runtime.validate_or_raise()
+    _sync_runtime_state_from_flags_or_raise(runtime, now_ts=now_ts)
 
     if runtime.safe_stop_requested:
         if runtime.engine_state not in (ENGINE_STATE_SAFE_STOP, ENGINE_STATE_RECOVERY):
@@ -582,27 +609,27 @@ def run_engine_loop_or_raise(
         if stop_requested:
             runtime.request_safe_stop("STOP_FLAG", now_ts=now_ts)
 
+        _sync_runtime_state_from_flags_or_raise(runtime, now_ts=now_ts)
+
         monitoring_cycle_fn(now_ts, runtime)
         runtime.last_monitoring_ts = now_ts
-        _raise_if_halted_or_stopped_or_raise(runtime)
+        _raise_if_halted_or_stopped_or_raise(runtime, now_ts=now_ts)
 
         position_supervisor_cycle_fn(now_ts, runtime)
         runtime.last_position_supervisor_ts = now_ts
-        _raise_if_halted_or_stopped_or_raise(runtime)
+        _raise_if_halted_or_stopped_or_raise(runtime, now_ts=now_ts)
 
         handled_open_position = open_position_cycle_fn(now_ts, runtime)
         if not isinstance(handled_open_position, bool):
             raise EngineLoopContractError("open_position_cycle_fn must return bool (STRICT)")
         if handled_open_position:
             runtime.last_open_position_cycle_ts = now_ts
-        _raise_if_halted_or_stopped_or_raise(runtime)
-
-        sleep_sec: float
+        _raise_if_halted_or_stopped_or_raise(runtime, now_ts=now_ts)
 
         if handled_open_position:
             reconciliation_cycle_fn(now_ts, runtime)
             runtime.last_reconciliation_ts = now_ts
-            _raise_if_halted_or_stopped_or_raise(runtime)
+            _raise_if_halted_or_stopped_or_raise(runtime, now_ts=now_ts)
 
             if runtime.safe_stop_requested:
                 sleep_sec = _run_safe_stop_resolution_or_raise(
@@ -613,7 +640,7 @@ def run_engine_loop_or_raise(
                     safe_stop_sleep_sec=config.safe_stop_tick_sec,
                 )
             else:
-                sleep_sec = config.open_position_tick_sec
+                sleep_sec = _require_float(config.open_position_tick_sec, "config.open_position_tick_sec", min_value=0.001)
 
         else:
             if runtime.safe_stop_requested:
@@ -632,11 +659,11 @@ def run_engine_loop_or_raise(
 
                 entry_cycle_fn(now_ts, runtime)
                 runtime.last_idle_entry_cycle_ts = now_ts
-                _raise_if_halted_or_stopped_or_raise(runtime)
+                _raise_if_halted_or_stopped_or_raise(runtime, now_ts=now_ts)
 
                 reconciliation_cycle_fn(now_ts, runtime)
                 runtime.last_reconciliation_ts = now_ts
-                _raise_if_halted_or_stopped_or_raise(runtime)
+                _raise_if_halted_or_stopped_or_raise(runtime, now_ts=now_ts)
 
                 if runtime.safe_stop_requested:
                     sleep_sec = _run_safe_stop_resolution_or_raise(
@@ -647,7 +674,7 @@ def run_engine_loop_or_raise(
                         safe_stop_sleep_sec=config.safe_stop_tick_sec,
                     )
                 else:
-                    sleep_sec = config.idle_tick_sec
+                    sleep_sec = _require_float(config.idle_tick_sec, "config.idle_tick_sec", min_value=0.001)
 
         runtime.validate_or_raise()
 
